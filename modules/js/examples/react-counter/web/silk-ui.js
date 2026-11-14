@@ -1,4 +1,4 @@
-// What the page uses of @silk/ui, on browser elements: `createBox` and the node a ref
+// What the page uses of @silkui/core, on browser elements: `createBox` and the node a ref
 // gives (`style.set`, `append`, `destroy`). motion.js draws through it unchanged.
 
 // Style keys a bare number does not get `px` on, as React DOM does it.

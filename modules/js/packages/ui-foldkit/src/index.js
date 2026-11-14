@@ -1,9 +1,9 @@
-// @silk/ui-foldkit: Foldkit programs on the Silk UI tree.
+// @silkui/foldkit: Foldkit programs on the Silk UI tree.
 //
 // Import it before `foldkit`. It installs `document` and the DOM members Foldkit patches
 // through (see dom.js), so the unmodified `foldkit` package renders into tree nodes:
 //
-//   import "@silk/ui-foldkit";
+//   import "@silkui/foldkit";
 //   import { Runtime } from "foldkit";
 //   Runtime.run(Runtime.makeApplication({ ..., container: document.getElementById("root") }));
 //

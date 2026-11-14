@@ -5,7 +5,7 @@ import { installMock } from "../../ui/test/mock.js";
 const mock = installMock();
 const { createElement: h, useState } = await import("react");
 const { createRoot, flushSync } = await import("../src/index.js");
-const { createBox } = await import("@silk/ui");
+const { createBox } = await import("@silkui/core");
 
 function find(calls, name, predicate = () => true) {
   return calls.filter((call) => call[0] === name && predicate(call));

@@ -5,7 +5,7 @@ export interface SilkOptions {
   entry?: string;
   /** Name of the bundle in `build.outDir`. Default `app.js`. */
   fileName?: string;
-  /** Package whose JSX runtime compiles JSX, or false to leave JSX settings alone. Default `@silk/ui-react`. */
+  /** Package whose JSX runtime compiles JSX, or false to leave JSX settings alone. Default `@silkui/react`. */
   jsx?: string | false;
   /** Host binary to start: given `--watch <bundle>` in watch mode, `--dev <port>` under the dev server. */
   host?: { command: string; args?: string[]; cwd?: string };

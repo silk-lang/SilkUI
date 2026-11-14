@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
 import { fileURLToPath } from "node:url";
-import silk from "@silk/vite";
+import silk from "@silkui/vite";
 
 // The benchmark app for the tree: dist/silk/app.js, one ES module a ui-js host runs.
 export default defineConfig({

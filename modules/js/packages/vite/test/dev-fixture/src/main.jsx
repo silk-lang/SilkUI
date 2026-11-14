@@ -1,4 +1,4 @@
-import { createRoot } from "@silk/ui-react";
+import { createRoot } from "@silkui/react";
 import { Label } from "./Label.jsx";
 
 createRoot().render(<Label />);

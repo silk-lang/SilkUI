@@ -3,7 +3,7 @@
 // repository root:
 //   silk run --manifest-path modules/js/demo/silk.toml
 // examples/react-counter is the same page in React.
-import { createBox, createText, mount } from "@silk/ui";
+import { createBox, createText, mount } from "@silkui/core";
 
 const DOCS = "https://silk-ui-docs.juliaortiz-js.workers.dev";
 const SANS = "Geist, Noto Sans, sans-serif";

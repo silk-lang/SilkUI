@@ -1,6 +1,6 @@
 import { defineConfig } from "vite";
-import silk from "@silk/vite";
-import { provided } from "@silk/ui-foldkit/apis";
+import silk from "@silkui/vite";
+import { provided } from "@silkui/foldkit/apis";
 
 // `npm run build` writes dist/app.js. `npm run watch` rebuilds the bundle on every change and
 // reloads the application in the host that SILK_UI_HOST names.

@@ -1,7 +1,7 @@
-// JSX for the tree's node kinds. With `"jsxImportSource": "@silk/ui-react"`, TypeScript
+// JSX for the tree's node kinds. With `"jsxImportSource": "@silkui/react"`, TypeScript
 // checks <box>, <input>, <richinput>, <image>, <icon> and <canvas> against these props.
 import type { Key, Ref, ReactNode, JSX as ReactJSX } from "react";
-import type * as Silk from "@silk/ui";
+import type * as Silk from "@silkui/core";
 
 export { Fragment, jsx, jsxs } from "react/jsx-runtime";
 

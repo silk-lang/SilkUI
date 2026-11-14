@@ -10,7 +10,7 @@ export default defineConfig({
   base: "./",
   resolve: {
     alias: [
-      { find: /^@silk\/ui$/, replacement: path("../react-counter/web/silk-ui.js") },
+      { find: /^@silkui\/core$/, replacement: path("../react-counter/web/silk-ui.js") },
       { find: /^silk-web\/jsx(-dev)?-runtime$/, replacement: path("../react-counter/web/jsx-runtime.js") },
     ],
   },

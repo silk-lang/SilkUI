@@ -1,4 +1,4 @@
-// @silk/ui-react: a React renderer for the Silk UI tree.
+// @silkui/react: a React renderer for the Silk UI tree.
 //
 // Host elements are the tree's node kinds: <box>, <input>, <image>, <icon>, <canvas>.
 // Strings in children become text nodes. Props:
@@ -7,7 +7,7 @@
 //   looks the tree lays over it in those states. `startingStyle` is what transitions start
 //   from when the node first shows, as CSS `@starting-style`.
 // - `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so on for every event of the
-//   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silk/ui
+//   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silkui/core
 //   event, which has the DOM members.
 // - `value` on <input>: a controlled value, as in React DOM.
 // - `svg` on <icon>: SVG markup, drawn at the icon's CSS size with its `color` as
@@ -22,7 +22,7 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext } from "react";
-import { RichInput, createNode, createText, mount, root as mountedRoot } from "@silk/ui";
+import { RichInput, createNode, createText, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout"]);
@@ -185,7 +185,7 @@ function applyProps(node, previous, next) {
 const EMPTY = {};
 
 const hostConfig = {
-  rendererPackageName: "@silk/ui-react",
+  rendererPackageName: "@silkui/react",
   rendererVersion: "0.1.0",
   extraDevToolsConfig: null,
   supportsMutation: true,
@@ -285,7 +285,7 @@ function report(kind) {
 }
 
 /**
- * A React root in `container`, a @silk/ui node. Without one, a new box is mounted as the
+ * A React root in `container`, a @silkui/core node. Without one, a new box is mounted as the
  * root of the window's tree.
  */
 export function createRoot(container) {

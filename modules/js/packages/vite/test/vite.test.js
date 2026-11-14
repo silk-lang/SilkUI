@@ -26,7 +26,7 @@ test("builds one ES module and stamps it", async () => {
   const outDir = await bundle("production");
   const code = readFileSync(join(outDir, "app.js"), "utf8");
   assert.match(code, /mode production/);
-  assert.doesNotMatch(code, /from\s*["']@silk\/ui["']/, "the library is bundled");
+  assert.doesNotMatch(code, /from\s*["']@silkui\/core["']/, "the library is bundled");
   assert.match(readFileSync(join(outDir, "app.js.stamp"), "utf8"), /^\d+\n$/);
 });
 

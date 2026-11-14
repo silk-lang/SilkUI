@@ -1,4 +1,4 @@
-// @silk/ui: the nodes of a Silk UI tree and their events, for JavaScript that runs on the
+// @silkui/core: the nodes of a Silk UI tree and their events, for JavaScript that runs on the
 // embedded SilkJS engine. The primitives are the tree's own (box, text, input, image, icon,
 // canvas); the methods and the event flow are the DOM's, so code written for the web reads
 // the same here.
@@ -7,7 +7,7 @@
 // queue after the script, and after each event it delivers.
 
 const native = globalThis.__ui;
-if (!native) throw new Error("@silk/ui needs the __ui functions of a ui-js host");
+if (!native) throw new Error("@silkui/core needs the __ui functions of a ui-js host");
 
 const KINDS = { box: 0, text: 1, input: 2, image: 3, icon: 4, canvas: 5 };
 const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starting: 5 };
@@ -818,7 +818,7 @@ export function defineKeyframes(name, frames) {
     for (const part of selector.split(",")) {
       const text = part.trim().toLowerCase();
       const offset = text === "from" ? 0 : text === "to" ? 1 : parseFloat(text) / 100;
-      if (!(offset >= 0 && offset <= 1)) throw new Error(`@silk/ui: bad keyframe selector '${part}'`);
+      if (!(offset >= 0 && offset <= 1)) throw new Error(`@silkui/core: bad keyframe selector '${part}'`);
       native.keyframe(offset, css);
     }
   }
