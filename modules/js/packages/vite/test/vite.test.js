@@ -9,14 +9,14 @@ import silk from "../src/index.js";
 
 const root = fileURLToPath(new URL("./fixture", import.meta.url));
 
-async function bundle(mode, entry = "src/main.js") {
+async function bundle(mode, entry = "src/main.js", options = {}) {
   const outDir = mkdtempSync(join(tmpdir(), "silk-vite-"));
   await build({
     root,
     mode,
     configFile: false,
     logLevel: "silent",
-    plugins: [silk({ entry })],
+    plugins: [silk({ entry, ...options })],
     build: { outDir },
   });
   return outDir;
@@ -40,4 +40,12 @@ test("takes a package's portable build, not its browser or Node one", async () =
   // A ui-js realm has neither a DOM nor Node APIs: `browser` builds reach for `document`.
   const outDir = await bundle("production", "src/conditional.js");
   assert.match(readFileSync(join(outDir, "app.js"), "utf8"), /portable build/);
+});
+
+test("keeps Node builtins as imports for a host on the SilkJS runtime", async () => {
+  const outDir = await bundle("production", "src/builtins.js", { node: true });
+  const code = readFileSync(join(outDir, "app.js"), "utf8");
+  assert.match(code, /from\s*["']node:fs["']/);
+  assert.match(code, /from\s*["']node:path["']/);
+  assert.doesNotMatch(code, /__vite-browser-external/);
 });
