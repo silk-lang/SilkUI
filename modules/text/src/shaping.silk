@@ -63,6 +63,8 @@ struct Item {
   key: usize,
   glyphStart: usize,
   glyphEnd: usize,
+  // How the glyphs' clusters run: 1 never falling, -1 never rising, 0 neither.
+  order: i8,
 }
 
 impl Copy for Item {}
@@ -533,6 +535,27 @@ effect fn shapeItem<'a>(
     &features,
     &mut state.raw,
   )
+  let glyphEnd = state.raw.length()
+  let mut rising = true
+  let mut falling = true
+  let mut index = glyphStart + 1
+  while index < glyphEnd {
+    let before = state.raw.get(index - 1).cluster
+    let cluster = state.raw.get(index).cluster
+    if cluster < before {
+      rising = false
+    }
+    if cluster > before {
+      falling = false
+    }
+    index = index + 1
+  }
+  let mut order: i8 = 0
+  if rising {
+    order = 1
+  } else if falling {
+    order = -1
+  }
   run state.items.append(
     Item {
       upright: upright,
@@ -540,9 +563,31 @@ effect fn shapeItem<'a>(
       end: end,
       key: key,
       glyphStart: glyphStart,
-      glyphEnd: state.raw.length(),
+      glyphEnd: glyphEnd,
+      order: order,
     },
   )
+}
+
+// The first glyph of `item` whose cluster is at or past `cluster` in the item's cluster order
+// (at or before it when the clusters fall). Needs `item.order != 0`.
+fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
+  let mut low = item.glyphStart
+  let mut high = item.glyphEnd
+  while low < high {
+    let middle = low + (high - low) / 2
+    let at = u32.toUsize(state.raw.get(middle).cluster)
+    let mut earlier = at < cluster
+    if item.order < 0 {
+      earlier = at > cluster
+    }
+    if earlier {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
 }
 
 // The letter-spacing and word-spacing after raw glyph `index`: letter-spacing follows the last
@@ -590,8 +635,21 @@ effect fn emit<'a>(
   let glyphStart = state.glyphs.length()
   let mut pen: f32 = 0.0
   let mut previous = u32.MAX
+  // A segment has a piece per word, so each piece finds its own glyphs instead of reading them all.
   let mut index = item.glyphStart
-  while index < item.glyphEnd {
+  let mut glyphEnd = item.glyphEnd
+  if item.order > 0 {
+    index = firstGlyphAt(&state, item, low)
+    glyphEnd = firstGlyphAt(&state, item, high)
+  } else if item.order < 0 {
+    // Falling clusters: those below `high` start after the last one at or above it.
+    index = firstGlyphAt(&state, item, high - 1)
+    glyphEnd = item.glyphEnd
+    if low > 0 {
+      glyphEnd = firstGlyphAt(&state, item, low - 1)
+    }
+  }
+  while index < glyphEnd {
     let raw = state.raw.get(index)
     let cluster = u32.toUsize(raw.cluster)
     if cluster >= low && cluster < high {
