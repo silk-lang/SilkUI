@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createIcon, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes } = await import("../src/index.js");
+const { createBox, createText, createInput, createIcon, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -353,4 +353,26 @@ test("selectionchange moves the caret of an input and names a rich input's typin
   assert.equal(seen.selectionStart, 2);
   assert.equal(input.selectionEnd, 3);
   assert.deepEqual(input.activeMarks, ["bold"]);
+});
+
+test("announce speaks through a hidden live region made before its text", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const app = mount(createBox());
+  mock.take();
+  announce("Saved");
+  const made = mock.take();
+  const region = app.childNodes.at(-1);
+  assert.ok(made.some((call) => call[0] === "attribute" && call[1] === region.id && call[2] === "aria-live" && call[3] === "polite"));
+  assert.ok(made.some((call) => call[0] === "append" && call[1] === app.id && call[2] === region.id));
+  assert.equal(region.childNodes.length, 0, "the text waits, so the region exists before it changes");
+  t.mock.timers.tick(100);
+  assert.equal(region.childNodes[0].data, "Saved");
+  announce("Saved");
+  t.mock.timers.tick(100);
+  assert.equal(region.childNodes.length, 1, "a repeat replaces the node, so it is a change too");
+  assert.equal(app.childNodes.at(-1), region, "one region per politeness");
+  announce("Failed", { politeness: "assertive" });
+  assert.notEqual(app.childNodes.at(-1), region);
+  t.mock.timers.tick(7100);
+  assert.equal(region.childNodes.length, 0, "messages go after a while");
 });
