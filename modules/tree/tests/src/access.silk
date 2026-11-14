@@ -3,6 +3,7 @@
 import ui_tree.css
 import ui_tree.css { px, Declaration, Keyword }
 import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node, Selection, Input, Modifiers }
+import ui_tree.mutation { TriState, Live }
 import ui_tree.access { AccessTree, ActionOutcome, accessId, windowId, runId, doAction, accessibleName }
 import accesskit.lib {
   Role as AccessRole,
@@ -14,7 +15,8 @@ import accesskit.lib {
   NodeEntry,
   TextPosition,
   TextSelection,
-  Toggled
+  Toggled,
+  Live as AccessLive
 }
 import ui_fixtures.fixtures as fixtures
 import silk.collections.list { List }
@@ -778,4 +780,102 @@ test effect fn inertSubtreesTakeNoFocus() -> ()
   ! TreeError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run inertSubtrees() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn labelOf(update: &TreeUpdate, id: u32, wanted: string) -> bool {
+  return match entryOf(update, id) {
+    Option.Some { value } => match value.node.label() {
+      Option.Some { value: label } => label == wanted
+      Option.None => false
+    }
+    Option.None => false
+  }
+}
+
+effect fn accessSemantics() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let title = run tree.box(&sized(100.0, 20.0))
+  let titleText = run tree.text("Shipping address")
+  let hint = run tree.box(&sized(100.0, 20.0))
+  let hintText = run tree.text("We never share it")
+  let field = run tree.input(&sized(100.0, 20.0))
+  let bold = run tree.box(&sized(40.0, 20.0))
+  let region = run tree.box(&sized(1.0, 1.0))
+  let heading = run tree.box(&sized(100.0, 20.0))
+  let gone = run tree.box(&sized(100.0, 20.0))
+  run tree.append(title, titleText)
+  run tree.append(hint, hintText)
+  run tree.append(root, title)
+  run tree.append(root, hint)
+  run tree.append(root, field)
+  run tree.append(root, bold)
+  run tree.append(root, region)
+  run tree.append(root, heading)
+  run tree.append(root, gone)
+  run tree.setRoot(root)
+  let mut by = List<u32>.make()
+  run by.append(title.id().raw())
+  run tree.setAttribute(field, Attribute.LabelledBy { ids: move by })
+  run tree.setAttribute(field, Attribute.Label { value: run String.copy("Ignored") })
+  let mut described = List<u32>.make()
+  run described.append(hint.id().raw())
+  run tree.setAttribute(field, Attribute.DescribedBy { ids: move described })
+  run tree.setAttribute(field, Attribute.Required { value: true })
+  run tree.setRole(bold, Role.Button)
+  run tree.setAttribute(bold, Attribute.Label { value: run String.copy("Bold") })
+  run tree.setAttribute(bold, Attribute.Pressed { value: TriState.True })
+  run tree.setAttribute(region, Attribute.Live { value: Live.Polite })
+  run tree.setAttribute(heading, Attribute.Element { name: run String.copy("h3") })
+  run tree.setAttribute(heading, Attribute.Label { value: run String.copy("Details") })
+  run tree.setRole(gone, Role.Button)
+  run tree.setAttribute(gone, Attribute.Label { value: run String.copy("Hidden") })
+  run tree.setAttribute(gone, Attribute.Hidden { value: true })
+  drop run tree.frame(viewport(), 0.0)
+
+  let mut access = AccessTree.make()
+  let update = run access.fullUpdate(tree.engine())
+  run Testing.expect(labelOf(&update, field.id().raw(), "Shipping address"), "aria-labelledby names the field, over its label")
+  let fieldOk = match entryOf(&update, field.id().raw()) {
+    Option.Some { value } => value.node.isRequired() && match value.node.description() {
+      Option.Some { value: text } => text == "We never share it"
+      Option.None => false
+    }
+    Option.None => false
+  }
+  run Testing.expect(fieldOk, "aria-describedby gives the description, and required is set")
+  let pressed = match entryOf(&update, bold.id().raw()) {
+    Option.Some { value } => match value.node.toggled() {
+      Option.Some { value: state } => state == Toggled.True
+      Option.None => false
+    }
+    Option.None => false
+  }
+  run Testing.expect(pressed, "a pressed toggle button is toggled")
+  let liveOk = match entryOf(&update, region.id().raw()) {
+    Option.Some { value } => match value.node.live() {
+      Option.Some { value: politeness } => politeness == AccessLive.Polite
+      Option.None => false
+    }
+    Option.None => false
+  }
+  run Testing.expect(liveOk, "a box with no role but aria-live is kept, as a polite live region")
+  let levelOk = match entryOf(&update, heading.id().raw()) {
+    Option.Some { value } => match value.node.level() {
+      Option.Some { value: level } => level == 3
+      Option.None => false
+    }
+    Option.None => false
+  }
+  run Testing.expect(levelOk, "an h3 is a level 3 heading")
+  run Testing.expect(!carries(&update, gone.id().raw()), "aria-hidden leaves a node out")
+}
+
+test effect fn semanticsReachAccessKit() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run accessSemantics() |> Effect.provideMut<Allocator>(&mut allocator)
 }

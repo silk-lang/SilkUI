@@ -15,13 +15,17 @@ import accesskit.lib {
   TextPosition,
   TextSelection,
   Toggled,
+  Live as AccessLive,
+  Orientation as AccessOrientation,
+  Invalid as AccessInvalid,
   TreeInfo,
   TreeUpdate,
   Rect as AccessRect
 }
 import engine { UiTree }
 import node { NONE, Event, EventKind }
-import mutation { NodeKind, Role, LISTEN_CLICK, NOT_FOCUSABLE }
+import mutation { NodeKind, Role, LISTEN_CLICK, NOT_FOCUSABLE, Live, TriState, Orientation }
+import node { Semantics }
 import input { Input }
 import inspect { NodeInfo }
 import inspect as inspect
@@ -37,6 +41,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
+import silk.num.i32
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
@@ -145,17 +150,28 @@ pub fn accessRoleOf(value: Role) -> AccessRole {
 
 fn toggles(value: Role) -> bool {
   return value == Role.Checkbox || value == Role.Radio || value == Role.Switch
+    || value == Role.MenuItemCheckbox
+    || value == Role.MenuItemRadio
 }
 
 fn selects(value: Role) -> bool {
   return value == Role.Option || value == Role.Tab || value == Role.ListItem
     || value == Role.MenuItem
+    || value == Role.TreeItem
+    || value == Role.GridCell
 }
 
-/// Whether `slot` is a modal dialog: a dialog that traps focus.
+/// Whether `slot` is a modal dialog: a dialog that traps focus, or a node set modal
+/// (`aria-modal`).
 fn modal(tree: &UiTree<'_>, slot: u32) -> bool {
   let node = tree.node(slot)
-  return node.accessRole == Role.Dialog && node.focusTrap
+  if (node.accessRole == Role.Dialog || node.accessRole == Role.AlertDialog) && node.focusTrap {
+    return true
+  }
+  return match node.semanticsOf() {
+    Option.Some { value } => value.modal
+    Option.None => false
+  }
 }
 
 /// The last exposed modal dialog at or below `slot` in tree order, or NONE.
@@ -220,8 +236,15 @@ fn disabled(tree: &UiTree<'_>, slot: u32) -> bool {
 
 fn exposed(tree: &UiTree<'_>, slot: u32) -> bool {
   let node = tree.node(slot)
+  // `aria-hidden` and `inert` take the node and its subtree away, as display: none does.
+  let hidden = match node.semanticsOf() {
+    Option.Some { value } => value.hidden
+    Option.None => false
+  }
   return node.live && node.computed.text.visible
     && &node.computed.layout.display != &CssDisplay.None
+    && !hidden
+    && !node.inert
 }
 
 /// Whether a role takes its name from its content when it has no label (ARIA 1.2 "name
@@ -232,9 +255,17 @@ fn namedByContent(value: Role) -> bool {
     || value == Role.Switch
     || value == Role.Heading
     || value == Role.MenuItem
+    || value == Role.MenuItemCheckbox
+    || value == Role.MenuItemRadio
     || value == Role.Tab
     || value == Role.Option
     || value == Role.Tooltip
+    || value == Role.TreeItem
+    || value == Role.Cell
+    || value == Role.GridCell
+    || value == Role.ColumnHeader
+    || value == Role.RowHeader
+    || value == Role.Row
 }
 
 /// Whether a role hides its descendants from assistive technology (ARIA "children
@@ -246,6 +277,10 @@ fn presentationalChildren(value: Role) -> bool {
     || value == Role.Option
     || value == Role.Image
     || value == Role.Slider
+    || value == Role.MenuItemCheckbox
+    || value == Role.MenuItemRadio
+    || value == Role.ProgressBar
+    || value == Role.Separator
 }
 
 fn isSpace(byte: u8) -> bool {
@@ -310,6 +345,13 @@ pub effect fn accessibleName(tree: &UiTree<'_>, slot: u32, out: &mut String) -> 
   ? &mut Allocator {
   out.clear()
   let node = tree.node(slot)
+  // `aria-labelledby` wins over the label, as in accname step 2B.
+  if let Option.Some { value: semantics } = node.semanticsOf() {
+    run referencedText(tree, semantics.labelledBy.asSlice(), &mut out)
+    if out.ownedByteLength() != 0 {
+      return ()
+    }
+  }
   if String.ownedByteLength(&node.label) != 0 {
     run appendWords(&mut out, String.view(&node.label))
     return ()
@@ -318,6 +360,166 @@ pub effect fn accessibleName(tree: &UiTree<'_>, slot: u32, out: &mut String) -> 
     run appendWords(&mut out, String.view(&node.text))
   } else if namedByContent(node.accessRole) {
     run appendContent(tree, slot, &mut out)
+  }
+}
+
+/// Appends the text of the nodes with client ids `ids`, in order: each one's label, its own
+/// text, or the text below it. As accname reads a reference, hidden nodes count too.
+effect fn referencedText(tree: &UiTree<'_>, ids: &[u32], out: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < ids.length {
+    let target = tree.slotOf(ids[i])
+    i = i + 1
+    if target == NONE {
+      continue
+    }
+    let node = tree.node(target)
+    if String.ownedByteLength(&node.label) != 0 {
+      run appendWords(&mut out, String.view(&node.label))
+    } else if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
+      run appendWords(&mut out, String.view(&node.text))
+    } else {
+      run appendContent(tree, target, &mut out)
+    }
+  }
+}
+
+/// Whether a node's rarer attributes make it worth keeping although it has no role: a live
+/// region, a description or a relation.
+fn meaningful(semantics: Option<&Semantics>) -> bool {
+  return match semantics {
+    Option.Some { value } => value.live != Live.Off || value.busy || value.description.ownedByteLength() != 0
+      || value.roleDescription.ownedByteLength() != 0
+      || value.labelledBy.length() != 0
+      || value.describedBy.length() != 0
+      || value.controls.length() != 0
+      || value.activeDescendant.length() != 0
+      || value.modal
+    Option.None => false
+  }
+}
+
+/// The AccessKit ids of the nodes with client ids `ids` that the tree publishes.
+effect fn references(tree: &UiTree<'_>, ids: &[u32]) -> List<AccessId> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<AccessId>.make()
+  let mut i: usize = 0
+  while i < ids.length {
+    let target = tree.slotOf(ids[i])
+    if target != NONE && exposed(tree, target) && !ignorable(tree, target) {
+      run out.append(accessId(ids[i]))
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+/// Sets on `out` what the node's rarer attributes say: levels, sets, states, live region
+/// settings, descriptions and relations.
+effect fn describeSemantics(tree: &UiTree<'_>, slot: u32, out: &mut AccessNode) -> () ! OutOfMemoryError ? &mut Allocator {
+  let node = tree.node(slot)
+  // Alerts and statuses are live regions without saying so, and read whole.
+  let mut live = match node.accessRole {
+    Role.Alert => Live.Assertive
+    Role.Status => Live.Polite
+    Role.Log => Live.Polite
+    _ => Live.Off
+  }
+  let mut atomic = node.accessRole == Role.Alert || node.accessRole == Role.Status
+  let semantics = match node.semanticsOf() {
+    Option.Some { value } => value
+    Option.None => {
+      if live != Live.Off {
+        run out.setLive(accessLive(live))
+        if atomic {
+          out.setLiveAtomic()
+        }
+      }
+      return ()
+    }
+  }
+  if semantics.live != Live.Off {
+    live = semantics.live
+  }
+  atomic = atomic || semantics.atomic
+  if live != Live.Off {
+    run out.setLive(accessLive(live))
+    if atomic {
+      out.setLiveAtomic()
+    }
+  }
+  if semantics.busy {
+    out.setBusy()
+  }
+  if semantics.level > 0 {
+    run out.setLevel(i32.toUsize(semantics.level))
+  }
+  if semantics.posInSet > 0 {
+    run out.setPositionInSet(i32.toUsize(semantics.posInSet))
+  }
+  if semantics.setSize > 0 {
+    run out.setSizeOfSet(i32.toUsize(semantics.setSize))
+  }
+  if semantics.pressed != TriState.Unset {
+    run out.setToggled(match semantics.pressed {
+      TriState.True => Toggled.True
+      TriState.Mixed => Toggled.Mixed
+      _ => Toggled.False
+    })
+  }
+  if semantics.indeterminate && toggles(node.accessRole) {
+    run out.setToggled(Toggled.Mixed)
+  }
+  if semantics.required {
+    out.setRequired()
+  }
+  if semantics.invalid {
+    run out.setInvalid(AccessInvalid.True)
+  }
+  if semantics.multiSelectable {
+    out.setMultiselectable()
+  }
+  if semantics.orientation != Orientation.Unset {
+    run out.setOrientation(if semantics.orientation == Orientation.Vertical { AccessOrientation.Vertical } else { AccessOrientation.Horizontal })
+  }
+  if semantics.roleDescription.ownedByteLength() != 0 {
+    run out.setRoleDescription(String.view(&semantics.roleDescription))
+  }
+  if semantics.valueText.ownedByteLength() != 0 && node.kind == NodeKind.Box {
+    run out.setValue(String.view(&semantics.valueText))
+  }
+  let mut description = String.make()
+  run referencedText(tree, semantics.describedBy.asSlice(), &mut description)
+  if description.ownedByteLength() == 0 {
+    run appendWords(&mut description, String.view(&semantics.description))
+  }
+  if description.ownedByteLength() != 0 {
+    run out.setDescription(String.view(&description))
+  }
+  let labelledBy = run references(tree, semantics.labelledBy.asSlice())
+  if labelledBy.length() != 0 {
+    run out.setLabelledBy(labelledBy.asSlice())
+  }
+  let describedBy = run references(tree, semantics.describedBy.asSlice())
+  if describedBy.length() != 0 {
+    run out.setDescribedBy(describedBy.asSlice())
+  }
+  let controls = run references(tree, semantics.controls.asSlice())
+  if controls.length() != 0 {
+    run out.setControls(controls.asSlice())
+  }
+  let active = run references(tree, semantics.activeDescendant.asSlice())
+  if active.length() != 0 {
+    run out.setActiveDescendant(active.get(0))
+  }
+}
+
+fn accessLive(value: Live) -> AccessLive {
+  return match value {
+    Live.Assertive => AccessLive.Assertive
+    Live.Polite => AccessLive.Polite
+    Live.Off => AccessLive.Off
   }
 }
 
@@ -347,6 +549,7 @@ fn ignorable(tree: &UiTree<'_>, slot: u32) -> bool {
     && !node.checked
     && !node.selected
     && !node.expanded
+    && !meaningful(node.semanticsOf())
 }
 
 /// The AccessKit node for `slot`, with `children` as its children.
@@ -431,6 +634,7 @@ effect fn describe(tree: &UiTree<'_>, slot: u32, children: &[AccessId]) -> Acces
   if modal(tree, slot) {
     out.setModal()
   }
+  run describeSemantics(tree, slot, &mut out)
   if node.hasValueRange {
     run out.setMinNumericValue(f32.toF64(node.valueMin))
     run out.setMaxNumericValue(f32.toF64(node.valueMax))
@@ -446,7 +650,8 @@ effect fn describe(tree: &UiTree<'_>, slot: u32, children: &[AccessId]) -> Acces
     || toggles(node.accessRole)
     || node.accessRole == Role.MenuItem
     || node.accessRole == Role.Tab
-    || node.accessRole == Role.Option {
+    || node.accessRole == Role.Option
+    || node.accessRole == Role.TreeItem {
     out.addAction(Action.Click)
   }
   return move out
