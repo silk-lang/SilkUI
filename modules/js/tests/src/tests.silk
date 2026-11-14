@@ -1,7 +1,7 @@
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError }
+import ui_js.lib { JsHost, JsError, ClipboardRequest }
 import ui_js.bridge as bridge
 import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
 import ui_fixtures.fixtures as fixtures
@@ -259,6 +259,31 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   let sent = host.takeOutbox()
   run Testing.expect(sent.length() == 1 && String.view(&sent.asSlice()[0]) == "echo hi", "devSend queued one line for the server")
   run Testing.expect(host.takeReload() && !host.takeReload(), "devReload asked once, from a promise job")
+
+  // navigator.clipboard asks the host, and its promises settle with the host's answers.
+  run host.evaluate(b"globalThis.copied = []; navigator.clipboard.writeText('hi').then((value) => copied.push('wrote ' + value)); navigator.clipboard.readText().then((text) => { copied.push('read ' + text); return navigator.clipboard.readText() }).then((text) => copied.push('empty ' + JSON.stringify(text)))", b"test")
+  let mut requests = host.takeClipboard()
+  run Testing.expect(requests.length() == 2, "two clipboard calls reached the host")
+  let write = match requests.remove(0) {
+    ClipboardRequest.Write { call, text } => if String.view(&text) == "hi" { call } else { 0 }
+    ClipboardRequest.Read { .. } => 0
+  }
+  let read = match requests.remove(0) {
+    ClipboardRequest.Read { call } => call
+    ClipboardRequest.Write { .. } => 0
+  }
+  run Testing.expect(write != 0 && read != 0, "a write of the text, then a read")
+  run host.answerClipboard(write, Option<String>.none())
+  let pasted = run String.copy("from the system")
+  run host.answerClipboard(read, Option<String>.some(move pasted))
+  let mut again = host.takeClipboard()
+  let next = match again.remove(0) {
+    ClipboardRequest.Read { call } => call
+    ClipboardRequest.Write { .. } => 0
+  }
+  run Testing.expect(next != 0, "the read's promise job read again")
+  run host.answerClipboard(next, Option<String>.none())
+  run host.evaluate(b"if (copied.join() !== 'wrote undefined,read from the system,empty \"\"') throw new Error('clipboard calls settled as ' + copied.join())", b"test")
 }
 
 /// `__ui.markdown` gives the tree remark gives for a sample with every construct of GFM.
@@ -390,6 +415,8 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
   run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
   run Testing.expect(bridge.CLEAR_STYLE == bridge.nativeId(b"clearStyle"), "CLEAR_STYLE")
+  run Testing.expect(bridge.CLIPBOARD_READ == bridge.nativeId(b"clipboardRead"), "CLIPBOARD_READ")
+  run Testing.expect(bridge.CLIPBOARD_WRITE == bridge.nativeId(b"clipboardWrite"), "CLIPBOARD_WRITE")
   run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
   run Testing.expect(bridge.DEFINE_ICON == bridge.nativeId(b"defineIcon"), "DEFINE_ICON")
   run Testing.expect(bridge.DESTROY == bridge.nativeId(b"destroy"), "DESTROY")

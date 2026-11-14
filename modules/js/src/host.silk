@@ -37,7 +37,7 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry, Rejected }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
@@ -752,6 +752,31 @@ impl<'m> JsHost<'m> {
   /// oldest first. The host decides what opening means.
   pub fn takeOpened(self: &mut Self) -> List<String> {
     return Intrinsic.replace(self.engine.services.opened, List<String>.make())
+  }
+
+  /// Takes the clipboard reads and writes JavaScript asked for (`navigator.clipboard`) since
+  /// the last call, oldest first. The host answers each with [`JsHost.answerClipboard`].
+  pub fn takeClipboard(self: &mut Self) -> List<ClipboardRequest> {
+    return Intrinsic.replace(self.engine.services.clipboard, List<ClipboardRequest>.make())
+  }
+
+  /// Settles clipboard call `call`: a read with the clipboard's `text` (none when it holds
+  /// no text), a write with none.
+  pub effect fn answerClipboard(self: &mut Self, call: u32, text: Option<String>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let value = match move text {
+      Option.Some { value } => run jsString(String.view(&value))
+      Option.None => Value.immediate(ValueBits.Undefined)
+    }
+    let arguments = [ValueBits.number(u32.toF64(call)), value.borrow().view()]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"clipboard", &arguments))
+    realm.release(&mut self.engine, move value)
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
   }
 
   /// Takes the console lines JavaScript wrote since the last call, oldest first.

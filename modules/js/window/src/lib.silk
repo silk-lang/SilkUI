@@ -21,7 +21,7 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError }
+import ui_js.lib { JsHost, JsError, ClipboardRequest }
 import opener { Openers }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree_window.host { WindowClient }
@@ -77,6 +77,35 @@ fn uncaught(error: JsError) -> () {
     write("  A ui-js realm has ECMAScript, timers, console and @silk/ui. It has no other web or Node API\n")
     write("  (fetch, URL, Intl, document, process and the like). @silk/vite lists the ones a build uses.\n")
   }
+}
+
+/// The host's answer to a `navigator.clipboard` call: for a read, the clipboard's text.
+pub struct ClipboardAnswer {
+  pub call: u32,
+  pub text: Option<String>,
+}
+
+/// How many rounds of clipboard calls one turn of the window's loop serves: the promise jobs
+/// of one round may call again, and the rest waits for the next turn.
+pub const CLIPBOARD_ROUNDS: usize = 8
+
+/// Does JavaScript's clipboard calls `requests` on the system clipboard, oldest first.
+pub effect fn serveClipboard(requests: List<ClipboardRequest>, platform: &mut HostPlatform) -> List<ClipboardAnswer> ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = move requests
+  let mut answers = List<ClipboardAnswer>.make()
+  while rest.length() > 0 {
+    match rest.remove(0) {
+      ClipboardRequest.Read { call } => {
+        let text = run platform.readClipboard()
+        run answers.append(ClipboardAnswer { call: call, text: move text })
+      }
+      ClipboardRequest.Write { call, text } => {
+        run platform.writeClipboard(String.view(&text))
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none() })
+      }
+    }
+  }
+  return move answers
 }
 
 impl<'m> JsApp<'m> {
@@ -217,6 +246,26 @@ impl<'m> JsApp<'m> {
     }
   }
 
+  /// Answers JavaScript's clipboard calls through `platform`, and the calls their promise
+  /// jobs made, then applies what it built. Says whether there were calls.
+  effect fn clipboard(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let requests = self.host.takeClipboard()
+      if requests.length() == 0 { break }
+      let mut answers = run serveClipboard(move requests, &mut platform)
+      while answers.length() > 0 {
+        let ClipboardAnswer { call, text } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerClipboard(call, move text)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move answered)
+      }
+      round = round + 1
+    }
+    if round == 0 { return false }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
   /// Delivers the tree's queued records and reports the listener exceptions. Says whether a
   /// listener prevented a default.
   effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -307,7 +356,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
-    return false
+    return run state.clipboard(&mut tree, &mut platform.*)
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()

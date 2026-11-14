@@ -1,7 +1,7 @@
 // The web globals a ui-js realm starts with, on top of the engine's ECMAScript: timers,
-// animation frames, a console, queueMicrotask, performance.now and reportError. The host
-// evaluates this once, before any application code. Edit it, then run
-// `silk task embed-assets` to regenerate generated_prelude.silk.
+// animation frames, a console, queueMicrotask, performance.now, reportError and
+// navigator.clipboard. The host evaluates this once, before any application code. Edit it,
+// then run `silk task embed-assets` to regenerate generated_prelude.silk.
 (function () {
   const native = globalThis.__ui;
   const timers = new Map();
@@ -92,6 +92,34 @@
   };
 
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
+  // clipboard after the code that asked has run, then settles the promise.
+  const clipboardCalls = new Map();
+  let nextClipboardCall = 0;
+  function clipboardCall(read, ask) {
+    const call = ++nextClipboardCall;
+    return new Promise((resolve) => {
+      clipboardCalls.set(call, { read, resolve });
+      ask(call);
+    });
+  }
+  // The host's answer to clipboard call `call`: a read's text, undefined when there is none.
+  native.clipboard = function (call, text) {
+    const pending = clipboardCalls.get(call);
+    if (!pending) return;
+    clipboardCalls.delete(call);
+    pending.resolve(pending.read ? (text ?? "") : undefined);
+  };
+  const clipboard = {
+    readText: () => clipboardCall(true, (call) => native.clipboardRead(call)),
+    writeText: (text) => {
+      const value = String(text);
+      return clipboardCall(false, (call) => native.clipboardWrite(call, value));
+    },
+  };
+  if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
+  Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
 
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
