@@ -9,11 +9,13 @@
 // modules/platform/window's WindowHost owns the canvas and its input, modules/gpu/webgpu's
 // WebGPUHost maps WebGPU onto navigator.gpu, and this file adds the `silk_browser` imports of
 // ui-tree-window (console output, the clock, giving the page a turn, the check flag, text kept in
-// localStorage) and the C math functions wasm32 has no libm for.
+// localStorage, the hidden DOM copy of the tree that screen readers read) and the C math
+// functions wasm32 has no libm for.
 //
 // Needs WebGPU and JSPI (WebAssembly.Suspending): Chrome and Edge 137 or later.
 import { WindowHost } from '/native/platform/window/browser/window-host.js';
 import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
+import { AccessMirror } from './access-mirror.js';
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -51,6 +53,8 @@ export function unsupported() {
  * - `storagePrefix`: put before each key, so apps on one origin can keep apart.
  * - `focus`: give the canvas the keyboard at once (default). A page that embeds the app among
  *   other content passes false, and the canvas takes the keyboard when it is clicked.
+ * - `accessibility`: keep a hidden DOM copy of each window's accessibility tree over its canvas
+ *   for screen readers (default). Pass false for a page that needs none.
  * - `imports`: more import modules, for functions the app declares itself
  *   (`extern … as "name#function"` is `imports.name.function`).
  * - `windows(control)`: called before the app starts, for a page that stands in for the desktop
@@ -61,7 +65,7 @@ export function unsupported() {
  */
 export async function runApp({
   wasm, container = document.body, check = false, log = console.log,
-  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows,
+  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows, accessibility = true,
 }) {
   const problem = unsupported();
   if (problem) throw new Error(problem);
@@ -90,6 +94,7 @@ export async function runApp({
     },
   });
   const gpuHost = new WebGPUHost();
+  const mirror = new AccessMirror(windowHost);
   let memory;
   let line = '';
   const print = text => {
@@ -103,6 +108,7 @@ export async function runApp({
     webgpu: gpuHost.imports,
     math: { sin: Math.sin, cos: Math.cos, tan: Math.tan, hypot: Math.hypot, fmod: (x, y) => x % y },
     silk_browser: {
+      ...mirror.imports(() => memory, accessibility && !check),
       write: (pointer, length) => print(decoder.decode(new Uint8Array(memory.buffer, pointer, length))),
       now: () => performance.now(),
       check: () => (check ? 1 : 0),

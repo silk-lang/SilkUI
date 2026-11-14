@@ -1,5 +1,6 @@
 //! Publishes the tree to assistive technology through the AccessKit adapters of
 //! `modules/accesskit`: NSAccessibility on macOS and UI Automation on Windows. A window's
+//! In a browser the page keeps a hidden DOM copy of the tree ([`web_access`]). A window's
 //! [`Bridge`] lives on the thread that runs the platform; its [`Publisher`] lives with the
 //! tree. Nothing is built until a screen reader or another client asks the window for its
 //! elements, and after that only the nodes that changed are sent.
@@ -8,6 +9,7 @@ import accesskit_macos.adapter { NativeSink as MacSink, Adapter as MacAdapter }
 import accesskit_windows.adapter { NativeSink as WinSink, Adapter as WinAdapter }
 import accesskit_unix.lib { App, WindowBounds, accessibilityBusAddress, accessibilityEnabled }
 import dbus.lib { DBusError }
+import web_access as web_access
 import window.native { Waker }
 import window.types { WindowId, RawSurface }
 import ui_tree.legacy { UiTree }
@@ -44,6 +46,8 @@ pub union Bridge {
   Win { adapter: WinAdapter<WinSink> },
   /// The AT-SPI adapter, on a thread of its own (D-Bus traffic does not wake the platform).
   Unix { link: UnixLink },
+  /// The page's DOM copy of the tree, in a browser.
+  Web { window: u32 },
   /// This platform or window publishes nothing.
   Unsupported,
 }
@@ -60,6 +64,15 @@ impl Bridge {
       _ => {
         return ()
       }
+    }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      drop raw
+      self.* = if web_access.attach(window.value) {
+        Bridge.Web { window: window.value }
+      } else {
+        Bridge.Unsupported
+      }
+      return ()
     }
     static if Intrinsic.targetOperatingSystem() == "darwin" {
       drop raw
@@ -106,6 +119,7 @@ impl Bridge {
       Bridge.Mac { adapter: _ } => true
       Bridge.Win { adapter: _ } => true
       Bridge.Unix { link } => link.shared.get().lock().get().enabled
+      Bridge.Web { window: _ } => true
       _ => false
     }
   }
@@ -135,6 +149,12 @@ impl Bridge {
         drop guard
         drop focused
         Bridge.Unix { link: move link }
+      }
+      Bridge.Web { window } => {
+        run web_access.send(window, &update)
+        drop update
+        drop focused
+        Bridge.Web { window: window }
       }
       Bridge other => {
         drop update
@@ -171,6 +191,7 @@ impl Bridge {
         let mut guard = link.shared.get().lock()
         Intrinsic.replace(guard.getMut().requests, List<ActionRequest>.make())
       }
+      Bridge.Web { window } => run web_access.take(window)
       _ => List<ActionRequest>.make()
     }
   }
