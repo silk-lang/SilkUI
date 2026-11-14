@@ -47,6 +47,7 @@ that layout, so it measures at least as much work:
 | `trees::Text.create_and_measure` | Make 2,000 five-digit labels, lay them out and read their widths |
 | `trees::Text.change_and_lay_out` | Change the text of each of 2,000 labels in a column, and lay out |
 | `trees::Text.narrow_and_lay_out` | Change the width of a wrapping panel of 500 paragraphs by 20 px, and lay out |
+| `trees::Text.ellipsis_long_line` | Change one character of a 360 KB one-line text cut with an ellipsis in a 200 px box, and draw a frame (not a FerroUI scenario) |
 | `layout_subsystem::PanelMeasureArrange.*` | Forget every kept layout result of a panel of 1,000 leaves and lay it out again |
 | `layout_subsystem::Invalidation.resize_one_leaf` | Make one of 4,000 leaves 1 px wider or narrower, and lay out |
 | `layout_subsystem::Invalidation.measure_every_leaf` | Forget every kept layout result of the 4,000 leaves and lay out |
