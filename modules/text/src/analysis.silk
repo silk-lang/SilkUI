@@ -22,10 +22,10 @@ import layout.lib {
 }
 import silk.text.bidi { BidiAnalysis, BidiRun, BidiParagraph, ParagraphDirection }
 import silk.text.line_break
-import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions, WordBreakMode }
+import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions, WordBreakMode, LineBreakMode, Hyphens }
 import silk.text.segmentation
 import fonts { FontState, Treatment }
-import properties.computed { WordBreak, OverflowWrap }
+import properties.computed { WordBreak, OverflowWrap, LineBreak, Hyphens as CssHyphens }
 import silk.text.string { String }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -335,21 +335,46 @@ fn wrapOf(treatment: Treatment) -> TextBreakKind {
   return TextBreakKind.Soft
 }
 
-// The `word-break` mode of the character before flat offset `offset`.
-fn modeAt(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, offset: usize) -> WordBreakMode {
+// The line breaking rules of a style: its `word-break`, `line-break` and `hyphens`.
+fn rulesOf(treatment: Treatment) -> LineOptions {
+  let mut options = LineOptions.make()
+  options.wordBreak = modeOf(treatment)
+  options.lineBreak = match treatment.lineBreak {
+    LineBreak.Auto => LineBreakMode.Auto
+    LineBreak.Loose => LineBreakMode.Loose
+    LineBreak.Normal => LineBreakMode.Normal
+    LineBreak.Strict => LineBreakMode.Strict
+    LineBreak.Anywhere => LineBreakMode.Anywhere
+  }
+  // `hyphens: auto` needs a hyphenation dictionary; without one it breaks as `manual` does.
+  options.hyphens = if treatment.hyphens == CssHyphens.None { Hyphens.None } else { Hyphens.Manual }
+  return options
+}
+
+fn sameRules(left: LineOptions, right: LineOptions) -> bool {
+  return left.wordBreak == right.wordBreak && left.lineBreak == right.lineBreak && left.hyphens == right.hyphens
+}
+
+fn defaultRules(options: LineOptions) -> bool {
+  return sameRules(options, LineOptions.make())
+}
+
+// The line breaking rules of the character before flat offset `offset`.
+fn rulesAt(tokens: &[TextToken<'_>], starts: &[usize], fonts: &FontState<'_>, offset: usize) -> LineOptions {
   if offset == 0 {
-    return WordBreakMode.Normal
+    return LineOptions.make()
   }
   let at = cursorAt(tokens, starts, offset - 1)
   if at.unit >= tokens.length {
-    return WordBreakMode.Normal
+    return LineOptions.make()
   }
-  return modeOf(fonts.treatment(tokens[at.unit].fontKey))
+  return rulesOf(fonts.treatment(tokens[at.unit].fontKey))
 }
 
-// Opportunities where some text sets `word-break`: each comes from the rules of the mode of
-// the character before it. Mandatory breaks hold in every mode.
-effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontState<'_>, breakAll: bool, keepAll: bool) -> ()
+// Opportunities where some text sets `word-break`, `line-break` or `hyphens`: each comes from
+// the rules of the character before it. Mandatory breaks hold under every rule. `rules` holds
+// the distinct rules other than the default that the text uses.
+effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontState<'_>, rules: &[LineOptions]) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let starts = state.lineStarts.asSlice()
@@ -357,45 +382,41 @@ effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontSta
   let mut index: usize = 0
   while index < state.opportunities.length() {
     let opportunity = state.opportunities.get(index)
-    if opportunity.kind == BreakKind.Mandatory || modeAt(tokens, starts, fonts, opportunity.offset) == WordBreakMode.Normal {
+    if opportunity.kind == BreakKind.Mandatory || defaultRules(rulesAt(tokens, starts, fonts, opportunity.offset)) {
       run state.merged.append(opportunity)
     }
     index = index + 1
   }
   let mut pass: usize = 0
-  while pass < 2 {
-    let mode = if pass == 0 { WordBreakMode.BreakAll } else { WordBreakMode.KeepAll }
-    if (pass == 0 && breakAll) || (pass == 1 && keepAll) {
-      state.tailored.clear()
-      let mut options = LineOptions.make()
-      options.wordBreak = mode
-      run line_break.breaks(state.lineText.view(), options, &mut state.tailored)
-      // Merge the ones of this mode into `merged`, in offset order.
-      state.opportunities.clear()
-      let mut left: usize = 0
-      let mut right: usize = 0
-      while left < state.merged.length() || right < state.tailored.length() {
-        if right < state.tailored.length() {
-          let candidate = state.tailored.get(right)
-          if candidate.kind == BreakKind.Mandatory || modeAt(tokens, starts, fonts, candidate.offset) != mode {
-            right = right + 1
-            continue
-          }
-          if left >= state.merged.length() || candidate.offset < state.merged.get(left).offset {
-            run state.opportunities.append(candidate)
-            right = right + 1
-            continue
-          }
-          if candidate.offset == state.merged.get(left).offset {
-            right = right + 1
-          }
+  while pass < rules.length {
+    let options = rules[pass]
+    state.tailored.clear()
+    run line_break.breaks(state.lineText.view(), options, &mut state.tailored)
+    // Merge the ones of these rules into `merged`, in offset order.
+    state.opportunities.clear()
+    let mut left: usize = 0
+    let mut right: usize = 0
+    while left < state.merged.length() || right < state.tailored.length() {
+      if right < state.tailored.length() {
+        let candidate = state.tailored.get(right)
+        if candidate.kind == BreakKind.Mandatory || !sameRules(rulesAt(tokens, starts, fonts, candidate.offset), options) {
+          right = right + 1
+          continue
         }
-        run state.opportunities.append(state.merged.get(left))
-        left = left + 1
+        if left >= state.merged.length() || candidate.offset < state.merged.get(left).offset {
+          run state.opportunities.append(candidate)
+          right = right + 1
+          continue
+        }
+        if candidate.offset == state.merged.get(left).offset {
+          right = right + 1
+        }
       }
-      state.merged.clear()
-      run state.merged.appendSlice(state.opportunities.asSlice())
+      run state.opportunities.append(state.merged.get(left))
+      left = left + 1
     }
+    state.merged.clear()
+    run state.merged.appendSlice(state.opportunities.asSlice())
     pass = pass + 1
   }
   state.opportunities.clear()
@@ -444,22 +465,32 @@ effect fn breaks(
   let tokens = context.tokens
   state.opportunities.clear()
   run line_break.breaks(state.lineText.view(), LineOptions.make(), &mut state.opportunities)
-  let mut breakAll = false
-  let mut keepAll = false
+  let mut rules = List<LineOptions>.make()
   let mut wraps = false
   let mut scan: usize = 0
   while scan < tokens.length {
     if tokens[scan].kind == TextTokenKind.Text {
       let treatment = fonts.treatment(tokens[scan].fontKey)
-      let mode = modeOf(treatment)
-      breakAll = breakAll || mode == WordBreakMode.BreakAll
-      keepAll = keepAll || mode == WordBreakMode.KeepAll
+      let options = rulesOf(treatment)
+      if !defaultRules(options) {
+        let mut known = false
+        let mut r: usize = 0
+        while r < rules.length() {
+          if sameRules(rules.get(r), options) {
+            known = true
+          }
+          r = r + 1
+        }
+        if !known {
+          run rules.append(options)
+        }
+      }
       wraps = wraps || wrapOf(treatment) != TextBreakKind.Soft
     }
     scan = scan + 1
   }
-  if breakAll || keepAll {
-    run tailor(&mut state, tokens, fonts, breakAll, keepAll)
+  if rules.length() > 0 {
+    run tailor(&mut state, tokens, fonts, rules.asSlice())
   }
   let starts = state.lineStarts.asSlice()
   let total = String.byteLength(state.lineText.view())

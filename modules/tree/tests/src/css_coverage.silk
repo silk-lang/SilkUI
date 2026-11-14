@@ -233,6 +233,7 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"width:40px;max-lines:1", sample: b"block-ellipsis:auto" },
     Row { root: b"", lead: b"", setup: b"width:40px;white-space:nowrap;overflow:hidden", sample: b"text-overflow:ellipsis" },
     Row { root: b"", lead: b"", setup: b"width:50px", sample: b"text-wrap:nowrap" },
+    Row { root: b"", lead: b"", setup: b"width:40px", sample: b"line-break:anywhere" },
     Row { root: b"", lead: b"", setup: b"", sample: b"filter:blur(2px)" },
     Row { root: b"", lead: b"", setup: b"", sample: b"text-shadow:1px 1px red" },
     Row { root: b"", lead: b"", setup: b"", sample: b"clip-path:circle(40%)" },
@@ -329,11 +330,11 @@ fn later(property: Property) -> bool {
     || property == Property.TextDecorationThickness
     || property == Property.TextDecorationFill || property == Property.TextDecorationStroke
     || property == Property.TextUnderlinePosition
-    || property == Property.TextRendering || property == Property.LineBreak
+    || property == Property.TextRendering
     || property == Property.TextAlignAll || property == Property.TextCombineUpright
     || property == Property.HangingPunctuation || property == Property.TextEmphasis
     || property == Property.TextEmphasisStyle || property == Property.TextEmphasisColor
-    || property == Property.TextEmphasisPosition || property == Property.Hyphens
+    || property == Property.TextEmphasisPosition
     || property == Property.WhiteSpaceTrim || property == Property.ShapeMargin
     // "Add CSS transitions, animations and vh units", continued.
     || property == Property.Transition || property == Property.TransitionProperty
@@ -399,6 +400,8 @@ fn later(property: Property) -> bool {
     || property == Property.FontVariantLigatures || property == Property.FontVariantNumeric
     || property == Property.FontVariantPosition || property == Property.FontWidth
     || property == Property.FontStretch
+    // The fixture text has no soft hyphens: `hyphensAtSoftHyphens` covers them.
+    || property == Property.Hyphens
 }
 
 struct Fixture {
@@ -705,6 +708,42 @@ effect fn fontFeatures() -> ()
   run Testing.expect(off == tabular, "font-feature-settings wins over font-variant")
   let reset = run digitsWidth(b"display: inline-block; font-variant-numeric: proportional-nums; font: 16px Noto Sans")
   run Testing.expect(reset == tabular, "font resets font-variant")
+}
+
+/// How tall "super·cali·fragilistic" (with soft hyphens) is in a 60px wide box styled `style`.
+effect fn hyphenatedHeight(style: &[u8]) -> f32
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let root = run tree.box(&[css.fontFamily(sans.raw())])
+  run restyle(&mut tree, root, b"width: 60px")
+  run restyle(&mut tree, root, style)
+  let text = run tree.text("super\u{AD}cali\u{AD}fragilistic")
+  run tree.append(root, text)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  let fragments = run tree.fragments(root)
+  let box = fragments.get(0).border
+  return box.yMax - box.yMin
+}
+
+/// Soft hyphens break a word unless `hyphens: none`; `auto` breaks as `manual` does.
+effect fn hyphensAtSoftHyphens() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let manual = run hyphenatedHeight(b"hyphens: manual")
+  let none = run hyphenatedHeight(b"hyphens: none")
+  let auto = run hyphenatedHeight(b"hyphens: auto")
+  run Testing.expect(none < manual, "hyphens: none keeps the word on one line")
+  run Testing.expect(auto == manual, "hyphens: auto breaks at soft hyphens")
+}
+
+test effect fn cssCoverageHyphens() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hyphensAtSoftHyphens() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn cssCoverageFontFeatures() -> ()
