@@ -74,7 +74,8 @@ mount(createBox({ width: 400, height: 300 }, button));
   on), and `aria-labelledby`, `aria-describedby`, `aria-controls` and
   `aria-activedescendant` name other nodes by their `id`. Other roles and ARIA names are
   ignored with one console warning each. `announce(message, { politeness })` has screen
-  readers say a message that nothing on screen shows.
+  readers say a message that nothing on screen shows. `inert` puts a subtree out of reach of
+  focus, pointers and screen readers, as in HTML.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
