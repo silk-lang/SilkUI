@@ -1,8 +1,9 @@
 # ui-js
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
-engine embedded in the process. Four parts are here: the Silk host with its native bridge,
-`@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, and `@silk/vite`,
+engine embedded in the process. Five parts are here: the Silk host with its native bridge,
+`@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, `@silk/ui-foldkit`,
+which runs Foldkit programs on it, and `@silk/vite`,
 a Vite plugin that builds an application and, in development, replaces edited modules in
 the running window.
 
@@ -149,6 +150,72 @@ runs in a browser from the same files for comparison.
 
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
+
+## @silk/ui-foldkit
+
+[packages/ui-foldkit](packages/ui-foldkit) runs [Foldkit](https://foldkit.dev) programs (the
+Elm architecture on Effect) on the tree, with the `foldkit` package as it is published.
+Foldkit has no renderer interface: its virtual DOM patches through `document`. So the package
+provides a `document` and the DOM members Foldkit uses, and every element is a tree node.
+Import it before `foldkit`:
+
+```ts
+import '@silk/ui-foldkit'
+import { Runtime } from 'foldkit'
+import { Model, init, update, view } from './main'
+
+Runtime.run(Runtime.makeApplication({ Model, init, update, view, container: document.getElementById('root') }))
+```
+
+```ts
+export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
+  title: `Counter: ${model.count}`,
+  body: h.div(
+    [h.Style({ display: 'flex', gap: '12px', padding: '24px' })],
+    [
+      h.p([], [model.count.toString()]),
+      h.button([h.OnClick(Message.ClickedIncrement()), HoverStyle({ color: 'rgb(0, 120, 230)' })], ['+']),
+    ],
+  ),
+})
+```
+
+- **The page.** The document is `<html><body><div id="root">`, filling the window, so a
+  program boots in `document.getElementById('root')` as it does from a browser's
+  `index.html`. Foldkit puts the view's root element in its place.
+- **Elements.** Every tag is a box, except `input` and `textarea` (the tree's input), `img`
+  (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
+  `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
+  `li` have theirs, and nothing has a default style.
+- **Style.** `h.Style` with CSS values (`fontSize: '13px'`). There are no stylesheets yet, so
+  `h.Class` matches nothing. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
+  and `StartingStyle` from this package are the looks the tree lays over an element in those
+  states, as attributes.
+- **Events.** The `On*` attributes of the events the tree has: clicks, pointers, keys, focus,
+  input, scroll, wheel, and the transition and animation ones. Mouse events arrive as the
+  pointer events they are. For an event the tree does not have (drag and drop, clipboard,
+  `change`, `submit`) the listener never runs, with one console warning.
+- **Attributes.** `Id`, `Role` and the `Aria*` ones, `Tabindex`, `Disabled`, `Readonly`,
+  `Placeholder`, `Value`, `Href` (a click opens it), `Hidden`, `Inert`, and `data-testid` as
+  the tree's test id. Others are kept on the element (`getAttribute`, selectors) and do
+  nothing else.
+- **Mounts and Commands.** An element is `Element`-shaped where Foldkit and its `Dom`
+  commands reach: `querySelector` with tag, `#id`, `.class` and `[attribute="value"]`
+  selectors, `focus`, `closest`, `contains`, `textContent`. `element.node` is the
+  `@silk/ui` node behind it, for code that draws on the tree itself. Layout reads
+  (`getBoundingClientRect`) are not there.
+- **Routing.** `location` and `history` keep an address in memory, starting at
+  `http://localhost/`, where the realm has `URL` (the [SilkJS runtime](node) does).
+- **Timing.** The first render is there for the window's first frame. After that Foldkit
+  renders the Model in an animation frame, as in a browser.
+- **Building.** `silk({ entry: "src/entry.ts", jsx: false, allow: provided })` with
+  `provided` from `@silk/ui-foldkit/apis`, so the missing API report leaves out what this
+  package provides. `vite build --watch` reloads the application on every change; the dev
+  server's module replacement does not run Foldkit programs yet.
+
+[examples/foldkit-counter](examples/foldkit-counter) is the starter page as a Foldkit
+program, the React example's twin: the count, the streak and the theme are the Model, and
+the same `motion.js` draws every frame, started by a Mount on the page element.
 
 ## @silk/vite
 
