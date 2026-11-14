@@ -835,6 +835,51 @@ export function root() {
   return rootNode;
 }
 
+// The live regions `announce` speaks through, one per politeness, made on first use.
+const regions = Object.create(null);
+// A box screen readers read and nothing shows, as the web's visually hidden pattern.
+const VISUALLY_HIDDEN = {
+  position: "absolute",
+  width: 1,
+  height: 1,
+  margin: -1,
+  overflow: "hidden",
+  clipPath: "inset(50%)",
+  whiteSpace: "nowrap",
+  pointerEvents: "none",
+};
+
+/**
+ * Has screen readers say `message` without showing it, as a toast or a "Saved" would. Polite
+ * messages wait for the reader to finish; `{ politeness: "assertive" }` interrupts it. The
+ * same message twice is said twice. Nothing happens before `mount`.
+ */
+export function announce(message, { politeness = "polite" } = {}) {
+  if (!rootNode) return;
+  const key = politeness === "assertive" ? "assertive" : "polite";
+  let region = regions[key];
+  if (!region || region.parentNode !== rootNode) {
+    region = regions[key] = createBox(VISUALLY_HIDDEN);
+    region.setAttribute("aria-live", key);
+    region.setAttribute("aria-atomic", "true");
+    rootNode.appendChild(region);
+  }
+  // A region announces changes, not what it holds when it appears, so the text waits a
+  // moment; each message is a node of its own so a repeat is a change too.
+  setTimeout(() => {
+    if (region.parentNode !== rootNode) return;
+    for (const child of region.childNodes.slice()) child.destroy();
+    const text = createText(String(message));
+    region.appendChild(text);
+    setTimeout(() => {
+      if (text.parentNode === region) text.destroy();
+    }, ANNOUNCEMENT_LIFETIME);
+  }, ANNOUNCEMENT_DELAY);
+}
+
+const ANNOUNCEMENT_DELAY = 100;
+const ANNOUNCEMENT_LIFETIME = 7000;
+
 /** The node with tree id `id`, for hosts and tools. */
 export function nodeById(id) {
   return nodes.get(id) ?? null;

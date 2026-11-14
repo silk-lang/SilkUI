@@ -71,7 +71,10 @@ mount(createBox({ width: 400, height: 300 }, button));
   `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
   tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
   and live regions (`aria-level`, `aria-pressed`, `aria-live`, `aria-checked="mixed"` and so
-  on). Other roles and ARIA names are ignored with one console warning each.
+  on), and `aria-labelledby`, `aria-describedby`, `aria-controls` and
+  `aria-activedescendant` name other nodes by their `id`. Other roles and ARIA names are
+  ignored with one console warning each. `announce(message, { politeness })` has screen
+  readers say a message that nothing on screen shows.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
 - **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
