@@ -13,6 +13,7 @@ import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
 import grid_css
 import expand
+import font_features
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -358,6 +359,7 @@ struct FontKeyEntry {
   size: f32,
   weight: f32,
   italic: bool,
+  width: f32,
   treatment: Treatment,
   key: usize,
 }
@@ -366,7 +368,7 @@ impl Copy for FontKeyEntry {}
 
 fn sameTreatment(a: Treatment, b: Treatment) -> bool {
   return a.letterSpacing == b.letterSpacing && a.wordSpacing == b.wordSpacing && a.transform == b.transform
-    && a.wordBreak == b.wordBreak && a.overflowWrap == b.overflowWrap
+    && a.wordBreak == b.wordBreak && a.overflowWrap == b.overflowWrap && a.features.same(&b.features)
 }
 
 effect fn layoutFailed<E>(error: E) -> never
@@ -419,12 +421,23 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
       let text = run values.cssText(&items[i].value)
       run stops.read(text.asSlice())
       timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice())
-    } else if run applyTransform(&mut computed, &items[i]) {
+    } else if run applyWritten(&mut computed, &items[i]) {
     } else if property != CssProperty.FontSize {
       computed.apply(&items[i])
     }
     i = i + 1
   }
+}
+
+/// Applies `declaration` when it sets a property read from its CSS text (a transform or a font
+/// feature); false when it does not.
+pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if run font_features.apply(&mut computed.text, declaration) {
+    return true
+  }
+  return run applyTransform(&mut computed, declaration)
 }
 
 /// Applies `declaration` when it sets a transform property; false when it does not.
@@ -3186,13 +3199,15 @@ impl<'a> UiTree<'a> {
       transform: text.textTransform,
       wordBreak: text.wordBreak,
       overflowWrap: text.overflowWrap,
+      features: text.features,
     }
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
       let entry = entries[i]
       if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
-        && entry.italic == italic && sameTreatment(entry.treatment, treatment) {
+        && entry.italic == italic && entry.width == text.width
+        && sameTreatment(entry.treatment, treatment) {
         return entry.key
       }
       i = i + 1
@@ -3202,7 +3217,7 @@ impl<'a> UiTree<'a> {
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
       weight: f32.toF64(text.weight),
-      width: 100.0,
+      width: f32.toF64(text.width),
       style: if italic {
         FaceStyle.Italic
       } else {
@@ -3217,6 +3232,7 @@ impl<'a> UiTree<'a> {
         size: text.size,
         weight: text.weight,
         italic: italic,
+        width: text.width,
         treatment: treatment,
         key: key,
       },
