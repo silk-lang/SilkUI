@@ -1,0 +1,27 @@
+import type { Plugin } from "vite";
+
+export interface SilkOptions {
+  /** Entry module, relative to the Vite root. Default `src/main.jsx`. */
+  entry?: string;
+  /** Name of the bundle in `build.outDir`. Default `app.js`. */
+  fileName?: string;
+  /** Package whose JSX runtime compiles JSX, or false to leave JSX settings alone. Default `@silk/ui-react`. */
+  jsx?: string | false;
+  /** Host binary to start: given `--watch <bundle>` in watch mode, `--dev <port>` under the dev server. */
+  host?: { command: string; args?: string[]; cwd?: string };
+  /** React Fast Refresh under the dev server. Default true. */
+  refresh?: boolean;
+  /** Port the dev server listens on for the host. Default: any free one. */
+  port?: number;
+  /** What to do when the build uses a web or Node API the runtime does not have. Default `warn`. */
+  apis?: "warn" | "error" | "off";
+  /** Such APIs the application provides itself. */
+  allow?: string[];
+  /**
+   * The host runs the full SilkJS runtime (ui-js-node): Node builtins stay `node:` imports,
+   * and `apis` reports only what that runtime lacks.
+   */
+  node?: boolean;
+}
+
+export default function silk(options?: SilkOptions): Plugin[];

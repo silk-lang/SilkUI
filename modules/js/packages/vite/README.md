@@ -20,6 +20,7 @@ export default defineConfig({ plugins: [silk()] });
 | `port` | any free one | Port the dev server listens on for the host |
 | `apis` | `warn` | What to do when the build uses a web or Node API a ui-js runtime does not have: `warn`, `error` or `off` |
 | `allow` | none | Names of such APIs the application provides itself |
+| `node` | `false` | The host runs the full SilkJS runtime (ui-js-node): `node:fs` and the other Node builtins stay imports, and `apis` reports only what that runtime lacks |
 
 - `vite build` makes the production bundle.
 - `vite` serves the modules to the host and replaces the ones an edit touches. Component

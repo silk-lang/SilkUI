@@ -204,23 +204,28 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       Result<Value, OutOfMemoryError | JsException>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
         JsException _ => {
-          let context = self.runtime.rawContext()
-          let realm = unsafe lendRealm(&context, context)
-          let thrown = realm.takeException()
-          let reported = run Effect.result(self.callUi(b"report", &[thrown.borrow().view()]))
-          self.release(move thrown)
-          match move reported {
-            Result<Value, OutOfMemoryError | JsException>.Success { value } => { self.release(move value) }
-            Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => match move failure {
-              OutOfMemoryError allocation => { fail move allocation }
-              JsException _ => {
-                let again = realm.takeException()
-                self.release(move again)
-                write("Uncaught exception, and __ui.report threw too\n")
-              }
-            }
-          }
+          run self.reportPending()
           Value.immediate(ValueBits.Undefined)
+        }
+      }
+    }
+  }
+
+  /// Prints the pending exception as uncaught, with its stack (`__ui.report`).
+  effect fn reportPending(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let context = self.runtime.rawContext()
+    let realm = unsafe lendRealm(&context, context)
+    let thrown = realm.takeException()
+    let reported = run Effect.result(self.callUi(b"report", &[thrown.borrow().view()]))
+    self.release(move thrown)
+    match move reported {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => { self.release(move value) }
+      Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => match move failure {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsException _ => {
+          let again = realm.takeException()
+          self.release(move again)
+          write("Uncaught exception, and __ui.report threw too\n")
         }
       }
     }
@@ -344,12 +349,7 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       }
       Result<Turn, OutOfMemoryError | JsException>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
-        JsException _ => {
-          let context = self.runtime.rawContext()
-          let thrown = (unsafe lendRealm(&context, context)).takeException()
-          self.release(move thrown)
-          write("The JavaScript runtime's loop failed\n")
-        }
+        JsException _ => { run self.reportPending() }
       }
     }
   }

@@ -9,6 +9,7 @@
 // them, and an edit replaces only the modules it touches: see dev.js.
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
+import { builtinModules } from "node:module";
 import { resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
@@ -30,11 +31,15 @@ import { resolveOptions } from "./resolve.js";
  * @param {"warn" | "error" | "off"} [options.apis] What to do when the application or one
  *   of its libraries uses a web or Node API a ui-js runtime does not have. Default `warn`.
  * @param {string[]} [options.allow] Such APIs the application provides itself.
+ * @param {boolean} [options.node] The host runs the full SilkJS runtime (ui-js-node): Node
+ *   builtins stay `node:` imports instead of empty stubs, and the API report leaves out
+ *   what that runtime has.
  */
 export default function silk(options = {}) {
   const entry = options.entry ?? "src/main.jsx";
   const fileName = options.fileName ?? "app.js";
   const jsx = options.jsx ?? "@silk/ui-react";
+  const node = options.node === true;
   let bundle = "";
   let watching = false;
   let child = null;
@@ -113,7 +118,7 @@ export default function silk(options = {}) {
       }
       const owner = ownerOf(id, root);
       for (const { name, area } of missingApis(ast)) {
-        if (allow.has(name)) continue;
+        if (allow.has(name) || (node && !NOT_IN_NODE.has(area))) continue;
         let use = uses.get(name);
         if (!use) uses.set(name, (use = { area, owners: new Set() }));
         if (use.owners.has(owner)) continue;
@@ -130,5 +135,28 @@ export default function silk(options = {}) {
     },
   };
 
-  return [buildPlugin, apiPlugin, reconcilerPlugin(), ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
+  const plugins = [buildPlugin, apiPlugin, reconcilerPlugin()];
+  if (node) plugins.push(builtinsPlugin);
+  return [...plugins, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
 }
+
+/** The areas of `MISSING` the SilkJS runtime does not have either. */
+const NOT_IN_NODE = new Set(["dom", "storage", "workers"]);
+
+const BUILTINS = new Set(builtinModules);
+
+/** `node:<name>` when `id` names a Node builtin, with or without the prefix. */
+function builtinOf(id) {
+  if (id.startsWith("node:")) return id;
+  return BUILTINS.has(id) ? `node:${id}` : null;
+}
+
+// Before Vite's resolver, which turns builtins into empty browser stubs: the runtime has them.
+const builtinsPlugin = {
+  name: "silk:node-builtins",
+  enforce: "pre",
+  resolveId(id) {
+    const builtin = builtinOf(id);
+    if (builtin) return { id: builtin, external: true };
+  },
+};
