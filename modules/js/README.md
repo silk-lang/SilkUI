@@ -279,8 +279,9 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 
 Every realm starts with the globals of [src/prelude.js](src/prelude.js) on top of the
 engine's ECMAScript: `setTimeout`, `setInterval`, `requestAnimationFrame`, `queueMicrotask`,
-`performance.now`, `console`, `reportError` and `open`. They sit on native timer, clock, frame and
-log functions, and the host decides what those mean:
+`performance.now`, `console`, `reportError`, `open` and `navigator.clipboard` (`readText` and
+`writeText`). They sit on native timer, clock, frame and log functions, and the host decides
+what those mean:
 
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
   `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
@@ -291,6 +292,10 @@ log functions, and the host decides what those mean:
 - `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
   only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
   for it; other systems print that they could not.
+- `JsHost.takeClipboard` hands over the `navigator.clipboard` calls, and
+  `JsHost.answerClipboard` settles each one. Both windows do them on the system clipboard
+  once the code that asked has run, so a copy button works from any listener, timer or
+  promise job. A host that has no clipboard leaves the promises pending.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.

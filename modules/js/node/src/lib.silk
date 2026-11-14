@@ -15,7 +15,7 @@
 import ui_js.lib { Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
-import ui_js_window.lib { write }
+import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
 import ui_tree.lib { EventRecord }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
@@ -245,6 +245,31 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     return true
   }
 
+  /// Answers JavaScript's clipboard calls through `platform`, and the calls their promise
+  /// jobs made, then applies what it built. Says whether there were calls.
+  pub effect fn clipboard(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let requests = Intrinsic.replace(self.bridge.clipboard, List<bridge.ClipboardRequest>.make())
+      if requests.length() == 0 { break }
+      let mut answers = run serveClipboard(move requests, &mut platform)
+      while answers.length() > 0 {
+        let ClipboardAnswer { call, text: answer } = answers.remove(0)
+        let value = match move answer {
+          Option.Some { value } => run text(String.utf8Bytes(String.view(&value)))
+          Option.None => Value.immediate(ValueBits.Undefined)
+        }
+        let returned = run self.callReporting(b"clipboard", &[ValueBits.number(u32.toF64(call)), value.borrow().view()])
+        self.release(move returned)
+        self.release(move value)
+      }
+      round = round + 1
+    }
+    if round == 0 { return false }
+    drop run self.flush(&mut tree)
+    return true
+  }
+
   /// Hands the tree's queued event records to JavaScript, then applies what it queued. Says
   /// whether a handler prevented a default.
   pub effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -395,7 +420,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
-    return false
+    return run state.clipboard(&mut tree, &mut platform.*)
   }
 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
