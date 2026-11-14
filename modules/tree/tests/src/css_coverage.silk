@@ -82,6 +82,10 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"", sample: b"font-size:30px" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font:bold 30px/40px serif" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font-family:Geist Mono" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-variant:small-caps" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-variant-caps:small-caps" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-kerning:none" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-feature-settings:\"smcp\"" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font-weight:700" },
     Row { root: b"", lead: b"", setup: b"display:flex", sample: b"gap:10px" },
     Row { root: b"", lead: b"", setup: b"", sample: b"height:50px" },
@@ -315,13 +319,9 @@ fn later(property: Property) -> bool {
     || property == Property.AnimationPlayState
     // "Support all CSS properties on every backend": text and stacking.
     || property == Property.All
-    || property == Property.FontSizeAdjust || property == Property.FontStretch
-    || property == Property.FontWidth || property == Property.FontVariant
-    || property == Property.FontVariantLigatures || property == Property.FontVariantCaps
-    || property == Property.FontVariantNumeric || property == Property.FontVariantEastAsian
-    || property == Property.FontVariantPosition || property == Property.FontVariantAlternates
-    || property == Property.FontVariantEmoji || property == Property.FontFeatureSettings
-    || property == Property.FontVariationSettings || property == Property.FontKerning
+    || property == Property.FontSizeAdjust || property == Property.FontVariantEastAsian
+    || property == Property.FontVariantAlternates || property == Property.FontVariantEmoji
+    || property == Property.FontVariationSettings
     || property == Property.FontOpticalSizing || property == Property.FontLanguageOverride
     || property == Property.FontSynthesis || property == Property.FontSynthesisWeight
     || property == Property.FontSynthesisStyle || property == Property.FontSynthesisSmallCaps
@@ -394,6 +394,11 @@ fn later(property: Property) -> bool {
     // scrollbars take no space, and a block's last baseline is not used for alignment.
     || property == Property.FontStyle || property == Property.ScrollbarGutter
     || property == Property.ScrollbarWidth || property == Property.BaselineSource
+    // Shaped with, but the fixture text has no digits or ligatures and its fonts no widths:
+    // `fontFeatures` covers digits.
+    || property == Property.FontVariantLigatures || property == Property.FontVariantNumeric
+    || property == Property.FontVariantPosition || property == Property.FontWidth
+    || property == Property.FontStretch
 }
 
 struct Fixture {
@@ -667,6 +672,45 @@ effect fn fontShorthands() -> ()
     b"text-decoration-line: underline; text-decoration-style: wavy; text-decoration-color: red",
   )
   run Testing.expect(decoration, "text-decoration sets its longhands")
+}
+
+/// The width of "1111" in Noto Sans, styled `style`.
+effect fn digitsWidth(style: &[u8]) -> f32
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let sans = run tree.fontFamily("Noto Sans, sans-serif")
+  let root = run tree.box(&[css.fontFamily(sans.raw())])
+  run restyle(&mut tree, root, style)
+  let text = run tree.text("1111")
+  run tree.append(root, text)
+  run tree.setRoot(root)
+  drop run tree.frame(viewport(), 0.0)
+  let fragments = run tree.fragments(text)
+  let box = fragments.get(0).border
+  return box.xMax - box.xMin
+}
+
+/// Font features reach the shaper: Noto Sans digits are tabular unless `pnum` is on.
+effect fn fontFeatures() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let tabular = run digitsWidth(b"display: inline-block")
+  let proportional = run digitsWidth(b"display: inline-block; font-variant-numeric: proportional-nums")
+  run Testing.expect(proportional < tabular, "proportional-nums narrows the ones")
+  let settings = run digitsWidth(b"display: inline-block; font-feature-settings: \"pnum\" on")
+  run Testing.expect(settings == proportional, "font-feature-settings turns pnum on")
+  let off = run digitsWidth(b"display: inline-block; font-variant-numeric: proportional-nums; font-feature-settings: \"pnum\" 0")
+  run Testing.expect(off == tabular, "font-feature-settings wins over font-variant")
+  let reset = run digitsWidth(b"display: inline-block; font-variant-numeric: proportional-nums; font: 16px Noto Sans")
+  run Testing.expect(reset == tabular, "font resets font-variant")
+}
+
+test effect fn cssCoverageFontFeatures() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run fontFeatures() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn cssCoverageFontShorthands() -> ()
