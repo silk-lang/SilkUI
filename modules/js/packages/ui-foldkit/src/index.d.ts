@@ -1,5 +1,5 @@
 import type { Attribute } from "foldkit/html";
-import type { Node as TreeNode } from "@silk/ui";
+import type { Node as TreeNode } from "@silkui/core";
 
 /** A style object, as `h.Style` takes it. */
 export type Style = Readonly<Record<string, string>>;
@@ -19,7 +19,7 @@ export declare const Svg: (markup: string) => Attribute<never>;
 
 declare global {
   interface Node {
-    /** The @silk/ui node behind this element or text. */
+    /** The @silkui/core node behind this element or text. */
     readonly node: TreeNode;
   }
 }

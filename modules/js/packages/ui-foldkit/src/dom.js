@@ -1,12 +1,12 @@
-// The part of the DOM that Foldkit uses, over the nodes of @silk/ui.
+// The part of the DOM that Foldkit uses, over the nodes of @silkui/core.
 //
 // Foldkit has no renderer interface: its Snabbdom patches through `document` and the
 // members of `Element`. Here an element, a text or a comment is a thin object over one
-// @silk/ui node (`element.node`): the tree's structure and event flow are the node's, and
+// @silkui/core node (`element.node`): the tree's structure and event flow are the node's, and
 // this file adds what the DOM has on top (attributes, reflected properties, text content,
 // selectors). It installs `document`, `window` and the classes Foldkit tests with
 // `instanceof`, where the realm does not have them.
-import { Event, createNode, createText, mount } from "@silk/ui";
+import { Event, createNode, createText, mount } from "@silkui/core";
 
 const HTML = "http://www.w3.org/1999/xhtml";
 
@@ -45,7 +45,7 @@ const warned = new Set();
 function warnOnce(message) {
   if (warned.has(message)) return;
   warned.add(message);
-  console.warn("@silk/ui-foldkit: " + message);
+  console.warn("@silkui/foldkit: " + message);
 }
 
 
@@ -61,7 +61,7 @@ function sweep() {
 
 const dom = (node) => node?._dom ?? null;
 
-/** What elements, text and comments share. `node` is the @silk/ui node behind it. */
+/** What elements, text and comments share. `node` is the @silkui/core node behind it. */
 class DomNode {
   constructor(node) {
     this.node = node;
@@ -709,7 +709,7 @@ export const document = {
   },
 
   createDocumentFragment() {
-    throw new Error("@silk/ui-foldkit: document fragments are not supported");
+    throw new Error("@silkui/foldkit: document fragments are not supported");
   },
 
   getElementById(id) {

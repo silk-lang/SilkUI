@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { Node } from "@silk/ui";
+import type { Node } from "@silkui/core";
 
 export interface Root {
   /** Renders `element`; the commit is done when it returns, so a window's first frame has it. */
@@ -8,7 +8,7 @@ export interface Root {
 }
 
 /**
- * A React root in `container`, a @silk/ui node. Without one, a new box is mounted as the
+ * A React root in `container`, a @silkui/core node. Without one, a new box is mounted as the
  * root of the window's tree.
  */
 export function createRoot(container?: Node): Root;

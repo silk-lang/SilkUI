@@ -21,7 +21,7 @@ import { resolveOptions } from "./resolve.js";
  * @param {string} [options.entry] Entry module, relative to the Vite root. Default `src/main.jsx`.
  * @param {string} [options.fileName] Name of the bundle in `build.outDir`. Default `app.js`.
  * @param {string | false} [options.jsx] Package whose JSX runtime compiles JSX, or false to
- *   leave JSX settings alone. Default `@silk/ui-react`.
+ *   leave JSX settings alone. Default `@silkui/react`.
  * @param {{ command: string, args?: string[], cwd?: string }} [options.host] Host binary to
  *   start. In watch mode it is given `--watch <bundle>` after `args`, under the dev
  *   server `--dev <port>`.
@@ -38,7 +38,7 @@ import { resolveOptions } from "./resolve.js";
 export default function silk(options = {}) {
   const entry = options.entry ?? "src/main.jsx";
   const fileName = options.fileName ?? "app.js";
-  const jsx = options.jsx ?? "@silk/ui-react";
+  const jsx = options.jsx ?? "@silkui/react";
   const node = options.node === true;
   let bundle = "";
   let watching = false;

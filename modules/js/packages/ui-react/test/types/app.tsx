@@ -1,7 +1,7 @@
 // Compiled by types.test.js: what an application writes against the packages' types.
 import { useRef, useState } from "react";
-import { createBox, createIcon, mount, parseMarkdown, OBJECT, type Input, type RichDocument, type Style } from "@silk/ui";
-import { createRoot, flushSync } from "@silk/ui-react";
+import { createBox, createIcon, mount, parseMarkdown, OBJECT, type Input, type RichDocument, type Style } from "@silkui/core";
+import { createRoot, flushSync } from "@silkui/react";
 
 const card: Style = { display: "flex", padding: 8, gridTemplateColumns: "1fr 2fr", opacity: 0.5, color: null };
 const box = createBox(card, "text", createIcon("<svg/>", { width: 16 }));

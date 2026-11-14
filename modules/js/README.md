@@ -2,18 +2,18 @@
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
 engine embedded in the process. Five parts are here: the Silk host with its native bridge,
-`@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, `@silk/ui-foldkit`,
-which runs Foldkit programs on it, and `@silk/vite`,
+`@silkui/core`, the node and event API, `@silkui/react`, a React renderer on it, `@silkui/foldkit`,
+which runs Foldkit programs on it, and `@silkui/vite`,
 a Vite plugin that builds an application and, in development, replaces edited modules in
 the running window.
 
-## @silk/ui
+## @silkui/core
 
 [packages/ui](packages/ui) is the node and event API. Its primitives are the tree's own (box,
 text, input, image, icon, canvas). Its methods and its event flow are the DOM's.
 
 ```js
-import { createBox, createText, mount } from "@silk/ui";
+import { createBox, createText, mount } from "@silkui/core";
 
 const label = createText("Click me");
 const button = createBox({ width: 180, height: 70, backgroundColor: "rgb(0, 100, 200)" }, label);
@@ -91,14 +91,14 @@ mount(createBox({ width: 400, height: 300 }, button));
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
-## @silk/ui-react
+## @silkui/react
 
 [packages/ui-react](packages/ui-react) renders React components to the tree. Host elements are the
 tree's node kinds, and strings in children become text nodes.
 
 ```jsx
 import { useState } from "react";
-import { createRoot } from "@silk/ui-react";
+import { createRoot } from "@silkui/react";
 
 function Counter() {
   const [clicks, setClicks] = useState(0);
@@ -121,7 +121,7 @@ createRoot().render(<Counter />);
   for the looks of those states. `startingStyle` is what transitions start from when the node
   first shows (CSS `@starting-style`). `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
-  receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
+  receive the `@silkui/core` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
   `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
   component keeps, whatever was typed. `<richinput>` takes `marks` and `atoms` (name to
@@ -131,7 +131,7 @@ createRoot().render(<Counter />);
   the content. A state change in a click, key or input listener commits before the host
   applies the mutations, so the next frame shows it. Other updates go through React's
   scheduler on the host's timers.
-- **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
+- **JSX.** Set the JSX import source to `@silkui/react`, or use React's own runtime: both
   work.
 
 [examples/react-counter](examples/react-counter) is a starter page in React where the counter
@@ -151,7 +151,7 @@ runs in a browser from the same files for comparison.
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
 
-## @silk/ui-foldkit
+## @silkui/foldkit
 
 [packages/ui-foldkit](packages/ui-foldkit) runs [Foldkit](https://foldkit.dev) programs (the
 Elm architecture on Effect) on the tree, with the `foldkit` package as it is published.
@@ -160,7 +160,7 @@ provides a `document` and the DOM members Foldkit uses, and every element is a t
 Import it before `foldkit`:
 
 ```ts
-import '@silk/ui-foldkit'
+import '@silkui/foldkit'
 import { Runtime } from 'foldkit'
 import { Model, init, update, view } from './main'
 
@@ -202,14 +202,14 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
 - **Mounts and Commands.** An element is `Element`-shaped where Foldkit and its `Dom`
   commands reach: `querySelector` with tag, `#id`, `.class` and `[attribute="value"]`
   selectors, `focus`, `closest`, `contains`, `textContent`. `element.node` is the
-  `@silk/ui` node behind it, for code that draws on the tree itself. Layout reads
+  `@silkui/core` node behind it, for code that draws on the tree itself. Layout reads
   (`getBoundingClientRect`) are not there.
 - **Routing.** `location` and `history` keep an address in memory, starting at
   `http://localhost/`, where the realm has `URL` (the [SilkJS runtime](node) does).
 - **Timing.** The first render is there for the window's first frame. After that Foldkit
   renders the Model in an animation frame, as in a browser.
 - **Building.** `silk({ entry: "src/entry.ts", jsx: false, allow: provided })` with
-  `provided` from `@silk/ui-foldkit/apis`, so the missing API report leaves out what this
+  `provided` from `@silkui/foldkit/apis`, so the missing API report leaves out what this
   package provides. `vite build --watch` reloads the application on every change; the dev
   server's module replacement does not run Foldkit programs yet.
 
@@ -217,15 +217,15 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
 program, the React example's twin: the count, the streak and the theme are the Model, and
 the same `motion.js` draws every frame, started by a Mount on the page element.
 
-## @silk/vite
+## @silkui/vite
 
 [packages/vite](packages/vite) is the Vite plugin. A host evaluates one ES module, so the
 plugin sets up a library build with a single output file, the JSX runtime of
-`@silk/ui-react`, and `process.env.NODE_ENV` from the Vite mode.
+`@silkui/react`, and `process.env.NODE_ENV` from the Vite mode.
 
 ```js
 import { defineConfig } from "vite";
-import silk from "@silk/vite";
+import silk from "@silkui/vite";
 
 export default defineConfig({
   plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } })],
@@ -236,7 +236,7 @@ export default defineConfig({
 
 ### APIs the runtime does not have
 
-A realm has ECMAScript, the web globals below and `@silk/ui`: no `fetch`, `URL`, `Intl`,
+A realm has ECMAScript, the web globals below and `@silkui/core`: no `fetch`, `URL`, `Intl`,
 `document`, `process` or Node modules. Libraries written for browsers or Node often expect
 them, so the plugin reads every module of a build and reports the ones that are used, and
 by whom:
@@ -314,7 +314,7 @@ JavaScript runs on the thread that owns the tree.
 
 ```silk
 let mut host = run JsHost.open(&memory, domain.handle())
-run host.define(b"@silk/ui", package)
+run host.define(b"@silkui/core", package)
 run host.module(source, b"app.js")
 run host.flush(&mut tree)
 run host.input(&mut tree, Input.press(10.0, 50.0))
@@ -390,7 +390,7 @@ their title bar.
 silk run --manifest-path modules/js/demo/silk.toml
 ```
 
-`@silk/ui` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
+`@silkui/core` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
 `Source.read("app.js")`), so the executable runs from any directory. After an edit to
 `packages/ui/src/index.js`, `silk task embed-assets` regenerates
 `src/generated_library.silk`. `silk task native check` runs the demo with `--check`.
@@ -425,5 +425,5 @@ the engine here (it lives in the SilkJS runtime, which ui-js does not link).
   the bundled examples on the engine (build them first).
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
-  174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and
+  174 MB. The GPU stack is most of each; the engine with `@silkui/core` adds about 14 MB and
   React about 5 MB more.

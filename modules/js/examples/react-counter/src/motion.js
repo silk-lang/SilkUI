@@ -1,7 +1,7 @@
 // Everything on the page that moves. React renders the page once per click; this draws
 // every frame, straight on the nodes React made (it gets them by ref) and on nodes of its
 // own for the dots, the rings and the sparks.
-import { createBox } from "@silk/ui";
+import { createBox } from "@silkui/core";
 import { rgb } from "./theme.js";
 
 export const SIZE = 340; // the number's font size at rest

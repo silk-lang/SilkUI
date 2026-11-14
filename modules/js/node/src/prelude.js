@@ -1,5 +1,5 @@
 // What a ui-js realm on the SilkJS runtime adds to Node's globals: animation frames,
-// `window.open`, `navigator.clipboard`, the `@silk/ui` modules the host defines, and
+// `window.open`, `navigator.clipboard`, the `@silkui/core` modules the host defines, and
 // uncaught exceptions printed as a browser console prints them, with the window left running.
 (() => {
   const native = globalThis.__ui;
@@ -75,7 +75,7 @@
   process.on("unhandledRejection", (reason) => console.error("Uncaught (in promise)", reason));
   globalThis.reportError ??= uncaught;
 
-  // Modules the host defines (`@silk/ui`), importable by name from any module.
+  // Modules the host defines (`@silkui/core`), importable by name from any module.
   const modules = new Map();
   native.defineModule = (name, source) => {
     modules.set(name, source);

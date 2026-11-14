@@ -1,12 +1,12 @@
 // The realm side of the network check: web APIs from the runtime, against fixtures/server.mjs
 // at process.env.SILK_TEST_PORT. Exits 0 when every check passed, 1 with the failure printed.
-import { createBox, mount } from "@silk/ui";
+import { createBox, mount } from "@silkui/core";
 
 const base = `http://127.0.0.1:${process.env.SILK_TEST_PORT}`;
 const check = (condition, what) => { if (!condition) throw new Error("failed: " + what); };
 
 async function main() {
-  // @silk/ui and __ui reach the tree from the runtime's realm.
+  // @silkui/core and __ui reach the tree from the runtime's realm.
   mount(createBox());
   check(new TextDecoder().decode(new TextEncoder().encode("héllo")) === "héllo", "TextEncoder");
   check(new URL("/a?b=1", base).searchParams.get("b") === "1", "URL");

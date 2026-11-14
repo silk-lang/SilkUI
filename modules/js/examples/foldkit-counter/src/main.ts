@@ -2,7 +2,7 @@ import { Effect, Queue, Schema, Stream } from 'effect'
 import { Command, Mount, Runtime, Update } from 'foldkit'
 import { Document, Html, HtmlBuilder } from 'foldkit/html'
 import { defineMessageUnion } from 'foldkit/message'
-import { HoverStyle } from '@silk/ui-foldkit'
+import { HoverStyle } from '@silkui/foldkit'
 
 // The page's motion and its two looks are the React starter's own files: the same code
 // draws every frame under both frameworks.

@@ -1,4 +1,4 @@
-// The development side of @silk/vite: a Vite environment whose modules run in a ui-js host,
+// The development side of @silkui/vite: a Vite environment whose modules run in a ui-js host,
 // reached over a local TCP connection the host opens (`--dev <port>`).
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";

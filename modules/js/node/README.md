@@ -3,7 +3,7 @@
 Runs a ui-js application on the SilkJS runtime instead of the bare engine: the realm has
 Node's APIs and the web APIs Node has (`fetch`, `WebSocket`, `URL`, `TextEncoder`,
 `crypto`, `AbortController`, `structuredClone`, `Intl`, timers, `process` and the rest), with
-`@silk/ui` beside them. Use it when an application needs the network or other platform APIs;
+`@silkui/core` beside them. Use it when an application needs the network or other platform APIs;
 `ui-js-window` stays the smaller choice for one that does not.
 
 The runtime runs on the window's UI thread. The window host waits in the runtime's loop
@@ -13,7 +13,7 @@ cost nothing while idle. Animation frames and events are the window's, as with
 
 ```silk
 let mut window = NodeWindow.make(&fonts, options, NodeClient.make())
-run window.define(b"@silk/ui", uiPackage())
+run window.define(b"@silkui/core", uiPackage())
 run window.entry(b"/app/app.js", source)
 let status = run window.start(b"my-app")
 ```
