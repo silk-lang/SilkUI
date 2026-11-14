@@ -130,6 +130,12 @@ How it differs from a native window:
   `browser.stored(key)` reads it back on the next visit (both do nothing natively). The page
   puts `silk-app:` before each key, and gives the app no storage in check mode, so a check
   always starts from nothing.
+- **Screen readers read a hidden DOM copy of the tree.** [browser/access-mirror.js](browser/access-mirror.js)
+  keeps one element per accessibility node over the canvas, with its ARIA role, name and
+  states, from the updates [web_access.silk](src/web_access.silk) sends. A screen reader's click
+  or focus on an element comes back to the app as an AccessKit action. The keyboard stays on the
+  window host's text area, which names the focused node with `aria-activedescendant`. Pass
+  `accessibility: false` to `runApp` to turn the copy off.
 - **An 8 MiB stack.** Browser tasks set the compiler's declarative `stackSize` profile input to
   `8MiB` on every platform. No clang or shell wrapper is generated. The compiler's default 1 MiB
   stack is too small for deep layouts, which otherwise trap with "memory access out of bounds".
