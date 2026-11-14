@@ -7,6 +7,7 @@ import mutation {
   NodeKind,
   StyleState,
   Role,
+  Orientation,
   Cursor,
   NOT_FOCUSABLE,
   PREVENT_FOCUS,
@@ -950,6 +951,203 @@ effect fn moveFocus(tree: &mut UiTree<'_>, forward: bool) -> ()
   run tree.reveal.append(pair(next, id))
 }
 
+/// The composite widget whose items arrow keys move focus among, as the WAI-ARIA Authoring
+/// Practices describe, for item `slot`: its nearest ancestor with a composite widget, when
+/// `slot` has that composite's item widget. NONE otherwise.
+fn compositeOf(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let mut at = tree.node(slot).parent
+  while at != NONE {
+    let widget = tree.node(at).accessRole
+    if composite(widget) {
+      return if itemOf(widget, tree.node(slot).accessRole) { at } else { NONE }
+    }
+    at = tree.node(at).parent
+  }
+  return NONE
+}
+
+fn composite(widget: Role) -> bool {
+  return widget == Role.TabList || widget == Role.Menu || widget == Role.MenuBar || widget == Role.ListBox
+    || widget == Role.RadioGroup || widget == Role.Toolbar || widget == Role.Tree
+}
+
+fn itemOf(container: Role, item: Role) -> bool {
+  return match container {
+    Role.TabList => item == Role.Tab
+    Role.Menu => item == Role.MenuItem || item == Role.MenuItemCheckbox || item == Role.MenuItemRadio
+    Role.MenuBar => item == Role.MenuItem || item == Role.MenuItemCheckbox || item == Role.MenuItemRadio
+    Role.ListBox => item == Role.Option
+    Role.RadioGroup => item == Role.Radio
+    Role.Tree => item == Role.TreeItem
+    // A toolbar's controls are whatever focusable nodes it holds.
+    Role.Toolbar => true
+    _ => false
+  }
+}
+
+/// Whether `container`'s items run top to bottom: its `aria-orientation`, else the widget's
+/// default (tab lists, toolbars and menu bars run sideways).
+fn vertical(tree: &UiTree<'_>, container: u32) -> bool {
+  let node = tree.node(container)
+  let set = match node.semanticsOf() {
+    Option.Some { value } => value.orientation
+    Option.None => Orientation.Unset
+  }
+  if set != Orientation.Unset {
+    return set == Orientation.Vertical
+  }
+  return node.accessRole != Role.TabList && node.accessRole != Role.Toolbar && node.accessRole != Role.MenuBar
+}
+
+/// Moves focus among the items of the composite widget around the focused item `slot` on an
+/// arrow key, Home or End, or a printable character (typeahead, in lists, menus and trees).
+/// Returns whether it handled the key.
+effect fn rove(tree: &mut UiTree<'_>, slot: u32, key: &[u8]) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let container = compositeOf(&tree.*, slot)
+  if container == NONE {
+    return false
+  }
+  let widget = tree.node(container).accessRole
+  let down = vertical(&tree.*, container)
+  let next = same(key, if down { b"ArrowDown" } else { b"ArrowRight" })
+  let previous = same(key, if down { b"ArrowUp" } else { b"ArrowLeft" })
+  let home = same(key, b"Home")
+  let end = same(key, b"End")
+  let typed = key.length == 1 && key[0] > 32 && key[0] < 127 && widget != Role.TabList && widget != Role.Toolbar
+    && widget != Role.RadioGroup
+  if !next && !previous && !home && !end && !typed {
+    return false
+  }
+
+  // The focusable items in tree order, leaving out those of composites nested inside.
+  let mut items = List<u32>.make()
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run tree.childSlots(container, &mut children)
+  let mut i = children.length()
+  while i > 0 {
+    i = i - 1
+    run stack.append(children.get(i))
+  }
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let at = stack.get(last)
+    stack.truncate(last)
+    let atRole = tree.node(at).accessRole
+    if itemOf(widget, atRole) && focusable(&tree.*, at) {
+      run items.append(at)
+      if widget == Role.Toolbar {
+        continue
+      }
+    }
+    if composite(atRole) && !(widget == Role.Tree && atRole == Role.Tree) {
+      continue
+    }
+    run tree.childSlots(at, &mut children)
+    let mut k = children.length()
+    while k > 0 {
+      k = k - 1
+      run stack.append(children.get(k))
+    }
+  }
+  let count = items.length()
+  let mut index: usize = 0
+  while index < count && items.get(index) != slot {
+    index = index + 1
+  }
+  if index == count {
+    return false
+  }
+  // Lists and trees stop at their ends; tabs, menus, radios and toolbars wrap around.
+  let wraps = widget != Role.ListBox && widget != Role.Tree
+  let mut target = NONE
+  if home {
+    target = items.get(0)
+  } else if end {
+    target = items.get(count - 1)
+  } else if next {
+    target = if index + 1 < count { items.get(index + 1) } else if wraps { items.get(0) } else { slot }
+  } else if previous {
+    target = if index > 0 { items.get(index - 1) } else if wraps { items.get(count - 1) } else { slot }
+  } else {
+    // The next item after this one whose name starts with the character typed.
+    let mut step: usize = 1
+    while step <= count {
+      let at = items.get((index + step) % count)
+      if run startsWith(&tree.*, at, key[0]) {
+        target = at
+        break
+      }
+      step = step + 1
+    }
+    if target == NONE {
+      return true
+    }
+  }
+  tree.focusVisible = true
+  if target != slot {
+    run tree.focusSlot(target)
+    let id = tree.node(target).id
+    run tree.reveal.append(pair(target, id))
+  }
+  return true
+}
+
+/// Whether node `slot`'s name (its label, else its text) starts with ASCII `letter`, ignoring
+/// case.
+effect fn startsWith(tree: &UiTree<'_>, slot: u32, letter: u8) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let label = tree.node(slot).label.ownedUtf8Bytes()
+  if label.length != 0 {
+    return lower(label[0]) == lower(letter)
+  }
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run stack.append(slot)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let at = stack.get(last)
+    stack.truncate(last)
+    let node = tree.node(at)
+    if node.kind == NodeKind.Text {
+      let text = node.text.ownedUtf8Bytes()
+      let mut j: usize = 0
+      while j < text.length && text[j] <= 32 {
+        j = j + 1
+      }
+      if j < text.length {
+        return lower(text[j]) == lower(letter)
+      }
+    }
+    run tree.childSlots(at, &mut children)
+    let mut k = children.length()
+    while k > 0 {
+      k = k - 1
+      run stack.append(children.get(k))
+    }
+  }
+  return false
+}
+
+fn lower(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
+}
+
 fn enterClicks(kind: Role) -> bool {
   return kind == Role.Button || kind == Role.Link || kind == Role.MenuItem || kind == Role.Tab
     || kind == Role.Option
@@ -1583,6 +1781,8 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
       if plain && String.view(&key) == "Tab" {
         run moveFocus(&mut tree, u32.bitAnd(modifiers, MOD_SHIFT) == 0)
+      } else if same && plain && target == tree.focused && run rove(&mut tree, target, String.utf8Bytes(String.view(&key))) {
+        return ()
       } else if same && plain && !repeat && String.view(&key) == "Enter" && target == tree.focused
         && enterClicks(tree.node(target).accessRole) {
         run keyboardClick(&mut tree, target, modifiers)
