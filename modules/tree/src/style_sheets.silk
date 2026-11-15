@@ -9,18 +9,21 @@ import svg_css.cascade { Priority, Origin }
 import svg_css.element { MatchContext, NO_ELEMENT }
 import svg_css.variables { ScopeId, RegistrationError }
 import svg_css.resolver { ResolverError }
-import svg_css.tokens { Limits, CssError, Buffers, TokenBuffer, insensitive }
+import svg_css.tokens { Limits, CssError, Buffers, TokenBuffer }
 import svg_css.adopted_variables { Inputs, InlineCustom }
 import style_identity { NodeIdentity }
+import sheet_cascade
+import paint_css
+import svg_css.values { Wide }
+import properties.catalog
 import silk.text.string { String }
-import silk.collections.slice { Slice }
 import svg_css.input { Input, TokenRef }
 import svg_css.value_cursor { Cursor }
 import svg_css.declaration_values
 import svg_css.lexer
 import svg_css.cssom_serialization
 import svg_css.written
-import svg_css.colors { ColorProgram, Color, Context }
+import svg_css.colors { ColorProgram, Color, Context, SystemColor }
 import svg_css.colors
 import svg_css.media_features { Environment }
 import properties.keywords { Keyword }
@@ -130,6 +133,7 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
   let mut declarations = List<Declaration>.make()
+  let mut ranks = List<Priority>.make()
   let mut expressions = List<Expression>.make()
   let candidates = sheets.candidates()
   i = 0
@@ -141,7 +145,7 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
           let expanded = run substituteText(&sheets.variableInputs()[0], scope, css.asSlice())
           match move expanded {
             Option<Bytes>.Some { value } => run appendText(&mut declarations, &mut expressions, item.property, item.important, value.asSlice())
-            _ => invalidate(&mut declarations, item.property)
+            _ => run declarations.append(Declaration { property: item.property, important: item.important, value: values.keyword(Keyword.Unset) })
           }
         } else { run declarations.append(run values.cloneDeclaration(item)) }
       }
@@ -153,7 +157,7 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
             match move substituted {
               Option<Bytes>.Some { value } => run appendText(&mut declarations, &mut expressions, property, candidates[i].priority.important, value.asSlice())
               Option<Bytes>.None => {
-                invalidate(&mut declarations, property)
+                run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: values.keyword(Keyword.Unset) })
               }
             }
           }
@@ -165,6 +169,7 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
         }
       }
     }
+    while ranks.length() < declarations.length() { run ranks.append(candidates[i].priority) }
     i = i + 1
   }
   let overrides = tree.styleOverrides()
@@ -177,11 +182,72 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
       let mut at: usize = 0
       while at < item.declarations.length() {
         run declarations.append(run values.cloneDeclaration(&item.declarations.asSlice()[at]))
+        run ranks.append(Priority.make(Origin.Transition, declarations.length()))
         at = at + 1
       }
     }
     i = i + 1
   }
+  let selected = run sheet_cascade.winners(declarations.asSlice(), ranks.asSlice())
+  let mut winning = List<Declaration>.make()
+  let mut winningExpressions = List<Expression>.make()
+  i = 0
+  while i < declarations.length() {
+    let declaration = &declarations.asSlice()[i]
+    // These native compound values retain information beyond their component
+    // fields. Keep their representation when every component has this winner.
+    let mut whole = declaration.property == Property.WhiteSpace || declaration.property == Property.VerticalAlign || declaration.property == Property.TextAlign
+    if sheet_cascade.wide(&declaration.value).isSome() { whole = false }
+    let mut check: usize = 0
+    while whole && check < catalog.longhandCount(declaration.property) {
+      if selected[catalog.index(catalog.longhandAt(declaration.property, check))] != i { whole = false }
+      check = check + 1
+    }
+    if whole {
+      run winning.append(run values.cloneDeclaration(declaration))
+      i = i + 1
+      continue
+    }
+    let mut at: usize = 0
+    while at < catalog.longhandCount(declaration.property) {
+      let target = catalog.longhandAt(declaration.property, at)
+      if selected[catalog.index(target)] == i {
+        let projected = run written.longhand(declaration, target)
+        if let Option<Value>.Some { value } = move projected {
+          let mut expressionIndex: usize = 0
+          while expressionIndex < expressions.length() {
+            let expression = &expressions.asSlice()[expressionIndex]
+            if expression.index == i && (target == declaration.property || convert.color(&value).isSome()) {
+              run winningExpressions.append(Expression { index: winning.length(), program: run expression.program.copy() })
+              break
+            }
+            expressionIndex = expressionIndex + 1
+          }
+          let mut resolved = move value
+          if let Option<Wide>.Some { value: wide } = &sheet_cascade.wide(&resolved) {
+            let inherits = wide == Wide.Inherit || (wide == Wide.Unset && catalog.inherited(target))
+            if inherits && node.parent != NONE {
+              resolved = values.keyword(Keyword.Inherit)
+            } else {
+              if target == Property.Color {
+                let rgba = colors.toSrgb(system[colors.systemIndex(SystemColor.CanvasText)])
+                resolved = values.color(Rgba<f32> { r: f64.toF32(rgba.r), g: f64.toF32(rgba.g), b: f64.toF32(rgba.b), a: f64.toF32(rgba.a) })
+              } else if paint_css.handles(target) {
+                resolved = run written.value(catalog.initial(target))
+              } else {
+                resolved = values.keyword(Keyword.Initial)
+              }
+            }
+          }
+          run winning.append(Declaration { property: target, important: declaration.important, value: move resolved })
+        }
+      }
+      at = at + 1
+    }
+    i = i + 1
+  }
+  declarations = move winning
+  expressions = move winningExpressions
   let inherited = if node.parent == NONE { TextStyle.initial().color } else { tree.node(node.parent).computed.text.color }
   let inheritedColor = Color.srgb(f32.toF64(inherited.r), f32.toF64(inherited.g), f32.toF64(inherited.b), f32.toF64(inherited.a))
   let mut foreground = inheritedColor
@@ -229,14 +295,7 @@ fn resolveColor(value: &mut Value, expressions: &[Expression], index: usize, cur
   }
 }
 
-fn invalidate(declarations: &mut List<Declaration>, property: Property) -> () {
-  let items = declarations.asMutSlice()
-  let mut i: usize = 0
-  while i < items.length {
-    if items[i].property == property { items[i].value = values.keyword(Keyword.Unset) }
-    i = i + 1
-  }
-}
+
 
 effect fn substituteText(inputs: &Inputs, scope: ScopeId, text: &[u8]) -> Option<Bytes>
   ! CssError | OutOfMemoryError ? &mut Allocator {
@@ -280,15 +339,7 @@ pub fn active(tree: &UiTree<'_>, slot: u32, state: StyleState) -> bool {
 pub fn needsScope(declarations: &[Declaration]) -> bool {
   let mut i: usize = 0
   while i < declarations.length {
-    if let Value.Text { css } = &declarations[i].value {
-      let text = css.asSlice()
-      let mut at: usize = 0
-      while at < text.length {
-        if at + 4 <= text.length && insensitive(Slice.view<u8>(text, at, 4), b"var(") { return true }
-        if at + 10 <= text.length && insensitive(Slice.view<u8>(text, at, 10), b"color-mix(") { return true }
-        at = at + 1
-      }
-    }
+    if sheet_cascade.contextual(&declarations[i].value) { return true }
     i = i + 1
   }
   return false

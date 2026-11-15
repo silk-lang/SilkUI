@@ -345,3 +345,92 @@ test effect fn inlineCustomPropertiesAndSheetsUseOneNativeScope() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run nativeInlineVariables() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn nativeWideCascade() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("parent") })
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("child") })
+  let bytes = run sheetBytes(b"@layer base, utilities; .parent{font-size:20px;width:2em;margin-left:12px;color:red;translate:2em;filter:blur(2em);border:color-mix(in srgb,red 50%,blue)} @layer base{.child{height:17px;padding:3px 4px}} @layer utilities{.child{height:30px;height:revert-layer;padding:8px;padding-left:revert-layer}} .child{font-size:10px;width:inherit;margin:9px;margin:var(--missing);margin-left:inherit;color:initial;background-color:currentcolor;translate:inherit;filter:inherit}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let viewport = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(tree.slotOf(1)).computed.paint.border.left == 3.0, "color-expression projection leaves the border width component intact")
+  let c = &tree.node(tree.slotOf(2)).computed
+  run Testing.expect(c.layout.width.value == 40.0 && c.text.size == 10.0, "inherit copies the computed parent width without re-evaluating em in the child")
+  run Testing.expect(c.transform.translate.x == 40.0, "transform inheritance copies resolved lengths")
+  let filter = match &tree.node(tree.slotOf(2)).paintEffects() {
+    Option<&Effects>.Some { value } => {
+      value.filters.length() == 1 && match &value.filters.asSlice()[0] {
+        Filter.Function { amount, .. } => value.number(amount) == 40.0
+        _ => false
+      }
+    }
+    _ => false
+  }
+  run Testing.expect(filter, "effect inheritance freezes relative lengths against the defining parent")
+  run Testing.expect(c.layout.height.value == 17.0, "native revert-layer reveals the earlier layer")
+  run Testing.expect(c.layout.padding.left.value == 4.0 && c.layout.padding.top.value == 8.0, "a longhand rollback excludes its layer's shorthand component only")
+  run Testing.expect(c.layout.margin.top.value == 0.0 && c.layout.margin.left.value == 12.0, "invalid variable shorthand unsets all longhands without reviving earlier values")
+  run Testing.expect(c.text.color.r == 0.0 && c.text.color.b == 0.0, "initial color overrides inherited red")
+  run Testing.expect(match c.paint.background { Fill.Solid { color } => color.r == 0.0 && color.b == 0.0 _ => false }, "currentColor observes the final defaulted foreground")
+  let inline = run written.declarations(b"height:revert-layer!important;color:unset;border:inherit;font:initial")
+  run batch.style(2, inline.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  let updated = &tree.node(tree.slotOf(2)).computed
+  run Testing.expect(updated.layout.height.value == 17.0, "inline rollback leaves stylesheet rules available")
+  run Testing.expect(updated.text.color.r == 1.0 && updated.text.color.b == 0.0, "unset inherits inherited properties")
+  run Testing.expect(updated.text.size == 16.0, "style-object wide font shorthand survives preparation and resets every longhand")
+}
+
+test effect fn nativeWideValuesRespectLonghandWinnersAndComputedInheritance() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nativeWideCascade() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.paint_css { Effects }
+import svg_css.effect_values { Filter }
+
+effect fn inlineWideWithoutSheets() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let parent = run written.declarations(b"font-size:20px;width:2em;color:red;vertical-align:middle;direction:rtl;margin-right:7px")
+  let child = run written.declarations(b"font:initial;width:inherit;color:unset;padding:9px;padding:unset;vertical-align:inherit;direction:ltr;margin-inline-start:inherit")
+  run batch.style(1, parent.asSlice())
+  run batch.style(2, child.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 })
+  let c = &tree.node(tree.slotOf(2)).computed
+  run Testing.expect(c.layout.width.value == 40.0 && c.text.size == 16.0 && c.text.color.r == 1.0 && c.layout.padding.top.value == 0.0, "style-object wide values use the same defaults and computed inheritance without sheets")
+  run Testing.expect(c.layout.verticalAlign.kind == VerticalAlignKind.Middle && c.layout.margin.left.value == 7.0, "compound and logical inheritance read the parent in its own writing direction")
+  run batch.customProperty(1, StyleState.Base, "--font", Option<string>.some("italic 22px serif"), false)
+  let variable = run written.declarations(b"font:var(--font);border-color:initial;color:blue")
+  run batch.style(2, variable.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(tree.node(tree.slotOf(2)).computed.text.size == 22.0, "deferred font shorthand survives style-object preparation before substitution")
+  run Testing.expect(tree.node(tree.slotOf(2)).computed.paint.borderColor.b == 1.0 && tree.node(tree.slotOf(2)).computed.paint.borderColor.r == 0.0, "initial currentColor paint sees a foreground declared later")
+}
+
+test effect fn styleObjectWideValuesUseTheCascadeWithoutSheets() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run inlineWideWithoutSheets() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import properties.computed { VerticalAlignKind }

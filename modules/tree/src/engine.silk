@@ -1,5 +1,11 @@
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
+import style_inherit
+import properties.convert as properties_convert
+import properties.catalog
+import svg_css.written as css_written
+import properties.keywords { Keyword }
+import properties.values { Value }
 import layout.lib { Fragmentainers, computeFragmented }
 import virtual_list { VirtualList, VirtualRange }
 import virtual_list as virtual
@@ -391,6 +397,72 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
       inside: DisplayInside.FlowRoot,
     }
     NodeKind.Canvas => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
+  }
+}
+
+effect fn invalidInitial(error: CssError) -> Value {
+  drop error
+  return values.keyword(Keyword.Initial)
+}
+
+effect fn applyInitial(computed: &mut Computed, property: CssProperty) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut initial = Computed.inViewport(TextStyle.initial(), computed.viewportWidth, computed.viewportHeight)
+  // Start with native initial representations for values such as font-size:
+  // medium, then let the catalog override native user-agent defaults.
+  let value = run Effect.catch<CssError>(css_written.value(catalog.initial(property)), invalidInitial)
+  let mut declaration = Declaration { property: property, important: false, value: move value }
+  if properties_convert.isKeyword(&declaration.value, Keyword.Currentcolor) { declaration.value = values.color(computed.text.color) }
+  if !run applyWritten(&mut initial, &declaration) { initial.apply(&declaration) }
+  drop style_inherit.apply(&mut computed.*, &initial, property)
+}
+
+/// Sheet winners have already been selected per longhand. Copy explicit inheritance from computed
+/// parent values, and establish writing mode/direction/font size before dependents.
+effect fn applyResolved(computed: &mut Computed, list: &List<Declaration>, parent: &Computed, stops: &mut EasingStops) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let items = list.asSlice()
+  let dependencies = [CssProperty.WritingMode, CssProperty.Direction, CssProperty.FontSize, CssProperty.Color]
+  let mut dependency: usize = 0
+  while dependency < dependencies.length {
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].property == dependencies[dependency] {
+        if properties_convert.isKeyword(&items[i].value, Keyword.Initial) {
+          run applyInitial(&mut computed.*, items[i].property)
+        } else if properties_convert.isKeyword(&items[i].value, Keyword.Inherit) {
+          drop style_inherit.apply(&mut computed.*, parent, items[i].property)
+        } else { computed.apply(&items[i]) }
+      }
+      i = i + 1
+    }
+    dependency = dependency + 1
+  }
+  let mut i: usize = 0
+  while i < items.length {
+    let property = items[i].property
+    if property != CssProperty.FontSize && property != CssProperty.WritingMode && property != CssProperty.Direction && property != CssProperty.Color {
+      if properties_convert.isKeyword(&items[i].value, Keyword.Initial) {
+        run applyInitial(&mut computed.*, property)
+      } else if properties_convert.isKeyword(&items[i].value, Keyword.Inherit) {
+        if paint_css.handles(property) { computed.effects.declared = true }
+        drop style_inherit.apply(&mut computed.*, parent, property)
+      } else {
+        let which = transitionList(property)
+        if which != NONE {
+          let text = run values.cssText(&items[i].value)
+          run stops.read(text.asSlice())
+          motion.declare(&mut computed.transition, which, text.asSlice())
+        } else if animationList(property) != NONE {
+          let text = run values.cssText(&items[i].value)
+          run stops.read(text.asSlice())
+          timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice())
+        } else if !run applyWritten(&mut computed.*, &items[i]) {
+          computed.apply(&items[i])
+        }
+      }
+    }
+    i = i + 1
   }
 }
 
@@ -3747,7 +3819,8 @@ impl<'a> UiTree<'a> {
       computed.outline.width = FOCUS_RING_WIDTH
     }
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      run applyAll(&mut computed, &value.declarations, &mut stops)
+      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+      run applyResolved(&mut computed, &value.declarations, &parentStyle, &mut stops)
     } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
       run applyAll(&mut computed, &node.base, &mut stops)
       if node.hovered {
@@ -3853,7 +3926,17 @@ impl<'a> UiTree<'a> {
     let mut effects = Effects.make()
     let node = self.node(slot)
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      run paint_css.applyAll(&mut effects, value.declarations.asSlice(), basis)
+      let declarations = value.declarations.asSlice()
+      let mut i: usize = 0
+      while i < declarations.length {
+        let declaration = &declarations[i]
+        if paint_css.handles(declaration.property) {
+          if properties_convert.isKeyword(&declaration.value, Keyword.Inherit) {
+            run self.inheritEffect(&mut effects, node.parent, declaration.property)
+          } else { run paint_css.apply(&mut effects, declaration, basis) }
+        }
+        i = i + 1
+      }
     } else {
     run paint_css.applyAll(&mut effects, node.base.asSlice(), basis)
     if node.hovered {
@@ -3883,6 +3966,35 @@ impl<'a> UiTree<'a> {
     let boxed = run Box<Effects>.make(move effects)
     let target = self.nodeMut(slot)
     target.effects = Option<Box<Effects>>.Some { value: move boxed }
+  }
+
+  /// Replay only the inherited effect's already substituted longhand, against
+  /// the defining ancestor's computed font and foreground. This freezes em and
+  /// currentColor there while retaining percentages for the descendant's box.
+  effect fn inheritEffect(self: &Self, effects: &mut Effects, parent: u32, property: CssProperty) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut ancestor = parent
+    while ancestor != NONE {
+      let node = self.node(ancestor)
+      let mut inherit = catalog.inherited(property)
+      if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+        let declarations = value.declarations.asSlice()
+        let mut i: usize = 0
+        while i < declarations.length {
+          if declarations[i].property == property {
+            if !properties_convert.isKeyword(&declarations[i].value, Keyword.Inherit) {
+              run paint_css.apply(&mut effects.*, &declarations[i], Basis { fontSize: node.computed.text.size, color: node.computed.text.color })
+              return ()
+            }
+            inherit = true
+            break
+          }
+          i = i + 1
+        }
+      }
+      if !inherit { return () }
+      ancestor = node.parent
+    }
   }
 
   // Style overrides.
