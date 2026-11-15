@@ -21,6 +21,7 @@
 //!
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
+import stylesheets
 import host { Kind, Plan, manifest, main as hostMain, page as hostPage, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import web { Server, site }
@@ -176,6 +177,7 @@ pub struct App {
   runsOn: Runtime,
   places: List<Target>,
   custom: string<'static>,
+  stylePaths: List<string<'static>>,
   bundled: String,
   hosts: List<Host>,
 }
@@ -348,6 +350,7 @@ impl App {
       runsOn: Runtime.Engine,
       places: List<Target>.make(),
       custom: "",
+      stylePaths: List<string<'static>>.make(),
       bundled: String.make(),
       hosts: List<Host>.make(),
     }
@@ -372,6 +375,15 @@ impl App {
     ! E | OutOfMemoryError ? R | &mut Allocator {
     let mut app = run move self
     run app.places.append(target)
+    return move app
+  }
+
+  /// Adds a CSS file, relative to the project root. Repeat to define adoption
+  /// order. Any Tailwind, Sass or PostCSS processing happens before this step.
+  pub effect fn stylesheet<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, path: string<'static>) -> App
+    ! E | OutOfMemoryError ? R | &mut Allocator {
+    let mut app = run move self
+    run app.stylePaths.append(path)
     return move app
   }
 
@@ -455,6 +467,7 @@ impl App {
     while at < targets.length {
       let target = targets[at]
       if app.custom != "" {
+        if app.stylePaths.length() != 0 { run Task.abort("silkui: App.stylesheet needs a generated host; a custom host adopts its compiled sheets directly") }
         if target.web() { run Task.abort("silkui: a custom host builds the window target only") }
         run app.hosts.append(Host { target: target, dir: run fromRoot(&project, app.custom), generated: false })
         at = at + 1
@@ -492,9 +505,11 @@ impl App {
         height: window.height,
         module: module,
         command: command,
+        stylesheets: app.stylePaths.length(),
       }
       let mut dir = run fromRoot(&project, ".silk")
       dir = run joined(String.view(&dir), target.id())
+      run stylesheets.emit(String.view(&project.root), app.stylePaths.asSlice(), String.view(&dir), target.id() == "web-dom")
       let toml = run joined(String.view(&dir), "silk.toml")
       run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
       let main = run joined(String.view(&dir), "src/main.silk")
@@ -551,7 +566,7 @@ impl App {
       let bytes = run sizeOf(String.view(&path))
       if hosts[at].target.web() {
         let folder = run joined(dir, "site")
-        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder))
+        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder), app.stylePaths.length())
         run artifacts.append(Artifact { target: hosts[at].target, path: move folder, bytes: bytes })
       } else {
         run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
@@ -749,7 +764,7 @@ effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator
 }
 
 /// Builds a web host again and puts the new program in its page's folder.
-effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact) -> ()
+effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact, sheetCount: usize) -> ()
   ! TaskError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let dir = String.view(&host.dir)
@@ -758,7 +773,7 @@ effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact) -> ()
   run String.append(&mut name, "-")
   run String.append(&mut name, host.target.id())
   let wasm = run binary(dir, String.view(&name), Mode.Dev)
-  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path))
+  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path), sheetCount)
 }
 
 impl Running {
@@ -793,7 +808,7 @@ impl Running {
           run say("src/ changed: rebuilding")
           let artifact = &running.launched.outputs.asSlice()[0]
           let host = &running.launched.source.hosts.asSlice()[0]
-          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact))
+          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact, running.launched.source.stylePaths.length()))
           match move rebuilt {
             Result.Success { .. } => { server.build = server.build + 1 }
             Result.Failure { error } => {

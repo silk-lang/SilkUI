@@ -1,0 +1,96 @@
+//! Build-time CSS assets. Processors run before App.stylesheet; this module
+//! accepts their CSS output and writes either compiled bytes or a DOM stylesheet.
+import css_style.compile { Options, CompileError }
+import css_style.compile
+import css_style.sheet { Sheet, DiagnosticKind }
+import css_style.tokens { CssError }
+import silk.cli.task { TaskError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.text.string { String }
+import silk.num.usize
+
+pub effect fn name(index: usize, dom: bool) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut number = String.make()
+  let mut rest = index
+  while true {
+    let mut digit = run String.copy(String.slice("0123456789", rest % 10, 1))
+    run String.append(&mut digit, String.view(&number))
+    number = move digit
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  let mut out = run String.copy("style-")
+  run String.append(&mut out, String.view(&number))
+  run String.append(&mut out, if dom { ".css" } else { ".sheet" })
+  return move out
+}
+
+pub effect fn joined(base: string, child: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  if String.startsWith(child, "/") { return run String.copy(child) }
+  let mut out = run String.copy(base)
+  if !String.endsWith(base, "/") { run String.append(&mut out, "/") }
+  run String.append(&mut out, child)
+  return move out
+}
+
+pub effect fn compiled(source: &[u8], path: string) -> Bytes
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let result = run Effect.result(compile.compile(source, &Options.make()))
+  let sheet = match move result {
+    Result<Sheet, CompileError | CssError | OutOfMemoryError>.Success { value } => move value
+    Result<Sheet, CompileError | CssError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        _ => {
+          let mut message = run String.copy("silkui: could not compile stylesheet: ")
+          run String.append(&mut message, path)
+          fail TaskError { message: move message, status: 1 }
+        }
+      }
+    }
+  }
+  let diagnostics = sheet.diagnostics.asSlice()
+  let mut i: usize = 0
+  while i < diagnostics.length {
+    let item = &diagnostics[i]
+    let kind = match item.kind {
+      DiagnosticKind.AtRule => "at-rule"
+      DiagnosticKind.Selector => "selector"
+      DiagnosticKind.Property => "property"
+      DiagnosticKind.Value => "value"
+      DiagnosticKind.Unsupported => "feature"
+    }
+    let feature = match String.fromUtf8(item.feature.asSlice()) {
+      Result.Success { value } => value
+      Result.Failure { .. } => "<non-UTF-8>"
+    }
+    StderrWriter.print("silkui: {}: dropped {} {} occurrence(s): {}\n", &.(path, item.count, kind, feature))
+    i = i + 1
+  }
+  return run sheet.encode()
+}
+
+pub effect fn emit(root: string, paths: &[string<'static>], host: string, dom: bool) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let mut i: usize = 0
+  while i < paths.length {
+    let sourceName = run joined(root, paths[i])
+    let sourcePath = run Path.make(String.view(&sourceName))
+    if !run FileSystem.exists(&sourcePath) {
+      let mut message = run String.copy("silkui: stylesheet not found: ")
+      run String.append(&mut message, String.view(&sourceName))
+      fail TaskError { message: move message, status: 1 }
+    }
+    let source = run FileSystem.readFile(&sourcePath)
+    let data = if dom { run Bytes.copy(source.asSlice()) } else { run compiled(source.asSlice(), String.view(&sourceName)) }
+    let destination = run joined(host, String.view(&run name(i, dom)))
+    let file = run Path.make(String.view(&destination))
+    run FileSystem.writeFileWithParents(&file, data.asSlice())
+    i = i + 1
+  }
+}
