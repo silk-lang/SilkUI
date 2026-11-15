@@ -6,26 +6,23 @@
 // and `vite build --watch`, the plugin starts the host after the first build.
 //
 // Under `vite` (the dev server) the host runs the application's modules as Vite serves
-// them, and an edit replaces only the modules it touches: see dev.js.
+// them, and an edit replaces only the modules it touches: see dev.js. The plugin knows no
+// UI framework: `@silkui/react/vite` adds React's JSX, its reconciler fix and Fast Refresh.
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
-import { reconcilerPlugin } from "./reconciler.js";
 import { resolveOptions } from "./resolve.js";
 
 /**
  * @param {object} [options]
  * @param {string} [options.entry] Entry module, relative to the Vite root. Default `src/main.jsx`.
  * @param {string} [options.fileName] Name of the bundle in `build.outDir`. Default `app.js`.
- * @param {string | false} [options.jsx] Package whose JSX runtime compiles JSX, or false to
- *   leave JSX settings alone. Default `@silkui/react`.
  * @param {{ command: string, args?: string[], cwd?: string }} [options.host] Host binary to
  *   start. In watch mode it is given `--watch <bundle>` after `args`, under the dev
  *   server `--dev <port>`.
- * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
  * @param {number} [options.port] Port the dev server listens on for the host. Default: any
  *   free one.
  * @param {"warn" | "error" | "off"} [options.apis] What to do when the application or one
@@ -38,7 +35,6 @@ import { resolveOptions } from "./resolve.js";
 export default function silk(options = {}) {
   const entry = options.entry ?? "src/main.jsx";
   const fileName = options.fileName ?? "app.js";
-  const jsx = options.jsx ?? "@silkui/react";
   const node = options.node === true;
   let bundle = "";
   let watching = false;
@@ -71,7 +67,6 @@ export default function silk(options = {}) {
           rolldownOptions: { output: { codeSplitting: false } },
         },
       };
-      if (jsx !== false) config.oxc = { jsx: { runtime: "automatic", importSource: jsx } };
       return config;
     },
 
@@ -135,9 +130,9 @@ export default function silk(options = {}) {
     },
   };
 
-  const plugins = [buildPlugin, apiPlugin, reconcilerPlugin()];
+  const plugins = [buildPlugin, apiPlugin];
   if (node) plugins.push(builtinsPlugin);
-  return [...plugins, ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
+  return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }
 
 /** The areas of `MISSING` the SilkJS runtime does not have either. */

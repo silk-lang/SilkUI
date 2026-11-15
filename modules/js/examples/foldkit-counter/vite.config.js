@@ -10,7 +10,6 @@ export default defineConfig({
   plugins: [
     silk({
       entry: "src/entry.ts",
-      jsx: false,
       // The document and the DOM classes are there at run time.
       allow: provided,
       host: host ? { command: host, cwd: new URL("../../../..", import.meta.url).pathname } : undefined,

@@ -1,18 +1,11 @@
 // The development side of @silkui/vite: a Vite environment whose modules run in a ui-js host,
 // reached over a local TCP connection the host opens (`--dev <port>`).
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import net from "node:net";
-import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { build, DevEnvironment, transformWithOxc } from "vite";
-import { reconcilerPlugin } from "./reconciler.js";
+import { build, DevEnvironment } from "vite";
 import { resolveOptions } from "./resolve.js";
 
-const require = createRequire(import.meta.url);
-const REFRESH = "virtual:silk-refresh";
-const REFRESH_ID = "\0" + REFRESH;
 // The longest text on one line: the host reads lines of up to one mebibyte.
 const CHUNK = 256 * 1024;
 
@@ -105,55 +98,16 @@ async function bootstrapScript(modules) {
   return `${code}\n__ui.devStart(${JSON.stringify(modules)});`;
 }
 
-/** react-refresh's runtime as an ES module that hooks itself up when it loads. */
-function refreshModule() {
-  // The package exports only `runtime`, which picks this file when NODE_ENV says so.
-  const file = join(dirname(require.resolve("react-refresh/runtime")), "cjs/react-refresh-runtime.development.js");
-  const source = readFileSync(file, "utf8")
-    .replaceAll("process.env.NODE_ENV", JSON.stringify("development"));
-  return `const exports = {};
-${source}
-exports.injectIntoGlobalHook(globalThis);
-globalThis.$RefreshReg$ = () => {};
-globalThis.$RefreshSig$ = () => (type) => type;
-
-let scheduled = false;
-/** Asks React to re-render with the components registered since the last time. */
-export function enqueue() {
-  if (scheduled) return;
-  scheduled = true;
-  setTimeout(() => {
-    scheduled = false;
-    exports.performReactRefresh();
-  }, 16);
-}
-
-/** Whether a module with these exports can be replaced alone: all of them are components. */
-export function isBoundary(module) {
-  let any = false;
-  for (const key in module) {
-    if (key === "__esModule") continue;
-    any = true;
-    if (!exports.isLikelyComponentType(module[key])) return false;
-  }
-  return any;
-}
-
-export const register = exports.register;
-export const createSignatureFunctionForTransform = exports.createSignatureFunctionForTransform;
-`;
-}
-
 /**
  * The plugins of `vite` (serve) for a ui-js application.
- * @param {{ entry: string, jsx: string | false, refresh: boolean, port: number,
- *   host?: { command: string, args?: string[], cwd?: string } }} options
+ * @param {{ entry: string, port: number, host?: { command: string, args?: string[], cwd?: string } }} options
  */
 export function devPlugins(options) {
   const { channel, accept } = createChannel();
-  const refresh = options.refresh && options.jsx !== false;
   let listener = null;
   let child = null;
+  // Modules other plugins ask to run before the entry, such as a framework's refresh runtime.
+  let preload = [];
 
   const main = {
     name: "silk:dev",
@@ -170,8 +124,7 @@ export function devPlugins(options) {
             define,
             // Nothing is left to the host to load: it has no module resolution of its own.
             resolve: { ...resolveOptions, noExternal: true },
-            // Dependencies are bundled before the plugins see them: patch React's reconciler there.
-            optimizeDeps: { noDiscovery: false, rolldownOptions: { transform: { define }, plugins: [reconcilerPlugin()] } },
+            optimizeDeps: { noDiscovery: false, rolldownOptions: { transform: { define } } },
             dev: {
               createEnvironment: (name, config) => new DevEnvironment(name, config, { hot: true, transport: channel }),
             },
@@ -180,9 +133,13 @@ export function devPlugins(options) {
       };
     },
 
+    configResolved(config) {
+      preload = config.plugins.flatMap((plugin) => plugin.api?.silkPreload ?? []);
+    },
+
     async configureServer(server) {
       const entry = options.entry.startsWith("/") ? options.entry : `/${options.entry}`;
-      const bootstrap = await bootstrapScript(refresh ? [REFRESH, entry] : [entry]);
+      const bootstrap = await bootstrapScript([...preload, entry]);
       listener = net.createServer((socket) => accept(socket, bootstrap));
       await new Promise((resolve, reject) => {
         listener.once("error", reject);
@@ -208,50 +165,5 @@ export function devPlugins(options) {
     },
   };
 
-  const react = {
-    name: "silk:refresh",
-    apply: "serve",
-    enforce: "pre",
-
-    resolveId(id) {
-      if (id === REFRESH) return REFRESH_ID;
-    },
-
-    load(id) {
-      if (id === REFRESH_ID) return refreshModule();
-    },
-
-    // JSX with the Fast Refresh registrations, which Vite leaves out for environments
-    // that are not browsers. A module whose exports are all components accepts its own
-    // updates; any other one passes the update on to its importers.
-    async transform(code, id) {
-      if (this.environment.name !== "silk") return;
-      const [file] = id.split("?");
-      if (!/\.[jt]sx$/.test(file) || file.includes("/node_modules/")) return;
-      const result = await transformWithOxc(code, file, {
-        jsx: { runtime: "automatic", importSource: options.jsx, development: false, refresh: true },
-      });
-      if (!result.code.includes("$RefreshReg$(")) return { code: result.code, map: result.map };
-      const name = JSON.stringify(file);
-      return {
-        code: `import * as __silkRefresh from ${JSON.stringify(REFRESH)};
-const __silkReg = globalThis.$RefreshReg$, __silkSig = globalThis.$RefreshSig$;
-globalThis.$RefreshReg$ = (type, id) => __silkRefresh.register(type, ${name} + " " + id);
-globalThis.$RefreshSig$ = __silkRefresh.createSignatureFunctionForTransform;
-${result.code}
-globalThis.$RefreshReg$ = __silkReg;
-globalThis.$RefreshSig$ = __silkSig;
-if (import.meta.hot) {
-  import.meta.hot.accept((next) => {
-    if (next && __silkRefresh.isBoundary(next)) __silkRefresh.enqueue();
-    else import.meta.hot.invalidate();
-  });
-}
-`,
-        map: null,
-      };
-    },
-  };
-
-  return refresh ? [main, react] : [main];
+  return [main];
 }

@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import silk from "@silkui/vite";
+import react from "@silkui/react/vite";
 
 // `npm run build` writes dist/app.js. `npm run dev` serves the modules to a ui-js host and
 // replaces the ones an edit touches, keeping component state. `npm run watch` rebuilds
@@ -13,5 +14,6 @@ export default defineConfig({
       // The demo host reads its fonts and @silkui/core from the repository root.
       host: host ? { command: host, cwd: new URL("../../../..", import.meta.url).pathname } : undefined,
     }),
+    react(),
   ],
 });

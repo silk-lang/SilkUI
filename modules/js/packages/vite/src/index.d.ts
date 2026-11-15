@@ -5,12 +5,8 @@ export interface SilkOptions {
   entry?: string;
   /** Name of the bundle in `build.outDir`. Default `app.js`. */
   fileName?: string;
-  /** Package whose JSX runtime compiles JSX, or false to leave JSX settings alone. Default `@silkui/react`. */
-  jsx?: string | false;
   /** Host binary to start: given `--watch <bundle>` in watch mode, `--dev <port>` under the dev server. */
   host?: { command: string; args?: string[]; cwd?: string };
-  /** React Fast Refresh under the dev server. Default true. */
-  refresh?: boolean;
   /** Port the dev server listens on for the host. Default: any free one. */
   port?: number;
   /** What to do when the build uses a web or Node API the runtime does not have. Default `warn`. */
