@@ -9,7 +9,7 @@ the running window.
 
 ## @silkui/core
 
-[packages/ui](packages/ui) is the node and event API. Its primitives are the tree's own (box,
+[packages/core](packages/core) is the node and event API. Its primitives are the tree's own (box,
 text, input, image, icon, canvas). Its methods and its event flow are the DOM's.
 
 ```js
@@ -93,7 +93,7 @@ mount(createBox({ width: 400, height: 300 }, button));
 
 ## @silkui/react
 
-[packages/ui-react](packages/ui-react) renders React components to the tree. Host elements are the
+[packages/react](packages/react) renders React components to the tree. Host elements are the
 tree's node kinds, and strings in children become text nodes.
 
 ```jsx
@@ -153,7 +153,7 @@ the web globals below.
 
 ## @silkui/foldkit
 
-[packages/ui-foldkit](packages/ui-foldkit) runs [Foldkit](https://foldkit.dev) programs (the
+[packages/foldkit](packages/foldkit) runs [Foldkit](https://foldkit.dev) programs (the
 Elm architecture on Effect) on the tree, with the `foldkit` package as it is published.
 Foldkit has no renderer interface: its virtual DOM patches through `document`. So the package
 provides a `document` and the DOM members Foldkit uses, and every element is a tree node.
@@ -208,7 +208,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
   `http://localhost/`, where the realm has `URL` (the [SilkJS runtime](node) does).
 - **Timing.** The first render is there for the window's first frame. After that Foldkit
   renders the Model in an animation frame, as in a browser.
-- **Building.** `silk({ entry: "src/entry.ts", jsx: false, allow: provided })` with
+- **Building.** `silk({ entry: "src/entry.ts", allow: provided })` with
   `provided` from `@silkui/foldkit/apis`, so the missing API report leaves out what this
   package provides. `vite build --watch` reloads the application on every change; the dev
   server's module replacement does not run Foldkit programs yet.
@@ -220,15 +220,19 @@ the same `motion.js` draws every frame, started by a Mount on the page element.
 ## @silkui/vite
 
 [packages/vite](packages/vite) is the Vite plugin. A host evaluates one ES module, so the
-plugin sets up a library build with a single output file, the JSX runtime of
-`@silkui/react`, and `process.env.NODE_ENV` from the Vite mode.
+plugin sets up a library build with a single output file and `process.env.NODE_ENV` from
+the Vite mode. It knows no UI framework. For React, add `@silkui/react/vite` beside it: it
+compiles JSX with the `@silkui/react` runtime, applies the reconciler's sibling-walk fix
+(see [reconciler.js](packages/react/src/reconciler.js)), and adds Fast Refresh under the dev
+server (`react({ refresh: false })` turns it off).
 
 ```js
 import { defineConfig } from "vite";
 import silk from "@silkui/vite";
+import react from "@silkui/react/vite";
 
 export default defineConfig({
-  plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } })],
+  plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } }), react()],
 });
 ```
 
@@ -264,8 +268,9 @@ features can be picked for each build.
 Under the dev server the host runs the application's modules as Vite serves them, and an
 edit replaces only the modules it touches:
 
-- A component file (every export is a React component) is swapped where it is with React
-  Fast Refresh. Component state and the rest of the application stay as they were.
+- With `@silkui/react/vite`, a component file (every export is a React component) is
+  swapped where it is with React Fast Refresh. Component state and the rest of the
+  application stay as they were.
 - Any other module passes the update on to its importers. When nothing accepts it, the
   window gets a new realm and the application starts again.
 - `import.meta.hot` works as in Vite: `accept`, `dispose`, `invalidate`, `data`.
@@ -392,7 +397,7 @@ silk run --manifest-path modules/js/demo/silk.toml
 
 `@silkui/core` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
 `Source.read("app.js")`), so the executable runs from any directory. After an edit to
-`packages/ui/src/index.js`, `silk task embed-assets` regenerates
+`packages/core/src/index.js`, `silk task embed-assets` regenerates
 `src/generated_library.silk`. `silk task native check` runs the demo with `--check`.
 
 ### Production builds

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { installMock } from "../../ui/test/mock.js";
+import { installMock } from "../../core/test/mock.js";
 
 const mock = installMock();
 const { createElement: h, useState } = await import("react");

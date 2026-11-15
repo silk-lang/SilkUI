@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
-import { installMock } from "../../ui/test/mock.js";
+import { installMock } from "../../core/test/mock.js";
 
 const ui = installMock();
 // Frames run when a test asks: Foldkit renders in one.
