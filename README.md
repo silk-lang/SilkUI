@@ -10,7 +10,7 @@ screen. This repository holds:
   `@silkui/vite`), and the DevTools (`ui-inspect`). A single front door, the `silkui` package,
   is in progress.
 - **Loom**: the Elm-style UI framework written in Silk, with Loom Components. It lives here for
-  now and is being renamed from `ui-app` and `ui-components` to `loom` and `loom-components`.
+  now, in `modules/loom` and `modules/loom-components`, and depends only on `ui-protocol`.
 
 JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
 The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
