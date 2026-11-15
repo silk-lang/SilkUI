@@ -33,6 +33,8 @@ import { resolveOptions } from "./resolve.js";
  *   what that runtime has.
  */
 export default function silk(options = {}) {
+  // silkui's tasks start Vite with the host they built in SILKUI_HOST.
+  if (options.host === undefined && process.env.SILKUI_HOST) options = { ...options, host: { command: process.env.SILKUI_HOST } };
   const entry = options.entry ?? "src/main.jsx";
   const fileName = options.fileName ?? "app.js";
   const node = options.node === true;

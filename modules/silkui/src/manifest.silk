@@ -1,0 +1,151 @@
+//! What the generated hosts take from the project's `silk.toml`: its package name and Silk
+//! version, and where its `silkui` dependency comes from, so a host gets the same revision
+//! of the window packages.
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
+import silk.collections.list { List }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { InvalidUtf8, String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, TomlChild, Value }
+
+/// The project as its manifest describes it.
+pub struct Project {
+  /// The project directory, absolute.
+  pub root: String,
+  /// `[package] name`.
+  pub name: String,
+  /// `[package] silk-version`, or empty.
+  pub silkVersion: String,
+  /// Where the `silkui` package comes from, as TOML fields with `path` left out: `git = "…",
+  /// rev = "…", ` for a Git dependency, empty for a path one.
+  pub git: String,
+  /// The `silkui` package's directory: inside the repository for a Git dependency, relative
+  /// to the project root or absolute for a path one.
+  pub path: String,
+}
+
+effect fn text(bytes: &[u8]) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(String.copyUtf8(bytes)) {
+    Result<Result<String, InvalidUtf8>, OutOfMemoryError>.Success { value } => match move value {
+      Result<String, InvalidUtf8>.Success { value: copied } => move copied
+      Result<String, InvalidUtf8>.Failure { .. } => run Task.abort("silkui: silk.toml is not UTF-8")
+    }
+    Result<Result<String, InvalidUtf8>, OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+fn field<'a>(value: &'a Value, name: string) -> string<'a> {
+  return Toml.field(value, name) |> Toml.asString |> Option<string>.unwrapOr("")
+}
+
+/// Finds the dependency on package `silkui` in `table`'s members.
+effect fn dependency(table: Option<&Value>, project: &mut Project) -> bool
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let value = match table {
+    Option<&Value>.Some { value } => value
+    Option<&Value>.None => { return false }
+  }
+  match &value.* {
+    Value.Table { entries, kind: _ } => {
+      let boxed = Box<List<TomlChild>>.get(&entries)
+      let children = List<TomlChild>.asSlice(&boxed[0])
+      let mut at: usize = 0
+      while at < children.length {
+        match &children[at] {
+          TomlChild.Member { entry } => {
+            let package = field(&entry.value, "package")
+            let path = field(&entry.value, "path")
+            if package == "silkui" || (package == "" && String.endsWith(path, "silkui")) {
+              let git = field(&entry.value, "git")
+              if git != "" {
+                run String.append(&mut project.git, "git = \"")
+                run String.append(&mut project.git, git)
+                run String.append(&mut project.git, "\", ")
+                let rev = field(&entry.value, "rev")
+                let branch = field(&entry.value, "branch")
+                if rev != "" {
+                  run String.append(&mut project.git, "rev = \"")
+                  run String.append(&mut project.git, rev)
+                  run String.append(&mut project.git, "\", ")
+                } else if branch != "" {
+                  run String.append(&mut project.git, "branch = \"")
+                  run String.append(&mut project.git, branch)
+                  run String.append(&mut project.git, "\", ")
+                }
+              }
+              project.path = run String.copy(path)
+              return true
+            }
+          }
+          _ => {}
+        }
+        at = at + 1
+      }
+    }
+    _ => {}
+  }
+  return false
+}
+
+/// Reads the project's manifest, `silk.toml` in the task's root.
+pub effect fn read() -> Project
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let root = run Task.root()
+  let manifest = run Path.join(&root, "silk.toml")
+  let bytes = run FileSystem.readFile(&manifest)
+  let document = match move run Effect.result(Toml.parse(Bytes.asSlice(&bytes))) {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError failure => { fail move failure }
+      TomlError failure => {
+        drop failure
+        run Task.abort("silkui: silk.toml is not valid TOML")
+      }
+    }
+  }
+  let package = Toml.field(&document, "package")
+  let mut project = Project {
+    root: run text(Path.rawBytes(&root)),
+    name: run String.copy(Toml.fieldAt(package, "name") |> Toml.asString |> Option<string>.unwrapOr("")),
+    silkVersion: run String.copy(Toml.fieldAt(package, "silk-version") |> Toml.asString |> Option<string>.unwrapOr("")),
+    git: String.make(),
+    path: String.make(),
+  }
+  if String.view(&project.name) == "" { run Task.abort("silkui: silk.toml has no [package] name") }
+  let tasks = Toml.field(&document, "profiles") |> Toml.fieldAt("tasks") |> Toml.fieldAt("dependencies")
+  if !run dependency(tasks, &mut project) {
+    if !run dependency(Toml.field(&document, "dependencies"), &mut project) {
+      run Task.abort("silkui: silk.toml has no dependency on the silkui package")
+    }
+  }
+  return move project
+}
+
+/// The TOML value of a dependency on the package at `subdirectory` of the silkui
+/// package's directory (such as `window`), for a manifest two directories below the project.
+pub effect fn sibling(project: &Project, subdirectory: string, package: string) -> String
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run String.copy("{ ")
+  run String.append(&mut out, String.view(&project.git))
+  run String.append(&mut out, "path = \"")
+  let path = String.view(&project.path)
+  if String.view(&project.git) == "" && !String.startsWith(path, "/") {
+    // .silk/<target>/ is two directories below the project root.
+    run String.append(&mut out, "../../")
+  }
+  run String.append(&mut out, path)
+  run String.append(&mut out, "/")
+  run String.append(&mut out, subdirectory)
+  run String.append(&mut out, "\", package = \"")
+  run String.append(&mut out, package)
+  run String.append(&mut out, "\" }")
+  return move out
+}
