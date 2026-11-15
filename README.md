@@ -11,7 +11,7 @@ screen. This repository holds:
   one dependency that builds and runs an app from its `tasks.silk`.
 - **Loom**, the Elm-style UI framework written in Silk, with Loom Components and the DevTools
   (a Loom app), lives in [silk-lang/loom](https://github.com/silk-lang/loom). It is built on
-  this repository: lib-ui's docs and benchmarks depend on it by Git like any other app.
+  this repository: silkui's docs and benchmarks depend on it by Git like any other app.
 
 JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
 The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
@@ -43,7 +43,7 @@ docs/build.sh serve   # builds the site and serves it on http://localhost:8017
 
 ## Run a demo locally
 
-Run commands from the **lib-ui repository root**, including when using a Git worktree.
+Run commands from the **silkui repository root**, including when using a Git worktree.
 The demo launcher builds the selected executable and opens its window; no workspace-wide
 build or sibling repository checkout is needed.
 
@@ -161,7 +161,7 @@ All 31 original UI workspace packages remain members of `silk.toml`:
 
 The manifests explicitly export consumable modules. Test-only packages declare their test module as the library entrypoint rather than inventing a runnable application. CLI executables and demos are developer tools, not dependencies of the API packages. Shared scenes, CPU/GPU rendering, vector graphics, codecs, and atlases remain in `lib-graphics`; native windows and WebGPU in `lib-native`; layout/styles in `lib-css`; parsing/shaping/rasterization in `lib-fonts`; SVG parsing/rendering in `lib-svg`. None are copied into this repository.
 
-UI-to-UI dependencies stay local, except in the packages built with Loom (`docs`, `docs/examples`, `docs/live`, `docs/shots`, `docs/tests`, the Loom apps under `docs/examples/apps`, `modules/bench`, `modules/bench/web`, `modules/silkui/examples/loom`). Those pin silk-lang/loom and take every other lib-ui package by Git at the lib-ui commit that Loom pins, since a build can hold only one copy of `ui-tree`; moving Loom's pin means moving theirs (both `rev`s) too. External dependencies use canonical `https://github.com/silk-lang/lib-NAME.git` URLs with exact 40-character revisions and package paths. Consumers must use these same revisions throughout their graph: Silk does not accept two physical checkouts of one named package.
+UI-to-UI dependencies stay local, except in the packages built with Loom (`docs`, `docs/examples`, `docs/live`, `docs/shots`, `docs/tests`, the Loom apps under `docs/examples/apps`, `modules/bench`, `modules/bench/web`, `modules/silkui/examples/loom`). Those pin silk-lang/loom and take every other package of this repository by Git at the commit that Loom pins, since a build can hold only one copy of `ui-tree`; moving Loom's pin means moving theirs (both `rev`s) too. External dependencies use canonical `https://github.com/silk-lang/NAME.git` URLs with exact 40-character revisions and package paths. Consumers must use these same revisions throughout their graph: Silk does not accept two physical checkouts of one named package.
 
 ## Building and checking
 
