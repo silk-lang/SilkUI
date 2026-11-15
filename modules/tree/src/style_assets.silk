@@ -1,0 +1,89 @@
+//! Compiled application sheets, adopted before a root's first frame. These bytes
+//! come from the build; no stylesheet text compiler is linked by this module.
+import engine { UiTree, TreeError }
+import batch { Batch }
+import style_sheets
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+struct Installed { root: u32, revision: usize }
+
+/// App assets use ids from u32.MAX downwards, leaving ordinary low ids to the
+/// application's own adoptedStyleSheets. Their order is the order of append.
+pub struct StyleAssets {
+  sources: List<Bytes>,
+  installed: List<Installed>,
+  revision: usize,
+}
+
+impl StyleAssets {
+  pub fn make() -> StyleAssets {
+    return StyleAssets { sources: List<Bytes>.make(), installed: List<Installed>.make(), revision: 0 }
+  }
+
+  pub effect fn from(sources: &[&[u8]]) -> StyleAssets ! OutOfMemoryError ? &mut Allocator {
+    let mut assets = StyleAssets.make()
+    let mut i: usize = 0
+    while i < sources.length {
+      run assets.append(sources[i])
+      i = i + 1
+    }
+    return move assets
+  }
+
+  pub fn length(self: &Self) -> usize { return self.sources.length() }
+
+  pub effect fn append(self: &mut Self, bytes: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.sources.append(run Bytes.copy(bytes))
+    self.revision = self.revision + 1
+  }
+
+  /// Replaces bytes while preserving adoption order. The next frame installs the
+  /// new version in every open root through ReplaceStyleSheet.
+  pub effect fn replace(self: &mut Self, index: usize, bytes: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    if index >= self.sources.length() { return false }
+    let copied = run Bytes.copy(bytes)
+    let sources = self.sources.asMutSlice()
+    sources[index] = move copied
+    self.revision = self.revision + 1
+    return true
+  }
+
+  /// Called for the client's root before layout, including windows opened later.
+  /// It never adopts into another client's root (such as the embedded inspector).
+  pub effect fn serve(self: &mut Self, tree: &mut UiTree<'_>, root: u32) -> bool
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.sources.length() == 0 || !tree.rootOpen(root) { return false }
+    let mut at: usize = 0
+    while at < self.installed.length() {
+      if !tree.rootOpen(self.installed.asSlice()[at].root) { drop self.installed.remove(at) }
+      else { at = at + 1 }
+    }
+    let mut installed: usize = 0
+    while installed < self.installed.length() && self.installed.asSlice()[installed].root != root { installed = installed + 1 }
+    let context = style_sheets.index(tree.styleSheets.asSlice(), root)
+    let present = context != usize.MAX && tree.styleSheets.asSlice()[context].sheets.index(u32.MAX) != usize.MAX
+    if !present || installed == self.installed.length() || self.installed.asSlice()[installed].revision != self.revision {
+      let mut batch = Batch.make()
+      let mut i: usize = 0
+      while i < self.sources.length() {
+        let id = u32.MAX - usize.toU32(i)
+        let exists = context != usize.MAX && tree.styleSheets.asSlice()[context].sheets.index(id) != usize.MAX
+        if exists { run batch.replaceStyleSheet(root, id, self.sources.asSlice()[i].asSlice()) }
+        else { run batch.adoptStyleSheet(root, id, self.sources.asSlice()[i].asSlice()) }
+        i = i + 1
+      }
+      run tree.apply(run batch.take())
+      if installed == self.installed.length() { run self.installed.append(Installed { root: root, revision: self.revision }) }
+      else {
+        let versions = self.installed.asMutSlice()
+        versions[installed].revision = self.revision
+      }
+      return true
+    }
+    return false
+  }
+}
