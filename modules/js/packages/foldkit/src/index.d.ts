@@ -1,6 +1,12 @@
 import type { Attribute } from "foldkit/html";
 import type { Node as TreeNode } from "@silkui/core";
 
+/**
+ * The page's document: `<html><body><div id="root">`, filling the window, with every element
+ * a tree node. Importing the package also installs it as the global `document`.
+ */
+export declare const document: Document;
+
 /** A style object, as `h.Style` takes it. */
 export type Style = Readonly<Record<string, string>>;
 

@@ -20,7 +20,7 @@ import { resolveOptions } from "./resolve.js";
  * @param {object} [options]
  * @param {string} [options.entry] Entry module, relative to the Vite root. Default `src/main.jsx`.
  * @param {string} [options.fileName] Name of the bundle in `build.outDir`. Default `app.js`.
- * @param {{ command: string, args?: string[], cwd?: string }} [options.host] Host binary to
+ * @param {{ command: string, args?: readonly string[], cwd?: string }} [options.host] Host binary to
  *   start. In watch mode it is given `--watch <bundle>` after `args`, under the dev
  *   server `--dev <port>`.
  * @param {number} [options.port] Port the dev server listens on for the host. Default: any

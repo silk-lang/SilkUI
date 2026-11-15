@@ -4,12 +4,13 @@ import type { Node } from "@silkui/core";
 export interface Root {
   /** Renders `element`; the commit is done when it returns, so a window's first frame has it. */
   render(element: ReactNode): void;
+  /** Unmounts what the root rendered. */
   unmount(): void;
 }
 
 /**
- * A React root in `container`, a @silkui/core node. Without one, a new box is mounted as the
- * root of the window's tree.
+ * A React root in `container`, a @silkui/core node. Without one it renders into the root of
+ * the window's tree, mounting a new box when there is none.
  */
 export function createRoot(container?: Node): Root;
 
