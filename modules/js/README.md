@@ -421,6 +421,18 @@ demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 
 the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
 the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
+## On the web canvas
+
+[web](web) (`ui-js-web`) runs the same bundle in a browser: the tree compiled to WebAssembly
+draws on a canvas and the application runs on the browser's JavaScript engine, through a
+second implementation of the `__ui` natives. Foldkit bundles add `define: pageGlobals` from
+`@silkui/foldkit/apis`. See [web/README.md](web/README.md) for how it works and its first
+frame numbers.
+
+```sh
+silk task browser serve --app modules/js/examples/plain-counter/dist/app.js
+```
+
 ## Status
 
 - Tests: `silk test --manifest-path modules/js/tests/silk.toml --root src/tests.silk` from the

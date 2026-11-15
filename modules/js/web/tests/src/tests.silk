@@ -1,0 +1,108 @@
+//! The calls the page's `__ui` writes (browser/js-host.js), decoded into the tree.
+import ui_js_web.wire as wire
+import ui_tree.lib { Tree, TreeError, ProtocolError, NodeId }
+import ui_tree.legacy { Batch, Keyframe }
+import ui_fixtures.fixtures as fixtures
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.u64
+import silk.num.f64
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+/// Writes calls as js-host.js `Calls` does.
+struct Calls {
+  bytes: List<u8>,
+}
+
+impl Calls {
+  effect fn word(self: &mut Self, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut i: u32 = 0
+    while i < 4 {
+      run self.bytes.append(u32.toU8(u32.bitAnd(u32.shiftRight(value, i * 8), 255)))
+      i = i + 1
+    }
+  }
+
+  effect fn op(self: &mut Self, code: u8, id: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.bytes.append(code)
+    run self.word(id)
+  }
+
+  effect fn number(self: &mut Self, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bits = f64.toBits(value)
+    run self.word(u64.toU32(u64.bitAnd(bits, 4294967295)))
+    run self.word(u64.toU32(u64.shiftRight(bits, 32)))
+  }
+
+  effect fn text(self: &mut Self, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    let bytes = String.utf8Bytes(value)
+    run self.word(usize.toU32(bytes.length))
+    run self.bytes.appendSlice(bytes)
+  }
+}
+
+import silk.num.usize
+
+effect fn decoded() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut calls = Calls { bytes: List<u8>.make() }
+  run calls.op(wire.CREATE, 1)
+  run calls.word(0)
+  run calls.op(wire.CREATE, 2)
+  run calls.word(1)
+  run calls.op(wire.ROOT, 1)
+  run calls.op(wire.APPEND, 1)
+  run calls.word(2)
+  run calls.op(wire.SET_TEXT, 2)
+  run calls.text("h\u{e9}llo")
+  run calls.op(wire.STYLE, 1)
+  run calls.word(0)
+  run calls.text("width: 120px; height: 40px")
+  run calls.op(wire.ATTRIBUTE, 1)
+  run calls.text("tabIndex")
+  run calls.bytes.append(1)
+  run calls.number(3.0)
+  run calls.op(wire.ATTRIBUTE, 1)
+  run calls.text("role")
+  run calls.bytes.append(2)
+  run calls.text("nope button")
+  run calls.op(wire.ATTRIBUTE, 2)
+  run calls.text("role")
+  run calls.bytes.append(2)
+  run calls.text("nothing")
+  // Keyframes carry no node id.
+  run calls.bytes.append(wire.KEYFRAME)
+  run calls.number(0.0)
+  run calls.text("opacity: 0")
+  run calls.bytes.append(wire.KEYFRAMES)
+  run calls.text("fade")
+
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  let unknown = run wire.decode(calls.bytes.asSlice(), &mut batch, &mut frames)
+  run Testing.expect(frames.length() == 0, "@keyframes took its frames")
+  run Testing.expect(unknown.length() == 1, "one role text the tree does not have")
+  run Testing.expect(String.view(&unknown.asSlice()[0].value) == "nothing", "the report names it")
+
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  run tree.apply(run batch.take())
+  let text = match tree.view(NodeId.of(2)) {
+    Option.Some { value } => value.text() == "h\u{e9}llo"
+    Option.None => false
+  }
+  run Testing.expect(text, "the text node holds the UTF-8 text")
+  let tab = match tree.view(NodeId.of(1)) {
+    Option.Some { value } => value.tabIndex() == 3
+    Option.None => false
+  }
+  run Testing.expect(tab, "a number attribute arrives as a number")
+}
+
+test effect fn pageCallsDecodeIntoTheTree() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run decoded() |> Effect.provideMut<Allocator>(&mut allocator)
+}

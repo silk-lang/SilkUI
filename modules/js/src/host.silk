@@ -2,10 +2,9 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
-import silk.text.string { String, InvalidUtf8 }
+import silk.text.string { String }
 import silk.num.u32
-import silk.num.f32
-import ui_tree.lib { Tree, ProtocolError, Input, EventKind, EventRecord, Event, Motion }
+import ui_tree.lib { Tree, ProtocolError, Input, EventRecord, Event, Motion }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree.node { Event as RawEvent }
 import silkjs.js_engine { Engine }
@@ -41,6 +40,7 @@ import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
+import ui_js_calls.lib { kindCode, numbersOf, motionOf, richStrings }
 
 /// How much native stack JavaScript may use below the frame that opened the host.
 const STACK_BYTES: usize = 4194304
@@ -59,88 +59,6 @@ pub struct JsHost<'m> {
   runtime: *mut HeapHeader,
   context: *mut HeapHeader,
   closed: bool,
-}
-
-/// The position of `kind` in the ui-protocol `LISTEN_*` flags, which is the number JavaScript
-/// receives as the event's kind.
-pub fn kindCode(kind: EventKind) -> u32 {
-  if kind == EventKind.PointerDown { return 0 }
-  if kind == EventKind.PointerUp { return 1 }
-  if kind == EventKind.Click { return 2 }
-  if kind == EventKind.PointerMove { return 3 }
-  if kind == EventKind.PointerEnter { return 4 }
-  if kind == EventKind.PointerLeave { return 5 }
-  if kind == EventKind.Wheel { return 6 }
-  if kind == EventKind.KeyDown { return 7 }
-  if kind == EventKind.KeyUp { return 8 }
-  if kind == EventKind.Focus { return 9 }
-  if kind == EventKind.Blur { return 10 }
-  if kind == EventKind.Input { return 11 }
-  if kind == EventKind.Scroll { return 12 }
-  if kind == EventKind.Layout { return 13 }
-  if kind == EventKind.PointerCancel { return 14 }
-  if kind == EventKind.GotPointerCapture { return 15 }
-  if kind == EventKind.Load { return 17 }
-  if kind == EventKind.LostPointerCapture { return 16 }
-  if kind == EventKind.Error { return 18 }
-  if kind == EventKind.TransitionRun { return 19 }
-  if kind == EventKind.TransitionStart { return 20 }
-  if kind == EventKind.TransitionEnd { return 21 }
-  if kind == EventKind.TransitionCancel { return 22 }
-  if kind == EventKind.AnimationStart { return 23 }
-  if kind == EventKind.AnimationIteration { return 24 }
-  if kind == EventKind.AnimationEnd { return 25 }
-  if kind == EventKind.AnimationCancel { return 26 }
-  return 27
-}
-
-/// The property or `@keyframes` name and elapsed time of a transition or animation event.
-fn motionOf(event: &Event) -> Option<&Motion> {
-  return match &event.* {
-    Event.TransitionRun { motion } => Option<&Motion>.some(&motion)
-    Event.TransitionStart { motion } => Option<&Motion>.some(&motion)
-    Event.TransitionEnd { motion } => Option<&Motion>.some(&motion)
-    Event.TransitionCancel { motion } => Option<&Motion>.some(&motion)
-    Event.AnimationStart { motion } => Option<&Motion>.some(&motion)
-    Event.AnimationIteration { motion } => Option<&Motion>.some(&motion)
-    Event.AnimationEnd { motion } => Option<&Motion>.some(&motion)
-    Event.AnimationCancel { motion } => Option<&Motion>.some(&motion)
-    _ => Option<&Motion>.None
-  }
-}
-
-/// The numbers of an event, in the order `__ui.dispatch` receives them after the target:
-/// two positions, the modifier bits, and two more values.
-///
-/// - pointer events: x, y, modifiers, button, click count
-/// - wheel: x, y, modifiers, deltaX, deltaY
-/// - key events: 0, 0, modifiers, 1 for a repeat
-/// - input: selection anchor, selection focus, 0, active marks
-/// - selection change: selection start, selection end, 0, active marks
-/// - scroll: x, y
-/// - layout: left, top, 0, width, height
-/// - transition and animation events: elapsed seconds
-pub fn numbersOf(event: &Event) -> [f64; 5] {
-  if let Option<&Motion>.Some { value: motion } = motionOf(event) {
-    return [f32.toF64(motion.elapsedTime), 0.0, 0.0, 0.0, 0.0]
-  }
-  return match &event.* {
-    Event.PointerDown { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), u32.toF64(count)]
-    Event.PointerUp { pointer, button } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), 0.0]
-    Event.Click { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), u32.toF64(count)]
-    Event.PointerMove { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerEnter { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerLeave { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerCancel { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.Wheel { pointer, deltaX, deltaY } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), f32.toF64(deltaX), f32.toF64(deltaY)]
-    Event.KeyDown { key, repeat } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), if repeat { 1.0 } else { 0.0 }, 0.0]
-    Event.KeyUp { key } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), 0.0, 0.0]
-    Event.Input { change } => [usize.toF64(change.selection.anchor), usize.toF64(change.selection.focus), 0.0, u32.toF64(change.activeMarks), 0.0]
-    Event.SelectionChange { selection, activeMarks } => [usize.toF64(selection.anchor), usize.toF64(selection.focus), 0.0, u32.toF64(activeMarks), 0.0]
-    Event.Scroll { x, y } => [f32.toF64(x), f32.toF64(y), 0.0, 0.0, 0.0]
-    Event.Layout { bounds } => [f32.toF64(bounds.xMin), f32.toF64(bounds.yMin), 0.0, f32.toF64(bounds.xMax - bounds.xMin), f32.toF64(bounds.yMax - bounds.yMin)]
-    _ => [0.0, 0.0, 0.0, 0.0, 0.0]
-  }
 }
 
 /// A JavaScript string of `value`, or undefined when it is too long to be one.
@@ -188,61 +106,6 @@ pub effect fn thirdString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allo
 pub effect fn fourthString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
   let packed = run richStrings(event)
   return run jsString(String.view(&packed[1]))
-}
-
-effect fn richStrings(event: &Event) -> [String; 2] ! OutOfMemoryError ? &mut Allocator {
-  let mut marks = String.make()
-  let mut atoms = String.make()
-  match &event.* {
-    Event.Input { change } => {
-      let spans = change.marks.asSlice()
-      let mut i: usize = 0
-      while i < spans.length {
-        run appendNumber(&mut marks, spans[i].start)
-        run marks.append(",")
-        run appendNumber(&mut marks, spans[i].end)
-        run marks.append(",")
-        run appendNumber(&mut marks, u32.toUsize(spans[i].marks))
-        run marks.append(";")
-        i = i + 1
-      }
-      let list = change.atoms.asSlice()
-      i = 0
-      while i < list.length {
-        run appendNumber(&mut atoms, u32.toUsize(list[i].kind))
-        run atoms.append("\u{0}")
-        run atoms.append(String.view(&list[i].label))
-        run atoms.append("\u{0}")
-        run atoms.append(String.view(&list[i].data))
-        run atoms.append("\u{0}")
-        i = i + 1
-      }
-    }
-    _ => ()
-  }
-  return [move marks, move atoms]
-}
-
-effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut digits: [u8; 20] = [0; 20]
-  let mut count: usize = 0
-  let mut rest = value
-  while true {
-    digits[count] = usize.toU8(rest % 10) + 48
-    count = count + 1
-    rest = rest / 10
-    if rest == 0 {
-      break
-    }
-  }
-  while count > 0 {
-    count = count - 1
-    let one: [u8; 1] = [digits[count]]
-    match String.fromUtf8(&one) {
-      Result<string, InvalidUtf8>.Success { value: text } => { run out.append(text) }
-      Result<string, InvalidUtf8>.Failure { .. } => ()
-    }
-  }
 }
 
 effect fn define<'a, 'b, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, object: ValueRef<'b>, native: bridge.Native) -> () ! JsException ? &mut Allocator {
