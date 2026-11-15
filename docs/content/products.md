@@ -2,7 +2,7 @@
 
 Silk has four brands, and each does one job. Silk compiles, SilkJS runs JavaScript, Silk UI puts things on screen, and Loom is the Silk-native way to write what goes on screen. This page names every product once, so the rest of the docs can use the names without explaining them.
 
-> **Note:** Some of these names are newer than the code. Packages are being renamed to match this page, and the `silkui` front door is still being built. Where a package has an old name today, the table says so.
+> **Note:** The `silkui` front door is still being built. Every other name on this page is the name in the code.
 
 ## The four brands
 
