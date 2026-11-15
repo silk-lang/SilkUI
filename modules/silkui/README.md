@@ -8,7 +8,7 @@ so the project never assembles hosts, fonts, GPU start-up or bundles by hand.
 | Written in | Files the project owns | What silkui generates |
 | --- | --- | --- |
 | React, Foldkit, plain JS | `silk.toml`, `src/tasks.silk`, a Vite project in `web/` | The window host in `.silk/window/`, with the bundle embedded in release builds |
-| Loom | `silk.toml`, `src/tasks.silk`, `src/app.silk` with the model, view and update | The window host in `.silk/window/`, which runs the app's `Model` |
+| Loom | `silk.toml`, `src/tasks.silk`, `src/app.silk` with the model, view and update | A host per target in `.silk/<target>/` that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
 
 `.silk/` is git-ignored (silkui writes its `.gitignore`) and rewritten on every build. It is
 readable: each host is a manifest and a `main.silk` of a few lines that call into
@@ -50,9 +50,9 @@ An app goes through three stages, and each step is scoped under the stage it tak
 | `App.host(mode)` | App | Writes the host of each target into `.silk/<target>/`; `Mode.Dev` hosts have the development tools |
 | `App.compile(mode)` | Built | Runs `silk build` on each host |
 | `App.build(mode)` | Built | The three above, in order |
-| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>` |
-| `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; otherwise the program |
-| `Running.watch()` | end | Runs until the window closes. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds and restarts it |
+| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>`, and each page to `<dir>/<target>/` |
+| `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
+| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window or reloads the page |
 
 `App.tap(fn)`, `Built.tap(fn)` and `Running.tap(fn)` run a function on the value and pass it
 on; `App.map` and `Built.map` take an effect closure that makes a new value of the same
@@ -76,10 +76,24 @@ no inspector.
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no hot reload yet: `dev` builds the bundle once |
-| `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas()`, `Target.webDom()` | One or more; `dev` launches the first. silkui builds `window` today; the web targets fail with one line naming the framework and target |
-| `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one |
+| `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
+| `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
-Fonts are the ones installed on the machine.
+Fonts are the ones installed on the machine. A `web-canvas` page has no access to those, so it
+gets the tree's own default fonts.
+
+## The web targets
+
+A Loom app on `web-canvas` runs the tree compiled to wasm and draws it with WebGPU on a canvas
+that fills the page (Chrome or Edge 137 and later: the page waits on the GPU through JSPI). On
+`web-dom` the same `Model` drives the page's own elements through the protocol, and the browser
+does layout and text.
+
+`build` writes a static site to `dist/<target>/`: `index.html`, `app.wasm` and the scripts that
+load it, which any static file server can serve. `dev --target web-canvas` (or `web-dom`) serves
+it from `.silk/<target>/site/`, rebuilds when `src/` changes, and the open page reloads itself.
+A `web-canvas` rebuild links the whole tree to wasm, which takes a minute or two; `web-dom`
+takes seconds.
 
 ## The project's manifest
 
@@ -122,9 +136,11 @@ so they always match it.
 
 ## Limits
 
-- Targets: `window` only. Loom on `web-canvas` and `web-dom`, and JavaScript apps on
-  `web-canvas`, come next.
-- Starting Vite and the app beside the tasks needs subprocesses, which Silk has on macOS and
-  Linux only: `dev` and `launch` fail on Windows.
+- JavaScript apps run in a window only: on `web-canvas` they come next, `web-dom` later.
+- A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
+- The web targets read the page scripts from Silk's checkouts of lib-ui and lib-native, so a Git
+  dependency on silkui must be pinned with `rev`.
+- Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
+  that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.
 - The examples install `@silkui/*` from this repository (`file:` dependencies with
   `install-links`) until the packages are on npm.
