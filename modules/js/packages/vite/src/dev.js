@@ -100,7 +100,7 @@ async function bootstrapScript(modules) {
 
 /**
  * The plugins of `vite` (serve) for a ui-js application.
- * @param {{ entry: string, port: number, host?: { command: string, args?: string[], cwd?: string } }} options
+ * @param {{ entry: string, port: number, host?: { command: string, args?: readonly string[], cwd?: string } }} options
  */
 export function devPlugins(options) {
   const { channel, accept } = createChannel();

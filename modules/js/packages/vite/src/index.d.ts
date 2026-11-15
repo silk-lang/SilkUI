@@ -6,13 +6,13 @@ export interface SilkOptions {
   /** Name of the bundle in `build.outDir`. Default `app.js`. */
   fileName?: string;
   /** Host binary to start: given `--watch <bundle>` in watch mode, `--dev <port>` under the dev server. */
-  host?: { command: string; args?: string[]; cwd?: string };
+  host?: { command: string; args?: readonly string[]; cwd?: string };
   /** Port the dev server listens on for the host. Default: any free one. */
   port?: number;
   /** What to do when the build uses a web or Node API the runtime does not have. Default `warn`. */
   apis?: "warn" | "error" | "off";
   /** Such APIs the application provides itself. */
-  allow?: string[];
+  allow?: readonly string[];
   /**
    * The host runs the full SilkJS runtime (ui-js-node): Node builtins stay `node:` imports,
    * and `apis` reports only what that runtime lacks.

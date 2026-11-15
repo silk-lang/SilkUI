@@ -1,33 +1,85 @@
 # @silkui/vite
 
-Vite plugin for ui-js applications: a library build with one ES module for the host to
-evaluate, and a reload of the native window after each rebuild. It knows no UI framework:
-a React application adds `react()` from `@silkui/react/vite` for JSX and Fast Refresh.
+The [Vite](https://vite.dev) plugin for [Silk UI](https://github.com/silk-lang/SilkUI)
+JavaScript apps. It builds the app into the one ES module a Silk UI host runs, serves its
+modules to the window under the dev server with hot module replacement, and reports the web
+and Node APIs the build uses that the embedded SilkJS runtime does not have. It knows no UI
+framework: a React app adds `react()` from `@silkui/react/vite`.
+
+## Install
+
+The templates (`silk init my-app -t ui-react`, `ui-foldkit` or `ui-js`) set it up, and
+`silk task dev` and `silk task build` run Vite for you. See
+[Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an
+existing project:
+
+```sh
+npm install -D @silkui/vite vite
+```
+
+## Usage
 
 ```js
+// vite.config.js
 import { defineConfig } from "vite";
 import silk from "@silkui/vite";
 import react from "@silkui/react/vite";
 
-export default defineConfig({ plugins: [silk(), react()] });
+export default defineConfig({ plugins: [silk({ entry: "src/main.tsx" }), react()] });
 ```
+
+- `vite build` writes the production bundle, `dist/app.js`, with `process.env.NODE_ENV`
+  from the Vite mode.
+- `vite` serves the modules to the host and replaces the ones an edit touches. A module
+  nothing accepts restarts the app. With `@silkui/react/vite`, component files keep their
+  state (React Fast Refresh). A build error is printed and the running app is left alone.
+  `import.meta.hot` works as in Vite.
+- `vite build --watch --mode development` rebuilds the bundle on every change and writes
+  `<bundle>.stamp` after each successful build. A host that watches it reloads the whole app.
+  This is the production code path, so it is the mode to check a bundle in.
+
+## Options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `entry` | `src/main.jsx` | Entry module, relative to the Vite root |
 | `fileName` | `app.js` | Name of the bundle in `build.outDir` |
-| `host` | the `SILKUI_HOST` program, which `silk task dev` sets | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode |
+| `host` | the `SILKUI_HOST` program, which `silk task dev` sets | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode. Without one, the plugin prints the port for a host you start yourself |
 | `port` | any free one | Port the dev server listens on for the host |
-| `apis` | `warn` | What to do when the build uses a web or Node API a ui-js runtime does not have: `warn`, `error` or `off` |
-| `allow` | none | Names of such APIs the application provides itself |
-| `node` | `false` | The host runs the full SilkJS runtime (ui-js-node): `node:fs` and the other Node builtins stay imports, and `apis` reports only what that runtime lacks |
+| `apis` | `"warn"` | What to do when the build uses an API the runtime does not have: `"warn"`, `"error"` or `"off"` |
+| `allow` | none | Names of such APIs the app provides itself, such as `provided` from `@silkui/foldkit/apis` |
+| `node` | `false` | The host runs the full SilkJS runtime: `node:fs` and the other Node builtins stay imports, and `apis` reports only what that runtime lacks |
 
-- `vite build` makes the production bundle.
-- `vite` serves the modules to the host and replaces the ones an edit touches. A module
-  nothing accepts restarts the application; with `@silkui/react/vite`, component files keep
-  their state (React Fast Refresh).
-- `vite build --watch --mode development` keeps building the bundle and writes
-  `<bundle>.stamp` after each successful build; a host that watches it reloads the whole
-  application.
+## The missing API report
 
-See [the ui-js README](../../README.md#silkvite).
+A realm has ECMAScript, timers, `requestAnimationFrame`, `console`, `performance.now`,
+`navigator.clipboard` and `@silkui/core`, but no `fetch`, `URL`, `Intl`, `document`,
+`process` or Node modules. Libraries written for browsers or Node often expect them, so the
+plugin reads every module of a build and says which are used, and by whom:
+
+```
+APIs used here that a ui-js runtime does not have:
+  fetch (network): src/api.js, ky
+  Intl (intl): date-fns
+  node:fs (node): some-package
+```
+
+A name counts when a module reads it as a global. A `typeof` test for it, a local of the
+same name and `process.env.NAME` do not count. Under the dev server the warning comes when
+the module is first served. For Node's APIs at run time, build with `node: true` and give
+the app the full runtime (`App.runtime(Runtime.node())` in `src/tasks.silk`).
+
+## TypeScript
+
+The package ships its types: `silk(options?: SilkOptions): Plugin[]`.
+
+## Requirements
+
+`vite` 8.
+
+## More
+
+- [The ui-js reference](https://github.com/silk-lang/SilkUI/blob/main/modules/js/README.md#silkuivite),
+  including how the dev server talks to the host.
+- [Templates](https://github.com/silk-lang/examples).
+- [Source](https://github.com/silk-lang/SilkUI/tree/main/modules/js/packages/vite). MIT license.
