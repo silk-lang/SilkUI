@@ -73,7 +73,9 @@ import svg_css.sheet { Sheet }
 import svg_css.sheet_binary { DecodeError }
 import svg_css.resolver { ResolverError }
 import svg_css.variables { RegistrationError }
-import svg_css.tokens { CssError, Limits }
+import svg_css.tokens { CssError, Limits, TokenBuffer }
+import svg_css.lexer
+import svg_css.declaration_values
 import svg_css.media_features { Environment }
 import svg_css.colors { Color as SheetColor }
 import style_attributes
@@ -292,6 +294,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.Remove { id } => id
     Mutation.Destroy { id } => id
     Mutation.SetStyle { id, .. } => id
+    Mutation.SetCustomProperty { id, .. } => id
     Mutation.ClearStyle { id, .. } => id
     Mutation.SetText { id, .. } => id
     Mutation.SetSelection { id, .. } => id
@@ -324,6 +327,7 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
     Mutation.AdoptStyleSheet { .. } => false
     Mutation.ReplaceStyleSheet { .. } => false
     Mutation.RemoveStyleSheet { .. } => false
+    Mutation.SetStyleSheetOrder { .. } => false
     _ => true
   }
 }
@@ -1173,8 +1177,28 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         run self.destroy(index, slot)
       }
+      Mutation.SetCustomProperty { id, state, name, value, important } => {
+        let slot = run self.require(index, id)
+        if !declaration_values.customName(String.utf8Bytes(String.view(&name))) { return () }
+        let mut tokens = Option<TokenBuffer>.None
+        if let Option<String>.Some { value: text } = move value {
+          let parsed = run Effect.result(lexer.tokenize(String.utf8Bytes(String.view(&text)), &Limits.make()))
+          match move parsed {
+            Result<TokenBuffer, CssError | OutOfMemoryError>.Success { value: buffer } => { tokens = Option<TokenBuffer>.some(move buffer) }
+            Result<TokenBuffer, CssError | OutOfMemoryError>.Failure { error: why } => {
+              match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: self.current, sheet: 0 } } }
+            }
+          }
+        }
+        let node = self.nodeMut(slot)
+        let identity = run node.identityMut()
+        run identity.setCustom(state, move name, move tokens, important)
+        run self.enableInlineScope()
+        self.restyle(slot)
+      }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
+        if style_sheets.needsScope(declarations.asSlice()) { run self.enableInlineScope() }
         let prepared = run expand.prepared(declarations.asSlice())
         let expanded = match &prepared {
           Option.Some { value } => value.asSlice()
@@ -1219,6 +1243,10 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
         let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
+        if node.selectorIdentity.isSome() {
+          let identity = run node.identityMut()
+          identity.clearCustom(state)
+        }
         match state {
           StyleState.Base => {
             node.base.clear()
@@ -1550,6 +1578,21 @@ impl<'a> UiTree<'a> {
       }
       Mutation.AdoptStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), false)
       Mutation.ReplaceStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), true)
+      Mutation.SetStyleSheetOrder { root, sheets } => {
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } }
+        if at == usize.MAX {
+          if sheets.length() == 0 { return () }
+          fail TreeError.StyleSheet { index: index, root: root, sheet: 0 }
+        }
+        let roots = self.styleSheets.asMutSlice()
+        let reordered = run Effect.result(roots[at].sheets.reorder(sheets.asSlice()))
+        if let Result<(), AdoptionError | OutOfMemoryError>.Failure { error: why } = move reordered {
+          match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } } }
+        }
+        drop run self.useRoot(root)
+        self.stylesDirty = true
+      }
       Mutation.RemoveStyleSheet { root, sheet } => {
         if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: sheet } }
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
@@ -3485,6 +3528,16 @@ impl<'a> UiTree<'a> {
   }
 
   /// Recomputes every node's style from its patches, variants and parent.
+  effect fn enableInlineScope(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX {
+      at = self.styleSheets.length()
+      run self.styleSheets.append(RootSheets.make(self.current))
+    }
+    let roots = self.styleSheets.asMutSlice()
+    roots[at].inlineVariables = true
+  }
+
   pub effect fn setStyleEnvironment(self: &mut Self, root: u32, environment: Environment, systemColors: [SheetColor; 19]) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     if !self.rootOpen(root) { fail TreeError.StyleSheet { index: 0, root: root, sheet: 0 } }
@@ -3534,7 +3587,7 @@ impl<'a> UiTree<'a> {
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    if at == usize.MAX || self.styleSheets.asSlice()[at].sheets.length() == 0 || self.node(slot).kind == NodeKind.Text {
+    if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Box<Resolved>>.None
       return ()
@@ -3582,7 +3635,7 @@ impl<'a> UiTree<'a> {
       return ()
     }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    if sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 {
+    if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       // A full walk is the conservative invalidation fallback until dependency sets prune it.
       self.stylesDirty = true
       let roots = self.styleSheets.asMutSlice()

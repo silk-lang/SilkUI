@@ -9,8 +9,11 @@ import svg_css.cascade { Priority, Origin }
 import svg_css.element { MatchContext, NO_ELEMENT }
 import svg_css.variables { ScopeId, RegistrationError }
 import svg_css.resolver { ResolverError }
-import svg_css.tokens { Limits, CssError, Buffers }
-import svg_css.adopted_variables { Inputs }
+import svg_css.tokens { Limits, CssError, Buffers, insensitive }
+import svg_css.adopted_variables { Inputs, InlineCustom }
+import style_identity { NodeIdentity }
+import silk.text.string { String }
+import silk.collections.slice { Slice }
 import svg_css.input { Input, TokenRef }
 import svg_css.value_cursor { Cursor }
 import svg_css.lexer
@@ -38,13 +41,14 @@ struct Expression { index: usize, program: ColorProgram }
 
 pub struct RootSheets {
   pub root: u32,
+  pub inlineVariables: bool,
   pub sheets: StyleSheets,
   pub environment: Environment,
   pub systemColors: [Color; 19],
 }
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
-    return RootSheets { root: root, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+    return RootSheets { root: root, inlineVariables: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
       systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
@@ -102,7 +106,28 @@ pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
   if node.parent != NONE {
     if let Option<&Resolved>.Some { value } = tree.node(node.parent).sheetStyle() { parent = Option<ScopeId>.some(value.scope) }
   }
-  let scope = run sheets.variableScope(parent, &Limits.make())
+  let mut custom = List<InlineCustom<'_, '_>>.make()
+  if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
+    let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+    let mut stateIndex: usize = 0
+    while stateIndex < states.length {
+      let state = states[stateIndex]
+      if active(tree, slot, state) {
+        let mut at: usize = 0
+        while at < identity.custom.length() {
+          let item = &identity.custom.asSlice()[at]
+          if item.state == state {
+            let mut priority = Priority.make(Origin.Author, custom.length())
+            priority.important = item.important
+            run custom.append(InlineCustom<'_, '_> { name: String.utf8Bytes(String.view(&item.name)), tokens: &item.tokens, priority: priority })
+          }
+          at = at + 1
+        }
+      }
+      stateIndex = stateIndex + 1
+    }
+  }
+  let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
   let mut declarations = List<Declaration>.make()
   let mut expressions = List<Expression>.make()
   let candidates = sheets.candidates()
@@ -242,4 +267,28 @@ effect fn appendText(declarations: &mut List<Declaration>, expressions: &mut Lis
     }
   }
   run declarations.append(Declaration { property: property, value: move value, important: important })
+}
+
+pub fn active(tree: &UiTree<'_>, slot: u32, state: StyleState) -> bool {
+  let node = tree.node(slot)
+  return state == StyleState.Base || (state == StyleState.Hover && node.hovered)
+    || (state == StyleState.Active && node.pressed) || (state == StyleState.Focus && tree.focused == slot)
+    || (state == StyleState.FocusVisible && tree.focused == slot && (tree.focusVisible || node.kind == NodeKind.Input))
+}
+
+pub fn needsScope(declarations: &[Declaration]) -> bool {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if let Value.Text { css } = &declarations[i].value {
+      let text = css.asSlice()
+      let mut at: usize = 0
+      while at < text.length {
+        if at + 4 <= text.length && insensitive(Slice.view<u8>(text, at, 4), b"var(") { return true }
+        if at + 10 <= text.length && insensitive(Slice.view<u8>(text, at, 10), b"color-mix(") { return true }
+        at = at + 1
+      }
+    }
+    i = i + 1
+  }
+  return false
 }

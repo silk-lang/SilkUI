@@ -438,3 +438,18 @@ test("named attributes preserve false, empty, replacement and absence", () => {
     ["attribute", box.nodeId, "aria-expanded", null],
   ]);
 });
+
+
+test("custom properties preserve case and unitless numeric tokens", () => {
+  mock.take();
+  const box = createBox({ "--Scale": 2, "--Gap": "8px", width: "calc(var(--Gap) * var(--Scale))" });
+  assert.deepEqual(mock.take(), [
+    ["create", box.nodeId, 0],
+    ["style", box.nodeId, "--Scale:2;--Gap:8px;width:calc(var(--Gap) * var(--Scale));", 0],
+  ]);
+  box.style.set({ "--Scale": null });
+  assert.deepEqual(mock.take(), [
+    ["clearStyle", box.nodeId, 0],
+    ["style", box.nodeId, "--Gap:8px;width:calc(var(--Gap) * var(--Scale));", 0],
+  ]);
+});

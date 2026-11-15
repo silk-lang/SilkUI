@@ -540,13 +540,15 @@ on X11 and Wayland under Xvfb and Weston with lavapipe.
 
 `Batch.adoptStyleSheet(root, sheet, bytes)` appends a compiled `css-style` sheet to that
 root's cascade. `replaceStyleSheet` keeps its position; `removeStyleSheet` removes its rules.
-Sheet ids are local to a root. Invalid compiled bytes fail with `TreeError.StyleSheet` and
+`styleSheetOrder(root, ids)` changes their order without recompiling. Sheet ids are local to a root. Invalid compiled bytes fail with `TreeError.StyleSheet` and
 leave the previous sheet intact. Closing a root releases its sheets.
 
 The tree matches native tags, ids, classes, named attributes and interaction state. Layer
 order is shared across adopted sheets. Inline looks participate in the same ordered list;
 important declarations preserve CSS precedence. Sheet custom properties inherit, registered
-properties use their declared inheritance/defaults, and inline `var()` can read that scope.
+properties use their declared inheritance/defaults, and inline `var()` can read that scope. `Batch.customProperty` sets or removes a custom
+property in a look; `ClearStyle` clears that look's custom properties too. JS style objects
+forward `--name` entries, preserving their case and numeric tokens.
 The resolved list feeds both layout and paint effects. Matched sheet/rule ids remain on the
 node's resolved style.
 
@@ -556,6 +558,5 @@ supply viewport queries and resolution. The default environment is headless. A r
 sheets currently uses a full restyle for invalidation, including ancestor and sibling
 selectors; roots that only use style objects retain their existing path.
 
-This API is an implementation foundation. Automatic stylesheet loading, inline custom-property
-declarations, complete CSS-wide keyword handling, generated pseudo-elements, container queries,
+This API is an implementation foundation. Automatic stylesheet loading, complete CSS-wide keyword handling, generated pseudo-elements, container queries,
 and the full stylesheet/style-object parity suite are still in progress.

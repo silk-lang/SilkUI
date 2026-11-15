@@ -43,6 +43,7 @@ let nextId = 0;
 const CSS_NAMES = new Map();
 
 function cssName(name) {
+  if (name.startsWith("--")) return name;
   let css = CSS_NAMES.get(name);
   if (css === undefined) {
     css = name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
@@ -68,6 +69,7 @@ function familyOf(names) {
 }
 
 function cssValue(name, value) {
+  if (name.startsWith("--")) return String(value);
   if (name === "fontFamily") return familyOf(String(value));
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }

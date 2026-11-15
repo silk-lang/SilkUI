@@ -16,7 +16,14 @@ import silk.num.usize
 import ui_tree.css { Declaration }
 import ui_tree.legacy { Batch, NodeKind, Attribute, StyleState, Cursor, Role, MarkSpan, Atom }
 import ui_tree.lib { EventKind, Event, Motion }
-import css_style.tokens { CssError }
+import css_style.tokens { CssError, Limits, Kind }
+import css_style.lexer
+import css_style.syntax
+import css_style.declaration_values
+import css_style.cssom_serialization
+import properties.catalog
+import properties.catalog { Property }
+import ui_tree.mutation { Mutation }
 import css_style.written as written
 import ui_tree.mutation { isNamedAttribute }
 
@@ -509,3 +516,41 @@ effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError 
   }
 }
 
+
+pub effect fn applyStyle(batch: &mut Batch, id: u32, state: StyleState, css: &String) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let parsed = run Effect.result(parseStyle(&mut batch.*, id, state, css))
+  if let Result<(), CssError | OutOfMemoryError>.Failure { error } = move parsed {
+    match move error { OutOfMemoryError allocation => { fail move allocation } CssError _ => {} }
+  }
+}
+
+effect fn parseStyle(batch: &mut Batch, id: u32, state: StyleState, css: &String) -> ()
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(String.utf8Bytes(String.view(css)), &limits)
+  let parsed = run syntax.parseDeclarations(&buffer, buffer.all(), &limits)
+  let mut declarations = List<Declaration>.make()
+  let items = parsed.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    let item = items[i]
+    let name = buffer.text(item.name)
+    if declaration_values.customName(name) {
+      let value = run cssom_serialization.components(&buffer, item.value)
+      run batch.push(Mutation.SetCustomProperty { id: id, state: state,
+        name: run String.copy(unsafe String.fromUtf8Unchecked(name)),
+        value: Option<String>.some(run String.copy(unsafe String.fromUtf8Unchecked(value.asSlice()))), important: item.important })
+    } else if let Option<Property>.Some { value: property } = catalog.lookup(name) {
+      let mut start = item.value.start
+      while start < item.value.end {
+        match buffer.tokens.asSlice()[start].kind { Kind.Whitespace => { start = start + 1 } _ => { break } }
+      }
+      if start < item.value.end {
+        run declarations.append(Declaration { property: property, value: run written.valueIn(&buffer, item.value.start, item.value.end), important: item.important })
+      }
+    }
+    i = i + 1
+  }
+  run batch.push(Mutation.SetStyle { id: id, state: state, declarations: move declarations })
+}
