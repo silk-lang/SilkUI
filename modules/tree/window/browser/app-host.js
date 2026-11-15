@@ -67,7 +67,7 @@ export function unsupported() {
  */
 export async function runApp({
   wasm, container = document.body, check = false, log = console.log,
-  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows, accessibility = true, started,
+  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows, accessibility = true, started, stylesheetUpdates,
 }) {
   const problem = unsupported();
   if (problem) throw new Error(problem);
@@ -98,6 +98,7 @@ export async function runApp({
   const gpuHost = new WebGPUHost();
   const mirror = new AccessMirror(windowHost);
   let memory;
+  let styles;
   let line = '';
   const print = text => {
     line += text;
@@ -114,6 +115,8 @@ export async function runApp({
       write: (pointer, length) => print(decoder.decode(new Uint8Array(memory.buffer, pointer, length))),
       now: () => performance.now(),
       check: () => (check ? 1 : 0),
+      stylesheet_length: () => styles?.length ?? 0,
+      stylesheet_read: (pointer, length) => styles?.read(memory, pointer, length) ?? -1,
       // A turn of the page's event loop, so pending WebGPU promises settle.
       yield: new WebAssembly.Suspending(() => new Promise(resolve => setTimeout(resolve, 0))),
       // localStorage, as UTF-8: stored_length answers -1 when nothing is kept under the key.
@@ -155,11 +158,16 @@ export async function runApp({
   started?.({ instance, windowHost });
   let status;
   try {
+    if (stylesheetUpdates) {
+      const { StyleUpdates } = await import('./style-updates.mjs');
+      styles = new StyleUpdates(stylesheetUpdates);
+    }
     status = await WebAssembly.promising(instance.exports.main)();
   } catch (error) {
     const text = report();
     throw new Error(text ? `${text}\n${error?.message ?? error}` : String(error?.message ?? error), { cause: error });
   } finally {
+    styles?.close();
     if (line) log(line);
   }
   if (gpuHost.failures.length) throw new Error(gpuHost.failures.join('\n'));
