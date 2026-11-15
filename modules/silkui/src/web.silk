@@ -133,6 +133,7 @@ pub struct Server {
   clients: List<Client>,
   root: String,
   pub build: u64,
+  pub styles: u64,
 }
 
 effect fn socketFailure(error: NativeSocketError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
@@ -178,7 +179,7 @@ impl Server {
       _ => port
     }
     StderrWriter.print("silkui: serving the page on http://127.0.0.1:{}/\n", &.(actual))
-    return Server { listener: move listener, clients: List<Client>.make(), root: run String.copy(root), build: 1 }
+    return Server { listener: move listener, clients: List<Client>.make(), root: run String.copy(root), build: 1, styles: 1 }
   }
 
   /// Answers requests for about `milliseconds`.
@@ -230,6 +231,7 @@ impl Server {
     ! NativeSocketError | TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let root = String.view(&self.root)
     let build = self.build
+    let styles = self.styles
     let client = &mut self.clients.asMutSlice()[index]
     if !client.ready {
       let mut buffer: [u8; 8192] = [0; 8192]
@@ -245,7 +247,7 @@ impl Server {
       if !String.contains(String.view(&request), "\r\n\r\n") {
         return client.request.length() > 65536
       }
-      run answer(&mut client, String.view(&request), root, build)
+      run answer(&mut client, String.view(&request), root, build, styles)
     }
     let headLength = client.header.length()
     let bodyLength = client.body.length()
@@ -279,7 +281,7 @@ fn mime(path: string) -> string<'static> {
   return "application/octet-stream"
 }
 
-effect fn answer(client: &mut Client, request: string, root: string, build: u64) -> ()
+effect fn answer(client: &mut Client, request: string, root: string, build: u64, styles: u64) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
   if !String.startsWith(request, "GET ") {
     run respond(&mut client, "405 Method Not Allowed", "text/plain", Bytes.make())
@@ -289,8 +291,8 @@ effect fn answer(client: &mut Client, request: string, root: string, build: u64)
   let mut end: usize = 4
   while end < bytes.length && bytes[end] != 32 && bytes[end] != 63 { end = end + 1 }
   let path = String.slice(request, 4, end - 4)
-  if path == "/__silkui/build" {
-    let number = run decimal(build)
+  if path == "/__silkui/build" || path == "/__silkui/styles" {
+    let number = run decimal(if path == "/__silkui/build" { build } else { styles })
     run respond(&mut client, "200 OK", "text/plain", run Bytes.copy(String.utf8Bytes(String.view(&number))))
     return ()
   }
@@ -312,7 +314,9 @@ effect fn answer(client: &mut Client, request: string, root: string, build: u64)
     // A dev page polls for a build number other than the one it was served with.
     if let Result.Success { value: text } = String.fromUtf8(body.asSlice()) {
       let number = run decimal(build)
-      let page = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+      let numbered = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+      let styleNumber = run decimal(styles)
+      let page = run replaced(String.view(&numbered), "__SILKUI_STYLES__", String.view(&styleNumber))
       run respond(&mut client, "200 OK", "text/html; charset=utf-8", run Bytes.copy(String.utf8Bytes(String.view(&page))))
       return ()
     }

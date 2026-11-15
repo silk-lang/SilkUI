@@ -99,8 +99,15 @@ DOM pages copy the CSS and link the files in the same order before mounting the 
 The [Loom counter](examples/loom) uses this path on all three targets.
 
 A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
-CSS to the configured path. Custom hosts adopt their compiled sheets directly. CSS edits
-currently require rebuilding; stylesheet hot replacement is still being integrated.
+CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `web-dom`, `dev` replaces changed stylesheets without reloading the page or resetting
+application state. A missing file leaves the active styles intact until it is restored.
+Native and canvas stylesheet hot replacement is still being integrated; CSS edits on those
+targets currently require rebuilding.
+
+The browser integration test runs the real dev task in a temporary project and checks
+replacement order, preserved state, missing-file recovery, and a subsequent code rebuild:
+`node modules/silkui/tests/stylesheets-browser.mjs` from the repository root. It needs
+`silk` and `chromium` on PATH (or the `SILK` and `CHROMIUM` environment variables).
 
 ## The web targets
 

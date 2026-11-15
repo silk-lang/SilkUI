@@ -709,7 +709,7 @@ impl Built {
 
 static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
   /// A fingerprint of the files under `dir`: their paths, sizes and contents, folded.
-  effect fn fingerprint(dir: &Path, hash: &mut u64) -> ()
+  effect fn fingerprint(dir: &Path, hash: &mut u64, excluded: &[Path]) -> ()
     ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let entries = run FileSystem.listDirectory(dir)
     let items = List<DirectoryEntry>.asSlice(&entries)
@@ -717,8 +717,18 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     while at < items.length {
       let name = Path.name(&items[at].path) |> Option<string>.unwrapOr("")
       if items[at].kind.code == 1 && name != "build" && !String.startsWith(name, ".") {
-        run fingerprint(&items[at].path, &mut hash)
+        run fingerprint(&items[at].path, &mut hash, excluded)
       } else if items[at].kind.code == 0 {
+        let mut skip = false
+        let mut index: usize = 0
+        while index < excluded.length {
+          if Path.view(&items[at].path).unwrapOr("") == Path.view(&excluded[index]).unwrapOr("") { skip = true }
+          index = index + 1
+        }
+        if skip {
+          at = at + 1
+          continue
+        }
         let bytes = run FileSystem.readFile(&items[at].path)
         fold(&mut hash, Path.rawBytes(&items[at].path))
         fold(&mut hash, Bytes.asSlice(&bytes))
@@ -737,11 +747,17 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     hash.* = value
   }
 
-  effect fn sources(project: &Project) -> u64
+  effect fn sources(project: &Project, css: &[string<'static>]) -> u64
     ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let mut hash: u64 = 2166136261
+    let mut excluded = List<Path>.make()
+    let mut at: usize = 0
+    while at < css.length {
+      run excluded.append(run stylesheets.sourcePath(String.view(&project.root), css[at]))
+      at = at + 1
+    }
     let src = run Path.make(String.view(&run joined(String.view(&project.root), "src")))
-    if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash) }
+    if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash, excluded.asSlice()) }
     return hash
   }
 }
@@ -763,17 +779,25 @@ effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator
   fail TaskError { message: move message, status: code }
 }
 
+/// Refreshes generated assets before rebuilding, including edits made during development.
+effect fn rebuildHost(project: &Project, host: &Host, sheets: &[string<'static>]) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run stylesheets.emit(String.view(&project.root), sheets, String.view(&host.dir), host.target.id() == "web-dom")
+  run compileHost(String.view(&host.dir), Mode.Dev, host.target.web())
+}
+
 /// Builds a web host again and puts the new program in its page's folder.
-effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact, sheetCount: usize) -> ()
+effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact, sheets: &[string<'static>]) -> ()
   ! TaskError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let dir = String.view(&host.dir)
-  run compileHost(dir, Mode.Dev, true)
+  run rebuildHost(project, host, sheets)
   let mut name = run String.copy(String.view(&project.name))
   run String.append(&mut name, "-")
   run String.append(&mut name, host.target.id())
   let wasm = run binary(dir, String.view(&name), Mode.Dev)
-  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path), sheetCount)
+  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path), sheets.length)
 }
 
 impl Running {
@@ -792,23 +816,46 @@ impl Running {
       let loom = running.launched.source.writtenIn.id() == "loom"
       let rebuilds = loom && running.launched.madeIn == Mode.Dev
       let project = run readProject()
-      let mut seen = run sources(&project)
+      let mut seen = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
       if running.target.web() {
         let mut server = match move Intrinsic.replace(running.server, Option<Server>.None) {
           Option<Server>.Some { value } => move value
           Option<Server>.None => run Task.abort("silkui: the page has no server")
         }
+        let watchesStyles = rebuilds && running.target.id() == "web-dom" && running.launched.source.stylePaths.length() != 0
+        let mut styled = Option<u64>.None
         if rebuilds { run say("watching src/ for changes") }
+        if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
         while true {
           run server.serveFor(300)
+          if watchesStyles {
+            let current = run Effect.result(stylesheets.fingerprint(String.view(&project.root), running.launched.source.stylePaths.asSlice()))
+            match move current {
+              Result.Success { value: fingerprint } => {
+                if styled.isNone() || fingerprint != styled.unwrapOr(0) {
+                  styled = Option<u64>.Some { value: fingerprint }
+                  let artifact = &running.launched.outputs.asSlice()[0]
+                  let updated = run Effect.result(stylesheets.emit(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&artifact.path), true))
+                  match move updated {
+                    Result.Success { .. } => { server.styles = server.styles + 1 }
+                    Result.Failure { error } => {
+                      drop error
+                      run say("stylesheet update failed: the page keeps its previous styles")
+                    }
+                  }
+                }
+              }
+              Result.Failure { error } => { drop error }
+            }
+          }
           if !rebuilds { continue }
-          let now = run sources(&project)
+          let now = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
           if now == seen { continue }
           seen = now
           run say("src/ changed: rebuilding")
           let artifact = &running.launched.outputs.asSlice()[0]
           let host = &running.launched.source.hosts.asSlice()[0]
-          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact, running.launched.source.stylePaths.length()))
+          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact, running.launched.source.stylePaths.asSlice()))
           match move rebuilt {
             Result.Success { .. } => { server.build = server.build + 1 }
             Result.Failure { error } => {
@@ -827,7 +874,7 @@ impl Running {
       run say("watching src/ for changes")
       while !child.ended() {
         pause(300)
-        let now = run sources(&project)
+        let now = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
         if now == seen { continue }
         seen = now
         run say("src/ changed: rebuilding")
@@ -836,8 +883,8 @@ impl Running {
         // The program is linked in place, so it stops before the build. A failed build
         // leaves the previous program, which starts again.
         child.stop()
-        let rebuilt = run Effect.result(compileHost(String.view(&host.dir), Mode.Dev, false))
-        if let Result<(), TaskError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
+        let rebuilt = run Effect.result(rebuildHost(&project, host, running.launched.source.stylePaths.asSlice()))
+        if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
           drop error
           run say("the build failed: the previous build runs until the next change")
         }
