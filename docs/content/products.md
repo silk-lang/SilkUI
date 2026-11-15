@@ -51,6 +51,8 @@ JavaScript apps in a window run on SilkJS, embedded in the app: the lean SilkJS 
 | Loom | `loom` | The Elm-style framework written in Silk. A peer of React and Foldkit: it reaches Silk UI only through the protocol. |
 | Loom Components | `loom-components` | Buttons, fields, menus, dialogs and a theme for Loom apps. |
 
+Both live in their own repository, [silk-lang/loom](https://github.com/silk-lang/loom), with the window that shows the DevTools (itself a Loom app).
+
 The [first guide](/core/) on this site teaches Loom, the [second](/native/) runs the same programs in native windows, and the [third](/tree/) uses the Silk UI Tree directly.
 
 ## What runs where

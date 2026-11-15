@@ -1,6 +1,6 @@
 //! What the generated hosts take from the project's `silk.toml`: its package name and Silk
-//! version, and where its `silkui` dependency comes from, so a host gets the same revision
-//! of the window packages.
+//! version, and where its `silkui` and `loom` dependencies come from, so a host gets the same
+//! revision of the window packages (and a Loom app's host the same Loom as the app).
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
@@ -31,6 +31,11 @@ pub struct Project {
   /// The `silkui` package's directory: inside the repository for a Git dependency, relative
   /// to the project root or absolute for a path one.
   pub path: String,
+  /// The same three for the `loom` dependency of a Loom app, all empty without one. Loom's
+  /// silkui targets are in its repository, beside `modules/loom`.
+  pub loomGit: String,
+  pub loomRev: String,
+  pub loomPath: String,
 }
 
 effect fn text(bytes: &[u8]) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
@@ -47,8 +52,9 @@ fn field<'a>(value: &'a Value, name: string) -> string<'a> {
   return Toml.field(value, name) |> Toml.asString |> Option<string>.unwrapOr("")
 }
 
-/// Finds the dependency on package `silkui` in `table`'s members.
-effect fn dependency(table: Option<&Value>, project: &mut Project) -> bool
+/// Finds the dependency on package `name` in `table`'s members: its Git fields (see
+/// [`Project`]), revision and path.
+effect fn dependency(table: Option<&Value>, name: string, gitFields: &mut String, revision: &mut String, directory: &mut String) -> bool
   ! TaskError | OutOfMemoryError ? &mut Allocator {
   let value = match table {
     Option<&Value>.Some { value } => value
@@ -64,26 +70,26 @@ effect fn dependency(table: Option<&Value>, project: &mut Project) -> bool
           TomlChild.Member { entry } => {
             let package = field(&entry.value, "package")
             let path = field(&entry.value, "path")
-            if package == "silkui" || (package == "" && String.endsWith(path, "silkui")) {
+            if package == name || (package == "" && String.endsWith(path, name)) {
               let git = field(&entry.value, "git")
               if git != "" {
-                run String.append(&mut project.git, "git = \"")
-                run String.append(&mut project.git, git)
-                run String.append(&mut project.git, "\", ")
+                run String.append(&mut gitFields, "git = \"")
+                run String.append(&mut gitFields, git)
+                run String.append(&mut gitFields, "\", ")
                 let rev = field(&entry.value, "rev")
                 let branch = field(&entry.value, "branch")
                 if rev != "" {
-                  project.rev = run String.copy(rev)
-                  run String.append(&mut project.git, "rev = \"")
-                  run String.append(&mut project.git, rev)
-                  run String.append(&mut project.git, "\", ")
+                  revision.* = run String.copy(rev)
+                  run String.append(&mut gitFields, "rev = \"")
+                  run String.append(&mut gitFields, rev)
+                  run String.append(&mut gitFields, "\", ")
                 } else if branch != "" {
-                  run String.append(&mut project.git, "branch = \"")
-                  run String.append(&mut project.git, branch)
-                  run String.append(&mut project.git, "\", ")
+                  run String.append(&mut gitFields, "branch = \"")
+                  run String.append(&mut gitFields, branch)
+                  run String.append(&mut gitFields, "\", ")
                 }
               }
-              project.path = run String.copy(path)
+              directory.* = run String.copy(path)
               return true
             }
           }
@@ -122,14 +128,18 @@ pub effect fn read() -> Project
     git: String.make(),
     rev: String.make(),
     path: String.make(),
+    loomGit: String.make(),
+    loomRev: String.make(),
+    loomPath: String.make(),
   }
   if String.view(&project.name) == "" { run Task.abort("silkui: silk.toml has no [package] name") }
   let tasks = Toml.field(&document, "profiles") |> Toml.fieldAt("tasks") |> Toml.fieldAt("dependencies")
-  if !run dependency(tasks, &mut project) {
-    if !run dependency(Toml.field(&document, "dependencies"), &mut project) {
+  if !run dependency(tasks, "silkui", &mut project.git, &mut project.rev, &mut project.path) {
+    if !run dependency(Toml.field(&document, "dependencies"), "silkui", &mut project.git, &mut project.rev, &mut project.path) {
       run Task.abort("silkui: silk.toml has no dependency on the silkui package")
     }
   }
+  drop run dependency(Toml.field(&document, "dependencies"), "loom", &mut project.loomGit, &mut project.loomRev, &mut project.loomPath)
   return move project
 }
 
@@ -152,6 +162,54 @@ pub effect fn sibling(project: &Project, subdirectory: string, package: string) 
   run String.append(&mut out, package)
   run String.append(&mut out, "\" }")
   return move out
+}
+
+/// The `loom` dependency's path with its `modules/loom` taken off: the Loom repository's root,
+/// as the dependency writes it (empty for a Git dependency's).
+effect fn loomRoot(project: &Project) -> String ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let path = String.view(&project.loomPath)
+  if path == "" { run Task.abort("silkui: a Loom app needs a dependency on the loom package") }
+  let trimmed = if String.endsWith(path, "/") { String.slice(path, 0, String.utf8Bytes(path).length - 1) } else { path }
+  if !String.endsWith(trimmed, "modules/loom") {
+    run Task.abort("silkui: the loom dependency's path must end in modules/loom, as in the Loom repository")
+  }
+  return run String.copy(String.slice(trimmed, 0, String.utf8Bytes(trimmed).length - String.utf8Bytes("modules/loom").length))
+}
+
+/// The TOML value of a dependency on the package at `subdirectory` of the Loom repository
+/// (such as `modules/silkui/window`), from the same place as the app's `loom` dependency, for
+/// a manifest two directories below the project.
+pub effect fn loomSibling(project: &Project, subdirectory: string, package: string) -> String
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let root = run loomRoot(project)
+  let mut out = run String.copy("{ ")
+  run String.append(&mut out, String.view(&project.loomGit))
+  run String.append(&mut out, "path = \"")
+  if String.view(&project.loomGit) == "" && !String.startsWith(String.view(&root), "/") {
+    run String.append(&mut out, "../../")
+  }
+  run String.append(&mut out, String.view(&root))
+  run String.append(&mut out, subdirectory)
+  run String.append(&mut out, "\", package = \"")
+  run String.append(&mut out, package)
+  run String.append(&mut out, "\" }")
+  return move out
+}
+
+/// The Loom repository's root, absolute: beside the project for a path dependency, Silk's
+/// checkout for a Git one.
+pub effect fn loomDir(project: &Project) -> String
+  ! TaskError | FileError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut root = run loomRoot(project)
+  if String.view(&root) == "" { run String.append(&mut root, ".") }
+  let relative = String.view(&root)
+  if String.view(&project.loomGit) == "" {
+    if String.startsWith(relative, "/") { return run String.copy(relative) }
+    return run resolved(String.view(&project.root), relative)
+  }
+  if String.view(&project.loomRev) == "" { run Task.abort("silkui: the web targets need the loom dependency pinned with `rev`") }
+  let repository = run checkout(String.view(&project.loomRev))
+  return run resolved(String.view(&repository), relative)
 }
 
 /// Where Silk keeps the checkout of a Git dependency at `rev`: `$SILK_HOME/git/<rev>`, or

@@ -122,7 +122,7 @@ main = "app.silk"
 exports = ["app"]
 
 [dependencies]
-loom = { git = "https://github.com/silk-lang/lib-ui.git", rev = "…", path = "modules/loom", package = "loom" }
+loom = { git = "https://github.com/silk-lang/loom.git", rev = "…", path = "modules/loom", package = "loom" }
 
 [profiles.tasks]
 main = "tasks.silk"
@@ -132,14 +132,17 @@ silkui = { git = "https://github.com/silk-lang/lib-ui.git", rev = "…", path = 
 ```
 
 The generated hosts depend on `silkui-window` from the same place as the `silkui` dependency,
-so they always match it.
+so they always match it. A Loom app's hosts run Loom's targets (`silkui-window-loom`,
+`silkui-web-canvas`, `silkui-web-dom`), which live in [the Loom repository](https://github.com/silk-lang/loom)
+under `modules/silkui`; they come from the same place as the app's `loom` dependency, so the
+app and its host share one Loom. That dependency's `path` must end in `modules/loom`.
 
 ## Limits
 
 - JavaScript apps run in a window only: on `web-canvas` they come next, `web-dom` later.
 - A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
-- The web targets read the page scripts from Silk's checkouts of lib-ui and lib-native, so a Git
-  dependency on silkui must be pinned with `rev`.
+- The web targets read the page scripts from Silk's checkouts of lib-ui, Loom and lib-native, so
+  Git dependencies on silkui and loom must be pinned with `rev`.
 - Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
   that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.
 - The examples install `@silkui/*` from this repository (`file:` dependencies with

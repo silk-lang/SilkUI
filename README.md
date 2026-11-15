@@ -7,10 +7,11 @@ screen. This repository holds:
 
 - **Silk UI**: the retained UI tree (`ui-tree`, `ui-protocol`, `ui-text`), the hosts for each
   target, the JS adapters as npm packages (`@silkui/core`, `@silkui/react`, `@silkui/foldkit`,
-  `@silkui/vite`), and the DevTools (`ui-inspect`). The front door is the `silkui` package:
+  `@silkui/vite`), and the inspector (`ui-inspect`). The front door is the `silkui` package:
   one dependency that builds and runs an app from its `tasks.silk`.
-- **Loom**: the Elm-style UI framework written in Silk, with Loom Components. It lives here for
-  now, in `modules/loom` and `modules/loom-components`, and depends only on `ui-protocol`.
+- **Loom**, the Elm-style UI framework written in Silk, with Loom Components and the DevTools
+  (a Loom app), lives in [silk-lang/loom](https://github.com/silk-lang/loom). It is built on
+  this repository: lib-ui's docs and benchmarks depend on it by Git like any other app.
 
 JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
 The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
@@ -63,7 +64,7 @@ export SILK_CLANG=/opt/homebrew/opt/llvm@22/bin/clang
 export PATH="/opt/homebrew/opt/lld@22/bin:$PATH"
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 "$SILK_CLANG" --version # must report clang 22, not Apple clang
-silk task native demo modules/loom/demo
+silk task native demo modules/tree/demo
 ```
 
 Change `SILK_CLANG` if LLVM 22 is installed elsewhere. `SDKROOT` matters for CPU-only tools
@@ -78,13 +79,9 @@ by [silk#3034](https://github.com/silk-lang/silk/issues/3034), with no legacy-sc
 
 | Demo | Interactive command |
 | --- | --- |
-| Todo application | `silk task native demo modules/loom/demo` |
-| Components gallery | `silk task native demo modules/loom-components/demo` |
 | Retained tree inbox | `silk task native demo modules/tree/demo` |
 | Retained tree editor | `silk task native demo modules/tree/demo -- --editor` |
 | Small window/counter | `silk task native demo modules/tree/window/demo` |
-| Todo with inspector/devtools | `silk task native devtools todo` |
-| Todo with devtools in its own process | `silk build --manifest-path modules/loom/demo/silk.toml`, then `SILK_UI_DEVTOOLS=window` (or `dock`) `build/llvm/<target>/debug/loom-demo`; F12 toggles them |
 
 Close the window to return to the terminal. The first build fetches pinned dependencies
 and prepares native libraries through Silk's manifest hooks.
@@ -156,16 +153,15 @@ All 31 original UI workspace packages remain members of `silk.toml`:
 | --- | --- |
 | Consumable text and assets | `modules/text`, `modules/sprites`, `modules/assets` |
 | Retained tree and platform hosting | `modules/tree`, `modules/tree/window` |
-| Application framework and components | `modules/loom`, `modules/loom/window`, `modules/loom-components` |
-| Inspection APIs | `modules/inspect`, `modules/inspect/server`, `modules/inspect/devtools` |
-| Reusable demo/fixture libraries | `modules/loom/examples`, `modules/loom-components/gallery`, `modules/tree/fixtures` |
-| Developer applications (not library APIs) | `modules/loom/demo`, `modules/loom-components/demo`, `modules/tree/demo`, `modules/tree/window/demo`, `modules/inspect/devtools/app` |
+| Inspection APIs | `modules/inspect`, `modules/inspect/server` |
+| Reusable demo/fixture libraries | `modules/tree/fixtures` |
+| Developer applications (not library APIs) | `modules/tree/demo`, `modules/tree/window/demo` |
 | Developer protocol and comparison executables | `modules/inspect/cli`, `modules/inspect/mcp`, `modules/text/tools/cli`, `modules/tree/browser` |
-| Tests and golden runners (not library APIs) | `modules/loom/tests`, `modules/loom/window/tests`, `modules/loom-components/tests`, `modules/inspect/tests`, `modules/inspect/server/tests`, `modules/inspect/devtools/tests`, `modules/tree/tests`, `modules/tree/window/tests` |
+| Tests and golden runners (not library APIs) | `modules/inspect/tests`, `modules/inspect/server/tests`, `modules/tree/tests`, `modules/tree/window/tests` |
 
 The manifests explicitly export consumable modules. Test-only packages declare their test module as the library entrypoint rather than inventing a runnable application. CLI executables and demos are developer tools, not dependencies of the API packages. Shared scenes, CPU/GPU rendering, vector graphics, codecs, and atlases remain in `lib-graphics`; native windows and WebGPU in `lib-native`; layout/styles in `lib-css`; parsing/shaping/rasterization in `lib-fonts`; SVG parsing/rendering in `lib-svg`. None are copied into this repository.
 
-UI-to-UI dependencies stay local. External dependencies use canonical `https://github.com/silk-lang/lib-NAME.git` URLs with exact 40-character revisions and package paths. Consumers must use these same revisions throughout their graph: Silk does not accept two physical checkouts of one named package.
+UI-to-UI dependencies stay local, except in the packages built with Loom (`docs`, `docs/examples`, `docs/live`, `docs/shots`, `docs/tests`, the Loom apps under `docs/examples/apps`, `modules/bench`, `modules/bench/web`, `modules/silkui/examples/loom`). Those pin silk-lang/loom and take every other lib-ui package by Git at the lib-ui commit that Loom pins, since a build can hold only one copy of `ui-tree`; moving Loom's pin means moving theirs (both `rev`s) too. External dependencies use canonical `https://github.com/silk-lang/lib-NAME.git` URLs with exact 40-character revisions and package paths. Consumers must use these same revisions throughout their graph: Silk does not accept two physical checkouts of one named package.
 
 ## Building and checking
 
@@ -194,26 +190,19 @@ silk task generate-browser-exports --check
 
 Windows managed-process tasks are blocked by [silk#3034](https://github.com/silk-lang/silk/issues/3034): the standard library does not expose live child pipes, exit observation, and termination there. These tasks report the unsupported capability; duplicate Python/Node implementations are not retained.
 
-`check` checks every workspace package, all ten UI unit-test roots, the loopback HTTP image test, five describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs five rendering/input scenarios (the mirror example opens a second window) plus socket inspector, MCP, devtools and same-process devtools interactions. Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
+`check` checks every workspace package, the UI unit-test roots, the describe/PNG golden runners, the text/inspector/MCP CLIs, portable wasm APIs, and generated-file freshness. It does not update goldens. `native check` runs three rendering/input scenarios plus socket inspector and MCP interactions. (Loom's demos, the DevTools and the HTTP image test are checked in silk-lang/loom.) Linux runs X11 and Wayland (`--backend x11` or `--backend wayland` selects one). `browser check` compares Chrome text, browser fixture trees, and the counter's real input.
 
 Individual entrypoints remain available:
 
 ```sh
-silk task native demo modules/loom/demo
-silk task native demo modules/loom-components/demo -- check --release
 silk task native demo modules/tree/demo -- --editor
 silk task native inspect
 silk task native mcp
 silk task native demo modules/tree/window/demo -- --check
-silk task native devtools todo
-silk task native devtools check
-silk task native devtools embedded
-silk task native devtools --connect 1
 silk task browser serve
 silk task browser test --width 400 --height 250 --click --click-x 90 --click-y 35
 ```
 
-The devtools check drives the owned todo demo: live element discovery, selection/highlighting, style declarations, box model, input/event logging, changed tree content, and screenshots of both windows. Notes-specific persistence remains an application-repository check. Use `silk task native devtools external --app-binary PATH [--app-args ARG ...]` for an already-built application, or `--connect ADDRESS` for an existing process. `devtools embedded` (part of `native check`) opens the devtools in the todo demo's own process, in a window and then docked, and checks through the socket inspector that it still sees the app alone, with the devtools' root hidden.
 
 ## Runtime resources and published browser payloads
 
@@ -230,4 +219,4 @@ These paths are supported payloads for applications using the published Git revi
 
 UI fixture assets are owned under `modules/assets/assets` and embedded in `src/generated_assets.silk`. `silk task embed-assets [--check]` refreshes/checks them. `silk task generate-photos` authors procedural photos in Silk, using native ImageMagick 7 only for PNG/JPEG encoding; it is not a build dependency. Regeneration retains the scene geometry and formats but is not byte-identical to the previous Pillow renderer; existing committed photos are unchanged. Additional text-comparison fonts are owned under `modules/text/tests/fonts`; all Noto, Amiri, M+ and Roboto Flex OFL notices accompany their unchanged subset files. Unit tests and golden runners use repository-root working directories. Fonts/icons/photos needed by normal UI fixtures are embedded and do not depend on the working directory.
 
-See [the UI guide](modules/README.md), [the framework](modules/loom/README.md), [components](modules/loom-components/README.md), and [inspection tools](modules/inspect/README.md).
+See [the UI guide](modules/README.md) and [inspection tools](modules/inspect/README.md). Loom, its components and the DevTools are documented in [silk-lang/loom](https://github.com/silk-lang/loom).
