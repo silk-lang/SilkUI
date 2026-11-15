@@ -57,6 +57,8 @@ export function unsupported() {
  *   for screen readers (default). Pass false for a page that needs none.
  * - `imports`: more import modules, for functions the app declares itself
  *   (`extern … as "name#function"` is `imports.name.function`).
+ * - `started({ instance, windowHost })`: called with the instance just before `main` starts, for
+ *   a page that runs code of its own beside the app (browser/js-host.js in modules/js/web).
  * - `windows(control)`: called before the app starts, for a page that stands in for the desktop
  *   around the app's windows (a title bar with a close button, say). `control.close(id)` asks
  *   window `id` to close, as a desktop's close button does: the app hears a close request and
@@ -65,7 +67,7 @@ export function unsupported() {
  */
 export async function runApp({
   wasm, container = document.body, check = false, log = console.log,
-  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows, accessibility = true,
+  storage = check ? null : pageStorage(), storagePrefix = 'silk-app:', imports: more = {}, focus = true, windows, accessibility = true, started,
 }) {
   const problem = unsupported();
   if (problem) throw new Error(problem);
@@ -150,6 +152,7 @@ export async function runApp({
     if (!length) return '';
     return decoder.decode(new Uint8Array(memory.buffer, instance.exports.silk_report(), length).slice());
   };
+  started?.({ instance, windowHost });
   let status;
   try {
     status = await WebAssembly.promising(instance.exports.main)();

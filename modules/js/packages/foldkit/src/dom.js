@@ -863,9 +863,18 @@ for (const [name, value] of Object.entries({ Node: DomNode, Element, HTMLElement
   provide(name, value);
 }
 // Elements the tree does not have: nothing is an instance of them.
+const absent = {};
 for (const name of ["HTMLCanvasElement", "HTMLSelectElement", "HTMLDialogElement", "HTMLOutputElement", "DocumentFragment"]) {
-  provide(name, class {});
+  absent[name] = class {};
+  provide(name, absent[name]);
 }
+// In a page (web-canvas) the browser's own document and DOM classes are there, and the page
+// cannot replace them: a build for both targets renames Foldkit's references to these
+// (`pageGlobals` in apis.js), which are the same objects in a window.
+globalThis.__silkuiDom = {
+  document, Node: DomNode, Element, HTMLElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, Text, Comment,
+  MutationObserver: windowMembers.MutationObserver, getComputedStyle: windowMembers.getComputedStyle, ...absent,
+};
 provide("navigator", { userAgent: "SilkUI" });
 provide("sessionStorage", storage());
 if (typeof URL === "function" && globalThis.location === undefined) {

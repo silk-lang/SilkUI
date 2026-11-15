@@ -9,16 +9,11 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import silk.collections.slice { Slice }
 import silk.num.i32
 import silk.num.f64
 import silk.num.u8
 import silk.num.usize
-import ui_tree.css { Declaration }
-import ui_tree.legacy { Batch, NodeKind, Attribute, Mutation, StyleState, Cursor, Keyframe, Role, MarkSpan, Atom }
-import ui_tree.mutation { ariaAttribute }
-import css_style.tokens { CssError }
-import css_style.written as written
+import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
@@ -33,7 +28,8 @@ import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
-import markdown
+import ui_js_calls.markdown as markdown
+import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
 /// renumbering the others. The ids start above the runtime callbacks' (`REJECTION`). Each
@@ -248,16 +244,6 @@ impl Bridge {
   }
 }
 
-fn same(left: &[u8], right: &[u8]) -> bool {
-  if left.length != right.length { return false }
-  let mut i: usize = 0
-  while i < left.length {
-    if left[i] != right[i] { return false }
-    i = i + 1
-  }
-  return true
-}
-
 /// A native function of `__ui`: its JavaScript name and declared argument count.
 pub struct Native {
   pub name: &'static [u8],
@@ -339,225 +325,23 @@ fn truthy(value: ValueBits) -> bool {
   }
 }
 
-/// The number at the start of `bytes[at..]`, and where it ends.
-fn digits(bytes: &[u8], at: usize) -> [usize; 2] {
-  let mut value: usize = 0
-  let mut i = at
-  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
-    value = value * 10 + u8.toUsize(bytes[i] - 48)
-    i = i + 1
-  }
-  return [value, i]
-}
-
-/// Mark spans packed as `"start,end,bits;..."`.
-pub effect fn unpackMarks(packed: string) -> List<MarkSpan> ! OutOfMemoryError ? &mut Allocator {
-  let bytes = String.utf8Bytes(packed)
-  let mut out = List<MarkSpan>.make()
-  let mut at: usize = 0
-  while at < bytes.length {
-    let start = digits(bytes, at)
-    let end = digits(bytes, start[1] + 1)
-    let marks = digits(bytes, end[1] + 1)
-    run out.append(MarkSpan { start: start[0], end: end[0], marks: usize.toU32(marks[0]) })
-    at = marks[1] + 1
-  }
-  return move out
-}
-
-/// Atoms packed as `kind\0label\0data\0` each.
-pub effect fn unpackAtoms(packed: string) -> List<Atom> ! OutOfMemoryError ? &mut Allocator {
-  let bytes = String.utf8Bytes(packed)
-  let mut out = List<Atom>.make()
-  let mut fields = List<usize>.make()
-  let mut at: usize = 0
-  let mut start: usize = 0
-  while at < bytes.length {
-    if bytes[at] == 0 {
-      run fields.append(start)
-      run fields.append(at)
-      start = at + 1
-      if fields.length() == 6 {
-        let kind = digits(bytes, fields.get(0))
-        run out.append(Atom {
-          kind: usize.toU32(kind[0]),
-          label: run String.copy(String.slice(packed, fields.get(2), fields.get(3) - fields.get(2))),
-          data: run String.copy(String.slice(packed, fields.get(4), fields.get(5) - fields.get(4))),
-        })
-        fields.clear()
-      }
-    }
-    at = at + 1
-  }
-  return move out
-}
-
-fn kind(code: u32) -> NodeKind {
-  if code == 1 { return NodeKind.Text }
-  if code == 2 { return NodeKind.Input }
-  if code == 3 { return NodeKind.Image }
-  if code == 4 { return NodeKind.Icon }
-  if code == 5 { return NodeKind.Canvas }
-  return NodeKind.Box
-}
-
-fn state(code: u32) -> StyleState {
-  if code == 1 { return StyleState.Hover }
-  if code == 2 { return StyleState.Active }
-  if code == 3 { return StyleState.Focus }
-  if code == 4 { return StyleState.FocusVisible }
-  if code == 5 { return StyleState.Starting }
-  return StyleState.Base
-}
-
 effect fn text<'v>(value: ValueRef<'v>) -> String ! OutOfMemoryError ? &mut Allocator {
   if !value.view().isString() { return String.make() }
   let bytes = run Strings.toUtf8(value.view(), false)
   return run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
 }
 
-/// The attribute `name` with `value`, or None for a name the tree does not have.
-effect fn attributeOf<'v>(name: string, value: ValueRef<'v>) -> Option<Attribute> ! OutOfMemoryError ? &mut Allocator {
+/// `value` as the calls in ui-js-calls take it.
+effect fn argOf<'v>(value: ValueRef<'v>) -> Arg ! OutOfMemoryError ? &mut Allocator {
   let bits = value.view()
-  if name == "tabIndex" { return Option<Attribute>.some(Attribute.TabIndex { value: f64.toI32(number(bits)) }) }
-  if name == "disabled" { return Option<Attribute>.some(Attribute.Disabled { value: truthy(bits) }) }
-  if name == "focusTrap" { return Option<Attribute>.some(Attribute.FocusTrap { value: truthy(bits) }) }
-  if name == "multiline" { return Option<Attribute>.some(Attribute.Multiline { value: truthy(bits) }) }
-  if name == "readOnly" { return Option<Attribute>.some(Attribute.ReadOnly { value: truthy(bits) }) }
-  if name == "checked" { return Option<Attribute>.some(Attribute.Checked { value: truthy(bits) }) }
-  if name == "selected" { return Option<Attribute>.some(Attribute.Selected { value: truthy(bits) }) }
-  if name == "expanded" { return Option<Attribute>.some(Attribute.Expanded { value: truthy(bits) }) }
-  if name == "indeterminate" { return Option<Attribute>.some(Attribute.Indeterminate { value: truthy(bits) }) }
-  if name == "label" { return Option<Attribute>.some(Attribute.Label { value: run text(value) }) }
-  if name == "testId" { return Option<Attribute>.some(Attribute.TestId { value: run text(value) }) }
-  if name == "inert" { return Option<Attribute>.some(Attribute.Inert { value: truthy(bits) }) }
-  if name == "id" { return Option<Attribute>.some(Attribute.ElementId { value: run text(value) }) }
-  if name == "placeholder" { return Option<Attribute>.some(Attribute.Placeholder { value: run text(value) }) }
-  if name == "href" { return Option<Attribute>.some(Attribute.Href { value: run text(value) }) }
-  if name == "transition" { return Option<Attribute>.some(Attribute.Transition { value: run text(value) }) }
-  if name == "cursor" {
-    let word = run text(value)
-    return Option<Attribute>.some(Attribute.Cursor { value: cursorOf(String.utf8Bytes(String.view(&word))) })
-  }
-  return Option<Attribute>.none()
-}
-
-/// The first role in ARIA role text the tree has: words are separated by spaces, and later
-/// ones are fallbacks, as in `role="switch checkbox"`. `none` and `presentation` are no role.
-fn roleOf(words: &[u8]) -> Option<Role> {
-  let mut start: usize = 0
-  while start < words.length {
-    let mut end = start
-    while end < words.length && !space(words[end]) { end = end + 1 }
-    if end > start {
-      match namedRole(Slice.view(words, start, end - start)) {
-        Option<Role>.Some { value } => { return Option<Role>.some(value) }
-        Option<Role>.None => {}
-      }
-    }
-    start = end + 1
-  }
-  return Option<Role>.none()
-}
-
-fn space(byte: u8) -> bool {
-  return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
-}
-
-/// The tree's role for one ARIA role name.
-fn namedRole(word: &[u8]) -> Option<Role> {
-  if same(word, b"none") || same(word, b"presentation") { return Option<Role>.some(Role.None) }
-  if same(word, b"generic") { return Option<Role>.some(Role.Generic) }
-  if same(word, b"button") { return Option<Role>.some(Role.Button) }
-  if same(word, b"link") { return Option<Role>.some(Role.Link) }
-  if same(word, b"checkbox") { return Option<Role>.some(Role.Checkbox) }
-  if same(word, b"radio") { return Option<Role>.some(Role.Radio) }
-  if same(word, b"textbox") { return Option<Role>.some(Role.TextBox) }
-  if same(word, b"heading") { return Option<Role>.some(Role.Heading) }
-  if same(word, b"paragraph") { return Option<Role>.some(Role.Paragraph) }
-  if same(word, b"list") { return Option<Role>.some(Role.List) }
-  if same(word, b"listitem") { return Option<Role>.some(Role.ListItem) }
-  if same(word, b"img") || same(word, b"image") { return Option<Role>.some(Role.Image) }
-  if same(word, b"dialog") { return Option<Role>.some(Role.Dialog) }
-  if same(word, b"menu") { return Option<Role>.some(Role.Menu) }
-  if same(word, b"menuitem") { return Option<Role>.some(Role.MenuItem) }
-  if same(word, b"tab") { return Option<Role>.some(Role.Tab) }
-  if same(word, b"tablist") { return Option<Role>.some(Role.TabList) }
-  if same(word, b"tabpanel") { return Option<Role>.some(Role.TabPanel) }
-  if same(word, b"toolbar") { return Option<Role>.some(Role.Toolbar) }
-  if same(word, b"navigation") { return Option<Role>.some(Role.Navigation) }
-  if same(word, b"main") { return Option<Role>.some(Role.Main) }
-  if same(word, b"form") { return Option<Role>.some(Role.Form) }
-  if same(word, b"group") { return Option<Role>.some(Role.Group) }
-  if same(word, b"slider") { return Option<Role>.some(Role.Slider) }
-  if same(word, b"switch") { return Option<Role>.some(Role.Switch) }
-  if same(word, b"listbox") { return Option<Role>.some(Role.ListBox) }
-  if same(word, b"option") { return Option<Role>.some(Role.Option) }
-  if same(word, b"tooltip") { return Option<Role>.some(Role.Tooltip) }
-  if same(word, b"alert") { return Option<Role>.some(Role.Alert) }
-  if same(word, b"alertdialog") { return Option<Role>.some(Role.AlertDialog) }
-  if same(word, b"status") { return Option<Role>.some(Role.Status) }
-  if same(word, b"log") { return Option<Role>.some(Role.Log) }
-  if same(word, b"timer") { return Option<Role>.some(Role.Timer) }
-  if same(word, b"progressbar") { return Option<Role>.some(Role.ProgressBar) }
-  if same(word, b"separator") { return Option<Role>.some(Role.Separator) }
-  if same(word, b"combobox") { return Option<Role>.some(Role.ComboBox) }
-  if same(word, b"searchbox") { return Option<Role>.some(Role.SearchBox) }
-  if same(word, b"spinbutton") { return Option<Role>.some(Role.SpinButton) }
-  if same(word, b"table") { return Option<Role>.some(Role.Table) }
-  if same(word, b"rowgroup") { return Option<Role>.some(Role.RowGroup) }
-  if same(word, b"row") { return Option<Role>.some(Role.Row) }
-  if same(word, b"cell") { return Option<Role>.some(Role.Cell) }
-  if same(word, b"columnheader") { return Option<Role>.some(Role.ColumnHeader) }
-  if same(word, b"rowheader") { return Option<Role>.some(Role.RowHeader) }
-  if same(word, b"grid") { return Option<Role>.some(Role.Grid) }
-  if same(word, b"gridcell") { return Option<Role>.some(Role.GridCell) }
-  if same(word, b"tree") { return Option<Role>.some(Role.Tree) }
-  if same(word, b"treegrid") { return Option<Role>.some(Role.TreeGrid) }
-  if same(word, b"treeitem") { return Option<Role>.some(Role.TreeItem) }
-  if same(word, b"menubar") { return Option<Role>.some(Role.MenuBar) }
-  if same(word, b"menuitemcheckbox") { return Option<Role>.some(Role.MenuItemCheckbox) }
-  if same(word, b"menuitemradio") { return Option<Role>.some(Role.MenuItemRadio) }
-  if same(word, b"radiogroup") { return Option<Role>.some(Role.RadioGroup) }
-  if same(word, b"region") { return Option<Role>.some(Role.Region) }
-  if same(word, b"banner") { return Option<Role>.some(Role.Banner) }
-  if same(word, b"contentinfo") { return Option<Role>.some(Role.ContentInfo) }
-  if same(word, b"complementary") { return Option<Role>.some(Role.Complementary) }
-  if same(word, b"search") { return Option<Role>.some(Role.Search) }
-  if same(word, b"article") { return Option<Role>.some(Role.Article) }
-  if same(word, b"figure") { return Option<Role>.some(Role.Figure) }
-  if same(word, b"document") { return Option<Role>.some(Role.Document) }
-  if same(word, b"application") { return Option<Role>.some(Role.Application) }
-  if same(word, b"note") { return Option<Role>.some(Role.Note) }
-  return Option<Role>.none()
-}
-
-/// The tree's cursor for a CSS `cursor` keyword. A keyword the tree has no cursor for is the
-/// default arrow.
-fn cursorOf(word: &[u8]) -> Cursor {
-  if same(word, b"pointer") { return Cursor.Pointer }
-  if same(word, b"text") { return Cursor.Text }
-  if same(word, b"move") { return Cursor.Move }
-  if same(word, b"grab") { return Cursor.Grab }
-  if same(word, b"grabbing") { return Cursor.Grabbing }
-  if same(word, b"not-allowed") { return Cursor.NotAllowed }
-  if same(word, b"ew-resize") || same(word, b"col-resize") { return Cursor.ResizeHorizontal }
-  if same(word, b"ns-resize") || same(word, b"row-resize") { return Cursor.ResizeVertical }
-  if same(word, b"nwse-resize") { return Cursor.ResizeNorthWestSouthEast }
-  if same(word, b"nesw-resize") { return Cursor.ResizeNorthEastSouthWest }
-  if same(word, b"crosshair") { return Cursor.Crosshair }
-  return Cursor.Default
-}
-
-/// The declarations of `css`. Text the tokenizer rejects sets nothing.
-effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryError ? &mut Allocator {
-  let parsed = run Effect.result(written.declarations(String.utf8Bytes(String.view(css))))
-  return match move parsed {
-    Result<List<Declaration>, CssError | OutOfMemoryError>.Success { value } => move value
-    Result<List<Declaration>, CssError | OutOfMemoryError>.Failure { error } => match move error {
-      OutOfMemoryError allocation => { fail move allocation }
-      CssError _ => List<Declaration>.make()
-    }
+  if bits.isString() { return Arg.Text { value: run text(value) } }
+  return match bits {
+    ValueBits.Int { value: integer } => Arg.Number { value: i32.toF64(integer) }
+    ValueBits.Float64 { value: float } => Arg.Number { value: float }
+    ValueBits.Bool { value: flag } => Arg.Flag { value: flag }
+    ValueBits.Undefined => Arg.Nothing
+    ValueBits.Null => Arg.Nothing
+    _ => Arg.Flag { value: true }
   }
 }
 
@@ -572,7 +356,7 @@ pub union Outcome {
 pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
   let first = id(argv.get(0).view())
   if function == CREATE {
-    run bridge.batch.create(first, kind(id(argv.get(1).view())))
+    run bridge.batch.create(first, nodeKind(id(argv.get(1).view())))
   } else if function == APPEND {
     run bridge.batch.append(first, id(argv.get(1).view()))
   } else if function == INSERT_BEFORE {
@@ -587,9 +371,9 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == STYLE {
     let css = run text(argv.get(1))
     let declarations = run declarationsOf(&css)
-    run bridge.batch.push(Mutation.SetStyle { id: first, state: state(id(argv.get(2).view())), declarations: move declarations })
+    run bridge.batch.push(Mutation.SetStyle { id: first, state: styleState(id(argv.get(2).view())), declarations: move declarations })
   } else if function == CLEAR_STYLE {
-    run bridge.batch.push(Mutation.ClearStyle { id: first, state: state(id(argv.get(1).view())) })
+    run bridge.batch.push(Mutation.ClearStyle { id: first, state: styleState(id(argv.get(1).view())) })
   } else if function == ATTRIBUTE {
     let attribute = run text(argv.get(1))
     if String.view(&attribute) == "valueRange" {
@@ -599,40 +383,16 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
       run bridge.batch.attribute(first, move range)
       return Outcome.Returned { value: ValueBits.Undefined }
     }
-    if String.startsWith(String.view(&attribute), "aria-") {
-      let words = run text(argv.get(2))
-      let known = match run ariaAttribute(String.utf8Bytes(String.view(&attribute)), String.utf8Bytes(String.view(&words))) {
-        Option<Attribute>.Some { value } => {
-          run bridge.batch.attribute(first, move value)
-          true
-        }
-        Option<Attribute>.None => false
-      }
-      return Outcome.Returned { value: ValueBits.Bool { value: known } }
-    }
-    if String.view(&attribute) == "role" {
-      let words = run text(argv.get(2))
-      let bytes = String.utf8Bytes(String.view(&words))
-      let mut known = bytes.length == 0
-      let mut value = Role.None
-      match roleOf(bytes) {
-        Option<Role>.Some { value: found } => {
-          known = true
-          value = found
-        }
-        Option<Role>.None => {}
-      }
-      run bridge.batch.attribute(first, Attribute.Role { value: value })
-      return Outcome.Returned { value: ValueBits.Bool { value: known } }
-    }
-    match run attributeOf(String.view(&attribute), argv.get(2)) {
-      Option<Attribute>.Some { value } => { run bridge.batch.attribute(first, move value) }
-      Option<Attribute>.None => {
+    let value = run argOf(argv.get(2))
+    return match run setAttribute(&mut bridge.batch, first, String.view(&attribute), &value) {
+      Applied.Set => Outcome.Returned { value: ValueBits.Undefined }
+      Applied.Known { value: known } => Outcome.Returned { value: ValueBits.Bool { value: known } }
+      Applied.Missing => {
         let mut message = List<u8>.make()
         run message.appendSlice(b"the tree has no attribute '")
         run message.appendSlice(String.utf8Bytes(String.view(&attribute)))
         run message.append(39)
-        return Outcome.TypeError { message: move message }
+        Outcome.TypeError { message: move message }
       }
     }
   } else if function == FOCUS {

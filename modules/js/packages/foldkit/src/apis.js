@@ -5,3 +5,13 @@ export const provided = [
   "addEventListener", "removeEventListener", "dispatchEvent", "Node", "Element", "HTMLElement", "HTMLInputElement",
   "HTMLTextAreaElement", "Text", "Comment", "Event", "CustomEvent", "MutationObserver", "CSSStyleDeclaration",
 ];
+
+// For `define` in a Vite config: the DOM names Foldkit reaches for, as the objects
+// `@silkui/foldkit` makes. In a window they are the globals already; in a page the browser's
+// own would win, so a bundle that runs on web-canvas too needs them renamed.
+export const pageGlobals = Object.fromEntries(
+  ["document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "Text", "Comment",
+    "MutationObserver", "getComputedStyle",
+    "HTMLCanvasElement", "HTMLSelectElement", "HTMLDialogElement", "HTMLOutputElement", "DocumentFragment"]
+    .map((name) => [name, `globalThis.__silkuiDom.${name}`]),
+);
