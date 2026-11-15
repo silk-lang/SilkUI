@@ -1,0 +1,109 @@
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute }
+import ui_tree.selector_tree { SelectorTree }
+import ui_tree.style_identity { NodeIdentity }
+import font_collection.lib { FontCollection }
+import svg_css.element { ElementTree, MatchContext, NO_ELEMENT }
+import svg_css.selectors { SelectorList }
+import svg_css.selectors
+import svg_css.lexer
+import svg_css.tokens { Limits, CssError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import silk.num.u32
+
+effect fn matches(tree: &UiTree<'_>, id: u32, selector: &[u8]) -> bool
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let buffer = run lexer.tokenize(selector, &Limits.make())
+  let parsed = run selectors.parse(&buffer, buffer.all(), &[], &Limits.make())
+  if let Option<SelectorList>.Some { value } = move parsed {
+    let mut context = MatchContext.make(u32.toUsize(tree.root), NO_ELEMENT)
+    let adapter = SelectorTree { tree: tree }
+    return (run selectors.matchElement(&value, &buffer, &adapter, u32.toUsize(tree.slotOf(id)), &mut context)).isSome()
+  }
+  return false
+}
+
+effect fn identityAndLinks() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.text(1, 3, "  \n")
+  run batch.create(4, NodeKind.Box)
+  run batch.append(1, 4)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("group dark") })
+  run batch.attribute(2, Attribute.Element { name: run String.copy("button") })
+  run batch.attribute(2, Attribute.ElementId { value: run String.copy("save") })
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("button\tprimary button") })
+  run batch.attribute(4, Attribute.ClassName { value: run String.copy("primary button") })
+  run tree.apply(run batch.take())
+  run Testing.expect(run matches(&tree, 2, b".dark > button#save.button.primary:first-child"), "native tag, class and id participate in selectors")
+  run Testing.expect(run matches(&tree, 4, b"#save + .button:nth-child(2):last-child"), "element sibling links skip text nodes")
+  run Testing.expect(run matches(&tree, 1, b":root:has(> #save)"), "root and relational selectors see retained element links")
+  run Testing.expect(run matches(&tree, 2, b"[id=save][class~=primary]:empty"), "identity is also exposed as attributes")
+  let first = tree.node(tree.slotOf(2)).identity()
+  let second = tree.node(tree.slotOf(4)).identity()
+  if let Option<&NodeIdentity>.Some { value: a } = first {
+    if let Option<&NodeIdentity>.Some { value: b } = second {
+      run Testing.expect(a.classAtoms.length() == 2 && b.classAtoms.length() == 2
+        && a.classAtoms.asSlice()[0] == b.classAtoms.asSlice()[0] && a.classAtoms.asSlice()[1] == b.classAtoms.asSlice()[1], "class atoms ignore ordering and duplicate tokens")
+    }
+  }
+  let savedSlot = tree.slotOf(2)
+  let saved = tree.nodeMut(savedSlot)
+  saved.styleDirty = false
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("changed") })
+  run tree.apply(run batch.take())
+  let oldClass = run matches(&tree, 2, b".primary")
+  let newClass = run matches(&tree, 2, b".changed")
+  run Testing.expect(!oldClass && newClass, "class replacement does not keep stale tokens")
+  run Testing.expect(tree.node(tree.slotOf(2)).styleDirty, "identity mutation marks node for restyling")
+}
+
+test effect fn selectorIdentityAndElementLinks() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run identityAndLinks() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn stateChanges() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Input)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.Element { name: run String.copy("input") })
+  run batch.attribute(2, Attribute.Placeholder { value: run String.copy("Name") })
+  run batch.attribute(2, Attribute.Required { value: true })
+  run batch.attribute(2, Attribute.Checked { value: true })
+  run batch.attribute(2, Attribute.Indeterminate { value: true })
+  run tree.apply(run batch.take())
+  let slot = tree.slotOf(2)
+  tree.focused = slot
+  tree.focusVisible = true
+  let input = tree.nodeMut(slot)
+  input.hovered = true
+  input.pressed = true
+  run Testing.expect(run matches(&tree, 2, b"input:hover:active:focus:focus-visible:enabled:required:checked:indeterminate:placeholder-shown:read-write"), "selectors read live input and interaction state")
+  run Testing.expect(run matches(&tree, 1, b":focus-within"), "focus-within follows ancestors")
+  run batch.attribute(2, Attribute.Disabled { value: true })
+  run batch.attribute(2, Attribute.ReadOnly { value: true })
+  run tree.apply(run batch.take())
+  run Testing.expect(run matches(&tree, 2, b":disabled:read-only:not(:enabled):not(:read-write)"), "state changes do not require reparsing selectors")
+}
+
+test effect fn selectorStateTracksNativeInput() -> ()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stateChanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
