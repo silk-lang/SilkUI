@@ -97,6 +97,8 @@ compiled bytes in native and canvas hosts. Sheets are adopted before the applica
 first layout, including later windows. The embedded inspector has its own styles.
 DOM pages copy the CSS and link the files in the same order before mounting the app.
 The [Loom counter](examples/loom) uses this path on all three targets.
+JavaScript release builds also pick up `dist/app.sheet` from `@silkui/vite`, validate its
+format, and embed it after the explicitly configured CSS files.
 
 A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
 CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `window`,

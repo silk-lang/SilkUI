@@ -1,0 +1,57 @@
+import css_style.compile { Options, CompileError }
+import css_style.compile
+import css_style.sheet { DiagnosticKind }
+import css_style.tokens { CssError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  unsafe extern "C" fn inputLength() -> usize as "stylesheet#input_length"
+  @foreign(noCapture: .("into"))
+  unsafe extern "C" fn inputRead(into: ?[*]mut u8, length: usize) -> () as "stylesheet#input_read"
+  @foreign(noCapture: .("bytes"))
+  unsafe extern "C" fn output(bytes: ?[*]const u8, length: usize) -> () as "stylesheet#output"
+  @foreign(noCapture: .("feature"))
+  unsafe extern "C" fn diagnostic(kind: u32, feature: ?[*]const u8, length: usize, count: usize) -> () as "stylesheet#diagnostic"
+
+  effect fn compiled(strict: bool) -> i32 ! CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+    let length = unsafe inputLength()
+    if length > 67108864 { return 2 }
+    let mut source = run Bytes.zeroed(length)
+    unsafe inputRead(Pointer.fromMutSlice(source.asMutSlice()), length)
+    let sheet = run compile.compile(source.asSlice(), &Options.make())
+    let entries = sheet.diagnostics.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      let item = &entries[i]
+      let kind: u32 = match item.kind {
+        DiagnosticKind.AtRule => 0
+        DiagnosticKind.Selector => 1
+        DiagnosticKind.Property => 2
+        DiagnosticKind.Value => 3
+        DiagnosticKind.Unsupported => 4
+      }
+      let feature = item.feature.asSlice()
+      unsafe diagnostic(kind, Pointer.fromSlice(feature), feature.length, item.count)
+      i = i + 1
+    }
+    if strict && entries.length != 0 { return 1 }
+    let bytes = run sheet.encode()
+    unsafe output(Pointer.fromSlice(bytes.asSlice()), bytes.length())
+    return 0
+  }
+
+  effect fn failed<E>(error: E) -> i32 {
+    drop error
+    return 2
+  }
+
+  export "C" fn compileSheet(strict: u32) -> i32 as "compile_stylesheet" {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    return run Effect.catchAll(compiled(strict != 0), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  }
+}
+
+pub fn main() -> i32 { return 0 }

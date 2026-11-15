@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -48,4 +48,23 @@ test("keeps Node builtins as imports for a host on the SilkJS runtime", async ()
   assert.match(code, /from\s*["']node:fs["']/);
   assert.match(code, /from\s*["']node:path["']/);
   assert.doesNotMatch(code, /__vite-browser-external/);
+});
+
+
+test("compiles processed CSS chunks into app.sheet without DOM injection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "silk-css-build-"));
+  try {
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src/main.js"), 'import "./app.css"; console.log("styled");');
+    writeFileSync(join(root, "src/app.css"), '.test { width: 12px; color: red; }');
+    await build({ root, configFile: false, logLevel: "silent", plugins: [silk({ entry: "src/main.js", strictStylesheets: true })] });
+    const bytes = readFileSync(join(root, "dist/app.sheet"));
+    assert.equal(bytes.subarray(0, 8).toString(), 'SILKCSS\0');
+    assert.equal(existsSync(join(root, "dist/app.css")), false);
+    const code = readFileSync(join(root, "dist/app.js"), 'utf8');
+    assert.doesNotMatch(code, /document|createElement|width: 12px|color: red/);
+    writeFileSync(join(root, "src/main.js"), 'console.log("without styles");');
+    await build({ root, configFile: false, logLevel: "silent", plugins: [silk({ entry: "src/main.js" })], build: { emptyOutDir: false } });
+    assert.equal(existsSync(join(root, "dist/app.sheet")), false, "removing the last CSS import removes stale compiled assets");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

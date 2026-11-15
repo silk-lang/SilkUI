@@ -179,6 +179,7 @@ pub struct App {
   custom: string<'static>,
   stylePaths: List<string<'static>>,
   bundled: String,
+  compiledSheet: String,
   hosts: List<Host>,
 }
 
@@ -352,6 +353,7 @@ impl App {
       custom: "",
       stylePaths: List<string<'static>>.make(),
       bundled: String.make(),
+      compiledSheet: String.make(),
       hosts: List<Host>.make(),
     }
   }
@@ -399,6 +401,11 @@ impl App {
   pub fn frameworkOf(self: &App) -> Framework { return self.writtenIn }
   pub fn targets(self: &App) -> &[Target] { return self.places.asSlice() }
 
+  fn sheetCount(self: &App) -> usize {
+    let bundled: usize = if String.view(&self.compiledSheet) == "" { 0 } else { 1 }
+    return self.stylePaths.length() + bundled
+  }
+
   // --- App: the steps ---
 
   /// Keeps only the target `id` when it is not empty (a `--target` flag), and fails naming
@@ -441,6 +448,7 @@ impl App {
     let web = run fromRoot(&project, dir)
     run installed(String.view(&web))
     app.bundled = run joined(String.view(&web), "dist/app.js")
+    app.compiledSheet = String.make()
     if mode == Mode.Dev && app.runsOn == Runtime.Engine { return move app }
     run say("bundling with Vite")
     if mode == Mode.Release {
@@ -448,6 +456,8 @@ impl App {
     } else {
       run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", "development"])
     }
+    let sheet = run joined(String.view(&web), "dist/app.sheet")
+    if run exists(String.view(&sheet)) { app.compiledSheet = move sheet }
     return move app
   }
 
@@ -467,7 +477,7 @@ impl App {
     while at < targets.length {
       let target = targets[at]
       if app.custom != "" {
-        if app.stylePaths.length() != 0 { run Task.abort("silkui: App.stylesheet needs a generated host; a custom host adopts its compiled sheets directly") }
+        if app.sheetCount() != 0 { run Task.abort("silkui: stylesheets need a generated host; a custom host adopts its compiled sheets directly") }
         if target.web() { run Task.abort("silkui: a custom host builds the window target only") }
         run app.hosts.append(Host { target: target, dir: run fromRoot(&project, app.custom), generated: false })
         at = at + 1
@@ -505,12 +515,12 @@ impl App {
         height: window.height,
         module: module,
         command: command,
-        stylesheets: app.stylePaths.length(),
+        stylesheets: app.sheetCount(),
       }
       let mut dir = run fromRoot(&project, ".silk")
       dir = run joined(String.view(&dir), target.id())
-      run stylesheets.emit(String.view(&project.root), app.stylePaths.asSlice(), String.view(&dir), target.id() == "web-dom")
-      if mode == Mode.Dev && target.id() != "web-dom" && app.stylePaths.length() != 0 {
+      run stylesheets.emitWithCompiled(String.view(&project.root), app.stylePaths.asSlice(), String.view(&dir), target.id() == "web-dom", String.view(&app.compiledSheet))
+      if mode == Mode.Dev && target.id() != "web-dom" && app.sheetCount() != 0 {
         let update = if target.web() { run String.copy("/styles.update") } else { run joined(String.view(&dir), "styles.update") }
         run refresh(String.view(&run joined(String.view(&dir), "styles.path")), String.view(&update))
       }
@@ -570,7 +580,7 @@ impl App {
       let bytes = run sizeOf(String.view(&path))
       if hosts[at].target.web() {
         let folder = run joined(dir, "site")
-        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder), app.stylePaths.length(), mode == Mode.Dev)
+        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder), app.sheetCount(), mode == Mode.Dev)
         run artifacts.append(Artifact { target: hosts[at].target, path: move folder, bytes: bytes })
       } else {
         run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
@@ -888,7 +898,7 @@ impl Running {
               if styled.isNone() || fingerprint != styled.unwrapOr(0) {
                 styled = Option<u64>.Some { value: fingerprint }
                 let host = &running.launched.source.hosts.asSlice()[0]
-                let updated = run Effect.result(stylesheets.emit(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&host.dir), false))
+                let updated = run Effect.result(stylesheets.emitWithCompiled(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&host.dir), false, String.view(&running.launched.source.compiledSheet)))
                 if let Result<(), TaskError | FileError | OutOfMemoryError>.Failure { error } = move updated {
                   drop error
                   run say("stylesheet update failed: the application keeps its previous styles")

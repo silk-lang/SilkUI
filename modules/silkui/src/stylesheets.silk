@@ -6,7 +6,7 @@ import ui_protocol.style_bundle { DecodeError }
 import silk.collections.list { List }
 import css_style.compile
 import css_style.sheet { Sheet, DiagnosticKind }
-import css_style.tokens { CssError }
+import css_style.tokens { CssError, Limits }
 import silk.cli.task { TaskError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
@@ -81,6 +81,11 @@ pub effect fn compiled(source: &[u8], path: string) -> Bytes
 
 pub effect fn emit(root: string, paths: &[string<'static>], host: string, dom: bool) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  run emitWithCompiled(root, paths, host, dom, "")
+}
+
+pub effect fn emitWithCompiled(root: string, paths: &[string<'static>], host: string, dom: bool, compiledPath: string) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
   let mut encoded = List<Bytes>.make()
   let mut i: usize = 0
   while i < paths.length {
@@ -99,11 +104,24 @@ pub effect fn emit(root: string, paths: &[string<'static>], host: string, dom: b
     if !dom { run encoded.append(move data) }
     i = i + 1
   }
-  if !dom && paths.length != 0 {
+  if !dom && compiledPath != "" {
+    let source = run Path.make(compiledPath)
+    let data = run FileSystem.readFile(&source)
+    drop run Effect.catch<DecodeError>(Sheet.decode(data.asSlice(), &Limits.make()), compiledFailure)
+    let file = run Path.make(String.view(&run joined(host, String.view(&run name(i, false)))))
+    run FileSystem.writeFileWithParents(&file, data.asSlice())
+    run encoded.append(move data)
+  }
+  if !dom && encoded.length() != 0 {
     let update = run Effect.catch<DecodeError>(bundle.encode(encoded.asSlice()), bundleFailure)
     let path = run Path.make(String.view(&run joined(host, "styles.update")))
     run Effect.catch<AtomicWriteError>(FileSystem.writeFileAtomic(&path, update.asSlice(), FileSystem.replaceExisting(), FileSystem.buffered()), atomicFailure)
   }
+}
+
+effect fn compiledFailure(error: DecodeError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  drop error
+  fail TaskError { message: run String.copy("silkui: app.sheet is invalid or was built with a different stylesheet compiler; rebuild it with the matching @silkui/vite version"), status: 1 }
 }
 
 effect fn bundleFailure(error: DecodeError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {

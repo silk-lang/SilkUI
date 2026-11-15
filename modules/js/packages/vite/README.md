@@ -38,6 +38,24 @@ export default defineConfig({ plugins: [silk({ entry: "src/main.tsx" }), react()
   `<bundle>.stamp` after each successful build. A host that watches it reloads the whole app.
   This is the production code path, so it is the mode to check a bundle in.
 
+## Stylesheets
+
+Import CSS from the application entry or its modules. Vite runs any configured CSS processors
+first, then this plugin compiles the resulting CSS with the shared Silk compiler shipped as
+WebAssembly. `vite build` writes `dist/app.sheet`; the `silkui` pipeline validates and embeds
+it after any explicitly configured `App.stylesheet` files. The generated host adopts all
+sheets before the first frame. The application bundle contains no CSS parser or DOM style
+injection. Tailwind and other processors remain optional Vite plugins.
+
+Unsupported features produce counted build warnings. Set `strictStylesheets: true` to fail
+instead. Compiler and host versions must match; stale compiled sheets fail the build.
+CSS import hot replacement under the Vite development server is still being integrated.
+`App.stylesheet` files already hot-reload through the pipeline.
+
+Maintainers rebuild the packaged compiler with `npm run build:compiler --workspace @silkui/vite`
+from `modules/js`, using the repository's pinned Silk toolchain. Applications need no Silk
+compiler to run the Vite CSS compilation step.
+
 ## Options
 
 | Option | Default | Meaning |
@@ -48,6 +66,7 @@ export default defineConfig({ plugins: [silk({ entry: "src/main.tsx" }), react()
 | `port` | any free one | Port the dev server listens on for the host |
 | `apis` | `"warn"` | What to do when the build uses an API the runtime does not have: `"warn"`, `"error"` or `"off"` |
 | `allow` | none | Names of such APIs the app provides itself, such as `provided` from `@silkui/foldkit/apis` |
+| `strictStylesheets` | `false` | Fail on unsupported CSS instead of warning |
 | `node` | `false` | The host runs the full SilkJS runtime: `node:fs` and the other Node builtins stay imports, and `apis` reports only what that runtime lacks |
 
 ## The missing API report
