@@ -14,8 +14,6 @@ silk task dev
 
 The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `web/src/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
 
-> **Note:** The JavaScript templates install `@silkui/*` from npm, and those packages are not published yet. Until they are, `ui-loom` is the template that runs as it is.
-
 On Linux the window system's headers have to be installed first:
 
 ```sh
