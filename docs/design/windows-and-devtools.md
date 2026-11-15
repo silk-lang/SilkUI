@@ -2,7 +2,8 @@
 
 Status: steps 1–6 of the [order of work](#order-of-work) are implemented; the rest is a draft
 for review.
-Code sketches show shape only, not final names or syntax.
+Code sketches show shape only, not final names or syntax. Paths under `modules/loom`,
+`modules/loom-components` and `modules/devtools` are in [silk-lang/loom](https://github.com/silk-lang/loom).
 
 ## Summary
 
@@ -50,19 +51,19 @@ Frame timings stay in the inspector: the window host produces them.
 | Native | The platform thread is already keyed by `WindowId` | `modules/tree/window/src/platform_thread.silk:57` |
 | DOM | One `Runtime` + one `Dom` per page; JS tracks one `rootId` | `modules/loom/dom/src/page.silk:68` |
 | Inspector | One JSON line in, one out, then close | `modules/inspect/server/README.md:73` |
-| Inspector | Devtools polls every 0.5 s; each sync is 6–8 requests, each a new connection | `modules/inspect/devtools/src/devtools.silk:64`, `:452` |
+| Inspector | Devtools polls every 0.5 s; each sync is 6–8 requests, each a new connection | `modules/devtools/src/devtools.silk:64`, `:452` |
 | Inspector | The host loop wakes every 20 ms while the inspector is on | `modules/inspect/server/src/server.silk:366` |
 | Inspector | `Protocol.handle` has no socket code; devtools already has a `Link` service with socket and in-process implementations | `protocol.silk:378`, `devtools/src/link.silk:8` |
 | Inspector | Everything is typed against `UiTree`, not `Backend` | `protocol.silk:378` |
 | Inspector | Hidden roots: left out of replies, queries, the event log and topics | `protocol.silk` (`Protocol.hide`) |
 | Inspector | A session in the same process: `openLocal`, served on the spot by `serveLocal` | `server.silk` |
 | Native | A companion beside the client: input, records and frames of its roots, every key first; its root in a window or docked in the first | `modules/tree/window/src/companion.silk` |
-| Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/inspect/devtools/src/embedded.silk` |
+| Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/devtools/src/embedded.silk` |
 | Inspector | Built-in commands are an if/else chain; `<id>.<command>` goes to the extension registry. The MCP tool list is the built-in array plus the tools of the extensions `hello` lists | `protocol.silk` (`execute`), `extension.silk`, `mcp.silk` |
 | Inspector | Extensions: registered with `Inspector.extend`, served from the app's loop with `Inspector.serveExtension`; topics by name, views on `<id>.view.<panel>` | `modules/inspect/server/src/extension.silk` |
 | Inspector | Mutation batches and event records as JSON, `mutationFormat` 1 | `modules/inspect/server/src/remote.silk` |
 | Framework | silk-ui's extension: program log, `silk-ui.*` commands, the Program panel as a silk-ui program on a `ViewBackend` | `modules/loom/inspect/src/{extension,program,panel}.silk` |
-| Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/inspect/devtools/src/{devtools,remote}.silk` |
+| Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/devtools/src/{devtools,remote}.silk` |
 | Inspector | `highlight` exists; devtools only calls it on click | `protocol.silk:784`, `devtools.silk:1128` |
 | Styles | `setStyle` lays an override over the node (`UiTree.setOverride`), kept until reset or resolved; each property is an edit in the app's edit log, with comments | `tree/src/engine.silk` (`StyleOverride`), `server/src/{tools,edits}.silk` |
 | Theme | `Theme` is a struct passed by hand in loom-components; no variables in css | `modules/loom-components/src/theme.silk:16` |

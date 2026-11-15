@@ -97,7 +97,7 @@ After a request dispatches input, the next request waits until the app has drawn
 `poll` also send subscribed sessions their notifications; `wantsFrame` is true when a topic
 changed again in a frame that already sent it, so it goes out with the next frame. Call `inspector.observe(&tree)` before every
 `takeEvents` (window input too) so the `events` log sees what the app sees. `modules/tree/demo` is
-the worked example; loom apps get all of this from `runWindowWith` in modules/loom/window.
+the worked example; loom apps get all of this from `runWindowWith` in loom-window (silk-lang/loom).
 
 ## Protocol
 
@@ -283,7 +283,7 @@ anchors and virtual lists do not travel, so a remote view is drawn with the clie
 images and look.
 
 silk-ui's own extension, `silk-ui` (a program's messages and model, and its Program panel), is
-in [loom-inspect](../../loom/inspect); the window host registers and serves it as any framework
+in [loom-inspect](https://github.com/silk-lang/loom/tree/main/modules/loom/inspect); the window host registers and serves it as any framework
 would.
 
 `key` down/up tracks held Shift/Control/Alt/Meta for subsequent commands that omit `modifiers`. Explicit `modifiers` overrides the event snapshot.

@@ -83,14 +83,14 @@ The program above knows nothing about where it runs. It needs a host: a few line
 - [Your first window](/native/) runs this same counter as a native app.
 - [In the browser](/core/browser/) builds a program for a web page.
 
-To use Silk UI in a package of your own, add it to `silk.toml`:
+To use Loom in a package of your own, add it to `silk.toml`:
 
 ```toml title="silk.toml"
 [dependencies]
-loom = { git = "https://github.com/silk-lang/lib-ui.git", rev = "<a commit>", path = "modules/loom", package = "loom" }
+loom = { git = "https://github.com/silk-lang/loom.git", rev = "<a commit>", path = "modules/loom", package = "loom" }
 ```
 
-The examples in these docs live in the same repository as Silk UI, under `docs/examples`, so their own manifests name it by path instead.
+Loom lives in its own repository, [silk-lang/loom](https://github.com/silk-lang/loom). The examples in these docs, under `docs/examples` of lib-ui, name it the same way.
 
 ## Recap
 

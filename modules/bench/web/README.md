@@ -2,7 +2,7 @@
 
 The keyed [js-framework-benchmark](https://github.com/krausest/js-framework-benchmark) entry for
 Silk UI in a page: a loom program (`src/main.silk`) shown with real DOM nodes by
-[loom-dom](../../loom/dom), compiled to WebAssembly. It builds the markup every entry builds (the
+[loom-dom](https://github.com/silk-lang/loom/tree/main/modules/loom/dom), compiled to WebAssembly. It builds the markup every entry builds (the
 Bootstrap jumbotron with six buttons, a table of rows with `tr`, `td`, `a` and the `danger` class
 on the selected row) with `h.element`, `h.className` and `h.id`, so the page's stylesheet and the
 driver's selectors apply as they do to the other entries.

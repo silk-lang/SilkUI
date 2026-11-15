@@ -34,7 +34,9 @@ silk build --manifest-path docs/examples/apps/tree-hello/silk.toml
 
 rm -rf "$out"
 mkdir -p "$out"
-cp "$root/modules/loom/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
+# loom-dom's page script, from Silk's checkout of the Loom commit this package pins.
+loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\([0-9a-f]*\)".*/\1/p' "$here/silk.toml" | head -1)"
+cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
 cp "$here/web/favicon.svg" "$out/favicon.svg"
 cp -R "$here/web/fonts" "$out/fonts"
 # The album's photos, icons and fonts, at the root as its relative URLs name them.
