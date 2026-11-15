@@ -99,13 +99,12 @@ DOM pages copy the CSS and link the files in the same order before mounting the 
 The [Loom counter](examples/loom) uses this path on all three targets.
 
 A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
-CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `window`
-and `web-dom`, `dev` replaces changed stylesheets without restarting the application or
+CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `window`,
+`web-canvas`, and `web-dom`, `dev` replaces changed stylesheets without restarting the application or
 resetting its state. Native hosts validate an atomically published set of compiled sheets
 before updating their application roots. A missing or invalid update leaves the active styles
 intact until a valid update is available. Release hosts do not watch stylesheet files.
-Canvas stylesheet hot replacement is still being integrated; CSS edits on that target
-currently require rebuilding.
+Canvas updates fetch the same compiled bundles; development polling is omitted from release pages.
 
 The browser integration test runs the real dev task in a temporary project and checks
 replacement order, preserved state, missing-file recovery, and a subsequent code rebuild:
