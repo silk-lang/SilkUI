@@ -106,3 +106,52 @@ test effect fn pageCallsDecodeIntoTheTree() -> () ! TreeError | ProtocolError | 
   let mut allocator = Allocator.systemAllocatorProvider()
   run decoded() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+
+import ui_js_calls.stylesheet_compiler { runtime }
+import ui_js_calls.stylesheets { encoded }
+import ui_tree.lib { Viewport }
+
+effect fn compiledSheets() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let compiler = runtime()
+  let compiled = compiler.call(b"div{width:123px;height:20px}")
+  let bytes = match move compiled {
+    Option.Some { value } => move value
+    Option.None => { run Testing.expect(false, "fixture compiles") return () }
+  }
+  let text = run encoded(bytes.asSlice())
+  let mut calls = Calls { bytes: List<u8>.make() }
+  run calls.op(wire.CREATE, 1)
+  run calls.word(0)
+  run calls.op(wire.ROOT, 1)
+  run calls.op(wire.STYLE_SHEET, 1)
+  run calls.word(55)
+  run calls.text(String.view(&text))
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  drop run wire.decode(calls.bytes.asSlice(), &mut batch, &mut frames)
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  run tree.apply(run batch.take())
+  drop run tree.frame(Viewport { width: 400.0, height: 300.0, scale: 1.0 }, 0.0)
+  run Testing.expect(match tree.view(NodeId.of(1)) { Option.Some { value } => value.computed().layout.width.value == 123.0 Option.None => false }, "browser wire adopts compiled CSS in root 0")
+  calls.bytes.clear()
+  run calls.op(wire.STYLE_SHEET, 2)
+  run calls.word(55)
+  run calls.text("invalid")
+  drop run wire.decode(calls.bytes.asSlice(), &mut batch, &mut frames)
+  run Testing.expect(batch.length() == 0, "invalid compiled wire data cannot replace the active sheet")
+  calls.bytes.clear()
+  run calls.op(wire.STYLE_SHEET, 3)
+  run calls.word(55)
+  run calls.text("")
+  drop run wire.decode(calls.bytes.asSlice(), &mut batch, &mut frames)
+  run tree.apply(run batch.take())
+  drop run tree.frame(Viewport { width: 400.0, height: 300.0, scale: 1.0 }, 0.1)
+  run Testing.expect(match tree.view(NodeId.of(1)) { Option.Some { value } => value.computed().layout.width.value != 123.0 Option.None => false }, "browser wire removes an adopted sheet")
+}
+
+test effect fn compiledSheetsCrossTheBrowserWire() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run compiledSheets() |> Effect.provideMut<Allocator>(&mut allocator)
+}

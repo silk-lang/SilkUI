@@ -5,6 +5,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -28,6 +29,8 @@ import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
+import ui_js_calls.stylesheets as stylesheets
+import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
@@ -61,6 +64,8 @@ pub const LISTEN: u32 = 668019 // nativeId(b"listen")
 /// `__ui.style(id, css, state)`: sets the declarations of `css` (`"width: 10px; color: red"`)
 /// in a look of the node. State 0 is the base look, 1 hover, 2 active, 3 focus, 4
 /// focus-visible. Declarations that do not parse are dropped, as in CSS.
+pub const COMPILE_STYLE_SHEET: u32 = 436067
+pub const STYLE_SHEET: u32 = 203804
 pub const STYLE: u32 = 794345 // nativeId(b"style")
 /// `__ui.clearStyle(id, state)`: forgets every declaration of that look.
 pub const CLEAR_STYLE: u32 = 724429 // nativeId(b"clearStyle")
@@ -166,6 +171,7 @@ pub struct LogEntry {
 /// The engine's services for a UI host: the batch JavaScript appends to, the modules it can
 /// import, and what its timers, frame requests and console calls left for the host.
 pub struct Bridge {
+  pub stylesheetCompiler: Compiler,
   pub batch: Batch,
   pub modules: List<ModuleSource>,
   /// The host clock in milliseconds, as of the host's last `advance`.
@@ -204,7 +210,7 @@ pub struct Rejected {
 impl Bridge {
   pub fn make() -> Bridge {
     return Bridge {
-      batch: Batch.make(),
+      stylesheetCompiler: Compiler.off(),      batch: Batch.make(),
       modules: List<ModuleSource>.make(),
       now: 0.0,
       timers: List<Timer>.make(),
@@ -292,6 +298,8 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"setText", arity: 2 },
     Native { name: b"source", arity: 2 },
     Native { name: b"style", arity: 3 },
+    Native { name: b"styleSheet", arity: 3 },
+    Native { name: b"compileStyleSheet", arity: 1 },
     Native { name: b"timer", arity: 2 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
@@ -368,6 +376,27 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.setText(first, String.view(&value))
   } else if function == LISTEN {
     run bridge.batch.listen(first, id(argv.get(1).view()))
+  } else if function == COMPILE_STYLE_SHEET {
+    let source = run text(argv.get(0))
+    let compiled = bridge.stylesheetCompiler.call(String.utf8Bytes(String.view(&source)))
+    if let Option<Bytes>.Some { value } = move compiled {
+      let encoded = run stylesheets.encoded(value.asSlice())
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&encoded))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    let mut message = List<u8>.make()
+    run message.appendSlice(b"runtime CSS compilation is disabled or the stylesheet could not be compiled")
+    return Outcome.TypeError { message: move message }
+  } else if function == STYLE_SHEET {
+    let encoded = run text(argv.get(2))
+    if !(run stylesheets.apply(&mut bridge.batch, first, id(argv.get(1).view()), String.view(&encoded))) {
+      let mut message = List<u8>.make()
+      run message.appendSlice(b"invalid compiled stylesheet or stylesheet operation")
+      return Outcome.TypeError { message: move message }
+    }
   } else if function == STYLE {
     let css = run text(argv.get(1))
     run applyStyle(&mut bridge.batch, first, styleState(id(argv.get(2).view())), &css)

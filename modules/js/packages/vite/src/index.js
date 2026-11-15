@@ -16,6 +16,7 @@ import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
+import { stylesheetDevPlugin } from "./stylesheets.js";
 
 /**
  * @param {object} [options]
@@ -170,7 +171,7 @@ export default function silk(options = {}) {
       if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
     },
   };
-  const plugins = [buildPlugin, apiPlugin, cssPlugin];
+  const plugins = [buildPlugin, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }

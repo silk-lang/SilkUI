@@ -24,7 +24,7 @@ const OP = {
   create: 1, append: 2, insertBefore: 3, root: 4, setText: 5, listen: 6, style: 7, clearStyle: 8,
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
-  richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26,
+  richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -123,6 +123,12 @@ export class JsHost {
       setText(id, value) { write(OP.setText, id); calls.text(value); },
       listen(id, flags) { write(OP.listen, id); calls.u32(flags); },
       style(id, css, state) { write(OP.style, id); calls.u32(state); calls.text(css); },
+      styleSheet(operation, id, bytes) {
+        if (operation < 0 || operation > 3 || (operation !== 0 && (id < 1 || id >= 0x80000000))) throw new TypeError('invalid stylesheet operation');
+        if (operation !== 3) host.validateStyleSheet(bytes);
+        if (operation === 0) return;
+        write(OP.styleSheet, operation); calls.u32(id); calls.text(bytes);
+      },
       clearStyle(id, state) { write(OP.clearStyle, id); calls.u32(state); },
       attribute(id, name, value, max, now) {
         name = String(name);
@@ -222,6 +228,19 @@ export class JsHost {
     const windows = this.windowHost?.windows;
     if (!windows) return;
     for (const window of windows.values()) this.windowHost.frame(window);
+  }
+
+  validateStyleSheet(text) {
+    const exports = this.instance?.exports;
+    if (!exports) throw new Error('Stylesheets are available once the page has started the app');
+    const source = encoder.encode(String(text));
+    if (source.length > 89478488) throw new RangeError('Compiled stylesheet exceeds the size limit');
+    const pointer = exports.webgpu_alloc(source.length);
+    if (!pointer && source.length) throw new Error('Stylesheet validation ran out of memory');
+    try {
+      new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
+      if (!exports.silkui_validate_stylesheet(pointer, source.length)) throw new TypeError('invalid compiled stylesheet');
+    } finally { exports.webgpu_free(pointer, source.length); }
   }
 
   markdown(text, flags) {

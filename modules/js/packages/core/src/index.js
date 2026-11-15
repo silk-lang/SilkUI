@@ -217,6 +217,163 @@ export class ClassList {
   toString() { return this.value; }
 }
 
+const sheetData = new WeakMap();
+const adoptedLists = new WeakMap();
+const importedSheets = new Map();
+let installedSheets = [];
+let nextSheet = 1;
+
+function sheetError(message) {
+  const error = new Error(message);
+  error.name = "NotAllowedError";
+  return error;
+}
+
+function base64Bytes(value) {
+  if (typeof value === "string") return value;
+  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
+  if (!(bytes instanceof Uint8Array)) throw new TypeError("Expected compiled stylesheet bytes");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const bits = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+    encoded += alphabet[bits >>> 18] + alphabet[(bits >>> 12) & 63]
+      + (i + 1 < bytes.length ? alphabet[(bits >>> 6) & 63] : "=")
+      + (i + 2 < bytes.length ? alphabet[bits & 63] : "=");
+  }
+  return encoded;
+}
+
+function replaceSheet(sheet, bytes) {
+  native.styleSheet(0, 0, bytes);
+  const state = sheetData.get(sheet);
+  state.bytes = bytes;
+  for (const entry of installedSheets) {
+    if (entry.sheet !== sheet) continue;
+    native.styleSheet(entry.live ? 2 : 1, entry.id, bytes);
+    entry.live = true;
+  }
+}
+
+/** A constructed stylesheet, adopted on an application's root. */
+export class CSSStyleSheet {
+  constructor() { sheetData.set(this, { bytes: null, replacing: false }); }
+
+  static fromCompiled(bytes) {
+    const sheet = new CSSStyleSheet();
+    replaceSheet(sheet, base64Bytes(bytes));
+    return sheet;
+  }
+
+  replaceCompiled(bytes) {
+    if (sheetData.get(this).replacing) throw sheetError("A stylesheet replacement is already pending");
+    replaceSheet(this, base64Bytes(bytes));
+  }
+
+  replaceSync(text) {
+    if (sheetData.get(this).replacing) throw sheetError("A stylesheet replacement is already pending");
+    if (!native.compileStyleSheet) throw sheetError("Runtime CSS compilation is disabled in this host");
+    replaceSheet(this, native.compileStyleSheet(String(text)));
+  }
+
+  replace(text) {
+    const state = sheetData.get(this);
+    if (state.replacing) return Promise.reject(sheetError("A stylesheet replacement is already pending"));
+    const source = String(text);
+    state.replacing = true;
+    return Promise.resolve().then(() => {
+      if (!native.compileStyleSheet) throw sheetError("Runtime CSS compilation is disabled in this host");
+      replaceSheet(this, native.compileStyleSheet(source));
+      return this;
+    }).finally(() => { state.replacing = false; });
+  }
+}
+
+function clearAdoptedSheets() {
+  for (const entry of installedSheets) if (entry.live) native.styleSheet(3, entry.id, "");
+  installedSheets = [];
+}
+
+function syncAdoptedSheets() {
+  if (!rootNode) return;
+  clearAdoptedSheets();
+  const sheets = [...importedSheets.values(), ...(adoptedLists.get(rootNode)?.values ?? [])];
+  for (const sheet of sheets) {
+    if (nextSheet >= 0x80000000) throw new RangeError("Too many stylesheet adoptions");
+    const entry = { sheet, id: nextSheet++, live: false };
+    installedSheets.push(entry);
+    const bytes = sheetData.get(sheet).bytes;
+    if (bytes !== null) { native.styleSheet(1, entry.id, bytes); entry.live = true; }
+  }
+}
+
+function validateSheets(values) {
+  for (const sheet of values) if (!sheetData.has(sheet)) throw new TypeError("adoptedStyleSheets accepts constructed CSSStyleSheet objects");
+  return values;
+}
+
+const sheetMutators = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
+function adoptedList(node) {
+  let list = adoptedLists.get(node);
+  if (list) return list;
+  const values = [];
+  const assign = next => {
+    validateSheets(next);
+    values.splice(0, values.length, ...next);
+    if (rootNode === node) syncAdoptedSheets();
+  };
+  const numeric = key => typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key);
+  const proxy = new Proxy(values, {
+    get(target, key, receiver) {
+      if (!sheetMutators.has(key)) return Reflect.get(target, key, receiver);
+      return (...args) => {
+        const next = values.slice();
+        const result = Array.prototype[key].apply(next, args);
+        assign(next);
+        return result === next ? proxy : result;
+      };
+    },
+    set(target, key, value) {
+      if (key !== "length" && !numeric(key)) return Reflect.set(target, key, value);
+      const next = values.slice();
+      Reflect.set(next, key, value);
+      assign(next);
+      return true;
+    },
+    defineProperty(target, key, descriptor) {
+      if (key !== "length" && !numeric(key)) return Reflect.defineProperty(target, key, descriptor);
+      if (!Object.hasOwn(descriptor, "value") || descriptor.get || descriptor.set || descriptor.configurable === false || descriptor.writable === false) {
+        throw new TypeError("adoptedStyleSheets entries must remain mutable values");
+      }
+      const next = values.slice();
+      Reflect.set(next, key, descriptor.value);
+      assign(next);
+      return true;
+    },
+    deleteProperty(target, key) {
+      if (!numeric(key)) return Reflect.deleteProperty(target, key);
+      return Number(key) >= values.length;
+    },
+  });
+  list = { values, proxy, assign };
+  adoptedLists.set(node, list);
+  return list;
+}
+
+/** Installs or replaces a CSS import compiled by the development build tool. */
+export function updateStyleSheet(id, compiled) {
+  const key = String(id);
+  const previous = importedSheets.get(key);
+  if (compiled === null) {
+    if (importedSheets.delete(key)) syncAdoptedSheets();
+  } else if (previous) {
+    previous.replaceCompiled(compiled);
+  } else {
+    importedSheets.set(key, CSSStyleSheet.fromCompiled(compiled));
+    syncAdoptedSheets();
+  }
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   #listeners = null;
@@ -238,6 +395,9 @@ export class Node {
     nodes.set(this.nodeId, this);
     native.create(this.nodeId, KINDS[kind]);
   }
+
+  get adoptedStyleSheets() { return adoptedList(this).proxy; }
+  set adoptedStyleSheets(value) { adoptedList(this).assign(Array.from(value)); }
 
   get firstChild() {
     return this.childNodes[0] ?? null;
@@ -305,6 +465,7 @@ export class Node {
 
   /** Detaches and frees this node and its subtree. They cannot be used again. */
   destroy() {
+    if (rootNode && this.contains(rootNode)) { clearAdoptedSheets(); rootNode = null; }
     const parent = this.parentNode;
     if (parent) {
       parent.childNodes.splice(parent.childNodes.indexOf(this), 1);
@@ -899,8 +1060,10 @@ export function defineKeyframes(name, frames) {
 }
 
 export function mount(node) {
+  if (rootNode) clearAdoptedSheets();
   rootNode = node;
   native.root(node.nodeId);
+  syncAdoptedSheets();
   return node;
 }
 
@@ -1132,6 +1295,7 @@ function follow(target) {
 // The host calls this before it replaces the realm, on a reload: every node goes, so the
 // next realm starts on an empty tree.
 native.unload = function () {
+  importedSheets.clear();
   for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
   rootNode = null;
 };

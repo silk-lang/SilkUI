@@ -1,3 +1,13 @@
+/** A constructed stylesheet. Text loading requires runtime stylesheet compilation in the host. */
+export class CSSStyleSheet {
+  static fromCompiled(bytes: Uint8Array | ArrayBuffer | string): CSSStyleSheet;
+  replaceCompiled(bytes: Uint8Array | ArrayBuffer | string): void;
+  replaceSync(text: string): void;
+  replace(text: string): Promise<CSSStyleSheet>;
+}
+/** Used by build tools to replace or remove a compiled CSS import without restarting the app. */
+export function updateStyleSheet(id: string, compiled: Uint8Array | ArrayBuffer | string | null): void;
+
 import type * as CSS from "csstype";
 
 /** The node kinds of the tree. `richinput` is an `input` with marks and atoms. */
@@ -55,6 +65,7 @@ export class Node {
   readonly nodeId: number;
   id: string;
   className: string;
+  adoptedStyleSheets: CSSStyleSheet[];
   readonly classList: ClassList;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;

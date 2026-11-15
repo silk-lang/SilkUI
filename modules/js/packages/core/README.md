@@ -178,3 +178,38 @@ The package ships its types. Every node class, event and style property is typed
 - [Templates](https://github.com/silk-lang/examples) and
   [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/).
 - [Source](https://github.com/silk-lang/SilkUI/tree/main/modules/js/packages/core). MIT license.
+
+
+## Stylesheets
+
+CSS imports built with `@silkui/vite` are adopted before the first frame and replaced in
+place during development. For application-managed themes, adopt constructed sheets on the
+node passed to `mount`:
+
+```js
+import { CSSStyleSheet, createBox, mount } from "@silkui/core";
+
+const theme = new CSSStyleSheet();
+theme.replaceSync(".card { padding: 12px; color: rebeccapurple }");
+const app = createBox();
+app.className = "card";
+app.adoptedStyleSheets = [theme];
+mount(app);
+await theme.replace(".card { padding: 18px; color: teal }");
+```
+
+JavaScript development hosts include the text compiler. Release hosts require
+`App.runtimeStylesheets()` in their Silk task pipeline. Without that option they accept
+compiled sheets and reject text compilation. The compiler is linked only when enabled.
+
+`adoptedStyleSheets` is an ordered mutable array. Assignment, `push`, `splice`, reordering,
+and shrinking `length` update the active root. Entries must be constructed `CSSStyleSheet`
+objects; deleting an indexed property or creating holes is invalid. The same sheet can
+appear multiple times, and replacing it updates each adoption. Invalid compiled bytes leave
+the current sheet intact. Replacing the mounted root switches to that node's adopted list.
+
+`CSSStyleSheet.fromCompiled(bytes)` creates a sheet from `Uint8Array`, `ArrayBuffer`, or
+Base64-encoded compiled bytes; `sheet.replaceCompiled(bytes)` updates it. The format is
+versioned and must match the host. Build-time sheets come first, followed by imported CSS
+and the root's constructed sheets. There is no `document`, `<style>`, or `<link>` node;
+`cssRules`, `insertRule`, and `deleteRule` are not part of this API.

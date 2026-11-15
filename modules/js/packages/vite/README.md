@@ -49,8 +49,10 @@ injection. Tailwind and other processors remain optional Vite plugins.
 
 Unsupported features produce counted build warnings. Set `strictStylesheets: true` to fail
 instead. Compiler and host versions must match; stale compiled sheets fail the build.
-CSS import hot replacement under the Vite development server is still being integrated.
-`App.stylesheet` files already hot-reload through the pipeline.
+CSS imports, including dependencies processed through `@import`, hot-replace their compiled
+sheet under the Vite development server. The mounted application and its state remain in
+place. Failed compilation preserves the previous sheet until a valid edit arrives.
+`App.stylesheet` files hot-reload through the pipeline.
 
 Maintainers rebuild the packaged compiler with `npm run build:compiler --workspace @silkui/vite`
 from `modules/js`, using the repository's pinned Silk toolchain. Applications need no Silk
