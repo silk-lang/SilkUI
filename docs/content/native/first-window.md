@@ -2,6 +2,8 @@
 
 A native app is a Silk UI program plus one small file that opens a window. This page takes the counter from [Your first program](/core/first-program/), unchanged, and runs it as a desktop app.
 
+> **Note:** A project made with `silk init -t ui-loom` gets this file generated, and `silk task dev` opens it (see [Get started](/start/)). This page writes it by hand, to show what is in it and for apps that need their own.
+
 ## The app
 
 ::shot native-hello "The counter, as a window would show it."

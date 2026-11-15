@@ -2,8 +2,6 @@
 
 Silk has four brands, and each does one job. Silk compiles, SilkJS runs JavaScript, Silk UI puts things on screen, and Loom is the Silk-native way to write what goes on screen. This page names every product once, so the rest of the docs can use the names without explaining them.
 
-> **Note:** The `silkui` front door is still being built. Every other name on this page is the name in the code.
-
 ## The four brands
 
 | Brand | You meet it as | What it is |
@@ -36,7 +34,7 @@ Silk UI is everything that puts an app on screen. Building an app comes down to 
 
 | Product | Package | What it is |
 | --- | --- | --- |
-| Front door | `silkui` | One dependency that takes your app definition and gives your project `dev` and `build` steps for its `tasks.silk`. In progress |
+| Front door | `silkui` | One dependency that takes your app definition and gives your project `dev` and `build` steps for its `tasks.silk`. The templates are set up with it: [Get started](/start/) |
 | Silk UI Tree | `ui-tree` | The retained tree: nodes, CSS styles, layout, text, input, focus, scrolling and paint. The "DOM" of Silk UI, driven by plain-data changes and events |
 | Targets | | Where an app runs: `window` (a desktop window), `web-canvas` (a browser canvas with WebGPU) or `web-dom` (real elements in a browser page). You pick them in the app definition |
 | Adapters | `@silkui/*` | What lets a JavaScript framework run on Silk UI: `@silkui/core` for plain JS or TS, `@silkui/react`, `@silkui/foldkit`, and `@silkui/vite` for bundling and hot reload. React and Foldkit stay your own npm dependencies |
@@ -52,6 +50,8 @@ JavaScript apps in a window run on SilkJS, embedded in the app: the lean SilkJS 
 | --- | --- | --- |
 | Loom | `loom` | The Elm-style framework written in Silk. A peer of React and Foldkit: it reaches Silk UI only through the protocol. |
 | Loom Components | `loom-components` | Buttons, fields, menus, dialogs and a theme for Loom apps. |
+
+Both live in their own repository, [silk-lang/loom](https://github.com/silk-lang/loom), with the window that shows the DevTools (itself a Loom app).
 
 The [first guide](/core/) on this site teaches Loom, the [second](/native/) runs the same programs in native windows, and the [third](/tree/) uses the Silk UI Tree directly.
 

@@ -7,8 +7,8 @@ screen. This repository holds:
 
 - **Silk UI**: the retained UI tree (`ui-tree`, `ui-protocol`, `ui-text`), the hosts for each
   target, the JS adapters as npm packages (`@silkui/core`, `@silkui/react`, `@silkui/foldkit`,
-  `@silkui/vite`), and the inspector (`ui-inspect`). A single front door, the `silkui` package,
-  is in progress.
+  `@silkui/vite`), and the inspector (`ui-inspect`). The front door is the `silkui` package:
+  one dependency that builds and runs an app from its `tasks.silk`.
 - **Loom**, the Elm-style UI framework written in Silk, with Loom Components and the DevTools
   (a Loom app), lives in [silk-lang/loom](https://github.com/silk-lang/loom). It is built on
   this repository: lib-ui's docs and benchmarks depend on it by Git like any other app.
@@ -16,6 +16,20 @@ screen. This repository holds:
 JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
 The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
 product once.
+
+## Get started
+
+```sh
+silk init my-app -t ui-react   # or ui-loom, ui-foldkit, ui-js
+cd my-app
+silk task dev                  # opens the app in a window, reloading as you edit
+silk task build                # writes the release program to dist/window/
+```
+
+The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
+[Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/) walks through one. Each
+project's `src/tasks.silk` defines the app through [`silkui`](modules/silkui). The JavaScript
+templates need the `@silkui/*` packages on npm, which are not published yet.
 
 ## Documentation
 
