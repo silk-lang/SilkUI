@@ -7,6 +7,10 @@ which runs Foldkit programs on it, and `@silkui/vite`,
 a Vite plugin that builds an application and, in development, replaces edited modules in
 the running window.
 
+To start an app, use a template: `silk init my-app -t ui-react` (or `ui-foldkit`, `ui-js`)
+gives a project whose `silk task dev` builds and opens it through [silkui](../silkui). This
+page is the reference for the packages and the host underneath.
+
 ## @silkui/core
 
 [packages/core](packages/core) is the node and event API. Its primitives are the tree's own (box,
