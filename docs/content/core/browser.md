@@ -40,7 +40,7 @@ This file is everything that is specific to the browser.
 
 ::source examples/apps/dice-web/silk.toml
 
-`ui_app_dom` is the browser backend. The third dependency is this site's examples, where `dice.silk` lives. In a package of your own the program would sit in `src/` next to `main.silk`.
+`loom_dom` is the browser backend. The third dependency is this site's examples, where `dice.silk` lives. In a package of your own the program would sit in `src/` next to `main.silk`.
 
 ## Build and serve
 

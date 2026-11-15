@@ -11,7 +11,7 @@ silk build --manifest-path "$here/silk.toml" \
 rm -rf "$here/dist"
 mkdir -p "$here/dist"
 cp "$root/build/llvm/wasm32-unknown-unknown/release-size/dice-web" "$here/dist/dice.wasm"
-cp "$root/modules/app/dom/js/silk-ui-dom.js" "$here/dist/silk-ui-dom.js"
+cp "$root/modules/loom/dom/js/silk-ui-dom.js" "$here/dist/silk-ui-dom.js"
 cp "$here/web/index.html" "$here/dist/index.html"
 echo "Built $here/dist"
 

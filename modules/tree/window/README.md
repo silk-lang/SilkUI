@@ -4,7 +4,7 @@
 
 `host.runWindow` owns the native window, GPU surface, input adapter, accessibility
 publication, inspector integration, frame requests, and presentation. It requires no
-`ui-app` runtime. Implement `host.WindowClient<State, Errors, Requirements>` and pass
+`loom` runtime. Implement `host.WindowClient<State, Errors, Requirements>` and pass
 ordinary client state, a font collection, initial resource mutations, window options,
 and an inspector. The app window package now adapts its existing runtime and custom
 `WindowContent` hooks to this host.
@@ -165,10 +165,10 @@ results. `release` cancels work and releases the installed resource. The request
 and generation checks come from portable `ui-tree.image_load` code; OS threads and
 I/O stay in this native package.
 
-`background.Background` and `Cancellation` are also available without `ui-app`.
+`background.Background` and `Cancellation` are also available without `loom`.
 Work and results must own transferable storage. Keep cancelled jobs until completion:
 dropping an unfinished job joins the worker. Compatibility imports remain available
-under `ui-app-window.background` and `ui-app-window.images`.
+under `loom-window.background` and `loom-window.images`.
 
 ## Extraction validation
 

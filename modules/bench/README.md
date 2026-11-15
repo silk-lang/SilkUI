@@ -1,6 +1,6 @@
 # ui-bench
 
-Benchmarks of the retained tree (`ui-tree`) and the framework (`ui-app`). The scenarios, their
+Benchmarks of the retained tree (`ui-tree`) and the framework (`loom`). The scenarios, their
 sizes and their names follow the benchmarks of
 [FerroUI](https://github.com/wieslawsoltes/FerroUI/tree/main/tests/FerroUI.Benchmarks)
 (`category::Class.benchmark[parameters]`), so the two tables can be read side by side. Only the

@@ -4,7 +4,7 @@ Embedded fonts, icons and photos for UI fixtures, tests and demos: two Noto Sans
 and Geist Mono (the devtools' faces), the
 toolbar and card icons, an animated orbit SVG, and procedural photos. They were the
 [graphics demo](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/graphics-demo)'s assets, and moved here because ui-tree's fixtures,
-ui-app tests and several demos use them too. Import `assets` for typed accessors (`regularFont`,
+loom tests and several demos use them too. Import `assets` for typed accessors (`regularFont`,
 `icon(index)`, `photo(index)` and the icon constants).
 
 Fonts are subsets of Noto Sans (SIL Open Font License, `assets/fonts/Noto-LICENSE-OFL.txt`)
