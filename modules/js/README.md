@@ -448,3 +448,20 @@ silk task browser serve --app modules/js/examples/plain-counter/dist/app.js
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silkui/core` adds about 14 MB and
   React about 5 MB more.
+
+### Selector identity
+
+Core nodes expose a string `id`, `className`, a live `classList` (`add`, `remove`,
+`toggle`, `contains`, `replace`), and `getAttribute`, `hasAttribute`, and
+`removeAttribute`. `setAttribute` accepts `data-*`, `aria-*`, `lang`, and `dir`;
+empty strings and `"false"` are present values, while null removes the attribute.
+React passes `className`, `id`, `data-*`, and `aria-*` props through. Foldkit's
+existing class and data attributes reach the same native nodes.
+
+The numeric handle formerly exposed as `node.id` is now the read-only
+`node.nodeId`. Use it with `nodeById` and low-level host calls; changing the CSS
+`id` does not change that handle or event routing. Existing accessibility
+relations continue to resolve by the string id.
+
+These identity APIs are the foundation for native stylesheet matching. Sheet
+adoption and CSS loading are still being implemented on this feature branch.

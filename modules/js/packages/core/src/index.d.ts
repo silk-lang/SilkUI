@@ -29,11 +29,33 @@ export interface Look {
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
 export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
 
+/** Live tokens in a node's class attribute. */
+export class ClassList implements Iterable<string> {
+  constructor(node: Node);
+  value: string;
+  readonly length: number;
+  item(index: number): string | null;
+  contains(token: string): boolean;
+  add(...tokens: string[]): void;
+  remove(...tokens: string[]): void;
+  toggle(token: string, force?: boolean): boolean;
+  replace(oldToken: string, newToken: string): boolean;
+  values(): IterableIterator<string>;
+  keys(): IterableIterator<number>;
+  entries(): IterableIterator<[number, string]>;
+  forEach(callback: (value: string, index: number, list: ClassList) => void, thisArg?: unknown): void;
+  [Symbol.iterator](): IterableIterator<string>;
+  toString(): string;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   constructor(kind: NodeKind);
-  /** The tree's number for the node (not the DOM `id`: that is `setAttribute("id", ...)`). */
-  readonly id: number;
+  /** Stable protocol identifier, independent of the CSS id attribute. */
+  readonly nodeId: number;
+  id: string;
+  className: string;
+  readonly classList: ClassList;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
@@ -61,9 +83,13 @@ export class Node {
   /**
    * Sets a tree attribute (`tabIndex`, `disabled`, `label`, `testId`, `placeholder`, `href`,
    * `cursor`, `multiline`, `readOnly`, `inert`, `focusTrap`, `transition`), `id`, `role`, or
-   * an ARIA attribute spelled `aria-checked` or `ariaChecked`.
+   * an ARIA attribute spelled `aria-checked` or `ariaChecked`, or a `data-*` attribute.
+   * `null` and `undefined` remove an attribute.
    */
   setAttribute(name: string, value: unknown): void;
+  getAttribute(name: string): string | null;
+  hasAttribute(name: string): boolean;
+  removeAttribute(name: string): void;
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;

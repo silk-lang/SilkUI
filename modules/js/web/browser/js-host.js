@@ -30,8 +30,8 @@ const OP = {
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
 // any other throws a TypeError, as in a window.
 const ATTRIBUTES = new Set([
-  'tabIndex', 'disabled', 'focusTrap', 'multiline', 'readOnly', 'checked', 'selected', 'expanded',
-  'indeterminate', 'label', 'testId', 'inert', 'id', 'placeholder', 'href', 'transition', 'cursor',
+  'element', 'tabIndex', 'disabled', 'focusTrap', 'multiline', 'readOnly', 'checked', 'selected', 'expanded',
+  'indeterminate', 'label', 'testId', 'inert', 'id', 'class', 'className', 'lang', 'dir', 'placeholder', 'href', 'transition', 'cursor',
 ]);
 
 const encoder = new TextEncoder();
@@ -134,7 +134,7 @@ export class JsHost {
         }
         // Whether the tree has a role or ARIA text cannot wait for the wasm: it reports the
         // ones it does not have on the console instead.
-        const known = name === 'role' || name.startsWith('aria-');
+        const known = name === 'role' || /^(?:aria|data)-[a-z0-9_.:-]+$/.test(name);
         if (!known && !ATTRIBUTES.has(name)) throw new TypeError(`the tree has no attribute '${name}'`);
         write(OP.attribute, id);
         calls.text(name);

@@ -155,7 +155,10 @@ function applyProps(node, previous, next) {
   for (const name of Object.keys(previous)) {
     if (name in next || SKIP.has(name)) continue;
     if (name in LOOKS) diffStyle(node.look(LOOKS[name]), previous[name], null);
-    else if (!eventOf(name)) node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
+    else if (!eventOf(name)) {
+      if (name === "id" || name === "className" || name.startsWith("data-") || name.startsWith("aria-")) node.removeAttribute(name);
+      else node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
+    }
   }
   if (node.kind === "icon" && next.svg !== previous.svg) node.svg = next.svg;
   if (node instanceof RichInput) {

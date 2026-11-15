@@ -202,11 +202,11 @@ function attributeChanged(element, name, value) {
   const node = element.node;
   const present = value !== null;
   if (name === "id") {
-    node.setAttribute("id", present ? value : "");
+    node.setAttribute("id", value);
   } else if (name === "role") {
     node.setAttribute("role", present ? value : ROLES[element.localName]?.[0] ?? "");
-  } else if (name.startsWith("aria-")) {
-    node.setAttribute(name, present ? value : "");
+  } else if (name.startsWith("aria-") || name.startsWith("data-") || name === "class" || name === "lang" || name === "dir") {
+    node.setAttribute(name, value);
   } else if (name === "tabindex") {
     node.setAttribute("tabIndex", present ? Number(value) : FOCUSABLE.has(element.localName) ? 0 : -2147483648);
   } else if (name in BOOLEANS) {
@@ -219,8 +219,6 @@ function attributeChanged(element, name, value) {
     element.style.cssText = value;
   } else if (name === "value" && element instanceof HTMLInputElement) {
     element.value = value ?? "";
-  } else if (name === "class" && present && value !== "") {
-    warnOnce("class names have no stylesheet to match yet: style elements with h.Style");
   } else if (name === "src") {
     warnOnce("an image has no src yet");
   }
@@ -687,6 +685,7 @@ export const document = {
     const tag = String(name).toLowerCase();
     const kind = KINDS[tag] ?? "box";
     const node = createNode(kind);
+    node.setAttribute("element", tag);
     const [role, level] = ROLES[tag] ?? [];
     if (role) node.setAttribute("role", role);
     if (level) node.setAttribute("aria-level", String(level));

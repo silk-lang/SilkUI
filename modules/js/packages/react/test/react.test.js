@@ -22,7 +22,7 @@ test("a component renders nodes, styles, attributes and text", () => {
   assert.deepEqual(find(calls, "style"), [["style", box, "width:100px;", 0], ["style", box, "color:red;", 1]]);
   assert.deepEqual(find(calls, "attribute"), [["attribute", box, "testId", "greeting"], ["attribute", box, "tabIndex", 0]]);
   assert.deepEqual(find(calls, "setText").map((call) => call[2]), ["Hello ", "world"]);
-  assert.deepEqual(find(calls, "append").at(-1), ["append", container.id, box]);
+  assert.deepEqual(find(calls, "append").at(-1), ["append", container.nodeId, box]);
 });
 
 test("a click updates state and commits before the dispatch returns", () => {
@@ -34,9 +34,9 @@ test("a click updates state and commits before the dispatch returns", () => {
   createRoot(createBox()).render(h(Counter));
   const label = button.firstChild;
   assert.equal(label.data, "Clicked 0");
-  mock.click(label.id);
+  mock.click(label.nodeId);
   assert.equal(label.data, "Clicked 1");
-  mock.click(label.id);
+  mock.click(label.nodeId);
   assert.equal(label.data, "Clicked 2");
 });
 
@@ -57,7 +57,7 @@ test("removed elements are destroyed", () => {
   const [a] = container.firstChild.childNodes;
   mock.take();
   root.render(h("box", null, h("box", { key: "b" })));
-  assert.deepEqual(mock.take(), [["destroy", a.id]]);
+  assert.deepEqual(mock.take(), [["destroy", a.nodeId]]);
   root.unmount();
   assert.equal(container.childNodes.length, 0);
 });
@@ -69,10 +69,10 @@ test("a controlled input keeps the value the component gives it", () => {
     return h("input", { ref: (node) => (input = node), value, onInput: (event) => setValue(event.value.toUpperCase().slice(0, 3)) });
   }
   createRoot(createBox()).render(h(Field));
-  mock.input(input.id, "ab");
+  mock.input(input.nodeId, "ab");
   assert.equal(input.value, "AB");
-  assert.equal(mock.textOf(input.id), "AB");
-  mock.input(input.id, "ABcd");
+  assert.equal(mock.textOf(input.nodeId), "AB");
+  mock.input(input.nodeId, "ABcd");
   assert.equal(input.value, "ABC");
 });
 
@@ -110,10 +110,30 @@ test("a rich input defines its marks and atoms and keeps the document it is give
   assert.equal(find(calls, "mark").length, 1);
   assert.equal(find(calls, "atomStyle").length, 1);
   assert.deepEqual(find(calls, "richText")[0].slice(2), ["hi", "0,2,1;", ""]);
-  globalThis.__ui.dispatch(11, input.id, 3, 3, 0, 1, 0, "hi!", "insertText", "0,3,1;", "");
+  globalThis.__ui.dispatch(11, input.nodeId, 3, 3, 0, 1, 0, "hi!", "insertText", "0,3,1;", "");
   assert.equal(input.document.text, "hi!");
   assert.equal(find(mock.take(), "richText").length, 0);
-  globalThis.__ui.dispatch(11, input.id, 4, 4, 0, 1, 0, "hi!?", "insertText", "0,4,1;", "");
+  globalThis.__ui.dispatch(11, input.nodeId, 4, 4, 0, 1, 0, "hi!?", "insertText", "0,4,1;", "");
   assert.equal(input.document.text, "hi!");
   assert.deepEqual(input.document.marks, [{ start: 0, end: 3, marks: ["bold"] }]);
+});
+
+test("class, id, data and ARIA props update and disappear on the retained node", () => {
+  const container = createBox();
+  const root = createRoot(container);
+  root.render(h("box", { id: "save", className: "button primary", "data-state": "open", "aria-expanded": false }));
+  const node = container.firstChild;
+  const number = node.nodeId;
+  assert.equal(node.id, "save");
+  assert.equal(node.classList.contains("primary"), true);
+  assert.equal(node.getAttribute("data-state"), "open");
+  assert.equal(node.getAttribute("aria-expanded"), "false");
+  root.render(h("box", { className: "button" }));
+  assert.equal(container.firstChild, node);
+  assert.equal(node.nodeId, number);
+  assert.equal(node.id, "");
+  assert.equal(node.className, "button");
+  assert.equal(node.getAttribute("data-state"), null);
+  assert.equal(node.getAttribute("aria-expanded"), null);
+  root.unmount();
 });
