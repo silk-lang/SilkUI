@@ -3,6 +3,10 @@
 import engine { UiTree, TreeError }
 import batch { Batch }
 import style_sheets
+import ui_protocol.style_bundle as bundle
+import svg_css.sheet { Sheet }
+import svg_css.sheet_binary { DecodeError, DecodeReason }
+import svg_css.tokens { Limits }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -50,6 +54,49 @@ impl StyleAssets {
     sources[index] = move copied
     self.revision = self.revision + 1
     return true
+  }
+
+  /// Validates the complete update before changing any asset. Changing the list
+  /// length needs a host rebuild; a CSS edit preserves sheet ids and their order.
+  pub effect fn replaceBundle(self: &mut Self, bytes: &[u8]) -> bool
+    ! DecodeError | OutOfMemoryError ? &mut Allocator {
+    let sources = run bundle.decode(bytes)
+    if sources.length() != self.sources.length() {
+      fail DecodeError { reason: DecodeReason.Invalid, offset: 12 }
+    }
+    let mut changed = false
+    let mut i: usize = 0
+    while i < sources.length() {
+      let source = sources.asSlice()[i].asSlice()
+      if !bundle.same(source, self.sources.asSlice()[i].asSlice()) {
+        drop run Sheet.decode(source, &Limits.make())
+        changed = true
+      }
+      i = i + 1
+    }
+    if !changed { return false }
+    self.sources = move sources
+    self.revision = self.revision + 1
+    return true
+  }
+
+  /// Installs an update in roots this client already owns, marking them for a
+  /// fresh layout. New roots receive the latest bytes from their layout hook.
+  pub effect fn serveInstalled(self: &mut Self, tree: &mut UiTree<'_>) -> bool
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut roots = List<u32>.make()
+    let mut i: usize = 0
+    while i < self.installed.length() {
+      run roots.append(self.installed.asSlice()[i].root)
+      i = i + 1
+    }
+    let mut changed = false
+    i = 0
+    while i < roots.length() {
+      if run self.serve(&mut tree, roots.asSlice()[i]) { changed = true }
+      i = i + 1
+    }
+    return changed
   }
 
   /// Called for the client's root before layout, including windows opened later.
