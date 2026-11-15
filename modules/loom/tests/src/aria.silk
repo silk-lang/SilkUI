@@ -1,0 +1,178 @@
+//! Accessibility attributes in the document backend's markup, by their ARIA names.
+import loom_dom.html { Html }
+import loom.lib { Document, drain, NoCommand, Node, NoOutput, Program, Update }
+import loom.program as program
+import loom.backend { Backend, TreeError }
+import ui_protocol.mutation { Mutation, Attribute, NodeKind, Role, TriState, Live, FIRST_ROOT }
+import ui_protocol.options { RootOptions }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn has(text: &[u8], needle: string) -> bool {
+  let wanted = String.utf8Bytes(needle)
+  let mut at: usize = 0
+  while at + wanted.length <= text.length {
+    let mut i: usize = 0
+    while i < wanted.length && text[at + i] == wanted[i] { i = i + 1 }
+    if i == wanted.length { return true }
+    at = at + 1
+  }
+  return false
+}
+
+effect fn set(page: &mut Html, attribute: Attribute) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.SetAttribute { id: 1, attribute: move attribute })
+  run page.mutate(move batch)
+}
+
+test effect fn ariaAttributesReachTheMarkup() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run markupBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn markupBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.Create { id: 1, kind: NodeKind.Box })
+  run batch.append(Mutation.OpenRoot { root: FIRST_ROOT, node: 1, options: RootOptions.default() })
+  run page.mutate(move batch)
+  run set(&mut page, Attribute.Role { value: Role.Alert })
+  run set(&mut page, Attribute.Level { value: 2 })
+  run set(&mut page, Attribute.Live { value: Live.Polite })
+  run set(&mut page, Attribute.Pressed { value: TriState.Mixed })
+  run set(&mut page, Attribute.Checked { value: true })
+  run set(&mut page, Attribute.Indeterminate { value: true })
+  run set(&mut page, Attribute.Description { value: run String.copy("Saved just now") })
+  let markup = run page.markup()
+  let text = Bytes.asSlice(&markup)
+  run Testing.expect(has(text, "role=\"alert\""), "the new role")
+  run Testing.expect(has(text, "aria-level=\"2\""), "a number")
+  run Testing.expect(has(text, "aria-live=\"polite\""), "a keyword")
+  run Testing.expect(has(text, "aria-pressed=\"mixed\""), "a three-way state")
+  run Testing.expect(has(text, "aria-checked=\"mixed\""), "indeterminate wins over checked")
+  run Testing.expect(has(text, "aria-description=\"Saved just now\""), "text")
+  run set(&mut page, Attribute.Inert { value: true })
+  let inert = run page.markup()
+  run Testing.expect(has(Bytes.asSlice(&inert), "inert=\"true\""), "inert, as HTML spells it")
+
+  run set(&mut page, Attribute.Level { value: 0 })
+  run set(&mut page, Attribute.Live { value: Live.Off })
+  run set(&mut page, Attribute.Indeterminate { value: false })
+  let cleared = run page.markup()
+  let after = Bytes.asSlice(&cleared)
+  run Testing.expect(!has(after, "aria-level") && !has(after, "aria-live"), "defaults leave the attribute out")
+  run Testing.expect(has(after, "aria-checked=\"true\""), "checked again without indeterminate")
+}
+
+struct Toggle {
+  on: bool,
+}
+
+union Flip {
+  Flip,
+}
+
+type FlipNext = Update<Toggle, NoCommand, NoOutput>
+
+impl Program<Flip, NoCommand> for Toggle {
+  effect fn init() -> FlipNext ! OutOfMemoryError ? &mut Allocator {
+    return FlipNext.of(Toggle { on: false })
+  }
+
+  effect fn update(mut model: Toggle, message: Flip) -> FlipNext ! OutOfMemoryError ? &mut Allocator {
+    match move message {
+      Flip.Flip => { model.on = !model.on }
+    }
+    return FlipNext.of(move model)
+  }
+
+  fn view(model: &Toggle, h: &Document<Flip>) -> Node {
+    return h.column(
+      &[
+        h.accessRole(Role.Button),
+        h.pressed(if model.on { TriState.True } else { TriState.False }),
+        h.level(if model.on { 3 } else { 0 }),
+        h.live(Live.Polite),
+        h.description(if model.on { "On now" } else { "" }),
+      ],
+      &[h.text("Bold"), h.liveRegion(if model.on { "Bold on" } else { "" }, Live.Assertive)],
+    )
+  }
+}
+
+effect fn builderBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut app = run program.make<Toggle, Flip, NoCommand>()
+  run app.start(&mut page, 0.0)
+  run drain(&mut app, &mut page)
+  let first = run page.markup()
+  let before = Bytes.asSlice(&first)
+  run Testing.expect(has(before, "aria-pressed=\"false\"") && has(before, "aria-live=\"polite\""), "builders reach the backend")
+  run Testing.expect(!has(before, "aria-level") && !has(before, "aria-description"), "defaults set nothing")
+  app.send(Flip.Flip)
+  run drain(&mut app, &mut page)
+  let second = run page.markup()
+  let after = Bytes.asSlice(&second)
+  run Testing.expect(has(after, "aria-pressed=\"true\"") && has(after, "aria-level=\"3\""), "changes are diffed")
+  run Testing.expect(has(after, "aria-description=\"On now\""), "text attributes too")
+  run Testing.expect(has(before, "aria-live=\"assertive\"") && !has(before, "Bold on"), "a live region is there, empty, from the start")
+  run Testing.expect(has(after, "Bold on"), "and says its message when it changes")
+}
+
+test effect fn documentBuildersSetAriaAttributes() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run builderBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn setOn(page: &mut Html, id: u32, attribute: Attribute) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.SetAttribute { id: id, attribute: move attribute })
+  run page.mutate(move batch)
+}
+
+effect fn ids(a: u32, b: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<u32>.make()
+  run list.append(a)
+  if b != 0 { run list.append(b) }
+  return move list
+}
+
+test effect fn relationsNameElementIds() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run relationsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn relationsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut page = Html.make()
+  let mut batch = List<Mutation>.make()
+  run batch.append(Mutation.Create { id: 1, kind: NodeKind.Box })
+  run batch.append(Mutation.Create { id: 2, kind: NodeKind.Box })
+  run batch.append(Mutation.Create { id: 3, kind: NodeKind.Box })
+  run batch.append(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.none() })
+  run batch.append(Mutation.InsertBefore { parent: 1, child: 3, before: Option<u32>.none() })
+  run batch.append(Mutation.OpenRoot { root: FIRST_ROOT, node: 1, options: RootOptions.default() })
+  run page.mutate(move batch)
+  run setOn(&mut page, 3, Attribute.ElementId { value: run String.copy("hint") })
+  run setOn(&mut page, 1, Attribute.LabelledBy { ids: run ids(2, 9) })
+  run setOn(&mut page, 1, Attribute.DescribedBy { ids: run ids(3, 0) })
+  let markup = run page.markup()
+  let text = Bytes.asSlice(&markup)
+  run Testing.expect(has(text, "aria-labelledby=\"silk-2\""), "a target without an id is named by its node, and a missing one is left out")
+  run Testing.expect(has(text, "id=\"silk-2\""), "and gets that id")
+  run Testing.expect(has(text, "aria-describedby=\"hint\""), "a target with an id is named by it")
+}

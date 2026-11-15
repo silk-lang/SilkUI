@@ -10,7 +10,7 @@ screen. This repository holds:
   `@silkui/vite`), and the DevTools (`ui-inspect`). A single front door, the `silkui` package,
   is in progress.
 - **Loom**: the Elm-style UI framework written in Silk, with Loom Components. It lives here for
-  now and is being renamed from `ui-app` and `ui-components` to `loom` and `loom-components`.
+  now, in `modules/loom` and `modules/loom-components`, and depends only on `ui-protocol`.
 
 JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
 The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
@@ -49,7 +49,7 @@ export SILK_CLANG=/opt/homebrew/opt/llvm@22/bin/clang
 export PATH="/opt/homebrew/opt/lld@22/bin:$PATH"
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 "$SILK_CLANG" --version # must report clang 22, not Apple clang
-silk task native demo modules/app/demo
+silk task native demo modules/loom/demo
 ```
 
 Change `SILK_CLANG` if LLVM 22 is installed elsewhere. `SDKROOT` matters for CPU-only tools
@@ -64,13 +64,13 @@ by [silk#3034](https://github.com/silk-lang/silk/issues/3034), with no legacy-sc
 
 | Demo | Interactive command |
 | --- | --- |
-| Todo application | `silk task native demo modules/app/demo` |
-| Components gallery | `silk task native demo modules/components/demo` |
+| Todo application | `silk task native demo modules/loom/demo` |
+| Components gallery | `silk task native demo modules/loom-components/demo` |
 | Retained tree inbox | `silk task native demo modules/tree/demo` |
 | Retained tree editor | `silk task native demo modules/tree/demo -- --editor` |
 | Small window/counter | `silk task native demo modules/tree/window/demo` |
 | Todo with inspector/devtools | `silk task native devtools todo` |
-| Todo with devtools in its own process | `silk build --manifest-path modules/app/demo/silk.toml`, then `SILK_UI_DEVTOOLS=window` (or `dock`) `build/llvm/<target>/debug/ui-app-demo`; F12 toggles them |
+| Todo with devtools in its own process | `silk build --manifest-path modules/loom/demo/silk.toml`, then `SILK_UI_DEVTOOLS=window` (or `dock`) `build/llvm/<target>/debug/loom-demo`; F12 toggles them |
 
 Close the window to return to the terminal. The first build fetches pinned dependencies
 and prepares native libraries through Silk's manifest hooks.
@@ -142,12 +142,12 @@ All 31 original UI workspace packages remain members of `silk.toml`:
 | --- | --- |
 | Consumable text and assets | `modules/text`, `modules/sprites`, `modules/assets` |
 | Retained tree and platform hosting | `modules/tree`, `modules/tree/window` |
-| Application framework and components | `modules/app`, `modules/app/window`, `modules/components` |
+| Application framework and components | `modules/loom`, `modules/loom/window`, `modules/loom-components` |
 | Inspection APIs | `modules/inspect`, `modules/inspect/server`, `modules/inspect/devtools` |
-| Reusable demo/fixture libraries | `modules/app/examples`, `modules/components/gallery`, `modules/tree/fixtures` |
-| Developer applications (not library APIs) | `modules/app/demo`, `modules/components/demo`, `modules/tree/demo`, `modules/tree/window/demo`, `modules/inspect/devtools/app` |
+| Reusable demo/fixture libraries | `modules/loom/examples`, `modules/loom-components/gallery`, `modules/tree/fixtures` |
+| Developer applications (not library APIs) | `modules/loom/demo`, `modules/loom-components/demo`, `modules/tree/demo`, `modules/tree/window/demo`, `modules/inspect/devtools/app` |
 | Developer protocol and comparison executables | `modules/inspect/cli`, `modules/inspect/mcp`, `modules/text/tools/cli`, `modules/tree/browser` |
-| Tests and golden runners (not library APIs) | `modules/app/tests`, `modules/app/window/tests`, `modules/components/tests`, `modules/inspect/tests`, `modules/inspect/server/tests`, `modules/inspect/devtools/tests`, `modules/tree/tests`, `modules/tree/window/tests` |
+| Tests and golden runners (not library APIs) | `modules/loom/tests`, `modules/loom/window/tests`, `modules/loom-components/tests`, `modules/inspect/tests`, `modules/inspect/server/tests`, `modules/inspect/devtools/tests`, `modules/tree/tests`, `modules/tree/window/tests` |
 
 The manifests explicitly export consumable modules. Test-only packages declare their test module as the library entrypoint rather than inventing a runnable application. CLI executables and demos are developer tools, not dependencies of the API packages. Shared scenes, CPU/GPU rendering, vector graphics, codecs, and atlases remain in `lib-graphics`; native windows and WebGPU in `lib-native`; layout/styles in `lib-css`; parsing/shaping/rasterization in `lib-fonts`; SVG parsing/rendering in `lib-svg`. None are copied into this repository.
 
@@ -185,8 +185,8 @@ Windows managed-process tasks are blocked by [silk#3034](https://github.com/silk
 Individual entrypoints remain available:
 
 ```sh
-silk task native demo modules/app/demo
-silk task native demo modules/components/demo -- check --release
+silk task native demo modules/loom/demo
+silk task native demo modules/loom-components/demo -- check --release
 silk task native demo modules/tree/demo -- --editor
 silk task native inspect
 silk task native mcp
@@ -216,4 +216,4 @@ These paths are supported payloads for applications using the published Git revi
 
 UI fixture assets are owned under `modules/assets/assets` and embedded in `src/generated_assets.silk`. `silk task embed-assets [--check]` refreshes/checks them. `silk task generate-photos` authors procedural photos in Silk, using native ImageMagick 7 only for PNG/JPEG encoding; it is not a build dependency. Regeneration retains the scene geometry and formats but is not byte-identical to the previous Pillow renderer; existing committed photos are unchanged. Additional text-comparison fonts are owned under `modules/text/tests/fonts`; all Noto, Amiri, M+ and Roboto Flex OFL notices accompany their unchanged subset files. Unit tests and golden runners use repository-root working directories. Fonts/icons/photos needed by normal UI fixtures are embedded and do not depend on the working directory.
 
-See [the UI guide](modules/README.md), [the framework](modules/app/README.md), [components](modules/components/README.md), and [inspection tools](modules/inspect/README.md).
+See [the UI guide](modules/README.md), [the framework](modules/loom/README.md), [components](modules/loom-components/README.md), and [inspection tools](modules/inspect/README.md).

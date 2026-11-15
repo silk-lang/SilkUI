@@ -34,7 +34,7 @@ silk build --manifest-path docs/examples/apps/tree-hello/silk.toml
 
 rm -rf "$out"
 mkdir -p "$out"
-cp "$root/modules/app/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
+cp "$root/modules/loom/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
 cp "$here/web/favicon.svg" "$out/favicon.svg"
 cp -R "$here/web/fonts" "$out/fonts"
 # The album's photos, icons and fonts, at the root as its relative URLs name them.

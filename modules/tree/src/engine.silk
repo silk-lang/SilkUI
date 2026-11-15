@@ -11,6 +11,8 @@ import cssom_view { ScrollAnimation }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
+pub import ui_protocol.error { TreeError }
+import ui_protocol.backend { Backend, Measured }
 import grid_css
 import expand
 import font_features
@@ -122,30 +124,6 @@ import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.text.string { String }
-
-/// Why a mutation or a frame failed.
-pub union TreeError {
-  /// Mutation `index` of the batch names a node id that does not exist.
-  UnknownNode { pub index: usize, pub id: u32 },
-  /// Mutation `index` creates a node id already in use.
-  IdInUse { pub index: usize, pub id: u32 },
-  /// Mutation `index` does not apply to the node's kind (children of a leaf, text of a box).
-  WrongKind { pub index: usize, pub id: u32 },
-  /// Mutation `index` would put a node inside itself, or move the root.
-  BadMove { pub index: usize, pub id: u32 },
-  /// Mutation `index` names a resource that is not defined.
-  UnknownResource { pub index: usize, pub resource: u32 },
-  /// Mutation `index` defines a resource whose data did not decode.
-  BadResource { pub index: usize, pub resource: u32 },
-  /// Layout or text shaping failed.
-  Layout,
-  /// Virtual list configuration or bindings are invalid.
-  BadVirtualList { pub index: usize, pub id: u32 },
-  /// A CSSOM View scroll scheduler operation failed.
-  View { pub error: CssomError },
-}
-
-impl Copy for TreeError {}
 
 /// An open root other than the current one: its share of the tree's state, kept while the
 /// current root is laid out, painted and given input. [`UiTree.useRoot`] swaps it in. The
@@ -4583,3 +4561,54 @@ struct FocusReturn {
 }
 
 impl Copy for FocusReturn {}
+
+/// Loom and any other protocol client drive the tree through this.
+impl<'a> Backend for UiTree<'a> {
+  effect fn mutate(self: &mut Self, batch: List<Mutation>) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.apply(move batch)
+  }
+
+  effect fn events(self: &mut Self, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.takeEvents(&mut out)
+  }
+
+  effect fn rootEvents(self: &mut Self, out: &mut List<RootEvent>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.takeRootEvents(&mut out)
+  }
+
+  fn viewport(self: &Self, root: u32) -> Rect<f32> {
+    return self.rootViewport(root)
+  }
+
+  fn roots(self: &Self) -> RootSupport {
+    return self.rootSupport
+  }
+
+  effect fn measure(self: &Self, id: u32) -> Option<Measured>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<inspect.NodeInfo>.Some { value: node } = run inspect.info(self, id) {
+      if node.laidOut {
+        return Option<Measured>.Some {
+          value: Measured {
+            bounds: node.bounds,
+            pressed: node.pressed,
+            hovered: node.hovered,
+            focused: node.focused,
+          },
+        }
+      }
+    }
+    return Option<Measured>.None
+  }
+
+  fn range(self: &Self, id: u32) -> Option<VirtualRange> {
+    return self.virtualRange(id)
+  }
+}

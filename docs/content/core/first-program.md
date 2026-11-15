@@ -87,7 +87,7 @@ To use Silk UI in a package of your own, add it to `silk.toml`:
 
 ```toml title="silk.toml"
 [dependencies]
-ui_app = { git = "https://github.com/silk-lang/lib-ui.git", rev = "<a commit>", path = "modules/app", package = "ui-app" }
+loom = { git = "https://github.com/silk-lang/lib-ui.git", rev = "<a commit>", path = "modules/loom", package = "loom" }
 ```
 
 The examples in these docs live in the same repository as Silk UI, under `docs/examples`, so their own manifests name it by path instead.

@@ -1,5 +1,5 @@
 // Runs a Silk UI app in the page: a wasm32 build of a program whose `main` calls ui-tree-window's
-// `host.runWindow` (directly, or through ui-app-window). The window host's own loop runs inside
+// `host.runWindow` (directly, or through loom-window). The window host's own loop runs inside
 // the module as it does natively; the page calls `main` through JSPI, so a wait for input
 // (`nextEvent`) or for a WebGPU promise suspends the module and gives the page its turn.
 //

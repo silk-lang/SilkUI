@@ -167,7 +167,7 @@ flags); each has the direct call listed above.
 
 ## Virtual scrolling
 
-Variable-height virtualization belongs to the retained tree. `ui-app` uses the same
+Variable-height virtualization belongs to the retained tree. `loom` uses the same
 mutation/query protocol available to a direct Silk client or a future JS binding;
 it does not maintain a separate geometry algorithm.
 
@@ -222,7 +222,7 @@ match the anchor width. The tree chooses above/below placement and viewport limi
 after continuous viewport layout, then updates them on scroll and resize without a framework render.
 The popup uses fixed viewport positioning; put it after ordinary content so it draws
 and receives hits above that content. This API does not change parentage or event
-bubbling. Menus and popovers in `ui-components` use it through `Ui.anchored`.
+bubbling. Menus and popovers in `loom-components` use it through `Ui.anchored`.
 Width matching includes the popup's padding and border; menus no longer add those
 on top of the trigger width.
 
@@ -253,7 +253,7 @@ by `begin`, test `accepts(token)` before installing pixels, then call `finish`.
 Replacement and cancellation invalidate old tokens. Native or browser hosts supply
 file/network I/O and decoding; the tree continues to accept `DefineImage` and
 `DefineDecodedImage` mutations. The native worker implementation is available through
-`ui-tree-window.images`, with compatibility exports from `ui-app-window.images`.
+`ui-tree-window.images`, with compatibility exports from `loom-window.images`.
 
 ## Interaction
 
