@@ -1,12 +1,26 @@
 # Silk UI
 
-Standalone retained UI, application framework, components, native/browser hosts, and inspection tools for Silk.
+Silk UI is the platform for building apps with [Silk](https://github.com/silk-lang/silk). You
+choose what you write the app in (Loom, React, Foldkit or plain JS) and where it runs (a
+desktop window, a browser canvas with WebGPU, or the browser DOM), and Silk UI puts it on
+screen. This repository holds:
+
+- **Silk UI**: the retained UI tree (`ui-tree`, `ui-protocol`, `ui-text`), the hosts for each
+  target, the JS adapters as npm packages (`@silkui/core`, `@silkui/react`, `@silkui/foldkit`,
+  `@silkui/vite`), and the DevTools (`ui-inspect`). A single front door, the `silkui` package,
+  is in progress.
+- **Loom**: the Elm-style UI framework written in Silk, with Loom Components. It lives here for
+  now and is being renamed from `ui-app` and `ui-components` to `loom` and `loom-components`.
+
+JavaScript apps run on [SilkJS](https://github.com/silk-lang/lib-silkjs), embedded in the app.
+The [Products](https://silk-ui-docs.juliaortiz-js.workers.dev/products/) page names every
+product once.
 
 ## Documentation
 
 The guides live in [`docs/`](docs/README.md) and are published from `main`. There are three:
-Silk UI (the framework), native apps, and the UI tree. Every example in them is a real
-program under `docs/examples`, tested by `docs/tests`.
+Loom apps, native apps, and the UI tree, plus a [Products](docs/content/products.md) page.
+Every example in them is a real program under `docs/examples`, tested by `docs/tests`.
 
 ```sh
 docs/build.sh serve   # builds the site and serves it on http://localhost:8017
