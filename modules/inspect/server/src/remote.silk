@@ -37,6 +37,8 @@ import ui_tree.css { Declaration }
 import ui_tree.inspect { roleName, kindName, writeInt, writeNumber }
 import ui_tree.mutation { Mutation, Attribute, Role, Cursor, NodeKind, StyleState, ariaText, ariaAttribute }
 import silk.collections.bytes { Bytes }
+import silk.encoding.base64 { Base64, Base64Error }
+import reply { writeBase64 }
 import ui_tree.node { Event, EventKind }
 import ui_tree.lib { RootOptions }
 import css_style.tokens { CssError }
@@ -336,6 +338,14 @@ pub effect fn writeMutations(out: &mut String, batch: &[Mutation]) -> ()
         run member(&mut out, "node", u32.toU64(node))
         run out.append("}")
       }
+      Mutation.AdoptStyleSheet { root, sheet, bytes } => run sheetOp(&mut out, &mut first, "adoptStyleSheet", root, sheet, bytes.asSlice())
+      Mutation.ReplaceStyleSheet { root, sheet, bytes } => run sheetOp(&mut out, &mut first, "replaceStyleSheet", root, sheet, bytes.asSlice())
+      Mutation.RemoveStyleSheet { root, sheet } => {
+        run begin(&mut out, &mut first, "removeStyleSheet")
+        run member(&mut out, "root", u32.toU64(root))
+        run member(&mut out, "sheet", u32.toU64(sheet))
+        run out.append("}")
+      }
       Mutation.CloseRoot { root } => {
         run begin(&mut out, &mut first, "closeRoot")
         run member(&mut out, "root", u32.toU64(root))
@@ -581,6 +591,26 @@ pub effect fn readMutation(value: &Value) -> Option<Mutation>
       },
     )
   }
+  if op == "removeStyleSheet" {
+    return Option<Mutation>.some(Mutation.RemoveStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet") })
+  }
+  if op == "adoptStyleSheet" || op == "replaceStyleSheet" {
+    let encoded = String.utf8Bytes(textField(value, "bytes"))
+    let length = match Base64.decodedLength(encoded) {
+      Result<usize, Base64Error>.Success { value: count } => count
+      _ => { return Option<Mutation>.None }
+    }
+    if length > 67108864 { return Option<Mutation>.None }
+    let mut bytes = run Bytes.zeroed(length)
+    match Base64.decodeInto(bytes.asMutSlice(), encoded) {
+      Result<usize, Base64Error>.Success { value: count } => bytes.truncate(count)
+      _ => { return Option<Mutation>.None }
+    }
+    if op == "adoptStyleSheet" {
+      return Option<Mutation>.some(Mutation.AdoptStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), bytes: move bytes })
+    }
+    return Option<Mutation>.some(Mutation.ReplaceStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), bytes: move bytes })
+  }
   if op == "closeRoot" {
     return Option<Mutation>.some(Mutation.CloseRoot { root: idOf(value, "root") })
   }
@@ -720,4 +750,14 @@ pub effect fn readEvent(value: &Value) -> Option<Event>
   event.selectionStart = u32.toUsize(idOf(value, "selectionStart"))
   event.selectionEnd = u32.toUsize(idOf(value, "selectionEnd"))
   return Option<Event>.some(move event)
+}
+
+effect fn sheetOp(out: &mut String, first: &mut bool, op: string, root: u32, sheet: u32, bytes: &[u8]) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run begin(&mut out.*, &mut first.*, op)
+  run member(&mut out.*, "root", u32.toU64(root))
+  run member(&mut out.*, "sheet", u32.toU64(sheet))
+  run out.append(",\"bytes\":\"")
+  run writeBase64(&mut out.*, bytes)
+  run out.append("\"}")
 }

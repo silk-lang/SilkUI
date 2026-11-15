@@ -535,3 +535,27 @@ Archive removes the focused row). `silk task native demo modules/tree/demo -- ch
 scroll, and a Tab, then reads the surface back and compares it with the CPU reference,
 on X11 and Wayland under Xvfb and Weston with lavapipe.
 
+
+## Compiled stylesheet input
+
+`Batch.adoptStyleSheet(root, sheet, bytes)` appends a compiled `css-style` sheet to that
+root's cascade. `replaceStyleSheet` keeps its position; `removeStyleSheet` removes its rules.
+Sheet ids are local to a root. Invalid compiled bytes fail with `TreeError.StyleSheet` and
+leave the previous sheet intact. Closing a root releases its sheets.
+
+The tree matches native tags, ids, classes, named attributes and interaction state. Layer
+order is shared across adopted sheets. Inline looks participate in the same ordered list;
+important declarations preserve CSS precedence. Sheet custom properties inherit, registered
+properties use their declared inheritance/defaults, and inline `var()` can read that scope.
+The resolved list feeds both layout and paint effects. Matched sheet/rule ids remain on the
+node's resolved style.
+
+Hosts may call `UiTree.setStyleEnvironment(root, environment, systemColors)` to supply media
+preferences, input capabilities and the system-color palette. Frame dimensions and scale
+supply viewport queries and resolution. The default environment is headless. A root with
+sheets currently uses a full restyle for invalidation, including ancestor and sibling
+selectors; roots that only use style objects retain their existing path.
+
+This API is an implementation foundation. Automatic stylesheet loading, inline custom-property
+declarations, complete CSS-wide keyword handling, generated pseudo-elements, container queries,
+and the full stylesheet/style-object parity suite are still in progress.

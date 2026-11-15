@@ -148,3 +148,147 @@ test effect fn selectorsReadNamedAndTypedAttributes() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run attributes() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import ui_tree.legacy { FrameInput }
+import svg_css.compile { Options, CompileError }
+import svg_css.compile
+import svg_css.written
+import ui_tree.style { Fill }
+import silk.collections.bytes { Bytes }
+
+effect fn sheetBytes(source: &[u8]) -> Bytes
+  ! CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let sheet = run compile.compile(source, &Options.make())
+  return run sheet.encode()
+}
+
+effect fn nativeCascade() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("parent") })
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("button") })
+  let inline = run written.declarations(b"width:50px;height:40px;margin-right:calc(var(--gap) * 2);color:blue")
+  run batch.style(2, inline.asSlice())
+  let initial = run sheetBytes(b"@layer base, utilities; .parent{--gap:8px} .button{background-color:color-mix(in srgb,currentcolor 50%,transparent)} @layer base {.button {width:10px!important}} @layer utilities {.button {width:20px!important;height:30px;margin-left:var(--gap)}} @media(width >= 600px){.button{height:60px!important}}")
+  run batch.adoptStyleSheet(0, 7, initial.asSlice())
+  run tree.apply(run batch.take())
+  let narrow = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(narrow)
+  let child = tree.slotOf(2)
+  run Testing.expect(tree.node(child).computed.layout.width.value == 10.0, "important first layer beats inline width")
+  run Testing.expect(tree.node(child).computed.layout.height.value == 40.0, "inline height beats normal sheet declarations")
+  run Testing.expect(tree.node(child).computed.layout.margin.left.value == 8.0, "inherited variables reach native computed lengths")
+  run Testing.expect(tree.node(child).computed.layout.margin.right.value == 16.0, "inline calc reads a custom property inherited from a sheet")
+  run Testing.expect(match tree.node(child).computed.paint.background {
+    Fill.Solid { color } => color.b == 1.0 && color.r == 0.0 && color.a == 0.5
+    _ => false
+  }, "compiled color-mix sees the final inline foreground")
+  run tree.frame(FrameInput { width: 800.0, height: 300.0, scale: 1.0, time: 1.0 })
+  run Testing.expect(tree.node(child).computed.layout.height.value == 60.0, "media eligibility responds to the root viewport")
+  let replacement = run sheetBytes(b".button{width:25px!important;height:70px!important}")
+  run batch.replaceStyleSheet(0, 7, replacement.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(narrow)
+  run Testing.expect(tree.node(child).computed.layout.width.value == 25.0 && tree.node(child).computed.layout.height.value == 70.0, "replacement changes computed values on the next frame")
+  run batch.removeStyleSheet(0, 7)
+  run tree.apply(run batch.take())
+  run tree.frame(narrow)
+  run Testing.expect(tree.node(child).computed.layout.width.value == 50.0 && tree.node(child).computed.layout.height.value == 40.0, "removal restores inline values and clears the sheet cache")
+}
+
+test effect fn compiledSheetsDriveNativeCascadeVariablesAndMedia() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nativeCascade() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.lib { RootOptions }
+import silk.core.result { Result }
+
+effect fn sheetsAreRootScoped() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.openRoot(1, 2, RootOptions.default())
+  let first = run sheetBytes(b"div{height:25px}")
+  let second = run sheetBytes(b"div{height:75px}")
+  run batch.adoptStyleSheet(0, 1, first.asSlice())
+  run batch.adoptStyleSheet(1, 1, second.asSlice())
+  run tree.apply(run batch.take())
+  let viewport = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frameRoot(0, viewport)
+  run tree.frameRoot(1, viewport)
+  run Testing.expect(tree.node(tree.slotOf(1)).computed.layout.height.value == 25.0 && tree.node(tree.slotOf(2)).computed.layout.height.value == 75.0, "sheet ids and rules are isolated per root")
+  run batch.replaceStyleSheet(1, 1, b"not a compiled stylesheet")
+  let rejected = run Effect.result(tree.apply(run batch.take()))
+  run Testing.expect(match &rejected {
+    Result<(), TreeError | OutOfMemoryError>.Failure { error: why } => match &why { TreeError.StyleSheet { root, sheet, .. } => root == 1 && sheet == 1 _ => false }
+    _ => false
+  }, "invalid compiled bytes report the root and sheet")
+  run tree.frameRoot(1, viewport)
+  run Testing.expect(tree.node(tree.slotOf(2)).computed.layout.height.value == 75.0, "failed replacement preserves the existing sheet")
+  run batch.closeRoot(1)
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.styleSheets.length() == 1 && tree.styleSheets.asSlice()[0].root == 0, "closing a root releases only its sheets")
+}
+
+test effect fn compiledSheetsAreIsolatedAndInvalidReplacementPreservesStyle() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sheetsAreRootScoped() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import svg_css.media_features { Environment, ColorScheme, Pointer }
+import svg_css.colors { Color, SystemColor, systemIndex }
+
+effect fn environmentAndInvalidation() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.create(3, NodeKind.Box)
+  run batch.append(1, 3)
+  let bytes = run sheetBytes(b"div{height:10px;width:10px} :root:has(>.active){height:90px} .active+div{width:33px} @media(prefers-color-scheme:dark) and (hover:hover){.active{color:color-mix(in srgb,CanvasText 50%,transparent)}}")
+  run batch.adoptStyleSheet(0, 2, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let viewport = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(viewport)
+  let mut environment = Environment.headless(400.0, 300.0)
+  environment.colorScheme = ColorScheme.Dark
+  environment.pointer = Pointer.Fine
+  environment.hover = true
+  let mut palette = [Color.srgb(0.0, 0.0, 0.0, 1.0); 19]
+  palette[systemIndex(SystemColor.CanvasText)] = Color.srgb(1.0, 0.0, 0.0, 1.0)
+  run tree.setStyleEnvironment(0, environment, palette)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("active") })
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(tree.slotOf(1)).computed.layout.height.value == 90.0, "class changes invalidate ancestors for :has")
+  run Testing.expect(tree.node(tree.slotOf(3)).computed.layout.width.value == 33.0, "class changes invalidate following siblings")
+  let foreground = tree.node(tree.slotOf(2)).computed.text.color
+  run Testing.expect(foreground.r == 1.0 && foreground.g == 0.0 && foreground.a == 0.5, "host media preferences and system colors reach the value pipeline")
+  run batch.attribute(2, Attribute.ClassName { value: String.make() })
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(tree.slotOf(1)).computed.layout.height.value == 10.0 && tree.node(tree.slotOf(3)).computed.layout.width.value == 10.0, "removing a matching class clears ancestor and sibling styles")
+}
+
+test effect fn compiledSheetsUseHostEnvironmentAndRelationalInvalidation() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run environmentAndInvalidation() |> Effect.provideMut<Allocator>(&mut allocator)
+}

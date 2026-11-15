@@ -1,0 +1,245 @@
+import engine { UiTree, StyleOverride }
+import node { NONE }
+import selector_tree { SelectorTree }
+import mutation { Declaration, NodeKind, StyleState }
+import style { TextStyle }
+import svg_css.adopted { StyleSheets, Source, MatchedRule }
+import svg_css.sheet { Declaration as SheetDeclaration }
+import svg_css.cascade { Priority, Origin }
+import svg_css.element { MatchContext, NO_ELEMENT }
+import svg_css.variables { ScopeId, RegistrationError }
+import svg_css.resolver { ResolverError }
+import svg_css.tokens { Limits, CssError, Buffers }
+import svg_css.adopted_variables { Inputs }
+import svg_css.input { Input, TokenRef }
+import svg_css.value_cursor { Cursor }
+import svg_css.lexer
+import svg_css.cssom_serialization
+import svg_css.written
+import svg_css.colors { ColorProgram, Color, Context }
+import svg_css.colors
+import svg_css.media_features { Environment }
+import properties.keywords { Keyword }
+import properties.convert
+import properties.catalog { Property }
+import silk.color.rgba { Rgba }
+import silk.num.f32
+import silk.num.f64
+import properties.values { Value }
+import properties.values
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+struct Expression { index: usize, program: ColorProgram }
+
+pub struct RootSheets {
+  pub root: u32,
+  pub sheets: StyleSheets,
+  pub environment: Environment,
+  pub systemColors: [Color; 19],
+}
+impl RootSheets {
+  pub fn make(root: u32) -> RootSheets {
+    return RootSheets { root: root, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+      systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
+  }
+}
+pub struct Resolved {
+  pub declarations: List<Declaration>,
+  pub matches: List<MatchedRule>,
+  pub scope: ScopeId,
+}
+
+pub fn index(roots: &[RootSheets], root: u32) -> usize {
+  let mut i: usize = 0
+  while i < roots.length {
+    if roots[i].root == root { return i }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree: &UiTree<'_>, id: u32, state: StyleState) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if let Option<&StyleOverride>.Some { value } = tree.overrideOf(id, state) {
+    if value.replace { return () }
+  }
+  let mut i: usize = 0
+  while i < source.length {
+    run out.append(run values.cloneDeclaration(&source[i]))
+    i = i + 1
+  }
+}
+
+pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32) -> Resolved
+  ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
+  let node = tree.node(slot)
+  let mut inline = List<Declaration>.make()
+  run inlineValues(&mut inline, node.base.asSlice(), tree, node.id, StyleState.Base)
+  if node.hovered { run inlineValues(&mut inline, node.hover.asSlice(), tree, node.id, StyleState.Hover) }
+  if node.pressed { run inlineValues(&mut inline, node.active.asSlice(), tree, node.id, StyleState.Active) }
+  if tree.focused == slot {
+    run inlineValues(&mut inline, node.focus.asSlice(), tree, node.id, StyleState.Focus)
+    if tree.focusVisible || node.kind == NodeKind.Input { run inlineValues(&mut inline, node.focusVisible.asSlice(), tree, node.id, StyleState.FocusVisible) }
+  }
+  let mut priorities = List<Priority>.make()
+  let mut i: usize = 0
+  while i < inline.length() {
+    let mut priority = Priority.make(Origin.Author, i)
+    priority.inline = true
+    priority.important = inline.asSlice()[i].important
+    run priorities.append(priority)
+    i = i + 1
+  }
+  let adapter = SelectorTree { tree: tree }
+  let mut context = MatchContext.make(u32.toUsize(tree.root), NO_ELEMENT)
+  run sheets.resolve(&adapter, u32.toUsize(slot), priorities.asSlice(), &mut context)
+  let mut parent = Option<ScopeId>.None
+  if node.parent != NONE {
+    if let Option<&Resolved>.Some { value } = tree.node(node.parent).sheetStyle() { parent = Option<ScopeId>.some(value.scope) }
+  }
+  let scope = run sheets.variableScope(parent, &Limits.make())
+  let mut declarations = List<Declaration>.make()
+  let mut expressions = List<Expression>.make()
+  let candidates = sheets.candidates()
+  i = 0
+  while i < candidates.length {
+    match candidates[i].source {
+      Source.Inline { declaration } => {
+        let item = &inline.asSlice()[declaration]
+        if let Value.Text { css } = &item.value {
+          let expanded = run substituteText(&sheets.variableInputs()[0], scope, css.asSlice())
+          match move expanded {
+            Option<Bytes>.Some { value } => run appendText(&mut declarations, &mut expressions, item.property, item.important, value.asSlice())
+            _ => invalidate(&mut declarations, item.property)
+          }
+        } else { run declarations.append(run values.cloneDeclaration(item)) }
+      }
+      Source.Sheet { sheet, declaration } => {
+        match &sheets.sheets()[sheet].sheet.declarations.asSlice()[declaration] {
+          SheetDeclaration.Typed { property, value, .. } => run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: run values.clone(&value) })
+          SheetDeclaration.Pending { property, .. } => {
+            let substituted = run sheets.variableInputs()[0].substitute(scope, sheet, declaration, &Limits.make())
+            match move substituted {
+              Option<Bytes>.Some { value } => run appendText(&mut declarations, &mut expressions, property, candidates[i].priority.important, value.asSlice())
+              Option<Bytes>.None => {
+                invalidate(&mut declarations, property)
+              }
+            }
+          }
+          SheetDeclaration.ColorExpression { property, program, .. } => {
+            run expressions.append(Expression { index: declarations.length(), program: run program.copy() })
+            run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: values.color(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }) })
+          }
+          SheetDeclaration.Custom { .. } => {}
+        }
+      }
+    }
+    i = i + 1
+  }
+  let overrides = tree.styleOverrides()
+  i = 0
+  while i < overrides.length {
+    let item = &overrides[i]
+    if item.id == node.id && (item.state == StyleState.Base || (item.state == StyleState.Hover && node.hovered)
+      || (item.state == StyleState.Active && node.pressed) || (item.state == StyleState.Focus && tree.focused == slot)
+      || (item.state == StyleState.FocusVisible && tree.focused == slot && (tree.focusVisible || node.kind == NodeKind.Input))) {
+      let mut at: usize = 0
+      while at < item.declarations.length() {
+        run declarations.append(run values.cloneDeclaration(&item.declarations.asSlice()[at]))
+        at = at + 1
+      }
+    }
+    i = i + 1
+  }
+  let inherited = if node.parent == NONE { TextStyle.initial().color } else { tree.node(node.parent).computed.text.color }
+  let inheritedColor = Color.srgb(f32.toF64(inherited.r), f32.toF64(inherited.g), f32.toF64(inherited.b), f32.toF64(inherited.a))
+  let mut foreground = inheritedColor
+  let items = declarations.asMutSlice()
+  i = 0
+  while i < items.length {
+    if items[i].property == Property.Color {
+      resolveColor(&mut items[i].value, expressions.asSlice(), i, inheritedColor, system)
+      if let Option<Rgba<f32>>.Some { value } = convert.color(&items[i].value) {
+        foreground = Color.srgb(f32.toF64(value.r), f32.toF64(value.g), f32.toF64(value.b), f32.toF64(value.a))
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < items.length {
+    if items[i].property != Property.Color { resolveColor(&mut items[i].value, expressions.asSlice(), i, foreground, system) }
+    i = i + 1
+  }
+  let mut matches = List<MatchedRule>.make()
+  run matches.appendSlice(sheets.matches())
+  return Resolved { declarations: move declarations, matches: move matches, scope: scope }
+}
+
+fn resolveColor(value: &mut Value, expressions: &[Expression], index: usize, current: Color, system: [Color; 19]) -> () {
+  if let Value.Keyword { value: keyword } = &value.* {
+    if keyword == Keyword.Unset { return () }
+    if keyword == Keyword.Currentcolor {
+      let rgba = colors.toSrgb(current)
+      value.* = values.color(Rgba<f32> { r: f64.toF32(rgba.r), g: f64.toF32(rgba.g), b: f64.toF32(rgba.b), a: f64.toF32(rgba.a) })
+      return ()
+    }
+  }
+  let mut i: usize = 0
+  while i < expressions.length {
+    if expressions[i].index == index {
+      let context = Context.make(current, system)
+      if let Option<Color>.Some { value: result } = expressions[i].program.evaluate(&context) {
+        let rgba = colors.toSrgb(result)
+        value.* = values.color(Rgba<f32> { r: f64.toF32(rgba.r), g: f64.toF32(rgba.g), b: f64.toF32(rgba.b), a: f64.toF32(rgba.a) })
+      }
+      return ()
+    }
+    i = i + 1
+  }
+}
+
+fn invalidate(declarations: &mut List<Declaration>, property: Property) -> () {
+  let items = declarations.asMutSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    if items[i].property == property { items[i].value = values.keyword(Keyword.Unset) }
+    i = i + 1
+  }
+}
+
+effect fn substituteText(inputs: &Inputs, scope: ScopeId, text: &[u8]) -> Option<Bytes>
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = run lexer.tokenize(text, &limits)
+  let range = buffer.all()
+  let mut buffers = Buffers.over(inputs.buffers.owned())
+  let index = buffers.length()
+  run buffers.append(move buffer)
+  let expanded = run inputs.variables.substitute(buffers.view(), scope, index, range, &limits)
+  if let Option<List<TokenRef>>.Some { value } = move expanded {
+    return Option<Bytes>.some(run cssom_serialization.componentsInput(&Input.Expanded { buffers: buffers.view(), references: value.asSlice() }))
+  }
+  return Option<Bytes>.None
+}
+
+effect fn appendText(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, property: Property, important: bool, text: &[u8]) -> ()
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let value = run written.value(text)
+  if let Value.Text { css } = &value {
+    let buffer = run lexer.tokenize(css.asSlice(), &Limits.make())
+    let input = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+    let mut cursor = Cursor.make(&input)
+    let parsed = run colors.parseProgram(&input, &mut cursor)
+    if cursor.done(&input) {
+      if let Option<ColorProgram>.Some { value: program } = move parsed {
+        run expressions.append(Expression { index: declarations.length(), program: move program })
+      }
+    }
+  }
+  run declarations.append(Declaration { property: property, value: move value, important: important })
+}

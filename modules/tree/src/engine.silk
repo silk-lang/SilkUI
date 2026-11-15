@@ -66,6 +66,16 @@ import transform
 import style
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
 import style_identity { Atoms, NodeIdentity }
+import style_sheets
+import style_sheets { RootSheets, Resolved }
+import svg_css.adopted { AdoptionError }
+import svg_css.sheet { Sheet }
+import svg_css.sheet_binary { DecodeError }
+import svg_css.resolver { ResolverError }
+import svg_css.variables { RegistrationError }
+import svg_css.tokens { CssError, Limits }
+import svg_css.media_features { Environment }
+import svg_css.colors { Color as SheetColor }
 import style_attributes
 import ui_protocol.aria { isNamedAttribute }
 import node {
@@ -311,6 +321,9 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
     Mutation.OpenRoot { .. } => false
     Mutation.UpdateRoot { .. } => false
     Mutation.CloseRoot { .. } => false
+    Mutation.AdoptStyleSheet { .. } => false
+    Mutation.ReplaceStyleSheet { .. } => false
+    Mutation.RemoveStyleSheet { .. } => false
     _ => true
   }
 }
@@ -534,6 +547,7 @@ pub struct UiTree<'a> {
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
   pub styleAtoms: Atoms,
+  pub styleSheets: List<RootSheets>,
   free: List<u32>,
   ids: HashMap<Word, u32>,
   /// The slot of each css-layout node, or NONE.
@@ -730,6 +744,7 @@ impl<'a> UiTree<'a> {
       },
       nodes: List<Node>.make(),
       styleAtoms: Atoms.make(),
+      styleSheets: List<RootSheets>.make(),
       free: List<u32>.make(),
       ids: HashMap<Word, u32>.make(seed),
       slotOfCss: List<u32>.make(),
@@ -1530,6 +1545,21 @@ impl<'a> UiTree<'a> {
       }
       Mutation.CloseRoot { root } => {
         run self.closeRoot(index, root)
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if at != usize.MAX { drop self.styleSheets.remove(at) }
+      }
+      Mutation.AdoptStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), false)
+      Mutation.ReplaceStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), true)
+      Mutation.RemoveStyleSheet { root, sheet } => {
+        if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: sheet } }
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if at != usize.MAX {
+          let roots = self.styleSheets.asMutSlice()
+          if run roots[at].sheets.remove(sheet) {
+            drop run self.useRoot(root)
+            self.stylesDirty = true
+          }
+        }
       }
       Mutation.Focus { id } => {
         let slot = run self.require(index, id)
@@ -1850,6 +1880,7 @@ impl<'a> UiTree<'a> {
       editing: move editing,
       effects: Option<Box<Effects>>.None,
       semantics: Option<Box<Semantics>>.None,
+      resolvedSheet: Option<Box<Resolved>>.None,
       selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
     }
@@ -3454,6 +3485,76 @@ impl<'a> UiTree<'a> {
   }
 
   /// Recomputes every node's style from its patches, variants and parent.
+  pub effect fn setStyleEnvironment(self: &mut Self, root: u32, environment: Environment, systemColors: [SheetColor; 19]) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) { fail TreeError.StyleSheet { index: 0, root: root, sheet: 0 } }
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX {
+      at = self.styleSheets.length()
+      run self.styleSheets.append(RootSheets.make(root))
+    }
+    let roots = self.styleSheets.asMutSlice()
+    roots[at].environment = environment
+    roots[at].systemColors = systemColors
+    if root == self.current { self.stylesDirty = true }
+    else {
+      let parked = self.parkedIndex(root)
+      let states = self.parked.asMutSlice()
+      states[parked].stylesDirty = true
+      states[parked].touched = true
+    }
+  }
+
+  effect fn adoptSheet(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
+    let decoded = run Effect.result(Sheet.decode(bytes, &Limits.make()))
+    let sheet = match move decoded {
+      Result<Sheet, DecodeError | OutOfMemoryError>.Success { value } => move value
+      Result<Sheet, DecodeError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
+      }
+    }
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX {
+      if replace { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
+      at = self.styleSheets.length()
+      run self.styleSheets.append(RootSheets.make(root))
+    }
+    let roots = self.styleSheets.asMutSlice()
+    let changed = if replace { run Effect.result(roots[at].sheets.replace(id, move sheet)) }
+      else { run Effect.result(roots[at].sheets.adopt(id, move sheet)) }
+    if let Result<(), AdoptionError | OutOfMemoryError>.Failure { error: why } = move changed {
+      match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
+    }
+    drop run self.useRoot(root)
+    self.stylesDirty = true
+  }
+
+  effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || self.styleSheets.asSlice()[at].sheets.length() == 0 || self.node(slot).kind == NodeKind.Text {
+      let node = self.nodeMut(slot)
+      node.resolvedSheet = Option<Box<Resolved>>.None
+      return ()
+    }
+    let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
+    let entries = roots.asMutSlice()
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, entries[at].systemColors, &self, slot))
+    self.styleSheets = move roots
+    match move resolved {
+      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+        let boxed = run Box<Resolved>.make(move value)
+        let node = self.nodeMut(slot)
+        node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
+      }
+      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+      }
+    }
+  }
+
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
@@ -3462,8 +3563,30 @@ impl<'a> UiTree<'a> {
       self.unitsHeight = self.input.height
       self.restyleViewportUnits()
     }
+    let conditionIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if conditionIndex != usize.MAX {
+      let roots = self.styleSheets.asMutSlice()
+      let mut environment = roots[conditionIndex].environment
+      environment.initial.viewportWidth = f32.toF64(self.input.width)
+      environment.initial.viewportHeight = f32.toF64(self.input.height)
+      environment.resolutionDppx = f32.toF64(self.input.scale)
+      let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
+      match move updated {
+        Result<bool, CssError | OutOfMemoryError>.Success { value } => { if value { self.stylesDirty = true } }
+        Result<bool, CssError | OutOfMemoryError>.Failure { error: why } => {
+          match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+        }
+      }
+    }
     if !self.stylesDirty && !self.stylesPending {
       return ()
+    }
+    let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 {
+      // A full walk is the conservative invalidation fallback until dependency sets prune it.
+      self.stylesDirty = true
+      let roots = self.styleSheets.asMutSlice()
+      roots[sheetIndex].sheets.resetScopes()
     }
     let full = self.stylesDirty
     self.stylesDirty = false
@@ -3531,6 +3654,7 @@ impl<'a> UiTree<'a> {
   effect fn resolve(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if self.styleSheets.length() != 0 { run self.resolveSheet(slot) }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -3567,7 +3691,9 @@ impl<'a> UiTree<'a> {
       computed.outline.auto = true
       computed.outline.width = FOCUS_RING_WIDTH
     }
-    if node.kind != NodeKind.Text && self.overrides.length() == 0 {
+    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+      run applyAll(&mut computed, &value.declarations, &mut stops)
+    } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
       run applyAll(&mut computed, &node.base, &mut stops)
       if node.hovered {
         run applyAll(&mut computed, &node.hover, &mut stops)
@@ -3671,6 +3797,9 @@ impl<'a> UiTree<'a> {
     let basis = Basis { fontSize: computed.text.size, color: computed.text.color }
     let mut effects = Effects.make()
     let node = self.node(slot)
+    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+      run paint_css.applyAll(&mut effects, value.declarations.asSlice(), basis)
+    } else {
     run paint_css.applyAll(&mut effects, node.base.asSlice(), basis)
     if node.hovered {
       run paint_css.applyAll(&mut effects, node.hover.asSlice(), basis)
@@ -3683,6 +3812,7 @@ impl<'a> UiTree<'a> {
       if self.focusVisible || node.kind == NodeKind.Input {
         run paint_css.applyAll(&mut effects, node.focusVisible.asSlice(), basis)
       }
+    }
     }
     computed.effects.hash = effects.hash
     computed.effects.layered = effects.layered()
