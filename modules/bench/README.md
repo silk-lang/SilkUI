@@ -4,7 +4,7 @@ Benchmarks of the retained tree (`ui-tree`) and the framework (`loom`). The scen
 sizes and their names follow the benchmarks of
 [FerroUI](https://github.com/wieslawsoltes/FerroUI/tree/main/tests/FerroUI.Benchmarks)
 (`category::Class.benchmark[parameters]`), so the two tables can be read side by side. Only the
-scenarios and numbers are taken from there; the code is lib-ui's own, in CSS terms: a Border is a
+scenarios and numbers are taken from there; the code is silkui's own, in CSS terms: a Border is a
 box, a StackPanel a flex box, a WrapPanel a wrapping flex box, a Canvas child an absolutely
 positioned box, a Grid or UniformGrid a CSS grid, a TextBlock a text node.
 
@@ -56,5 +56,5 @@ that layout, so it measures at least as much work:
 | `declarative::ViewBenchmark.*` | Model change, `view`, diff and the tree applying the mutations, on 1,000 keyed rows or 2,600 cells (`lazy` for memoized) |
 
 FerroUI's DockPanel, the element-level properties of its property system (bindings, styled and
-direct properties, resource dictionaries), XAML parsing and its themes have no lib-ui counterpart
+direct properties, resource dictionaries), XAML parsing and its themes have no silkui counterpart
 and are left out.

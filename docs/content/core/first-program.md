@@ -97,7 +97,7 @@ To use Loom in a package of your own, add it to `silk.toml`:
 loom = { git = "https://github.com/silk-lang/loom.git", rev = "<a commit>", path = "modules/loom", package = "loom" }
 ```
 
-Loom lives in its own repository, [silk-lang/loom](https://github.com/silk-lang/loom). The examples in these docs, under `docs/examples` of lib-ui, name it the same way.
+Loom lives in its own repository, [silk-lang/loom](https://github.com/silk-lang/loom). The examples in these docs, under `docs/examples` of silkui, name it the same way.
 
 ## Recap
 
