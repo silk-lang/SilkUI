@@ -510,6 +510,10 @@ impl App {
       let mut dir = run fromRoot(&project, ".silk")
       dir = run joined(String.view(&dir), target.id())
       run stylesheets.emit(String.view(&project.root), app.stylePaths.asSlice(), String.view(&dir), target.id() == "web-dom")
+      if mode == Mode.Dev && target.id() == "window" && app.stylePaths.length() != 0 {
+        let update = run joined(String.view(&dir), "styles.update")
+        run refresh(String.view(&run joined(String.view(&dir), "styles.path")), String.view(&update))
+      }
       let toml = run joined(String.view(&dir), "silk.toml")
       run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
       let main = run joined(String.view(&dir), "src/main.silk")
@@ -816,7 +820,7 @@ impl Running {
       let loom = running.launched.source.writtenIn.id() == "loom"
       let rebuilds = loom && running.launched.madeIn == Mode.Dev
       let project = run readProject()
-      let mut seen = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
+      let mut seen = run sources(&project, if running.target.id() != "web-canvas" { running.launched.source.stylePaths.asSlice() } else { &[] })
       if running.target.web() {
         let mut server = match move Intrinsic.replace(running.server, Option<Server>.None) {
           Option<Server>.Some { value } => move value
@@ -849,7 +853,7 @@ impl Running {
             }
           }
           if !rebuilds { continue }
-          let now = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
+          let now = run sources(&project, if running.target.id() != "web-canvas" { running.launched.source.stylePaths.asSlice() } else { &[] })
           if now == seen { continue }
           seen = now
           run say("src/ changed: rebuilding")
@@ -870,11 +874,32 @@ impl Running {
         Option<Child>.Some { value } => move value
         Option<Child>.None => run Task.abort("silkui: the app has no program running")
       }
-      if !rebuilds { return run ended(child.wait()) }
-      run say("watching src/ for changes")
+      let watchesStyles = running.launched.madeIn == Mode.Dev && running.launched.source.stylePaths.length() != 0
+      if !rebuilds && !watchesStyles { return run ended(child.wait()) }
+      if rebuilds { run say("watching src/ for changes") }
+      if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
+      let mut styled = Option<u64>.None
       while !child.ended() {
         pause(300)
-        let now = run sources(&project, if running.target.id() == "web-dom" { running.launched.source.stylePaths.asSlice() } else { &[] })
+        if watchesStyles {
+          let current = run Effect.result(stylesheets.fingerprint(String.view(&project.root), running.launched.source.stylePaths.asSlice()))
+          match move current {
+            Result.Success { value: fingerprint } => {
+              if styled.isNone() || fingerprint != styled.unwrapOr(0) {
+                styled = Option<u64>.Some { value: fingerprint }
+                let host = &running.launched.source.hosts.asSlice()[0]
+                let updated = run Effect.result(stylesheets.emit(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&host.dir), false))
+                if let Result<(), TaskError | FileError | OutOfMemoryError>.Failure { error } = move updated {
+                  drop error
+                  run say("stylesheet update failed: the application keeps its previous styles")
+                }
+              }
+            }
+            Result.Failure { error } => { drop error }
+          }
+        }
+        if !rebuilds { continue }
+        let now = run sources(&project, if running.target.id() != "web-canvas" { running.launched.source.stylePaths.asSlice() } else { &[] })
         if now == seen { continue }
         seen = now
         run say("src/ changed: rebuilding")

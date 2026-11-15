@@ -1,6 +1,9 @@
 //! Build-time CSS assets. Processors run before App.stylesheet; this module
 //! accepts their CSS output and writes either compiled bytes or a DOM stylesheet.
 import css_style.compile { Options, CompileError }
+import ui_protocol.style_bundle as bundle
+import ui_protocol.style_bundle { DecodeError }
+import silk.collections.list { List }
 import css_style.compile
 import css_style.sheet { Sheet, DiagnosticKind }
 import css_style.tokens { CssError }
@@ -10,7 +13,7 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.io.writer_native { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem { FileError, AtomicWriteError, FileSystem, Path }
 import silk.text.string { String }
 import silk.num.usize
 import silk.num.u8
@@ -78,6 +81,7 @@ pub effect fn compiled(source: &[u8], path: string) -> Bytes
 
 pub effect fn emit(root: string, paths: &[string<'static>], host: string, dom: bool) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let mut encoded = List<Bytes>.make()
   let mut i: usize = 0
   while i < paths.length {
     let sourceName = run joined(root, paths[i])
@@ -92,8 +96,23 @@ pub effect fn emit(root: string, paths: &[string<'static>], host: string, dom: b
     let destination = run joined(host, String.view(&run name(i, dom)))
     let file = run Path.make(String.view(&destination))
     run FileSystem.writeFileWithParents(&file, data.asSlice())
+    if !dom { run encoded.append(move data) }
     i = i + 1
   }
+  if !dom && paths.length != 0 {
+    let update = run Effect.catch<DecodeError>(bundle.encode(encoded.asSlice()), bundleFailure)
+    let path = run Path.make(String.view(&run joined(host, "styles.update")))
+    run Effect.catch<AtomicWriteError>(FileSystem.writeFileAtomic(&path, update.asSlice(), FileSystem.replaceExisting(), FileSystem.buffered()), atomicFailure)
+  }
+}
+
+effect fn bundleFailure(error: DecodeError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  drop error
+  fail TaskError { message: run String.copy("silkui: compiled stylesheets exceed the update bundle limits"), status: 1 }
+}
+
+effect fn atomicFailure(error: AtomicWriteError) -> never ! FileError {
+  fail move error.cause
 }
 
 /// Content fingerprints include missing paths so deletion and recreation are changes.

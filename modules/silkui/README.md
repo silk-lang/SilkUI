@@ -76,7 +76,7 @@ no inspector.
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
-| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no hot reload yet: `dev` builds the bundle once |
+| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
 | `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
@@ -99,15 +99,20 @@ DOM pages copy the CSS and link the files in the same order before mounting the 
 The [Loom counter](examples/loom) uses this path on all three targets.
 
 A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
-CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `web-dom`, `dev` replaces changed stylesheets without reloading the page or resetting
-application state. A missing file leaves the active styles intact until it is restored.
-Native and canvas stylesheet hot replacement is still being integrated; CSS edits on those
-targets currently require rebuilding.
+CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `window`
+and `web-dom`, `dev` replaces changed stylesheets without restarting the application or
+resetting its state. Native hosts validate an atomically published set of compiled sheets
+before updating their application roots. A missing or invalid update leaves the active styles
+intact until a valid update is available. Release hosts do not watch stylesheet files.
+Canvas stylesheet hot replacement is still being integrated; CSS edits on that target
+currently require rebuilding.
 
 The browser integration test runs the real dev task in a temporary project and checks
 replacement order, preserved state, missing-file recovery, and a subsequent code rebuild:
 `node modules/silkui/tests/stylesheets-browser.mjs` from the repository root. It needs
 `silk` and `chromium` on PATH (or the `SILK` and `CHROMIUM` environment variables).
+The native file-update test is `silk test --manifest-path modules/tree/window/tests/silk.toml --root src/stylesheet_updates.silk`; it checks complete-set validation, recovery, adoption
+order, repaint scheduling, and isolation between application and inspector roots.
 
 ## The web targets
 

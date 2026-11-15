@@ -7,7 +7,7 @@
 //!
 //! A debug build serves the inspector when `SILK_UI_INSPECT` is set. The release host
 //! (`js.release`) has none of this code.
-import js { Settings, programWithSheets, failed }
+import js { Settings, programWithSheetUpdates, failed }
 import ui_js_window_dev.lib { DevTools }
 import ui_tree_window.host { startInspector }
 import ui_tree_window.platform_thread { Launched, launch }
@@ -15,6 +15,8 @@ import ui_inspect_server.lib { InspectorOptions }
 import ui_js.lib { JsError }
 import ui_tree.legacy { TreeError }
 import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+import silk.system.filesystem { FileError }
 import silkjs.js_atomics_native { SynchronizationError }
 import silkjs.js_libc_platform as platform
 import window.types { WindowError }
@@ -53,7 +55,7 @@ pub fn same(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
-effect fn develop(settings: Settings, watch: bool, port: u16, entry: &[u8], launched: Option<Launched>, sheets: StyleAssets) -> i32
+effect fn develop(settings: Settings, watch: bool, port: u16, entry: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   let mut tools = DevTools.make()
@@ -67,12 +69,12 @@ effect fn develop(settings: Settings, watch: bool, port: u16, entry: &[u8], laun
   let inspector = run startInspector(InspectorOptions.make())
   // Under the development server the app comes from the server: start from an empty module.
   let source: &[u8] = if entry.length == 0 { b"export {};" } else { b"" }
-  return run programWithSheets(settings, entry, source, move tools, move inspector, move launched, move sheets)
+  return run programWithSheetUpdates(settings, entry, source, move tools, move inspector, move launched, move sheets, move updates)
 }
 
-fn developed(settings: Settings, watch: bool, port: u16, entry: Bytes, launched: Option<Launched>, sheets: StyleAssets) -> i32 {
+fn developed(settings: Settings, watch: bool, port: u16, entry: Bytes, launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(develop(settings, watch, port, Bytes.asSlice(&entry), move launched, move sheets), failed)
+  return run Effect.catchAll(develop(settings, watch, port, Bytes.asSlice(&entry), move launched, move sheets, move updates), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -91,16 +93,21 @@ pub effect fn main(settings: Settings) -> i32 ? &mut HostInput {
   return run mainWithSheets(settings, &[])
 }
 
-effect fn launchDeveloped(settings: Settings, watch: bool, port: u16, entry: Bytes, sources: &[&[u8]]) -> i32
-  ! OutOfMemoryError ? &mut Allocator {
+effect fn launchDeveloped(settings: Settings, watch: bool, port: u16, entry: Bytes, sources: &[&[u8]], updatePath: string) -> i32
+  ! FileError | OutOfMemoryError ? &mut Allocator {
   let sheets = run StyleAssets.from(sources)
+  let updates = run SheetWatch.from(updatePath)
   return run launch(fn(launched: Option<Launched>) -> i32 {
-    return developed(settings, watch, port, move entry, move launched, move sheets)
+    return developed(settings, watch, port, move entry, move launched, move sheets, move updates)
   })
 }
 
 /// Development entry with the application's initially compiled sheets.
 pub effect fn mainWithSheets(settings: Settings, sources: &[&[u8]]) -> i32 ? &mut HostInput {
+  return run mainWithSheetUpdates(settings, sources, "")
+}
+
+pub effect fn mainWithSheetUpdates(settings: Settings, sources: &[&[u8]], updatePath: string) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let count = run Effect.catchAll(HostInput.argumentCount(), noArguments)
   let mut watch = false
@@ -128,7 +135,7 @@ pub effect fn mainWithSheets(settings: Settings, sources: &[&[u8]]) -> i32 ? &mu
   let path = move entry
   // The main thread keeps the OS event loop; the app runs on its own thread.
   return run Effect.catchAll(
-    launchDeveloped(settings, watching, serving, move path, sources),
+    launchDeveloped(settings, watching, serving, move path, sources, updatePath),
     failed,
   )
     |> Effect.provideMut<Allocator>(&mut allocator)

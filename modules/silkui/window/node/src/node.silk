@@ -6,10 +6,13 @@ import ui_js.lib { uiPackage }
 import ui_js_node.lib { NodeWindow, NodeClient }
 import ui_tree.legacy { TreeError }
 import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+import silk.system.filesystem { FileError }
 import ui_tree_window.host { RunOptions, StartedGpu, startGpu }
 import ui_tree_window.platform_thread { Launched, launch }
 import ui_tree_window.console { StderrWriter }
-import silkui_window.js { Settings, failed, systemFonts }
+pub import silkui_window.js { Settings }
+import silkui_window.js { failed, systemFonts }
 import silkjs.js_atomics_native { SynchronizationError }
 import silkjs.js_libc_platform as platform
 import window.types { WindowError }
@@ -22,7 +25,7 @@ import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.host_input { HostInput }
 
-effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets) -> i32
+effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   let gpu = run startGpu(false)
@@ -40,6 +43,7 @@ effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Opt
   }
   let mut client = NodeClient.make()
   client.stylesheets = move sheets
+  client.stylesheetUpdates = move updates
   let mut window = NodeWindow.make(&fonts, move options, move client)
   run window.define(b"@silkui/core", uiPackage())
   if source.length != 0 {
@@ -51,9 +55,9 @@ effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Opt
   return run window.start(b"app")
 }
 
-fn ran(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets) -> i32 {
+fn ran(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(settings, Bytes.asSlice(&entry), source, move launched, move sheets), failed)
+  return run Effect.catchAll(program(settings, Bytes.asSlice(&entry), source, move launched, move sheets, move updates), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -62,21 +66,22 @@ effect fn noArgument<E>(error: E) -> Option<Bytes> {
   return Option<Bytes>.None
 }
 
-effect fn started(settings: Settings, entry: Bytes, source: &'static [u8], sheets: StyleAssets) -> i32 ? &mut HostInput {
+effect fn started(settings: Settings, entry: Bytes, source: &'static [u8], sheets: StyleAssets, updates: SheetWatch) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let path = move entry
   // The main thread keeps the OS event loop; the app and the runtime run on their own.
   return run Effect.catchAll(
-    launch(fn(launched: Option<Launched>) -> i32 { return ran(settings, move path, source, move launched, move sheets) }),
+    launch(fn(launched: Option<Launched>) -> i32 { return ran(settings, move path, source, move launched, move sheets, move updates) }),
     failed,
   )
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn loaded(settings: Settings, entry: Bytes, source: &'static [u8], sources: &[&[u8]]) -> i32
-  ! OutOfMemoryError ? &mut Allocator | &mut HostInput {
+effect fn loaded(settings: Settings, entry: Bytes, source: &'static [u8], sources: &[&[u8]], updatePath: string) -> i32
+  ! FileError | OutOfMemoryError ? &mut Allocator | &mut HostInput {
   let sheets = run StyleAssets.from(sources)
-  return run started(settings, move entry, source, move sheets)
+  let updates = run SheetWatch.from(updatePath)
+  return run started(settings, move entry, source, move sheets, move updates)
 }
 
 /// The release host's `main`: the bundle `source` is part of the binary.
@@ -86,7 +91,7 @@ pub effect fn release(settings: Settings, source: &'static [u8]) -> i32 ? &mut H
 
 pub effect fn releaseWithSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets), failed)
+  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets, ""), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -96,6 +101,10 @@ pub effect fn develop(settings: Settings) -> i32 ? &mut HostInput {
 }
 
 pub effect fn developWithSheets(settings: Settings, sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+  return run developWithSheetUpdates(settings, sheets, "")
+}
+
+pub effect fn developWithSheetUpdates(settings: Settings, sheets: &[&[u8]], updatePath: string) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let entry = match move run Effect.catchAll(HostInput.argument(1), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
     Option<Bytes>.Some { value } => move value
@@ -104,6 +113,6 @@ pub effect fn developWithSheets(settings: Settings, sheets: &[&[u8]]) -> i32 ? &
       return 2
     }
   }
-  return run Effect.catchAll(loaded(settings, move entry, b"", sheets), failed)
+  return run Effect.catchAll(loaded(settings, move entry, b"", sheets, updatePath), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
