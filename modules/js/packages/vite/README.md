@@ -16,7 +16,7 @@ export default defineConfig({ plugins: [silk(), react()] });
 | --- | --- | --- |
 | `entry` | `src/main.jsx` | Entry module, relative to the Vite root |
 | `fileName` | `app.js` | Name of the bundle in `build.outDir` |
-| `host` | none | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode |
+| `host` | the `SILKUI_HOST` program, which `silk task dev` sets | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode |
 | `port` | any free one | Port the dev server listens on for the host |
 | `apis` | `warn` | What to do when the build uses a web or Node API a ui-js runtime does not have: `warn`, `error` or `off` |
 | `allow` | none | Names of such APIs the application provides itself |

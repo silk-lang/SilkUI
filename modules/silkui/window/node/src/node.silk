@@ -1,0 +1,89 @@
+//! A JavaScript app in a window on the full SilkJS runtime (`Runtime.node()`): Node's APIs and
+//! the web APIs Node has, with `@silkui/core` beside them. What the hosts silkui generates for
+//! such an app run. There is no hot reload on the runtime yet: the development host runs the
+//! bundle at the path its command line gives, once.
+import ui_js.lib { uiPackage }
+import ui_js_node.lib { NodeWindow, NodeClient }
+import ui_tree.legacy { TreeError }
+import ui_tree_window.host { RunOptions, StartedGpu, startGpu }
+import ui_tree_window.platform_thread { Launched, launch }
+import ui_tree_window.console { StderrWriter }
+import silkui_window.js { Settings, failed, systemFonts }
+import silkjs.js_atomics_native { SynchronizationError }
+import silkjs.js_libc_platform as platform
+import window.types { WindowError }
+import webgpu.runtime { GpuError }
+import atlas.atlas { AtlasError }
+import vector.geometry_error { GeometryError }
+import silk.collections.bytes { Bytes }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.host_input { HostInput }
+
+effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  let gpu = run startGpu(false)
+  let fonts = run systemFonts()
+  let options = RunOptions {
+    title: settings.title,
+    width: settings.width,
+    height: settings.height,
+    check: false,
+    checkClick: "",
+    checkExpect: "",
+    lowestLatency: false,
+    platform: move launched,
+    gpu: Option<StartedGpu>.some(move gpu),
+  }
+  let mut window = NodeWindow.make(&fonts, move options, NodeClient.make())
+  run window.define(b"@silkui/core", uiPackage())
+  if source.length != 0 {
+    run window.entry(b"/app/app.js", source)
+  } else {
+    let read = run platform.readFile(entry)
+    run window.entry(b"/app/app.js", read.asSlice())
+  }
+  return run window.start(b"app")
+}
+
+fn ran(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(program(settings, Bytes.asSlice(&entry), source, move launched), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn noArgument<E>(error: E) -> Option<Bytes> {
+  drop error
+  return Option<Bytes>.None
+}
+
+effect fn started(settings: Settings, entry: Bytes, source: &'static [u8]) -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let path = move entry
+  // The main thread keeps the OS event loop; the app and the runtime run on their own.
+  return run Effect.catchAll(
+    launch(fn(launched: Option<Launched>) -> i32 { return ran(settings, move path, source, move launched) }),
+    failed,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The release host's `main`: the bundle `source` is part of the binary.
+pub effect fn release(settings: Settings, source: &'static [u8]) -> i32 ? &mut HostInput {
+  return run started(settings, Bytes.make(), source)
+}
+
+/// The development host's `main`: `<host> <bundle>` runs the bundle at that path.
+pub effect fn develop(settings: Settings) -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let entry = match move run Effect.catchAll(HostInput.argument(1), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      StderrWriter.print("silkui: give the bundle's path\n", &())
+      return 2
+    }
+  }
+  return run started(settings, move entry, b"")
+}

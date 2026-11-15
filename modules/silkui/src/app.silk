@@ -1,0 +1,737 @@
+//! An app and the pipeline that builds and runs it, in three stages: an [`App`] (the
+//! definition), a [`Built`] (the artifacts per target) and a [`Running`] (live processes).
+//! Each step is scoped under the stage it takes, so `App.build` takes an App and gives a
+//! Built, and `Built.launch` takes a Built and gives a Running. Steps are effects, so a chain
+//! starts with `run`:
+//!
+//! ```silk,ignore
+//! effect fn app() -> App {
+//!   return run App.make("my-app")
+//!     |> App.framework(Framework.react("web"))
+//!     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
+//! }
+//!
+//! run app() |> App.only(target) |> App.build(Mode.Dev) |> Built.launch() |> Running.watch()
+//! run app() |> App.only(target) |> App.build(Mode.Release) |> Built.write("dist")
+//! ```
+//!
+//! A project's own step is a function of the same shape, `effect fn sign<'env, E, ?R>(built:
+//! once Effect<'env; Built ! E ? R>) -> Built ! … ? …`, placed in the chain. `tap` and `map`
+//! take a closure for something small between two steps.
+//!
+//! The steps run inside a task (`silk task`): they use the task's root as the project
+//! directory and its compiler for `silk build`.
+import host { Kind, Plan, manifest, main as hostMain }
+import manifest { Project, read as readProject }
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.core.result { Result }
+import silk.io.writer { WriterError }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { DirectoryEntry, FileError, FileInfo, DirectoryInfo, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.i32
+import silk.num.u8
+import process { Child, Variable, start, pause }
+
+/// A desktop window's options.
+pub struct Window {
+  pub title: string<'static>,
+  pub width: f64,
+  pub height: f64,
+}
+
+impl Copy for Window {}
+
+/// Where an app runs. Its id names it in `--target`, in `.silk/<id>/` and in `dist/<id>/`.
+pub union Target {
+  /// A desktop window (`window`).
+  Window { pub window: Window },
+  /// A browser page drawn with WebGPU (`web-canvas`). Not built by silkui yet.
+  WebCanvas,
+  /// A browser page of real elements (`web-dom`). Not built by silkui yet.
+  WebDom,
+}
+
+impl Copy for Target {}
+
+impl Target {
+  pub fn window(window: Window) -> Target { return Target.Window { window: window } }
+  pub fn webCanvas() -> Target { return Target.WebCanvas }
+  pub fn webDom() -> Target { return Target.WebDom }
+
+  /// `window`, `web-canvas` or `web-dom`.
+  pub fn id(self: &Target) -> string<'static> {
+    return match self.* {
+      Target.Window { .. } => "window"
+      Target.WebCanvas => "web-canvas"
+      Target.WebDom => "web-dom"
+    }
+  }
+}
+
+/// What the app is written in. The JavaScript ones name the directory of a Vite project with
+/// `@silkui/vite` in its config, which bundles to `dist/app.js`.
+pub union Framework {
+  /// Loom: `module` in the project's sources has a `Model` (a `Program<Message, C>`) and its
+  /// `Message`; `command` names its command type, or is empty for none.
+  Loom { pub module: string<'static>, pub command: string<'static> },
+  React { pub dir: string<'static> },
+  Foldkit { pub dir: string<'static> },
+  Js { pub dir: string<'static> },
+}
+
+impl Copy for Framework {}
+
+impl Framework {
+  /// A Loom app whose `Model` and `Message` are in the project module `module`, such as `app`
+  /// for `src/app.silk`. The project's manifest exports it.
+  pub fn loom(module: string<'static>) -> Framework { return Framework.Loom { module: module, command: "" } }
+  /// A Loom app with commands: `command` is the name of its command type in `module`.
+  pub fn loomWithCommands(module: string<'static>, command: string<'static>) -> Framework {
+    return Framework.Loom { module: module, command: command }
+  }
+  pub fn react(dir: string<'static>) -> Framework { return Framework.React { dir: dir } }
+  pub fn foldkit(dir: string<'static>) -> Framework { return Framework.Foldkit { dir: dir } }
+  pub fn js(dir: string<'static>) -> Framework { return Framework.Js { dir: dir } }
+
+  /// `loom`, `react`, `foldkit` or `js`.
+  pub fn id(self: &Framework) -> string<'static> {
+    return match self.* {
+      Framework.Loom { .. } => "loom"
+      Framework.React { .. } => "react"
+      Framework.Foldkit { .. } => "foldkit"
+      Framework.Js { .. } => "js"
+    }
+  }
+
+  /// The Vite project's directory, or empty for Loom.
+  pub fn dir(self: &Framework) -> string<'static> {
+    return match self.* {
+      Framework.Loom { .. } => ""
+      Framework.React { dir } => dir
+      Framework.Foldkit { dir } => dir
+      Framework.Js { dir } => dir
+    }
+  }
+}
+
+/// What runs a JavaScript app in a window. Browser targets run it on the browser's own engine.
+pub enum Runtime {
+  /// The SilkJS Engine: lean, no Node or web platform APIs. The default.
+  Engine,
+  /// The full SilkJS runtime: Node's APIs and the web APIs Node has. No hot reload yet.
+  Node,
+}
+
+impl Runtime {
+  pub fn engine() -> Runtime { return Runtime.Engine }
+  pub fn node() -> Runtime { return Runtime.Node }
+}
+
+/// How a build is made. `Dev` adds the development tools (hot reload, the inspector) and
+/// keeps debug information; `Release` is optimized and has none of them.
+pub enum Mode {
+  Dev,
+  Release,
+}
+
+/// The host of one target: the package `silk build` builds.
+pub struct Host {
+  pub target: Target,
+  /// The package directory, absolute.
+  pub dir: String,
+  /// Whether silkui wrote it.
+  pub generated: bool,
+}
+
+/// An app: the definition, and once [`App.bundle`] and [`App.host`] ran, where its bundle
+/// and hosts are.
+pub struct App {
+  named: string<'static>,
+  writtenIn: Framework,
+  runsOn: Runtime,
+  places: List<Target>,
+  custom: string<'static>,
+  bundled: String,
+  hosts: List<Host>,
+}
+
+/// One built target.
+pub struct Artifact {
+  pub target: Target,
+  /// The program, absolute.
+  pub path: String,
+  /// Its size in bytes.
+  pub bytes: usize,
+}
+
+/// A built app: an artifact per target.
+pub struct Built {
+  source: App,
+  madeIn: Mode,
+  outputs: List<Artifact>,
+}
+
+/// A launched app: what [`Built.launch`] started.
+pub struct Running {
+  launched: Built,
+  target: Target,
+  vite: bool,
+  child: Child,
+}
+
+// --- helpers ---
+
+fn same(left: string, right: string) -> bool { return left == right }
+
+effect fn joined(base: string, child: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run String.copy(base)
+  if !String.endsWith(base, "/") { run String.append(&mut out, "/") }
+  run String.append(&mut out, child)
+  return move out
+}
+
+/// `path`, absolute: relative ones are from the project root.
+effect fn fromRoot(project: &Project, path: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  if String.startsWith(path, "/") { return run String.copy(path) }
+  return run joined(String.view(&project.root), path)
+}
+
+effect fn say(text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut line = run String.copy("silkui: ")
+  run String.append(&mut line, text)
+  StderrWriter.print("{}\n", &.(String.view(&line)))
+}
+
+effect fn writeText(path: string, text: string) -> ()
+  ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let file = run Path.make(path)
+  run FileSystem.writeFileWithParents(&file, String.utf8Bytes(text))
+}
+
+effect fn exists(path: string) -> bool ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let file = run Path.make(path)
+  return run FileSystem.exists(&file)
+}
+
+/// Writes `path` only when its content changes, so `silk build` sees no change otherwise.
+effect fn refresh(path: string, text: string) -> ()
+  ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let file = run Path.make(path)
+  if run FileSystem.exists(&file) {
+    let old = run FileSystem.readFile(&file)
+    if Bytes.asSlice(&old) == String.utf8Bytes(text) { return () }
+  }
+  run FileSystem.writeFileWithParents(&file, String.utf8Bytes(text))
+}
+
+effect fn unsupported(framework: &Framework, target: &Target, runtime: Runtime) -> never
+  ! TaskError | OutOfMemoryError ? &mut Allocator {
+  let mut message = run String.copy("silkui cannot build ")
+  run String.append(&mut message, framework.id())
+  if runtime == Runtime.Node && framework.id() != "loom" { run String.append(&mut message, " (on the SilkJS runtime)") }
+  run String.append(&mut message, " apps for the ")
+  run String.append(&mut message, target.id())
+  run String.append(&mut message, " target yet")
+  fail TaskError { message: move message, status: 1 }
+}
+
+effect fn npm(dir: string, arguments: &[string]) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    let mut child = run start("npm", arguments, dir, &[])
+    let code = child.wait()
+    if code != 0 {
+      let mut message = run String.copy("npm ")
+      run String.append(&mut message, arguments[0])
+      run String.append(&mut message, " failed in ")
+      run String.append(&mut message, dir)
+      fail TaskError { message: move message, status: code }
+    }
+  } else {
+    run Task.abort("silkui: running Vite needs Windows subprocess support in Silk")
+  }
+}
+
+/// Installs the Vite project's packages when it has none yet.
+effect fn installed(dir: string) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let modules = run joined(dir, "node_modules")
+  if !run exists(String.view(&modules)) {
+    run say("installing the Vite project's packages")
+    run npm(dir, &["install"])
+  }
+}
+
+/// The program `silk build` made for the package at `dir`.
+effect fn binary(dir: string, name: string, mode: Mode) -> String
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let profile = if mode == Mode.Release { "release" } else { "debug" }
+  let llvm = run joined(dir, "build/llvm")
+  let root = run Path.make(String.view(&llvm))
+  if run FileSystem.exists(&root) {
+    let entries = run FileSystem.listDirectory(&root)
+    let items = List<DirectoryEntry>.asSlice(&entries)
+    let mut at: usize = 0
+    while at < items.length {
+      let triple = Path.view(&items[at].path) |> Option<string>.unwrapOr("")
+      let mut candidate = run joined(triple, profile)
+      candidate = run joined(String.view(&candidate), name)
+      if run exists(String.view(&candidate)) { return move candidate }
+      at = at + 1
+    }
+  }
+  run Task.abort("silkui: silk build made no program where silkui looked for it")
+}
+
+effect fn sizeOf(path: string) -> usize ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let file = run Path.make(path)
+  return match run FileSystem.stat(&file) {
+    FileInfo info => info.byteLength
+    DirectoryInfo _info => 0
+  }
+}
+
+effect fn compileHost(dir: string, mode: Mode) -> ()
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let manifest = run joined(dir, "silk.toml")
+  if mode == Mode.Release {
+    run Task.silk(&["build", "--manifest-path", String.view(&manifest), "--release"])
+  } else {
+    run Task.silk(&["build", "--manifest-path", String.view(&manifest)])
+  }
+}
+
+// --- App: the definition ---
+
+impl App {
+  /// A new app named `name`: the name of its program. No framework, no target yet.
+  pub effect fn make(name: string<'static>) -> App {
+    return App {
+      named: name,
+      writtenIn: Framework.Js { dir: "web" },
+      runsOn: Runtime.Engine,
+      places: List<Target>.make(),
+      custom: "",
+      bundled: String.make(),
+      hosts: List<Host>.make(),
+    }
+  }
+
+  /// What the app is written in. Plain JS in `web/` until this says otherwise.
+  pub effect fn framework<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, framework: Framework) -> App ! E ? R {
+    let mut app = run move self
+    app.writtenIn = framework
+    return move app
+  }
+
+  /// What runs a JavaScript app in a window. The Engine until this says otherwise.
+  pub effect fn runtime<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, runtime: Runtime) -> App ! E ? R {
+    let mut app = run move self
+    app.runsOn = runtime
+    return move app
+  }
+
+  /// Adds a target. The first one is what `dev` launches.
+  pub effect fn target<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, target: Target) -> App
+    ! E | OutOfMemoryError ? R | &mut Allocator {
+    let mut app = run move self
+    run app.places.append(target)
+    return move app
+  }
+
+  /// The escape hatch: the project's own host package at `dir` (relative to the project) is
+  /// built instead of a generated one, for every target. It gets no bundle copied in.
+  pub effect fn customHost<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, dir: string<'static>) -> App ! E ? R {
+    let mut app = run move self
+    app.custom = dir
+    return move app
+  }
+
+  pub fn name(self: &App) -> string<'static> { return self.named }
+  pub fn frameworkOf(self: &App) -> Framework { return self.writtenIn }
+  pub fn targets(self: &App) -> &[Target] { return self.places.asSlice() }
+
+  // --- App: the steps ---
+
+  /// Keeps only the target `id` when it is not empty (a `--target` flag), and fails naming
+  /// the targets there are when the app has no such target.
+  pub effect fn only<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, id: string) -> App
+    ! E | TaskError | OutOfMemoryError ? R | &mut Allocator {
+    let mut app = run move self
+    if id == "" { return move app }
+    let mut kept = List<Target>.make()
+    let all = app.places.asSlice()
+    let mut names = String.make()
+    let mut at: usize = 0
+    while at < all.length {
+      if all[at].id() == id { run kept.append(all[at]) }
+      if at > 0 { run String.append(&mut names, ", ") }
+      run String.append(&mut names, all[at].id())
+      at = at + 1
+    }
+    if kept.length() == 0 {
+      let mut message = run String.copy("silkui: the app has no target ")
+      run String.append(&mut message, id)
+      run String.append(&mut message, "; it has ")
+      if all.length == 0 { run String.append(&mut message, "none") } else { run String.append(&mut message, String.view(&names)) }
+      fail TaskError { message: move message, status: 2 }
+    }
+    app.places = move kept
+    return move app
+  }
+
+  /// Runs Vite for a JavaScript app: `vite build` into the Vite project's `dist/app.js`. In
+  /// `Mode.Dev` on the Engine it only installs the packages, because the development server
+  /// serves the modules to the window. Does nothing for a Loom app.
+  pub effect fn bundle<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, mode: Mode) -> App
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let mut app = run move self
+    let dir = app.writtenIn.dir()
+    if dir == "" { return move app }
+    let project = run readProject()
+    let web = run fromRoot(&project, dir)
+    run installed(String.view(&web))
+    app.bundled = run joined(String.view(&web), "dist/app.js")
+    if mode == Mode.Dev && app.runsOn == Runtime.Engine { return move app }
+    run say("bundling with Vite")
+    if mode == Mode.Release {
+      run npm(String.view(&web), &["exec", "--", "vite", "build"])
+    } else {
+      run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", "development"])
+    }
+    return move app
+  }
+
+  /// Writes the Silk host of each target into `.silk/<target>/`: a manifest, a `main.silk`
+  /// of a few lines and, for a release JavaScript host, the bundle it embeds. `Mode.Dev`
+  /// hosts have the development tools. Fails for a framework and target silkui cannot
+  /// build yet.
+  pub effect fn host<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, mode: Mode) -> App
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let mut app = run move self
+    let project = run readProject()
+    app.hosts = List<Host>.make()
+    let targets = app.places.asSlice()
+    if targets.length == 0 { run Task.abort("silkui: the app has no target: add one with App.target") }
+    let mut at: usize = 0
+    while at < targets.length {
+      let target = targets[at]
+      if app.custom != "" {
+        run app.hosts.append(Host { target: target, dir: run fromRoot(&project, app.custom), generated: false })
+        at = at + 1
+        continue
+      }
+      let mut window = Window { title: "", width: 0.0, height: 0.0 }
+      if let Target.Window { window: options } = target { window = options } else { run unsupported(&app.writtenIn, &target, app.runsOn) }
+      let kind = match app.writtenIn {
+        Framework.Loom { .. } => Kind.Loom
+        _ => if app.runsOn == Runtime.Node { Kind.Node } else { Kind.Engine }
+      }
+      let mut module = ""
+      let mut command = ""
+      if let Framework.Loom { module: named, command: commands } = app.writtenIn {
+        module = named
+        command = commands
+      }
+      let plan = Plan {
+        target: target.id(),
+        kind: kind,
+        dev: mode == Mode.Dev,
+        title: window.title,
+        width: window.width,
+        height: window.height,
+        module: module,
+        command: command,
+      }
+      let mut dir = run fromRoot(&project, ".silk")
+      dir = run joined(String.view(&dir), target.id())
+      let toml = run joined(String.view(&dir), "silk.toml")
+      run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
+      let main = run joined(String.view(&dir), "src/main.silk")
+      run refresh(String.view(&main), String.view(&run hostMain(&plan)))
+      if kind != Kind.Loom && mode == Mode.Release {
+        let copy = run joined(String.view(&dir), "app.js")
+        let source = run Path.make(String.view(&app.bundled))
+        if !run FileSystem.exists(&source) { run Task.abort("silkui: there is no bundle to embed: run App.bundle before App.host") }
+        let bytes = run FileSystem.readFile(&source)
+        let destination = run Path.make(String.view(&copy))
+        run FileSystem.writeFileWithParents(&destination, Bytes.asSlice(&bytes))
+      }
+      // The folder is the tasks' own output: keep it out of version control.
+      let ignore = run fromRoot(&project, ".silk/.gitignore")
+      run refresh(String.view(&ignore), "*\n")
+      run app.hosts.append(Host { target: target, dir: move dir, generated: true })
+      at = at + 1
+    }
+    return move app
+  }
+
+  /// Runs `silk build` on each host: a native program per window target.
+  pub effect fn compile<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, mode: Mode) -> Built
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let app = run move self
+    if app.hosts.length() == 0 { run Task.abort("silkui: there is no host to compile: run App.host before App.compile") }
+    let project = run readProject()
+    let mut artifacts = List<Artifact>.make()
+    let hosts = app.hosts.asSlice()
+    let mut at: usize = 0
+    while at < hosts.length {
+      let dir = String.view(&hosts[at].dir)
+      let mut line = run String.copy("building the ")
+      run String.append(&mut line, hosts[at].target.id())
+      run String.append(&mut line, if mode == Mode.Release { " host (release)" } else { " host (dev)" })
+      run say(String.view(&line))
+      run compileHost(dir, mode)
+      // A generated host is named after the project and the target; a custom one after the app.
+      let mut name = run String.copy(app.named)
+      if hosts[at].generated {
+        name = run String.copy(String.view(&project.name))
+        run String.append(&mut name, "-")
+        run String.append(&mut name, hosts[at].target.id())
+      }
+      let path = run binary(dir, String.view(&name), mode)
+      let bytes = run sizeOf(String.view(&path))
+      run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
+      at = at + 1
+    }
+    return Built { source: move app, madeIn: mode, outputs: move artifacts }
+  }
+
+  /// [`App.bundle`], [`App.host`] and [`App.compile`], in order. Most projects only use this.
+  pub effect fn build<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, mode: Mode) -> Built
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    return run move self |> App.bundle(mode) |> App.host(mode) |> App.compile(mode)
+  }
+
+  /// Runs `f` on the app and passes it on unchanged.
+  pub effect fn tap<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, f: once fn<'env>(&App) -> ()) -> App ! E ? R {
+    let app = run move self
+    f(&app)
+    return move app
+  }
+
+  /// The app `f` makes of it.
+  pub effect fn map<'env, E, F, ?R, ?S>(self: once Effect<'env; App ! E ? R>, f: once effect fn<'env>(App) -> App ! F ? S) -> App ! E | F ? R | S {
+    let app = run move self
+    return run f(move app)
+  }
+}
+
+// --- Built ---
+
+impl Built {
+  pub fn app(self: &Built) -> &App { return &self.source }
+  pub fn mode(self: &Built) -> Mode { return self.madeIn }
+  pub fn artifacts(self: &Built) -> &[Artifact] { return self.outputs.asSlice() }
+
+  /// Writes each artifact's size to standard error.
+  pub fn sizes(self: &Built) -> () {
+    let all = self.outputs.asSlice()
+    let mut at: usize = 0
+    while at < all.length {
+      StderrWriter.print("silkui: {} {} ({} KiB)\n", &.(all[at].target.id(), String.view(&all[at].path), all[at].bytes / 1024))
+      at = at + 1
+    }
+  }
+
+  /// The artifacts but the one for target `id`.
+  pub effect fn without(self: Built, id: string) -> Built ! OutOfMemoryError ? &mut Allocator {
+    let mut built = move self
+    let mut kept = List<Artifact>.make()
+    while built.outputs.length() > 0 {
+      let artifact = built.outputs.remove(0)
+      if artifact.target.id() != id { run kept.append(move artifact) }
+    }
+    built.outputs = move kept
+    return move built
+  }
+
+  /// Copies each artifact to `<dir>/<target>/<app name>` (relative to the project).
+  /// It ends a build pipeline.
+  pub effect fn write<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>, dir: string) -> ()
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let built = run move self
+    let project = run readProject()
+    let all = built.outputs.asSlice()
+    let mut at: usize = 0
+    while at < all.length {
+      let mut out = run fromRoot(&project, dir)
+      out = run joined(String.view(&out), all[at].target.id())
+      let folder = run Path.make(String.view(&out))
+      run FileSystem.createDirectoriesRecursively(&folder)
+      // cp keeps the program's mode, so it stays executable. It takes the app's name.
+      out = run joined(String.view(&out), built.source.named)
+      run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
+      let mut line = run String.copy("wrote ")
+      run String.append(&mut line, String.view(&out))
+      run say(String.view(&line))
+      at = at + 1
+    }
+    drop built
+  }
+
+  /// Starts the app on its first target: for a JavaScript app in `Mode.Dev` on the Engine,
+  /// Vite's development server, which opens the window and replaces edited modules in it;
+  /// otherwise the program itself.
+  pub effect fn launch<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>) -> Running
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let built = run move self
+    static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+      if built.outputs.length() == 0 { run Task.abort("silkui: nothing was built to launch") }
+      let project = run readProject()
+      let artifact = &built.outputs.asSlice()[0]
+      let target = artifact.target
+      let dir = built.source.writtenIn.dir()
+      let vite = dir != "" && built.madeIn == Mode.Dev && built.source.runsOn == Runtime.Engine
+      let mut child = if vite {
+        let web = run fromRoot(&project, dir)
+        run say("starting Vite's development server")
+        run start("npm", &["exec", "--", "vite"], String.view(&web), &[Variable { name: "SILKUI_HOST", value: String.view(&artifact.path) }])
+      } else if dir != "" && built.madeIn == Mode.Dev {
+        run start(String.view(&artifact.path), &[String.view(&built.source.bundled)], String.view(&project.root), &[])
+      } else {
+        run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
+      }
+      return Running { launched: move built, target: target, vite: vite, child: move child }
+    } else {
+      run Task.abort("silkui: launching needs Windows subprocess support in Silk")
+    }
+  }
+
+  /// Runs `f` on the built app and passes it on unchanged.
+  pub effect fn tap<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>, f: once fn<'env>(&Built) -> ()) -> Built ! E ? R {
+    let built = run move self
+    f(&built)
+    return move built
+  }
+
+  /// The built app `f` makes of it, such as `built.without("web-dom")`.
+  pub effect fn map<'env, E, F, ?R, ?S>(self: once Effect<'env; Built ! E ? R>, f: once effect fn<'env>(Built) -> Built ! F ? S) -> Built ! E | F ? R | S {
+    let built = run move self
+    return run f(move built)
+  }
+}
+
+// --- Running ---
+
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+  /// A fingerprint of the files under `dir`: their paths, sizes and contents, folded.
+  effect fn fingerprint(dir: &Path, hash: &mut u64) -> ()
+    ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+    let entries = run FileSystem.listDirectory(dir)
+    let items = List<DirectoryEntry>.asSlice(&entries)
+    let mut at: usize = 0
+    while at < items.length {
+      let name = Path.name(&items[at].path) |> Option<string>.unwrapOr("")
+      if items[at].kind.code == 1 && name != "build" && !String.startsWith(name, ".") {
+        run fingerprint(&items[at].path, &mut hash)
+      } else if items[at].kind.code == 0 {
+        let bytes = run FileSystem.readFile(&items[at].path)
+        fold(&mut hash, Path.rawBytes(&items[at].path))
+        fold(&mut hash, Bytes.asSlice(&bytes))
+      }
+      at = at + 1
+    }
+  }
+
+  fn fold(hash: &mut u64, bytes: &[u8]) -> () {
+    let mut at: usize = 0
+    let mut value = hash.*
+    while at < bytes.length {
+      value = ((value ^ u8.toU64(bytes[at])) * 16777619) & 4294967295
+      at = at + 1
+    }
+    hash.* = value
+  }
+
+  effect fn sources(project: &Project) -> u64
+    ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+    let mut hash: u64 = 2166136261
+    let src = run Path.make(String.view(&run joined(String.view(&project.root), "src")))
+    if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash) }
+    return hash
+  }
+}
+
+effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
+  if code == 0 { return () }
+  let mut message = run String.copy("the app ended with status ")
+  let mut digits = String.make()
+  let mut value = code
+  if value < 0 { value = 0 - value }
+  if value == 0 { run String.append(&mut digits, "0") }
+  while value > 0 {
+    let mut one = run String.copy(String.slice("0123456789", i32.toUsize(value % 10), 1))
+    run String.append(&mut one, String.view(&digits))
+    digits = move one
+    value = value / 10
+  }
+  run String.append(&mut message, String.view(&digits))
+  fail TaskError { message: move message, status: code }
+}
+
+impl Running {
+  pub fn built(self: &Running) -> &Built { return &self.launched }
+
+  /// Keeps the app running until its window closes. Fails when the program ends with a
+  /// nonzero status.
+  /// For a JavaScript app in `Mode.Dev`, Vite replaces edited modules in place. For a Loom
+  /// app in `Mode.Dev`, a change under `src/` rebuilds the host and restarts the app; after
+  /// a build that fails, the previous build runs.
+  pub effect fn watch<'env, E, ?R>(self: once Effect<'env; Running ! E ? R>) -> ()
+    ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let mut running = run move self
+    static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+      let loom = running.launched.source.writtenIn.id() == "loom"
+      if !loom || running.launched.madeIn != Mode.Dev { return run ended(running.child.wait()) }
+      let project = run readProject()
+      let mut seen = run sources(&project)
+      run say("watching src/ for changes")
+      while !running.child.ended() {
+        pause(300)
+        let now = run sources(&project)
+        if now == seen { continue }
+        seen = now
+        run say("src/ changed: rebuilding")
+        let artifact = &running.launched.outputs.asSlice()[0]
+        let host = &running.launched.source.hosts.asSlice()[0]
+        // The program is linked in place, so it stops before the build. A failed build
+        // leaves the previous program, which starts again.
+        running.child.stop()
+        let rebuilt = run Effect.result(compileHost(String.view(&host.dir), Mode.Dev))
+        if let Result<(), TaskError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
+          drop error
+          run say("the build failed: the previous build runs until the next change")
+        }
+        running.child = run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
+      }
+      return run ended(running.child.wait())
+    } else {
+      drop running
+      run Task.abort("silkui: watching needs Windows subprocess support in Silk")
+    }
+  }
+
+  /// Runs `f` on the running app and passes it on unchanged.
+  pub effect fn tap<'env, E, ?R>(self: once Effect<'env; Running ! E ? R>, f: once fn<'env>(&Running) -> ()) -> Running ! E ? R {
+    let running = run move self
+    f(&running)
+    return move running
+  }
+}
