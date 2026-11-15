@@ -21,8 +21,9 @@
 //!
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
-import host { Kind, Plan, manifest, main as hostMain }
+import host { Kind, Plan, manifest, main as hostMain, page as hostPage, webgpuExports, libm }
 import manifest { Project, read as readProject }
+import web { Server, site }
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
@@ -50,29 +51,44 @@ pub struct Window {
 
 impl Copy for Window {}
 
+/// A browser page's options. The app fills the page.
+pub struct Page {
+  pub title: string<'static>,
+}
+
+impl Copy for Page {}
+
 /// Where an app runs. Its id names it in `--target`, in `.silk/<id>/` and in `dist/<id>/`.
 pub union Target {
   /// A desktop window (`window`).
   Window { pub window: Window },
-  /// A browser page drawn with WebGPU (`web-canvas`). Not built by silkui yet.
-  WebCanvas,
-  /// A browser page of real elements (`web-dom`). Not built by silkui yet.
-  WebDom,
+  /// A browser page drawn with WebGPU (`web-canvas`): the tree, compiled to wasm.
+  WebCanvas { pub page: Page },
+  /// A browser page of real elements (`web-dom`): the browser's DOM in the tree's place.
+  WebDom { pub page: Page },
 }
 
 impl Copy for Target {}
 
 impl Target {
   pub fn window(window: Window) -> Target { return Target.Window { window: window } }
-  pub fn webCanvas() -> Target { return Target.WebCanvas }
-  pub fn webDom() -> Target { return Target.WebDom }
+  pub fn webCanvas(page: Page) -> Target { return Target.WebCanvas { page: page } }
+  pub fn webDom(page: Page) -> Target { return Target.WebDom { page: page } }
 
   /// `window`, `web-canvas` or `web-dom`.
   pub fn id(self: &Target) -> string<'static> {
     return match self.* {
       Target.Window { .. } => "window"
-      Target.WebCanvas => "web-canvas"
-      Target.WebDom => "web-dom"
+      Target.WebCanvas { .. } => "web-canvas"
+      Target.WebDom { .. } => "web-dom"
+    }
+  }
+
+  /// Whether it is a browser page.
+  pub fn web(self: &Target) -> bool {
+    return match self.* {
+      Target.Window { .. } => false
+      _ => true
     }
   }
 }
@@ -167,9 +183,9 @@ pub struct App {
 /// One built target.
 pub struct Artifact {
   pub target: Target,
-  /// The program, absolute.
+  /// The program, absolute. For a web target, the folder with the page and its program.
   pub path: String,
-  /// Its size in bytes.
+  /// Its size in bytes: for a web target, the wasm program's.
   pub bytes: usize,
 }
 
@@ -185,7 +201,10 @@ pub struct Running {
   launched: Built,
   target: Target,
   vite: bool,
-  child: Child,
+  /// The program, for a window.
+  child: Option<Child>,
+  /// What serves the page, for a web target.
+  server: Option<Server>,
 }
 
 // --- helpers ---
@@ -300,10 +319,18 @@ effect fn sizeOf(path: string) -> usize ! FileError | OutOfMemoryError ? &mut Al
   }
 }
 
-effect fn compileHost(dir: string, mode: Mode) -> ()
+effect fn compileHost(dir: string, mode: Mode, web: bool) -> ()
   ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let manifest = run joined(dir, "silk.toml")
-  if mode == Mode.Release {
+  if web {
+    // The page's WebGPU host waits on the GPU through JSPI, which needs a deep stack.
+    let profile = if mode == Mode.Release {
+      "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"speed\",\"debug\":false,\"stackSize\":\"8MiB\"}"
+    } else {
+      "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"none\",\"debug\":true,\"stackSize\":\"8MiB\"}"
+    }
+    run Task.silk(&["build", "--manifest-path", String.view(&manifest), "--profile-input", profile])
+  } else if mode == Mode.Release {
     run Task.silk(&["build", "--manifest-path", String.view(&manifest), "--release"])
   } else {
     run Task.silk(&["build", "--manifest-path", String.view(&manifest)])
@@ -428,12 +455,19 @@ impl App {
     while at < targets.length {
       let target = targets[at]
       if app.custom != "" {
+        if target.web() { run Task.abort("silkui: a custom host builds the window target only") }
         run app.hosts.append(Host { target: target, dir: run fromRoot(&project, app.custom), generated: false })
         at = at + 1
         continue
       }
       let mut window = Window { title: "", width: 0.0, height: 0.0 }
-      if let Target.Window { window: options } = target { window = options } else { run unsupported(&app.writtenIn, &target, app.runsOn) }
+      match target {
+        Target.Window { window: options } => { window = options }
+        Target.WebCanvas { page } => { window.title = page.title }
+        Target.WebDom { page } => { window.title = page.title }
+      }
+      // The browser runs JavaScript apps against a wasm tree, which silkui does not set up yet.
+      if target.web() && app.writtenIn.id() != "loom" { run unsupported(&app.writtenIn, &target, app.runsOn) }
       let kind = match app.writtenIn {
         Framework.Loom { .. } => Kind.Loom
         _ => if app.runsOn == Runtime.Node { Kind.Node } else { Kind.Engine }
@@ -443,6 +477,11 @@ impl App {
       if let Framework.Loom { module: named, command: commands } = app.writtenIn {
         module = named
         command = commands
+      }
+      if let Framework.Loom { command: commands, .. } = app.writtenIn {
+        if target.id() == "web-dom" && commands != "" {
+          run Task.abort("silkui cannot build Loom apps with commands for the web-dom target yet: the page has no shell for them")
+        }
       }
       let plan = Plan {
         target: target.id(),
@@ -460,6 +499,13 @@ impl App {
       run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
       let main = run joined(String.view(&dir), "src/main.silk")
       run refresh(String.view(&main), String.view(&run hostMain(&plan)))
+      if target.id() == "web-canvas" {
+        run refresh(String.view(&run joined(String.view(&dir), "src/webgpu_exports.silk")), String.view(&run webgpuExports()))
+        run refresh(String.view(&run joined(String.view(&dir), "src/libm.silk")), String.view(&run libm()))
+      }
+      if target.web() {
+        run refresh(String.view(&run joined(String.view(&dir), "index.html")), String.view(&run hostPage(&plan)))
+      }
       if kind != Kind.Loom && mode == Mode.Release {
         let copy = run joined(String.view(&dir), "app.js")
         let source = run Path.make(String.view(&app.bundled))
@@ -493,7 +539,7 @@ impl App {
       run String.append(&mut line, hosts[at].target.id())
       run String.append(&mut line, if mode == Mode.Release { " host (release)" } else { " host (dev)" })
       run say(String.view(&line))
-      run compileHost(dir, mode)
+      run compileHost(dir, mode, hosts[at].target.web())
       // A generated host is named after the project and the target; a custom one after the app.
       let mut name = run String.copy(app.named)
       if hosts[at].generated {
@@ -503,7 +549,13 @@ impl App {
       }
       let path = run binary(dir, String.view(&name), mode)
       let bytes = run sizeOf(String.view(&path))
-      run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
+      if hosts[at].target.web() {
+        let folder = run joined(dir, "site")
+        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder))
+        run artifacts.append(Artifact { target: hosts[at].target, path: move folder, bytes: bytes })
+      } else {
+        run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
+      }
       at = at + 1
     }
     return Built { source: move app, madeIn: mode, outputs: move artifacts }
@@ -559,8 +611,8 @@ impl Built {
     return move built
   }
 
-  /// Copies each artifact to `<dir>/<target>/<app name>` (relative to the project).
-  /// It ends a build pipeline.
+  /// Copies each artifact to `<dir>/<target>/<app name>` (relative to the project), and the
+  /// page of a web target to `<dir>/<target>/`. It ends a build pipeline.
   pub effect fn write<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>, dir: string) -> ()
     ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
     ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
@@ -573,9 +625,15 @@ impl Built {
       out = run joined(String.view(&out), all[at].target.id())
       let folder = run Path.make(String.view(&out))
       run FileSystem.createDirectoriesRecursively(&folder)
-      // cp keeps the program's mode, so it stays executable. It takes the app's name.
-      out = run joined(String.view(&out), built.source.named)
-      run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
+      if all[at].target.web() {
+        // The page's folder, as it is: a static site.
+        let from = run joined(String.view(&all[at].path), ".")
+        run Task.exec("cp", &["-R", String.view(&from), String.view(&out)])
+      } else {
+        // cp keeps the program's mode, so it stays executable. It takes the app's name.
+        out = run joined(String.view(&out), built.source.named)
+        run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
+      }
       let mut line = run String.copy("wrote ")
       run String.append(&mut line, String.view(&out))
       run say(String.view(&line))
@@ -586,7 +644,8 @@ impl Built {
 
   /// Starts the app on its first target: for a JavaScript app in `Mode.Dev` on the Engine,
   /// Vite's development server, which opens the window and replaces edited modules in it;
-  /// otherwise the program itself.
+  /// for a web target, a server for its page on the loopback address; otherwise the program
+  /// itself.
   pub effect fn launch<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>) -> Running
     ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
     ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
@@ -597,8 +656,12 @@ impl Built {
       let artifact = &built.outputs.asSlice()[0]
       let target = artifact.target
       let dir = built.source.writtenIn.dir()
+      if target.web() {
+        let server = run Server.open(String.view(&artifact.path), 8090)
+        return Running { launched: move built, target: target, vite: false, child: Option<Child>.None, server: Option<Server>.Some { value: move server } }
+      }
       let vite = dir != "" && built.madeIn == Mode.Dev && built.source.runsOn == Runtime.Engine
-      let mut child = if vite {
+      let child = if vite {
         let web = run fromRoot(&project, dir)
         run say("starting Vite's development server")
         run start("npm", &["exec", "--", "vite"], String.view(&web), &[Variable { name: "SILKUI_HOST", value: String.view(&artifact.path) }])
@@ -607,7 +670,7 @@ impl Built {
       } else {
         run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
       }
-      return Running { launched: move built, target: target, vite: vite, child: move child }
+      return Running { launched: move built, target: target, vite: vite, child: Option<Child>.Some { value: move child }, server: Option<Server>.None }
     } else {
       run Task.abort("silkui: launching needs Windows subprocess support in Silk")
     }
@@ -685,25 +748,69 @@ effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator
   fail TaskError { message: move message, status: code }
 }
 
+/// Builds a web host again and puts the new program in its page's folder.
+effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let dir = String.view(&host.dir)
+  run compileHost(dir, Mode.Dev, true)
+  let mut name = run String.copy(String.view(&project.name))
+  run String.append(&mut name, "-")
+  run String.append(&mut name, host.target.id())
+  let wasm = run binary(dir, String.view(&name), Mode.Dev)
+  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path))
+}
+
 impl Running {
   pub fn built(self: &Running) -> &Built { return &self.launched }
 
-  /// Keeps the app running until its window closes. Fails when the program ends with a
-  /// nonzero status.
+  /// Keeps the app running until its window closes, or for a web target serves its page
+  /// until the task is stopped. Fails when the program ends with a nonzero status.
   /// For a JavaScript app in `Mode.Dev`, Vite replaces edited modules in place. For a Loom
-  /// app in `Mode.Dev`, a change under `src/` rebuilds the host and restarts the app; after
-  /// a build that fails, the previous build runs.
+  /// app in `Mode.Dev`, a change under `src/` rebuilds the host and restarts the app (a page
+  /// reloads itself); after a build that fails, the previous build runs.
   pub effect fn watch<'env, E, ?R>(self: once Effect<'env; Running ! E ? R>) -> ()
     ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
     ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
     let mut running = run move self
     static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
       let loom = running.launched.source.writtenIn.id() == "loom"
-      if !loom || running.launched.madeIn != Mode.Dev { return run ended(running.child.wait()) }
+      let rebuilds = loom && running.launched.madeIn == Mode.Dev
       let project = run readProject()
       let mut seen = run sources(&project)
+      if running.target.web() {
+        let mut server = match move Intrinsic.replace(running.server, Option<Server>.None) {
+          Option<Server>.Some { value } => move value
+          Option<Server>.None => run Task.abort("silkui: the page has no server")
+        }
+        if rebuilds { run say("watching src/ for changes") }
+        while true {
+          run server.serveFor(300)
+          if !rebuilds { continue }
+          let now = run sources(&project)
+          if now == seen { continue }
+          seen = now
+          run say("src/ changed: rebuilding")
+          let artifact = &running.launched.outputs.asSlice()[0]
+          let host = &running.launched.source.hosts.asSlice()[0]
+          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact))
+          match move rebuilt {
+            Result.Success { .. } => { server.build = server.build + 1 }
+            Result.Failure { error } => {
+              drop error
+              run say("the build failed: the page keeps the previous build until the next change")
+            }
+          }
+        }
+        return ()
+      }
+      let mut child = match move Intrinsic.replace(running.child, Option<Child>.None) {
+        Option<Child>.Some { value } => move value
+        Option<Child>.None => run Task.abort("silkui: the app has no program running")
+      }
+      if !rebuilds { return run ended(child.wait()) }
       run say("watching src/ for changes")
-      while !running.child.ended() {
+      while !child.ended() {
         pause(300)
         let now = run sources(&project)
         if now == seen { continue }
@@ -713,15 +820,15 @@ impl Running {
         let host = &running.launched.source.hosts.asSlice()[0]
         // The program is linked in place, so it stops before the build. A failed build
         // leaves the previous program, which starts again.
-        running.child.stop()
-        let rebuilt = run Effect.result(compileHost(String.view(&host.dir), Mode.Dev))
+        child.stop()
+        let rebuilt = run Effect.result(compileHost(String.view(&host.dir), Mode.Dev, false))
         if let Result<(), TaskError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
           drop error
           run say("the build failed: the previous build runs until the next change")
         }
-        running.child = run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
+        child = run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
       }
-      return run ended(running.child.wait())
+      return run ended(child.wait())
     } else {
       drop running
       run Task.abort("silkui: watching needs Windows subprocess support in Silk")

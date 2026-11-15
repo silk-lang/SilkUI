@@ -26,6 +26,8 @@ pub struct Project {
   /// Where the `silkui` package comes from, as TOML fields with `path` left out: `git = "…",
   /// rev = "…", ` for a Git dependency, empty for a path one.
   pub git: String,
+  /// The Git revision of a Git dependency, or empty.
+  pub rev: String,
   /// The `silkui` package's directory: inside the repository for a Git dependency, relative
   /// to the project root or absolute for a path one.
   pub path: String,
@@ -71,6 +73,7 @@ effect fn dependency(table: Option<&Value>, project: &mut Project) -> bool
                 let rev = field(&entry.value, "rev")
                 let branch = field(&entry.value, "branch")
                 if rev != "" {
+                  project.rev = run String.copy(rev)
                   run String.append(&mut project.git, "rev = \"")
                   run String.append(&mut project.git, rev)
                   run String.append(&mut project.git, "\", ")
@@ -117,6 +120,7 @@ pub effect fn read() -> Project
     name: run String.copy(Toml.fieldAt(package, "name") |> Toml.asString |> Option<string>.unwrapOr("")),
     silkVersion: run String.copy(Toml.fieldAt(package, "silk-version") |> Toml.asString |> Option<string>.unwrapOr("")),
     git: String.make(),
+    rev: String.make(),
     path: String.make(),
   }
   if String.view(&project.name) == "" { run Task.abort("silkui: silk.toml has no [package] name") }
@@ -148,4 +152,68 @@ pub effect fn sibling(project: &Project, subdirectory: string, package: string) 
   run String.append(&mut out, package)
   run String.append(&mut out, "\" }")
   return move out
+}
+
+/// Where Silk keeps the checkout of a Git dependency at `rev`: `$SILK_HOME/git/<rev>`, or
+/// `~/.silk/git/<rev>`.
+pub effect fn checkout(rev: string) -> String
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let mut home = run variable("SILK_HOME")
+  if String.view(&home) == "" {
+    static if Intrinsic.targetOperatingSystem() == "windows" { home = run variable("USERPROFILE") } else { home = run variable("HOME") }
+    if String.view(&home) == "" { run Task.abort("silkui: HOME or SILK_HOME must be set") }
+    run String.append(&mut home, "/.silk")
+  }
+  run String.append(&mut home, "/git/")
+  run String.append(&mut home, rev)
+  return move home
+}
+
+effect fn variable(name: string) -> String
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variableNamed(name) {
+    Option<Bytes>.Some { value } => run text(Bytes.asSlice(&value))
+    Option<Bytes>.None => String.make()
+  }
+}
+
+/// `relative` resolved against the absolute directory `base`, with no `.` or `..` left.
+pub effect fn resolved(base: string, relative: string) -> String
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator {
+  let from = run Path.make(base)
+  let path = run Path.resolve(&from, relative)
+  return run text(Path.rawBytes(&path))
+}
+
+/// The silkui package's own directory, absolute: in the project for a path dependency, in
+/// Silk's checkout for a Git one (which `silk build` of a host has fetched).
+pub effect fn silkuiDir(project: &Project) -> String
+  ! TaskError | FileError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  let path = String.view(&project.path)
+  if String.view(&project.git) == "" {
+    if String.startsWith(path, "/") { return run String.copy(path) }
+    return run resolved(String.view(&project.root), path)
+  }
+  if String.view(&project.rev) == "" { run Task.abort("silkui: the web targets need the silkui dependency pinned with `rev`") }
+  let repository = run checkout(String.view(&project.rev))
+  return run resolved(String.view(&repository), path)
+}
+
+/// The `rev` of dependency `alias` in the manifest at `path`, or empty.
+pub effect fn pinned(path: string, alias: string) -> String
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let manifest = run Path.make(path)
+  let bytes = run FileSystem.readFile(&manifest)
+  let document = match move run Effect.result(Toml.parse(Bytes.asSlice(&bytes))) {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError failure => { fail move failure }
+      TomlError failure => {
+        drop failure
+        run Task.abort("silkui: a silkui package manifest is not valid TOML")
+      }
+    }
+  }
+  let rev = Toml.field(&document, "dependencies") |> Toml.fieldAt(alias) |> Toml.fieldAt("rev") |> Toml.asString |> Option<string>.unwrapOr("")
+  return run String.copy(rev)
 }
