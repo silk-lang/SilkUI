@@ -25,8 +25,8 @@ Silk has four brands, and each does one job. Silk compiles, SilkJS runs JavaScri
 
 | Product | Package | What it is |
 | --- | --- | --- |
-| SilkJS Engine | `silkjs-engine` | The JavaScript engine and its embedding API, a Silk port of QuickJS. No event loop, no Node or web APIs. The package is `silkjs` today |
-| SilkJS | `silkjs-runtime` | The runtime: the engine plus an event loop, Node builtins, `fetch` and a package manager. It owns the `silkjs` command and knows nothing about UI. The package is `silkjsruntime` today |
+| SilkJS Engine | `silkjs-engine` | The JavaScript engine and its embedding API, a Silk port of QuickJS. No event loop, no Node or web APIs. |
+| SilkJS | `silkjs-runtime` | The runtime: the engine plus an event loop, Node builtins, `fetch` and a package manager. It owns the `silkjs` command and knows nothing about UI. |
 
 The split is the same as Node and V8: "SilkJS" and the `silkjs` command mean the runtime, and the engine is always called the SilkJS Engine.
 
