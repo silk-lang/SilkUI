@@ -71,6 +71,7 @@ import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle, NO_SHADOW }
 import paint_css { Effects }
 import paint_css
+import font_units
 import motion
 import motion { Running }
 import animation
@@ -1142,7 +1143,7 @@ impl<'a> UiTree<'a> {
     let styled = declarations.length() != 0
     if !styled && !node.gridStyled { return () }
     let css = node.css
-    let grid = run grid_css.gridOfWith(declarations.asSlice(), &computed.unitContext())
+    let grid = run grid_css.gridOfWith(declarations.asSlice(), &font_units.context(&self, slot, computed, node.fontKey))
     run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
     let target = self.nodeMut(slot)
     target.gridStyled = styled
@@ -4152,6 +4153,8 @@ impl<'a> UiTree<'a> {
     if self.root == NONE {
       return ()
     }
+    // Root font units cross descendants with an independently specified font.
+    let mut rootFontChanged = false
     // Each entry is a slot and whether its parent's inherited values changed.
     let mut stack = List<u64>.make()
     run stack.append(u32.toU64(self.root))
@@ -4160,13 +4163,14 @@ impl<'a> UiTree<'a> {
       let entry = stack.get(last)
       stack.truncate(last)
       let slot = u64.toU32(u64.bitAnd(entry, 0xFFFFFFFF))
-      let forced = full || u64.shiftRight(entry, 32) != 0
+      let forced = full || rootFontChanged || u64.shiftRight(entry, 32) != 0
       let node = self.node(slot)
       let own = forced || node.styleDirty
       let below = node.subtreeDirty
       let mut changed = full
       if own {
         let before = node.computed.text
+        let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
         let shadow = node.computed.effects
         let wasRendered = node.rendered
@@ -4174,7 +4178,8 @@ impl<'a> UiTree<'a> {
         let namesChanged = run self.resolve(slot)
         run self.syncGenerated(slot)
         let after = &self.node(slot).computed
-        changed = full || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
+        changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || namesChanged || containment != after.layout.sizeContainment
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -4370,8 +4375,8 @@ impl<'a> UiTree<'a> {
       computed.effects.shadowFrom = above.shadowFrom
       computed.effects.shadowHash = above.shadowHash
     }
-    run self.resolveEffects(slot, &mut computed)
     let fontKey = run self.fontKeyOf(computed.text)
+    run self.resolveEffects(slot, &mut computed, fontKey)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
     let target = self.nodeMut(slot)
@@ -4409,7 +4414,7 @@ impl<'a> UiTree<'a> {
 
   /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
   /// rest of its style is in `computed`, so `em` and `currentColor` see its font and color.
-  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed) -> ()
+  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if !computed.effects.declared {
@@ -4422,7 +4427,7 @@ impl<'a> UiTree<'a> {
       }
       return ()
     }
-    let basis = computed.paintBasis()
+    let basis = font_units.paintBasis(&self, slot, &computed.*, fontKey)
     let mut effects = Effects.make()
     let node = self.node(slot)
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
@@ -4540,7 +4545,7 @@ impl<'a> UiTree<'a> {
         } else if properties_convert.isKeyword(&value.value, Keyword.Initial) {
           return ()
         } else {
-          run paint_css.apply(&mut effects.*, value, node.computed.paintBasis())
+          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed, node.fontKey))
           return ()
         }
       }

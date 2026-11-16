@@ -6,6 +6,7 @@
 //! does not parse is dropped and the earlier one stays.
 import mutation { Declaration, CssProperty }
 import properties.values
+import properties.convert { Context }
 import properties.catalog
 import svg_css.lexer
 import svg_css.tokens { Limits, CssError }
@@ -246,13 +247,8 @@ impl Effects {
 
 /// What lengths and `currentColor` compute against.
 pub struct Basis {
-  pub fontSize: f32,
+  pub units: Context,
   pub color: Rgba<f32>,
-  pub viewportWidth: f32,
-  pub viewportHeight: f32,
-  pub containerWidth: f32,
-  pub containerHeight: f32,
-  pub vertical: bool,
 }
 
 impl Copy for Basis {}
@@ -295,16 +291,26 @@ pub effect fn apply(effects: &mut Effects, declaration: &Declaration, basis: Bas
     h = Hash.combine(h, u8.toU64(bytes[b]))
     b = b + 1
   }
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.fontSize)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.r)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.g)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.b)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.color.a)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.viewportWidth)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.viewportHeight)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.containerWidth)))
-  h = Hash.combine(h, u32.toU64(f32.toBits(basis.containerHeight)))
-  h = Hash.combine(h, if basis.vertical { 1 } else { 0 })
+  let units = &basis.units
+  let metrics = units.metrics()
+  let root = units.rootMetrics()
+  let bases = [units.fontSize, units.rootFontSize,
+    metrics.xHeight, metrics.capHeight, metrics.zeroAdvance, metrics.ideographAdvance, metrics.lineHeight,
+    root.xHeight, root.capHeight, root.zeroAdvance, root.ideographAdvance, root.lineHeight,
+    basis.color.r, basis.color.g, basis.color.b, basis.color.a, units.viewportWidth, units.viewportHeight]
+  let mut i: usize = 0
+  while i < bases.length { h = Hash.combine(h, u32.toU64(f32.toBits(bases[i]))) i = i + 1 }
+  let optional = [units.smallViewportWidth, units.smallViewportHeight,
+    units.containerWidth, units.containerHeight, units.containerInlineSize, units.containerBlockSize]
+  i = 0
+  while i < optional.length {
+    h = Hash.combine(h, match optional[i] {
+      Option.Some { value } => u32.toU64(f32.toBits(value)) + 1
+      _ => 0
+    })
+    i = i + 1
+  }
+  h = Hash.combine(h, if units.vertical { 1 } else { 0 })
   effects.hash = h
   drop run Effect.catch<CssError>(applyText(&mut effects.*, declaration.property, bytes, basis), ignored)
 }
@@ -319,13 +325,7 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
   let buffer = run lexer.tokenize(css, &Limits.make())
   let source = Input.Contiguous { buffer: &buffer, range: buffer.all() }
   let mut cursor = Cursor.make(&source)
-  let size = f32.toF64(basis.fontSize)
-  let mut context = LengthContext.make(f32.toF64(basis.viewportWidth), f32.toF64(basis.viewportHeight), size)
-  context.vertical = basis.vertical
-  context.containerWidth = Option<f64>.some(f32.toF64(basis.containerWidth))
-  context.containerHeight = Option<f64>.some(f32.toF64(basis.containerHeight))
-  context.containerInlineSize = if basis.vertical { context.containerHeight } else { context.containerWidth }
-  context.containerBlockSize = if basis.vertical { context.containerWidth } else { context.containerHeight }
+  let context = LengthContext.fromProperties(&basis.units)
   let current = Color.srgb(
     f32.toF64(basis.color.r),
     f32.toF64(basis.color.g),

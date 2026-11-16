@@ -1,0 +1,127 @@
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.inspect
+import ui_fixtures.fixtures as fixtures
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.written
+import svg_css.tokens { CssError }
+import svg_css.effect_values { Filter, Size as LayerSize }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import silk.num.f32
+import silk.num.usize
+
+fn close(a: f32, b: f32) -> bool { return f32.abs(a - b) < 0.02 }
+
+effect fn tracks(tree: &UiTree<'_>, expected: &[f32]) ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut i: usize = 0
+  while i < expected.length {
+    let bounds = run inspect.infoSlot(tree, tree.slotOf(usize.toU32(i) + 4))
+    run Testing.expect(match bounds { Option.Some { value } => close(value.bounds.width(), expected[i]) _ => false }, "grid geometry uses the font file's measured element and root unit bases")
+    i = i + 1
+  }
+}
+
+effect fn paint(tree: &UiTree<'_>, id: u32, ch: f32, lh: f32, cap: f32, rootCap: f32, rootLh: f32) ! AssertionError<'static> {
+  if let Option.Some { value } = tree.node(tree.slotOf(id)).paintEffects() {
+    run Testing.expect(value.filters.length() == 1 && match &value.filters.asSlice()[0] {
+      Filter.Function { amount, .. } => close(value.number(amount), cap)
+      _ => false
+    }, "filter lengths use measured cap height")
+    run Testing.expect(value.shadows.length() == 1, "font-relative text shadow is retained")
+    let shadow = value.shadows.asSlice()[0]
+    run Testing.expect(close(shadow.x, ch) && close(shadow.y, lh) && close(shadow.blur, rootCap), "paint uses measured character advances, line height and root cap height")
+    let sized = match value.backgrounds.size(0) {
+      LayerSize.Explicit { x, y } => match x {
+        Option.Some { value: horizontal } => match y {
+          Option.Some { value: vertical } => close(value.pixels(horizontal, 200.0), 50.0) && close(value.pixels(vertical, 200.0), rootLh)
+          _ => false
+        }
+        _ => false
+      }
+      _ => false
+    }
+    run Testing.expect(sized, "background sizing retains percentages alongside root line-height lengths")
+  } else { run Testing.expect(false, "font-relative paint effects are installed") }
+}
+
+effect fn measuredUnits(sheet: bool) ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("grid") })
+  let root = run written.declarations(b"font-family:'Noto Sans';font-size:30px;line-height:42px;text-shadow:1rem 1rlh red")
+  let barrier = run written.declarations(b"font-size:10px;line-height:20px")
+  run batch.style(1, root.asSlice())
+  run batch.style(2, barrier.asSlice())
+  if sheet {
+    let compiled = run compile.compile(b".grid{display:grid;width:1000px;font-size:20px;line-height:28px;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh}", &Options.make())
+    let bytes = run compiled.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  } else {
+    let style = run written.declarations(b"display:grid;width:1000px;font-size:20px;line-height:28px;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh")
+    run batch.style(3, style.asSlice())
+  }
+  let mut id: u32 = 4
+  while id < 16 { run batch.create(id, NodeKind.Box) run batch.append(3, id) id = id + 1 }
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 1200.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  // Noto Sans fixture: UPEM 1000, zero advance 572, x-height 536, cap height 714.
+  run tracks(&tree, &[20.0, 30.0, 11.44, 17.16, 10.72, 16.08, 14.28, 21.42, 28.0, 42.0, 20.0, 30.0])
+  run paint(&tree, 3, 11.44, 28.0, 14.28, 21.42, 42.0)
+  if let Option.Some { value } = tree.node(tree.slotOf(1)).paintEffects() {
+    run Testing.expect(value.shadows.length() == 1 && close(value.shadows.asSlice()[0].x, 30.0)
+      && close(value.shadows.asSlice()[0].y, 42.0), "root paint uses its newly computed root font and line height on the first frame")
+  } else { run Testing.expect(false, "root shadow is present") }
+  let previousHash = tree.node(tree.slotOf(3)).computed.effects.hash
+  let largerRoot = run written.declarations(b"font-size:40px;line-height:50px")
+  run batch.style(1, largerRoot.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run tracks(&tree, &[20.0, 40.0, 11.44, 22.88, 10.72, 21.44, 14.28, 28.56, 28.0, 50.0, 20.0, 40.0])
+  run paint(&tree, 3, 11.44, 28.0, 14.28, 28.56, 50.0)
+  run Testing.expect(tree.node(tree.slotOf(3)).computed.effects.hash != previousHash, "root metric changes invalidate paint through a fixed-font ancestor")
+  let changedFont = run written.declarations(b"font-family:'Geist Mono';line-height:normal")
+  run batch.style(3, changedFont.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  // Geist Mono fixture: zero 600, x-height 530, cap 710; rounded normal line box 18+4+2.
+  run tracks(&tree, &[20.0, 40.0, 12.0, 22.88, 10.6, 21.44, 14.2, 28.56, 24.0, 50.0, 20.0, 40.0])
+  run paint(&tree, 3, 12.0, 24.0, 14.2, 28.56, 50.0)
+  if !sheet { run Testing.expect(tree.node(tree.slotOf(3)).sheetStyle().isNone(), "plain font-relative paint and grid values use the direct style-object path") }
+  let rootLine = run written.declarations(b"line-height:70px")
+  run batch.style(1, rootLine.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run tracks(&tree, &[20.0, 40.0, 12.0, 22.88, 10.6, 21.44, 14.2, 28.56, 24.0, 70.0, 20.0, 40.0])
+  run paint(&tree, 3, 12.0, 24.0, 14.2, 28.56, 70.0)
+  let rootFamily = run written.declarations(b"font-family:'Geist Mono'")
+  run batch.style(1, rootFamily.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run tracks(&tree, &[20.0, 40.0, 12.0, 24.0, 10.6, 21.2, 14.2, 28.4, 24.0, 70.0, 20.0, 40.0])
+  run paint(&tree, 3, 12.0, 24.0, 14.2, 28.4, 70.0)
+  run batch.create(20, NodeKind.Box)
+  run batch.append(3, 20)
+  let inherited = run written.declarations(b"font-size:7px;line-height:9px;filter:inherit;text-shadow:inherit;background-size:inherit")
+  run batch.style(20, inherited.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run paint(&tree, 20, 12.0, 24.0, 14.2, 28.4, 70.0)
+}
+
+test effect fn fontMetricsDriveGridAndPaintThroughRootChanges() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run measuredUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run measuredUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}

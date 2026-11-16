@@ -594,6 +594,11 @@ selects the nearest eligible ancestor for all required axes; pseudo-elements can
 origin. `cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, and `cqmax` work in styles, grid tracks, transforms,
 paint effects, and keyframes. Missing unit axes fall back to the viewport.
 
+Grid tracks and paint effects resolve `ch`, `ex`, `cap`, `lh`, and their root-relative forms
+against the selected font and computed line height. Root font changes cross ancestors with
+independent fonts; inherited effects retain their defining font bases. These measured bases
+are not yet wired into every ordinary length or transform property.
+
 Frames, immediate geometry reads, and fragmented layout settle changed query results and unit
 bases within a pass budget derived from container depth. Only dependent nodes and their inherited
 subtrees are restyled. Intermediate passes retain the original transition state and animation
