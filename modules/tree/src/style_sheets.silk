@@ -1,4 +1,10 @@
 import style_load { Status }
+import animation { Rule }
+import animation
+import timing { AnimationLists, EasingStops }
+import timing
+import mutation { Keyframe }
+import svg_css.adopted { KeyframesRef }
 import engine { UiTree, StyleOverride }
 import node { NONE }
 import selector_tree { SelectorTree }
@@ -17,7 +23,8 @@ import sheet_cascade
 import paint_css
 import svg_css.values { Wide }
 import properties.catalog
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
 import svg_css.input { Input, TokenRef }
 import svg_css.value_cursor { Cursor }
 import svg_css.declaration_values
@@ -60,6 +67,7 @@ impl RootSheets {
   }
 }
 pub struct Resolved {
+  pub keyframes: List<Rule>,
   pub overrides: List<Declaration>,
   pub starting: Option<List<Declaration>>,
   pub declarations: List<Declaration>,
@@ -88,13 +96,14 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
   }
 }
 
-pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32) -> Resolved
+pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolved
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let mut resolved = run resolveWith(&mut sheets, system, tree, slot, false)
   if !tree.node(slot).rendered && (hasStarting || tree.node(slot).starting.length() != 0) {
     let before = run resolveWith(&mut sheets, system, tree, slot, true)
     resolved.starting = Option<List<Declaration>>.some(move before.declarations)
   }
+  resolved.keyframes = run keyframes(&sheets.*, system, tree, slot, &resolved, &mut stops)
   return move resolved
 }
 
@@ -168,23 +177,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
         } else { run declarations.append(run values.cloneDeclaration(item)) }
       }
       Source.Sheet { sheet, declaration } => {
-        match &sheets.sheets()[sheet].sheet.declarations.asSlice()[declaration] {
-          SheetDeclaration.Typed { property, value, .. } => run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: run values.clone(&value) })
-          SheetDeclaration.Pending { property, .. } => {
-            let substituted = run sheets.variableInputs()[0].substitute(scope, sheet, declaration, &Limits.make())
-            match move substituted {
-              Option<Bytes>.Some { value } => run appendText(&mut declarations, &mut expressions, property, candidates[i].priority.important, value.asSlice())
-              Option<Bytes>.None => {
-                run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: values.keyword(Keyword.Unset) })
-              }
-            }
-          }
-          SheetDeclaration.ColorExpression { property, program, .. } => {
-            run expressions.append(Expression { index: declarations.length(), program: run program.copy() })
-            run declarations.append(Declaration { property: property, important: candidates[i].priority.important, value: values.color(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }) })
-          }
-          SheetDeclaration.Custom { .. } => {}
-        }
+        run appendSheet(&mut declarations, &mut expressions, &sheets.*, scope, sheet, declaration, candidates[i].priority.important)
       }
     }
     while ranks.length() < declarations.length() { run ranks.append(candidates[i].priority) }
@@ -205,6 +198,124 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
     }
     i = i + 1
   }
+  let finished = run finish(move declarations, move ranks, move expressions, system, tree, slot, Option<Color>.None)
+  let mut matches = List<MatchedRule>.make()
+  run matches.appendSlice(sheets.matches())
+  return Resolved { keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
+}
+
+effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets,
+  scope: ScopeId, sheet: usize, declaration: usize, important: bool) -> ()
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  match &sheets.sheets()[sheet].sheet.declarations.asSlice()[declaration] {
+    SheetDeclaration.Typed { property, value, .. } => run declarations.append(Declaration { property: property, important: important, value: run values.clone(&value) })
+    SheetDeclaration.Pending { property, .. } => {
+      let substituted = run sheets.variableInputs()[0].substitute(scope, sheet, declaration, &Limits.make())
+      match move substituted {
+        Option<Bytes>.Some { value } => run appendText(&mut declarations.*, &mut expressions.*, property, important, value.asSlice())
+        Option<Bytes>.None => {
+          run declarations.append(Declaration { property: property, important: important, value: values.keyword(Keyword.Unset) })
+        }
+      }
+    }
+    SheetDeclaration.ColorExpression { property, program, .. } => {
+      run expressions.append(Expression { index: declarations.length(), program: run program.copy() })
+      run declarations.append(Declaration { property: property, important: important, value: values.color(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }) })
+    }
+    SheetDeclaration.Custom { .. } => {}
+  }
+}
+
+effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32, resolved: &Resolved, stops: &mut EasingStops) -> List<Rule>
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let mut names = AnimationLists.initial()
+  let mut foreground = parentStyle(tree, slot).text.color
+  let declarations = resolved.declarations.asSlice()
+  let mut i: usize = 0
+  while i < declarations.length {
+    let declaration = &declarations[i]
+    if declaration.property == Property.AnimationName {
+      if convert.isKeyword(&declaration.value, Keyword.Inherit) { names = parentStyle(tree, slot).animation }
+      else {
+        let text = run values.cssText(&declaration.value)
+        timing.declareAnimation(&mut names, timing.ANIMATION_NAME, text.asSlice())
+      }
+    } else if declaration.property == Property.Color {
+      if let Option.Some { value } = convert.color(&declaration.value) { foreground = value }
+    }
+    i = i + 1
+  }
+  let color = Color.srgb(f32.toF64(foreground.r), f32.toF64(foreground.g), f32.toF64(foreground.b), f32.toF64(foreground.a))
+  let mut out = List<Rule>.make()
+  i = 0
+  while i < names.nameCount {
+    let hash = names.names[i]
+    let mut found = false
+    let mut previous: usize = 0
+    while previous < out.length() {
+      if out.asSlice()[previous].hash == hash { found = true }
+      previous = previous + 1
+    }
+    let mut sheet: usize = 0
+    while hash != 0 && !found && sheet < sheets.sheets().length {
+      let definitions = sheets.sheets()[sheet].sheet.keyframes.asSlice()
+      let mut rule: usize = 0
+      while !found && rule < definitions.length {
+        if timing.nameHash(definitions[rule].name.asSlice()) == hash {
+          if let Option<KeyframesRef>.Some { value } = sheets.keyframes(definitions[rule].name.asSlice()) {
+            let name = match String.fromUtf8(definitions[rule].name.asSlice()) {
+              Result<string, InvalidUtf8>.Success { value: text } => run String.copy(text)
+              _ => String.make()
+            }
+            let frames = run keyframeValues(sheets, system, tree, slot, resolved.scope, value, color)
+            run out.append(run animation.make(move name, move frames, &mut stops))
+          }
+          found = true
+        }
+        rule = rule + 1
+      }
+      sheet = sheet + 1
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32,
+  scope: ScopeId, reference: KeyframesRef, color: Color) -> List<Keyframe>
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let sheet = &sheets.sheets()[reference.sheet].sheet
+  let frames = sheet.keyframes.asSlice()[reference.rule].frames.asSlice()
+  let mut out = List<Keyframe>.make()
+  let mut i: usize = 0
+  while i < frames.length {
+    let frame = frames[i]
+    let mut declarations = List<Declaration>.make()
+    let mut expressions = List<Expression>.make()
+    let mut ranks = List<Priority>.make()
+    let mut declaration = frame.declarations.start
+    while declaration < frame.declarations.end {
+      run appendSheet(&mut declarations, &mut expressions, sheets, scope, reference.sheet, declaration, false)
+      while ranks.length() < declarations.length() {
+        let priority = Priority.make(Origin.Animation, ranks.length())
+        run ranks.append(priority)
+      }
+      declaration = declaration + 1
+    }
+    let resolved = run finish(move declarations, move ranks, move expressions, system, tree, slot, Option<Color>.some(color))
+    run out.append(Keyframe { offset: f64.toF32(frame.offset), declarations: move resolved.declarations })
+    i = i + 1
+  }
+  return move out
+}
+
+struct Finished { declarations: List<Declaration>, overrides: List<Declaration> }
+
+effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut expressions: List<Expression>,
+  system: [Color; 19], tree: &UiTree<'_>, slot: u32, baseColor: Option<Color>) -> Finished
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let node = tree.node(slot)
+  let mut i: usize = 0
   let selected = run sheet_cascade.winners(declarations.asSlice(), ranks.asSlice())
   let mut winning = List<Declaration>.make()
   let mut winningExpressions = List<Expression>.make()
@@ -267,7 +378,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
   expressions = move winningExpressions
   let inherited = parentStyle(tree, slot).text.color
   let inheritedColor = Color.srgb(f32.toF64(inherited.r), f32.toF64(inherited.g), f32.toF64(inherited.b), f32.toF64(inherited.a))
-  let mut foreground = inheritedColor
+  let mut foreground = match baseColor { Option.Some { value } => value Option.None => inheritedColor }
   let items = declarations.asMutSlice()
   i = 0
   while i < items.length {
@@ -295,9 +406,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
     }
     i = i + 1
   }
-  let mut matches = List<MatchedRule>.make()
-  run matches.appendSlice(sheets.matches())
-  return Resolved { overrides: move finalOverrides, declarations: move declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
+  return Finished { declarations: move declarations, overrides: move finalOverrides }
 }
 
 pub fn parentStyle(tree: &UiTree<'_>, slot: u32) -> Computed {

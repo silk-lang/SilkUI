@@ -280,19 +280,45 @@ pub fn part(text: &[u8], start: usize, end: usize) -> &[u8] {
 /// The end of the item that starts at `at`: the next comma (or space) outside parentheses.
 fn itemEnd(text: &[u8], at: usize, comma: bool) -> usize {
   let mut depth: u32 = 0
+  let mut quote: u8 = 0
   let mut i = at
   while i < text.length {
     let byte = text[i]
-    if byte == 40 {
-      depth = depth + 1
-    } else if byte == 41 && depth > 0 {
-      depth = depth - 1
-    } else if depth == 0 && ((comma && byte == 44) || (!comma && isSpace(byte))) {
-      return i
-    }
+    if byte == 92 { i = escapeEnd(text, i)
+      continue }
+    if quote != 0 {
+      if byte == quote { quote = 0 }
+    } else if byte == 34 || byte == 39 { quote = byte }
+    else if byte == 40 { depth = depth + 1 }
+    else if byte == 41 && depth > 0 { depth = depth - 1 }
+    else if depth == 0 && ((comma && byte == 44) || (!comma && isSpace(byte))) { return i }
     i = i + 1
   }
   return text.length
+}
+
+fn hex(byte: u8) -> u32 {
+  if byte >= 48 && byte <= 57 { return u8.toU32(byte - 48) }
+  if byte >= 65 && byte <= 70 { return u8.toU32(byte - 65 + 10) }
+  if byte >= 97 && byte <= 102 { return u8.toU32(byte - 97 + 10) }
+  return 16
+}
+
+fn escapeEnd(text: &[u8], slash: usize) -> usize {
+  let mut at = slash + 1
+  if at == text.length { return at }
+  if hex(text[at]) == 16 {
+    if text[at] == 13 && at + 1 < text.length && text[at + 1] == 10 { return at + 2 }
+    return at + 1
+  }
+  let mut count: usize = 0
+  while at < text.length && count < 6 && hex(text[at]) != 16 { at = at + 1
+    count = count + 1 }
+  if at < text.length && isSpace(text[at]) {
+    if text[at] == 13 && at + 1 < text.length && text[at + 1] == 10 { return at + 2 }
+    return at + 1
+  }
+  return at
 }
 
 fn trimStart(text: &[u8], start: usize, end: usize) -> usize {
@@ -909,6 +935,47 @@ pub fn nameHash(name: &[u8]) -> u64 {
   }
 }
 
+fn hashByte(hash: u64, byte: u32) -> u64 {
+  return u64.wrappingMultiply(u64.bitXor(hash, u32.toU64(byte)), 0x100000001b3)
+}
+
+fn hashScalar(hash: u64, scalar: u32) -> u64 {
+  if scalar < 128 { return hashByte(hash, scalar) }
+  if scalar < 2048 { return hashByte(hashByte(hash, 192 | u32.shiftRight(scalar, 6)), 128 | (scalar & 63)) }
+  if scalar < 65536 { return hashByte(hashByte(hashByte(hash, 224 | u32.shiftRight(scalar, 12)), 128 | (u32.shiftRight(scalar, 6) & 63)), 128 | (scalar & 63)) }
+  return hashByte(hashByte(hashByte(hashByte(hash, 240 | u32.shiftRight(scalar, 18)), 128 | (u32.shiftRight(scalar, 12) & 63)), 128 | (u32.shiftRight(scalar, 6) & 63)), 128 | (scalar & 63))
+}
+
+fn cssNameHash(text: &[u8]) -> u64 {
+  let name = unquoted(text)
+  let mut hash: u64 = 0xcbf29ce484222325
+  let mut at: usize = 0
+  while at < name.length {
+    if name[at] != 92 { hash = hashByte(hash, u8.toU32(name[at]))
+      at = at + 1
+      continue }
+    let end = escapeEnd(name, at)
+    at = at + 1
+    if at == name.length { hash = hashScalar(hash, 65533)
+      break }
+    if hex(name[at]) == 16 {
+      if name[at] != 10 && name[at] != 13 && name[at] != 12 { hash = hashByte(hash, u8.toU32(name[at])) }
+    } else {
+      let mut scalar: u32 = 0
+      let mut count: usize = 0
+      while at < name.length && count < 6 && hex(name[at]) != 16 {
+        scalar = scalar * 16 + hex(name[at])
+        at = at + 1
+        count = count + 1
+      }
+      if scalar == 0 || scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) { scalar = 65533 }
+      hash = hashScalar(hash, scalar)
+    }
+    at = end
+  }
+  return if hash == 0 { 1 } else { hash }
+}
+
 fn direction(word: &[u8]) -> u8 {
   if named(word, b"normal") {
     return NORMAL
@@ -986,7 +1053,7 @@ pub fn declareAnimation(lists: &mut AnimationLists, which: u32, text: &[u8]) -> 
       next.names[i] = if named(item, b"none") {
         0
       } else {
-        nameHash(unquoted(item))
+        cssNameHash(item)
       }
     } else if which == ANIMATION_DURATION {
       match time(item) {
@@ -1168,7 +1235,7 @@ fn animationItem(lists: &mut AnimationLists, index: usize, item: &[u8]) -> bool 
         return false
       }
       hasName = true
-      lists.names[index] = nameHash(unquoted(word))
+      lists.names[index] = cssNameHash(word)
     }
     i = i + 1
   }

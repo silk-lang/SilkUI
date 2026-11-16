@@ -8,10 +8,10 @@
 //! restyles the nodes whose animations move.
 import engine { UiTree }
 import engine
-import style { Computed }
+import style { Computed, TextStyle }
 import motion { Sample }
 import motion
-import timing { Easing, AnimationSpec }
+import timing { Easing, EasingStops, AnimationSpec }
 import timing
 import node { NONE, Event, EventKind }
 import mutation {
@@ -28,13 +28,15 @@ import properties.values
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
+import silk.core.order { Order, Ordering }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
-import silk.text.string { String }
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
 
 /// One frame of a defined rule, with the easing it starts.
 pub struct Frame {
@@ -55,11 +57,24 @@ pub struct Rule {
   pub fields: u64,
 }
 
+struct FrameOrder { offset: f64, index: usize }
+impl Copy for FrameOrder {}
+impl Order for FrameOrder {
+  fn compare(a: &Self, b: &Self) -> Ordering {
+    if a.offset < b.offset { return Ordering.Less }
+    if a.offset > b.offset { return Ordering.Greater }
+    if a.index < b.index { return Ordering.Less }
+    if a.index > b.index { return Ordering.Greater }
+    return Ordering.Equal
+  }
+}
+
 /// One animation a node plays.
 pub struct Playing {
   pub slot: u32,
   pub id: u32,
   pub name: u64,
+  pub label: usize,
   /// Its place in the node's `animation-name` list.
   pub index: usize,
   pub spec: AnimationSpec,
@@ -95,20 +110,24 @@ pub effect fn define(tree: &mut UiTree<'_>, name: String, frames: List<Keyframe>
   if frames.length() == 0 {
     return ()
   }
+  let rule = run make(move name, move frames, &mut tree.easingStops)
+  run tree.keyframes.append(move rule)
+}
+
+pub effect fn make(name: String, frames: List<Keyframe>, stops: &mut EasingStops) -> Rule
+  ! OutOfMemoryError ? &mut Allocator {
+  let hash = timing.nameHash(name.ownedUtf8Bytes())
   let mut rule = Rule { hash: hash, name: move name, frames: List<Frame>.make(), fields: 0 }
-  let mut source = move frames
-  while source.length() != 0 {
-    // Taken in offset order: the smallest left first, the earlier of equal ones first.
-    let items = source.asSlice()
-    let mut least: usize = 0
-    let mut j: usize = 1
-    while j < items.length {
-      if items[j].offset < items[least].offset {
-        least = j
-      }
-      j = j + 1
-    }
-    let taken = source.remove(least)
+  let mut order = List<FrameOrder>.make()
+  let mut i: usize = 0
+  while i < frames.length() {
+    run order.append(FrameOrder { offset: f32.toF64(frames.asSlice()[i].offset), index: i })
+    i = i + 1
+  }
+  run order.sort()
+  i = 0
+  while i < order.length() {
+    let taken = &frames.asSlice()[order.asSlice()[i].index]
     let mut frame = Frame {
       offset: f32.max(0.0, f32.min(1.0, taken.offset)),
       declarations: List<Declaration>.make(),
@@ -121,7 +140,7 @@ pub effect fn define(tree: &mut UiTree<'_>, name: String, frames: List<Keyframe>
     while k < declared.length {
       if declared[k].property == CssProperty.AnimationTimingFunction {
         let text = run values.cssText(&declared[k].value)
-        run tree.easingStops.read(text.asSlice())
+        run stops.read(text.asSlice())
         match timing.easing(text.asSlice()) {
           Option<Easing>.Some { value } => {
             frame.easing = value
@@ -137,20 +156,40 @@ pub effect fn define(tree: &mut UiTree<'_>, name: String, frames: List<Keyframe>
     }
     rule.fields = rule.fields | frame.fields
     run rule.frames.append(move frame)
+    i = i + 1
   }
-  run tree.keyframes.append(move rule)
+  return move rule
 }
 
-fn ruleIndex(tree: &UiTree<'_>, hash: u64) -> usize {
+fn named<'a>(tree: &'a UiTree<'_>, slot: u32, hash: u64) -> Option<&'a Rule> {
+  if let Option.Some { value } = tree.node(slot).sheetStyle() {
+    let mut i: usize = 0
+    while i < value.keyframes.length() {
+      let rule = &value.keyframes.asSlice()[i]
+      if rule.hash == hash { return Option<&Rule>.some(rule) }
+      i = i + 1
+    }
+  }
   let rules = tree.keyframes.asSlice()
   let mut i: usize = 0
   while i < rules.length {
-    if rules[i].hash == hash {
-      return i
-    }
+    if rules[i].hash == hash { return Option<&Rule>.some(&rules[i]) }
     i = i + 1
   }
-  return usize.MAX
+  return Option<&Rule>.None
+}
+
+fn importantFields(tree: &UiTree<'_>, slot: u32) -> u64 {
+  let mut fields: u64 = 0
+  if let Option.Some { value } = tree.node(slot).sheetStyle() {
+    let declarations = value.declarations.asSlice()
+    let mut i: usize = 0
+    while i < declarations.length {
+      if declarations[i].important { fields = fields | fieldsOf(declarations[i].property) }
+      i = i + 1
+    }
+  }
+  return fields
 }
 
 fn listenFlag(kind: EventKind) -> u32 {
@@ -175,14 +214,15 @@ effect fn record(tree: &mut UiTree<'_>, kind: EventKind, playing: &Playing, elap
     }
     at = tree.node(at).parent
   }
-  let rule = ruleIndex(&tree.*, playing.name)
-  if !heard || rule == usize.MAX {
-    return ()
+  if !heard { return () }
+  let name = match String.fromUtf8(tree.styleAtoms.text(playing.label)) {
+    Result<string, InvalidUtf8>.Success { value } => run String.copy(value)
+    _ => String.make()
   }
   let mut path = List<u32>.make()
   run tree.pathTo(playing.slot, &mut path)
   let mut event = Event.make(kind, tree.node(playing.slot).id, move path)
-  event.name = run String.copy(String.view(&tree.keyframes.asSlice()[rule].name))
+  event.name = move name
   event.elapsedTime = f64.toF32(elapsed)
   run tree.queueEvent(move event)
 }
@@ -281,8 +321,9 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
     let mut index: usize = 0
     while index < lists.nameCount {
       let spec = lists.spec(index)
-      let rule = ruleIndex(&tree.*, spec.name)
-      if spec.name != 0 && rule != usize.MAX {
+      let rule = named(&tree.*, slot, spec.name)
+      let ruleFields = match rule { Option.Some { value } => value.fields Option.None => 0 }
+      if spec.name != 0 && rule.isSome() {
         let mut found = usize.MAX
         let mut j: usize = 0
         while j < old.length() {
@@ -295,7 +336,13 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
         let mut playing = if found != usize.MAX {
           old.remove(found)
         } else {
+          let name = match named(&tree.*, slot, spec.name) {
+            Option.Some { value } => run String.copy(String.view(&value.name))
+            Option.None => String.make()
+          }
+          let label = run tree.styleAtoms.intern(name.ownedUtf8Bytes())
           Playing {
+            label: label,
             slot: slot,
             id: id,
             name: spec.name,
@@ -327,7 +374,7 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
           playing.reported = 1
           run record(&mut tree, EventKind.AnimationStart, &playing, 0.0)
         }
-        fields = fields | tree.keyframes.asSlice()[rule].fields
+        fields = fields | ruleFields
         run kept.append(playing)
       }
       index = index + 1
@@ -342,7 +389,7 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
     k = k + 1
   }
   run tree.animations.appendSlice(kept.asSlice())
-  return fields
+  return u64.bitXor(fields, u64.bitAnd(fields, importantFields(&tree.*, slot)))
 }
 
 /// Writes the values of the node's animations at the frame clock over `computed`; later
@@ -356,13 +403,14 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed) -> ()
   let id = tree.node(slot).id
   let now = tree.input.time
   let base = computed.*
+  let blocked = importantFields(tree, slot)
   let mut order: usize = 0
   while order < 8 {
     let list = tree.animations.asSlice()
     let mut i: usize = 0
     while i < list.length {
       if list[i].slot == slot && list[i].id == id && list[i].index == order {
-        run applyOne(tree, &list[i], &base, now, &mut computed)
+        run applyOne(tree, &list[i], &base, now, blocked, &mut computed)
       }
       i = i + 1
     }
@@ -371,40 +419,35 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed) -> ()
 }
 
 // The value of `field` at frame `frame`: its declarations over the underlying style.
-effect fn frameValue(rule: &Rule, frame: usize, field: u32, base: &Computed) -> Sample
+effect fn frameValue(tree: &UiTree<'_>, slot: u32, rule: &Rule, frame: usize, field: u32, base: &Computed) -> Sample
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut styled = base.*
-  let declared = rule.frames.asSlice()[frame].declarations.asSlice()
-  let mut i: usize = 0
-  while i < declared.length {
-    if !run engine.applyWritten(&mut styled, &declared[i]) {
-      styled.apply(&declared[i])
-    }
-    i = i + 1
-  }
+  let parent = tree.node(slot).parent
+  let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { tree.node(parent).computed }
+  let mut stops = EasingStops.make()
+  run engine.applyResolved(&mut styled, &rule.frames.asSlice()[frame].declarations, &parentStyle, &mut stops)
   return motion.sample(&styled, field)
 }
 
-effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f64, computed: &mut Computed) -> ()
+effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f64, blocked: u64, computed: &mut Computed) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut overall: f64 = 0.0
   if !progressAt(playing, now, &mut overall) {
     return ()
   }
-  let at = ruleIndex(tree, playing.name)
-  if at == usize.MAX {
-    return ()
+  let rule = match named(tree, playing.slot, playing.name) {
+    Option.Some { value } => value
+    Option.None => { return () }
   }
-  let rule = &tree.keyframes.asSlice()[at]
   let p = directed(&playing.spec, overall)
   let frames = rule.frames.asSlice()
   let size = motion.boxSize(tree, playing.slot)
   let mut field: u32 = 0
   while field < motion.FIELDS {
     let bit = u64.shiftLeft(1, u32.toU64(field))
-    if u64.bitAnd(rule.fields, bit) != 0 {
+    if u64.bitAnd(rule.fields, bit) != 0 && u64.bitAnd(blocked, bit) == 0 {
       // The frames around p that set the field; a missing end is the underlying value.
       let mut before = usize.MAX
       let mut after = usize.MAX
@@ -413,7 +456,7 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
         if u64.bitAnd(frames[i].fields, bit) != 0 {
           if frames[i].offset <= p {
             before = i
-          } else if after == usize.MAX {
+          } else if after == usize.MAX || frames[i].offset == frames[after].offset {
             after = i
           }
         }
@@ -424,12 +467,12 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       let from = if before == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(rule, before, field, base)
+        run frameValue(tree, playing.slot, rule, before, field, base)
       }
       let to = if after == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(rule, after, field, base)
+        run frameValue(tree, playing.slot, rule, after, field, base)
       }
       let easing = if before != usize.MAX && frames[before].eased {
         frames[before].easing
