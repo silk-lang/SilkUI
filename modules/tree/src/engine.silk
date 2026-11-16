@@ -95,6 +95,9 @@ import style_invalidation
 import svg_css.element as css_element
 import svg_css.element { PseudoTarget, StateBits }
 import style_sheets { RootSheets, Resolved, Resolution }
+import style_share
+import sheet_cache { Pending as PendingStyle }
+import silk.mem.frozen { Frozen }
 import svg_css.adopted { AdoptionError }
 import svg_css.sheet { Sheet }
 import svg_css.sheet_binary { DecodeError }
@@ -2246,7 +2249,7 @@ impl<'a> UiTree<'a> {
       editing: move editing,
       effects: Option<Box<Effects>>.None,
       semantics: Option<Box<Semantics>>.None,
-      resolvedSheet: Option<Box<Resolved>>.None,
+      resolvedSheet: Option<Frozen<Resolved>>.None,
       selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
     }
@@ -4153,9 +4156,9 @@ impl<'a> UiTree<'a> {
     if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
       value.starting = Option<List<Declaration>>.some(move named)
     }
-    let boxed = run Box<Resolved>.make(move value)
+    let shared = run Frozen<Resolved>.make(move value)
     let node = self.nodeMut(slot)
-    node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
+    node.resolvedSheet = Option<Frozen<Resolved>>.some(move shared)
   }
 
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
@@ -4163,9 +4166,17 @@ impl<'a> UiTree<'a> {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
-      node.resolvedSheet = Option<Box<Resolved>>.None
+      node.resolvedSheet = Option<Frozen<Resolved>>.None
       run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
       return ()
+    }
+    if self.styleSheets.asSlice()[at].siblingsShare && !self.styleSheets.asSlice()[at].hasStarting {
+      if let Option<Frozen<Resolved>>.Some { value } = move style_share.exemplar(&self, slot) {
+        let node = self.nodeMut(slot)
+        node.resolvedSheet = Option<Frozen<Resolved>>.some(move value)
+        run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
+        return ()
+      }
     }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
@@ -4176,7 +4187,20 @@ impl<'a> UiTree<'a> {
     match move resolved {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
         run container_watch.record(&mut self, slot, PseudoTarget.None, value.containers.asSlice())
+        if let Option<Frozen<Resolved>>.Some { value: shared } = move value.hit {
+          let node = self.nodeMut(slot)
+          node.resolvedSheet = Option<Frozen<Resolved>>.some(move shared)
+          return ()
+        }
         run self.installResolved(slot, move value.style)
+        if let Option<PendingStyle>.Some { value: pending } = move value.pending {
+          let style = match &self.node(slot).resolvedSheet {
+            Option<Frozen<Resolved>>.Some { value: installed } => installed.clone()
+            _ => { return () }
+          }
+          let roots = self.styleSheets.asMutSlice()
+          run roots[at].cache.insert(move pending, move style)
+        }
       }
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
@@ -4280,6 +4304,7 @@ impl<'a> UiTree<'a> {
       if self.stylesDirty {
         roots[sheetIndex].sheets.resetScopes()
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
+        roots[sheetIndex].siblingsShare = style_invalidation.siblingsShare(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)

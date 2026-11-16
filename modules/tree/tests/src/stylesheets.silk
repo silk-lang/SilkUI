@@ -963,3 +963,107 @@ test effect fn pixelStylesTrackRelativeAndLogicalStateChanges() ! TreeError | Cs
   let mut allocator = Allocator.systemAllocatorProvider()
   run pixelAndRelativeStates() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import silk.collections.list { List }
+
+fn sameStyle(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
+  if let Option.Some { value: one } = &tree.node(tree.slotOf(first)).resolvedSheet {
+    if let Option.Some { value: other } = &tree.node(tree.slotOf(second)).resolvedSheet { return one.address() == other.address() }
+  }
+  return false
+}
+
+effect fn rowsTree(tree: &mut UiTree<'_>, rule: &[u8]) -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("stack") })
+  let mut id: u32 = 2
+  while id < 7 {
+    run batch.create(id, NodeKind.Box)
+    run batch.append(1, id)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy("row") })
+    id = id + 1
+  }
+  run batch.create(10, NodeKind.Box)
+  run batch.append(4, 10)
+  run batch.attribute(10, Attribute.ClassName { value: run String.copy("x") })
+  let mut source = List<u8>.make()
+  run source.appendSlice(b".row{width:20px;height:5px;color:red;background:currentColor}.on{width:40px}")
+  run source.appendSlice(rule)
+  run source.appendSlice(b"{width:25px}")
+  let bytes = run sheetBytes(source.asSlice())
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(0.0))
+}
+
+effect fn rowsShare(rule: &[u8]) -> bool
+  ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  run rowsTree(&mut tree, rule)
+  return sameStyle(&tree, 2, 3) && sameStyle(&tree, 5, 6)
+}
+
+fn rowWidth(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.width.value }
+
+/// Whether rows 2 to 6 are 25px wide exactly where `wide` has a set bit, and 20px elsewhere.
+effect fn rowsMatch(rule: &[u8], wide: [bool; 5]) -> bool
+  ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  run rowsTree(&mut tree, rule)
+  let mut i: u32 = 0
+  while i < 5 {
+    let expected: f32 = if wide[u32.toUsize(i)] { 25.0 } else { 20.0 }
+    if rowWidth(&tree, i + 2) != expected { return false }
+    i = i + 1
+  }
+  return true
+}
+
+effect fn equalSiblings() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run Testing.expect(run rowsShare(b".absent"), "equal siblings hold one matched style")
+  run Testing.expect(run rowsShare(b".absent .row"), "rules that read only ancestors keep sibling sharing")
+  run Testing.expect(run rowsShare(b".row:hover"), "state rules keep sibling sharing while states agree")
+  let message = "rules that read position, siblings or descendants are matched for each sibling"
+  run Testing.expect(run rowsMatch(b".row:last-child", [false, false, false, false, true]), message)
+  run Testing.expect(run rowsMatch(b".row+.row", [false, true, true, true, true]), message)
+  run Testing.expect(run rowsMatch(b".row~.row", [false, true, true, true, true]), message)
+  run Testing.expect(run rowsMatch(b".row:has(.x)", [false, false, true, false, false]), message)
+  run Testing.expect(run rowsMatch(b".row:empty", [true, true, false, true, true]), message)
+  run Testing.expect(run rowsMatch(b".row:nth-child(2)", [false, true, false, false, false]), message)
+  run Testing.expect(run rowsMatch(b".row:not(:last-child)", [true, true, true, true, false]), message)
+  run Testing.expect(run rowsMatch(b".row:is(:first-child)", [true, false, false, false, false]), message)
+  run Testing.expect(run rowsMatch(b".row:where(.stack>:not(:first-child))", [false, true, true, true, true]), message)
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  run rowsTree(&mut tree, b".absent .row")
+  let mut batch = Batch.make()
+  run batch.attribute(4, Attribute.ClassName { value: run String.copy("row on") })
+  let wide = run written.declarations(b"width:50px")
+  run batch.style(6, wide.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&tree, 3) == 20.0 && rowWidth(&tree, 4) == 40.0 && rowWidth(&tree, 5) == 20.0 && rowWidth(&tree, 6) == 50.0,
+    "a changed class or style object leaves the sibling's shared style")
+  run Testing.expect(!sameStyle(&tree, 3, 4) && !sameStyle(&tree, 4, 5) && !sameStyle(&tree, 5, 6) && sameStyle(&tree, 2, 3), "only equal inputs share")
+  batch = Batch.make()
+  run batch.attribute(4, Attribute.ClassName { value: run String.copy("row") })
+  run batch.attribute(5, Attribute.ElementId { value: run String.copy("named") })
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("stack absent") })
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(2.0))
+  run Testing.expect(rowWidth(&tree, 3) == 25.0 && rowWidth(&tree, 4) == 25.0 && rowWidth(&tree, 5) == 25.0 && rowWidth(&tree, 6) == 50.0,
+    "an ancestor change reaches every sharer")
+  run Testing.expect(sameStyle(&tree, 3, 4), "restored inputs share again")
+}
+
+test effect fn equalSiblingsShareOneMatchedStyle() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run equalSiblings() |> Effect.provideMut<Allocator>(&mut allocator)
+}

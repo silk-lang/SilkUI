@@ -1,0 +1,67 @@
+//! A node whose selector inputs equal its previous sibling's takes that sibling's matched style.
+//! Both have the same ancestors, so every rule that does not read sibling position, children or
+//! descendants gives them the same result; `RootSheets.siblingsShare` rules those rules out.
+import engine { UiTree }
+import node { Node, NONE }
+import mutation { Declaration, NodeKind }
+import selector_tree { SelectorTree }
+import style_identity { NodeIdentity }
+import style_sheets { Resolved }
+import properties.values
+import svg_css.element { ElementTree, NO_ELEMENT }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.frozen { Frozen }
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String }
+
+fn sameList(a: &List<Declaration>, b: &List<Declaration>) -> bool {
+  if a.length() != b.length() { return false }
+  let mut i: usize = 0
+  while i < a.length() {
+    if !values.sameDeclaration(&a.asSlice()[i], &b.asSlice()[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn sameIdentity(a: Option<&NodeIdentity>, b: Option<&NodeIdentity>) -> bool {
+  let left = match a { Option.Some { value } => value _ => { return b.isNone() } }
+  let right = match b { Option.Some { value } => value _ => { return false } }
+  // An id names one element, and custom properties build their own variable scope.
+  if left.hasId || right.hasId || left.custom.length() != 0 || right.custom.length() != 0 { return false }
+  if left.hasClasses != right.hasClasses || String.view(&left.classes) != String.view(&right.classes) { return false }
+  if String.view(&left.tag) != String.view(&right.tag) || left.attributes.length() != right.attributes.length() { return false }
+  let mut i: usize = 0
+  while i < left.attributes.length() {
+    let one = &left.attributes.asSlice()[i]
+    let other = &right.attributes.asSlice()[i]
+    if String.view(&one.name) != String.view(&other.name) || String.view(&one.value) != String.view(&other.value) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn plainBox(node: &Node) -> bool {
+  return node.kind == NodeKind.Box && node.live && !node.isGenerated() && node.starting.length() == 0
+}
+
+/// The previous sibling's style when `slot` would match the same rules with the same values.
+pub fn exemplar(tree: &UiTree<'_>, slot: u32) -> Option<Frozen<Resolved>> {
+  let node = tree.node(slot)
+  if !plainBox(node) || node.parent == NONE || tree.styleOverrides().length != 0 { return Option<Frozen<Resolved>>.None }
+  let adapter = SelectorTree { tree: tree }
+  let found = adapter.previousSibling(u32.toUsize(slot))
+  if found == NO_ELEMENT { return Option<Frozen<Resolved>>.None }
+  let previous = tree.node(usize.toU32(found))
+  if !plainBox(previous) || previous.styleDirty { return Option<Frozen<Resolved>>.None }
+  let shared = match previous.sheetStyle() { Option.Some { value } => value.plain _ => false }
+  if !shared { return Option<Frozen<Resolved>>.None }
+  if !sameIdentity(node.identity(), previous.identity()) { return Option<Frozen<Resolved>>.None }
+  if adapter.state(u32.toUsize(slot)).bits != adapter.state(found).bits { return Option<Frozen<Resolved>>.None }
+  if !sameList(&node.base, &previous.base) || !sameList(&node.hover, &previous.hover) || !sameList(&node.active, &previous.active)
+    || !sameList(&node.focus, &previous.focus) || !sameList(&node.focusVisible, &previous.focusVisible) { return Option<Frozen<Resolved>>.None }
+  if let Option<Frozen<Resolved>>.Some { value } = &previous.resolvedSheet { return Option<Frozen<Resolved>>.some(value.clone()) }
+  return Option<Frozen<Resolved>>.None
+}
