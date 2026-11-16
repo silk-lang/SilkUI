@@ -973,6 +973,12 @@ fn sameStyle(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
   return false
 }
 
+/// Whether one took the other's matched style without matching selectors itself.
+fn sameClass(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
+  let one = tree.node(tree.slotOf(first)).styleClass
+  return one != 0 && one == tree.node(tree.slotOf(second)).styleClass
+}
+
 effect fn rowsTree(tree: &mut UiTree<'_>, rule: &[u8]) -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
   let mut batch = Batch.make()
@@ -1135,4 +1141,94 @@ test effect fn equalCousinsShareOneMatchedStyle() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run equalCousins() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn addRow(tree: &mut UiTree<'_>, id: u32, before: u32) -> ()
+  ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.create(id, NodeKind.Box)
+  run batch.attribute(id, Attribute.ClassName { value: run String.copy("row") })
+  if before == 0 { run batch.append(1, id) } else { run batch.insertBefore(1, id, before) }
+  run tree.apply(run batch.take())
+}
+
+effect fn dropNode(tree: &mut UiTree<'_>, id: u32) -> ()
+  ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let mut batch = Batch.make()
+  run batch.push(Mutation.Destroy { id: id })
+  run tree.apply(run batch.take())
+}
+
+effect fn localStructure() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut plain = run UiTree.make(&fonts)
+  run rowsTree(&mut plain, b".absent")
+  run addRow(&mut plain, 7, 0)
+  run Testing.expect(!plain.stylesDirty && !plain.node(plain.slotOf(6)).styleDirty, "an insert under plain rules dirties only the new node")
+  run plain.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&plain, 7) == 20.0 && sameClass(&plain, 6, 7), "the new row takes its sibling's style")
+  let mut batch = Batch.make()
+  let wide = run written.declarations(b"width:50px;color:blue")
+  run batch.style(3, wide.asSlice())
+  run plain.apply(run batch.take())
+  run Testing.expect(!plain.stylesDirty && !plain.node(plain.slotOf(4)).styleDirty, "a style object dirties only its node")
+  run plain.frame(motionFrame(2.0))
+  let background: f32 = match plain.node(plain.slotOf(3)).computed.paint.background { Fill.Solid { color } => color.b _ => -1.0 }
+  run Testing.expect(rowWidth(&plain, 3) == 50.0 && rowWidth(&plain, 4) == 20.0 && background == 1.0, "the style object joins the node's cascade")
+  run dropNode(&mut plain, 2)
+  run Testing.expect(!plain.stylesDirty && !plain.stylesPending, "a removal under plain rules restyles nothing")
+  run batch.attribute(5, Attribute.TabIndex { value: 0 })
+  run plain.apply(run batch.take())
+  run plain.frame(motionFrame(3.0))
+  run batch.focus(5)
+  run plain.apply(run batch.take())
+  run Testing.expect(!plain.stylesDirty && plain.node(plain.slotOf(5)).styleDirty && !plain.node(plain.slotOf(1)).styleDirty, "focus dirties only the focused node")
+
+  let mut edge = run UiTree.make(&fonts)
+  run rowsTree(&mut edge, b".row:last-child")
+  run Testing.expect(sameClass(&edge, 3, 4) && sameClass(&edge, 4, 5) && !sameClass(&edge, 2, 3) && !sameClass(&edge, 5, 6), "rows between the edges share under edge rules")
+  run addRow(&mut edge, 7, 0)
+  run Testing.expect(!edge.stylesDirty && edge.node(edge.slotOf(6)).styleDirty && !edge.node(edge.slotOf(5)).styleDirty, "an insert under edge rules dirties its neighbours")
+  run edge.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&edge, 6) == 20.0 && rowWidth(&edge, 7) == 25.0 && sameClass(&edge, 5, 6), "the old last child joins the middle rows")
+  run dropNode(&mut edge, 7)
+  run edge.frame(motionFrame(2.0))
+  run Testing.expect(rowWidth(&edge, 6) == 25.0 && rowWidth(&edge, 5) == 20.0, "a removal makes its neighbour the last child")
+
+  let mut index = run UiTree.make(&fonts)
+  run rowsTree(&mut index, b".row:nth-child(2)")
+  run addRow(&mut index, 7, 2)
+  run index.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&index, 7) == 20.0 && rowWidth(&index, 2) == 25.0 && rowWidth(&index, 3) == 20.0, "an insert shifts indexed rules")
+  run dropNode(&mut index, 7)
+  run index.frame(motionFrame(2.0))
+  run Testing.expect(rowWidth(&index, 2) == 20.0 && rowWidth(&index, 3) == 25.0, "a removal shifts them back")
+
+  let mut next = run UiTree.make(&fonts)
+  run rowsTree(&mut next, b".row+.row")
+  run addRow(&mut next, 7, 2)
+  run next.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&next, 7) == 20.0 && rowWidth(&next, 2) == 25.0, "an insert reaches the following sibling")
+  run dropNode(&mut next, 7)
+  run next.frame(motionFrame(2.0))
+  run Testing.expect(rowWidth(&next, 2) == 20.0 && rowWidth(&next, 3) == 25.0, "a removal reaches it too")
+
+  let mut empty = run UiTree.make(&fonts)
+  run rowsTree(&mut empty, b".row:empty")
+  run Testing.expect(sameClass(&empty, 2, 3) && !sameClass(&empty, 3, 4) && sameClass(&empty, 5, 6), "empty rows share apart from the filled one")
+  run dropNode(&mut empty, 10)
+  run empty.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&empty, 4) == 25.0, "removing the only child empties its parent")
+  run batch.create(11, NodeKind.Box)
+  run batch.append(5, 11)
+  run empty.apply(run batch.take())
+  run empty.frame(motionFrame(2.0))
+  run Testing.expect(rowWidth(&empty, 5) == 20.0 && rowWidth(&empty, 6) == 25.0, "a first child fills its parent")
+}
+
+test effect fn structureAndStyleObjectsRestyleLocally() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run localStructure() |> Effect.provideMut<Allocator>(&mut allocator)
 }

@@ -1,7 +1,8 @@
 //! A node takes the matched style of another whose selector inputs and ancestors equal its own:
 //! a sibling, or the matching child of its parent's twin, as the rows of a list are to each other.
-//! Every rule that does not read sibling position, children or descendants gives both the same
-//! result; `RootSheets.siblingsShare` rules those rules out.
+//! Rules that read only identity, state and ancestors give both the same result. Edge position
+//! and emptiness join the comparison when a sheet reads them (`READS_EDGE`, `READS_EMPTY`);
+//! the engine does not ask at all when a sheet reads sibling order, indexes or descendants.
 import engine { UiTree }
 import node { Node, NONE }
 import mutation { Declaration, NodeKind }
@@ -9,6 +10,7 @@ import selector_tree { SelectorTree }
 import style_identity { NodeIdentity }
 import properties.values
 import svg_css.element { ElementTree, NO_ELEMENT }
+import svg_css.selectors
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.color.rgba { Rgba }
@@ -48,13 +50,20 @@ fn plainBox(node: &Node) -> bool {
 }
 
 /// Whether `slot` and the clean, classed node `other` would match the same rules given equal ancestors.
-fn alike(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, other: u32) -> bool {
+fn alike(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, other: u32, reads: u32) -> bool {
   let node = tree.node(slot)
   let model = tree.node(other)
   if !plainBox(model) || model.styleDirty || model.styleClass == 0 { return false }
   let shared = match model.sheetStyle() { Option.Some { value } => value.plain _ => false }
   if !shared || !sameIdentity(node.identity(), model.identity()) { return false }
   if adapter.state(u32.toUsize(slot)).bits != adapter.state(u32.toUsize(other)).bits { return false }
+  let one = u32.toUsize(slot)
+  let two = u32.toUsize(other)
+  if u32.bitAnd(reads, selectors.READS_EDGE) != 0 {
+    if (adapter.previousSibling(one) == NO_ELEMENT) != (adapter.previousSibling(two) == NO_ELEMENT) { return false }
+    if (adapter.nextSibling(one) == NO_ELEMENT) != (adapter.nextSibling(two) == NO_ELEMENT) { return false }
+  }
+  if u32.bitAnd(reads, selectors.READS_EMPTY) != 0 && adapter.isEmpty(one) != adapter.isEmpty(two) { return false }
   return sameList(&node.base, &model.base) && sameList(&node.hover, &model.hover) && sameList(&node.active, &model.active)
     && sameList(&node.focus, &model.focus) && sameList(&node.focusVisible, &model.focusVisible)
 }
@@ -71,7 +80,7 @@ fn twinOf(tree: &UiTree<'_>, slot: u32) -> u32 {
 
 /// A node whose matched style `slot` can take, or NONE. Its selector inputs equal `slot`'s and
 /// its ancestors equal `slot`'s: it is a sibling, or a child of the parent's own twin.
-pub fn twin(tree: &UiTree<'_>, slot: u32) -> u32 {
+pub fn twin(tree: &UiTree<'_>, slot: u32, reads: u32) -> u32 {
   let node = tree.node(slot)
   if !plainBox(node) || node.parent == NONE || tree.styleOverrides().length != 0 { return NONE }
   let adapter = SelectorTree { tree: tree }
@@ -86,9 +95,9 @@ pub fn twin(tree: &UiTree<'_>, slot: u32) -> u32 {
       let before = twinOf(tree, usize.toU32(previous))
       if before != NONE && tree.node(before).parent == uncle { cousin = adapter.nextSibling(u32.toUsize(before)) }
     }
-    if cousin != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(cousin)) { return usize.toU32(cousin) }
+    if cousin != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(cousin), reads) { return usize.toU32(cousin) }
   }
-  if previous != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(previous)) { return usize.toU32(previous) }
+  if previous != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(previous), reads) { return usize.toU32(previous) }
   return NONE
 }
 
