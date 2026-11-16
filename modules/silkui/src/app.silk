@@ -21,7 +21,8 @@
 //!
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
-import host { Kind, Plan, manifest, main as hostMain, page as hostPage, webgpuExports, libm }
+import stylesheets
+import host { Kind, Plan, packageName as hostPackageName, manifest, main as hostMain, page as hostPage, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import web { Server, site }
 import silk.cli.task { Task, TaskError }
@@ -174,9 +175,12 @@ pub struct App {
   named: string<'static>,
   writtenIn: Framework,
   runsOn: Runtime,
+  runtimeCss: bool,
   places: List<Target>,
   custom: string<'static>,
+  stylePaths: List<string<'static>>,
   bundled: String,
+  compiledSheet: String,
   hosts: List<Host>,
 }
 
@@ -346,9 +350,12 @@ impl App {
       named: name,
       writtenIn: Framework.Js { dir: "web" },
       runsOn: Runtime.Engine,
+      runtimeCss: false,
       places: List<Target>.make(),
       custom: "",
+      stylePaths: List<string<'static>>.make(),
       bundled: String.make(),
+      compiledSheet: String.make(),
       hosts: List<Host>.make(),
     }
   }
@@ -375,6 +382,22 @@ impl App {
     return move app
   }
 
+  /// Includes the CSS text compiler in a release native or canvas host. Development hosts always include it.
+  pub effect fn runtimeStylesheets<'env, E, ?R>(self: once Effect<'env; App ! E ? R>) -> App ! E ? R {
+    let mut app = run move self
+    app.runtimeCss = true
+    return move app
+  }
+
+  /// Adds a CSS file, relative to the project root. Repeat to define adoption
+  /// order. Any Tailwind, Sass or PostCSS processing happens before this step.
+  pub effect fn stylesheet<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, path: string<'static>) -> App
+    ! E | OutOfMemoryError ? R | &mut Allocator {
+    let mut app = run move self
+    run app.stylePaths.append(path)
+    return move app
+  }
+
   /// The escape hatch: the project's own host package at `dir` (relative to the project) is
   /// built instead of a generated one, for every target. It gets no bundle copied in.
   pub effect fn customHost<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, dir: string<'static>) -> App ! E ? R {
@@ -386,6 +409,11 @@ impl App {
   pub fn name(self: &App) -> string<'static> { return self.named }
   pub fn frameworkOf(self: &App) -> Framework { return self.writtenIn }
   pub fn targets(self: &App) -> &[Target] { return self.places.asSlice() }
+
+  fn sheetCount(self: &App) -> usize {
+    let bundled: usize = if String.view(&self.compiledSheet) == "" { 0 } else { 1 }
+    return self.stylePaths.length() + bundled
+  }
 
   // --- App: the steps ---
 
@@ -429,6 +457,7 @@ impl App {
     let web = run fromRoot(&project, dir)
     run installed(String.view(&web))
     app.bundled = run joined(String.view(&web), "dist/app.js")
+    app.compiledSheet = String.make()
     if mode == Mode.Dev && app.runsOn == Runtime.Engine { return move app }
     run say("bundling with Vite")
     if mode == Mode.Release {
@@ -436,6 +465,8 @@ impl App {
     } else {
       run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", "development"])
     }
+    let sheet = run joined(String.view(&web), "dist/app.sheet")
+    if run exists(String.view(&sheet)) { app.compiledSheet = move sheet }
     return move app
   }
 
@@ -455,6 +486,7 @@ impl App {
     while at < targets.length {
       let target = targets[at]
       if app.custom != "" {
+        if app.sheetCount() != 0 { run Task.abort("silkui: stylesheets need a generated host; a custom host adopts its compiled sheets directly") }
         if target.web() { run Task.abort("silkui: a custom host builds the window target only") }
         run app.hosts.append(Host { target: target, dir: run fromRoot(&project, app.custom), generated: false })
         at = at + 1
@@ -492,9 +524,16 @@ impl App {
         height: window.height,
         module: module,
         command: command,
+        stylesheets: app.sheetCount(),
+        runtimeCss: app.runtimeCss,
       }
       let mut dir = run fromRoot(&project, ".silk")
       dir = run joined(String.view(&dir), target.id())
+      run stylesheets.emitWithCompiled(String.view(&project.root), app.stylePaths.asSlice(), String.view(&dir), target.id() == "web-dom", String.view(&app.compiledSheet))
+      if mode == Mode.Dev && target.id() != "web-dom" && app.sheetCount() != 0 {
+        let update = if target.web() { run String.copy("/styles.update") } else { run joined(String.view(&dir), "styles.update") }
+        run refresh(String.view(&run joined(String.view(&dir), "styles.path")), String.view(&update))
+      }
       let toml = run joined(String.view(&dir), "silk.toml")
       run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
       let main = run joined(String.view(&dir), "src/main.silk")
@@ -543,15 +582,13 @@ impl App {
       // A generated host is named after the project and the target; a custom one after the app.
       let mut name = run String.copy(app.named)
       if hosts[at].generated {
-        name = run String.copy(String.view(&project.name))
-        run String.append(&mut name, "-")
-        run String.append(&mut name, hosts[at].target.id())
+        name = run hostPackageName(String.view(&project.name), hosts[at].target.id())
       }
       let path = run binary(dir, String.view(&name), mode)
       let bytes = run sizeOf(String.view(&path))
       if hosts[at].target.web() {
         let folder = run joined(dir, "site")
-        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder))
+        run site(&project, hosts[at].target.id(), dir, String.view(&path), String.view(&folder), app.sheetCount(), mode == Mode.Dev)
         run artifacts.append(Artifact { target: hosts[at].target, path: move folder, bytes: bytes })
       } else {
         run artifacts.append(Artifact { target: hosts[at].target, path: move path, bytes: bytes })
@@ -694,7 +731,7 @@ impl Built {
 
 static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
   /// A fingerprint of the files under `dir`: their paths, sizes and contents, folded.
-  effect fn fingerprint(dir: &Path, hash: &mut u64) -> ()
+  effect fn fingerprint(dir: &Path, hash: &mut u64, excluded: &[Path]) -> ()
     ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let entries = run FileSystem.listDirectory(dir)
     let items = List<DirectoryEntry>.asSlice(&entries)
@@ -702,8 +739,18 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     while at < items.length {
       let name = Path.name(&items[at].path) |> Option<string>.unwrapOr("")
       if items[at].kind.code == 1 && name != "build" && !String.startsWith(name, ".") {
-        run fingerprint(&items[at].path, &mut hash)
+        run fingerprint(&items[at].path, &mut hash, excluded)
       } else if items[at].kind.code == 0 {
+        let mut skip = false
+        let mut index: usize = 0
+        while index < excluded.length {
+          if Path.view(&items[at].path).unwrapOr("") == Path.view(&excluded[index]).unwrapOr("") { skip = true }
+          index = index + 1
+        }
+        if skip {
+          at = at + 1
+          continue
+        }
         let bytes = run FileSystem.readFile(&items[at].path)
         fold(&mut hash, Path.rawBytes(&items[at].path))
         fold(&mut hash, Bytes.asSlice(&bytes))
@@ -722,11 +769,17 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
     hash.* = value
   }
 
-  effect fn sources(project: &Project) -> u64
+  effect fn sources(project: &Project, css: &[string<'static>]) -> u64
     ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let mut hash: u64 = 2166136261
+    let mut excluded = List<Path>.make()
+    let mut at: usize = 0
+    while at < css.length {
+      run excluded.append(run stylesheets.sourcePath(String.view(&project.root), css[at]))
+      at = at + 1
+    }
     let src = run Path.make(String.view(&run joined(String.view(&project.root), "src")))
-    if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash) }
+    if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash, excluded.asSlice()) }
     return hash
   }
 }
@@ -748,17 +801,23 @@ effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator
   fail TaskError { message: move message, status: code }
 }
 
+/// Refreshes generated assets before rebuilding, including edits made during development.
+effect fn rebuildHost(project: &Project, host: &Host, sheets: &[string<'static>]) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  run stylesheets.emit(String.view(&project.root), sheets, String.view(&host.dir), host.target.id() == "web-dom")
+  run compileHost(String.view(&host.dir), Mode.Dev, host.target.web())
+}
+
 /// Builds a web host again and puts the new program in its page's folder.
-effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact) -> ()
+effect fn rebuildPage(project: &Project, host: &Host, artifact: &Artifact, sheets: &[string<'static>]) -> ()
   ! TaskError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let dir = String.view(&host.dir)
-  run compileHost(dir, Mode.Dev, true)
-  let mut name = run String.copy(String.view(&project.name))
-  run String.append(&mut name, "-")
-  run String.append(&mut name, host.target.id())
+  run rebuildHost(project, host, sheets)
+  let name = run hostPackageName(String.view(&project.name), host.target.id())
   let wasm = run binary(dir, String.view(&name), Mode.Dev)
-  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path))
+  run site(project, host.target.id(), dir, String.view(&wasm), String.view(&artifact.path), sheets.length, true)
 }
 
 impl Running {
@@ -777,23 +836,46 @@ impl Running {
       let loom = running.launched.source.writtenIn.id() == "loom"
       let rebuilds = loom && running.launched.madeIn == Mode.Dev
       let project = run readProject()
-      let mut seen = run sources(&project)
+      let mut seen = run sources(&project, running.launched.source.stylePaths.asSlice())
       if running.target.web() {
         let mut server = match move Intrinsic.replace(running.server, Option<Server>.None) {
           Option<Server>.Some { value } => move value
           Option<Server>.None => run Task.abort("silkui: the page has no server")
         }
+        let watchesStyles = rebuilds && running.launched.source.stylePaths.length() != 0
+        let mut styled = Option<u64>.None
         if rebuilds { run say("watching src/ for changes") }
+        if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
         while true {
           run server.serveFor(300)
+          if watchesStyles {
+            let current = run Effect.result(stylesheets.fingerprint(String.view(&project.root), running.launched.source.stylePaths.asSlice()))
+            match move current {
+              Result.Success { value: fingerprint } => {
+                if styled.isNone() || fingerprint != styled.unwrapOr(0) {
+                  styled = Option<u64>.Some { value: fingerprint }
+                  let artifact = &running.launched.outputs.asSlice()[0]
+                  let updated = run Effect.result(stylesheets.emit(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&artifact.path), running.target.id() == "web-dom"))
+                  match move updated {
+                    Result.Success { .. } => { server.styles = server.styles + 1 }
+                    Result.Failure { error } => {
+                      drop error
+                      run say("stylesheet update failed: the page keeps its previous styles")
+                    }
+                  }
+                }
+              }
+              Result.Failure { error } => { drop error }
+            }
+          }
           if !rebuilds { continue }
-          let now = run sources(&project)
+          let now = run sources(&project, running.launched.source.stylePaths.asSlice())
           if now == seen { continue }
           seen = now
           run say("src/ changed: rebuilding")
           let artifact = &running.launched.outputs.asSlice()[0]
           let host = &running.launched.source.hosts.asSlice()[0]
-          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact))
+          let rebuilt = run Effect.result(rebuildPage(&project, host, artifact, running.launched.source.stylePaths.asSlice()))
           match move rebuilt {
             Result.Success { .. } => { server.build = server.build + 1 }
             Result.Failure { error } => {
@@ -808,11 +890,32 @@ impl Running {
         Option<Child>.Some { value } => move value
         Option<Child>.None => run Task.abort("silkui: the app has no program running")
       }
-      if !rebuilds { return run ended(child.wait()) }
-      run say("watching src/ for changes")
+      let watchesStyles = running.launched.madeIn == Mode.Dev && running.launched.source.stylePaths.length() != 0
+      if !rebuilds && !watchesStyles { return run ended(child.wait()) }
+      if rebuilds { run say("watching src/ for changes") }
+      if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
+      let mut styled = Option<u64>.None
       while !child.ended() {
         pause(300)
-        let now = run sources(&project)
+        if watchesStyles {
+          let current = run Effect.result(stylesheets.fingerprint(String.view(&project.root), running.launched.source.stylePaths.asSlice()))
+          match move current {
+            Result.Success { value: fingerprint } => {
+              if styled.isNone() || fingerprint != styled.unwrapOr(0) {
+                styled = Option<u64>.Some { value: fingerprint }
+                let host = &running.launched.source.hosts.asSlice()[0]
+                let updated = run Effect.result(stylesheets.emitWithCompiled(String.view(&project.root), running.launched.source.stylePaths.asSlice(), String.view(&host.dir), false, String.view(&running.launched.source.compiledSheet)))
+                if let Result<(), TaskError | FileError | OutOfMemoryError>.Failure { error } = move updated {
+                  drop error
+                  run say("stylesheet update failed: the application keeps its previous styles")
+                }
+              }
+            }
+            Result.Failure { error } => { drop error }
+          }
+        }
+        if !rebuilds { continue }
+        let now = run sources(&project, running.launched.source.stylePaths.asSlice())
         if now == seen { continue }
         seen = now
         run say("src/ changed: rebuilding")
@@ -821,8 +924,8 @@ impl Running {
         // The program is linked in place, so it stops before the build. A failed build
         // leaves the previous program, which starts again.
         child.stop()
-        let rebuilt = run Effect.result(compileHost(String.view(&host.dir), Mode.Dev, false))
-        if let Result<(), TaskError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
+        let rebuilt = run Effect.result(rebuildHost(&project, host, running.launched.source.stylePaths.asSlice()))
+        if let Result<(), TaskError | FileError | HostInputError | OutOfMemoryError>.Failure { error } = move rebuilt {
           drop error
           run say("the build failed: the previous build runs until the next change")
         }

@@ -766,3 +766,41 @@ test effect fn textTreatmentsSpaceTransformAndBreak() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run textTreatmentsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn activatedFacesBody() ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let first = run system.fonts.set.declare(run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0)))
+  let second = run system.fonts.set.declare(run FaceRule.make(String.utf8Bytes("Brand"), Range.point(400.0)))
+  run Testing.expect(run system.fonts.set.load(first, run readFile(SERIF),0), "first face loads")
+  run Testing.expect(run system.fonts.set.load(second, run readFile(BOLD),0), "second face loads")
+  let normal = run system.addStyle(run families(&["Brand", "Noto Sans"],16.0))
+  run Testing.expect(system.keyInfo(normal).face == 4, "later face wins equal descriptors by default")
+  drop system.fonts.set.setActive(second,false,1)
+  let removed = run system.addStyle(run families(&["Brand", "Noto Sans"],16.0))
+  run Testing.expect(system.keyInfo(removed).face == 3, "deactivating a rule reveals the earlier face")
+  drop system.fonts.set.setActive(second,true,1)
+  drop system.fonts.set.setActive(first,true,100)
+  let reordered = run system.addStyle(run families(&["Brand", "Noto Sans"],16.0))
+  run Testing.expect(system.keyInfo(reordered).face == 3, "explicit cascade order takes precedence over insertion order")
+  let generation = system.fonts.set.generation
+  run Testing.expect(!system.fonts.set.setActive(first,true,100) && system.fonts.set.generation == generation, "unchanged eligibility does not invalidate font matching")
+  drop system.fonts.set.setActive(first,false,100)
+  drop system.fonts.set.setActive(second,false,1)
+  let fallback = run system.addStyle(run families(&["Brand", "Noto Sans"],16.0))
+  run Testing.expect(!system.fonts.set.hasFamily(String.utf8Bytes("Brand")) && system.keyInfo(fallback).face == 0, "removing all faces restores the fallback family")
+  drop system.fonts.set.setActive(first,true,100)
+  let restored = run system.addStyle(run families(&["Brand", "Noto Sans"],16.0))
+  run Testing.expect(system.keyInfo(restored).face == 3 && system.fonts.set.faceCount() == 5 && !system.fonts.set.hasWanted(), "reactivation reuses loaded bytes without another request")
+  let pending = run system.fonts.set.declare(run FaceRule.make(String.utf8Bytes("Pending"), Range.point(400.0)))
+  system.fonts.set.markFailed(pending)
+  run Testing.expect(system.fonts.set.retry(pending) && system.fonts.set.state(pending) == FaceState.Loading, "an alternative source can retry a failed face")
+  system.fonts.set.markFailed(pending)
+  drop system.fonts.set.setActive(pending,false,0)
+  run Testing.expect(!system.fonts.set.retry(pending), "inactive rules do not retry their sources")
+}
+
+test effect fn declaredFacesCanDeactivateReorderAndReuseLoadedData() ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run activatedFacesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

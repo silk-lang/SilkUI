@@ -191,8 +191,8 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
   (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
   `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
   `li` have theirs, and nothing has a default style.
-- **Style.** `h.Style` with CSS values (`fontSize: '13px'`). There are no stylesheets yet, so
-  `h.Class` matches nothing. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
+- **Style.** `h.Style` with CSS values (`fontSize: '13px'`) and `h.Class` for adopted
+  stylesheets. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
   and `StartingStyle` from this package are the looks the tree lays over an element in those
   states, as attributes.
 - **Events.** The `On*` attributes of the events the tree has: clicks, pointers, keys, focus,
@@ -448,3 +448,24 @@ silk task browser serve --app modules/js/examples/plain-counter/dist/app.js
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
   174 MB. The GPU stack is most of each; the engine with `@silkui/core` adds about 14 MB and
   React about 5 MB more.
+
+### Selector identity
+
+Core nodes expose a string `id`, `className`, a live `classList` (`add`, `remove`,
+`toggle`, `contains`, `replace`), and `getAttribute`, `hasAttribute`, and
+`removeAttribute`. `setAttribute` accepts `data-*`, `aria-*`, `lang`, and `dir`;
+empty strings and `"false"` are present values, while null removes the attribute.
+React passes `className`, `id`, `data-*`, and `aria-*` props through. Foldkit's
+existing class and data attributes reach the same native nodes.
+
+The numeric handle formerly exposed as `node.id` is now the read-only
+`node.nodeId`. Use it with `nodeById` and low-level host calls; changing the CSS
+`id` does not change that handle or event routing. Existing accessibility
+relations continue to resolve by the string id.
+
+CSS imports processed by `@silkui/vite` are compiled and adopted by the native tree.
+Production sheets embed local font assets, including Vite public-directory fonts.
+Development sheets use the Vite asset server; CSS and font edits preserve the mounted
+application. Middleware-mode integrations that serve fonts must set `server.origin`.
+See the [stylesheet guide](../../docs/content/core/stylesheets.md) for adoption APIs,
+runtime loading, and supported CSS.

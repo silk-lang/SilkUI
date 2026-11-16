@@ -10,13 +10,18 @@ import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position 
 import style { Computed, Fill }
 import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
 import resources { Resources, Resource }
-import scrollbar { thumbOf, Thumb, rangeOf, scrolls, usedOverflow }
+import scrollbar { geometryOf, Thumb, rangeOf, scrolls, usedOverflow }
 import layers
 import transform
 import layers { Sticky }
 import stacking
 import stacking { Stacking, IN_FLOW }
 import edit
+import selection
+import placeholder
+import scrollbar_parts { Part, Scrollbars, THUMB_COLOR }
+import scrollbar_parts
+import caret
 import rich
 import ui_text.system { TextSystem }
 import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
@@ -441,6 +446,52 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   ! OutOfMemoryError
   ? &mut Allocator {
   let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input && f.textData != NO_INDEX {
+    let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+    let e = node.edit()
+    if e.focused && !e.composing && !e.showsPlaceholder && e.anchor != e.focus {
+      if selection.styled(node) {
+        let foreground = selection.foreground(node)
+        let mut piece = caret.pieceOf(p.output, p.text, index)
+        let r = rich.runOf(&e.runs, f.source)
+        if e.hasRuns() && r != NO_INDEX {
+          let found = e.runs.get(r)
+          piece.start = piece.start + found.start
+          piece.end = piece.end + found.start
+          piece.base = found.start
+        }
+        let span = caret.spanX(p.text, &piece, e.toDisplay(e.low()), e.toDisplay(e.high()))
+        if span.xMin < span.xMax {
+          let selected = ContentMask.new(device(span, p.scale)).intersect(mask)
+          let b = mask.bounds
+          let s = selected.bounds
+          if s.xMin < s.xMax && s.yMin < s.yMax {
+            // Paint disjoint regions so alpha and partial ligatures replace the
+            // selected ink rather than compositing another glyph on top of it.
+            let outside = [Rect<f32>.new(b.xMin, b.yMin, b.xMax, s.yMin),
+              Rect<f32>.new(b.xMin, s.yMax, b.xMax, b.yMax),
+              Rect<f32>.new(b.xMin, s.yMin, s.xMin, s.yMax),
+              Rect<f32>.new(s.xMax, s.yMin, b.xMax, s.yMax)]
+            let mut i: usize = 0
+            while i < outside.length {
+              let rect = outside[i]
+              if rect.xMin < rect.xMax && rect.yMin < rect.yMax {
+                run paintTextNormally(&mut p, index, slot, f, ContentMask.new(rect))
+              }
+              i = i + 1
+            }
+            run paintTextAs(&mut p, index, slot, f, selected, Option<Rgba<f32>>.None, foreground)
+            return ()
+          }
+        }
+      }
+    }
+  }
+  run paintTextNormally(&mut p, index, slot, f, mask)
+}
+
+effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
   if slot != NONE {
     if p.nodes.asSlice()[u32.toUsize(slot)].computed.effects.shadowFrom != NONE {
       let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
@@ -462,14 +513,14 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
           effects.blur = shadow.blur * 0.5 * p.scale
           drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 }, effects)
         }
-        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color))
+        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color), Option<Rgba<f32>>.None)
         if blurred {
           run p.scene.popLayer()
         }
       }
     }
   }
-  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None)
+  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None, Option<Rgba<f32>>.None)
 }
 
 /// Paints a text fragment: its glyph run, as shaped during layout, and its decorations, all in
@@ -481,6 +532,7 @@ effect fn paintTextAs(
   f: Fragment,
   mask: ContentMask,
   shadow: Option<Rgba<f32>>,
+  foreground: Option<Rgba<f32>>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -502,7 +554,10 @@ effect fn paintTextAs(
   if p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input {
     let e = p.nodes.asSlice()[u32.toUsize(slot)].edit()
     if e.showsPlaceholder {
-      color = c.text.placeholder()
+      if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(slot)]) {
+        c = value.computed
+        color = c.text.color
+      } else { color = c.text.placeholder() }
     }
     let r = rich.runOf(&e.runs, f.source)
     if e.hasRuns() && r != NO_INDEX {
@@ -516,6 +571,7 @@ effect fn paintTextAs(
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
+  if let Option.Some { value } = foreground { color = value c.text.color = value }
   let mut shadowed = false
   if let Option<Rgba<f32>>.Some { value } = shadow {
     color = value
@@ -1237,7 +1293,7 @@ effect fn noteOrder(p: &mut Painter<'_, '_>, f: &Fragment) -> ()
     return ()
   }
   let slot = slotIn(p.slotOfCss, f.source)
-  if slot != NONE {
+  if slot != NONE && !p.nodes.asSlice()[u32.toUsize(slot)].isGenerated() {
     run p.order.append(p.nodes.asSlice()[u32.toUsize(slot)].id)
   }
 }
@@ -1775,6 +1831,13 @@ effect fn decorateRun(p: &mut Painter<'_, '_>, f: &Fragment, mask: ContentMask) 
   if owner == NONE || p.nodes.asSlice()[u32.toUsize(owner)].kind != NodeKind.Input {
     return ()
   }
+  if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(owner)]) {
+    if value.css == f.source {
+      let c = value.computed
+      if c.text.visible && c.decorated() { run decorate(&mut p, NONE, &c, f, f.decorationEdges, mask) }
+      return ()
+    }
+  }
   let e = p.nodes.asSlice()[u32.toUsize(owner)].edit()
   let r = rich.runOf(&e.runs, f.source)
   if r == NO_INDEX || e.runs.get(r).css != f.source {
@@ -1791,10 +1854,19 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   ? &mut Allocator {
   let slot = slotIn(p.slotOfCss, f.source)
   if slot == NONE {
+    let owner = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+    let mut partOpacity: f32 = 1.0
+    if owner != NONE {
+      if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(owner)]) {
+        if value.css == f.source { partOpacity = value.computed.paint.opacity }
+      }
+    }
+    if partOpacity < 1.0 { drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: partOpacity, blend: 0 }, LayerEffects.none()) }
     if !f.nonpainting {
       run decorateRun(&mut p, &f, mask)
     }
     run paintStack(&mut p, index, mask)
+    if partOpacity < 1.0 { run p.scene.popLayer() }
     return ()
   }
   let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
@@ -1895,9 +1967,6 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   }
 }
 
-/// The color of overlay scrollbar thumbs: a gray that shows on light and dark backgrounds.
-const THUMB_COLOR: Rgba<f32> = Rgba<f32> { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
-
 /// Draws the overlay scrollbar thumbs of a scroll container over its content.
 effect fn paintThumbs(
   p: &mut Painter<'_, '_>,
@@ -1909,10 +1978,32 @@ effect fn paintThumbs(
   ! OutOfMemoryError
   ? &mut Allocator {
   let range = rangeOf(c, f)
-  let id = p.nodes.asSlice()[u32.toUsize(slot)].id
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let generated = node.isGenerated()
+  let vertical = geometryOf(node, f, if generated { node.scrollY } else { range.minY }, true)
+  let horizontal = geometryOf(node, f, if generated { node.scrollX } else { range.minX }, false)
+  let id = node.id
+  let parts = match scrollbar_parts.of(node) { Option.Some { value } => Option<Scrollbars>.some(value.*) _ => Option<Scrollbars>.None }
+  let mut thumbStyle = Option<Part>.None
+  if let Option.Some { value } = parts {
+    thumbStyle = Option<Part>.some(value.thumb)
+    if vertical.thumb.visible {
+      run paintScrollbarPart(&mut p, vertical.track, value.bar, mask)
+      run paintScrollbarPart(&mut p, vertical.track, value.track, mask)
+    }
+    if horizontal.thumb.visible {
+      run paintScrollbarPart(&mut p, horizontal.track, value.bar, mask)
+      run paintScrollbarPart(&mut p, horizontal.track, value.track, mask)
+    }
+  }
+  if generated {
+    run paintThumb(&mut p, vertical.thumb, thumbStyle, mask)
+    run paintThumb(&mut p, horizontal.thumb, thumbStyle, mask)
+    return ()
+  }
   let port = device(paddingBox(f), p.scale)
-  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minY, true), range.minY, port, true, mask)
-  run paintThumbIn(&mut p, id, thumbOf(c, f, range.minX, false), range.minX, port, false, mask)
+  run paintThumbIn(&mut p, id, vertical.thumb, thumbStyle, range.minY, port, true, mask)
+  run paintThumbIn(&mut p, id, horizontal.thumb, thumbStyle, range.minX, port, false, mask)
 }
 
 /// Opens the scroll group of the content of scroll container `slot` (fragment `f`), cut to
@@ -1933,6 +2024,15 @@ effect fn openScroller(
   let sx: f32 = node.scrollX * s
   let sy: f32 = node.scrollY * s
   let range = rangeOf(c, f)
+  if node.isGenerated() {
+    // Private boxes have no compositor-facing client id. Their offsets are baked into
+    // paint and its cache key, preserving the origin's independent scroll record.
+    let mut x = ScrollAxis.fixed()
+    let mut y = ScrollAxis.fixed()
+    x.base = -sx
+    y.base = -sy
+    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, inner.bounds, inner.bounds)
+  } else {
   run p.scene.setScroll(
     ScrollPosition {
       node: id,
@@ -1949,6 +2049,7 @@ effect fn openScroller(
     inner.bounds,
     inner.bounds,
   )
+  }
   let seen = ContentMask.new(p.cull).intersect(inner).bounds
   let lead: f32 = p.lead
   let leadX: f32 = if scrolls(usedOverflow(c, true)) {
@@ -1984,6 +2085,7 @@ effect fn paintThumbIn(
   p: &mut Painter<'_, '_>,
   id: u32,
   thumb: Thumb,
+  style: Option<Part>,
   start: f32,
   port: Rect<f32>,
   vertical: bool,
@@ -2011,18 +2113,42 @@ effect fn paintThumbIn(
     ScrollLink { node: id, x: axis, y: ScrollAxis.fixed() }
   }
   drop run p.scene.pushScrollGroup(link, mask.bounds, port)
-  run paintThumb(&mut p, thumb, mask)
+  run paintThumb(&mut p, thumb, style, mask)
   run p.scene.popScrollGroup()
 }
 
-effect fn paintThumb(p: &mut Painter<'_, '_>, thumb: Thumb, mask: ContentMask) -> ()
+effect fn paintThumb(p: &mut Painter<'_, '_>, thumb: Thumb, style: Option<Part>, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !thumb.visible {
     return ()
   }
+  if let Option.Some { value } = style {
+    run paintScrollbarPart(&mut p, thumb.rect, value, mask)
+    return ()
+  }
   let mut quad = Quad.fill(device(thumb.rect, p.scale), mask, Background.solid(THUMB_COLOR))
   quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
+  drop run p.scene.quad(quad)
+}
+
+/// Scrollbar parts use the same solid/gradient fill, border, and corner primitives as boxes.
+effect fn paintScrollbarPart(p: &mut Painter<'_, '_>, rect: Rect<f32>, part: Part, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if part.hidden { return () }
+  let paint = part.paint
+  let background = backgroundOf(paint.background)
+  let bordered = paint.borderStyle != StyleBorder.None && paint.borderColor.a > 0.0
+  if background.isTransparent() && !bordered { return () }
+  let scale = p.scale
+  let mut quad = Quad.fill(device(rect, scale), mask, background)
+  quad.cornerRadii = scaledCorners(paint.radii, scale)
+  if bordered {
+    quad.borderWidths = Insets<f32> { top: borderWidth(paint.border.top * scale), right: borderWidth(paint.border.right * scale),
+      bottom: borderWidth(paint.border.bottom * scale), left: borderWidth(paint.border.left * scale) }
+    quad.borderColor = paint.borderColor
+    quad.borderStyle = if paint.borderStyle == StyleBorder.Dashed { BorderStyle.Dashed } else { BorderStyle.Solid }
+  }
   drop run p.scene.quad(quad)
 }
 
@@ -2103,7 +2229,8 @@ fn ownHash(
   let slot = styleSlot(slots, css, nodes, f.source)
   if slot != NONE {
     let node = &nodes.asSlice()[u32.toUsize(slot)]
-    h = Hash.combine(h, node.paintHash)
+    h = selection.hash(node, Hash.combine(h, node.paintHash))
+    if node.isGenerated() { h = floatHash(h, node.scrollX) h = floatHash(h, node.scrollY) }
     if f.kind == FragmentKind.Box {
       h = transform.perspectiveHash(&node.computed.transform, h)
       h = Hash.combine(h, node.content)

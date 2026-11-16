@@ -1,0 +1,128 @@
+//! Per-pass cache: scope ids and parent styles stay valid only until the next root restyle.
+import mutation { Declaration }
+import properties.values
+import svg_css.adopted { Candidate, Source }
+import svg_css.cascade
+import svg_css.variables { ScopeId }
+import silk.collections.list { List }
+import silk.collections.hash_map { HashMap }
+import silk.collections.hash { Hash }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+const LIMIT: usize = 128
+
+struct Entry {
+  scope: usize,
+  parent: u32,
+  candidates: List<Candidate>,
+  inline: List<Declaration>,
+  declarations: List<Declaration>,
+  next: usize,
+}
+
+pub struct Cache { entries: List<Entry>, heads: HashMap<u64, usize> }
+
+pub effect fn copy(source: &[Declaration]) -> List<Declaration> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<Declaration>.make()
+  let mut i: usize = 0
+  while i < source.length {
+    run out.append(run values.cloneDeclaration(&source[i]))
+    i = i + 1
+  }
+  return move out
+}
+
+fn hash(scope: ScopeId, parent: u32, candidates: &[Candidate]) -> u64 {
+  let mut result = Hash.mix(&Hash.seed(5347), usize.toU64(scope.index))
+  result = Hash.combine(result, u32.toU64(parent))
+  let mut i: usize = 0
+  while i < candidates.length {
+    match candidates[i].source {
+      Source.Sheet { sheet, declaration } => {
+        result = Hash.combine(result, usize.toU64(sheet))
+        result = Hash.combine(result, usize.toU64(declaration))
+      }
+      Source.Inline { declaration } => {
+        result = Hash.combine(result, 18446744073709551615)
+        result = Hash.combine(result, usize.toU64(declaration))
+      }
+    }
+    let specificity = candidates[i].priority.specificity
+    result = Hash.combine(result, usize.toU64(specificity.ids))
+    result = Hash.combine(result, usize.toU64(specificity.classes))
+    result = Hash.combine(result, usize.toU64(specificity.types))
+    i = i + 1
+  }
+  return result
+}
+
+fn sameSource(a: Source, b: Source) -> bool {
+  return match a {
+    Source.Sheet { sheet, declaration } => match b {
+      Source.Sheet { sheet: otherSheet, declaration: otherDeclaration } => sheet == otherSheet && declaration == otherDeclaration
+      _ => false
+    }
+    Source.Inline { declaration } => match b {
+      Source.Inline { declaration: otherDeclaration } => declaration == otherDeclaration
+      _ => false
+    }
+  }
+}
+
+fn same(entry: &Entry, scope: ScopeId, parent: u32, candidates: &[Candidate], inline: &[Declaration]) -> bool {
+  if entry.scope != scope.index || entry.parent != parent || entry.candidates.length() != candidates.length || entry.inline.length() != inline.length { return false }
+  let mut i: usize = 0
+  while i < candidates.length {
+    let previous = entry.candidates.asSlice()[i]
+    if !sameSource(previous.source, candidates[i].source) || cascade.compare(previous.priority, candidates[i].priority) != 0 { return false }
+    i = i + 1
+  }
+  i = 0
+  while i < inline.length {
+    if !values.sameDeclaration(&entry.inline.asSlice()[i], &inline[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
+impl Cache {
+  pub fn make() -> Cache {
+    return Cache { entries: List<Entry>.make(), heads: HashMap<u64, usize>.make(Hash.seed(5351)) }
+  }
+
+  pub fn reset(self: &mut Self) -> () {
+    self.entries.truncate(0)
+    self.heads.clear()
+  }
+
+  pub fn find(self: &Self, scope: ScopeId, parent: u32, candidates: &[Candidate], inline: &[Declaration]) -> usize {
+    let mut at = match self.heads.get(hash(scope, parent, candidates)) { Option.Some { value } => value _ => usize.MAX }
+    while at != usize.MAX {
+      let entry = &self.entries.asSlice()[at]
+      if same(entry, scope, parent, candidates, inline) { return at }
+      at = entry.next
+    }
+    return usize.MAX
+  }
+
+  pub effect fn declarations(self: &Self, index: usize) -> List<Declaration> ! OutOfMemoryError ? &mut Allocator {
+    return run copy(self.entries.asSlice()[index].declarations.asSlice())
+  }
+
+  pub effect fn insert(self: &mut Self, scope: ScopeId, parent: u32, candidates: &[Candidate], inline: &[Declaration], declarations: &[Declaration]) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if self.entries.length() == LIMIT { return () }
+    let key = hash(scope, parent, candidates)
+    let next = match self.heads.get(key) { Option.Some { value } => value _ => usize.MAX }
+    let mut inputs = List<Candidate>.make()
+    run inputs.appendSlice(candidates)
+    let entry = Entry { scope: scope.index, parent: parent, candidates: move inputs,
+      inline: run copy(inline), declarations: run copy(declarations), next: next }
+    let index = self.entries.length()
+    run self.entries.append(move entry)
+    drop run self.heads.insert(key, index)
+  }
+}

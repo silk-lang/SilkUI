@@ -9,12 +9,15 @@
 // them, and an edit replaces only the modules it touches: see dev.js. The plugin knows no
 // UI framework: `@silkui/react/vite` adds React's JSX, its reconciler fix and Fast Refresh.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
+import { compileStylesheet } from "./compiler.js";
+import { stylesheetDevPlugin } from "./stylesheets.js";
+import { fontAssetResolver } from "./font-assets.js";
 
 /**
  * @param {object} [options]
@@ -41,6 +44,9 @@ export default function silk(options = {}) {
   let bundle = "";
   let watching = false;
   let child = null;
+  let stylesheetPath = "";
+  let emittedStylesheet = false;
+  let stylesheetConfig;
 
   function startHost() {
     const { command, args = [], cwd } = options.host;
@@ -65,7 +71,8 @@ export default function silk(options = {}) {
         build: {
           target: "es2022",
           minify: mode !== "development",
-          lib: { entry, formats: ["es"], fileName: () => fileName },
+          cssCodeSplit: false,
+          lib: { entry, formats: ["es"], fileName: () => fileName, cssFileName: "app" },
           rolldownOptions: { output: { codeSplitting: false } },
         },
       };
@@ -115,6 +122,7 @@ export default function silk(options = {}) {
       }
       const owner = ownerOf(id, root);
       for (const { name, area } of missingApis(ast)) {
+        if (serving && (name === "TextEncoder" || name === "TextDecoder")) continue;
         if (allow.has(name) || (node && !NOT_IN_NODE.has(area))) continue;
         let use = uses.get(name);
         if (!use) uses.set(name, (use = { area, owners: new Set() }));
@@ -132,7 +140,42 @@ export default function silk(options = {}) {
     },
   };
 
-  const plugins = [buildPlugin, apiPlugin];
+  const cssPlugin = {
+    name: "silk:stylesheets",
+    apply: "build",
+    enforce: "post",
+    configResolved(config) {
+      stylesheetPath = resolve(config.root, config.build.outDir, "app.sheet");
+      stylesheetConfig = config;
+    },
+    generateBundle: {
+      order: "post",
+      handler(_options, output) {
+        const sheets = Object.values(output).filter(item => item.type === "asset" && item.fileName.endsWith(".css"));
+        emittedStylesheet = sheets.length !== 0;
+        if (!sheets.length) return;
+        const css = sheets.map(sheet => typeof sheet.source === "string" ? sheet.source : new TextDecoder().decode(sheet.source)).join("\n");
+        let compiled;
+        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
+        catch (error) {
+          const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
+          this.error(error.message + (dropped ? `\n${dropped}` : ""));
+        }
+        for (const diagnostic of compiled.diagnostics) {
+          this.warn(`dropped ${diagnostic.count} ${diagnostic.kind} occurrence(s): ${diagnostic.feature}`);
+        }
+        for (const sheet of sheets) {
+          delete output[sheet.fileName];
+          delete output[sheet.fileName + ".map"];
+        }
+        this.emitFile({ type: "asset", fileName: "app.sheet", source: compiled.bytes });
+      },
+    },
+    writeBundle() {
+      if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
+    },
+  };
+  const plugins = [buildPlugin, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }

@@ -1,3 +1,13 @@
+/** A constructed stylesheet. Text loading requires runtime stylesheet compilation in the host. */
+export class CSSStyleSheet {
+  static fromCompiled(bytes: Uint8Array | ArrayBuffer | string): CSSStyleSheet;
+  replaceCompiled(bytes: Uint8Array | ArrayBuffer | string): void;
+  replaceSync(text: string): void;
+  replace(text: string): Promise<CSSStyleSheet>;
+}
+/** Used by build tools to replace or remove a compiled CSS import without restarting the app. */
+export function updateStyleSheet(id: string, compiled: Uint8Array | ArrayBuffer | string | null): void;
+
 import type * as CSS from "csstype";
 
 /** The node kinds of the tree. `richinput` is an `input` with marks and atoms. */
@@ -29,11 +39,34 @@ export interface Look {
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
 export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
 
+/** Live tokens in a node's class attribute. */
+export class ClassList implements Iterable<string> {
+  constructor(node: Node);
+  value: string;
+  readonly length: number;
+  item(index: number): string | null;
+  contains(token: string): boolean;
+  add(...tokens: string[]): void;
+  remove(...tokens: string[]): void;
+  toggle(token: string, force?: boolean): boolean;
+  replace(oldToken: string, newToken: string): boolean;
+  values(): IterableIterator<string>;
+  keys(): IterableIterator<number>;
+  entries(): IterableIterator<[number, string]>;
+  forEach(callback: (value: string, index: number, list: ClassList) => void, thisArg?: unknown): void;
+  [Symbol.iterator](): IterableIterator<string>;
+  toString(): string;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   constructor(kind: NodeKind);
-  /** The tree's number for the node (not the DOM `id`: that is `setAttribute("id", ...)`). */
-  readonly id: number;
+  /** Stable protocol identifier, independent of the CSS id attribute. */
+  readonly nodeId: number;
+  id: string;
+  className: string;
+  adoptedStyleSheets: CSSStyleSheet[];
+  readonly classList: ClassList;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
@@ -61,9 +94,13 @@ export class Node {
   /**
    * Sets a tree attribute (`tabIndex`, `disabled`, `label`, `testId`, `placeholder`, `href`,
    * `cursor`, `multiline`, `readOnly`, `inert`, `focusTrap`, `transition`), `id`, `role`, or
-   * an ARIA attribute spelled `aria-checked` or `ariaChecked`.
+   * an ARIA attribute spelled `aria-checked` or `ariaChecked`, or a `data-*` attribute.
+   * `null` and `undefined` remove an attribute.
    */
   setAttribute(name: string, value: unknown): void;
+  getAttribute(name: string): string | null;
+  hasAttribute(name: string): boolean;
+  removeAttribute(name: string): void;
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;

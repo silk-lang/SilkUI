@@ -879,3 +879,77 @@ test effect fn semanticsReachAccessKit() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run accessSemantics() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import ui_tree.mutation { ariaText }
+import silk.collections.bytes { Bytes }
+
+effect fn literalRelations() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let root = run tree.box(&[])
+  let title = run tree.box(&[])
+  let other = run tree.box(&[])
+  let field = run tree.input(&[])
+  let detached = run tree.box(&[])
+  run tree.append(root, title)
+  run tree.append(root, other)
+  run tree.append(root, field)
+  run tree.setRoot(root)
+  run tree.setAttribute(title, Attribute.ElementId { value: run String.copy("title") })
+  run tree.setAttribute(title, Attribute.Label { value: run String.copy("Title") })
+  run tree.setAttribute(other, Attribute.Label { value: run String.copy("Other") })
+  run tree.setAttribute(detached, Attribute.ElementId { value: run String.copy("title") })
+  run tree.setAttribute(detached, Attribute.Label { value: run String.copy("Detached") })
+  run tree.setAttribute(field, Attribute.Label { value: run String.copy("Fallback") })
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-labelledby"), value: Option<String>.some(run String.copy("title title missing")) })
+  let mut name = String.make()
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "literal relations resolve element IDs in the same root and skip duplicates")
+
+  let mut ids = List<u32>.make()
+  run ids.append(title.id().raw())
+  let typed = Attribute.LabelledBy { ids: move ids }
+  let mut numeric = Bytes.make()
+  drop run ariaText(&typed, &mut numeric)
+  let number = unsafe String.fromUtf8Unchecked(numeric.asSlice())
+  run tree.setAttribute(other, Attribute.ElementId { value: run String.copy(number) })
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-labelledby"), value: Option<String>.some(run String.copy(number)) })
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Other", "a numeric-looking literal ID is never interpreted as a node number")
+  run tree.setAttribute(field, move typed)
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "a later typed reference uses the actual node number")
+
+  run tree.setAttribute(other, Attribute.ElementId { value: run String.copy("title") })
+  run tree.insertBefore(root, other, title)
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-labelledby"), value: Option<String>.some(run String.copy("title")) })
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-describedby"), value: Option<String>.some(run String.copy("title")) })
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-controls"), value: Option<String>.some(run String.copy("title")) })
+  drop run tree.frame(viewport(), 0.0)
+  let mut access = AccessTree.make()
+  let update = run access.fullUpdate(tree.engine())
+  run Testing.expect(labelOf(&update, field.id().raw(), "Other"), "duplicate literal IDs resolve to the first element in tree order")
+  let correct = match entryOf(&update, field.id().raw()) {
+    Option.Some { value } => value.node.controls().length == 1
+      && value.node.controls()[0].equals(accessId(other.id().raw()))
+      && match value.node.description() { Option.Some { value: description } => description == "Other" Option.None => false }
+    Option.None => false
+  }
+  run Testing.expect(correct, "literal descriptions and controls reach accessibility")
+  run tree.setAttribute(other, Attribute.ElementId { value: run String.copy("renamed") })
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "renaming a target re-resolves literal references")
+  run tree.destroy(title)
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "removed targets fall back to the explicit label")
+  run tree.setAttribute(field, Attribute.Named { name: run String.copy("aria-labelledby"), value: Option<String>.None })
+  run accessibleName(tree.engine(), tree.engine().slotOf(field.id().raw()), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "removing a literal relation clears the previous numeric reference too")
+}
+
+test effect fn literalAriaRelationsResolveElementIdsInTreeOrder() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run literalRelations() |> Effect.provideMut<Allocator>(&mut allocator)
+}

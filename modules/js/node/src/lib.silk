@@ -12,11 +12,14 @@
 //! run app.entry(b"/app/app.js", source)
 //! let status = run app.start(b"my-app")
 //! ```
-import ui_js.lib { Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
+import ui_js.lib { StylesheetCompiler, Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
 import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
 import ui_tree.lib { EventRecord }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+import ui_tree.legacy { FrameInput }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
 import ui_tree_window.host { WindowClient, RunOptions, runWindow }
@@ -381,6 +384,10 @@ effect fn text(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
 
 /// The window client of a [`NodeApp`].
 pub struct NodeClient {
+  pub stylesheetCompiler: StylesheetCompiler,
+  /// Compiled application stylesheets, installed before each root first paints.
+  pub stylesheets: StyleAssets,
+  pub stylesheetUpdates: SheetWatch,
   /// How the window's title bar is drawn (see `ui_js_window.lib.JsClient.titleBar`).
   pub titleBar: TitleBar,
   pub titleBarHeight: f64,
@@ -389,11 +396,24 @@ pub struct NodeClient {
 
 impl NodeClient {
   pub fn make() -> NodeClient {
-    return NodeClient { titleBar: TitleBar.Standard, titleBarHeight: 0.0, windowDrag: false }
+    return NodeClient { stylesheetCompiler: StylesheetCompiler.off(), titleBar: TitleBar.Standard, titleBarHeight: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make() }
   }
 }
 
 impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient {
+  effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree.*, root)
+    run tree.frame(input)
+  }
+
+  effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    drop run self.stylesheets.serve(&mut tree.*, root)
+    run tree.frameRoot(root, input)
+  }
+
   fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm>, options: &mut WindowOptions<'_>) -> () {
     options.titleBar = self.titleBar
     options.titleBarHeight = self.titleBarHeight
@@ -434,6 +454,15 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
     platform.alsoWake(AlsoWake { wake: wakeRuntime, token: state.runtime.wakerAddress() })
+  }
+
+  effect fn poll(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError ? &mut Allocator {
+    return run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
+  }
+
+  fn wakeAfter(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> Option<f64> {
+    return self.stylesheetUpdates.wakeAfter(Option<f64>.None)
   }
 
   fn quitting(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
@@ -548,6 +577,7 @@ impl<'f> NodeWindow<'f> {
 impl<'f> Host for NodeWindow<'f> {
   effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     let mut app = run NodeApp.make(&mut runtime.*)
+    app.bridge.stylesheetCompiler = self.client.stylesheetCompiler
     let items = self.modules.asSlice()
     let mut i: usize = 0
     while i < items.length {

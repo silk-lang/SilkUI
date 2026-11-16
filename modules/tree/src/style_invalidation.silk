@@ -1,0 +1,89 @@
+import svg_css.adopted { StyleSheets }
+import svg_css.sheet { Sheet, Declaration }
+import svg_css.selectors { DependencyKind }
+import svg_css.tokens { equal, insensitive, TokenRange }
+import properties.catalog { Property }
+import style_identity { Atoms }
+import silk.num.u32
+import silk.core.ownership { Copy }
+
+pub struct States { pub descendants: u32, pub external: u32 }
+impl Copy for States {}
+impl States {
+  pub fn make() -> States { return States { descendants: 0, external: 0 } }
+}
+
+fn scopeSensitive(sheet: &Sheet, range: TokenRange) -> bool {
+  let mut i = range.start
+  while i < range.end {
+    let property = match &sheet.declarations.asSlice()[i] {
+      Declaration.Custom { .. } => { return true }
+      Declaration.Typed { property, .. } => property
+      Declaration.Pending { property, .. } => property
+      Declaration.ColorExpression { property, .. } => property
+    }
+    if property == Property.Display || property == Property.Content || property == Property.All { return true }
+    i = i + 1
+  }
+  return false
+}
+
+pub fn states(sheets: &StyleSheets) -> States {
+  let mut result = States.make()
+  let mut i: usize = 0
+  while i < sheets.sheets().length {
+    let sheet = &sheets.sheets()[i].sheet
+    let rules = sheet.resolver.rules()
+    let mut rule: usize = 0
+    while rule < rules.length {
+      let sensitive = scopeSensitive(sheet, rules[rule].declarations)
+      let dependencies = sheet.resolver.invalidation(rule)
+      let mut at: usize = 0
+      while at < dependencies.length {
+        let dependency = dependencies[at]
+        if dependency.ancestors || dependency.siblings || sensitive { result.external = u32.bitOr(result.external, dependency.states) }
+        if dependency.descendants { result.descendants = u32.bitOr(result.descendants, dependency.states) }
+        at = at + 1
+      }
+      rule = rule + 1
+    }
+    i = i + 1
+  }
+  return result
+}
+
+fn contains(atoms: &Atoms, values: &[usize], name: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if equal(atoms.text(values[i]), name) { return true }
+    i = i + 1
+  }
+  return false
+}
+
+pub fn classesNeedRoot(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: &[usize]) -> bool {
+  let mut i: usize = 0
+  while i < sheets.sheets().length {
+    let sheet = &sheets.sheets()[i].sheet
+    let rules = sheet.resolver.rules()
+    let mut rule: usize = 0
+    while rule < rules.length {
+      let sensitive = scopeSensitive(sheet, rules[rule].declarations)
+      let dependencies = sheet.resolver.invalidation(rule)
+      let buffer = &sheet.buffers.asSlice()[rules[rule].buffer]
+      let mut at: usize = 0
+      while at < dependencies.length {
+        let dependency = dependencies[at]
+        if dependency.ancestors || dependency.siblings || sensitive {
+          let name = buffer.text(dependency.name)
+          if dependency.kind == DependencyKind.Attribute && insensitive(name, b"class") { return true }
+          if dependency.kind == DependencyKind.Class && contains(atoms, before, name) != contains(atoms, after, name) { return true }
+        }
+        at = at + 1
+      }
+      rule = rule + 1
+    }
+    i = i + 1
+  }
+  return false
+}

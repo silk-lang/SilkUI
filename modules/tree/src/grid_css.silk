@@ -1,7 +1,6 @@
-//! The CSS grid properties of a node's base look (`grid-template-columns`, `grid-row`,
+//! The CSS grid properties of a node's resolved style (`grid-template-columns`, `grid-row`,
 //! `grid-area`, ...) read into its [`Grid`], with the syntax of CSS Grid Layout 2. As in CSS, a
-//! declaration that does not parse is dropped and the others still apply. Lengths are `px`,
-//! the absolute units and `rem` (16px); `em` and viewport units have no size here yet.
+//! declaration that does not parse is dropped and the others still apply.
 import ui_protocol.grid {
   Grid,
   GridAxis,
@@ -20,6 +19,10 @@ import ui_protocol.grid {
 }
 import mutation { Declaration, CssProperty }
 import properties.values
+import properties.convert { Context }
+import properties.convert
+import silk.core.option { Option }
+import silk.num.f32
 import svg_css.lexer
 import svg_css.tokens { TokenBuffer, Kind, Limits, CssError, insensitive }
 import silk.collections.bytes { Bytes }
@@ -68,11 +71,16 @@ pub fn mentionsGrid(declarations: &[Declaration]) -> bool {
 pub effect fn gridOf(declarations: &[Declaration]) -> Grid
   ! OutOfMemoryError
   ? &mut Allocator {
+  return run gridOfWith(declarations, &Context.make())
+}
+
+pub effect fn gridOfWith(declarations: &[Declaration], context: &Context) -> Grid
+  ! OutOfMemoryError ? &mut Allocator {
   let mut grid = Grid.make()
   let mut i: usize = 0
   while i < declarations.length {
     if isGridProperty(declarations[i].property) {
-      drop run applied(&mut grid, &declarations[i])
+      drop run applied(&mut grid, &declarations[i], context)
     }
     i = i + 1
   }
@@ -91,15 +99,15 @@ pub effect fn rejects(declaration: &Declaration) -> bool
     return false
   }
   let mut scratch = Grid.make()
-  return !run applied(&mut scratch, declaration)
+  return !run applied(&mut scratch, declaration, &Context.make())
 }
 
 /// Applies `declaration` to `grid`. Says whether its value parsed.
-effect fn applied(grid: &mut Grid, declaration: &Declaration) -> bool
+effect fn applied(grid: &mut Grid, declaration: &Declaration, context: &Context) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let text = run values.cssText(&declaration.value)
-  let result = run Effect.result(apply(&mut grid.*, declaration.property, Bytes.asSlice(&text)))
+  let result = run Effect.result(apply(&mut grid.*, declaration.property, Bytes.asSlice(&text), context))
   return match move result {
     Result<(), GridError | CssError | OutOfMemoryError>.Success { .. } => true
     Result<(), GridError | CssError | OutOfMemoryError>.Failure { error } => match move error {
@@ -114,6 +122,7 @@ effect fn applied(grid: &mut Grid, declaration: &Declaration) -> bool
 struct Cursor {
   at: usize,
   end: usize,
+  context: Context,
 }
 
 impl Copy for Cursor {}
@@ -153,7 +162,7 @@ fn enter(buffer: &TokenBuffer, cursor: &mut Cursor) -> Cursor {
     close = cursor.end
   }
   cursor.at = if close < cursor.end { close + 1 } else { cursor.end }
-  return Cursor { at: open + 1, end: close }
+  return Cursor { at: open + 1, end: close, context: cursor.context }
 }
 
 fn word(buffer: &TokenBuffer, kind: Kind, expected: &[u8]) -> bool {
@@ -195,7 +204,7 @@ effect fn slashed(buffer: &TokenBuffer, cursor: Cursor) -> List<Cursor>
   while at < cursor.end {
     let kind = kindAt(buffer, at)
     if isSlash(kind) {
-      run parts.append(Cursor { at: start, end: at })
+      run parts.append(Cursor { at: start, end: at, context: cursor.context })
       start = at + 1
       at = at + 1
     } else {
@@ -203,7 +212,7 @@ effect fn slashed(buffer: &TokenBuffer, cursor: Cursor) -> List<Cursor>
       at = if matching > at && matching < cursor.end { matching + 1 } else { at + 1 }
     }
   }
-  run parts.append(Cursor { at: start, end: cursor.end })
+  run parts.append(Cursor { at: start, end: cursor.end, context: cursor.context })
   return move parts
 }
 
@@ -213,15 +222,10 @@ fn textOf(bytes: &[u8]) -> string {
 }
 
 /// Pixels per unit, for the units with a fixed size.
-effect fn pixels(unit: &[u8]) -> f64 ! GridError {
-  if insensitive(unit, b"px") { return 1.0 }
-  if insensitive(unit, b"rem") { return 16.0 }
-  if insensitive(unit, b"in") { return 96.0 }
-  if insensitive(unit, b"cm") { return 96.0 / 2.54 }
-  if insensitive(unit, b"mm") { return 96.0 / 25.4 }
-  if insensitive(unit, b"q") { return 96.0 / 101.6 }
-  if insensitive(unit, b"pt") { return 96.0 / 72.0 }
-  if insensitive(unit, b"pc") { return 16.0 }
+effect fn pixels(unit: &[u8], context: &Context) -> f64 ! GridError {
+  if let Option.Some { value } = values.unitLookup(unit) {
+    if let Option.Some { value: factor } = convert.pixelsPer(value, context) { return f32.toF64(factor) }
+  }
   fail GridError {}
 }
 
@@ -254,7 +258,7 @@ effect fn breadth(buffer: &TokenBuffer, cursor: &mut Cursor) -> GridBreadth ! Gr
         if insensitive(name, b"fr") {
           return GridBreadth.flex(f64.toF32(value))
         }
-        return GridBreadth.fixed(f64.toF32(value * run pixels(name)))
+        return GridBreadth.fixed(f64.toF32(value * run pixels(name, &cursor.context)))
       }
     }
     _ => {}
@@ -792,13 +796,13 @@ fn autoRepeat(axis: &GridAxis) -> bool {
 
 /// Applies one grid declaration, `property: css`, to `grid`. Fails without a change to the
 /// template when the value does not parse.
-effect fn apply(grid: &mut Grid, property: CssProperty, css: &[u8]) -> ()
+effect fn apply(grid: &mut Grid, property: CssProperty, css: &[u8], context: &Context) -> ()
   ! GridError | CssError | OutOfMemoryError
   ? &mut Allocator {
   let limits = Limits.make()
   let buffer = run lexer.tokenize(css, &limits)
   let all = buffer.all()
-  let mut cursor = Cursor { at: all.start, end: all.end }
+  let mut cursor = Cursor { at: all.start, end: all.end, context: context.* }
   if property == CssProperty.GridTemplateColumns {
     let axis = run trackList(&buffer, &mut cursor, &mut grid.*)
     grid.template.columns = move axis

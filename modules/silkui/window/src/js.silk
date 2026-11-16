@@ -7,9 +7,11 @@
 //!   return run release(Settings { title: "My app", width: 900.0, height: 600.0 }, Source.read("app.js"))
 //! }
 //! ```
-import ui_js.lib { JsError, uiPackage }
+import ui_js.lib { StylesheetCompiler, runtimeStylesheets, JsError, uiPackage }
 import ui_js_window.lib { JsApp, JsClient, JsTools, NoTools }
 import ui_tree.legacy { TreeError, Mutation }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
 import ui_tree_window.host { RunOptions, runWindow, StartedGpu, startGpu }
 import ui_tree_window.platform_thread { Launched, launch }
 import ui_tree_window.console { StderrWriter }
@@ -52,6 +54,25 @@ impl Copy for Settings {}
 pub effect fn program<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
+  return run programWithSheets(settings, entry, source, move tools, move inspector, move launched, StyleAssets.make())
+}
+
+/// Runs compiled application sheets before the first frame.
+pub effect fn programWithSheets<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>, sheets: StyleAssets) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  return run programWithSheetUpdates(settings, entry, source, move tools, move inspector, move launched, move sheets, SheetWatch.make())
+}
+
+pub effect fn programWithSheetUpdates<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
+  return run programWithStylesheetCompiler(settings, entry, source, move tools, move inspector, move launched, move sheets, move updates, StylesheetCompiler.off())
+}
+
+pub effect fn programWithStylesheetCompiler<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
   // The GPU first: it takes longer than the fonts, the script and the realm together.
   let gpu = run startGpu(false)
   let fonts = run systemFonts()
@@ -59,6 +80,7 @@ pub effect fn program<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8
   let allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut app = run JsApp.open(&memory, move allocator, domain.handle())
+  app.javascript().setStylesheetCompiler(compiler)
   run app.define(b"@silkui/core", uiPackage())
   if source.length != 0 {
     run app.entry(b"app.js", source)
@@ -67,6 +89,8 @@ pub effect fn program<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8
     run app.entry(b"app.js", read.asSlice())
   }
   let mut client = JsClient.make(move tools)
+  client.stylesheets = move sheets
+  client.stylesheetUpdates = move updates
   let options = RunOptions {
     title: settings.title,
     width: settings.width,
@@ -124,24 +148,36 @@ pub effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
-fn released(settings: Settings, source: &'static [u8], launched: Option<Launched>) -> i32 {
+fn released(settings: Settings, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, compiler: StylesheetCompiler) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(settings, b"", source, NoTools {}, Inspector.off(), move launched), failed)
+  return run Effect.catchAll(programWithStylesheetCompiler(settings, b"", source, NoTools {}, Inspector.off(), move launched, move sheets, SheetWatch.make(), compiler), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// The release host's `main`: the bundle `source` is part of the binary, and no development
 /// tool is (no reload, no development server, no inspector).
 pub effect fn release(settings: Settings, source: &'static [u8]) -> i32 ? &mut HostInput {
+  return run releaseWithSheets(settings, source, &[])
+}
+
+effect fn launchReleased(settings: Settings, source: &'static [u8], sources: &[&[u8]], compiler: StylesheetCompiler) -> i32
+  ! OutOfMemoryError ? &mut Allocator {
+  let sheets = run StyleAssets.from(sources)
+  return run launch(fn(launched: Option<Launched>) -> i32 {
+    return released(settings, source, move launched, move sheets, compiler)
+  })
+}
+
+/// Release entry with build-compiled stylesheets, in adoption order.
+pub effect fn releaseWithSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  // The main thread keeps the OS event loop; the app runs on its own thread.
-  return run Effect.catchAll(
-    launch(
-      fn(launched: Option<Launched>) -> i32 {
-        return released(settings, source, move launched)
-      },
-    ),
-    failed,
-  )
+  return run Effect.catchAll(launchReleased(settings, source, sheets, StylesheetCompiler.off()), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Release entry that opts into parsing CSS text at runtime.
+pub effect fn releaseWithRuntimeSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(launchReleased(settings, source, sheets, runtimeStylesheets()), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }

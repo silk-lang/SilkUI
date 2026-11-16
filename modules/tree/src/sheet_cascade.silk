@@ -1,0 +1,89 @@
+//! Select one declaration per longhand before evaluating native computed values.
+import mutation { Declaration }
+import properties.catalog { COUNT }
+import properties.catalog
+import properties.values { Value }
+import properties.keywords { Keyword }
+import svg_css.cascade { Declaration as Cascaded, Candidate, Target, Specified, Priority }
+import svg_css.cascade
+import svg_css.values { Wide, ValueId }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.usize
+import svg_css.tokens { insensitive }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+pub fn wide(value: &Value) -> Option<Wide> {
+  if let Value.Keyword { value: keyword } = &value.* {
+    return match keyword {
+      Keyword.Initial => Option<Wide>.some(Wide.Initial)
+      Keyword.Inherit => Option<Wide>.some(Wide.Inherit)
+      Keyword.Unset => Option<Wide>.some(Wide.Unset)
+      Keyword.Revert => Option<Wide>.some(Wide.Revert)
+      Keyword.RevertLayer => Option<Wide>.some(Wide.RevertLayer)
+      _ => Option<Wide>.None
+    }
+  }
+  return Option<Wide>.None
+}
+
+pub effect fn winners(declarations: &[Declaration], priorities: &[Priority]) -> [usize; COUNT]
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut compiled = List<Cascaded>.make()
+  let mut candidates = List<Candidate>.make()
+  let mut covered = [false; COUNT]
+  let mut result = [usize.MAX; COUNT]
+  let mut i: usize = 0
+  while i < declarations.length {
+    let declaration = &declarations[i]
+    let specified = match &wide(&declaration.value) {
+      Option<Wide>.Some { value } => Specified.Wide { keyword: value }
+      _ => Specified.Parsed { value: ValueId { index: 0 } }
+    }
+    run compiled.append(Cascaded { target: Target.Property { property: declaration.property }, specified: specified, buffer: 0, important: declaration.important })
+    run candidates.append(Candidate { declaration: i, priority: priorities[i] })
+    let mut at: usize = 0
+    while at < catalog.longhandCount(declaration.property) {
+      covered[catalog.index(catalog.longhandAt(declaration.property, at))] = true
+      at = at + 1
+    }
+    i = i + 1
+  }
+  let properties = catalog.all()
+  i = 0
+  while i < COUNT {
+    if covered[i] {
+      if let Option<Candidate>.Some { value } = &cascade.select(compiled.asSlice(), candidates.asSlice(), properties[i], 0) {
+        result[i] = value.declaration
+      }
+    }
+    i = i + 1
+  }
+  return result
+}
+
+/// Values that need element context must survive shorthand preparation.
+pub fn contextual(value: &Value) -> bool {
+  if wide(value).isSome() { return true }
+  if let Value.Keyword { value: keyword } = &value.* {
+    if keyword == Keyword.Currentcolor { return true }
+  }
+  if let Value.Sequence { values, .. } = &value.* {
+    let mut i: usize = 0
+    while i < values.length() {
+      if contextual(&values.asSlice()[i]) { return true }
+      i = i + 1
+    }
+  }
+  if let Value.Text { css } = &value.* {
+    let text = css.asSlice()
+    let mut at: usize = 0
+    while at < text.length {
+      if at + 4 <= text.length && insensitive(Slice.view<u8>(text, at, 4), b"var(") { return true }
+      if at + 10 <= text.length && insensitive(Slice.view<u8>(text, at, 10), b"color-mix(") { return true }
+      at = at + 1
+    }
+  }
+  return false
+}

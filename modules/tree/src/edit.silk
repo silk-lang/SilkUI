@@ -22,6 +22,10 @@ import caret {
   collectRuns
 }
 import rich
+import selection
+import placeholder
+import placeholder { Placeholder }
+import silk.mem.box { Box }
 import rich {
   MarkSpan,
   Atom,
@@ -45,7 +49,7 @@ import rich {
   dropRuns
 }
 import paint { Painter, contentBox }
-import layout.lib { LayoutTree }
+import layout.lib { LayoutTree, FontRequest, LineHeight }
 import ui_text.system { TextSystem }
 import node { NONE, NO_INDEX, Event, EventKind }
 import input { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
@@ -141,6 +145,7 @@ pub struct EditState {
   /// What css-layout lays out, and whether it is the placeholder or ends with a filler.
   pub display: String,
   pub showsPlaceholder: bool,
+  pub placeholderStyle: Option<Box<Placeholder>>,
   pub filler: bool,
   pub undo: List<Snapshot>,
   pub redo: List<Snapshot>,
@@ -191,6 +196,7 @@ impl EditState {
       placeholder: String.make(),
       display: String.make(),
       showsPlaceholder: false,
+      placeholderStyle: Option<Box<Placeholder>>.None,
       filler: false,
       undo: List<Snapshot>.make(),
       redo: List<Snapshot>.make(),
@@ -410,15 +416,16 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut display = String.make()
-  let placeholder = run displayText(&tree.*, slot, &mut display)
+  let wasPlaceholder = tree.node(slot).edit().showsPlaceholder
+  let showing = run displayText(&tree.*, slot, &mut display)
   let multiline = state(&tree.*, slot).multiline
   let text = String.view(&display)
-  let filler = !placeholder
+  let filler = !showing
     && (String.byteLength(text) == 0 || multiline && String.endsWith(text, "\n"))
   if filler {
     run display.append(FILLER)
   }
-  let rich = state(&tree.*, slot).rich && !placeholder
+  let rich = state(&tree.*, slot).rich && !showing
   let copy = if rich {
     String.make()
   } else {
@@ -427,12 +434,16 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   let inner = tree.node(slot).inner
   let e = stateMut(&mut tree, slot)
   e.display = move display
-  e.showsPlaceholder = placeholder
+  e.showsPlaceholder = showing
   e.filler = filler
   run Effect.catch<InvalidNode>(
     tree.layout.setText(NodeId { index: inner }, move copy),
     ignoreInvalid,
   )
+  if wasPlaceholder != showing {
+    if !showing { run placeholder.clear(&mut tree, slot) }
+    tree.restyleLocal(slot)
+  }
   if rich {
     run syncRuns(&mut tree, slot)
   } else if state(&tree.*, slot).runs.length() != 0 {
@@ -591,11 +602,33 @@ pub effect fn collectOf(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let first = out.length()
   if node.edit().hasRuns() {
     let sources = run node.edit().runSources()
     run collectRuns(output, text, root, sources.asSlice(), &mut out.*)
   } else {
     run collect(output, text, root, node.inner, &mut out.*)
+  }
+  if node.edit().showsPlaceholder && placeholder.of(node).isSome() {
+    // The empty value's caret and IME area keep the input font, even when the
+    // placeholder uses a much larger face. Its ink is not editable text.
+    let input = node.computed.text
+    let metrics = text.font(FontRequest { key: node.fontKey, writingMode: input.writingMode,
+      textOrientation: input.textOrientation, direction: input.direction })
+    let height = metrics.ascent + metrics.descent
+    let line = match input.lineHeight {
+      LineHeight.Number { value } => input.size * value
+      LineHeight.Length { value } => value
+      LineHeight.Normal => height + metrics.lineGap
+    }
+    let leading = (line - height) * 0.5
+    let items = out.asMutSlice()
+    let mut i = first
+    while i < items.length {
+      items[i].top = items[i].lineTop + leading
+      items[i].bottom = items[i].top + height
+      i = i + 1
+    }
   }
 }
 
@@ -1906,7 +1939,7 @@ pub effect fn paintSelection(
   }
   let lo = e.toDisplay(e.low())
   let hi = e.toDisplay(e.high())
-  let color = node.computed.text.selectionColor
+  let color = selection.background(node)
   let mut pieces = List<Piece>.make()
   run collectOf(p.output, p.text, index, node, &mut pieces)
   let values = pieces.asSlice()

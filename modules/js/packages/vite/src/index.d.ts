@@ -18,6 +18,8 @@ export interface SilkOptions {
    * and `apis` reports only what that runtime lacks.
    */
   node?: boolean;
+  /** Fail the stylesheet build when the CSS compiler drops an unsupported feature. */
+  strictStylesheets?: boolean;
 }
 
 export default function silk(options?: SilkOptions): Plugin[];

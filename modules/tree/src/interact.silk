@@ -30,7 +30,7 @@ import mutation {
 import node { NONE, NO_INDEX, Event, EventKind }
 import edit
 import paint { styleSlot, borderBox, paddingBox, overflowClip }
-import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOf }
+import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
 import layout.lib { FragmentKind, InvalidNode }
 import silk.collections.list { List }
@@ -320,8 +320,18 @@ fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) ->
   return NONE
 }
 
-/// The slot of the node a pointer at (`x`, `y`) targets in the last layout, or NONE.
+fn eventSlot(tree: &UiTree<'_>, slot: u32) -> u32 {
+  if slot == NONE { return NONE }
+  let origin = tree.node(slot).generatedOrigin()
+  return if origin == NONE { slot } else { origin }
+}
+
+/// Public pointer targets retarget generated boxes to their originating element.
 pub fn hitSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
+  return eventSlot(tree, hitLayoutSlot(tree, x, y))
+}
+
+fn hitLayoutSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
   let values = tree.output.fragments.values.asSlice()
   let mut index = values.length
   while index > 0 {
@@ -409,7 +419,7 @@ effect fn hitsFragment(
   if fragment.kind == FragmentKind.Text {
     let textSlot = styleSlot(&tree.slotOfCss, &tree.layout, &tree.nodes, fragment.source)
     if textSlot != NONE && targetable(tree, textSlot) && inside(borderBox(&fragment), x, y) {
-      run appendHit(&mut out.*, textSlot)
+      run appendHit(&mut out.*, eventSlot(tree, textSlot))
     }
     return ()
   }
@@ -424,7 +434,7 @@ effect fn hitsFragment(
     run hitsInside(tree, index, x, y, pruned, &mut out.*)
   }
   if slot != NONE && targetable(tree, slot) && inside(borderBox(&fragment), x, y) {
-    run appendHit(&mut out.*, slot)
+    run appendHit(&mut out.*, eventSlot(tree, slot))
   }
 }
 
@@ -623,9 +633,8 @@ effect fn setHovered(tree: &mut UiTree<'_>, slot: u32, value: bool) -> () {
   let overridden = tree.overridden(tree.node(slot).id, StyleState.Hover)
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   node.hovered = value
-  if node.hover.length() != 0 || overridden {
-    tree.restyle(slot)
-  }
+  let inline = node.hover.length() != 0 || overridden
+  tree.pointerStyleChanged(slot, StyleState.Hover, inline)
 }
 
 /// Hit tests the pointer again after a layout moved content under it.
@@ -649,11 +658,9 @@ effect fn setPressed(tree: &mut UiTree<'_>, target: u32) -> ()
     let overridden = tree.overridden(tree.node(at).id, StyleState.Active)
     let node = &mut tree.nodes.asMutSlice()[u32.toUsize(at)]
     node.pressed = true
-    let restyled = node.active.length() != 0 || overridden
+    let inline = node.active.length() != 0 || overridden
     let id = node.id
-    if restyled {
-      tree.restyle(at)
-    }
+    tree.pointerStyleChanged(at, StyleState.Active, inline)
     run tree.pressChain.append(pair(at, id))
     at = tree.node(at).parent
   }
@@ -670,10 +677,8 @@ fn clearPress(tree: &mut UiTree<'_>) -> () {
       let overridden = tree.overridden(tree.node(slot).id, StyleState.Active)
       let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
       node.pressed = false
-      let restyled = node.active.length() != 0 || overridden
-      if restyled {
-        tree.restyle(slot)
-      }
+      let inline = node.active.length() != 0 || overridden
+      tree.pointerStyleChanged(slot, StyleState.Active, inline)
     }
     i = i + 1
   }
@@ -1242,6 +1247,7 @@ effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
   }
   node.scrollX = x
   node.scrollY = y
+  if node.isGenerated() { tree.paintDirty = true }
 
   // Layout never sees scroll offsets: paint and the geometry queries apply them (see `layers`).
   tree.scrolled = true
@@ -1453,8 +1459,7 @@ fn startThumb(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool {
     let index = fragmentIndex(&tree.*, at)
     if index != NO_INDEX && tree.node(at).computed.clips() {
       let f = tree.visualFragment(index)
-      let c = tree.node(at).computed
-      let vertical = thumbOf(&c, &f, tree.node(at).scrollY, true)
+      let vertical = thumbOfNode(tree.node(at), &f, tree.node(at).scrollY, true)
       if vertical.visible && inside(vertical.rect, x, y) {
         tree.thumbSlot = at
         tree.thumbVertical = true
@@ -1462,7 +1467,7 @@ fn startThumb(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool {
         tree.thumbOffset = tree.node(at).scrollY
         return true
       }
-      let horizontal = thumbOf(&c, &f, tree.node(at).scrollX, false)
+      let horizontal = thumbOfNode(tree.node(at), &f, tree.node(at).scrollX, false)
       if horizontal.visible && inside(horizontal.rect, x, y) {
         tree.thumbSlot = at
         tree.thumbVertical = false
@@ -1490,7 +1495,7 @@ effect fn dragThumb(tree: &mut UiTree<'_>) -> ()
   let f = tree.output.fragments.values.asSlice()[index]
   let c = tree.node(slot).computed
   let range = rangeOf(&c, &f)
-  let thumb = thumbOf(&c, &f, tree.thumbOffset, tree.thumbVertical)
+  let thumb = thumbOfNode(tree.node(slot), &f, tree.thumbOffset, tree.thumbVertical)
   let x = tree.node(slot).scrollX
   let y = tree.node(slot).scrollY
   let moved = if tree.thumbVertical {
@@ -1579,7 +1584,8 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
         // A press that never saw its release ends here. A scrollbar thumb belongs to the
         // tree, so a press on one is no pointer down for the client.
         clearPress(&mut tree)
-        if hit != NONE && startThumb(&mut tree, hit, x, y) {
+        let layoutHit = hitLayoutSlot(&tree.*, x, y)
+        if layoutHit != NONE && startThumb(&mut tree, layoutHit, x, y) {
           return ()
         }
       }
@@ -1773,7 +1779,8 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if hit == NONE || prevented || pathPrevents(&tree.*, hit, PREVENT_SCROLL) {
         return ()
       }
-      run scrollChain(&mut tree, hit, deltaX, deltaY)
+      let layoutHit = hitLayoutSlot(&tree.*, x, y)
+      run scrollChain(&mut tree, if layoutHit != NONE { layoutHit } else { hit }, deltaX, deltaY)
     }
     Input.KeyDown { key, modifiers, repeat, .. } => {
       let target = keyTarget(&tree.*)

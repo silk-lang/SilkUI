@@ -1,6 +1,9 @@
+import svg_css.element { PseudoTarget }
 //! The tree's node records and the per-frame data shared by the tree and its painter.
 import mutation { NodeKind, Declaration, Role, Cursor, CanvasCommand, TriState, Live, Orientation }
 import style { Computed }
+import style_sheets { Resolved }
+import style_identity { NodeIdentity }
 import edit { EditState }
 import paint_css { Effects }
 import font_raster.face { FontFace }
@@ -151,6 +154,12 @@ pub struct Node {
   pub pressed: bool,
   /// The node's own style inputs changed since it was last resolved.
   pub styleDirty: bool,
+  pub gridDeclared: bool,
+  pub gridStyled: bool,
+  pub styleNeedsContext: bool,
+  pub containerWatch: u32,
+  pub styleChange: u32,
+  pub generatedSuppressed: bool,
   /// A node under this one has `styleDirty`.
   pub subtreeDirty: bool,
   /// The node and its ancestors were displayed at its last style resolve: it has a
@@ -175,6 +184,8 @@ pub struct Node {
   /// The ARIA states and properties most nodes do not have, on the heap: a node gets them
   /// with the first such attribute.
   pub semantics: Option<Box<Semantics>>,
+  pub resolvedSheet: Option<Box<Resolved>>,
+  pub selectorIdentity: Option<Box<NodeIdentity>>,
   pub cache: PaintCache,
 }
 
@@ -198,6 +209,7 @@ pub struct Semantics {
   pub setSize: i32,
   pub modal: bool,
   /// Client ids, as the relation attributes carry them.
+  pub literalRelations: u32,
   pub labelledBy: List<u32>,
   pub describedBy: List<u32>,
   pub controls: List<u32>,
@@ -224,6 +236,7 @@ impl Semantics {
       posInSet: 0,
       setSize: 0,
       modal: false,
+      literalRelations: 0,
       labelledBy: List<u32>.make(),
       describedBy: List<u32>.make(),
       controls: List<u32>.make(),
@@ -233,6 +246,46 @@ impl Semantics {
 }
 
 impl Node {
+  pub fn generatedOrigin(self: &Self) -> u32 {
+    return match self.identity() { Option.Some { value } => value.generatedOrigin _ => NONE }
+  }
+
+  pub fn pseudoElement(self: &Self) -> string<'static> {
+    return match self.identity() {
+      Option.Some { value } => match value.generatedTarget {
+        PseudoTarget.Before => "::before"
+        PseudoTarget.After => "::after"
+        _ => ""
+      }
+      _ => ""
+    }
+  }
+  pub fn isGenerated(self: &Self) -> bool { return self.generatedOrigin() != NONE }
+
+  pub fn sheetStyle(self: &Self) -> Option<&Resolved> {
+    return match &self.resolvedSheet {
+      Option<Box<Resolved>>.Some { value } => Option<&Resolved>.some(&value.get()[0])
+      _ => Option<&Resolved>.None
+    }
+  }
+
+  pub fn identity(self: &Self) -> Option<&NodeIdentity> {
+    return match &self.selectorIdentity {
+      Option<Box<NodeIdentity>>.Some { value } => Option<&NodeIdentity>.some(&value.get()[0])
+      _ => Option<&NodeIdentity>.None
+    }
+  }
+
+  pub effect fn identityMut(self: &mut Self) -> &mut NodeIdentity ! OutOfMemoryError ? &mut Allocator {
+    if self.selectorIdentity.isNone() {
+      self.selectorIdentity = Option<Box<NodeIdentity>>.some(run Box<NodeIdentity>.make(NodeIdentity.make()))
+    }
+    return match &mut self.selectorIdentity {
+      Option<Box<NodeIdentity>>.Some { value } => &mut value.getMut()[0]
+      _ => Intrinsic.trap("ui-tree: selector identity was just made")
+    }
+  }
+
   /// The node's paint effects, when it declares any.
   /// Whether the node declares paint effects.
   pub fn hasEffects(self: &Self) -> bool {

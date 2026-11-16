@@ -1,6 +1,7 @@
 //! The web targets' pages: [`site`] puts a page, its program and the scripts that load it into
 //! one folder that any static file server can serve, and [`Server`] serves that folder while
 //! `dev` runs.
+import stylesheets
 import manifest { Project, checkout, loomDir, pinned, resolved, silkuiDir }
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
@@ -71,7 +72,7 @@ effect fn copied(from: string, to: string, scripts: bool) -> ()
 /// host folder `host`), the program as `app.wasm`, and the scripts that load it, from the
 /// silkui repository checkout the package is in, the Loom one the app's `loom` comes from and, for
 /// `web-canvas`, the lib-native one Loom's canvas target pins.
-pub effect fn site(project: &Project, target: string, host: string, wasm: string, dir: string) -> ()
+pub effect fn site(project: &Project, target: string, host: string, wasm: string, dir: string, sheetCount: usize, dev: bool) -> ()
   ! TaskError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let silkui = run silkuiDir(project)
@@ -81,13 +82,36 @@ pub effect fn site(project: &Project, target: string, host: string, wasm: string
   run copied(String.view(&run joined(host, "index.html")), String.view(&run joined(dir, "index.html")), false)
   run copied(wasm, String.view(&run joined(dir, "app.wasm")), false)
   if target == "web-dom" {
+    let mut i: usize = 0
+    while i < sheetCount {
+      let name = run stylesheets.name(i, true)
+      run copied(String.view(&run joined(host, String.view(&name))), String.view(&run joined(dir, String.view(&name))), false)
+      i = i + 1
+    }
     run copied(String.view(&run joined(String.view(&loom), "modules/loom/dom/js/silk-ui-dom.js")), String.view(&run joined(dir, "silk-ui-dom.js")), false)
     return ()
   }
   let window = run joined(String.view(&ui), "modules/tree/window/browser/")
   let pageWindow = run joined(dir, "ui/tree/window/browser/")
+  if dev && sheetCount != 0 {
+    run copied(String.view(&run joined(host, "styles.update")), String.view(&run joined(dir, "styles.update")), false)
+    run copied(String.view(&run joined(String.view(&window), "style-updates.mjs")), String.view(&run joined(String.view(&pageWindow), "style-updates.mjs")), false)
+  } else {
+    let update = run Path.make(String.view(&run joined(dir, "styles.update")))
+    if run FileSystem.exists(&update) { run FileSystem.removeFile(&update) }
+    let helper = run Path.make(String.view(&run joined(String.view(&pageWindow), "style-updates.mjs")))
+    if run FileSystem.exists(&helper) { run FileSystem.removeFile(&helper) }
+    let mut i: usize = 0
+    while i < sheetCount {
+      let oldSheet = run Path.make(String.view(&run joined(dir, String.view(&run stylesheets.name(i, false)))))
+      if run FileSystem.exists(&oldSheet) { run FileSystem.removeFile(&oldSheet) }
+      i = i + 1
+    }
+  }
   run copied(String.view(&run joined(String.view(&window), "app-host.js")), String.view(&run joined(String.view(&pageWindow), "app-host.js")), true)
   run copied(String.view(&run joined(String.view(&window), "access-mirror.js")), String.view(&run joined(String.view(&pageWindow), "access-mirror.js")), false)
+  run copied(String.view(&run joined(String.view(&window), "media.mjs")), String.view(&run joined(String.view(&pageWindow), "media.mjs")), false)
+  run copied(String.view(&run joined(String.view(&window), "sheet-fetch.mjs")), String.view(&run joined(String.view(&pageWindow), "sheet-fetch.mjs")), false)
   let canvasManifest = run joined(String.view(&loom), "modules/silkui/web/canvas/silk.toml")
   let rev = run pinned(String.view(&canvasManifest), "webgpu")
   if String.view(&rev) == "" { run Task.abort("silkui: silkui-web-canvas pins no lib-native revision") }
@@ -126,6 +150,7 @@ pub struct Server {
   clients: List<Client>,
   root: String,
   pub build: u64,
+  pub styles: u64,
 }
 
 effect fn socketFailure(error: NativeSocketError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
@@ -171,7 +196,7 @@ impl Server {
       _ => port
     }
     StderrWriter.print("silkui: serving the page on http://127.0.0.1:{}/\n", &.(actual))
-    return Server { listener: move listener, clients: List<Client>.make(), root: run String.copy(root), build: 1 }
+    return Server { listener: move listener, clients: List<Client>.make(), root: run String.copy(root), build: 1, styles: 1 }
   }
 
   /// Answers requests for about `milliseconds`.
@@ -223,6 +248,7 @@ impl Server {
     ! NativeSocketError | TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
     let root = String.view(&self.root)
     let build = self.build
+    let styles = self.styles
     let client = &mut self.clients.asMutSlice()[index]
     if !client.ready {
       let mut buffer: [u8; 8192] = [0; 8192]
@@ -238,7 +264,7 @@ impl Server {
       if !String.contains(String.view(&request), "\r\n\r\n") {
         return client.request.length() > 65536
       }
-      run answer(&mut client, String.view(&request), root, build)
+      run answer(&mut client, String.view(&request), root, build, styles)
     }
     let headLength = client.header.length()
     let bodyLength = client.body.length()
@@ -261,7 +287,7 @@ effect fn dropped(error: NativeSocketError) -> bool {
 
 fn mime(path: string) -> string<'static> {
   if String.endsWith(path, ".html") { return "text/html; charset=utf-8" }
-  if String.endsWith(path, ".js") { return "text/javascript" }
+  if String.endsWith(path, ".js") || String.endsWith(path, ".mjs") { return "text/javascript" }
   if String.endsWith(path, ".wasm") { return "application/wasm" }
   if String.endsWith(path, ".css") { return "text/css" }
   if String.endsWith(path, ".json") { return "application/json" }
@@ -272,7 +298,7 @@ fn mime(path: string) -> string<'static> {
   return "application/octet-stream"
 }
 
-effect fn answer(client: &mut Client, request: string, root: string, build: u64) -> ()
+effect fn answer(client: &mut Client, request: string, root: string, build: u64, styles: u64) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
   if !String.startsWith(request, "GET ") {
     run respond(&mut client, "405 Method Not Allowed", "text/plain", Bytes.make())
@@ -282,8 +308,8 @@ effect fn answer(client: &mut Client, request: string, root: string, build: u64)
   let mut end: usize = 4
   while end < bytes.length && bytes[end] != 32 && bytes[end] != 63 { end = end + 1 }
   let path = String.slice(request, 4, end - 4)
-  if path == "/__silkui/build" {
-    let number = run decimal(build)
+  if path == "/__silkui/build" || path == "/__silkui/styles" {
+    let number = run decimal(if path == "/__silkui/build" { build } else { styles })
     run respond(&mut client, "200 OK", "text/plain", run Bytes.copy(String.utf8Bytes(String.view(&number))))
     return ()
   }
@@ -305,7 +331,9 @@ effect fn answer(client: &mut Client, request: string, root: string, build: u64)
     // A dev page polls for a build number other than the one it was served with.
     if let Result.Success { value: text } = String.fromUtf8(body.asSlice()) {
       let number = run decimal(build)
-      let page = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+      let numbered = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+      let styleNumber = run decimal(styles)
+      let page = run replaced(String.view(&numbered), "__SILKUI_STYLES__", String.view(&styleNumber))
       run respond(&mut client, "200 OK", "text/html; charset=utf-8", run Bytes.copy(String.utf8Bytes(String.view(&page))))
       return ()
     }
