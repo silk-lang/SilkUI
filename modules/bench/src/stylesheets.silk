@@ -1,0 +1,134 @@
+import harness { Bench }
+import walls { Fixture }
+import ui_tree.lib { BoxNode, TreeError, ProtocolError, Attribute, StyleState, FlexDirection, Align, BoxSizing, Input }
+import ui_tree.batch { Batch }
+import ui_tree.style { Fill }
+import ui_tree.style_media { Preferences }
+import ui_tree.css
+import ui_tree.css { px, Keyword }
+import silk.build.source { Source }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.text.string { String }
+
+pub enum Step { Create, Idle, Class, Hover, Theme }
+
+const BASE: string = "flex items-center gap-2 p-2 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white"
+const CHANGED: string = "flex items-center gap-2 p-4 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white"
+
+fn color(white: bool) -> Rgba<f32> {
+  let value: f32 = if white { 1.0 } else { 0.0 }
+  return Rgba<f32> { r: value, g: value, b: value, a: 1.0 }
+}
+
+effect fn protocol(error: ProtocolError) -> never ! TreeError { fail error.error }
+
+pub struct Rows<'a> {
+  fixture: Fixture<'a>,
+  rows: List<BoxNode>,
+  count: usize,
+  sheet: bool,
+  step: Step,
+  changed: bool,
+}
+
+impl<'a> Rows<'a> {
+  pub effect fn make(mut fixture: Fixture<'a>, sheet: bool, step: Step, count: usize) -> Rows<'a>
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run fixture.tree.setStyle(fixture.root, &[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column)])
+    drop fixture.tree.engineMut().setStylePreferences(Preferences.desktop(false))
+    if sheet {
+      let mut batch = Batch.make()
+      run batch.adoptStyleSheet(0, 1, Source.read("fixtures/rows.sheet"))
+      run Effect.catch<ProtocolError>(fixture.tree.apply(run batch.take()), protocol)
+    }
+    return Rows { fixture: move fixture, rows: List<BoxNode>.make(), count: count, sheet: sheet, step: step, changed: false }
+  }
+
+  effect fn build(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.count {
+      let row = run self.fixture.tree.box(&[
+        css.width(px(240.0)), css.height(px(40.0)), css.flexShrink(0.0), css.boxSizing(BoxSizing.BorderBox),
+      ])
+      if self.sheet {
+        run self.fixture.tree.setAttribute(row, Attribute.ClassName { value: run String.copy(BASE) })
+      } else {
+        run self.fixture.tree.setStyle(row, &[
+          css.display(Keyword.Flex), css.alignItems(Align.Center), css.gap(px(8.0)), css.padding(px(8.0)),
+          css.borderRadius(px(8.0)), css.backgroundColor(color(true)), css.color(color(false)),
+        ])
+        run self.fixture.tree.setStyleFor(row, StyleState.Hover, &[css.backgroundColor(color(false))])
+      }
+      let label = run self.fixture.tree.text("Row")
+      run self.fixture.tree.append(row, label)
+      run self.fixture.tree.append(self.fixture.root, row)
+      run self.rows.append(row)
+      i = i + 1
+    }
+  }
+
+  effect fn verify(self: &Self) -> () ! TreeError {
+    let engine = self.fixture.tree.engine()
+    let mut i: usize = 0
+    while i < self.rows.length() {
+      let node = engine.node(engine.slotOf(self.rows.asSlice()[i].id().raw()))
+      let padded = self.changed && self.step == Step.Class && i == 0
+      let dark = self.changed && self.step == Step.Theme
+      let hovered = self.changed && self.step == Step.Hover && i == 0
+      let background: f32 = match node.computed.paint.background { Fill.Solid { color } => color.r _ => -1.0 }
+      let expectedPadding: f32 = if padded { 16.0 } else { 8.0 }
+      let expectedColor: f32 = if dark { 1.0 } else { 0.0 }
+      let expectedBackground: f32 = if dark || hovered { 0.0 } else { 1.0 }
+      if node.computed.layout.width.value != 240.0 || node.computed.layout.height.value != 40.0
+        || node.computed.layout.padding.left.value != expectedPadding
+        || background != expectedBackground
+        || node.computed.text.color.r != expectedColor { fail TreeError.Layout }
+      if i == self.rows.length() - 1 { break }
+      i = self.rows.length() - 1
+    }
+  }
+}
+
+impl<'a> Bench for Rows<'a> {
+  effect fn prepare(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.step == Step.Create {
+      while self.rows.length() != 0 {
+        let last = self.rows.length() - 1
+        run self.fixture.tree.destroy(self.rows.get(last))
+        self.rows.truncate(last)
+      }
+    } else if self.rows.length() == 0 {
+      run self.build()
+      run self.fixture.frame()
+      run self.verify()
+    }
+  }
+
+  effect fn body(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.step == Step.Create { run self.build() }
+    else if self.step != Step.Idle {
+      self.changed = !self.changed
+      if self.step == Step.Class {
+        let row = self.rows.get(0)
+        if self.sheet {
+          run self.fixture.tree.setAttribute(row, Attribute.ClassName { value: run String.copy(if self.changed { CHANGED } else { BASE }) })
+        } else { run self.fixture.tree.setStyle(row, &[css.padding(px(if self.changed { 16.0 } else { 8.0 }))]) }
+      } else if self.step == Step.Hover {
+        run self.fixture.tree.dispatch(Input.moveTo(if self.changed { 20.0 } else { 1100.0 }, 20.0))
+      } else if self.sheet {
+        run self.fixture.tree.setAttribute(self.fixture.root, Attribute.ClassName { value: run String.copy(if self.changed { "dark" } else { "" }) })
+      } else {
+        let mut i: usize = 0
+        while i < self.rows.length() {
+          run self.fixture.tree.setStyle(self.rows.get(i), &[css.backgroundColor(color(!self.changed)), css.color(color(self.changed))])
+          i = i + 1
+        }
+      }
+    }
+    run self.fixture.frame()
+    run self.verify()
+  }
+}

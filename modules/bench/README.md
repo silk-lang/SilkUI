@@ -58,3 +58,69 @@ that layout, so it measures at least as much work:
 FerroUI's DockPanel, the element-level properties of its property system (bindings, styled and
 direct properties, resource dictionaries), XAML parsing and its themes have no silkui counterpart
 and are left out.
+
+## Stylesheet rows
+
+`stylesheets::{Inline,Tailwind}.{create,idle,change_class,hover,theme}[Rows=1000]`
+compares the same rows expressed through typed style objects and Tailwind classes. Each row
+has a box and a text node. A class change changes the first row's padding, hover changes its
+background, and a theme switch changes every row's background and text color. The theme and
+idle cases also run with 5,000 rows. Each case checks the first and last row's resulting styles.
+Frames include style resolution, layout and painting.
+
+The Tailwind fixture includes preflight and was generated with `tailwindcss@4.3.5` and
+`@tailwindcss/cli@4.3.5` from `fixtures/rows.input.css`. The benchmark embeds `rows.sheet`:
+there is no stylesheet compilation in the measured program. To regenerate after a CSS or
+compiled-format change, run the pinned Tailwind CLI and the matching Vite compiler from the
+repository root:
+
+```sh
+tailwindcss -i modules/bench/fixtures/rows.input.css -o modules/bench/fixtures/rows.css
+node modules/bench/scripts/compile-stylesheet.mjs
+```
+
+The compiler reports unsupported browser-specific preflight form-control rules; these do not
+select the benchmark's boxes or text nodes. Keep these diagnostics visible when regenerating.
+
+Use optimized builds and Callgrind instruction counts for comparisons:
+
+```sh
+valgrind --tool=callgrind --callgrind-out-file=/dev/null \
+  build/llvm/x86_64-unknown-linux-gnu/release/ui-bench --smoke \
+  'stylesheets::Tailwind.change_class[Rows=1000]'
+```
+
+`--smoke` executes the operation once. Callgrind's process total includes fixture construction,
+font loading, sheet decoding/adoption, initial layout and the harness, even though the wall-time
+column excludes preparation. Record that total and subtract the corresponding `idle` process
+count to estimate an update's additional instructions. Use the same row count, build and machine
+for both runs. The difference still includes the operation's dispatch, verification and reporting;
+it is not a pure selector-matching measurement.
+
+### Initial instruction counts
+
+Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,
+`--release`, and Valgrind 3.24.0. The original controls use SilkUI `9f7ea7e5`; the
+stylesheet implementation uses `2696d56b`. Counts include the whole process as described above.
+The stylesheet benchmark source and compiled fixture are in this directory.
+
+| Style-object control | Original | Stylesheet branch | Change |
+| --- | ---: | ---: | ---: |
+| `trees::Lifetime.first_frame[Tiles=2000]` | 457,904,947 | 457,511,474 | -0.09% |
+| `layout_subsystem::Invalidation.resize_one_leaf[Leaves=4000]` | 120,463,174 | 120,562,986 | +0.08% |
+
+| Rows | Operation | Inline total | Tailwind total | Inline minus idle | Tailwind minus idle |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1,000 | create | 80,912,149 | 279,813,077 | — | — |
+| 1,000 | idle | 82,707,013 | 281,611,959 | — | — |
+| 1,000 | change_class | 86,589,615 | 491,384,170 | 3,882,602 | 209,772,211 |
+| 1,000 | hover | 83,965,580 | 486,524,966 | 1,258,567 | 204,913,007 |
+| 1,000 | theme | 93,113,998 | 516,668,084 | 10,406,985 | 235,056,125 |
+| 5,000 | idle | 394,602,575 | 1,380,793,199 | — | — |
+| 5,000 | theme | 446,210,353 | 2,555,360,736 | 51,607,778 | 1,174,567,537 |
+
+These are the conservative full-root restyle baseline, before style sharing and dependency-based
+invalidation. Local class and hover changes currently repeat work across all rows. The results
+do not meet the target of similar per-frame cost to inline styles. The 5,000-row theme case
+contains 10,000 row/text nodes; instruction counts alone do not establish a 16 ms frame budget.
+Creation does not subtract idle because idle includes a separate initial frame.
