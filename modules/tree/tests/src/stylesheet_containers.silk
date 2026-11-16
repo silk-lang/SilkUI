@@ -1,4 +1,4 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Mutation, Grid, GridTrack, GridBreadth }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Mutation, Grid, GridTrack, GridBreadth, Keyframe }
 import properties.catalog { Property }
 import properties.values { Declaration }
 import properties.values
@@ -15,6 +15,7 @@ import silk.core.option { Option }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
+import silk.collections.list { List }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
 import silk.num.u32
@@ -274,4 +275,65 @@ test effect fn containerGridTracksUseTheFinalStyleContext() ! TreeError | Compil
   let mut allocator = Allocator.systemAllocatorProvider()
   run gridUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run gridUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn keyframeUnits(sheetStyles: bool) ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("subject") })
+  let container = run written.declarations(b"container-type:size;width:200px;height:100px")
+  run batch.style(1, container.asSlice())
+  if sheetStyles {
+    let sheet = run compile.compile(b".subject{animation:grow 1s linear both;height:1px}@keyframes grow{from{width:10cqw}to{width:20cqw}}", &Options.make())
+    let bytes = run sheet.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  } else {
+    let mut frames = List<Keyframe>.make()
+    run frames.append(Keyframe { offset: 0.0, declarations: run written.declarations(b"width:10cqw") })
+    run frames.append(Keyframe { offset: 1.0, declarations: run written.declarations(b"width:20cqw") })
+    run batch.keyframes("grow", move frames)
+    let animation = run written.declarations(b"animation:grow 1s linear both;height:1px")
+    run batch.style(2, animation.asSlice())
+  }
+  run tree.apply(run batch.take())
+  let mut frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  let slot = tree.slotOf(2)
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 20.0 && tree.node(slot).computed.usesContainer, "keyframe-only units select containers without a base declaration using them")
+  frame.time = 0.5
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 30.0, "keyframe endpoints interpolate against the selected container")
+  let wider = run written.declarations(b"width:400px")
+  run batch.style(1, wider.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 60.0, "changing the unit basis retains animation progress")
+  let paused = run written.declarations(b"animation-play-state:paused")
+  run batch.style(2, paused.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  let normal = run written.declarations(b"container-type:normal")
+  run batch.style(1, normal.asSlice())
+  run tree.apply(run batch.take())
+  frame.time = 2.0
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 120.0, "paused keyframes retain progress when containment is removed")
+  frame.width = 1000.0
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 150.0, "paused keyframe-only fallback units invalidate on viewport resize")
+}
+
+test effect fn containerKeyframesResolveUnitsWithoutBaseDeclarations() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keyframeUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run keyframeUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
 }
