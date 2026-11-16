@@ -10,10 +10,10 @@ positioned box, a Grid or UniformGrid a CSS grid, a TextBlock a text node.
 
 ```sh
 silk build --release --manifest-path modules/bench/silk.toml
-build/llvm/<target>/release/ui-bench                  # every benchmark (a few minutes)
-build/llvm/<target>/release/ui-bench Propagation Text # names containing either part
-build/llvm/<target>/release/ui-bench --quick          # shorter samples
-build/llvm/<target>/release/ui-bench --smoke          # each benchmark once, nothing measured
+build/<target>/release/ui-bench                  # every benchmark (a few minutes)
+build/<target>/release/ui-bench Propagation Text # names containing either part
+build/<target>/release/ui-bench --quick          # shorter samples
+build/<target>/release/ui-bench --smoke          # each benchmark once, nothing measured
 ```
 
 Measure an optimized build on a quiet machine, and compare runs of two builds on the same

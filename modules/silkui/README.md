@@ -103,9 +103,9 @@ The tasks depend on silkui; the app does not. A JavaScript project has no Silk c
 [package]
 name = "my-app"
 version = "0.1.0"
-silk-version = "0.1.0-dev.74+205aea3f5b2e"
+silk-version = "0.1.0-pipeline.1"
 
-[profiles.tasks.dependencies]
+[dependencies]
 silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "…", path = "modules/silkui", package = "silkui" }
 ```
 
@@ -116,7 +116,7 @@ it:
 [package]
 name = "my-app"
 version = "0.1.0"
-silk-version = "0.1.0-dev.74+205aea3f5b2e"
+silk-version = "0.1.0-pipeline.1"
 kind = "library"
 main = "app.silk"
 exports = ["app"]
@@ -124,10 +124,6 @@ exports = ["app"]
 [dependencies]
 loom = { git = "https://github.com/silk-lang/loom.git", rev = "…", path = "modules/loom", package = "loom" }
 
-[profiles.tasks]
-main = "tasks.silk"
-
-[profiles.tasks.dependencies]
 silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "…", path = "modules/silkui", package = "silkui" }
 ```
 

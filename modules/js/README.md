@@ -304,8 +304,8 @@ the same code path as production, so it is the mode to check a bundle in.
 For the React example, from `modules/js/examples/react-counter`:
 
 ```sh
-silk build --manifest-path ../../demo/silk.toml --profile dev
-export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/dev/ui-js-demo
+silk build --manifest-path ../../demo/silk.toml --optimization none
+export SILK_UI_HOST=$PWD/../../../../build/<target>/dev/ui-js-demo
 npm run dev     # dev server, Fast Refresh
 npm run watch   # rebuild and reload
 ```
@@ -413,7 +413,7 @@ passes an inspector that is off; since its client answers `servesInspector` with
 constant false, the window host's inspector code is not in the program either.
 
 ```sh
-silk build --manifest-path modules/js/demo/silk.toml --profile production
+silk task --manifest-path modules/js/demo/silk.toml production --release
 ```
 
 Engine features are chosen per build too. The bridge answers

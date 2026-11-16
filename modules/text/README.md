@@ -34,7 +34,7 @@ Both the unit tests and Chrome comparison run with the repository root as their 
 
 ```sh
 silk build --manifest-path modules/text/tools/cli/silk.toml
-silk task browser chrome-text --cli build/llvm/x86_64-unknown-linux-gnu/debug/ui-text-cli
+silk task browser chrome-text --cli build/x86_64-unknown-linux-gnu/dev/ui-text-cli
 ```
 
 Use `--chrome PATH` (or `CHROMIUM_EXECUTABLE`) to select Chrome; `--only NAME`, `--cases FILE`,
