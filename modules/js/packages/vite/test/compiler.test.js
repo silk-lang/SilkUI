@@ -38,4 +38,7 @@ test('ships generated pseudo programs and diagnoses unsupported content', () => 
   const unsupported = '.card::before { content: counter(item); content: url(icon.png); }';
   assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'content', count: 2 }]);
   assert.throws(() => compileStylesheet(unsupported, { strict: true }));
+  const suffix = '.card::before:hover { color: red }';
+  assert.deepEqual(compileStylesheet(suffix).diagnostics, [{ kind: 'feature', feature: 'pseudo-element state', count: 1 }]);
+  assert.throws(() => compileStylesheet(suffix, { strict: true }));
 });
