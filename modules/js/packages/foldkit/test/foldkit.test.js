@@ -136,3 +136,15 @@ test("the document shim forwards literal classes, attributes and their removal",
   assert.equal(element.node.getAttribute("data-state"), null);
   assert.equal(element.node.getAttribute("aria-expanded"), null);
 });
+
+test("data-testid remains available to both stylesheet selectors and the inspector", () => {
+  const element = document.createElement("button");
+  for (const value of ["counter", "renamed"]) {
+    element.setAttribute("data-testid", value);
+    assert.equal(element.node.getAttribute("data-testid"), value);
+    assert.equal(element.node.getAttribute("testId"), value);
+  }
+  element.removeAttribute("data-testid");
+  assert.equal(element.node.getAttribute("data-testid"), null);
+  assert.equal(element.node.getAttribute("testId"), "");
+});

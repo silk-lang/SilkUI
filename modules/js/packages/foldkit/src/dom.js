@@ -207,6 +207,7 @@ function attributeChanged(element, name, value) {
     node.setAttribute("role", present ? value : ROLES[element.localName]?.[0] ?? "");
   } else if (name.startsWith("aria-") || name.startsWith("data-") || name === "class" || name === "lang" || name === "dir") {
     node.setAttribute(name, value);
+    if (name === "data-testid") node.setAttribute("testId", present ? value : "");
   } else if (name === "tabindex") {
     node.setAttribute("tabIndex", present ? Number(value) : FOCUSABLE.has(element.localName) ? 0 : -2147483648);
   } else if (name in BOOLEANS) {
