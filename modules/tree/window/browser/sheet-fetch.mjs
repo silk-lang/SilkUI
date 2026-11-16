@@ -1,7 +1,7 @@
 const MAX_BYTES = 64 * 1024 * 1024;
 
 export class SheetFetch {
-  constructor(wake, fetcher = fetch) {
+  constructor(wake, fetcher = (url, options) => fetch(url, options)) {
     this.wake = wake;
     this.fetcher = fetcher;
     this.next = 1;
