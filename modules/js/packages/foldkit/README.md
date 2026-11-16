@@ -86,16 +86,18 @@ export default defineConfig({ plugins: [silk({ entry: "src/entry.ts", allow: pro
   (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
   `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
   `li` have theirs, and nothing has a default style.
-- **Style.** `h.Style` with CSS values (`fontSize: "13px"`). There are no stylesheets yet, so
-  `h.Class` matches nothing; use the look attributes above for states.
+- **Style.** `h.Style` takes CSS values (`fontSize: "13px"`). `h.Class` matches rules in
+  imported CSS, including Tailwind output. Stylesheets can use state selectors such as
+  `:hover`; the look attributes above also remain available.
 - **Events.** The `On*` attributes of the events the tree has: clicks, pointers, keys, focus,
   input, scroll, wheel, transitions and animations. Mouse events arrive as the pointer events
   they are. For an event the tree does not have (drag and drop, clipboard, `change`,
   `submit`) the listener never runs, with one console warning.
 - **Attributes.** `Id`, `Role` and the `Aria*` ones, `Tabindex`, `Disabled`, `Readonly`,
   `Placeholder`, `Value`, `Href` (a click opens it), `Hidden`, `Inert`, and `data-testid` as
-  the tree's test id. Others are kept on the element (`getAttribute`, selectors) and do
-  nothing else.
+  the tree's test id. Classes, `data-*`, `aria-*`, `lang`, and `dir` also reach native
+  stylesheet matching. Other attributes remain available through `getAttribute` and
+  the document's selectors.
 - **Mounts and commands.** Elements support `querySelector` with tag, `#id`, `.class` and
   `[attribute="value"]` selectors, `focus`, `closest`, `contains` and `textContent`.
   `element.node` is the `@silkui/core` node behind it, for code that draws on the tree
@@ -105,7 +107,8 @@ export default defineConfig({ plugins: [silk({ entry: "src/entry.ts", allow: pro
 - **Timing.** The first render is there for the window's first frame. After that Foldkit
   renders in an animation frame, as in a browser.
 - **Development.** `vite build --watch` reloads the app on every change. The dev server's
-  module replacement does not run Foldkit programs yet.
+  CSS replacement updates the native stylesheet while preserving the running Foldkit
+  program and its model. Application-module replacement does not preserve Foldkit models yet.
 
 ## TypeScript
 
