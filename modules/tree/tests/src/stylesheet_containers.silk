@@ -66,17 +66,13 @@ effect fn selection() ! TreeError | CompileError | CssError | OutOfMemoryError |
   let inner = tree.slotOf(2)
   let subject = tree.slotOf(3)
   let firstChanges = run container_watch.changed(&tree)
-  run Testing.expect(firstChanges.length() == 1 && firstChanges.get(0) == subject, "only the dependent subject needs an initial container refinement")
+  run Testing.expect(firstChanges.length() == 0, "initial container geometry settles in the first frame")
   run Testing.expect(tree.node(outer).computed.layout.containsSize(true) && tree.node(outer).computed.layout.containsSize(false) && tree.node(inner).computed.layout.containsSize(true) && !tree.node(inner).computed.layout.containsSize(false), "container shorthand projects layout containment")
   let adapter = SelectorTree { tree: &tree }
   run Testing.expect(width(adapter.container(u32.toUsize(subject), b"card", 1, PseudoTarget.None)) == 200.0, "width query selects the nearest named eligible ancestor")
   run Testing.expect(width(adapter.container(u32.toUsize(subject), b"card", 2, PseudoTarget.None)) == 400.0, "height query skips an inline-size-only ancestor")
   run Testing.expect(adapter.container(u32.toUsize(subject), b"Card", 1, PseudoTarget.None).isNone(), "container names are case-sensitive")
   run Testing.expect(width(adapter.container(u32.toUsize(inner), b"card", 1, PseudoTarget.None)) == 400.0, "ordinary elements do not query themselves")
-  // Exercise the host adapter after geometry exists. The bounded settling phase
-  // will request this restyle automatically when the recorded results change.
-  tree.stylesDirty = true
-  run tree.frame(frame)
   let computed = tree.node(subject).computed
   run Testing.expect(computed.layout.width.value == 200.0 && computed.layout.height.value == 300.0 && computed.usesContainer, "physical container units select ancestors independently")
   run Testing.expect(computed.layout.padding.top.value == 0.0, "a failed query does not try a more distant same-named container")
@@ -84,9 +80,7 @@ effect fn selection() ! TreeError | CompileError | CssError | OutOfMemoryError |
   run Testing.expect(computed.layout.margin.top.value == 13.0 && computed.layout.padding.bottom.value == 7.0, "one selected size container satisfies all required physical axes")
   run Testing.expect(computed.layout.padding.left.value == 9.0, "query em values use the selected container's font size")
   let pseudoChanges = run container_watch.changed(&tree)
-  run Testing.expect(pseudoChanges.length() == 1 && pseudoChanges.get(0) == subject, "pseudo query changes invalidate their originating element")
-  tree.stylesDirty = true
-  run tree.frame(frame)
+  run Testing.expect(pseudoChanges.length() == 0, "pseudo query changes settle with their originating element")
   let before = tree.node(subject).identity()
   if let Option.Some { value } = before {
     run Testing.expect(tree.node(value.before).computed.layout.margin.left.value == 17.0, "pseudo-element queries can select their originating element")
@@ -127,8 +121,6 @@ effect fn objectUnits() ! TreeError | CssError | OutOfMemoryError | AssertionErr
   run batch.style(3, subject.asSlice())
   run tree.apply(run batch.take())
   let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
-  run tree.frame(frame)
-  tree.stylesDirty = true
   run tree.frame(frame)
   let slot = tree.slotOf(3)
   let computed = tree.node(slot).computed
@@ -206,8 +198,6 @@ effect fn gridUnits(sheetStyles: bool) ! TreeError | CompileError | CssError | O
   run tree.apply(run batch.take())
   let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
   run tree.frame(frame)
-  tree.stylesDirty = true
-  run tree.frame(frame)
   run gridWidths(&tree, &[20.0, 30.0, 20.0, 20.0, 30.0, 20.0, 30.0, 20.0, 80.0])
   let width = run written.declarations(b"width:100px")
   let height = run written.declarations(b"height:200px")
@@ -216,8 +206,6 @@ effect fn gridUnits(sheetStyles: bool) ! TreeError | CompileError | CssError | O
   run batch.style(2, width.asSlice())
   run batch.style(3, font.asSlice())
   run tree.apply(run batch.take())
-  run tree.frame(frame)
-  tree.stylesDirty = true
   run tree.frame(frame)
   run gridWidths(&tree, &[10.0, 20.0, 10.0, 10.0, 20.0, 10.0, 20.0, 30.0, 80.0])
   let smaller = FrameInput { width: 700.0, height: 500.0, scale: 1.0, time: 0.0 }
@@ -310,8 +298,6 @@ effect fn keyframeUnits(sheetStyles: bool) ! TreeError | CompileError | CssError
   run tree.apply(run batch.take())
   let mut frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
   run tree.frame(frame)
-  tree.stylesDirty = true
-  run tree.frame(frame)
   let slot = tree.slotOf(2)
   run Testing.expect(tree.node(slot).computed.layout.width.value == 20.0 && tree.node(slot).computed.usesContainer, "keyframe-only units select containers without a base declaration using them")
   frame.time = 0.5
@@ -320,8 +306,6 @@ effect fn keyframeUnits(sheetStyles: bool) ! TreeError | CompileError | CssError
   let wider = run written.declarations(b"width:400px")
   run batch.style(1, wider.asSlice())
   run tree.apply(run batch.take())
-  run tree.frame(frame)
-  tree.stylesDirty = true
   run tree.frame(frame)
   run Testing.expect(tree.node(slot).computed.layout.width.value == 60.0, "changing the unit basis retains animation progress")
   let paused = run written.declarations(b"animation-play-state:paused")
@@ -367,19 +351,10 @@ effect fn absentPseudo() ! TreeError | CompileError | CssError | OutOfMemoryErro
   let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
   run tree.frame(frame)
   let slot = tree.slotOf(2)
-  run Testing.expect(!beforeExists(&tree, slot), "a query with no previous layout initially generates no box")
-  let changes = run container_watch.changed(&tree)
-  run Testing.expect(changes.length() == 1 && changes.get(0) == slot, "false pseudo queries survive when there is no generated box")
-  tree.restyleLocal(slot)
-  run tree.frame(frame)
   run Testing.expect(beforeExists(&tree, slot) && (run container_watch.changed(&tree)).length() == 0, "an origin refinement creates the newly matching pseudo")
   let smaller = run written.declarations(b"width:200px")
   run batch.style(1, smaller.asSlice())
   run tree.apply(run batch.take())
-  run tree.frame(frame)
-  let removed = run container_watch.changed(&tree)
-  run Testing.expect(removed.length() == 1 && removed.get(0) == slot, "a true-to-false pseudo condition marks the same origin")
-  tree.restyleLocal(slot)
   run tree.frame(frame)
   run Testing.expect(!beforeExists(&tree, slot) && (run container_watch.changed(&tree)).length() == 0, "removing a generated box retains its now-false dependency")
 }
@@ -412,16 +387,10 @@ effect fn rootWatches() ! TreeError | CssError | OutOfMemoryError | AssertionErr
   let wide = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
   let narrow = FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 }
   run tree.frameRoot(0, wide)
-  let first = tree.slotOf(2)
-  tree.restyleLocal(first)
-  run tree.frame(wide)
   run Testing.expect((run container_watch.changed(&tree)).length() == 0, "the first root's unit dependency settles")
   run tree.frameRoot(1, narrow)
   let changes = run container_watch.changed(&tree)
-  run Testing.expect(changes.length() == 1 && changes.get(0) == tree.slotOf(12), "a root evaluates only its own container geometry")
-  let second = tree.slotOf(12)
-  tree.restyleLocal(second)
-  run tree.frame(narrow)
+  run Testing.expect(changes.length() == 0 && tree.node(tree.slotOf(12)).computed.layout.width.value == 80.0, "each root settles against only its own container geometry")
   drop run tree.useRoot(0)
   run Testing.expect((run container_watch.changed(&tree)).length() == 0, "parked query and unit records return with their original layout")
   let old = tree.slotOf(2)
@@ -443,4 +412,178 @@ effect fn rootWatches() ! TreeError | CssError | OutOfMemoryError | AssertionErr
 test effect fn containerDependencyRecordsFollowRootsAndSlotReuse() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run rootWatches() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+
+import ui_tree.legacy { EventKind, LISTEN_ALL, Fragmentainers, LayoutRect }
+
+fn near(a: f32, b: f32) -> bool { return a - b < 0.001 && b - a < 0.001 }
+fn eventCount(tree: &UiTree<'_>, kind: EventKind) -> usize {
+  let mut count: usize = 0
+  let mut i: usize = 0
+  while i < tree.events.length() { if tree.events.asSlice()[i].kind == kind { count = count + 1 } i = i + 1 }
+  return count
+}
+
+effect fn transitionPasses() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  let classes = ["outer", "inner", "subject"]
+  let mut i: usize = 0
+  while i < classes.length {
+    let id = usize.toU32(i + 1)
+    run batch.create(id, NodeKind.Box)
+    if i == 0 { run batch.root(id) } else { run batch.append(id - 1, id) }
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy(classes[i]) })
+    i = i + 1
+  }
+  run batch.listen(3, LISTEN_ALL)
+  run batch.create(4, NodeKind.Box)
+  run batch.append(1, 4)
+  run batch.attribute(4, Attribute.ClassName { value: run String.copy("other") })
+  run batch.listen(4, LISTEN_ALL)
+  let sheet = run compile.compile(b".outer{container-type:size;width:400px;height:200px}.inner{container-type:size;width:50cqw;height:100px}.subject{width:100cqw;height:10px;transition:width 1s linear}@starting-style{.subject{width:0px}}.other{animation:peer 1s linear both}@keyframes peer{from{opacity:.4}to{opacity:.8}}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let mut frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let subject = tree.slotOf(3)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 0.0), "starting styles survive all initial geometry refinements")
+  run Testing.expect(tree.transitions.length() == 1 && tree.transitions.get(0).duration == 1.0, "settling creates only the final transition")
+  run Testing.expect(eventCount(&tree, EventKind.TransitionRun) == 1 && eventCount(&tree, EventKind.TransitionStart) == 1 && eventCount(&tree, EventKind.TransitionCancel) == 0, "initial fallback and intermediate container sizes do not leak transition events")
+  run Testing.expect(tree.events.length() >= 3 && tree.events.asSlice()[0].kind == EventKind.TransitionRun
+    && tree.events.asSlice()[1].kind == EventKind.TransitionStart && tree.events.asSlice()[2].kind == EventKind.AnimationStart
+    && tree.events.asSlice()[2].target == 4, "provisional events retain their position before unrelated motion events")
+  frame.time = 0.5
+  run tree.frame(frame)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 100.0), "the transition targets the final 200px container basis")
+  tree.events.clear()
+  let larger = run written.declarations(b"width:800px")
+  run batch.style(1, larger.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 100.0), "retargeting starts from the same-clock sample")
+  run Testing.expect(eventCount(&tree, EventKind.TransitionCancel) == 1 && eventCount(&tree, EventKind.TransitionRun) == 1 && eventCount(&tree, EventKind.TransitionStart) == 1, "only the final retarget emits cancellation and start events")
+  frame.time = 1.0
+  run tree.frame(frame)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 250.0), "retargeted progress is not reset by intermediate passes")
+  tree.events.clear()
+  let smaller = run written.declarations(b"width:200px")
+  run batch.style(1, smaller.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(tree.transitions.length() == 1 && near(tree.transitions.get(0).factor, 0.5) && tree.transitions.get(0).duration == 0.5, "reversal uses the pre-change transition and its shortening factor")
+  run Testing.expect(eventCount(&tree, EventKind.TransitionCancel) == 1 && eventCount(&tree, EventKind.TransitionRun) == 1, "a multi-pass reversal emits one event pair")
+  frame.time = 1.25
+  run tree.frame(frame)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 175.0), "the reversal reaches its expected midpoint")
+  frame.time = 1.5
+  run tree.frame(frame)
+  run Testing.expect(near(tree.node(subject).computed.layout.width.value, 100.0), "the reversed transition ends at the settled container basis")
+}
+
+test effect fn containerSettlingPreservesStartingTransitionsRetargetsAndReversals()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run transitionPasses() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn transientPseudo() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  let classes = ["outer", "inner", "subject"]
+  let mut i: usize = 0
+  while i < classes.length {
+    let id = usize.toU32(i + 1)
+    run batch.create(id, NodeKind.Box)
+    if i == 0 { run batch.root(id) } else { run batch.append(id - 1, id) }
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy(classes[i]) })
+    i = i + 1
+  }
+  run batch.listen(3, LISTEN_ALL)
+  let sheet = run compile.compile(b".outer{container:card / size;width:400px;height:200px}.inner{container-type:inline-size;width:50cqw;height:100px}.subject{width:100px;height:20px}@container card (width>300px){.subject::before{content:'animated';animation:grow 1s linear both}}@keyframes grow{from{font-size:10px;opacity:0}to{font-size:30px;opacity:1}}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let mut frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let origin = tree.slotOf(3)
+  let before = match tree.node(origin).identity() { Option.Some { value } => value.before _ => NONE }
+  run Testing.expect(before != NONE && eventCount(&tree, EventKind.AnimationStart) == 1, "the initially matched pseudo starts one animation")
+  frame.time = 0.25
+  run tree.frame(frame)
+  tree.events.clear()
+  let larger = run written.declarations(b"width:800px")
+  let named = run written.declarations(b"container-name:card")
+  run batch.style(1, larger.asSlice())
+  run batch.style(2, named.asSlice())
+  run tree.apply(run batch.take())
+  frame.time = 0.5
+  run tree.frame(frame)
+  let after = match tree.node(origin).identity() { Option.Some { value } => value.before _ => NONE }
+  run Testing.expect(before == after && tree.node(before).live, "a false intermediate query preserves the original generated box")
+  run Testing.expect(near(tree.node(before).computed.paint.opacity, 0.5) && near(tree.node(before).computed.text.size, 20.0), "the final query restores the original animation timeline")
+  run Testing.expect(eventCount(&tree, EventKind.AnimationStart) == 0 && eventCount(&tree, EventKind.AnimationCancel) == 0, "transient pseudo disappearance emits no animation lifecycle events")
+  let mut children = List<u32>.make()
+  run tree.childSlots(before, &mut children)
+  run Testing.expect(children.length() == 1 && near(tree.node(children.get(0)).computed.text.size, 20.0), "generated text inherits its parent's final animated font size")
+  let smaller = run written.declarations(b"width:400px")
+  run batch.style(1, smaller.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(!beforeExists(&tree, origin) && !tree.node(before).live && eventCount(&tree, EventKind.AnimationCancel) == 1, "a final false query destroys the pseudo and cancels exactly once")
+}
+
+test effect fn containerSettlingPreservesTransientPseudoIdentityAndAnimatedInheritance()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run transientPseudo() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn depthAndEntryPoints() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  let top = run written.declarations(b"container-type:size;width:512px;height:100px")
+  let nested = run written.declarations(b"container-type:size;width:50cqw;height:100px")
+  let mut id: u32 = 1
+  while id <= 7 {
+    run batch.create(id, NodeKind.Box)
+    if id == 1 { run batch.root(id) run batch.style(id, top.asSlice()) }
+    else { run batch.append(id - 1, id) run batch.style(id, nested.asSlice()) }
+    id = id + 1
+  }
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let last = tree.slotOf(7)
+  run Testing.expect(tree.node(last).computed.layout.width.value == 8.0 && (run container_watch.changed(&tree)).length() == 0, "deeply nested units settle within the same frame")
+  run tree.frame(frame)
+  run Testing.expect(tree.stats.layoutSkipped, "an idle container tree needs no layout pass")
+  let wider = run written.declarations(b"width:1024px")
+  run batch.style(1, wider.asSlice())
+  run tree.apply(run batch.take())
+  run tree.layoutNow()
+  run Testing.expect(tree.node(last).computed.layout.width.value == 16.0 && (run container_watch.changed(&tree)).length() == 0, "immediate geometry reads settle all nested container levels")
+  run batch.style(1, top.asSlice())
+  run tree.apply(run batch.take())
+  let pages = [LayoutRect { x: 0.0, y: 0.0, width: 1600.0, height: 2000.0 }]
+  run tree.frameFragmented(frame, pagesOf(&pages))
+  run Testing.expect(tree.node(last).computed.layout.width.value == 8.0 && (run container_watch.changed(&tree)).length() == 0, "fragmented layout also settles against its own content boxes")
+}
+
+test effect fn containerSettlingHandlesDepthIdleImmediateAndFragmentedLayout()
+  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run depthAndEntryPoints() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+
+fn pagesOf<'a>(pages: &'a [LayoutRect]) -> Fragmentainers<'a> {
+  let mut frames: Fragmentainers<'a> = Fragmentainers.empty()
+  frames.rects = Option<&'a [LayoutRect]>.some(pages)
+  return move frames
 }

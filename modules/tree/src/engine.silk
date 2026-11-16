@@ -6,6 +6,8 @@ import style_inherit
 import generated
 import containers
 import container_watch
+import style_change
+import style_change { Change }
 import container_watch { Watch }
 import style_media { Preferences }
 import properties.convert as properties_convert
@@ -665,6 +667,8 @@ pub struct UiTree<'a> {
   pub layout: Tree,
   pub output: LayoutTree,
   pub containerWatches: List<Watch>,
+  pub styleChanges: List<Change>,
+  pub changingStyles: bool,
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
   pub styleAtoms: Atoms,
@@ -864,6 +868,8 @@ impl<'a> UiTree<'a> {
       layout: move layout,
       output: LayoutTree.make(),
       containerWatches: List<Watch>.make(),
+      styleChanges: List<Change>.make(),
+      changingStyles: false,
       provider: Provider<'a> {
         text: TextSystem.make(collection),
         naturals: List<NaturalDimensions>.make(),
@@ -2147,6 +2153,8 @@ impl<'a> UiTree<'a> {
       gridDeclared: false,
       gridStyled: false,
       containerWatch: NONE,
+      styleChange: NONE,
+      generatedSuppressed: false,
       subtreeDirty: false,
       rendered: false,
       transition: String.make(),
@@ -4053,7 +4061,7 @@ impl<'a> UiTree<'a> {
       let mut prepared = Option<Resolved>.None
       let mut content = Option<String>.None
       if enabled {
-        let rendered = old != NONE && self.node(old).rendered
+        let rendered = old != NONE && style_change.rendered(&self, old)
         let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
         content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice()), generatedFailed)
         prepared = Option<Resolved>.some(move value)
@@ -4079,9 +4087,15 @@ impl<'a> UiTree<'a> {
           let identity = run originNode.identityMut()
           if target == PseudoTarget.Before { identity.before = slot } else { identity.after = slot }
         }
+        let active = self.nodeMut(slot)
+        active.generatedSuppressed = false
         let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
         if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
         if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+      } else if old != NONE && style_change.tracks(&self, origin) {
+        let dormant = self.nodeMut(old)
+        dormant.generatedSuppressed = true
+        if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(old, move value) }
       } else if old != NONE {
         let originNode = self.nodeMut(origin)
         let identity = run originNode.identityMut()
@@ -4290,14 +4304,17 @@ impl<'a> UiTree<'a> {
     }
     if animationUnits != 0 { computed.usesViewport = true }
     let kind = node.kind
+    if node.generatedSuppressed { computed.layout.display = CssDisplay.None }
+    run style_change.prepare(&mut self, slot, computed.usesContainer)
+    let motionNode = self.node(slot)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
     if kind != NodeKind.Text {
-      let mut before = node.computed
-      let mut hasBefore = node.rendered && parentRendered
+      let mut before = style_change.before(&self, slot)
+      let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
       let mut sheetStarting = false
       if !hasBefore && rendered {
-        if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+        if let Option<&Resolved>.Some { value } = motionNode.sheetStyle() {
           if let Option<List<Declaration>>.Some { value: start } = &value.starting {
             let parentStyle = style_sheets.parentStyle(&self, slot)
             before = computed
@@ -4306,15 +4323,16 @@ impl<'a> UiTree<'a> {
             hasBefore = true
           }
         }
-        if !sheetStarting && node.starting.length() != 0 {
+        if !sheetStarting && motionNode.starting.length() != 0 {
           before = computed
-          run applyAll(&mut before, &node.starting, &mut stops)
+          run applyAll(&mut before, &motionNode.starting, &mut stops)
           hasBefore = true
         }
       }
       self.easingStops = move stops
       let animated = run animation.update(&mut self, slot, rendered, &computed)
-      run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated)
+      if self.node(slot).generatedSuppressed { run motion.cancelAll(&mut self, slot) }
+      else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
       if animated != 0 {
         run animation.apply(&self, slot, &mut computed)
       }
@@ -4679,6 +4697,7 @@ impl<'a> UiTree<'a> {
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
     run animation.tick(&mut self)
+    style_change.begin(&mut self)
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()
@@ -4700,6 +4719,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run self.finishStyleChange()
     run self.notifyLayout()
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
@@ -4770,28 +4790,40 @@ impl<'a> UiTree<'a> {
     self.input = input
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
+    style_change.begin(&mut self)
     run self.resolveStyles()
     let mut viewport = CssStyle.make()
     let root = self.layout.root()
     run Effect.catchAll(self.layout.setStyle(root, move viewport), layoutFailed)
-    run Effect.catchAll(
-      computeFragmented(
-        &self.layout,
-        &mut self.output,
-        &mut self.provider,
-        OptionalSize.none(),
-        move frames,
-      ),
-      layoutFailed,
-    )
-    self.output.fragments.resolveLocations()
-    self.paintCachesStale = true
-    self.semanticRevision = self.semanticRevision + 1
-    self.revision = self.revision + 1
-    self.laidOutRevision = usize.MAX
-    self.stats.layout = self.output.stats
-    self.stats.layoutSkipped = false
-    run self.indexFragments()
+    let mut pass: usize = 0
+    let mut budget = container_watch.depth(&self)
+    while true {
+      run Effect.catchAll(
+        computeFragmented(
+          &self.layout,
+          &mut self.output,
+          &mut self.provider,
+          OptionalSize.none(),
+          Fragmentainers { rects: frames.rects, contexts: frames.contexts, ancestors: frames.ancestors,
+            repeatStep: frames.repeatStep, kind: frames.kind, writingMode: frames.writingMode,
+            direction: frames.direction, firstPageRight: frames.firstPageRight, rectoOnRight: frames.rectoOnRight },
+        ),
+        layoutFailed,
+      )
+      self.output.fragments.resolveLocations()
+      self.paintCachesStale = true
+      self.semanticRevision = self.semanticRevision + 1
+      self.revision = self.revision + 1
+      self.laidOutRevision = usize.MAX
+      self.stats.layout = self.output.stats
+      self.stats.layoutSkipped = false
+      run self.indexFragments()
+      let depth = container_watch.depth(&self)
+      if depth > budget { budget = depth }
+      if pass >= budget || !(run self.refineContainers()) { break }
+      pass = pass + 1
+    }
+    run self.finishStyleChange()
     self.layoutObserversDirty = true
     run self.notifyLayout()
     edit.beginPaint(&mut self)
@@ -4826,6 +4858,7 @@ impl<'a> UiTree<'a> {
   pub effect fn layoutNow(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    style_change.begin(&mut self)
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()
@@ -4834,16 +4867,63 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run self.finishStyleChange()
   }
 
-  effect fn layoutFrame(self: &mut Self) -> ()
+  effect fn refineContainers(self: &mut Self) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let changed = run Effect.result(container_watch.changed(&self))
+    let slots = match move changed {
+      Result.Success { value } => move value
+      Result.Failure { error: why } => match move why {
+        OutOfMemoryError allocation => { fail move allocation }
+        CssError invalid => { drop invalid fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } }
+      }
+    }
+    let mut i: usize = 0
+    while i < slots.length() { self.restyleLocal(slots.get(i)) i = i + 1 }
+    if slots.length() == 0 { return false }
+    run self.resolveStyles()
+    return true
+  }
+
+  effect fn layoutFrame(self: &mut Self) ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !(run self.layoutPass()) || self.containerWatches.length() == 0 { return () }
+    let mut pass: usize = 0
+    let mut budget = container_watch.depth(&self)
+    while pass < budget && (run self.refineContainers()) {
+      if !(run self.layoutPass()) { break }
+      pass = pass + 1
+      let depth = container_watch.depth(&self)
+      if depth > budget { budget = depth }
+    }
+  }
+
+  effect fn finishStyleChange(self: &mut Self) ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.styleChanges.length() {
+      let entry = &self.styleChanges.asSlice()[i]
+      let slot = entry.slot
+      if self.node(slot).live && self.node(slot).id == entry.id && self.node(slot).generatedSuppressed {
+        let origin = self.node(slot).parent
+        let target = self.node(slot).pseudoElement()
+        let parent = self.nodeMut(origin)
+        let identity = run parent.identityMut()
+        if target == "::before" { identity.before = NONE } else { identity.after = NONE }
+        run self.destroy(0, slot)
+      }
+      i = i + 1
+    }
+    run style_change.finish(&mut self)
+  }
+
+  effect fn layoutPass(self: &mut Self) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if self.layout.revision() == self.laidOutRevision
       && self.layout.scrollRevision() == self.laidOutScrolls
       && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height {
-      return ()
+      return false
     }
 
     // css-layout has one viewport, sized by whichever root was laid out last.
@@ -4885,6 +4965,7 @@ impl<'a> UiTree<'a> {
       run self.indexFragments()
     }
     self.layoutObserversDirty = true
+    return !moved
   }
 
   /// Reports changed geometry once after layout, including scrolling and first attachment.

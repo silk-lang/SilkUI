@@ -585,9 +585,21 @@ events carry `pseudoElement`. Generated overflow scrolls independently, with off
 baked into paint rather than exported under the origin's compositor scroll ID.
 
 Input, image, icon, and canvas nodes do not generate these boxes. Counters, quotes, images,
-alternative content, typed `attr()`, other pseudo-elements, and container queries remain
-unsupported. The compiler diagnoses unsupported static content and pseudo-state suffixes;
+alternative content, typed `attr()`, and other pseudo-elements remain unsupported. The compiler diagnoses unsupported static content and pseudo-state suffixes;
 origin states such as `.button:hover::before` work.
+
+Size container queries support named containers, `size` and `inline-size` containment,
+physical and logical dimensions, ranges, boolean conditions, and query lists. Each query
+selects the nearest eligible ancestor for all required axes; pseudo-elements can select their
+origin. `cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, and `cqmax` work in styles, grid tracks, transforms,
+paint effects, and keyframes. Missing unit axes fall back to the viewport.
+
+Frames, immediate geometry reads, and fragmented layout settle changed query results and unit
+bases within a pass budget derived from container depth. Only dependent nodes and their inherited
+subtrees are restyled. Intermediate passes retain the original transition state and animation
+clock, including starting styles and generated boxes whose final query still matches. Idle and
+scroll-only layout does not re-evaluate container conditions. Style and scroll-state queries
+remain unsupported.
 
 The stylesheet/style-object parity suite covers every `css_coverage` row. Generated-content
 tests also exercise real pixels, public structure, accessibility, media changes, sheet

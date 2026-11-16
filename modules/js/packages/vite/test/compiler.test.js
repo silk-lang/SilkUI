@@ -47,8 +47,8 @@ test('ships container units and serialized condition programs', () => {
   const declarations = '.card { container: card / inline-size; width: 10cqw; height: 20cqh; padding: 1cqi 2cqb; margin: 1cqmin 2cqmax; }';
   assert.deepEqual(compileStylesheet(declarations, { strict: true }).diagnostics, []);
   const source = `${declarations} @container card (width > calc(10em + 1px)) and ((height > 20px) or unknown(value)) { .child { width: 50cqw } }`;
-  const { bytes, diagnostics } = compileStylesheet(source);
+  const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
   assert.equal(new DataView(bytes.buffer).getUint32(8, true), 6);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
-  assert.deepEqual(diagnostics, [{ kind: 'feature', feature: 'container', count: 1 }]);
+  assert.deepEqual(diagnostics, []);
 });
