@@ -64,7 +64,7 @@ h.box(&[h.class("flex gap-3 p-4")], children)
 
 Class strings must be literal so Tailwind can find them. Classes assembled at runtime need an explicit source declaration in the Tailwind input.
 
-The `ui-loom-tailwind`, `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` templates show the complete setup. The original templates keep their style-object defaults. See the [Tailwind helper](https://github.com/silk-lang/SilkUI/tree/feat/stylesheets-tailwind/modules/tailwind) for build and watch examples and platform support.
+The `ui-loom-tailwind`, `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` templates show the complete setup. The original templates keep their style-object defaults. See the [Tailwind helper](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) for build and watch examples and platform support.
 
 ## JavaScript apps
 
@@ -124,9 +124,9 @@ On `web-dom`, the browser implements CSS. Window and canvas targets use the tree
 
 The tree's property coverage suite checks the supported declarations through both style objects and compiled sheets. A stylesheet does not add rendering support for a property the tree does not yet implement.
 
-Large theme changes and retained per-node stylesheet data remain more expensive than inline styles. The [stylesheet benchmark report](https://github.com/silk-lang/SilkUI/tree/feat/stylesheets-tailwind/modules/bench#complete-runtime-measurements) records instruction counts, storage measurements and the budgets not yet met.
+Large theme changes and retained per-node stylesheet data remain more expensive than inline styles. The [stylesheet benchmark report](https://github.com/silk-lang/SilkUI/tree/main/modules/bench#complete-runtime-measurements) records instruction counts, storage measurements and the budgets not yet met.
 
-The local [Chromium stylesheet comparison](https://github.com/silk-lang/SilkUI/tree/feat/stylesheets-tailwind/modules/tree/tools/stylesheet-parity) checks computed values and box geometry against three committed CSS fixtures. Its case table covers these utility families:
+The local [Chromium stylesheet comparison](https://github.com/silk-lang/SilkUI/tree/main/modules/tree/tools/stylesheet-parity) checks computed values and box geometry against three committed CSS fixtures. Its case table covers these utility families:
 
 | Coverage | Utilities or behavior |
 | --- | --- |
