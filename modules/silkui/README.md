@@ -75,7 +75,7 @@ no inspector.
 | Setting | Choices | Notes |
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
-| `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release JavaScript host; development JavaScript hosts always include it |
+| `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
@@ -108,6 +108,22 @@ resetting its state. Native hosts validate an atomically published set of compil
 before updating their application roots. A missing or invalid update leaves the active styles
 intact until a valid update is available. Release hosts do not watch stylesheet files.
 Canvas updates fetch the same compiled bundles; development polling is omitted from release pages.
+
+Runtime CSS text is optional in release: add `App.runtimeStylesheets()` to enable it.
+Silk code can use `StyleSheet.load(&mut tree, run StyleSource.text(bytes))`, or
+`tree.loadStyleSheet(root, run StyleSource.url("https://example.com/theme.css"))`.
+`StyleSource.url` accepts the same relative, `file:`, HTTP(S), and `data:` sources as
+images and fonts. Native file and HTTP reads run on workers; canvas URLs use browser fetch
+and its CORS rules. Local files on canvas must be served by the app's web server.
+Custom hosts configure `Loader.setStylesheetCompiler(ui_tree.style_runtime.runtime())`;
+the loader defaults to disabled and does not fetch CSS when disabled.
+
+A load reserves its adoption position immediately. Its handle exposes loading, ready,
+or failed state; `replace` keeps the previous sheet until the replacement succeeds.
+Removal, another replacement, or closing the root discards stale completions. Failed
+initial loads leave an empty slot that can be replaced or removed. Compiled sheet adoption
+never requires the text compiler. The DOM backend uses the browser's CSS parser and needs
+no compiler option.
 
 Media queries use each root's viewport and scale. Window hosts supply system light/dark
 appearance and desktop pointer capabilities. Canvas hosts read the browser's appearance,

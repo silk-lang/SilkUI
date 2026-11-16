@@ -558,5 +558,13 @@ supply viewport queries and resolution. The default environment is headless. A r
 sheets currently uses a full restyle for invalidation, including ancestor and sibling
 selectors; roots that only use style objects retain their existing path.
 
-This API is an implementation foundation. Automatic stylesheet loading, complete CSS-wide keyword handling, generated pseudo-elements, container queries,
-and the full stylesheet/style-object parity suite are still in progress.
+`StyleSheet.load(&mut tree, run StyleSource.text(bytes))` loads runtime CSS into root 0.
+`tree.loadStyleSheet(root, run StyleSource.url(url))` targets another root. Hosts serve
+these requests through `Loader` with an explicitly installed runtime compiler; compiled-only
+hosts leave it disabled. A handle's `state`, `replace`, and `remove` methods observe or
+change the load. The batch equivalent is `loadStyleSheet(root, id, source)`.
+Loads reserve their cascade position before I/O, preserve the previous sheet on failure,
+and discard stale completions after replacement, removal, or root closure.
+
+The stylesheet/style-object parity suite covers every `css_coverage` row. Generated
+pseudo-elements, container queries, and dependency-based invalidation remain in progress.
