@@ -155,3 +155,28 @@ The style-object controls are 457,658,860 (-0.05% from the original) and 120,512
 respectively. Local stylesheet updates still cost substantially more than inline updates.
 The next performance work is sharing variable scopes and resolved storage, plus dependency-based
 invalidation; these numbers do not establish a frame-time budget.
+
+### Registered variable scopes
+
+lib-css `927ddab6` shares immutable variable scopes for identical parent and stylesheet custom-property
+inputs, including `inherits: false` registration defaults. The cache holds up to 128 input sets,
+resets with scopes, and includes computation limits in its keys. Inline custom properties retain
+their own scopes. Shared scope identities allow the cascade-result cache to serve repeated rows.
+
+These measurements use the `RegisteredTailwind` fixture from SilkUI `84113a8`. Before uses
+lib-css `78c6b41d` with the cascade cache already enabled; after uses lib-css `927ddab6` through
+SilkUI `6d1991cd`. The benchmark source, compiler flags and toolchain are the same.
+
+| Rows | Operation | Before total | After total | Before minus idle | After minus idle | Update reduction |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | create | 307,967,872 | 142,418,032 | — | — | — |
+| 1,000 | idle | 309,770,944 | 144,217,212 | — | — | — |
+| 1,000 | change_class | 547,652,811 | 215,762,832 | 237,881,867 | 71,545,620 | 69.9% |
+| 1,000 | hover | 544,435,704 | 213,294,310 | 234,664,760 | 69,077,098 | 70.6% |
+| 1,000 | theme | 571,532,150 | 218,862,796 | 261,761,206 | 74,645,584 | 71.5% |
+| 5,000 | idle | 1,518,218,255 | 692,537,616 | — | — | — |
+| 5,000 | theme | 2,818,685,798 | 1,061,913,776 | 1,300,467,543 | 369,376,160 | 71.6% |
+
+The style-object controls are 457,518,423 (-0.08% from the original) and 120,562,315 (+0.08% from the original),
+respectively. All 21 stylesheet cases pass their result checks. Full-root matching and per-node
+declaration storage remain; narrower invalidation and shared resolved storage are still needed.
