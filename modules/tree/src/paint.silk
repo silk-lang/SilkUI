@@ -17,6 +17,8 @@ import layers { Sticky }
 import stacking
 import stacking { Stacking, IN_FLOW }
 import edit
+import selection
+import caret
 import rich
 import ui_text.system { TextSystem }
 import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
@@ -441,6 +443,52 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   ! OutOfMemoryError
   ? &mut Allocator {
   let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input && f.textData != NO_INDEX {
+    let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+    let e = node.edit()
+    if e.focused && !e.composing && !e.showsPlaceholder && e.anchor != e.focus {
+      if selection.styled(node) {
+        let foreground = selection.foreground(node)
+        let mut piece = caret.pieceOf(p.output, p.text, index)
+        let r = rich.runOf(&e.runs, f.source)
+        if e.hasRuns() && r != NO_INDEX {
+          let found = e.runs.get(r)
+          piece.start = piece.start + found.start
+          piece.end = piece.end + found.start
+          piece.base = found.start
+        }
+        let span = caret.spanX(p.text, &piece, e.toDisplay(e.low()), e.toDisplay(e.high()))
+        if span.xMin < span.xMax {
+          let selected = ContentMask.new(device(span, p.scale)).intersect(mask)
+          let b = mask.bounds
+          let s = selected.bounds
+          if s.xMin < s.xMax && s.yMin < s.yMax {
+            // Paint disjoint regions so alpha and partial ligatures replace the
+            // selected ink rather than compositing another glyph on top of it.
+            let outside = [Rect<f32>.new(b.xMin, b.yMin, b.xMax, s.yMin),
+              Rect<f32>.new(b.xMin, s.yMax, b.xMax, b.yMax),
+              Rect<f32>.new(b.xMin, s.yMin, s.xMin, s.yMax),
+              Rect<f32>.new(s.xMax, s.yMin, b.xMax, s.yMax)]
+            let mut i: usize = 0
+            while i < outside.length {
+              let rect = outside[i]
+              if rect.xMin < rect.xMax && rect.yMin < rect.yMax {
+                run paintTextNormally(&mut p, index, slot, f, ContentMask.new(rect))
+              }
+              i = i + 1
+            }
+            run paintTextAs(&mut p, index, slot, f, selected, Option<Rgba<f32>>.None, foreground)
+            return ()
+          }
+        }
+      }
+    }
+  }
+  run paintTextNormally(&mut p, index, slot, f, mask)
+}
+
+effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
   if slot != NONE {
     if p.nodes.asSlice()[u32.toUsize(slot)].computed.effects.shadowFrom != NONE {
       let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
@@ -462,14 +510,14 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
           effects.blur = shadow.blur * 0.5 * p.scale
           drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 }, effects)
         }
-        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color))
+        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color), Option<Rgba<f32>>.None)
         if blurred {
           run p.scene.popLayer()
         }
       }
     }
   }
-  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None)
+  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None, Option<Rgba<f32>>.None)
 }
 
 /// Paints a text fragment: its glyph run, as shaped during layout, and its decorations, all in
@@ -481,6 +529,7 @@ effect fn paintTextAs(
   f: Fragment,
   mask: ContentMask,
   shadow: Option<Rgba<f32>>,
+  foreground: Option<Rgba<f32>>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -516,6 +565,7 @@ effect fn paintTextAs(
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
+  if let Option.Some { value } = foreground { color = value c.text.color = value }
   let mut shadowed = false
   if let Option<Rgba<f32>>.Some { value } = shadow {
     color = value
@@ -2121,7 +2171,7 @@ fn ownHash(
   let slot = styleSlot(slots, css, nodes, f.source)
   if slot != NONE {
     let node = &nodes.asSlice()[u32.toUsize(slot)]
-    h = Hash.combine(h, node.paintHash)
+    h = selection.hash(node, Hash.combine(h, node.paintHash))
     if node.isGenerated() { h = floatHash(h, node.scrollX) h = floatHash(h, node.scrollY) }
     if f.kind == FragmentKind.Box {
       h = transform.perspectiveHash(&node.computed.transform, h)

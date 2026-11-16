@@ -1,3 +1,4 @@
+import selection
 import style_load { Status }
 import sheet_cache { Cache }
 import style_invalidation { States }
@@ -62,13 +63,14 @@ pub struct RootSheets {
   pub inlineVariables: bool,
   pub hasStarting: bool,
   pub hasGenerated: bool,
+  pub hasSelection: bool,
   pub sheets: StyleSheets,
   pub environment: Environment,
   pub systemColors: [Color; 19],
 }
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
-    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasSelection: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
       systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
@@ -83,6 +85,8 @@ pub struct Resolved {
 }
 
 pub struct Resolution {
+  /// Highlight backgrounds inherit their currentColor expression, not an ancestor's used color.
+  pub highlightBackground: Option<ColorProgram>,
   pub style: Resolved,
   pub containers: List<ContainerDependency>,
 }
@@ -128,6 +132,7 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   if target == PseudoTarget.None { return run resolve(&mut sheets, &mut cache, system, hasStarting, tree, origin, &mut stops) }
   let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states)
+  if target != PseudoTarget.Before && target != PseudoTarget.After { return move resolved }
   if !rendered && hasStarting {
     let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states)
     let style = &mut resolved.style
@@ -199,13 +204,13 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     }
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
-  let share = !starting && tree.styleOverrides().length == 0
+  let share = !starting && target != PseudoTarget.Selection && tree.styleOverrides().length == 0
   if share {
     let cached = cache.find(scope, parentSlot, sheets.candidates(), inline.asSlice())
     if cached != usize.MAX {
       let mut matches = List<MatchedRule>.make()
       run matches.appendSlice(sheets.matches())
-      return Resolution { containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
+      return Resolution { highlightBackground: Option<ColorProgram>.None, containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
         declarations: run cache.declarations(cached), matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
     }
   }
@@ -248,11 +253,11 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     }
     i = i + 1
   }
-  let finished = run finish(move declarations, move ranks, move expressions, system, tree, parentSlot, Option<Color>.None)
+  let finished = run finish(move declarations, move ranks, move expressions, system, tree, parentSlot, Option<Color>.None, target == PseudoTarget.Selection)
   if share { run cache.insert(scope, parentSlot, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
-  return Resolution { containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
+  return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
 }
 
 effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets,
@@ -353,17 +358,17 @@ effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTre
       }
       declaration = declaration + 1
     }
-    let resolved = run finish(move declarations, move ranks, move expressions, system, tree, parent, Option<Color>.some(color))
+    let resolved = run finish(move declarations, move ranks, move expressions, system, tree, parent, Option<Color>.some(color), false)
     run out.append(Keyframe { offset: f64.toF32(frame.offset), declarations: move resolved.declarations })
     i = i + 1
   }
   return move out
 }
 
-struct Finished { declarations: List<Declaration>, overrides: List<Declaration> }
+struct Finished { highlightBackground: Option<ColorProgram>, declarations: List<Declaration>, overrides: List<Declaration> }
 
 effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut expressions: List<Expression>,
-  system: [Color; 19], tree: &UiTree<'_>, parent: u32, baseColor: Option<Color>) -> Finished
+  system: [Color; 19], tree: &UiTree<'_>, parent: u32, baseColor: Option<Color>, highlight: bool) -> Finished
   ! CssError | OutOfMemoryError ? &mut Allocator {
   let mut i: usize = 0
   let selected = run sheet_cascade.winners(declarations.asSlice(), ranks.asSlice())
@@ -403,7 +408,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
           }
           let mut resolved = move value
           if let Option<Wide>.Some { value: wide } = &sheet_cascade.wide(&resolved) {
-            let inherits = wide == Wide.Inherit || (wide == Wide.Unset && catalog.inherited(target))
+            let inherits = wide == Wide.Inherit || (wide == Wide.Unset && (highlight || catalog.inherited(target)))
             if inherits && parent != NONE {
               resolved = values.keyword(Keyword.Inherit)
             } else {
@@ -424,16 +429,50 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
     }
     i = i + 1
   }
+  // Only the transient selection result retains this program; ordinary per-node
+  // Resolved storage stays unchanged. Each descendant evaluates its own highlight color.
+  let mut highlightBackground = Option<ColorProgram>.None
+  if highlight {
+    let mut at: usize = 0
+    while at < winningExpressions.length() {
+      let expression = &winningExpressions.asSlice()[at]
+      if winning.asSlice()[expression.index].property == Property.BackgroundColor {
+        highlightBackground = Option<ColorProgram>.some(run expression.program.copy())
+      }
+      at = at + 1
+    }
+  }
   declarations = move winning
   expressions = move winningExpressions
-  let inherited = parentComputed(tree, parent).text.color
+  let mut inherited = parentComputed(tree, parent).text.color
+  if highlight {
+    let ancestor = tree.node(parent).parent
+    let initial = colors.toSrgb(system[colors.systemIndex(SystemColor.CanvasText)])
+    inherited = Rgba<f32> { r: f64.toF32(initial.r), g: f64.toF32(initial.g), b: f64.toF32(initial.b), a: f64.toF32(initial.a) }
+    if ancestor != NONE {
+      if let Option.Some { value } = selection.foreground(tree.node(ancestor)) { inherited = value }
+    }
+  }
   let inheritedColor = Color.srgb(f32.toF64(inherited.r), f32.toF64(inherited.g), f32.toF64(inherited.b), f32.toF64(inherited.a))
   let mut foreground = match baseColor { Option.Some { value } => value Option.None => inheritedColor }
+  if highlight {
+    let origin = tree.node(parent)
+    let mut color = origin.computed.text.color
+    if origin.parent != NONE {
+      if let Option.Some { value } = selection.color(selection.of(tree.node(origin.parent)).foreground, color) { color = value }
+    }
+    foreground = Color.srgb(f32.toF64(color.r), f32.toF64(color.g), f32.toF64(color.b), f32.toF64(color.a))
+  }
   let items = declarations.asMutSlice()
   i = 0
   while i < items.length {
     if items[i].property == Property.Color {
-      resolveColor(&mut items[i].value, expressions.asSlice(), i, inheritedColor, system)
+      if !highlight || !convert.isKeyword(&items[i].value, Keyword.Currentcolor) {
+        resolveColor(&mut items[i].value, expressions.asSlice(), i, inheritedColor, system)
+      } else {
+        let origin = tree.node(parent).computed.text.color
+        foreground = Color.srgb(f32.toF64(origin.r), f32.toF64(origin.g), f32.toF64(origin.b), f32.toF64(origin.a))
+      }
       if let Option<Rgba<f32>>.Some { value } = convert.color(&items[i].value) {
         foreground = Color.srgb(f32.toF64(value.r), f32.toF64(value.g), f32.toF64(value.b), f32.toF64(value.a))
       }
@@ -442,7 +481,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
   }
   i = 0
   while i < items.length {
-    if items[i].property != Property.Color { resolveColor(&mut items[i].value, expressions.asSlice(), i, foreground, system) }
+    if items[i].property != Property.Color && (!highlight || !convert.isKeyword(&items[i].value, Keyword.Currentcolor)) { resolveColor(&mut items[i].value, expressions.asSlice(), i, foreground, system) }
     i = i + 1
   }
   let mut finalOverrides = List<Declaration>.make()
@@ -456,7 +495,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
     }
     i = i + 1
   }
-  return Finished { declarations: move declarations, overrides: move finalOverrides }
+  return Finished { highlightBackground: move highlightBackground, declarations: move declarations, overrides: move finalOverrides }
 }
 
 pub fn parentStyle(tree: &UiTree<'_>, slot: u32) -> Computed {
