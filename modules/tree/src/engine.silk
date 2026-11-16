@@ -1,3 +1,6 @@
+import sheet_urls
+import sheet_faces
+import sheet_faces { Registry as SheetFaces }
 import ui_protocol.stylesheet { StyleSource }
 import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as StyleStatus, LoadState as StyleLoadState }
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
@@ -122,7 +125,7 @@ import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
-import ui_text.set { FaceRule, UnicodeRange }
+import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
@@ -379,6 +382,7 @@ struct FontFaceEntry {
 impl Copy for FontFaceEntry {}
 
 struct FontKeyEntry {
+  root: u32,
   family: u32,
   size: f32,
   weight: f32,
@@ -747,6 +751,7 @@ pub struct UiTree<'a> {
   sourceTells: List<u32>,
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
+  pub sheetFaces: SheetFaces,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -940,6 +945,7 @@ impl<'a> UiTree<'a> {
       sourceTells: List<u32>.make(),
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
+      sheetFaces: SheetFaces.make(),
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -1851,6 +1857,7 @@ impl<'a> UiTree<'a> {
         }
       }
       Mutation.CloseRoot { root } => {
+        run sheet_faces.close(&mut self, root)
         run self.closeRoot(index, root)
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
@@ -3646,7 +3653,7 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < entries.length {
       let entry = entries[i]
-      if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
+      if entry.root == self.current && entry.family == text.family && entry.size == text.size && entry.weight == text.weight
         && entry.italic == italic && entry.width == text.width
         && sameTreatment(entry.treatment, treatment) {
         return entry.key
@@ -3655,6 +3662,7 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
       weight: f32.toF64(text.weight),
@@ -3669,6 +3677,7 @@ impl<'a> UiTree<'a> {
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
+        root: self.current,
         family: text.family,
         size: text.size,
         weight: text.weight,
@@ -3688,18 +3697,24 @@ impl<'a> UiTree<'a> {
   effect fn fontFamilyChanged(self: &mut Self, family: &[u8]) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let mut actual = run Bytes.copy(family)
+    let mut root = NONE
+    if let Option.Some { value } = sheet_faces.original(&self.sheetFaces,family) {
+      actual = run Bytes.copy(value.name.asSlice())
+      root = value.root
+    }
     let mut changed = false
     let mut names = List<Family>.make()
     let mut i: usize = 0
     while i < self.fontKeys.length() {
       let list = self.fontKeys.get(i).family
-      if list != NONE {
+      if list != NONE && (root == NONE || self.fontKeys.get(i).root == root) {
         names.clear()
         run self.families.copyOf(list, &mut names)
         let mut j: usize = 0
         while j < names.length() {
           if let Family.Named { name } = &names.asSlice()[j] {
-            if sameFamilyName(Bytes.asSlice(&name), family) {
+            if sameFamilyName(Bytes.asSlice(&name), actual.asSlice()) {
               let entries = self.fontKeys.asMutSlice()
               entries[i].family = NONE
               changed = true
@@ -3787,6 +3802,7 @@ impl<'a> UiTree<'a> {
       run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(declared))
       run self.fontFamilyChanged(Bytes.asSlice(&family))
     }
+    if !ok && sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
     return ok
   }
 
@@ -3795,13 +3811,42 @@ impl<'a> UiTree<'a> {
     let declared = self.fontFaceIndex(id)
     if declared != usize.MAX {
       self.provider.text.fonts.set.markFailed(declared)
+      if sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
     }
+  }
+
+  pub effect fn loadLocalHostFontFace(self: &mut Self, id: u32, name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index == usize.MAX || !self.provider.text.fonts.set.loadLocal(index,name) { return false }
+    let family = run Bytes.copy(self.provider.text.fonts.set.familyOf(index))
+    run self.fontFamilyChanged(family.asSlice())
+    return true
+  }
+
+  pub fn hostFontFaceFailed(self: &Self, id: u32) -> bool {
+    let index = self.fontFaceIndex(id)
+    return index != usize.MAX && self.provider.text.fonts.set.state(index) == FaceState.Failed
+  }
+
+  pub effect fn setHostFontFaceActive(self: &mut Self, id: u32, active: bool, order: usize) ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index != usize.MAX && self.provider.text.fonts.set.setActive(index,active,order) {
+      let family = run Bytes.copy(self.provider.text.fonts.set.familyOf(index))
+      run self.fontFamilyChanged(family.asSlice())
+    }
+  }
+
+  pub effect fn retryHostFontFace(self: &mut Self, id: u32, url: string) ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index == usize.MAX || !self.provider.text.fonts.set.retry(index) { return () }
+    run self.loads.append(Mutation.LoadFontFace { face: id, url: run String.copy(url) })
   }
 
   /// Moves the font faces text needed in the last layouts to the host requests.
   effect fn requestFontFaces(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run sheet_faces.retry(&mut self)
     if !self.provider.text.fonts.set.hasWanted() {
       return
     }
@@ -3939,7 +3984,8 @@ impl<'a> UiTree<'a> {
     self.cancelStyleLoad(root, sheet)
     let at = style_sheets.index(self.styleSheets.asSlice(), root)
     let roots = self.styleSheets.asMutSlice()
-    run roots[at].loads.append(StyleStatus { sheet: sheet, generation: ticket.generation, state: StyleLoadState.Loading })
+    let base = match &source { StyleSource.Url { url } => run String.copy(String.view(&url)) _ => String.make() }
+    run roots[at].loads.append(StyleStatus { base: move base, sheet: sheet, generation: ticket.generation, state: StyleLoadState.Loading })
     drop roots
     run self.styleLoads.append(StyleRequest { ticket: ticket, source: move source })
   }
@@ -3947,9 +3993,17 @@ impl<'a> UiTree<'a> {
   pub effect fn settleStyleSheet(self: &mut Self, ticket: StyleTicket, bytes: Option<Bytes>) -> bool
     ! OutOfMemoryError ? &mut Allocator {
     if !self.styleLoadCurrent(ticket) { return false }
+    let mut base = String.make()
+    let rootIndex = style_sheets.index(self.styleSheets.asSlice(),ticket.root)
+    let statuses = self.styleSheets.asSlice()[rootIndex].loads.asSlice()
+    let mut status: usize = 0
+    while status < statuses.length {
+      if statuses[status].sheet == ticket.sheet { base = run String.copy(String.view(&statuses[status].base)) break }
+      status = status + 1
+    }
     let mut state = StyleLoadState.Failed
     if let Option<Bytes>.Some { value } = move bytes {
-      let result = run Effect.result(self.adoptSheet(0, ticket.root, ticket.sheet, value.asSlice(), true))
+      let result = run Effect.result(self.adoptSheetFrom(0, ticket.root, ticket.sheet, value.asSlice(), true, String.view(&base)))
       match move result {
         Result.Success { .. } => { state = StyleLoadState.Ready }
         Result.Failure { error } => match move error {
@@ -4011,14 +4065,20 @@ impl<'a> UiTree<'a> {
 
   effect fn adoptSheet(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run self.adoptSheetFrom(index,root,id,bytes,replace,"")
+  }
+
+  effect fn adoptSheetFrom(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool, base: string) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
     if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
     let decoded = run Effect.result(Sheet.decode(bytes, &Limits.make()))
-    let sheet = match move decoded {
+    let mut sheet = match move decoded {
       Result<Sheet, DecodeError | OutOfMemoryError>.Success { value } => move value
       Result<Sheet, DecodeError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
       }
     }
+    run sheet_urls.rebase(&mut sheet,base)
     let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
     if at == usize.MAX {
       if replace { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
@@ -4196,6 +4256,7 @@ impl<'a> UiTree<'a> {
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
+    if self.stylesDirty { run sheet_faces.sync(&mut self) }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       let roots = self.styleSheets.asMutSlice()
