@@ -92,6 +92,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
+import style_invalidation { Reach }
 import svg_css.element as css_element
 import svg_css.element { PseudoTarget, StateBits }
 import style_sheets { RootSheets, Resolved, Resolution }
@@ -1246,12 +1247,18 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  fn classesNeedRoot(self: &Self, slot: u32, after: &[usize]) -> bool {
-    if self.stylesDirty || self.styleSheets.length() == 0 { return false }
+  fn classReach(self: &Self, slot: u32, after: &[usize]) -> Reach {
+    if self.stylesDirty || self.styleSheets.length() == 0 { return Reach.Subtree }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    if at == usize.MAX { return false }
+    if at == usize.MAX { return Reach.Subtree }
     let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms.asSlice() _ => &[] }
-    return style_invalidation.classesNeedRoot(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
+    return style_invalidation.classReach(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
+  }
+
+  /// Restyles the subtree of `slot`'s parent, which holds every sibling a selector can relate it to.
+  fn restyleSiblings(self: &mut Self, slot: u32) -> () {
+    let parent = self.node(slot).parent
+    self.restyleLocal(if parent == NONE { slot } else { parent })
   }
 
   pub fn pointerStyleChanged(self: &mut Self, slot: u32, state: StyleState, inline: bool) -> () {
@@ -1275,6 +1282,8 @@ impl<'a> UiTree<'a> {
     let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
     let reach = &self.styleSheets.asSlice()[at].states
     if inline || custom || u32.bitAnd(reach.external, mask) != 0 { self.restyle(slot)
+      return () }
+    if u32.bitAnd(reach.siblings, mask) != 0 { self.restyleSiblings(slot)
       return () }
     let own = match node.sheetStyle() { Option.Some { value } => value.states _ => 0 }
     if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { self.restyleLocal(slot) }
@@ -1589,9 +1598,9 @@ impl<'a> UiTree<'a> {
           Attribute.ClassName { value } => run self.styleAtoms.classes(String.utf8Bytes(String.view(&value)))
           _ => List<usize>.make()
         }
-        let partialClass = match &attribute {
-          Attribute.ClassName { .. } => !self.classesNeedRoot(slot, classAtoms.asSlice())
-          _ => false
+        let classReach = match &attribute {
+          Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
+          _ => Reach.Root
         }
         let node = self.nodeMut(slot)
         run style_attributes.reflect(&mut node, &attribute)
@@ -1833,7 +1842,11 @@ impl<'a> UiTree<'a> {
             identity.hasId = true
           }
         }
-        if partialClass { self.restyleLocal(slot) } else { self.restyle(slot) }
+        match classReach {
+          Reach.Subtree => self.restyleLocal(slot)
+          Reach.Siblings => self.restyleSiblings(slot)
+          Reach.Root => self.restyle(slot)
+        }
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)

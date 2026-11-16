@@ -7,17 +7,32 @@ import style_identity { Atoms }
 import silk.num.u32
 import silk.core.ownership { Copy }
 
-pub struct States { pub descendants: u32, pub external: u32 }
+/// State bits by how far a change of that state reaches beyond the element itself.
+pub struct States { pub descendants: u32, pub siblings: u32, pub external: u32 }
 impl Copy for States {}
 impl States {
-  pub fn make() -> States { return States { descendants: 0, external: 0 } }
+  pub fn make() -> States { return States { descendants: 0, siblings: 0, external: 0 } }
 }
 
-fn scopeSensitive(sheet: &Sheet, range: TokenRange) -> bool {
+/// How far a class change reaches: the element, its subtree, its parent's subtree or the root.
+pub enum Reach { Subtree, Siblings, Root }
+
+/// Custom properties reach only the element's subtree: descendants inherit a new variable scope.
+fn declaresCustom(sheet: &Sheet, range: TokenRange) -> bool {
+  let mut i = range.start
+  while i < range.end {
+    if let Declaration.Custom { .. } = &sheet.declarations.asSlice()[i] { return true }
+    i = i + 1
+  }
+  return false
+}
+
+fn rootSensitive(sheet: &Sheet, range: TokenRange) -> bool {
   let mut i = range.start
   while i < range.end {
     let property = match &sheet.declarations.asSlice()[i] {
-      Declaration.Custom { .. } => { return true }
+      Declaration.Custom { .. } => { i = i + 1
+        continue }
       Declaration.Typed { property, .. } => property
       Declaration.Pending { property, .. } => property
       Declaration.ColorExpression { property, .. } => property
@@ -36,13 +51,15 @@ pub fn states(sheets: &StyleSheets) -> States {
     let rules = sheet.resolver.rules()
     let mut rule: usize = 0
     while rule < rules.length {
-      let sensitive = scopeSensitive(sheet, rules[rule].declarations)
+      let sensitive = rootSensitive(sheet, rules[rule].declarations)
+      let custom = declaresCustom(sheet, rules[rule].declarations)
       let dependencies = sheet.resolver.invalidation(rule)
       let mut at: usize = 0
       while at < dependencies.length {
         let dependency = dependencies[at]
-        if dependency.ancestors || dependency.siblings || sensitive { result.external = u32.bitOr(result.external, dependency.states) }
-        if dependency.descendants { result.descendants = u32.bitOr(result.descendants, dependency.states) }
+        if dependency.ancestors || sensitive { result.external = u32.bitOr(result.external, dependency.states) }
+        else if dependency.siblings { result.siblings = u32.bitOr(result.siblings, dependency.states) }
+        if dependency.descendants || custom { result.descendants = u32.bitOr(result.descendants, dependency.states) }
         at = at + 1
       }
       rule = rule + 1
@@ -87,14 +104,15 @@ fn contains(atoms: &Atoms, values: &[usize], name: &[u8]) -> bool {
   return false
 }
 
-pub fn classesNeedRoot(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: &[usize]) -> bool {
+pub fn classReach(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: &[usize]) -> Reach {
+  let mut reach = Reach.Subtree
   let mut i: usize = 0
   while i < sheets.sheets().length {
     let sheet = &sheets.sheets()[i].sheet
     let rules = sheet.resolver.rules()
     let mut rule: usize = 0
     while rule < rules.length {
-      let sensitive = scopeSensitive(sheet, rules[rule].declarations)
+      let sensitive = rootSensitive(sheet, rules[rule].declarations)
       let dependencies = sheet.resolver.invalidation(rule)
       let buffer = &sheet.buffers.asSlice()[rules[rule].buffer]
       let mut at: usize = 0
@@ -102,8 +120,12 @@ pub fn classesNeedRoot(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], af
         let dependency = dependencies[at]
         if dependency.ancestors || dependency.siblings || sensitive {
           let name = buffer.text(dependency.name)
-          if dependency.kind == DependencyKind.Attribute && insensitive(name, b"class") { return true }
-          if dependency.kind == DependencyKind.Class && contains(atoms, before, name) != contains(atoms, after, name) { return true }
+          let touched = (dependency.kind == DependencyKind.Attribute && insensitive(name, b"class"))
+            || (dependency.kind == DependencyKind.Class && contains(atoms, before, name) != contains(atoms, after, name))
+          if touched {
+            if dependency.ancestors || sensitive { return Reach.Root }
+            reach = Reach.Siblings
+          }
         }
         at = at + 1
       }
@@ -111,5 +133,5 @@ pub fn classesNeedRoot(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], af
     }
     i = i + 1
   }
-  return false
+  return reach
 }
