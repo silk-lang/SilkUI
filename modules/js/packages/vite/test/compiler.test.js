@@ -78,3 +78,21 @@ test('ships typed font faces and diagnoses unsupported display timing', () => {
   assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'font-face font-display timing', count: 1 }]);
   assert.throws(() => compileStylesheet(unsupported, { strict: true }));
 });
+
+
+test('resolves typed font URLs without rewriting local names or unrelated values', () => {
+  const css = '@font-face{font-family:Brand;src:local("Full Name"),url("../fonts/a b.ttf") format("truetype"),url("https://cdn.example/b.woff2")}';
+  const seen = [];
+  const resolveUrl = url => { seen.push(url); return new URL(url, 'https://app.example/styles/main.css').href; };
+  const result = compileStylesheet(css, { strict: true, resolveUrl });
+  assert.deepEqual(seen, ['../fonts/a b.ttf', 'https://cdn.example/b.woff2']);
+  const bytes = Buffer.from(result.bytes);
+  assert.ok(bytes.includes(Buffer.from('https://app.example/fonts/a%20b.ttf')));
+  assert.ok(bytes.includes(Buffer.from('https://cdn.example/b.woff2')));
+  assert.ok(bytes.includes(Buffer.from('Full Name')));
+  const failure = new Error('asset missing');
+  assert.throws(() => compileStylesheet(css, { resolveUrl() { throw failure; } }), error => error === failure);
+  assert.throws(() => compileStylesheet(css, { resolveUrl() { return Promise.resolve('bad'); } }), /must return a string/);
+  assert.throws(() => compileStylesheet(css, { resolveUrl() { return compileStylesheet(css); } }), /cannot run inside resolveUrl/);
+  assert.deepEqual(compileStylesheet(css, { strict: true }).diagnostics, [], 'resolver failures leave the compiler usable');
+});

@@ -1,6 +1,9 @@
 import css_style.compile { Options, CompileError }
 import css_style.compile
 import css_style.sheet { DiagnosticKind }
+import css_style.sheet_fonts { FaceSource }
+import silk.text.string { String }
+import silk.core.result { Result }
 import css_style.tokens { CssError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
@@ -16,12 +19,17 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   @foreign(noCapture: .("feature"))
   unsafe extern "C" fn diagnostic(kind: u32, feature: ?[*]const u8, length: usize, count: usize) -> () as "stylesheet#diagnostic"
 
+  @foreign(noCapture: .("url"))
+  unsafe extern "C" fn fontUrlLength(url: ?[*]const u8, length: usize) -> usize as "stylesheet#font_url_length"
+  @foreign(noCapture: .("into"))
+  unsafe extern "C" fn fontUrlRead(into: ?[*]mut u8, length: usize) -> () as "stylesheet#font_url_read"
+
   effect fn compiled(strict: bool) -> i32 ! CompileError | CssError | OutOfMemoryError ? &mut Allocator {
     let length = unsafe inputLength()
     if length > 67108864 { return 2 }
     let mut source = run Bytes.zeroed(length)
     unsafe inputRead(Pointer.fromMutSlice(source.asMutSlice()), length)
-    let sheet = run compile.compile(source.asSlice(), &Options.make())
+    let mut sheet = run compile.compile(source.asSlice(), &Options.make())
     let entries = sheet.diagnostics.asSlice()
     let mut i: usize = 0
     while i < entries.length {
@@ -38,6 +46,26 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
       i = i + 1
     }
     if strict && entries.length != 0 { return 1 }
+    i = 0
+    while i < sheet.fontFaces.length() {
+      let faces = sheet.fontFaces.asMutSlice()
+      let mut source: usize = 0
+      while source < faces[i].rule.sources.length() {
+        let sources = faces[i].rule.sources.asMutSlice()
+        if let FaceSource.Url { url, .. } = &mut sources[source] {
+          let original = String.utf8Bytes(String.view(&url))
+          let size = unsafe fontUrlLength(Pointer.fromSlice(original),original.length)
+          if size > 67108864 { return 2 }
+          if size != 0 {
+            let mut replacement = run Bytes.zeroed(size - 1)
+            unsafe fontUrlRead(Pointer.fromMutSlice(replacement.asMutSlice()),size - 1)
+            match move String.fromBytes(move replacement) { Result.Success { value } => { url = move value } _ => { return 2 } }
+          }
+        }
+        source = source + 1
+      }
+      i = i + 1
+    }
     let bytes = run sheet.encode()
     unsafe output(Pointer.fromSlice(bytes.asSlice()), bytes.length())
     return 0

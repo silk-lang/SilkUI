@@ -7,6 +7,7 @@ const virtualPrefix = '\0silk:stylesheet:';
 
 export function stylesheetDevPlugin({ strict = false } = {}) {
   const sources = new Map();
+  let server;
   return [{
     name: 'silk:stylesheet-dev',
     apply: 'serve',
@@ -40,6 +41,7 @@ if (import.meta.hot) {
     },
   }, {
     name: 'silk:stylesheet-compile',
+    configureServer(value) { server = value; },
     apply: 'serve',
     enforce: 'post',
     transform(code, id) {
@@ -50,7 +52,14 @@ if (import.meta.hot) {
         this.error('The CSS processor did not produce an inline stylesheet');
       }
       let result;
-      try { result = compileStylesheet(expression.value, { strict }); }
+      try {
+        result = compileStylesheet(expression.value, { strict, resolveUrl(url) {
+          if (!url) return url;
+          const origin = server?.config.server.origin ?? server?.resolvedUrls?.local[0] ?? server?.resolvedUrls?.network[0];
+          try { return new URL(url, origin).href; }
+          catch { throw new Error('Font URLs need a Vite server origin; set server.origin when using middleware mode'); }
+        } });
+      }
       catch (error) {
         const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
         this.error(error.message + (dropped ? `\n${dropped}` : ""));

@@ -97,6 +97,10 @@ The build compiles each file with `css-style`, reports unsupported constructs, a
 compiled bytes in native and canvas hosts. Sheets are adopted before the application's
 first layout, including later windows. The embedded inspector has its own styles.
 DOM pages copy the CSS and link the files in the same order before mounting the app.
+Local `@font-face` files are embedded as data URLs in both outputs. Relative font paths
+start at the original CSS file; paths beginning with `/` start at the app root. Remote
+URLs remain host requests. Changes to a local font also trigger stylesheet hot replacement.
+Keep fonts outside `src/` to avoid also triggering the application source rebuild watcher.
 The [Loom counter](examples/loom) uses this path on all three targets.
 JavaScript release builds also pick up `dist/app.sheet` from `@silkui/vite`, validate its
 format, and embed it after the explicitly configured CSS files.

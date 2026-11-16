@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { createServer } from 'vite';
@@ -51,4 +51,42 @@ const count = 7; mount(createBox({}, createText('counter=' + count)));`);
   } finally {
     host?.close(); await server.close(); rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test('native stylesheet font URLs point to the live Vite asset server through CSS HMR', async () => {
+  const root = mkdtempSync(fileURLToPath(new URL('.fonts-', import.meta.url)));
+  const font = readFileSync(new URL('../../../../assets/assets/fonts/GeistMono.subset.ttf', import.meta.url));
+  mkdirSync(join(root, 'src'));
+  writeFileSync(join(root, 'src/main.js'), `import './app.css';
+import { createBox, createText, mount } from '@silkui/core';
+mount(createBox({}, createText('font counter=7')));`);
+  writeFileSync(join(root, 'src/brand.ttf'), font);
+  writeFileSync(join(root, 'src/other.ttf'), font);
+  const css = join(root, 'src/app.css');
+  writeFileSync(css, '@font-face{font-family:Brand;src:url("./brand.ttf");font-display:swap}');
+  const server = await createServer({ root, configFile: false, logLevel: 'silent', cacheDir: join(root, '.vite'),
+    server: { host: '127.0.0.1', port: 0 }, plugins: [silk({ entry: 'src/main.js', strictStylesheets: true })] });
+  let host;
+  try {
+    await server.listen();
+    host = fakeHost(server.config.plugins.find(plugin => plugin.name === 'silk:dev').api.listener().address().port);
+    const sheets = () => host.calls.filter(call => call[0] === 'styleSheet' && (call[1] === 1 || call[1] === 2));
+    await until('font sheet adoption', host, () => sheets().length === 1 && host.texts().includes('font counter=7'));
+    const fontUrl = new URL('/src/brand.ttf', server.resolvedUrls.local[0]).href;
+    assert.ok(Buffer.from(sheets()[0][3], 'base64').includes(Buffer.from(fontUrl)));
+    const response = await fetch(fontUrl);
+    assert.equal(response.status, 200);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), font);
+    writeFileSync(css, '@font-face{font-family:Brand;src:url("./other.ttf");font-display:swap}');
+    await until('font source replacement', host, () => sheets().length === 2);
+    const otherUrl = new URL('/src/other.ttf', server.resolvedUrls.local[0]).href;
+    assert.ok(Buffer.from(sheets()[1][3], 'base64').includes(Buffer.from(otherUrl)));
+    const previous = sheets()[1][3];
+    writeFileSync(join(root, 'src/other.ttf'), readFileSync(new URL('../../../../assets/assets/fonts/NotoSans-Regular.subset.ttf', import.meta.url)));
+    await until('font file update', host, () => sheets().length === 3);
+    assert.notEqual(sheets()[2][3], previous, 'font-only edits change the URL so native font caches reload it');
+    assert.equal(host.calls.filter(call => call[0] === 'root').length, 1);
+    assert.equal(host.calls.filter(call => call[0] === 'destroy' || call[0] === 'devReload').length, 0);
+  } finally { host?.close(); await server.close(); rmSync(root, { recursive: true, force: true }); }
 });

@@ -2,6 +2,11 @@ import host { Kind, Plan }
 import host
 import stylesheets
 import css_style.sheet { Sheet }
+import css_style.sheet_fonts { FaceSource }
+import css_style.tokens { equal }
+import silk.core.result { Result }
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.filesystem_native { OsFileSystem }
 import css_style.sheet_binary { DecodeError }
 import css_style.tokens { Limits }
 import silk.cli.task { TaskError }
@@ -86,4 +91,57 @@ effect fn compileAsset() -> () ! TaskError | DecodeError | OutOfMemoryError | As
 test effect fn compiledAssetRoundTrip() -> () ! TaskError | DecodeError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run compileAsset() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+
+effect fn bundledFonts() ! TaskError | FileError | DecodeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut FileSystem {
+  let temporary = run FileSystem.temporaryDirectory(&run Path.root(),"silk-font-assets-")
+  let root = temporary.path.view().unwrapOr("")
+  let font = run Path.resolve(&temporary.path,"fonts/font one.ttf")
+  let other = run Path.resolve(&temporary.path,"fonts/root.woff2")
+  let source = run Path.resolve(&temporary.path,"styles/main.css")
+  let host = run Path.resolve(&temporary.path,"host")
+  run FileSystem.writeFileWithParents(&font,b"first font")
+  run FileSystem.writeFileWithParents(&other,b"second font")
+  run FileSystem.writeFileWithParents(&source,b"@layer fonts{@media(min-width:1px){@font-face{font-family:Brand;src:local('Full Name'),url('../fonts/font%20one.ttf?v=1#face') format('truetype'),url(/fonts/root.woff2),url(https://example.invalid/a.woff2);font-display:swap}}}.untouched{background:url(../images/keep.png)}")
+  let paths: [string<'static>; 1] = ["styles/main.css"]
+  run stylesheets.emit(root,&paths,host.view().unwrapOr(""),false)
+  let compiledPath = run Path.resolve(&host,"style-0.sheet")
+  let compiled = run FileSystem.readFile(&compiledPath)
+  let sheet = run Sheet.decode(compiled.asSlice(),&Limits.make())
+  run Testing.expect(sheet.fontFaces.length() == 1 && sheet.fontFaces.asSlice()[0].rule.sources.length() == 4,"bundling preserves conditions, local sources and URL alternatives")
+  let sources = sheet.fontFaces.asSlice()[0].rule.sources.asSlice()
+  run Testing.expect(match &sources[1] { FaceSource.Url { url, format, .. } => String.view(&url) == "data:application/octet-stream;base64,Zmlyc3QgZm9udA==" && equal(format.asSlice(),b"truetype") _ => false },"relative escaped font path is bundled with its format hint")
+  run Testing.expect(match &sources[2] { FaceSource.Url { url, .. } => String.view(&url) == "data:application/octet-stream;base64,c2Vjb25kIGZvbnQ=" _ => false },"root-relative font path uses the app root")
+  run Testing.expect(match &sources[3] { FaceSource.Url { url, .. } => String.view(&url) == "https://example.invalid/a.woff2" _ => false },"remote URLs remain lazy host loads")
+  run stylesheets.emit(root,&paths,host.view().unwrapOr(""),true)
+  let dom = run FileSystem.readFile(&run Path.resolve(&host,"style-0.css"))
+  let domText = match String.fromUtf8(dom.asSlice()) { Result.Success { value } => value _ => "" }
+  run Testing.expect(String.contains(domText,"data:application/octet-stream;base64,Zmlyc3QgZm9udA==") && String.contains(domText,".untouched{background:url(../images/keep.png)}"),"DOM output embeds the font and preserves unrelated CSS source")
+  let before = run stylesheets.fingerprint(root,&paths)
+  run FileSystem.writeFile(&font,b"updated font")
+  let after = run stylesheets.fingerprint(root,&paths)
+  run Testing.expect(before != after,"editing only a font changes the stylesheet update fingerprint")
+  run stylesheets.emit(root,&paths,host.view().unwrapOr(""),false)
+  let updated = run FileSystem.readFile(&compiledPath)
+  run Testing.expect(!equal(compiled.asSlice(),updated.asSlice()),"font edits change the embedded sheet without application source edits")
+  let updatePath = run Path.resolve(&host,"styles.update")
+  let previous = run FileSystem.readFile(&updatePath)
+  run FileSystem.writeFile(&source,b"@font-face{font-family:Missing;src:url(missing.ttf)}")
+  let failed = run Effect.result(stylesheets.emit(root,&paths,host.view().unwrapOr(""),false))
+  run Testing.expect(match &failed { Result.Failure { .. } => true _ => false },"missing local assets fail the build")
+  let retained = run FileSystem.readFile(&updatePath)
+  run Testing.expect(equal(previous.asSlice(),retained.asSlice()),"failed font updates retain the last published bundle")
+  run FileSystem.release(move temporary)
+}
+
+effect fn withFontFiles() ! TaskError | FileError | DecodeError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/tmp")
+  run bundledFonts() |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn stylesheetBuildBundlesLocalFontsForNativeAndDomAndTracksChanges() ! TaskError | FileError | DecodeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withFontFiles() |> Effect.provideMut<Allocator>(&mut allocator)
 }

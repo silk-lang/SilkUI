@@ -49,10 +49,15 @@ async function stop(child, group = false) {
 try {
   await mkdir(join(temporary, 'src'));
   await mkdir(join(temporary, 'styles'));
+  await mkdir(join(temporary, 'fonts'));
+  const font = join(temporary, 'fonts/brand.ttf');
+  const monoFont = new URL('../../assets/assets/fonts/GeistMono.subset.ttf', import.meta.url);
+  const sansFont = new URL('../../assets/assets/fonts/NotoSans-Regular.subset.ttf', import.meta.url);
+  await copyFile(monoFont, font);
   await copyFile(join(fixture, 'src/app.silk'), join(temporary, 'src/app.silk'));
   await copyFile(join(fixture, 'styles/app.css'), join(temporary, 'styles/app.css'));
   const theme = join(temporary, 'src/theme.css');
-  const original = await readFile(join(fixture, 'styles/theme.css'), 'utf8');
+  const original = (await readFile(join(fixture, 'styles/theme.css'), 'utf8')) + '\n@font-face{font-family:Bundled;src:url("../fonts/brand.ttf");font-display:swap}.font-probe{display:inline-block;font:16px Bundled}';
   await writeFile(theme, original);
   // A configured CSS file under src/ must not also trigger a program rebuild.
   const tasks = (await readFile(join(fixture, 'src/tasks.silk'), 'utf8')).replace('styles/theme.css', 'src/theme.css');
@@ -105,6 +110,24 @@ try {
     plus.click(); plus.click();
   })()`);
   const origin = await evaluate('performance.timeOrigin');
+  const fontWidth = await evaluate(`(async()=>{
+    const probe=document.createElement('span');probe.className='font-probe';probe.textContent='iiiiiiii';document.body.append(probe);
+    await document.fonts.load('16px Bundled','iiiiiiii');return probe.getBoundingClientRect().width;
+  })()`);
+  assert.ok(fontWidth > 70 && fontWidth < 80, 'the generated DOM sheet loads its bundled font');
+  await copyFile(sansFont, font);
+  const fontUpdate = await evaluate(`(async()=>{
+    for(let i=0;i<100;i++){
+      await document.fonts.load('16px Bundled','iiiiiiii');
+      const width=document.querySelector('.font-probe').getBoundingClientRect().width;
+      if(width > 30 && width < 40) return {width,origin:performance.timeOrigin,token:window.styleTestToken,count:document.querySelector('.count').textContent};
+      await new Promise(r=>setTimeout(r,50));
+    }
+    throw new Error('font-only stylesheet update timed out');
+  })()`);
+  assert.equal(fontUpdate.origin,origin);
+  assert.equal(fontUpdate.token,'survived');
+  assert.equal(fontUpdate.count,'2');
   async function waitForColor(color) {
     return evaluate(`(async () => {
       for (let i = 0; i < 100; i++) {
@@ -149,7 +172,7 @@ try {
   assert.notEqual(rebuilt?.origin, origin);
   assert.equal(rebuilt?.count, '0');
   assert.equal(rebuilt?.color, 'rgb(22, 101, 52)');
-  console.log('PASS: CSS replacement preserves state and order, recovers from missing files, and survives source rebuilds');
+  console.log('PASS: bundled fonts load and hot-update; CSS replacement preserves state and order, recovers from missing files, and survives source rebuilds');
 } catch (error) {
   console.error(buildLog);
   throw error;

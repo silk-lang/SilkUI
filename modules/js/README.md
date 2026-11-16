@@ -191,8 +191,8 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
   (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
   `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
   `li` have theirs, and nothing has a default style.
-- **Style.** `h.Style` with CSS values (`fontSize: '13px'`). There are no stylesheets yet, so
-  `h.Class` matches nothing. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
+- **Style.** `h.Style` with CSS values (`fontSize: '13px'`) and `h.Class` for adopted
+  stylesheets. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
   and `StartingStyle` from this package are the looks the tree lays over an element in those
   states, as attributes.
 - **Events.** The `On*` attributes of the events the tree has: clicks, pointers, keys, focus,
@@ -463,5 +463,9 @@ The numeric handle formerly exposed as `node.id` is now the read-only
 `id` does not change that handle or event routing. Existing accessibility
 relations continue to resolve by the string id.
 
-These identity APIs are the foundation for native stylesheet matching. Sheet
-adoption and CSS loading are still being implemented on this feature branch.
+CSS imports processed by `@silkui/vite` are compiled and adopted by the native tree.
+Production sheets embed local font assets, including Vite public-directory fonts.
+Development sheets use the Vite asset server; CSS and font edits preserve the mounted
+application. Middleware-mode integrations that serve fonts must set `server.origin`.
+See the [stylesheet guide](../../docs/content/core/stylesheets.md) for adoption APIs,
+runtime loading, and supported CSS.

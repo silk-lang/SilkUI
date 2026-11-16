@@ -68,3 +68,40 @@ test("compiles processed CSS chunks into app.sheet without DOM injection", async
     assert.equal(existsSync(join(root, "dist/app.sheet")), false, "removing the last CSS import removes stale compiled assets");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+test("bundles local font files into the compiled production sheet", async () => {
+  const root = mkdtempSync(join(tmpdir(), "silk-font-build-"));
+  const font = readFileSync(new URL('../../../../assets/assets/fonts/GeistMono.subset.ttf', import.meta.url));
+  try {
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src/main.js"), 'import "./app.css"; console.log("font app");');
+    writeFileSync(join(root, "src/brand.ttf"), font);
+    writeFileSync(join(root, "src/app.css"), '@font-face{font-family:Brand;src:url("./brand.ttf") format("truetype");font-display:swap}.title{font-family:Brand}');
+    await build({ root, configFile: false, logLevel: "silent", plugins: [silk({ entry: "src/main.js", strictStylesheets: true })] });
+    const bytes = readFileSync(join(root, "dist/app.sheet"));
+    assert.ok(bytes.includes(Buffer.from(font.toString('base64'))), 'Vite library assets remain embedded after CSS compilation');
+    assert.equal(existsSync(join(root, 'dist/app.css')), false);
+    assert.doesNotMatch(readFileSync(join(root, 'dist/app.js'), 'utf8'), /@font-face|document/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+
+test("embeds public and emitted fonts with relative bases and nested CSS assets", async () => {
+  const root = mkdtempSync(join(tmpdir(), "silk-public-font-build-"));
+  const font = readFileSync(new URL('../../../../assets/assets/fonts/GeistMono.subset.ttf', import.meta.url));
+  const publicFont = readFileSync(new URL('../../../../assets/assets/fonts/NotoSans-Regular.subset.ttf', import.meta.url));
+  try {
+    mkdirSync(join(root, 'src'));
+    mkdirSync(join(root, 'public/fonts'), { recursive: true });
+    writeFileSync(join(root, 'src/main.js'), 'import "./app.css";');
+    writeFileSync(join(root, 'src/brand.ttf'), font);
+    writeFileSync(join(root, 'public/fonts/public.ttf'), publicFont);
+    writeFileSync(join(root, 'src/app.css'), '@font-face{font-family:Emitted;src:url("./brand.ttf?no-inline")}@font-face{font-family:Public;src:url("/fonts/public.ttf")}');
+    await build({ root, base: './', configFile: false, logLevel: 'silent', plugins: [silk({ entry: 'src/main.js', strictStylesheets: true })],
+      build: { rolldownOptions: { output: { assetFileNames: 'assets/[name]-[hash][extname]' } } } });
+    const bytes = readFileSync(join(root, 'dist/app.sheet'));
+    assert.ok(bytes.includes(Buffer.from(font.toString('base64'))));
+    assert.ok(bytes.includes(Buffer.from(publicFont.toString('base64'))), 'public font bytes are carried by the sheet');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

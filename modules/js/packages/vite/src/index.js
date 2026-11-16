@@ -17,6 +17,7 @@ import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
 import { stylesheetDevPlugin } from "./stylesheets.js";
+import { fontAssetResolver } from "./font-assets.js";
 
 /**
  * @param {object} [options]
@@ -45,6 +46,7 @@ export default function silk(options = {}) {
   let child = null;
   let stylesheetPath = "";
   let emittedStylesheet = false;
+  let stylesheetConfig;
 
   function startHost() {
     const { command, args = [], cwd } = options.host;
@@ -143,6 +145,7 @@ export default function silk(options = {}) {
     enforce: "post",
     configResolved(config) {
       stylesheetPath = resolve(config.root, config.build.outDir, "app.sheet");
+      stylesheetConfig = config;
     },
     generateBundle: {
       order: "post",
@@ -152,7 +155,7 @@ export default function silk(options = {}) {
         if (!sheets.length) return;
         const css = sheets.map(sheet => typeof sheet.source === "string" ? sheet.source : new TextDecoder().decode(sheet.source)).join("\n");
         let compiled;
-        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true }); }
+        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
         catch (error) {
           const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
           this.error(error.message + (dropped ? `\n${dropped}` : ""));
