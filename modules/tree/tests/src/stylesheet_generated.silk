@@ -1,0 +1,101 @@
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, StyleState, FrameInput }
+import ui_tree.css
+import ui_tree.css { px }
+import font_collection.lib { FontCollection }
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.element { PseudoTarget, StateBits, HOVER }
+import svg_css.tokens { CssError, Limits, equal }
+import svg_css.generated_content { Content, Item }
+import svg_css.generated_content
+import svg_css.written
+import svg_css.lexer
+import svg_css.input { Input }
+import properties.catalog { Property }
+import properties.values { Value, Declaration }
+import properties.values
+import properties.convert
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn value<'a>(declarations: &'a [Declaration], property: Property) -> Option<&'a Value> {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if declarations[i].property == property { return Option<&Value>.some(&declarations[i].value) }
+    i = i + 1
+  }
+  return Option<&Value>.None
+}
+fn number(declarations: &[Declaration], property: Property) -> f32 {
+  return match value(declarations, property) {
+    Option.Some { value: found } => match &found.* {
+      Value.Unit { value: amount, .. } => amount
+      _ => -1.0
+    }
+    _ => -1.0
+  }
+}
+
+effect fn exercise() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("outer") })
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("origin") })
+  run batch.style(2, &[css.width(px(190.0)), css.marginBottom(px(81.0))])
+  run batch.customProperty(2, StyleState.Base, "--label", Option<string>.some("'inline label'"), false)
+  run batch.customProperty(2, StyleState.Hover, "--unit", Option<string>.some("23px"), false)
+  let source = b"@property --isolated{syntax:'<length>';inherits:false;initial-value:7px}.outer{--unit:5px;color:blue}.origin{--unit:11px;--isolated:99px;color:red;width:170px;height:40px}.origin::before{content:var(--label);width:var(--unit);height:var(--isolated);background:currentColor;animation:glow 1s}.origin::before:hover{opacity:.5}.origin:hover::before{padding:4px}.origin::after{content:'';--unit:29px;width:var(--unit);background:currentColor}@starting-style{.origin::before{width:3px}}@keyframes glow{from{width:var(--unit)}to{width:22px}}"
+  let sheet = run compile.compile(source, &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  run Testing.expect(tree.node(tree.slotOf(2)).computed.layout.width.value == 190.0, "ordinary inline styles still win on the origin")
+  let origin = tree.slotOf(2)
+  let before = run tree.resolveGeneratedStyle(origin, PseudoTarget.Before, StateBits { bits: 0 }, false)
+  run Testing.expect(number(before.declarations.asSlice(), Property.Width) == 11.0 && number(before.declarations.asSlice(), Property.Height) == 7.0, "pseudo variables inherit from the origin while registered non-inherited values reset")
+  run Testing.expect(value(before.declarations.asSlice(), Property.MarginBottom).isNone(), "origin inline declarations do not become pseudo declarations")
+  run Testing.expect(match value(before.declarations.asSlice(), Property.BackgroundColor) {
+    Option.Some { value } => match convert.color(value) { Option.Some { value: color } => color.r == 1.0 && color.b == 0.0 _ => false }
+    _ => false
+  }, "currentColor uses the origin's computed color rather than its parent's")
+  run Testing.expect(match &before.starting { Option.Some { value } => number(value.asSlice(), Property.Width) == 3.0 _ => false }, "starting rules use the generated target")
+  run Testing.expect(before.keyframes.length() == 1 && number(before.keyframes.asSlice()[0].frames.asSlice()[0].declarations.asSlice(), Property.Width) == 11.0, "keyframe variables resolve in the generated scope")
+  let contentValue = match value(before.declarations.asSlice(), Property.Content) { Option.Some { value } => value _ => { run Testing.expect(false, "content declaration survives")
+    return () } }
+  let contentText = run values.cssText(contentValue)
+  let tokens = run lexer.tokenize(contentText.asSlice(), &Limits.make())
+  let content = run generated_content.parse(&Input.Contiguous { buffer: &tokens, range: tokens.all() })
+  run Testing.expect(match &content { Option.Some { value: Content.Items { values } } => values.length() == 1 && match &values.asSlice()[0] { Item.Text { value } => equal(value.asSlice(), b"inline label") _ => false } _ => false }, "inherited inline custom properties substitute into generated content")
+  let after = run tree.resolveGeneratedStyle(origin, PseudoTarget.After, StateBits { bits: 0 }, true)
+  run Testing.expect(number(after.declarations.asSlice(), Property.Width) == 29.0 && after.starting.isNone(), "after owns a separate variable scope and does not restart an existing box")
+  let hovered = run tree.resolveGeneratedStyle(origin, PseudoTarget.Before, StateBits { bits: HOVER }, true)
+  run Testing.expect(number(hovered.declarations.asSlice(), Property.Opacity) == 0.5 && value(hovered.declarations.asSlice(), Property.PaddingTop).isNone(), "pseudo hover is independent of origin hover")
+  let node = tree.nodeMut(origin)
+  node.hovered = true
+  tree.restyle(origin)
+  run tree.frame(frame)
+  let originHovered = run tree.resolveGeneratedStyle(origin, PseudoTarget.Before, StateBits { bits: 0 }, true)
+  run Testing.expect(number(originHovered.declarations.asSlice(), Property.Width) == 23.0 && number(originHovered.declarations.asSlice(), Property.PaddingTop) == 4.0 && value(originHovered.declarations.asSlice(), Property.Opacity).isNone(), "origin hover and its inherited variable changes affect the generated target")
+  let overrides = run written.declarations(b"width:999px;opacity:.3")
+  drop run tree.setOverride(2, StyleState.Base, move overrides, false)
+  run tree.frame(frame)
+  let overridden = run tree.resolveGeneratedStyle(origin, PseudoTarget.Before, StateBits { bits: 0 }, true)
+  run Testing.expect(tree.node(origin).computed.layout.width.value == 999.0 && number(overridden.declarations.asSlice(), Property.Width) == 23.0 && value(overridden.declarations.asSlice(), Property.Opacity).isNone() && overridden.overrides.length() == 0, "origin inspector overrides do not become generated declarations")
+}
+
+test effect fn generatedTargetsResolveInheritanceVariablesAndMotionWithoutInlineLeakage() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run exercise() |> Effect.provideMut<Allocator>(&mut allocator)
+}

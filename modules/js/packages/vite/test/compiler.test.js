@@ -6,7 +6,7 @@ test('compiles layers, variables, conditions, and modern colors using the shippe
   const source = '@layer theme, utilities; @layer theme { :root { --gap: 4px } } @layer utilities { .card:hover { padding: calc(var(--gap) * 2); color: color-mix(in oklch, red 30%, blue) } } @media (min-width: 10px) { .card { display: flex } }';
   const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
   assert.equal(new TextDecoder().decode(bytes.slice(0, 8)), 'SILKCSS\0');
-  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 4);
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 5);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
   assert.equal(new TextDecoder().decode(bytes).includes(source), false);
@@ -26,4 +26,16 @@ test('results keep their bytes after subsequent compilations and memory growth',
   const css = Array.from({ length: 500 }, (_, i) => `.rule-${i} { width: ${i}px; }`).join('\n');
   assert.ok(compileStylesheet(css).bytes.length > first.length);
   assert.deepEqual(first, saved);
+});
+
+
+test('ships generated pseudo programs and diagnoses unsupported content', () => {
+  const source = `.card { &::before { content: ""; } &::after { content: attr(data-label, "fallback"); color: red; } }`;
+  const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 5);
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(compileStylesheet(source).bytes, bytes);
+  const unsupported = '.card::before { content: counter(item); content: url(icon.png); }';
+  assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'content', count: 2 }]);
+  assert.throws(() => compileStylesheet(unsupported, { strict: true }));
 });

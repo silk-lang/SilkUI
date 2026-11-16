@@ -15,7 +15,7 @@ import style { TextStyle, Computed }
 import svg_css.adopted { StyleSheets, Source, MatchedRule }
 import svg_css.sheet { Declaration as SheetDeclaration }
 import svg_css.cascade { Priority, Origin }
-import svg_css.element { MatchContext, NO_ELEMENT }
+import svg_css.element { MatchContext, PseudoTarget, StateBits, NO_ELEMENT }
 import svg_css.variables { ScopeId, RegistrationError }
 import svg_css.resolver { ResolverError }
 import svg_css.tokens { Limits, CssError, Buffers, TokenBuffer }
@@ -103,27 +103,43 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
 
 pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolved
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
-  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false)
+  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false, PseudoTarget.None, StateBits.empty())
   if !tree.node(slot).rendered && (hasStarting || tree.node(slot).starting.length() != 0) {
-    let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true)
+    let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true, PseudoTarget.None, StateBits.empty())
     resolved.starting = Option<List<Declaration>>.some(move before.declarations)
   }
-  resolved.keyframes = run keyframes(&sheets.*, system, tree, slot, &resolved, &mut stops)
+  resolved.keyframes = run keyframes(&sheets.*, system, tree, tree.node(slot).parent, &resolved, &mut stops)
   return move resolved
 }
 
-effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool) -> Resolved
+pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool,
+  tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolved
+  ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
+  if target == PseudoTarget.None { return run resolve(&mut sheets, &mut cache, system, hasStarting, tree, origin, &mut stops) }
+  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states)
+  if !rendered && hasStarting {
+    let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states)
+    resolved.starting = Option<List<Declaration>>.some(move before.declarations)
+  }
+  resolved.keyframes = run keyframes(&sheets.*, system, tree, origin, &resolved, &mut stops)
+  return move resolved
+}
+
+effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool, target: PseudoTarget, states: StateBits) -> Resolved
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
+  let parentSlot = if target == PseudoTarget.None { node.parent } else { slot }
   let mut inline = List<Declaration>.make()
-  run inlineValues(&mut inline, node.base.asSlice(), tree, node.id, StyleState.Base)
-  if node.hovered { run inlineValues(&mut inline, node.hover.asSlice(), tree, node.id, StyleState.Hover) }
-  if node.pressed { run inlineValues(&mut inline, node.active.asSlice(), tree, node.id, StyleState.Active) }
-  if tree.focused == slot {
-    run inlineValues(&mut inline, node.focus.asSlice(), tree, node.id, StyleState.Focus)
-    if tree.focusVisible || node.kind == NodeKind.Input { run inlineValues(&mut inline, node.focusVisible.asSlice(), tree, node.id, StyleState.FocusVisible) }
+  if target == PseudoTarget.None {
+    run inlineValues(&mut inline, node.base.asSlice(), tree, node.id, StyleState.Base)
+    if node.hovered { run inlineValues(&mut inline, node.hover.asSlice(), tree, node.id, StyleState.Hover) }
+    if node.pressed { run inlineValues(&mut inline, node.active.asSlice(), tree, node.id, StyleState.Active) }
+    if tree.focused == slot {
+      run inlineValues(&mut inline, node.focus.asSlice(), tree, node.id, StyleState.Focus)
+      if tree.focusVisible || node.kind == NodeKind.Input { run inlineValues(&mut inline, node.focusVisible.asSlice(), tree, node.id, StyleState.FocusVisible) }
+    }
+    if starting { run inlineValues(&mut inline, node.starting.asSlice(), tree, node.id, StyleState.Starting) }
   }
-  if starting { run inlineValues(&mut inline, node.starting.asSlice(), tree, node.id, StyleState.Starting) }
   let mut priorities = List<Priority>.make()
   let mut i: usize = 0
   while i < inline.length() {
@@ -135,38 +151,42 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   }
   let adapter = SelectorTree { tree: tree }
   let mut context = MatchContext.make(u32.toUsize(tree.root), NO_ELEMENT)
+  context.pseudo = target
+  context.pseudoStates = states
   run sheets.resolveWith(&adapter, u32.toUsize(slot), priorities.asSlice(), &mut context, starting)
   let mut parent = Option<ScopeId>.None
-  if node.parent != NONE {
-    if let Option<&Resolved>.Some { value } = tree.node(node.parent).sheetStyle() {
+  if parentSlot != NONE {
+    if let Option<&Resolved>.Some { value } = tree.node(parentSlot).sheetStyle() {
       parent = Option<ScopeId>.some(value.scope)
     }
   }
   let mut custom = List<InlineCustom<'_, '_>>.make()
-  if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
-    let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible, StyleState.Starting]
-    let mut stateIndex: usize = 0
-    while stateIndex < states.length {
-      let state = states[stateIndex]
-      if active(tree, slot, state) || (starting && state == StyleState.Starting) {
-        let mut at: usize = 0
-        while at < identity.custom.length() {
-          let item = &identity.custom.asSlice()[at]
-          if item.state == state {
-            let mut priority = Priority.make(Origin.Author, custom.length())
-            priority.important = item.important
-            run custom.append(InlineCustom<'_, '_> { name: String.utf8Bytes(String.view(&item.name)), tokens: &item.tokens, priority: priority })
+  if target == PseudoTarget.None {
+    if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
+      let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible, StyleState.Starting]
+      let mut stateIndex: usize = 0
+      while stateIndex < states.length {
+        let state = states[stateIndex]
+        if active(tree, slot, state) || (starting && state == StyleState.Starting) {
+          let mut at: usize = 0
+          while at < identity.custom.length() {
+            let item = &identity.custom.asSlice()[at]
+            if item.state == state {
+              let mut priority = Priority.make(Origin.Author, custom.length())
+              priority.important = item.important
+              run custom.append(InlineCustom<'_, '_> { name: String.utf8Bytes(String.view(&item.name)), tokens: &item.tokens, priority: priority })
+            }
+            at = at + 1
           }
-          at = at + 1
         }
+        stateIndex = stateIndex + 1
       }
-      stateIndex = stateIndex + 1
     }
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
   let share = !starting && tree.styleOverrides().length == 0
   if share {
-    let cached = cache.find(scope, node.parent, sheets.candidates(), inline.asSlice())
+    let cached = cache.find(scope, parentSlot, sheets.candidates(), inline.asSlice())
     if cached != usize.MAX {
       let mut matches = List<MatchedRule>.make()
       run matches.appendSlice(sheets.matches())
@@ -200,7 +220,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   }
   let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible, StyleState.Starting]
   i = 0
-  while tree.styleOverrides().length != 0 && i < states.length {
+  while target == PseudoTarget.None && tree.styleOverrides().length != 0 && i < states.length {
     if active(tree, slot, states[i]) || (starting && states[i] == StyleState.Starting) {
       if let Option<&StyleOverride>.Some { value: item } = tree.overrideOf(node.id, states[i]) {
         let mut at: usize = 0
@@ -213,8 +233,8 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     }
     i = i + 1
   }
-  let finished = run finish(move declarations, move ranks, move expressions, system, tree, slot, Option<Color>.None)
-  if share { run cache.insert(scope, node.parent, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
+  let finished = run finish(move declarations, move ranks, move expressions, system, tree, parentSlot, Option<Color>.None)
+  if share { run cache.insert(scope, parentSlot, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
   return Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
@@ -242,16 +262,16 @@ effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut Li
   }
 }
 
-effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32, resolved: &Resolved, stops: &mut EasingStops) -> List<Rule>
+effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, parent: u32, resolved: &Resolved, stops: &mut EasingStops) -> List<Rule>
   ! CssError | OutOfMemoryError ? &mut Allocator {
   let mut names = AnimationLists.initial()
-  let mut foreground = parentStyle(tree, slot).text.color
+  let mut foreground = parentComputed(tree, parent).text.color
   let declarations = resolved.declarations.asSlice()
   let mut i: usize = 0
   while i < declarations.length {
     let declaration = &declarations[i]
     if declaration.property == Property.AnimationName {
-      if convert.isKeyword(&declaration.value, Keyword.Inherit) { names = parentStyle(tree, slot).animation }
+      if convert.isKeyword(&declaration.value, Keyword.Inherit) { names = parentComputed(tree, parent).animation }
       else {
         let text = run values.cssText(&declaration.value)
         run timing.declareAnimation(&mut names, timing.ANIMATION_NAME, text.asSlice(), &mut stops)
@@ -283,7 +303,7 @@ effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>
               Result<string, InvalidUtf8>.Success { value: text } => run String.copy(text)
               _ => String.make()
             }
-            let frames = run keyframeValues(sheets, system, tree, slot, resolved.scope, value, color)
+            let frames = run keyframeValues(sheets, system, tree, parent, resolved.scope, value, color)
             run out.append(run animation.make(move name, move frames, &mut stops))
           }
           found = true
@@ -297,7 +317,7 @@ effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>
   return move out
 }
 
-effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32,
+effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, parent: u32,
   scope: ScopeId, reference: KeyframesRef, color: Color) -> List<Keyframe>
   ! CssError | OutOfMemoryError ? &mut Allocator {
   let sheet = &sheets.sheets()[reference.sheet].sheet
@@ -318,7 +338,7 @@ effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTre
       }
       declaration = declaration + 1
     }
-    let resolved = run finish(move declarations, move ranks, move expressions, system, tree, slot, Option<Color>.some(color))
+    let resolved = run finish(move declarations, move ranks, move expressions, system, tree, parent, Option<Color>.some(color))
     run out.append(Keyframe { offset: f64.toF32(frame.offset), declarations: move resolved.declarations })
     i = i + 1
   }
@@ -328,9 +348,8 @@ effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTre
 struct Finished { declarations: List<Declaration>, overrides: List<Declaration> }
 
 effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut expressions: List<Expression>,
-  system: [Color; 19], tree: &UiTree<'_>, slot: u32, baseColor: Option<Color>) -> Finished
+  system: [Color; 19], tree: &UiTree<'_>, parent: u32, baseColor: Option<Color>) -> Finished
   ! CssError | OutOfMemoryError ? &mut Allocator {
-  let node = tree.node(slot)
   let mut i: usize = 0
   let selected = run sheet_cascade.winners(declarations.asSlice(), ranks.asSlice())
   let mut winning = List<Declaration>.make()
@@ -370,7 +389,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
           let mut resolved = move value
           if let Option<Wide>.Some { value: wide } = &sheet_cascade.wide(&resolved) {
             let inherits = wide == Wide.Inherit || (wide == Wide.Unset && catalog.inherited(target))
-            if inherits && node.parent != NONE {
+            if inherits && parent != NONE {
               resolved = values.keyword(Keyword.Inherit)
             } else {
               if target == Property.Color {
@@ -392,7 +411,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
   }
   declarations = move winning
   expressions = move winningExpressions
-  let inherited = parentStyle(tree, slot).text.color
+  let inherited = parentComputed(tree, parent).text.color
   let inheritedColor = Color.srgb(f32.toF64(inherited.r), f32.toF64(inherited.g), f32.toF64(inherited.b), f32.toF64(inherited.a))
   let mut foreground = match baseColor { Option.Some { value } => value Option.None => inheritedColor }
   let items = declarations.asMutSlice()
@@ -426,7 +445,10 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
 }
 
 pub fn parentStyle(tree: &UiTree<'_>, slot: u32) -> Computed {
-  let parent = tree.node(slot).parent
+  return parentComputed(tree, tree.node(slot).parent)
+}
+
+fn parentComputed(tree: &UiTree<'_>, parent: u32) -> Computed {
   if parent == NONE { return Computed.inheriting(TextStyle.initial()) }
   return tree.node(parent).computed
 }
