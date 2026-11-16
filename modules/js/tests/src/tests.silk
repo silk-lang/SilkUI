@@ -318,7 +318,9 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 3 {
+  let ran = if scenario == 4 {
+    run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 3 {
     run Effect.result(stylesheets(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 0 {
     run Effect.result(counter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -524,4 +526,39 @@ test effect fn constructedStylesheetsCompileReplaceAndRemoveInTheNativeTree() ->
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(3) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.access { accessibleName }
+
+effect fn literalAria(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { CSSStyleSheet, createBox, createInput, mount } from '@silkui/core'; const root = createBox(); globalThis.title = createBox(); globalThis.field = createInput(); title.id = 'title'; title.setAttribute('aria-label', 'Title'); field.setAttribute('aria-label', 'Fallback'); field.setAttribute('aria-labelledby', 'title'); root.appendChild(title); root.appendChild(field); const sheet = new CSSStyleSheet(); sheet.replaceSync('[aria-labelledby=title] { width: 123px }'); root.adoptedStyleSheets.push(sheet); mount(root);", b"aria.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  let mut name = String.make()
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "JavaScript literal relations reach native accessibility")
+  run Testing.expect(tree.engine().node(tree.engine().slotOf(3)).computed.layout.width.value == 123.0, "CSS selectors see the literal ARIA attribute, not translated node numbers")
+  run host.evaluate(b"title.id = 'renamed'", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "renaming the referenced element changes the native name without rewriting the attribute")
+  run host.evaluate(b"title.id = 'title'", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "restoring an ID restores the relation")
+  run host.evaluate(b"title.destroy()", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "destroying a referenced element clears its name")
+}
+
+test effect fn literalAriaIdsReachNativeSelectorsAndAccessibility() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(4) |> Effect.provideMut<Allocator>(&mut allocator)
 }

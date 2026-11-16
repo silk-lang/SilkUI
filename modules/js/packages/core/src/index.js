@@ -77,12 +77,6 @@ function cssValue(name, value) {
 // ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
 // the other ARIA names as they are; one it does not know is ignored, with one warning.
 const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
-// ARIA attributes that name other elements by their ids. The tree takes node numbers, so a
-// relation is sent again whenever an id it names comes, goes or moves to another node.
-const ARIA_RELATIONS = new Set(["labelledby", "describedby", "controls", "activedescendant"]);
-// Nodes by their `id`, and the nodes whose relations name each id.
-const byId = new Map();
-const naming = new Map();
 const warned = new Set();
 
 function warnOnce(message) {
@@ -545,9 +539,7 @@ export class Node {
   }
 
   #aria(name, value) {
-    if (ARIA_RELATIONS.has(name)) {
-      this.#relate(name, value == null ? [] : value.split(/\s+/).filter(Boolean));
-    } else if (name in ARIA_RANGE) {
+    if (name in ARIA_RANGE) {
       const range = (this.#range ??= [undefined, undefined, undefined]);
       range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
       const [min = 0, max = 100, now] = range;
@@ -563,40 +555,8 @@ export class Node {
   #identify(id) {
     const old = this._elementId ?? "";
     if (old === (id ?? "") && this.getAttribute("id") === id) return;
-    if (old && byId.get(old) === this) {
-      byId.delete(old);
-      resolveNaming(old);
-    }
     this._elementId = id || undefined;
     native.attribute(this.nodeId, "id", id);
-    if (id) {
-      byId.set(id, this);
-      resolveNaming(id);
-    }
-  }
-
-  // Sets relation `name` (`labelledby`) to the nodes with ids `refs`, as they are now and
-  // as they change.
-  #relate(name, refs) {
-    const relations = (this._relations ??= new Map());
-    for (const ref of relations.get(name) ?? []) naming.get(ref)?.delete(this);
-    if (refs.length) relations.set(name, refs);
-    else relations.delete(name);
-    for (const ref of refs) {
-      let sources = naming.get(ref);
-      if (!sources) naming.set(ref, (sources = new Set()));
-      sources.add(this);
-    }
-    this._sendRelation(name);
-  }
-
-  _sendRelation(name) {
-    const numbers = [];
-    for (const ref of this._relations?.get(name) ?? []) {
-      const target = byId.get(ref);
-      if (target) numbers.push(target.nodeId);
-    }
-    native.attribute(this.nodeId, "aria-" + name, numbers.join(" "));
   }
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
@@ -974,22 +934,8 @@ export function createRichInput(style) {
   return input;
 }
 
-// Sends again the relations that name `ref`, after the node with that id changed.
-function resolveNaming(ref) {
-  for (const source of naming.get(ref) ?? []) {
-    for (const [name, refs] of source._relations) if (refs.includes(ref)) source._sendRelation(name);
-  }
-}
-
 function forget(node) {
   nodes.delete(node.nodeId);
-  if (node._relations) {
-    for (const refs of node._relations.values()) for (const ref of refs) naming.get(ref)?.delete(node);
-  }
-  if (node._elementId && byId.get(node._elementId) === node) {
-    byId.delete(node._elementId);
-    resolveNaming(node._elementId);
-  }
   node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;

@@ -246,7 +246,7 @@ test("aria-value* make one range, and it clears without a value", () => {
   ]);
 });
 
-test("ARIA relations name nodes by id, before and after the id is set", () => {
+test("ARIA relations retain literal IDs while targets change", () => {
   const field = createBox();
   const title = createBox();
   const hint = createBox();
@@ -259,17 +259,13 @@ test("ARIA relations name nodes by id, before and after the id is set", () => {
   title.destroy();
   field.setAttribute("aria-labelledby", null);
   assert.deepEqual(mock.take(), [
-    ["attribute", field.nodeId, "aria-labelledby", ""],
+    ["attribute", field.nodeId, "aria-labelledby", "title missing"],
     ["attribute", title.nodeId, "id", "title"],
-    ["attribute", field.nodeId, "aria-labelledby", String(title.nodeId)],
-    ["attribute", field.nodeId, "aria-describedby", ""],
+    ["attribute", field.nodeId, "aria-describedby", "hint"],
     ["attribute", hint.nodeId, "id", "hint"],
-    ["attribute", field.nodeId, "aria-describedby", String(hint.nodeId)],
-    ["attribute", field.nodeId, "aria-describedby", ""],
     ["attribute", hint.nodeId, "id", ""],
     ["destroy", title.nodeId],
-    ["attribute", field.nodeId, "aria-labelledby", ""],
-    ["attribute", field.nodeId, "aria-labelledby", ""],
+    ["attribute", field.nodeId, "aria-labelledby", null],
   ]);
 });
 
