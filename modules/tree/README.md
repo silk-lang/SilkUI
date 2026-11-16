@@ -573,7 +573,8 @@ and discard stale completions after replacement, removal, or root closure.
 
 `::before` and `::after` on box elements generate private layout boxes for string content
 and `attr(name[, "fallback"])`. Empty strings generate boxes; `normal`, `none`, and invalid
-computed content do not. The boxes inherit from their origin and participate in layout,
+computed content do not. `content: inherit` receives the ordinary origin's computed
+`normal` value and generates no box, matching CSS 2.2 and Chromium. The boxes inherit from their origin and participate in layout,
 paint, transitions, animations, and accessible names. Selectors and public child queries
 see only application nodes. Pointer and accessibility actions target the origin; motion
 events carry `pseudoElement`. Generated overflow scrolls independently, with offsets
