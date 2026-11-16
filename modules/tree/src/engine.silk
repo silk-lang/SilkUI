@@ -3661,9 +3661,14 @@ impl<'a> UiTree<'a> {
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let hadGrid = match self.node(slot).sheetStyle() {
+      Option.Some { value } => grid_css.mentionsGrid(value.declarations.asSlice())
+      Option.None => false
+    }
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Box<Resolved>>.None
+      if hadGrid { run self.styleGrid(slot) }
       return ()
     }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
@@ -3671,7 +3676,17 @@ impl<'a> UiTree<'a> {
     let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, entries[at].systemColors, &self, slot))
     self.styleSheets = move roots
     match move resolved {
-      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: resolvedStyle } => {
+        let mut value = move resolvedStyle
+        if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
+          value.declarations = move named
+        }
+        if hadGrid || grid_css.mentionsGrid(value.declarations.asSlice()) {
+          let grid = run grid_css.gridOf(value.declarations.asSlice())
+          let css = self.node(slot).css
+          run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+          self.paintDirty = true
+        }
         let boxed = run Box<Resolved>.make(move value)
         let node = self.nodeMut(slot)
         node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
@@ -4889,6 +4904,11 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
 // A `font-family` written as CSS text rather than as a family list id.
 fn writtenFamily(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
 /// The width of the default focus ring, as Chromium draws `outline: auto`.
