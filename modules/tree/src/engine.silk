@@ -3830,13 +3830,20 @@ impl<'a> UiTree<'a> {
     }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
-    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, entries[at].systemColors, &self, slot))
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, entries[at].systemColors, entries[at].hasStarting, &self, slot))
     self.styleSheets = move roots
     match move resolved {
       Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: resolvedStyle } => {
         let mut value = move resolvedStyle
         if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
           value.declarations = move named
+        }
+        let namedStarting = match &value.starting {
+          Option<List<Declaration>>.Some { value: before } => run self.namedFamilies(before.asSlice())
+          Option<List<Declaration>>.None => Option<List<Declaration>>.None
+        }
+        if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
+          value.starting = Option<List<Declaration>>.some(move named)
         }
         if hadGrid || grid_css.mentionsGrid(value.declarations.asSlice()) {
           let grid = run grid_css.gridOf(value.declarations.asSlice())
@@ -3870,6 +3877,7 @@ impl<'a> UiTree<'a> {
       environment.initial.viewportHeight = f32.toF64(self.input.height)
       environment.resolutionDppx = f32.toF64(self.input.scale)
       let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
+      roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
       match move updated {
         Result<bool, CssError | OutOfMemoryError>.Success { value } => { if value { self.stylesDirty = true } }
         Result<bool, CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -4035,11 +4043,22 @@ impl<'a> UiTree<'a> {
     if kind != NodeKind.Text {
       let mut before = node.computed
       let mut hasBefore = node.rendered && parentRendered
-      if !hasBefore && rendered && node.starting.length() != 0 {
-        // First shown: transitions start from the starting style over the new one.
-        before = computed
-        run applyAll(&mut before, &node.starting, &mut stops)
-        hasBefore = true
+      let mut sheetStarting = false
+      if !hasBefore && rendered {
+        if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+          if let Option<List<Declaration>>.Some { value: start } = &value.starting {
+            let parentStyle = style_sheets.parentStyle(&self, slot)
+            before = computed
+            run applyResolved(&mut before, &start, &parentStyle, &mut stops)
+            sheetStarting = true
+            hasBefore = true
+          }
+        }
+        if !sheetStarting && node.starting.length() != 0 {
+          before = computed
+          run applyAll(&mut before, &node.starting, &mut stops)
+          hasBefore = true
+        }
       }
       self.easingStops = move stops
       let animated = run animation.update(&mut self, slot, rendered, &computed)
@@ -4047,6 +4066,32 @@ impl<'a> UiTree<'a> {
       if animated != 0 {
         run animation.apply(&self, slot, &mut computed)
       }
+    }
+    if kind != NodeKind.Text && self.overrides.length() != 0 {
+      let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
+      let node = self.node(slot)
+      if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+        let parentStyle = style_sheets.parentStyle(&self, slot)
+        run applyResolved(&mut computed, &value.overrides, &parentStyle, &mut finalStops)
+      } else {
+        let mut declarations = List<Declaration>.make()
+        let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+        let mut i: usize = 0
+        while i < states.length {
+          if style_sheets.active(&self, slot, states[i]) {
+            if let Option<&StyleOverride>.Some { value } = self.overrideOf(node.id, states[i]) {
+              let mut j: usize = 0
+              while j < value.declarations.length() {
+                run css.set(&mut declarations, &value.declarations.asSlice()[j])
+                j = j + 1
+              }
+            }
+          }
+          i = i + 1
+        }
+        run applyAll(&mut computed, &declarations, &mut finalStops)
+      }
+      self.easingStops = move finalStops
     }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
