@@ -559,9 +559,9 @@ numeric-looking literal ID is an element ID, not a client node number.
 
 Hosts may call `UiTree.setStyleEnvironment(root, environment, systemColors)` to supply media
 preferences, input capabilities and the system-color palette. Frame dimensions and scale
-supply viewport queries and resolution. The default environment is headless. A root with
-sheets currently uses a full restyle for invalidation, including ancestor and sibling
-selectors; roots that only use style objects retain their existing path.
+supply viewport queries and resolution. The default environment is headless. Class and pointer-state changes invalidate affected subtrees when selector dependencies
+permit it. Ancestor/sibling selectors and scope-changing declarations conservatively
+restyle the root; roots that only use style objects retain their existing path.
 
 `StyleSheet.load(&mut tree, run StyleSource.text(bytes))` loads runtime CSS into root 0.
 `tree.loadStyleSheet(root, run StyleSource.url(url))` targets another root. Hosts serve
@@ -571,5 +571,19 @@ change the load. The batch equivalent is `loadStyleSheet(root, id, source)`.
 Loads reserve their cascade position before I/O, preserve the previous sheet on failure,
 and discard stale completions after replacement, removal, or root closure.
 
-The stylesheet/style-object parity suite covers every `css_coverage` row. Generated
-pseudo-elements, container queries, and dependency-based invalidation remain in progress.
+`::before` and `::after` on box elements generate private layout boxes for string content
+and `attr(name[, "fallback"])`. Empty strings generate boxes; `normal`, `none`, and invalid
+computed content do not. The boxes inherit from their origin and participate in layout,
+paint, transitions, animations, and accessible names. Selectors and public child queries
+see only application nodes. Pointer and accessibility actions target the origin; motion
+events carry `pseudoElement`. Generated overflow scrolls independently, with offsets
+baked into paint rather than exported under the origin's compositor scroll ID.
+
+Input, image, icon, and canvas nodes do not generate these boxes. Counters, quotes, images,
+alternative content, typed `attr()`, other pseudo-elements, and container queries remain
+unsupported. The compiler diagnoses unsupported static content and pseudo-state suffixes;
+origin states such as `.button:hover::before` work.
+
+The stylesheet/style-object parity suite covers every `css_coverage` row. Generated-content
+tests also exercise real pixels, public structure, accessibility, media changes, sheet
+replacement/removal, scrolling, motion cancellation, and private slot reuse.

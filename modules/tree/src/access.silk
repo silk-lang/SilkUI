@@ -1,4 +1,5 @@
 import style_relations
+import svg_css.element { PseudoTarget }
 //! The tree as an AccessKit accessibility tree: [`AccessTree`] turns the live nodes into
 //! [`TreeUpdate`]s, sending only the nodes that changed since the last update, and
 //! [`doAction`] answers the [`ActionRequest`]s a platform adapter hands back.
@@ -66,14 +67,43 @@ pub fn runId(id: u32, index: usize) -> AccessId {
   return AccessId.of(u64.shiftLeft(usize.toU64(index) + 2, 32) + u32.toU64(id))
 }
 
+// Box origins have no text runs, so their otherwise unused run namespace is private.
+fn privateIndex(tree: &UiTree<'_>, slot: u32) -> usize {
+  return match tree.node(slot).identity() {
+    Option.Some { value } => if value.generatedTarget == PseudoTarget.Before { 0 } else { 1 }
+    _ => 0
+  }
+}
+fn slotId(tree: &UiTree<'_>, slot: u32) -> AccessId {
+  let node = tree.node(slot)
+  if !node.isGenerated() { return accessId(node.id) }
+  let offset: usize = if node.kind == NodeKind.Text { 2 } else { 0 }
+  return runId(node.id, privateIndex(tree, slot) + offset)
+}
+effect fn textRunId(tree: &UiTree<'_>, slot: u32, index: usize) -> AccessId ! OutOfMemoryError {
+  let node = tree.node(slot)
+  if !node.isGenerated() { return runId(node.id, index) }
+  // The high 32 bits must remain representable after interleaving both pseudo runs.
+  if index > 2147483644 { fail OutOfMemoryError {} }
+  return runId(node.id, 4 + 2 * index + privateIndex(tree, slot))
+}
+
 /// The most characters one text run holds: AccessKit counts them in bytes.
 fn RUN_LIMIT() -> usize {
   return 255
 }
 
 /// The tree node a target names, or NONE for the window node or an id the tree never had.
-fn nodeIdOf(target: AccessId) -> u32 {
+fn nodeIdOf(tree: &UiTree<'_>, target: AccessId) -> u32 {
   if target.value >= u64.shiftLeft(1, 32) {
+    let high = u64.shiftRight(target.value, 32)
+    let origin = tree.slotOf(u64.toU32(u64.bitAnd(target.value, 0xFFFFFFFF)))
+    if high >= 2 && high <= 5 && origin != NONE && tree.node(origin).kind == NodeKind.Box {
+      if let Option.Some { value } = tree.node(origin).identity() {
+        let box = if high == 2 || high == 4 { value.before } else { value.after }
+        if box != NONE && tree.node(box).live { return tree.node(origin).id }
+      }
+    }
     return NONE
   }
   return u64.toU32(target.value)
@@ -580,7 +610,7 @@ effect fn describe(tree: &UiTree<'_>, slot: u32, children: &[AccessId]) -> Acces
   if children.length > 0 {
     run out.setChildren(children)
   }
-  match run inspect.info(tree, node.id) {
+  match run inspect.infoSlot(tree, slot) {
     Option.Some { value } => {
       let info: NodeInfo = value
       if info.laidOut {
@@ -703,7 +733,6 @@ effect fn collect(
   if !kept {
     return ()
   }
-  let id = node.id
   let mut selection = TextSelection {
     anchor: TextPosition { node: windowId(), characterIndex: 0 },
     focus: TextPosition { node: windowId(), characterIndex: 0 },
@@ -724,8 +753,8 @@ effect fn collect(
   if selects {
     run described.setTextSelection(selection)
   }
-  run out.append(Entry { id: accessId(id).value, node: move described })
-  run parent.append(accessId(id))
+  run out.append(Entry { id: slotId(tree, slot).value, node: move described })
+  run parent.append(slotId(tree, slot))
 }
 
 fn smaller(a: usize, b: usize) -> usize {
@@ -881,7 +910,7 @@ effect fn textRuns(
         AccessRect.make(f32.toF64(low), f32.toF64(top), f32.toF64(high), f32.toF64(bottom))
       }
       run runNode.setBounds(bounds)
-      let id = runId(node.id, spans.length())
+      let id = run textRunId(tree, slot, spans.length())
       run out.append(Entry { id: id.value, node: move runNode })
       run children.append(id)
       run spans.append(Span { start: start, end: end })
@@ -895,7 +924,7 @@ effect fn textRuns(
     run runNode.setCharacterPositions(&[])
     run runNode.setCharacterWidths(&[])
     run runNode.setWordStarts(&[])
-    let id = runId(node.id, 0)
+    let id = run textRunId(tree, slot, 0)
     run out.append(Entry { id: id.value, node: move runNode })
     run children.append(id)
     run spans.append(Span { start: 0, end: 0 })
@@ -1147,7 +1176,7 @@ pub enum ActionOutcome {
 pub effect fn doAction(tree: &mut UiTree<'_>, request: &ActionRequest) -> ActionOutcome
   ! OutOfMemoryError
   ? &mut Allocator {
-  let target = nodeIdOf(request.targetNode)
+  let target = nodeIdOf(&tree.*, request.targetNode)
   if target == NONE {
     return ActionOutcome.Unsupported
   }

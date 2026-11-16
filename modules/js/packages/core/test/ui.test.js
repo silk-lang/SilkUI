@@ -91,10 +91,10 @@ test("transition events bubble with their property and elapsed time", () => {
   outer.append(inner);
   mock.take();
   let seen;
-  outer.addEventListener("transitionend", (event) => (seen = [event.propertyName, event.elapsedTime, event.target]));
+  outer.addEventListener("transitionend", (event) => (seen = [event.propertyName, event.elapsedTime, event.pseudoElement, event.target]));
   assert.deepEqual(mock.take(), [["listen", outer.nodeId, 1 << 21]]);
-  mock.native.dispatch(21, inner.nodeId, 0.25, 0, 0, 0, 0, "opacity");
-  assert.deepEqual(seen, ["opacity", 0.25, inner]);
+  mock.native.dispatch(21, inner.nodeId, 0.25, 0, 0, 0, 0, "opacity", "::before");
+  assert.deepEqual(seen, ["opacity", 0.25, "::before", inner]);
 });
 
 test("an input follows what the user types", () => {

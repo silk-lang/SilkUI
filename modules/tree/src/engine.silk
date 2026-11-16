@@ -3,6 +3,7 @@ import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as St
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import style_inherit
+import generated
 import style_media { Preferences }
 import properties.convert as properties_convert
 import properties.catalog
@@ -391,6 +392,14 @@ effect fn layoutFailed<E>(error: E) -> never
 effect fn viewFailed(error: CssomError) -> never
   ! TreeError {
   fail TreeError.View { error: error }
+}
+
+effect fn generatedFailed(error: CssError | OutOfMemoryError) -> Option<String>
+  ! OutOfMemoryError {
+  match move error {
+    OutOfMemoryError allocation => { fail move allocation }
+    CssError invalid => { drop invalid return Option<String>.None }
+  }
 }
 
 fn defaultDisplay(kind: NodeKind) -> CssDisplay {
@@ -1993,7 +2002,12 @@ impl<'a> UiTree<'a> {
   effect fn create(self: &mut Self, index: usize, id: u32, kind: NodeKind) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.contains(id) {
+    drop run self.createNode(index, id, kind, NONE, PseudoTarget.None)
+  }
+
+  effect fn createNode(self: &mut Self, index: usize, id: u32, kind: NodeKind, origin: u32, target: PseudoTarget) -> u32
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if origin == NONE && self.contains(id) {
       fail TreeError.IdInUse { index: index, id: id }
     }
     let mut css: usize = 0
@@ -2092,7 +2106,13 @@ impl<'a> UiTree<'a> {
       slot = usize.toU32(self.nodes.length())
       run self.nodes.append(move node)
     }
-    drop run self.ids.insert(Word { value: u32.toU64(id) }, slot)
+    if origin == NONE { drop run self.ids.insert(Word { value: u32.toU64(id) }, slot) }
+    else {
+      let node = self.nodeMut(slot)
+      let identity = run node.identityMut()
+      identity.generatedOrigin = origin
+      identity.generatedTarget = target
+    }
     run self.mapCss(css, slot)
     if inner != NO_INDEX {
       // The input's text node maps to no slot, but the table reaches it so `destroy` can clear it.
@@ -2108,6 +2128,7 @@ impl<'a> UiTree<'a> {
       run edit.syncDisplay(&mut self, slot)
     }
     // A new node is detached: it is resolved when it is attached (`restyle`).
+    return slot
   }
 
   fn canHaveChildren(kind: NodeKind) -> bool {
@@ -2153,6 +2174,8 @@ impl<'a> UiTree<'a> {
         return ()
       }
       beforeCss = Option<NodeId>.Some { value: NodeId { index: self.node(beforeSlot).css } }
+    } else if let Option.Some { value } = self.node(parentSlot).identity() {
+      if value.after != NONE { beforeCss = Option<NodeId>.some(NodeId { index: self.node(value.after).css }) }
     }
     let parentCss = self.node(parentSlot).css
     let childCss = self.node(childSlot).css
@@ -2197,7 +2220,6 @@ impl<'a> UiTree<'a> {
   effect fn destroy(self: &mut Self, index: usize, slot: u32) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    run self.detach(index, slot)
     let mut doomed = List<u32>.make()
     run doomed.append(slot)
     let mut children = List<u32>.make()
@@ -2209,9 +2231,23 @@ impl<'a> UiTree<'a> {
     }
     let mut v: usize = 0
     while v < doomed.length() {
-      let id = self.node(doomed.get(v)).id
-      run virtual.clear(&mut self, id)
-      anchoring.clear(&mut self, id)
+      let gone = doomed.get(v)
+      if self.node(gone).isGenerated() {
+        let computed = self.node(gone).computed
+        drop run animation.update(&mut self, gone, false, &computed)
+        run motion.cancelAll(&mut self, gone)
+      }
+      v = v + 1
+    }
+    run self.detach(index, slot)
+    v = 0
+    while v < doomed.length() {
+      let gone = doomed.get(v)
+      if !self.node(gone).isGenerated() {
+        let id = self.node(gone).id
+        run virtual.clear(&mut self, id)
+        anchoring.clear(&mut self, id)
+      }
       v = v + 1
     }
     let css = self.node(slot).css
@@ -2246,14 +2282,15 @@ impl<'a> UiTree<'a> {
       let nodeCss = node.css
       let inner = node.inner
       let trap = node.focusTrap
+      let generated = node.isGenerated()
       if node.inert {
         self.inerts = self.inerts - 1
       }
-      drop self.ids.remove(Word { value: u32.toU64(id) })
+      if !generated { drop self.ids.remove(Word { value: u32.toU64(id) }) }
       if trap {
         self.forgetReturn(id)
       }
-      if self.overrides.length() != 0 {
+      if !generated && self.overrides.length() != 0 {
         // The id may name another node later: its overrides go with this one.
         self.dropOverrides(id)
       }
@@ -3105,7 +3142,7 @@ impl<'a> UiTree<'a> {
     out.clear()
     let mut at = slot
     while at != NONE {
-      run out.append(self.node(at).id)
+      if !self.node(at).isGenerated() { run out.append(self.node(at).id) }
       at = self.node(at).parent
     }
     let values = out.asMutSlice()
@@ -3884,6 +3921,34 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  effect fn installResolved(self: &mut Self, slot: u32, resolvedStyle: Resolved) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let hadGrid = match self.node(slot).sheetStyle() {
+      Option.Some { value } => grid_css.mentionsGrid(value.declarations.asSlice())
+      _ => false
+    }
+    let mut value = move resolvedStyle
+    if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
+      value.declarations = move named
+    }
+    let namedStarting = match &value.starting {
+      Option<List<Declaration>>.Some { value: before } => run self.namedFamilies(before.asSlice())
+      Option<List<Declaration>>.None => Option<List<Declaration>>.None
+    }
+    if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
+      value.starting = Option<List<Declaration>>.some(move named)
+    }
+    if hadGrid || grid_css.mentionsGrid(value.declarations.asSlice()) {
+      let grid = run grid_css.gridOf(value.declarations.asSlice())
+      let css = self.node(slot).css
+      run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+      self.paintDirty = true
+    }
+    let boxed = run Box<Resolved>.make(move value)
+    let node = self.nodeMut(slot)
+    node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
+  }
+
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
@@ -3905,30 +3970,66 @@ impl<'a> UiTree<'a> {
     self.styleSheets = move roots
     match move resolved {
       Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: resolvedStyle } => {
-        let mut value = move resolvedStyle
-        if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
-          value.declarations = move named
-        }
-        let namedStarting = match &value.starting {
-          Option<List<Declaration>>.Some { value: before } => run self.namedFamilies(before.asSlice())
-          Option<List<Declaration>>.None => Option<List<Declaration>>.None
-        }
-        if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
-          value.starting = Option<List<Declaration>>.some(move named)
-        }
-        if hadGrid || grid_css.mentionsGrid(value.declarations.asSlice()) {
-          let grid = run grid_css.gridOf(value.declarations.asSlice())
-          let css = self.node(slot).css
-          run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
-          self.paintDirty = true
-        }
-        let boxed = run Box<Resolved>.make(move value)
-        let node = self.nodeMut(slot)
-        node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
+        run self.installResolved(slot, move resolvedStyle)
       }
       Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
       }
+    }
+  }
+
+  effect fn syncGenerated(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.node(origin).isGenerated() || self.node(origin).kind != NodeKind.Box { return () }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].sheets.length() != 0 && self.styleSheets.asSlice()[at].hasGenerated
+    let targets = [PseudoTarget.Before, PseudoTarget.After]
+    let mut i: usize = 0
+    while i < targets.length {
+      let target = targets[i]
+      let old = match self.node(origin).identity() {
+        Option.Some { value } => if target == PseudoTarget.Before { value.before } else { value.after }
+        _ => NONE
+      }
+      let mut prepared = Option<Resolved>.None
+      let mut content = Option<String>.None
+      if enabled {
+        let rendered = old != NONE && self.node(old).rendered
+        let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
+        content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice()), generatedFailed)
+        prepared = Option<Resolved>.some(move value)
+      }
+      if let Option<String>.Some { value: text } = move content {
+        let mut slot = old
+        if slot == NONE {
+          let id = self.node(origin).id
+          slot = run self.createNode(0, id, NodeKind.Box, origin, target)
+          let child = run self.createNode(0, id, NodeKind.Text, origin, target)
+          let parentCss = self.node(origin).css
+          let boxCss = self.node(slot).css
+          let textCss = self.node(child).css
+          let first = self.layout.nodes.asSlice()[parentCss].firstChild
+          let before = if target == PseudoTarget.Before && first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
+          run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
+          run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: textCss }, Option<NodeId>.None), layoutFailed)
+          let boxNode = self.nodeMut(slot)
+          boxNode.parent = origin
+          let textNode = self.nodeMut(child)
+          textNode.parent = slot
+          let originNode = self.nodeMut(origin)
+          let identity = run originNode.identityMut()
+          if target == PseudoTarget.Before { identity.before = slot } else { identity.after = slot }
+        }
+        let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+        if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
+        if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+      } else if old != NONE {
+        let originNode = self.nodeMut(origin)
+        let identity = run originNode.identityMut()
+        if target == PseudoTarget.Before { identity.before = NONE } else { identity.after = NONE }
+        run self.destroy(0, old)
+      }
+      i = i + 1
     }
   }
 
@@ -3966,6 +4067,7 @@ impl<'a> UiTree<'a> {
       if self.stylesDirty {
         roots[sheetIndex].sheets.resetScopes()
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
       }
       roots[sheetIndex].cache.reset()
     }
@@ -3995,6 +4097,7 @@ impl<'a> UiTree<'a> {
         let shadow = node.computed.effects
         let wasRendered = node.rendered
         run self.resolve(slot)
+        run self.syncGenerated(slot)
         let after = &self.node(slot).computed
         changed = full || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || wasRendered != self.node(slot).rendered
@@ -4035,7 +4138,7 @@ impl<'a> UiTree<'a> {
   effect fn resolve(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.styleSheets.length() != 0 { run self.resolveSheet(slot) }
+    if self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -4049,7 +4152,7 @@ impl<'a> UiTree<'a> {
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
     }
-    computed.layout.display = defaultDisplay(node.kind)
+    computed.layout.display = defaultDisplay(if node.isGenerated() { NodeKind.Text } else { node.kind })
     if node.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
       if node.edit().multiline {
@@ -4110,7 +4213,7 @@ impl<'a> UiTree<'a> {
         }
       }
     }
-    anchoring.apply(&self, node.id, &mut computed)
+    if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let kind = node.kind
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
@@ -4141,7 +4244,7 @@ impl<'a> UiTree<'a> {
         run animation.apply(&self, slot, &mut computed)
       }
     }
-    if kind != NodeKind.Text && self.overrides.length() != 0 {
+    if kind != NodeKind.Text && !self.node(slot).isGenerated() && self.overrides.length() != 0 {
       let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
       let node = self.node(slot)
       if let Option<&Resolved>.Some { value } = node.sheetStyle() {

@@ -1171,7 +1171,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind >= 19 && kind <= 22) {
     event.propertyName = first;
     event.elapsedTime = a;
-    event.pseudoElement = "";
+    event.pseudoElement = second ?? "";
   } else if (kind === 27) {
     event.target._selected?.(a, b, d);
     event.selectionStart = event.target.selectionStart;
@@ -1179,7 +1179,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind >= 23) {
     event.animationName = first;
     event.elapsedTime = a;
-    event.pseudoElement = "";
+    event.pseudoElement = second ?? "";
   }
 }
 
