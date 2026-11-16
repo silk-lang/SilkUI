@@ -19,7 +19,7 @@ import properties.computed { WritingMode, Direction, VerticalAlignKind }
 import properties.convert { Context }
 import timing { TransitionLists, AnimationLists }
 import transform { Transform }
-import properties.values { Unit, Separator }
+import properties.values { Unit, Separator, MathOperator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
@@ -37,6 +37,46 @@ import silk.num.i32
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
+
+// Opacity percentages are numbers with a 100% basis, including inside math functions.
+fn alpha(value: &Value) -> Option<f32> {
+  match &value.* {
+    Value.Unit { value: amount, unit } => {
+      if unit == Unit.Number { return Option<f32>.some(amount) }
+      if unit == Unit.Percent { return Option<f32>.some(amount / 100.0) }
+    }
+    Value.Math { operator, values } => {
+      let items = values.asSlice()
+      if items.length == 0 { return Option<f32>.None }
+      let mut total = match alpha(&items[0]) { Option.Some { value: found } => found _ => { return Option<f32>.None } }
+      if operator == MathOperator.Negate { return Option<f32>.some(0.0 - total) }
+      if operator == MathOperator.Invert {
+        return if total == 0.0 { Option<f32>.None } else { Option<f32>.some(1.0 / total) }
+      }
+      if operator == MathOperator.Clamp {
+        if items.length != 3 { return Option<f32>.None }
+        let preferred = match alpha(&items[1]) { Option.Some { value: found } => found _ => { return Option<f32>.None } }
+        let maximum = match alpha(&items[2]) { Option.Some { value: found } => found _ => { return Option<f32>.None } }
+        return Option<f32>.some(f32.max(total, f32.min(preferred, maximum)))
+      }
+      let mut i: usize = 1
+      while i < items.length {
+        let next = match alpha(&items[i]) { Option.Some { value: found } => found _ => { return Option<f32>.None } }
+        total = match operator {
+          MathOperator.Sum => total + next
+          MathOperator.Product => total * next
+          MathOperator.Min => f32.min(total, next)
+          MathOperator.Max => f32.max(total, next)
+          _ => { return Option<f32>.None }
+        }
+        i = i + 1
+      }
+      return Option<f32>.some(total)
+    }
+    _ => {}
+  }
+  return Option<f32>.None
+}
 
 /// A node's computed style.
 pub struct Computed {
@@ -1513,11 +1553,8 @@ impl Computed {
         }
       }
       CssProperty.Opacity => {
-        match convert.number(value) {
-          Option.Some { value: found } => {
-            self.paint.opacity = found
-          }
-          Option.None => {}
+        if let Option.Some { value: found } = alpha(value) {
+          self.paint.opacity = f32.max(0.0, f32.min(1.0, found))
         }
       }
       // Paint.

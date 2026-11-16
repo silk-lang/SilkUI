@@ -124,4 +124,17 @@ On `web-dom`, the browser implements CSS. Window and canvas targets use the tree
 
 The tree's property coverage suite checks the supported declarations through both style objects and compiled sheets. A stylesheet does not add rendering support for a property the tree does not yet implement.
 
+The local [Chromium stylesheet comparison](https://github.com/silk-lang/SilkUI/tree/feat/stylesheets-tailwind/modules/tree/tools/stylesheet-parity) checks computed values and box geometry against three committed CSS fixtures. Its case table covers these utility families:
+
+| Coverage | Utilities or behavior |
+| --- | --- |
+| Compared with Chromium | Numeric padding, margins, gaps, width/height constraints, flex/grid layouts and alignment, border widths/radii/colors, foreground/background colors, font size/weight, line height, letter spacing, and opacity |
+| Compared state combinations | Hover and group-hover, checked peers, disabled opacity, focus-visible outlines, data attributes, dark classes, responsive grids, nesting, layers, important declarations, and `:has()` |
+| Separate tree tests | Motion, container queries, generated content, font loading, text shaping, selection, placeholders, and overlay scrollbars |
+| Host differences | No HTML user-agent styles; native overlay scrollbar sizing and preferences as described above |
+| Dropped by the fixture compiler | Unavailable browser form-control parts, vendor-only selectors/properties, and `text-box`; unexpected diagnostic changes fail the comparison |
+
+This table describes the checked cases, not every class emitted by Tailwind. See the comparison's `cases.json` for the exact combinations; unsupported compound values and parts still follow the limits above.
+
+
 Next: [Images and fonts](/core/images-and-fonts/).
