@@ -1,0 +1,722 @@
+//! Drawing for the spectrogram view, piano keyboard, spectrum slice, overview and axis ticks.
+
+import dsp
+import track { Track }
+import loom.lib { CanvasCommand }
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.i64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+const RATE: f32 = 44100.0
+const HOP: f32 = 512.0
+const MAX_COLS: usize = 300
+const MAX_ROWS: usize = 180
+const LEVELS: u32 = 48
+
+pub struct View {
+  pub start: f32,
+  pub cols: f32,
+  pub lo: f32,
+  pub hi: f32,
+  pub log: bool,
+  pub width: f32,
+  pub height: f32,
+}
+
+pub struct Look {
+  pub top: f32,
+  pub range: f32,
+  pub gamma: f32,
+  pub colormap: u32,
+  pub noteLines: bool,
+  pub pitch: bool,
+  pub formants: bool,
+  pub harmonics: bool,
+}
+
+pub struct Tick {
+  pub pos: f32,
+  pub value: f32,
+  pub places: u32,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coordinates
+
+pub fn yOf(v: &View, hz: f32) -> f32 {
+  if v.log {
+    let lo = f32.log(f32.max(1.0, v.lo))
+    let hi = f32.log(f32.max(2.0, v.hi))
+    let h = f32.log(f32.max(0.001, hz))
+    return v.height * (1.0 - (h - lo) / (hi - lo))
+  }
+  return v.height * (1.0 - (hz - v.lo) / (v.hi - v.lo))
+}
+
+pub fn hzAt(v: &View, y: f32) -> f32 {
+  let t = 1.0 - y / v.height
+  if v.log {
+    let lo = f32.log(f32.max(1.0, v.lo))
+    let hi = f32.log(f32.max(2.0, v.hi))
+    return f32.exp(lo + t * (hi - lo))
+  }
+  return v.lo + t * (v.hi - v.lo)
+}
+
+pub fn xOf(v: &View, col: f32) -> f32 {
+  return (col - v.start) / v.cols * v.width
+}
+
+pub fn colAt(v: &View, x: f32) -> f32 {
+  return v.start + x / v.width * v.cols
+}
+
+fn umax(a: usize, b: usize) -> usize {
+  if a > b {
+    return a
+  }
+  return b
+}
+
+fn umin(a: usize, b: usize) -> usize {
+  if a < b {
+    return a
+  }
+  return b
+}
+
+fn midiHz(m: f32) -> f32 {
+  return 440.0 * f32.pow(2.0, (m - 69.0) / 12.0)
+}
+
+fn isBlack(m: u32) -> bool {
+  let n = m - (m / 12) * 12
+  return n == 1 || n == 3 || n == 6 || n == 8 || n == 10
+}
+
+// ---------------------------------------------------------------------------------------------
+// Colours
+
+fn rgb(hex: u32) -> Rgba<f32> {
+  return Rgba<f32> {
+    r: u32.toF32(u32.shiftRight(hex, 16) & 0xFF) / 255.0,
+    g: u32.toF32(u32.shiftRight(hex, 8) & 0xFF) / 255.0,
+    b: u32.toF32(hex & 0xFF) / 255.0,
+    a: 1.0,
+  }
+}
+
+fn rgba(hex: u32, a: f32) -> Rgba<f32> {
+  let mut c = rgb(hex)
+  c.a = a
+  return c
+}
+
+fn mix(a: u32, b: u32, t: f32) -> Rgba<f32> {
+  let x = rgb(a)
+  let y = rgb(b)
+  return Rgba<f32> {
+    r: x.r + (y.r - x.r) * t,
+    g: x.g + (y.g - x.g) * t,
+    b: x.b + (y.b - x.b) * t,
+    a: 1.0,
+  }
+}
+
+fn ramp(t: f32, c0: u32, c1: u32, c2: u32, c3: u32, c4: u32, c5: u32, c6: u32) -> Rgba<f32> {
+  let s = f32.max(0.0, f32.min(1.0, t)) * 6.0
+  let i = f32.min(5.0, f32.floor(s))
+  let f = s - i
+  if i < 1.0 {
+    return mix(c0, c1, f)
+  } else if i < 2.0 {
+    return mix(c1, c2, f)
+  } else if i < 3.0 {
+    return mix(c2, c3, f)
+  } else if i < 4.0 {
+    return mix(c3, c4, f)
+  } else if i < 5.0 {
+    return mix(c4, c5, f)
+  }
+  return mix(c5, c6, f)
+}
+
+fn colormap(map: u32, t: f32) -> Rgba<f32> {
+  if map == 1 {
+    return ramp(t, 0x000004, 0x1B0C41, 0x4A0C6B, 0x781C6D, 0xBB3754, 0xF98C0A, 0xFCFFA4)
+  } else if map == 2 {
+    return mix(0x000000, 0xFFFFFF, f32.max(0.0, f32.min(1.0, t)))
+  }
+  return ramp(t, 0x000000, 0x0A0A5A, 0x1E3CFF, 0x00E5FF, 0xFFF200, 0xFF8C78, 0xC8102E)
+}
+
+/// Level 0 is background; 1..LEVELS are shades.
+fn levelOf(look: &Look, q: u8) -> u32 {
+  let db = u8.toF32(q) * 0.5 - 120.0
+  let t = (db - (look.top - look.range)) / look.range
+  if t <= 0.0 {
+    return 0
+  }
+  let g = f32.pow(f32.min(1.0, t), f32.max(0.05, look.gamma))
+  return 1 + f32.toU32(g * u32.toF32(LEVELS - 1) + 0.5)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+
+effect fn rect(list: &mut List<CanvasCommand>, x: f32, y: f32, w: f32, h: f32, color: Rgba<f32>)
+  -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run list.append(
+    CanvasCommand.FillRect { x: x, y: y, width: w, height: h, radius: 0.0, color: color },
+  )
+}
+
+/// Polyline of `values * mult` over the visible columns, broken at zeros. Returns whether
+/// anything was emitted.
+effect fn path(list: &mut List<CanvasCommand>, t: &Track, values: &List<f32>, v: &View, mult: f32)
+  -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = values.length()
+  if n == 0 {
+    return false
+  }
+  let first = f32.max(0.0, f32.floor(v.start) - 1.0)
+  let last = f32.min(usize.toF32(n), f32.ceil(v.start + v.cols) + 1.0)
+  let step = f32.max(1.0, f32.floor(v.cols / 600.0))
+  let mut drawing = false
+  let mut any = false
+  let mut c = first
+  while c < last {
+    let hz = values.get(f32.toUsize(c)) * mult
+    if hz > 0.0 && hz >= v.lo && hz <= v.hi {
+      let x = xOf(v, c + 0.5)
+      let y = yOf(v, hz)
+      if drawing {
+        run list.append(CanvasCommand.LineTo { x: x, y: y })
+      } else {
+        run list.append(CanvasCommand.MoveTo { x: x, y: y })
+        drawing = true
+        any = true
+      }
+    } else {
+      drawing = false
+    }
+    c = c + step
+  }
+  return any
+}
+
+effect fn dots(list: &mut List<CanvasCommand>, values: &List<f32>, v: &View, color: Rgba<f32>)
+  -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let n = values.length()
+  if n == 0 {
+    return
+  }
+  let first = f32.max(0.0, f32.floor(v.start))
+  let last = f32.min(usize.toF32(n), f32.ceil(v.start + v.cols))
+  let step = f32.max(1.0, f32.floor(v.cols / 400.0))
+  let w = f32.max(2.0, v.width / v.cols * step)
+  let mut c = first
+  while c < last {
+    let hz = values.get(f32.toUsize(c))
+    if hz > 0.0 && hz >= v.lo && hz <= v.hi {
+      run list.append(
+        CanvasCommand.FillRect {
+          x: xOf(v, c),
+          y: yOf(v, hz) - 1.5,
+          width: w,
+          height: 3.0,
+          radius: 1.5,
+          color: color,
+        },
+      )
+    }
+    c = c + step
+  }
+}
+
+/// Loudest byte over columns [c0, c1) and bins [k0, k1], stride-sampled.
+fn loudest(t: &Track, c0: usize, c1: usize, k0: usize, k1: usize) -> u8 {
+  let cs = umax(1, (c1 - c0) / 6)
+  let ks = umax(1, (k1 - k0 + 1) / 12)
+  let mut best: u8 = 0
+  let mut c = c0
+  while c < c1 {
+    let base = c * dsp.BINS
+    let mut k = k0
+    while k <= k1 {
+      let q = t.spec.get(base + k)
+      if q > best {
+        best = q
+      }
+      k = k + ks
+    }
+    c = c + cs
+  }
+  return best
+}
+
+fn binOf(hz: f32) -> usize {
+  let b = f32.max(0.0, hz * 2048.0 / RATE)
+  return umin(dsp.BINS - 1, f32.toUsize(b))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Spectrogram
+
+pub effect fn spectrogram(
+  t: &Track,
+  v: &View,
+  look: &Look,
+  selA: f32,
+  selB: f32,
+  guides: &List<f32>,
+  hoverX: f32,
+  hoverY: f32,
+) -> List<CanvasCommand> ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, v.width, v.height, rgb(0x000000))
+  let total = t.columns()
+  let dispCols = umax(1, umin(MAX_COLS, f32.toUsize(f32.max(1.0, f32.ceil(v.cols)))))
+  let rows = umax(1, umin(MAX_ROWS, f32.toUsize(f32.max(1.0, v.height))))
+  let colW = v.width / usize.toF32(dispCols)
+  let rowH = v.height / usize.toF32(rows)
+  // Bin range of every row, computed once.
+  let mut kLo = List<usize>.make()
+  let mut kHi = List<usize>.make()
+  let mut r: usize = 0
+  while r < rows {
+    let hzTop = hzAt(v, usize.toF32(r) * rowH)
+    let hzBot = hzAt(v, usize.toF32(r + 1) * rowH)
+    let a = binOf(f32.min(hzTop, hzBot))
+    let b = binOf(f32.max(hzTop, hzBot))
+    run kLo.append(a)
+    run kHi.append(umax(a, b))
+    r = r + 1
+  }
+  let mut levels = List<u32>.make()
+  r = 0
+  while r < rows {
+    run levels.append(0)
+    r = r + 1
+  }
+  let mut d: usize = 0
+  while d < dispCols {
+    let fa = v.start + usize.toF32(d) * v.cols / usize.toF32(dispCols)
+    let fb = v.start + usize.toF32(d + 1) * v.cols / usize.toF32(dispCols)
+    if fb > 0.0 && fa < usize.toF32(total) {
+      let c0 = f32.toUsize(f32.max(0.0, f32.floor(fa)))
+      let c1 = umin(total, umax(c0 + 1, f32.toUsize(f32.max(0.0, f32.ceil(fb)))))
+      r = 0
+      while r < rows {
+        levels.set(r, levelOf(look, loudest(t, c0, c1, kLo.get(r), kHi.get(r))))
+        r = r + 1
+      }
+      let x = usize.toF32(d) * colW
+      r = 0
+      while r < rows {
+        let level = levels.get(r)
+        let mut end = r + 1
+        while end < rows && levels.get(end) == level {
+          end = end + 1
+        }
+        if level > 0 {
+          let shade = u32.toF32(level - 1) / u32.toF32(LEVELS - 1)
+          run rect(
+            &mut list,
+            x,
+            usize.toF32(r) * rowH,
+            colW + 0.5,
+            usize.toF32(end - r) * rowH + 0.5,
+            colormap(look.colormap, shade),
+          )
+        }
+        r = end
+      }
+    }
+    d = d + 1
+  }
+
+  // Note lines.
+  if look.noteLines {
+    let mut m: u32 = 12
+    while m < 128 {
+      let hz = midiHz(u32.toF32(m))
+      if hz >= v.lo && hz <= v.hi {
+        let y = yOf(v, hz)
+        let spacing = y - yOf(v, midiHz(u32.toF32(m) + 1.0))
+        if spacing >= 4.0 {
+          let isC = m - (m / 12) * 12 == 0
+          let alpha: f32 = if isC {
+            0.22
+          } else {
+            0.07
+          }
+          run rect(&mut list, 0.0, y - 0.5, v.width, 1.0, rgba(0xFFFFFF, alpha))
+        }
+      }
+      m = m + 1
+    }
+  }
+
+  // Harmonics.
+  if look.harmonics {
+    let mut h: u32 = 2
+    while h <= 6 {
+      if run path(&mut list, t, &t.pitches, v, u32.toF32(h)) {
+        run list.append(CanvasCommand.Stroke { color: rgba(0x4FC3F7, 0.35), width: 1.0 })
+      }
+      h = h + 1
+    }
+  }
+
+  // Formants.
+  if look.formants {
+    run dots(&mut list, &t.f1s, v, rgb(0xFF5D8F))
+    run dots(&mut list, &t.f2s, v, rgb(0xFFB547))
+    run dots(&mut list, &t.f3s, v, rgb(0xFFFFFF))
+  }
+
+  // Pitch.
+  if look.pitch {
+    if run path(&mut list, t, &t.pitches, v, 1.0) {
+      run list.append(CanvasCommand.Stroke { color: rgba(0x000000, 0.7), width: 4.0 })
+      drop run path(&mut list, t, &t.pitches, v, 1.0)
+      run list.append(CanvasCommand.Stroke { color: rgb(0x4FC3F7), width: 2.0 })
+    }
+  }
+
+  // Selection.
+  if selA < selB {
+    let x1 = f32.max(0.0, xOf(v, selA))
+    let x2 = f32.min(v.width, xOf(v, selB))
+    if x2 > x1 {
+      run rect(&mut list, x1, 0.0, x2 - x1, v.height, rgba(0xFFFFFF, 0.14))
+      run rect(&mut list, x1, 0.0, 1.0, v.height, rgba(0xFFFFFF, 0.6))
+      run rect(&mut list, x2 - 1.0, 0.0, 1.0, v.height, rgba(0xFFFFFF, 0.6))
+    }
+  }
+
+  // Guides (Hz).
+  let mut g: usize = 0
+  while g < guides.length() {
+    let hz = guides.get(g)
+    if hz >= v.lo && hz <= v.hi {
+      run rect(&mut list, 0.0, f32.floor(yOf(v, hz)), v.width, 1.0, rgb(0xFF3B30))
+    }
+    g = g + 1
+  }
+
+  // Hover crosshair.
+  if hoverX >= 0.0 {
+    run rect(&mut list, f32.floor(hoverX), 0.0, 1.0, v.height, rgba(0xFFFFFF, 0.5))
+    if hoverY >= 0.0 {
+      run rect(&mut list, 0.0, f32.floor(hoverY), v.width, 1.0, rgba(0xFFFFFF, 0.5))
+    }
+  }
+  return move list
+}
+
+// ---------------------------------------------------------------------------------------------
+// Piano
+
+pub effect fn piano(v: &View, width: f32, highlightHz: f32) -> List<CanvasCommand>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, width, v.height, rgb(0x000000))
+  let mut hl: u32 = 0
+  if highlightHz > 0.0 {
+    let mf = f32.round(12.0 * f32.log(highlightHz / 440.0) / f32.log(2.0) + 69.0)
+    if mf >= 21.0 && mf <= 120.0 {
+      hl = f32.toU32(mf)
+    }
+  }
+  // White keys.
+  let mut m: u32 = 21
+  while m <= 120 {
+    if isBlack(m) == false {
+      let mf = u32.toF32(m)
+      let up: f32 = if isBlack(m + 1) {
+        mf + 1.0
+      } else {
+        mf + 0.5
+      }
+      let down: f32 = if m > 21 && isBlack(m - 1) {
+        mf - 1.0
+      } else {
+        mf - 0.5
+      }
+      let yTop = yOf(v, midiHz(up))
+      let yBot = yOf(v, midiHz(down))
+      let color = if m == hl {
+        rgb(0x4FC3F7)
+      } else {
+        rgb(0xFFFFFF)
+      }
+      run rect(&mut list, 0.0, yTop, width, yBot - yTop, color)
+      run rect(&mut list, 0.0, yTop, width, 1.0, rgb(0x9A9A9A))
+    }
+    m = m + 1
+  }
+  // Black keys.
+  m = 21
+  while m <= 120 {
+    if isBlack(m) {
+      let mf = u32.toF32(m)
+      let yTop = yOf(v, midiHz(mf + 0.5))
+      let yBot = yOf(v, midiHz(mf - 0.5))
+      let color = if m == hl {
+        rgb(0x4FC3F7)
+      } else {
+        rgb(0x000000)
+      }
+      run rect(&mut list, 0.0, yTop, width * 0.6, yBot - yTop, color)
+    }
+    m = m + 1
+  }
+  return move list
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slice
+
+pub effect fn slice(t: &Track, col: usize, v: &View, look: &Look, width: f32) -> List<CanvasCommand>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, width, v.height, rgb(0x000000))
+  if col >= t.columns() {
+    return move list
+  }
+  let rows = umax(1, umin(MAX_ROWS, f32.toUsize(f32.max(1.0, v.height / 2.0))))
+  let rowH = v.height / usize.toF32(rows)
+  let floorDb = look.top - look.range
+  let mut xs = List<f32>.make()
+  let mut r: usize = 0
+  while r < rows {
+    let hzTop = hzAt(v, usize.toF32(r) * rowH)
+    let hzBot = hzAt(v, usize.toF32(r + 1) * rowH)
+    let a = binOf(f32.min(hzTop, hzBot))
+    let b = umax(a, binOf(f32.max(hzTop, hzBot)))
+    let q = loudest(t, col, col + 1, a, b)
+    let db = u8.toF32(q) * 0.5 - 120.0
+    let x = f32.max(0.0, f32.min(1.0, (db - floorDb) / look.range)) * width
+    run xs.append(x)
+    r = r + 1
+  }
+  run list.append(CanvasCommand.MoveTo { x: 0.0, y: v.height })
+  r = rows
+  while r > 0 {
+    r = r - 1
+    run list.append(CanvasCommand.LineTo { x: xs.get(r), y: (usize.toF32(r) + 0.5) * rowH })
+  }
+  run list.append(CanvasCommand.LineTo { x: 0.0, y: 0.0 })
+  run list.append(CanvasCommand.Close {})
+  run list.append(CanvasCommand.Fill { color: rgb(0x2B50FF) })
+  r = 0
+  while r < rows {
+    let y = (usize.toF32(r) + 0.5) * rowH
+    if r == 0 {
+      run list.append(CanvasCommand.MoveTo { x: xs.get(r), y: y })
+    } else {
+      run list.append(CanvasCommand.LineTo { x: xs.get(r), y: y })
+    }
+    r = r + 1
+  }
+  run list.append(CanvasCommand.Stroke { color: rgb(0x6E8BFF), width: 1.0 })
+  return move list
+}
+
+// ---------------------------------------------------------------------------------------------
+// Overview
+
+pub effect fn overview(
+  t: &Track,
+  width: f32,
+  height: f32,
+  viewStart: f32,
+  viewCols: f32,
+  selA: f32,
+  selB: f32,
+) -> List<CanvasCommand> ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, width, height, rgb(0x1E1E1E))
+  let n = umin(t.columns(), t.peaks.length())
+  if n == 0 {
+    return move list
+  }
+  let total = usize.toF32(n)
+  let bars = umax(1, f32.toUsize(f32.max(1.0, width / 2.0)))
+  let barW = width / usize.toF32(bars)
+  let mid = height / 2.0
+  let mut i: usize = 0
+  while i < bars {
+    let fa = usize.toF32(i) * total / usize.toF32(bars)
+    let fb = usize.toF32(i + 1) * total / usize.toF32(bars)
+    let c0 = umin(n - 1, f32.toUsize(f32.floor(fa)))
+    let c1 = umin(n, umax(c0 + 1, f32.toUsize(f32.ceil(fb))))
+    let mut p: f32 = 0.0
+    let mut c = c0
+    while c < c1 {
+      p = f32.max(p, f32.abs(t.peaks.get(c)))
+      c = c + 1
+    }
+    let h = f32.max(1.0, f32.min(1.0, p) * height * 0.95)
+    let center = (fa + fb) * 0.5
+    let color = if center >= viewStart && center <= viewStart + viewCols {
+      rgb(0xFF6A2B)
+    } else {
+      rgb(0x9A9CE0)
+    }
+    run rect(&mut list, usize.toF32(i) * barW, mid - h / 2.0, f32.max(1.0, barW - 0.5), h, color)
+    i = i + 1
+  }
+  if selA < selB {
+    let x1 = selA / total * width
+    let x2 = selB / total * width
+    run rect(&mut list, x1, 0.0, f32.max(1.0, x2 - x1), height, rgba(0xFFFFFF, 0.18))
+  }
+  let vx = viewStart / total * width
+  let vw = f32.max(2.0, viewCols / total * width)
+  let gray = rgb(0x9E9E9E)
+  run rect(&mut list, vx, 0.0, vw, 1.0, gray)
+  run rect(&mut list, vx, height - 1.0, vw, 1.0, gray)
+  run rect(&mut list, vx, 0.0, 1.0, height, gray)
+  run rect(&mut list, vx + vw - 1.0, 0.0, 1.0, height, gray)
+  return move list
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ticks
+
+pub effect fn freqTicks(v: &View) -> List<Tick> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = List<f32>.make()
+  run values.append(20.0)
+  run values.append(30.0)
+  run values.append(40.0)
+  run values.append(50.0)
+  run values.append(60.0)
+  run values.append(70.0)
+  run values.append(80.0)
+  run values.append(100.0)
+  run values.append(200.0)
+  run values.append(300.0)
+  run values.append(400.0)
+  run values.append(500.0)
+  run values.append(600.0)
+  run values.append(700.0)
+  run values.append(800.0)
+  run values.append(1000.0)
+  run values.append(2000.0)
+  run values.append(3000.0)
+  run values.append(4000.0)
+  run values.append(5000.0)
+  run values.append(6000.0)
+  run values.append(7000.0)
+  run values.append(8000.0)
+  run values.append(10000.0)
+  run values.append(15000.0)
+  run values.append(20000.0)
+  let mut out = List<Tick>.make()
+  let mut lastY: f32 = 0.0
+  let mut have = false
+  let mut i: usize = 0
+  while i < values.length() {
+    let hz = values.get(i)
+    if hz >= v.lo && hz <= v.hi {
+      let y = yOf(v, hz)
+      if have == false || lastY - y >= 14.0 {
+        run out.append(Tick { pos: y, value: hz, places: 0 })
+        lastY = y
+        have = true
+      }
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+pub effect fn timeTicks(v: &View) -> List<Tick> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<Tick>.make()
+  let secPerCol = HOP / RATE
+  let span = v.cols * secPerCol
+  if span <= 0.0 || v.width <= 0.0 {
+    return move out
+  }
+  let pxPerSec = v.width / span
+  let mut steps = List<f32>.make()
+  run steps.append(0.01)
+  run steps.append(0.02)
+  run steps.append(0.05)
+  run steps.append(0.1)
+  run steps.append(0.2)
+  run steps.append(0.5)
+  run steps.append(1.0)
+  run steps.append(2.0)
+  run steps.append(5.0)
+  run steps.append(10.0)
+  run steps.append(15.0)
+  run steps.append(30.0)
+  run steps.append(60.0)
+  let mut step: f32 = 60.0
+  let mut i: usize = 0
+  while i < steps.length() {
+    if steps.get(i) * pxPerSec >= 70.0 {
+      step = steps.get(i)
+      i = steps.length()
+    } else {
+      i = i + 1
+    }
+  }
+  let places: u32 = if step < 0.095 {
+    2
+  } else if step < 0.95 {
+    1
+  } else {
+    0
+  }
+  let startSec = v.start * secPerCol
+  let mut k = f32.toI64(f32.ceil(startSec / step))
+  let mut guard: u32 = 0
+  while guard < 1000 {
+    let sec = i64.toF32(k) * step
+    if sec > startSec + span {
+      guard = 1000
+    } else {
+      run out.append(Tick { pos: xOf(v, sec / secPerCol), value: sec, places: places })
+      k = k + 1
+      guard = guard + 1
+    }
+  }
+  return move out
+}
+
+pub effect fn dbTicks(look: &Look, width: f32) -> List<Tick> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<Tick>.make()
+  if look.range <= 0.0 {
+    return move out
+  }
+  let lo = look.top - look.range
+  let step: f32 = if width / (look.range / 5.0) >= 40.0 {
+    5.0
+  } else {
+    10.0
+  }
+  let mut d = f32.ceil(lo / step) * step
+  while d <= look.top + 0.001 {
+    run out.append(Tick { pos: (d - lo) / look.range * width, value: d, places: 0 })
+    d = d + step
+  }
+  return move out
+}
