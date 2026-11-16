@@ -347,3 +347,27 @@ Measured as above, before and after that step. Executable SHA-256 after:
 Creating these 1,000 rows costs 37% more than inline styles (was 3.6 times as much), and the
 theme change 3.1 times the inline update (was 16 times). The flat-row totals above are unchanged
 within 0.1%. All 27 stylesheet result checks pass.
+
+### One row added, one style object changed
+
+`append_row[Rows=1000,Cells=3]` adds one more row to the 1,000, with its text and three boxes,
+and `style_row` changes the opacity in the style object of the first row. Both restyled the
+whole root while it held sheets. Now a node set up before it joins the tree restyles nothing
+else, an insert or a removal restyles the node plus what the root's selectors can read from it
+(the parent for `:empty`, the element neighbours for `:first-child` and the like, the parent's
+subtree for sibling combinators and positional selectors, the root for `:has()`), and a style
+object without custom properties restyles its own subtree. Sheets whose rules read
+`:first-child`, `:last-child`, `:only-child` or `:empty` no longer turn sharing off: twins must
+then agree on those facts.
+
+Measured as above, before and after. Executable SHA-256 after: `f77d8c619d793f1440d64251320a4933aa67e6486b9d0c727bf63ea3d7631bb6`.
+
+| Operation | Inline total | Tailwind before | Tailwind after |
+| --- | ---: | ---: | ---: |
+| idle | 143,584,036 | 195,473,974 | 195,528,776 |
+| append_row | 166,930,056 | 290,260,253 | 218,410,879 |
+| append_row minus idle | 23,346,020 | 94,786,279 | 22,882,103 |
+| style_row | 145,487,560 | 269,549,437 | 198,037,141 |
+| style_row minus idle | 1,903,524 | 74,075,463 | 2,508,365 |
+
+Both updates now cost about what they cost with inline styles. The other stylesheet totals are unchanged within 0.1%.
