@@ -113,8 +113,9 @@ paths apply the same `Computed` property implementation.
 Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,
 `--release` and Valgrind 3.24.0. Executable SHA-256:
 `59c61a512c558b7e1af145cba778364ccb7c47ea4d864b0f02dc5b4f9d5cb18e`.
-The local runtime sources were used for all UI and Loom dependencies. The original executable
-uses SilkUI `9f7ea7e5`; its benchmark controls are unchanged.
+The runtime changes are in SilkUI `09bac4c8`; local runtime sources were used for all UI and
+Loom dependencies in this measurement. The original executable uses SilkUI `9f7ea7e5`; its
+benchmark controls are unchanged.
 
 | Style-object control | Original | Complete runtime | Change |
 | --- | ---: | ---: | ---: |
