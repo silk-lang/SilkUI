@@ -68,6 +68,12 @@ background, and a theme switch changes every row's background and text color. Th
 idle cases also run with 5,000 rows. Each case checks the first and last row's resulting styles.
 Frames include style resolution, layout and painting.
 
+`RegisteredTailwind` runs the same seven Tailwind scenarios with a second compiled sheet,
+`fixtures/registered.css`. It adds a non-inheriting registered length, declares it on each row,
+and reads it for the unchanged 8 px gap. This exercises both registration-default isolation and
+repeated custom-property scopes without changing row geometry or visual results. The compiler
+script regenerates both binary fixtures.
+
 The Tailwind fixture includes preflight and was generated with `tailwindcss@4.3.5` and
 `@tailwindcss/cli@4.3.5` from `fixtures/rows.input.css`. The benchmark embeds `rows.sheet`:
 there is no stylesheet compilation in the measured program. To regenerate after a CSS or
