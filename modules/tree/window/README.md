@@ -86,6 +86,15 @@ the repository root:
     silk task native demo modules/tree/window/demo
     silk task native demo modules/tree/window/demo -- --check
 
+With `SILK_UI_HEADLESS=<script>` (debug builds) `runWindow` runs the client with no display
+instead: `runHeadless` with a `HostPlatform.headless()` platform, no GPU (`startGpu` and
+`launch` start nothing), frames drawn on the CPU and a clock that moves 1/60 s per turn.
+Script lines are `ui-inspect-cli` commands served through a local inspector session, plus
+`wait <time>`, `size` and `record`/`stop` (raw RGBA frames handed to ffmpeg). See
+[headless.silk](src/headless.silk) and docs/content/native/testing.md.
+
+    SILK_UI_HEADLESS=script.txt build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-window-demo
+
 The check dispatches a click and Tab through the real input path, verifies the
 updated text, and compares GPU output with the CPU reference. `--debug` builds a
 development binary; `--build-only` compiles without opening a window.
