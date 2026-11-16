@@ -17,6 +17,7 @@ import { WindowHost } from '/native/platform/window/browser/window-host.js';
 import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
 import { AccessMirror } from './access-mirror.js';
 import { MediaPreferences } from './media.mjs';
+import { SheetFetch } from './sheet-fetch.mjs';
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -100,6 +101,7 @@ export async function runApp({
   const mirror = new AccessMirror(windowHost);
   let memory;
   let media;
+  let sheetFetch;
   let styles;
   let line = '';
   const print = text => {
@@ -118,6 +120,10 @@ export async function runApp({
       now: () => performance.now(),
       check: () => (check ? 1 : 0),
       media: () => media?.bits ?? 212,
+      sheet_fetch: (pointer, length) => sheetFetch?.start(text(pointer, length)) ?? 0,
+      sheet_length: id => sheetFetch?.length(id) ?? -1,
+      sheet_read: (id, pointer, length) => sheetFetch?.read(id, memory, pointer, length) ?? -1,
+      sheet_forget: id => sheetFetch?.forget(id),
       stylesheet_length: () => styles?.length ?? 0,
       stylesheet_read: (pointer, length) => styles?.read(memory, pointer, length) ?? -1,
       // A turn of the page's event loop, so pending WebGPU promises settle.
@@ -161,6 +167,9 @@ export async function runApp({
   started?.({ instance, windowHost });
   let status;
   try {
+    sheetFetch = new SheetFetch(() => {
+      for (const id of windowHost.windows.keys()) windowHost.silk_window_request_frame(id);
+    });
     if (!check) media = new MediaPreferences(() => {
       for (const id of windowHost.windows.keys()) windowHost.silk_window_request_frame(id);
     });
@@ -174,6 +183,7 @@ export async function runApp({
     throw new Error(text ? `${text}\n${error?.message ?? error}` : String(error?.message ?? error), { cause: error });
   } finally {
     media?.close();
+    sheetFetch?.close();
     styles?.close();
     if (line) log(line);
   }

@@ -1,3 +1,5 @@
+import ui_protocol.stylesheet { StyleSource }
+import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as StyleStatus, LoadState as StyleLoadState }
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import style_inherit
@@ -330,6 +332,7 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
     Mutation.OpenRoot { .. } => false
     Mutation.UpdateRoot { .. } => false
     Mutation.CloseRoot { .. } => false
+    Mutation.LoadStyleSheet { .. } => false
     Mutation.AdoptStyleSheet { .. } => false
     Mutation.ReplaceStyleSheet { .. } => false
     Mutation.RemoveStyleSheet { .. } => false
@@ -624,6 +627,9 @@ pub struct UiTree<'a> {
   pub nodes: List<Node>,
   pub styleAtoms: Atoms,
   pub styleSheets: List<RootSheets>,
+  styleLoads: List<StyleRequest>,
+  styleGeneration: u64,
+  nextStyleId: u32,
   hostStylePreferences: Option<Preferences>,
   free: List<u32>,
   ids: HashMap<Word, u32>,
@@ -822,6 +828,9 @@ impl<'a> UiTree<'a> {
       nodes: List<Node>.make(),
       styleAtoms: Atoms.make(),
       styleSheets: List<RootSheets>.make(),
+      styleLoads: List<StyleRequest>.make(),
+      styleGeneration: 0,
+      nextStyleId: 1,
       hostStylePreferences: Option<Preferences>.None,
       free: List<u32>.make(),
       ids: HashMap<Word, u32>.make(seed),
@@ -1653,8 +1662,15 @@ impl<'a> UiTree<'a> {
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
       }
-      Mutation.AdoptStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), false)
-      Mutation.ReplaceStyleSheet { root, sheet, bytes } => run self.adoptSheet(index, root, sheet, bytes.asSlice(), true)
+      Mutation.LoadStyleSheet { root, sheet, source } => run self.requestStyleSheet(root, sheet, move source)
+      Mutation.AdoptStyleSheet { root, sheet, bytes } => {
+        run self.adoptSheet(index, root, sheet, bytes.asSlice(), false)
+        self.cancelStyleLoad(root, sheet)
+      }
+      Mutation.ReplaceStyleSheet { root, sheet, bytes } => {
+        run self.adoptSheet(index, root, sheet, bytes.asSlice(), true)
+        self.cancelStyleLoad(root, sheet)
+      }
       Mutation.SetStyleSheetOrder { root, sheets } => {
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } }
@@ -1671,6 +1687,7 @@ impl<'a> UiTree<'a> {
         self.stylesDirty = true
       }
       Mutation.RemoveStyleSheet { root, sheet } => {
+        self.cancelStyleLoad(root, sheet)
         if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: sheet } }
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX {
@@ -3614,6 +3631,108 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < roots.length {
       preferences.apply(&mut roots[i].environment)
+      i = i + 1
+    }
+    return true
+  }
+
+  pub effect fn loadStyleSheet(self: &mut Self, root: u32, source: StyleSource) -> u32
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    while self.nextStyleId < 2147483648 && self.styleLoadState(root, self.nextStyleId).isSome() {
+      self.nextStyleId = self.nextStyleId + 1
+    }
+    if self.nextStyleId >= 2147483648 { fail TreeError.StyleSheet { index: 0, root: root, sheet: 0 } }
+    let id = self.nextStyleId
+    self.nextStyleId = id + 1
+    run self.requestStyleSheet(root, id, move source)
+    return id
+  }
+
+  pub fn takeStyleLoads(self: &mut Self) -> List<StyleRequest> {
+    return Intrinsic.replace(self.styleLoads, List<StyleRequest>.make())
+  }
+
+  fn cancelStyleLoad(self: &mut Self, root: u32, sheet: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX { return () }
+    let roots = self.styleSheets.asMutSlice()
+    let mut i: usize = 0
+    while i < roots[at].loads.length() {
+      if roots[at].loads.asSlice()[i].sheet == sheet { drop roots[at].loads.remove(i) return () }
+      i = i + 1
+    }
+  }
+
+  pub fn styleLoadCurrent(self: &Self, ticket: StyleTicket) -> bool {
+    let at = style_sheets.index(self.styleSheets.asSlice(), ticket.root)
+    if at == usize.MAX { return false }
+    let loads = self.styleSheets.asSlice()[at].loads.asSlice()
+    let mut i: usize = 0
+    while i < loads.length {
+      if loads[i].sheet == ticket.sheet {
+        return loads[i].generation == ticket.generation && loads[i].state == StyleLoadState.Loading
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn styleLoadState(self: &Self, root: u32, sheet: u32) -> Option<StyleLoadState> {
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX { return Option<StyleLoadState>.None }
+    let scope = &self.styleSheets.asSlice()[at]
+    let mut i: usize = 0
+    while i < scope.loads.length() {
+      if scope.loads.asSlice()[i].sheet == sheet { return Option<StyleLoadState>.some(scope.loads.asSlice()[i].state) }
+      i = i + 1
+    }
+    i = 0
+    while i < scope.sheets.sheets().length {
+      if scope.sheets.sheets()[i].id == sheet { return Option<StyleLoadState>.some(StyleLoadState.Ready) }
+      i = i + 1
+    }
+    return Option<StyleLoadState>.None
+  }
+
+  pub effect fn requestStyleSheet(self: &mut Self, root: u32, sheet: u32, source: StyleSource) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) || self.styleGeneration == 18446744073709551615 {
+      fail TreeError.StyleSheet { index: 0, root: root, sheet: sheet }
+    }
+    if self.styleLoadState(root, sheet).isNone() {
+      let empty = run Sheet.make().encode()
+      run self.adoptSheet(0, root, sheet, empty.asSlice(), false)
+    }
+    self.styleGeneration = self.styleGeneration + 1
+    let ticket = StyleTicket { root: root, sheet: sheet, generation: self.styleGeneration }
+    self.cancelStyleLoad(root, sheet)
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    let roots = self.styleSheets.asMutSlice()
+    run roots[at].loads.append(StyleStatus { sheet: sheet, generation: ticket.generation, state: StyleLoadState.Loading })
+    drop roots
+    run self.styleLoads.append(StyleRequest { ticket: ticket, source: move source })
+  }
+
+  pub effect fn settleStyleSheet(self: &mut Self, ticket: StyleTicket, bytes: Option<Bytes>) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    if !self.styleLoadCurrent(ticket) { return false }
+    let mut state = StyleLoadState.Failed
+    if let Option<Bytes>.Some { value } = move bytes {
+      let result = run Effect.result(self.adoptSheet(0, ticket.root, ticket.sheet, value.asSlice(), true))
+      match move result {
+        Result.Success { .. } => { state = StyleLoadState.Ready }
+        Result.Failure { error } => match move error {
+          OutOfMemoryError allocation => { fail move allocation }
+          TreeError invalid => { drop invalid }
+        }
+      }
+    }
+    let at = style_sheets.index(self.styleSheets.asSlice(), ticket.root)
+    let roots = self.styleSheets.asMutSlice()
+    let loads = roots[at].loads.asMutSlice()
+    let mut i: usize = 0
+    while i < loads.length {
+      if loads[i].sheet == ticket.sheet { loads[i].state = state break }
       i = i + 1
     }
     return true
