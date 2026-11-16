@@ -3,6 +3,7 @@
 //! a time selection and cut/copy/paste/delete/crop/undo. Brightness and contrast set the
 //! displayed dynamic range, as in the colormap settings of voice analysis tools.
 import dsp
+import png
 import render
 import render { Look, Tick, View }
 import source { Sound, SAMPLE_RATE }
@@ -103,12 +104,52 @@ pub struct Doc {
   selA: f32,
   selB: f32,
   guides: List<f32>,
+  /// The spectrogram image (a PNG data URL) and what it was made from.
+  image: String,
+  key: ImageKey,
   spectro: List<CanvasCommand>,
   piano: List<CanvasCommand>,
   slice: List<CanvasCommand>,
   overview: List<CanvasCommand>,
   freqTicks: List<Tick>,
   timeTicks: List<Tick>,
+}
+
+/// What a spectrogram image depends on; the image is rebuilt only when this changes.
+pub struct ImageKey {
+  columns: usize,
+  start: f32,
+  cols: f32,
+  lo: f32,
+  hi: f32,
+  height: f32,
+  log: bool,
+  top: f32,
+  range: f32,
+  gamma: f32,
+  colormap: u32,
+}
+
+fn sameKey(a: &ImageKey, b: &ImageKey) -> bool {
+  return a.columns == b.columns && a.start == b.start && a.cols == b.cols && a.lo == b.lo
+    && a.hi == b.hi && a.height == b.height && a.log == b.log && a.top == b.top
+    && a.range == b.range && a.gamma == b.gamma && a.colormap == b.colormap
+}
+
+fn blankKey() -> ImageKey {
+  return ImageKey {
+    columns: 0,
+    start: -1.0,
+    cols: 0.0,
+    lo: 0.0,
+    hi: 0.0,
+    height: 0.0,
+    log: false,
+    top: 0.0,
+    range: 0.0,
+    gamma: 0.0,
+    colormap: 99,
+  }
 }
 
 pub struct Studio {
@@ -307,6 +348,8 @@ effect fn newDoc(name: string) -> Doc ! OutOfMemoryError ? &mut Allocator {
     selA: 0.0,
     selB: 0.0,
     guides: List<f32>.make(),
+    image: String.make(),
+    key: blankKey(),
     spectro: List<CanvasCommand>.make(),
     piano: List<CanvasCommand>.make(),
     slice: List<CanvasCommand>.make(),
@@ -385,6 +428,24 @@ effect fn redrawDoc(model: &mut Studio, index: usize) -> () ! OutOfMemoryError ?
     log: log,
     width: SPEC_W,
     height: height,
+  }
+  let key = ImageKey {
+    columns: doc.track.columns(),
+    start: view.start,
+    cols: view.cols,
+    lo: view.lo,
+    hi: view.hi,
+    height: view.height,
+    log: view.log,
+    top: look.top,
+    range: look.range,
+    gamma: look.gamma,
+    colormap: look.colormap,
+  }
+  if !sameKey(&key, &doc.key) {
+    let pixels = run render.spectrogramPixels(&doc.track, &view, &look)
+    doc.image = run png.dataUrl(pixels.width, pixels.height, pixels.rgb.asSlice())
+    doc.key = move key
   }
   doc.spectro = run render.spectrogram(
     &doc.track,
@@ -1653,7 +1714,39 @@ fn pane(model: &Studio, h: &Document<Message>, which: u32) -> Node {
               ),
             ],
             &[
-              h.canvas(doc.spectro.asSlice(), &[h.style(&[css.width(px(SPEC_W)), css.height(px(height))])]),
+              h.box(&[h.style(&[css.position(Position.Absolute), css.inset(px(0.0)), css.backgroundColor(rgb(0x000000))])], &[]),
+              if String.byteLength(String.view(&doc.image)) > 0 {
+                h.image(
+                  String.view(&doc.image),
+                  &[
+                    h.style(
+                      &[
+                        css.position(Position.Absolute),
+                        css.top(px(0.0)),
+                        css.left(px(0.0)),
+                        css.width(px(SPEC_W)),
+                        css.height(px(height)),
+                      ],
+                    ),
+                  ],
+                )
+              } else {
+                h.empty()
+              },
+              h.canvas(
+                doc.spectro.asSlice(),
+                &[
+                  h.style(
+                    &[
+                      css.position(Position.Absolute),
+                      css.top(px(0.0)),
+                      css.left(px(0.0)),
+                      css.width(px(SPEC_W)),
+                      css.height(px(height)),
+                    ],
+                  ),
+                ],
+              ),
               h.each(
                 doc.guides.asSlice(),
                 |g| label(h, render.yOf(&view, g.*) - 15.0, SPEC_W - 120.0, hzNote(h, g.*)),

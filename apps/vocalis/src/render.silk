@@ -152,7 +152,7 @@ fn colormap(map: u32, t: f32) -> Rgba<f32> {
   } else if map == 2 {
     return mix(0x000000, 0xFFFFFF, f32.max(0.0, f32.min(1.0, t)))
   }
-  return ramp(t, 0x000000, 0x0A0A5A, 0x1E3CFF, 0x00E5FF, 0xFFF200, 0xFF8C78, 0xC8102E)
+  return ramp(t, 0x00000C, 0x0B0BB0, 0x1F6EFF, 0x00DDF5, 0xF2F26A, 0xE58A74, 0xC2103E)
 }
 
 /// Level 0 is background; 1..LEVELS are shades.
@@ -267,12 +267,149 @@ fn loudest(t: &Track, c0: usize, c1: usize, k0: usize, k1: usize) -> u8 {
 }
 
 fn binOf(hz: f32) -> usize {
-  let b = f32.max(0.0, hz * 2048.0 / RATE)
+  let b = f32.max(0.0, hz * usize.toF32(dsp.FFT_SIZE) / RATE)
   return umin(dsp.BINS - 1, f32.toUsize(b))
 }
 
 // ---------------------------------------------------------------------------------------------
 // Spectrogram
+
+/// The spectrogram of a view as a small RGB image: one pixel per analysis column (fewer when
+/// zoomed far out, keeping the loudest), and rows sampled at their own frequency, interpolated
+/// between FFT bins. Stretched over the view with bilinear filtering, it reads as a smooth field
+/// rather than as blocks.
+pub struct Pixels {
+  pub width: usize,
+  pub height: usize,
+  pub rgb: List<u8>,
+}
+
+pub const MAX_IMAGE_W: usize = 640
+pub const MAX_IMAGE_H: usize = 300
+
+/// The spectrum byte of column `c` at fractional bin `b`, interpolated between bins.
+fn sampleBin(t: &Track, c: usize, b: f32) -> f32 {
+  let base = c * dsp.BINS
+  let k = f32.toUsize(f32.floor(b))
+  if k + 1 >= dsp.BINS {
+    return u8.toF32(t.spec.get(base + dsp.BINS - 1))
+  }
+  let f = b - f32.floor(b)
+  let q0 = u8.toF32(t.spec.get(base + k))
+  let q1 = u8.toF32(t.spec.get(base + k + 1))
+  return q0 + (q1 - q0) * f
+}
+
+/// The spectrum byte of column `c` over bins [b0, b1]: interpolated when the span is under a
+/// bin, else the loudest bin in it (a few samples of it when wide).
+fn sampleBand(t: &Track, c: usize, b0: f32, b1: f32) -> f32 {
+  if b1 - b0 <= 1.0 {
+    return sampleBin(t, c, (b0 + b1) * 0.5)
+  }
+  let k0 = f32.toUsize(f32.max(0.0, f32.floor(b0)))
+  let k1 = umin(dsp.BINS - 1, f32.toUsize(f32.ceil(b1)))
+  let step = umax(1, (k1 - k0) / 8)
+  let base = c * dsp.BINS
+  let mut best: u8 = 0
+  let mut k = k0
+  while k <= k1 {
+    let q = t.spec.get(base + k)
+    if q > best {
+      best = q
+    }
+    k = k + step
+  }
+  return u8.toF32(best)
+}
+
+fn colorByte(value: f32) -> u8 {
+  return f32.toU8(f32.max(0.0, f32.min(255.0, value * 255.0 + 0.5)))
+}
+
+pub effect fn spectrogramPixels(t: &Track, v: &View, look: &Look) -> Pixels
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let total = t.columns()
+  let width = umax(2, umin(MAX_IMAGE_W, f32.toUsize(f32.ceil(f32.max(1.0, v.cols)))))
+  let height = umax(2, umin(MAX_IMAGE_H, f32.toUsize(f32.ceil(v.height * 0.7))))
+  let mut rgb = run List<u8>.makeWithCapacity(width * height * 3)
+  // The bin span of every row, computed once.
+  let perBin = usize.toF32(dsp.FFT_SIZE) / RATE
+  let mut b0s = List<f32>.make()
+  let mut b1s = List<f32>.make()
+  let mut r: usize = 0
+  while r < height {
+    let yTop = usize.toF32(r) * v.height / usize.toF32(height)
+    let yBottom = usize.toF32(r + 1) * v.height / usize.toF32(height)
+    let hzA = hzAt(v, yTop)
+    let hzB = hzAt(v, yBottom)
+    run b0s.append(f32.min(hzA, hzB) * perBin)
+    run b1s.append(f32.max(hzA, hzB) * perBin)
+    r = r + 1
+  }
+  // One spectrum byte per pixel, column by column, then colored row by row.
+  let mut values = run List<f32>.makeWithCapacity(width * height)
+  let step = v.cols / usize.toF32(width)
+  let mut x: usize = 0
+  while x < width {
+    let fa = v.start + usize.toF32(x) * step
+    let center = fa + step * 0.5 - 0.5
+    let mut y: usize = 0
+    while y < height {
+      let b0 = b0s.get(y)
+      let b1 = b1s.get(y)
+      let mut q: f32 = -1.0
+      if total > 0 && center > -1.0 && center < usize.toF32(total) {
+        if step <= 1.0 {
+          // Zoomed in: interpolate between neighbouring columns.
+          let cf = f32.max(0.0, f32.min(usize.toF32(total - 1), center))
+          let c0 = f32.toUsize(f32.floor(cf))
+          let c1 = umin(total - 1, c0 + 1)
+          let f = cf - f32.floor(cf)
+          let qa = sampleBand(t, c0, b0, b1)
+          let qb = sampleBand(t, c1, b0, b1)
+          q = qa + (qb - qa) * f
+        } else {
+          // Zoomed out: the loudest of a few columns under the pixel.
+          let c0 = f32.toUsize(f32.max(0.0, f32.floor(fa)))
+          let c1 = umin(total, umax(c0 + 1, f32.toUsize(f32.max(0.0, f32.ceil(fa + step)))))
+          let cs = umax(1, (c1 - c0) / 4)
+          let mut c = c0
+          while c < c1 {
+            q = f32.max(q, sampleBand(t, c, b0, b1))
+            c = c + cs
+          }
+        }
+      }
+      run values.append(q)
+      y = y + 1
+    }
+    x = x + 1
+  }
+  let floor = look.top - look.range
+  let gamma = f32.max(0.05, look.gamma)
+  let mut y: usize = 0
+  while y < height {
+    let mut x2: usize = 0
+    while x2 < width {
+      let q = values.get(x2 * height + y)
+      let mut color = Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+      if q >= 0.0 {
+        let db = q * 0.5 - 120.0
+        let level = (db - floor) / look.range
+        if level > 0.0 {
+          color = colormap(look.colormap, f32.pow(f32.min(1.0, level), gamma))
+        }
+      }
+      run rgb.append(colorByte(color.r))
+      run rgb.append(colorByte(color.g))
+      run rgb.append(colorByte(color.b))
+      x2 = x2 + 1
+    }
+    y = y + 1
+  }
+  return Pixels { width: width, height: height, rgb: move rgb }
+}
 
 pub effect fn spectrogram(
   t: &Track,
@@ -284,68 +421,8 @@ pub effect fn spectrogram(
   hoverX: f32,
   hoverY: f32,
 ) -> List<CanvasCommand> ! OutOfMemoryError ? &mut Allocator {
+  // Drawn over the spectrogram image: transparent everywhere else.
   let mut list = List<CanvasCommand>.make()
-  run rect(&mut list, 0.0, 0.0, v.width, v.height, rgb(0x000000))
-  let total = t.columns()
-  let dispCols = umax(1, umin(MAX_COLS, f32.toUsize(f32.max(1.0, f32.ceil(v.cols)))))
-  let rows = umax(1, umin(MAX_ROWS, f32.toUsize(f32.max(1.0, v.height))))
-  let colW = v.width / usize.toF32(dispCols)
-  let rowH = v.height / usize.toF32(rows)
-  // Bin range of every row, computed once.
-  let mut kLo = List<usize>.make()
-  let mut kHi = List<usize>.make()
-  let mut r: usize = 0
-  while r < rows {
-    let hzTop = hzAt(v, usize.toF32(r) * rowH)
-    let hzBot = hzAt(v, usize.toF32(r + 1) * rowH)
-    let a = binOf(f32.min(hzTop, hzBot))
-    let b = binOf(f32.max(hzTop, hzBot))
-    run kLo.append(a)
-    run kHi.append(umax(a, b))
-    r = r + 1
-  }
-  let mut levels = List<u32>.make()
-  r = 0
-  while r < rows {
-    run levels.append(0)
-    r = r + 1
-  }
-  let mut d: usize = 0
-  while d < dispCols {
-    let fa = v.start + usize.toF32(d) * v.cols / usize.toF32(dispCols)
-    let fb = v.start + usize.toF32(d + 1) * v.cols / usize.toF32(dispCols)
-    if fb > 0.0 && fa < usize.toF32(total) {
-      let c0 = f32.toUsize(f32.max(0.0, f32.floor(fa)))
-      let c1 = umin(total, umax(c0 + 1, f32.toUsize(f32.max(0.0, f32.ceil(fb)))))
-      r = 0
-      while r < rows {
-        levels.set(r, levelOf(look, loudest(t, c0, c1, kLo.get(r), kHi.get(r))))
-        r = r + 1
-      }
-      let x = usize.toF32(d) * colW
-      r = 0
-      while r < rows {
-        let level = levels.get(r)
-        let mut end = r + 1
-        while end < rows && levels.get(end) == level {
-          end = end + 1
-        }
-        if level > 0 {
-          let shade = u32.toF32(level - 1) / u32.toF32(LEVELS - 1)
-          run rect(
-            &mut list,
-            x,
-            usize.toF32(r) * rowH,
-            colW + 0.5,
-            usize.toF32(end - r) * rowH + 0.5,
-            colormap(look.colormap, shade),
-          )
-        }
-        r = end
-      }
-    }
-    d = d + 1
-  }
 
   // Note lines.
   if look.noteLines {
