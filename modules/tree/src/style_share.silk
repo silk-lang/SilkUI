@@ -1,17 +1,17 @@
-//! A node whose selector inputs equal its previous sibling's takes that sibling's matched style.
-//! Both have the same ancestors, so every rule that does not read sibling position, children or
-//! descendants gives them the same result; `RootSheets.siblingsShare` rules those rules out.
+//! A node takes the matched style of another whose selector inputs and ancestors equal its own:
+//! a sibling, or the matching child of its parent's twin, as the rows of a list are to each other.
+//! Every rule that does not read sibling position, children or descendants gives both the same
+//! result; `RootSheets.siblingsShare` rules those rules out.
 import engine { UiTree }
 import node { Node, NONE }
 import mutation { Declaration, NodeKind }
 import selector_tree { SelectorTree }
 import style_identity { NodeIdentity }
-import style_sheets { Resolved }
 import properties.values
 import svg_css.element { ElementTree, NO_ELEMENT }
 import silk.collections.list { List }
 import silk.core.option { Option }
-import silk.mem.frozen { Frozen }
+import silk.color.rgba { Rgba }
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { String }
@@ -47,21 +47,49 @@ fn plainBox(node: &Node) -> bool {
   return node.kind == NodeKind.Box && node.live && !node.isGenerated() && node.starting.length() == 0
 }
 
-/// The previous sibling's style when `slot` would match the same rules with the same values.
-pub fn exemplar(tree: &UiTree<'_>, slot: u32) -> Option<Frozen<Resolved>> {
+/// Whether `slot` and the clean, classed node `other` would match the same rules given equal ancestors.
+fn alike(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, other: u32) -> bool {
   let node = tree.node(slot)
-  if !plainBox(node) || node.parent == NONE || tree.styleOverrides().length != 0 { return Option<Frozen<Resolved>>.None }
-  let adapter = SelectorTree { tree: tree }
-  let found = adapter.previousSibling(u32.toUsize(slot))
-  if found == NO_ELEMENT { return Option<Frozen<Resolved>>.None }
-  let previous = tree.node(usize.toU32(found))
-  if !plainBox(previous) || previous.styleDirty { return Option<Frozen<Resolved>>.None }
-  let shared = match previous.sheetStyle() { Option.Some { value } => value.plain _ => false }
-  if !shared { return Option<Frozen<Resolved>>.None }
-  if !sameIdentity(node.identity(), previous.identity()) { return Option<Frozen<Resolved>>.None }
-  if adapter.state(u32.toUsize(slot)).bits != adapter.state(found).bits { return Option<Frozen<Resolved>>.None }
-  if !sameList(&node.base, &previous.base) || !sameList(&node.hover, &previous.hover) || !sameList(&node.active, &previous.active)
-    || !sameList(&node.focus, &previous.focus) || !sameList(&node.focusVisible, &previous.focusVisible) { return Option<Frozen<Resolved>>.None }
-  if let Option<Frozen<Resolved>>.Some { value } = &previous.resolvedSheet { return Option<Frozen<Resolved>>.some(value.clone()) }
-  return Option<Frozen<Resolved>>.None
+  let model = tree.node(other)
+  if !plainBox(model) || model.styleDirty || model.styleClass == 0 { return false }
+  let shared = match model.sheetStyle() { Option.Some { value } => value.plain _ => false }
+  if !shared || !sameIdentity(node.identity(), model.identity()) { return false }
+  if adapter.state(u32.toUsize(slot)).bits != adapter.state(u32.toUsize(other)).bits { return false }
+  return sameList(&node.base, &model.base) && sameList(&node.hover, &model.hover) && sameList(&node.active, &model.active)
+    && sameList(&node.focus, &model.focus) && sameList(&node.focusVisible, &model.focusVisible)
 }
+
+/// The node `slot` took its record from, while both still hold the same class.
+fn twinOf(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let node = tree.node(slot)
+  let found = node.styleTwin
+  if found == NONE || node.styleClass == 0 || u32.toUsize(found) >= tree.nodes.length() { return NONE }
+  let other = tree.node(found)
+  if !other.live || other.styleDirty || other.styleClass != node.styleClass { return NONE }
+  return found
+}
+
+/// A node whose matched style `slot` can take, or NONE. Its selector inputs equal `slot`'s and
+/// its ancestors equal `slot`'s: it is a sibling, or a child of the parent's own twin.
+pub fn twin(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let node = tree.node(slot)
+  if !plainBox(node) || node.parent == NONE || tree.styleOverrides().length != 0 { return NONE }
+  let adapter = SelectorTree { tree: tree }
+  let previous = adapter.previousSibling(u32.toUsize(slot))
+  // A record holds values resolved against the parent's color, which a transition can change
+  // on one parent only.
+  let uncle = twinOf(tree, node.parent)
+  if uncle != NONE && sameColor(&tree.node(uncle).computed.text.color, &tree.node(node.parent).computed.text.color) {
+    let mut cousin = NO_ELEMENT
+    if previous == NO_ELEMENT { cousin = adapter.firstChild(u32.toUsize(uncle)) }
+    else {
+      let before = twinOf(tree, usize.toU32(previous))
+      if before != NONE && tree.node(before).parent == uncle { cousin = adapter.nextSibling(u32.toUsize(before)) }
+    }
+    if cousin != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(cousin)) { return usize.toU32(cousin) }
+  }
+  if previous != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(previous)) { return usize.toU32(previous) }
+  return NONE
+}
+
+fn sameColor(a: &Rgba<f32>, b: &Rgba<f32>) -> bool { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a }
