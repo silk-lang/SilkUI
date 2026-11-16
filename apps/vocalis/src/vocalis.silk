@@ -1,0 +1,947 @@
+//! Vocalis: a voice analysis studio. A scrolling spectrogram with the pitch track and the
+//! formants drawn over it, the current spectrum slice, and readouts for pitch (Hz and note),
+//! loudness and F1–F3. Sound comes from the microphone, a WAV file, or a built-in synthetic
+//! singer, all through the `Sound` service so a test can run it with no machine at all.
+import dsp
+import source { Sound, SAMPLE_RATE }
+import loom.css
+import loom.css { px, Align, BorderStyle }
+import loom.lib {
+  CanvasCommand,
+  CommandSet,
+  Document,
+  FileDialog,
+  Node,
+  NoOutput,
+  Program,
+  Shell,
+  Subscriptions,
+  Update
+}
+import silk.collections.list { List }
+import silk.color.rgba { Rgba }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.text.string { String }
+
+/// Columns of spectrogram history, one per analysis hop.
+pub const COLS: usize = 220
+/// Frequency rows drawn from 0 to TOP_HZ.
+pub const ROWS: usize = 140
+pub const TOP_HZ: f32 = 5000.0
+/// Samples between analysis columns (~11.6 ms at 44.1 kHz).
+pub const HOP: usize = 512
+/// Samples a frame of the synthetic voice or a file playback advances (60 fps).
+pub const PER_FRAME: usize = 735
+
+pub const SPEC_W: f32 = 880.0
+pub const SPEC_H: f32 = 520.0
+pub const SLICE_W: f32 = 220.0
+
+const OPENING: u32 = 1
+
+pub union Source {
+  Off,
+  Mic,
+  Demo,
+  File,
+}
+
+/// Everything the program remembers.
+pub struct Vocalis {
+  pub source: Source,
+  pub paused: bool,
+  pub status: String,
+  /// The last FFT_SIZE samples, oldest first.
+  window: List<f32>,
+  /// Samples waiting to be analysed.
+  pending: List<f32>,
+  /// A loaded file and where playback is.
+  clip: List<f32>,
+  clipAt: usize,
+  /// The synthetic singer's clock and phase.
+  demoTime: f32,
+  demoPhase: f32,
+  /// Scratch for the DSP.
+  windowed: List<f32>,
+  re: List<f32>,
+  im: List<f32>,
+  db: List<f32>,
+  scratch: List<f32>,
+  formantOut: List<f32>,
+  /// Spectrogram history: COLS * ROWS intensity levels (0..LEVELS), column-major, oldest
+  /// column first.
+  cells: List<u8>,
+  /// Per column: pitch Hz (0 = unvoiced) and F1..F3 Hz (0 = none).
+  pitches: List<f32>,
+  f1s: List<f32>,
+  f2s: List<f32>,
+  f3s: List<f32>,
+  /// The latest readouts.
+  pub pitch: f32,
+  pub level: f32,
+  pub f1: f32,
+  pub f2: f32,
+  pub f3: f32,
+  /// Drawings, rebuilt when a column arrives.
+  spectro: List<CanvasCommand>,
+  slice: List<CanvasCommand>,
+  meter: List<CanvasCommand>,
+}
+
+/// Everything that can happen.
+pub union Message {
+  Frame { pub time: f64 },
+  Arrived { pub samples: List<f32> },
+  ClickedMic,
+  ClickedDemo,
+  ClickedOpen,
+  ClickedPause,
+  ClickedClear,
+  ClosedDialog { pub request: u32, pub paths: List<String> },
+  LoadedClip { pub samples: List<f32> },
+  MicStarted { pub ok: bool },
+  Done,
+}
+
+pub union Command {
+  Pull,
+  StartMic,
+  StopMic,
+  AskOpen,
+  Load { pub path: String },
+}
+
+impl CommandSet<Message ? &mut Shell | &mut Sound | &mut Allocator> for Command {
+  effect fn execute(self: Self) -> Message
+    ! OutOfMemoryError
+    ? &mut Shell | &mut Sound | &mut Allocator {
+    match move self {
+      Command.Pull => {
+        return Message.Arrived { samples: run Sound.readMic() }
+      }
+      Command.StartMic => {
+        return Message.MicStarted { ok: run Sound.startMic() }
+      }
+      Command.StopMic => {
+        run Sound.stopMic()
+      }
+      Command.AskOpen => {
+        run Shell.openFile(OPENING, FileDialog.file("Open a recording", "wav"))
+      }
+      Command.Load { path } => {
+        return Message.LoadedClip { samples: run Sound.loadWav(String.view(&path)) }
+      }
+    }
+    return Message.Done
+  }
+}
+
+type Next = Update<Vocalis, Command, NoOutput>
+
+// ---------------------------------------------------------------------------------------------
+// Colors
+
+fn rgb(hex: u32) -> Rgba<f32> {
+  return Rgba<f32> {
+    r: u32.toF32((hex >> 16) & 0xFF) / 255.0,
+    g: u32.toF32((hex >> 8) & 0xFF) / 255.0,
+    b: u32.toF32(hex & 0xFF) / 255.0,
+    a: 1.0,
+  }
+}
+
+fn rgba(hex: u32, a: f32) -> Rgba<f32> {
+  let mut c = rgb(hex)
+  c.a = a
+  return c
+}
+
+const BG: u32 = 0x0B0E14
+const PANEL: u32 = 0x131824
+const LINE: u32 = 0x263042
+const INK: u32 = 0xE6EAF2
+const MUTED: u32 = 0x8A94A8
+const ACCENT: u32 = 0x4FD1C5
+const PITCH: u32 = 0x7CFF6B
+const F1C: u32 = 0xFF5D8F
+const F2C: u32 = 0xFFB547
+const F3C: u32 = 0x6AA8FF
+
+/// Intensity levels drawn; level 0 is the background.
+const LEVELS: u8 = 24
+
+/// An "inferno"-like ramp from near black through purple and orange to pale yellow.
+fn heat(level: u8) -> Rgba<f32> {
+  let t = u8.toF32(level) / u8.toF32(LEVELS)
+  let r = f32.min(1.0, 0.05 + 1.6 * t)
+  let g = f32.max(0.0, f32.min(1.0, -0.25 + 1.3 * t * t + 0.1 * t))
+  let b = f32.max(0.0, f32.min(1.0, 0.25 + 0.9 * t - 1.4 * t * t + 0.9 * t * t * t))
+  return Rgba<f32> { r: r, g: g, b: b, a: 1.0 }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Buffers
+
+effect fn zeros(count: usize) -> List<f32> ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<f32>.make()
+  let mut i: usize = 0
+  while i < count {
+    run list.append(0.0)
+    i = i + 1
+  }
+  return move list
+}
+
+effect fn zeroBytes(count: usize) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<u8>.make()
+  let mut i: usize = 0
+  while i < count {
+    run list.append(0)
+    i = i + 1
+  }
+  return move list
+}
+
+/// Drops the first `count` items of a history list and appends `value`.
+effect fn push(list: &mut List<f32>, value: f32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let n = list.length()
+  let mut i: usize = 1
+  while i < n {
+    list.set(i - 1, list.get(i))
+    i = i + 1
+  }
+  if n > 0 {
+    list.set(n - 1, value)
+  } else {
+    run list.append(value)
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The synthetic singer: a glottal-like harmonic series shaped by five vowels' formants, with a
+// slow pitch glide and vibrato, so the app has something to show with no microphone.
+
+fn vowelFormant(vowel: usize, which: usize) -> f32 {
+  // a, e, i, o, u
+  let f1: [f32; 5] = [800.0, 500.0, 300.0, 500.0, 320.0]
+  let f2: [f32; 5] = [1200.0, 1900.0, 2300.0, 900.0, 800.0]
+  let f3: [f32; 5] = [2500.0, 2600.0, 3000.0, 2500.0, 2400.0]
+  if which == 0 {
+    return f1[vowel]
+  }
+  if which == 1 {
+    return f2[vowel]
+  }
+  return f3[vowel]
+}
+
+fn resonance(freq: f32, center: f32, width: f32) -> f32 {
+  let d = (freq - center) / width
+  return 1.0 / (1.0 + d * d)
+}
+
+effect fn synthesize(model: &mut Vocalis, count: usize) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<f32>.make()
+  let tau: f32 = 6.2831853
+  let mut i: usize = 0
+  while i < count {
+    let t = model.demoTime
+    let glide = 165.0 + 70.0 * f32.sin(tau * t / 6.0)
+    let vibrato = 1.0 + 0.025 * f32.sin(tau * 5.5 * t)
+    let f0 = glide * vibrato
+    // A vowel every 1.2 s, blended over the last 0.3 s into the next.
+    let slot = t / 1.2
+    let index = f32.toI64(f32.trunc(slot))
+    let vowel = i64.toUsize(index % 5)
+    let next = (vowel + 1) % 5
+    let frac = slot - f32.trunc(slot)
+    let blend = f32.max(0.0, (frac - 0.75) / 0.25)
+    model.demoPhase = model.demoPhase + tau * f0 / SAMPLE_RATE
+    if model.demoPhase > tau {
+      model.demoPhase = model.demoPhase - tau
+    }
+    let mut sample: f32 = 0.0
+    let mut k: usize = 1
+    while k <= 28 {
+      let hz = usize.toF32(k) * f0
+      if hz < 5500.0 {
+        let mut gain: f32 = 0.0
+        let mut w: usize = 0
+        while w < 3 {
+          let center = vowelFormant(vowel, w) * (1.0 - blend) + vowelFormant(next, w) * blend
+          gain = gain + resonance(hz, center, 90.0 + 40.0 * usize.toF32(w))
+          w = w + 1
+        }
+        // A -12 dB/octave source tilt.
+        gain = gain / usize.toF32(k)
+        sample = sample + gain * f32.sin(usize.toF32(k) * model.demoPhase)
+      }
+      k = k + 1
+    }
+    // Breath between phrases: silence for 0.4 s every 4.8 s.
+    let phrase = t - 4.8 * f32.trunc(t / 4.8)
+    let envelope = if phrase > 4.4 {
+      0.0
+    } else {
+      f32.min(1.0, phrase * 8.0)
+    }
+    run out.append(0.18 * sample * envelope)
+    model.demoTime = model.demoTime + 1.0 / SAMPLE_RATE
+    i = i + 1
+  }
+  return move out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Analysis
+
+fn hzToRow(hz: f32) -> f32 {
+  return hz / TOP_HZ * usize.toF32(ROWS)
+}
+
+/// Analyses the current window into a new rightmost column.
+effect fn analyse(model: &mut Vocalis) -> () ! OutOfMemoryError ? &mut Allocator {
+  dsp.hann(model.window.asSlice(), model.windowed.asMutSlice())
+  dsp.spectrumDb(
+    model.windowed.asSlice(),
+    model.re.asMutSlice(),
+    model.im.asMutSlice(),
+    model.db.asMutSlice(),
+  )
+  model.level = dsp.rmsDb(model.window.asSlice())
+  let voiced = model.level > -50.0
+  model.pitch = if voiced {
+    dsp.pitchYin(model.window.asSlice(), SAMPLE_RATE, model.scratch.asMutSlice())
+  } else {
+    0.0
+  }
+  model.f1 = 0.0
+  model.f2 = 0.0
+  model.f3 = 0.0
+  if voiced && model.pitch > 0.0 {
+    let found = dsp.formants(model.window.asSlice(), SAMPLE_RATE, model.formantOut.asMutSlice())
+    if found > 0 {
+      model.f1 = model.formantOut.get(0)
+    }
+    if found > 1 {
+      model.f2 = model.formantOut.get(1)
+    }
+    if found > 2 {
+      model.f3 = model.formantOut.get(2)
+    }
+  }
+
+  // Shift the history one column left.
+  let mut i: usize = ROWS
+  let total = COLS * ROWS
+  while i < total {
+    model.cells.set(i - ROWS, model.cells.get(i))
+    i = i + 1
+  }
+  // The new column: each row takes the loudest bin it covers, mapped from -90..-10 dB.
+  let binHz = SAMPLE_RATE / usize.toF32(dsp.FFT_SIZE)
+  let base = (COLS - 1) * ROWS
+  let mut row: usize = 0
+  while row < ROWS {
+    let lo = usize.toF32(row) * TOP_HZ / usize.toF32(ROWS)
+    let hi = usize.toF32(row + 1) * TOP_HZ / usize.toF32(ROWS)
+    let mut bin = f32.toUsize(lo / binHz)
+    let last = f32.toUsize(hi / binHz)
+    let mut loudest: f32 = -120.0
+    while bin <= last && bin < dsp.BINS {
+      loudest = f32.max(loudest, model.db.get(bin))
+      bin = bin + 1
+    }
+    let t = f32.max(0.0, f32.min(1.0, (loudest + 90.0) / 80.0))
+    model.cells.set(base + row, f32.toU8(t * u8.toF32(LEVELS)))
+    row = row + 1
+  }
+  run push(&mut model.pitches, model.pitch)
+  run push(&mut model.f1s, model.f1)
+  run push(&mut model.f2s, model.f2)
+  run push(&mut model.f3s, model.f3)
+}
+
+/// Feeds `samples` through the analysis, hop by hop.
+effect fn feed(model: &mut Vocalis, samples: &List<f32>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: usize = 0
+  while i < samples.length() {
+    run model.pending.append(samples.get(i))
+    i = i + 1
+  }
+  let mut changed = false
+  let mut columns: usize = 0
+  while model.pending.length() >= HOP && columns < 8 {
+    // Slide the window HOP samples and append HOP pending samples.
+    let n = model.window.length()
+    let mut j: usize = HOP
+    while j < n {
+      model.window.set(j - HOP, model.window.get(j))
+      j = j + 1
+    }
+    let mut k: usize = 0
+    while k < HOP {
+      model.window.set(n - HOP + k, model.pending.get(k))
+      k = k + 1
+    }
+    // Drop the consumed pending samples.
+    let left = model.pending.length() - HOP
+    let mut m: usize = 0
+    while m < left {
+      model.pending.set(m, model.pending.get(m + HOP))
+      m = m + 1
+    }
+    while model.pending.length() > left {
+      model.pending.remove(model.pending.length() - 1)
+    }
+    run analyse(model)
+    changed = true
+    columns = columns + 1
+  }
+  // A source faster than the display: drop the backlog rather than fall behind.
+  if model.pending.length() > HOP * 16 {
+    model.pending.clear()
+  }
+  return changed
+}
+
+// ---------------------------------------------------------------------------------------------
+// Drawings
+
+effect fn rect(list: &mut List<CanvasCommand>, x: f32, y: f32, w: f32, h: f32, color: Rgba<f32>)
+  -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run list.append(
+    CanvasCommand.FillRect { x: x, y: y, width: w, height: h, radius: 0.0, color: color },
+  )
+}
+
+/// A track (pitch or formant) as a polyline, broken where it is zero.
+effect fn track(list: &mut List<CanvasCommand>, values: &List<f32>, color: Rgba<f32>, width: f32)
+  -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let colW = SPEC_W / usize.toF32(COLS)
+  let mut drawing = false
+  let mut any = false
+  let mut c: usize = 0
+  while c < values.length() {
+    let hz = values.get(c)
+    if hz > 0.0 && hz < TOP_HZ {
+      let x = (usize.toF32(c) + 0.5) * colW
+      let y = SPEC_H - hz / TOP_HZ * SPEC_H
+      if drawing {
+        run list.append(CanvasCommand.LineTo { x: x, y: y })
+      } else {
+        run list.append(CanvasCommand.MoveTo { x: x, y: y })
+        drawing = true
+        any = true
+      }
+    } else {
+      drawing = false
+    }
+    c = c + 1
+  }
+  if any {
+    run list.append(CanvasCommand.Stroke { color: color, width: width })
+  }
+}
+
+/// Formant dots, cheaper and clearer than lines for jumpy estimates.
+effect fn dots(list: &mut List<CanvasCommand>, values: &List<f32>, color: Rgba<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let colW = SPEC_W / usize.toF32(COLS)
+  let mut c: usize = 0
+  while c < values.length() {
+    let hz = values.get(c)
+    if hz > 0.0 && hz < TOP_HZ {
+      let x = usize.toF32(c) * colW
+      let y = SPEC_H - hz / TOP_HZ * SPEC_H
+      run list.append(
+        CanvasCommand.FillRect {
+          x: x,
+          y: y - 1.5,
+          width: f32.max(2.0, colW),
+          height: 3.0,
+          radius: 1.5,
+          color: color,
+        },
+      )
+    }
+    c = c + 1
+  }
+}
+
+effect fn drawSpectrogram(model: &mut Vocalis) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, SPEC_W, SPEC_H, heat(0))
+  let colW = SPEC_W / usize.toF32(COLS)
+  let rowH = SPEC_H / usize.toF32(ROWS)
+  let mut c: usize = 0
+  while c < COLS {
+    // Runs of equal level in a column become one rectangle.
+    let mut row: usize = 0
+    while row < ROWS {
+      let level = model.cells.get(c * ROWS + row)
+      let mut end = row + 1
+      while end < ROWS && model.cells.get(c * ROWS + end) == level {
+        end = end + 1
+      }
+      if level > 0 {
+        let top = SPEC_H - usize.toF32(end) * rowH
+        run rect(
+          &mut list,
+          usize.toF32(c) * colW,
+          top,
+          colW + 0.6,
+          usize.toF32(end - row) * rowH + 0.6,
+          heat(level),
+        )
+      }
+      row = end
+    }
+    c = c + 1
+  }
+  // Frequency grid every 500 Hz.
+  let mut hz: f32 = 500.0
+  while hz < TOP_HZ {
+    let y = SPEC_H - hz / TOP_HZ * SPEC_H
+    let alpha = if f32.trunc(hz / 1000.0) * 1000.0 == hz {
+      0.22
+    } else {
+      0.09
+    }
+    run rect(&mut list, 0.0, y, SPEC_W, 1.0, rgba(0xFFFFFF, alpha))
+    hz = hz + 500.0
+  }
+  run dots(&mut list, &model.f1s, rgba(F1C, 0.9))
+  run dots(&mut list, &model.f2s, rgba(F2C, 0.9))
+  run dots(&mut list, &model.f3s, rgba(F3C, 0.9))
+  // The pitch track, and its 2nd and 3rd harmonics faintly, as a voice teacher reads them.
+  run track(&mut list, &model.pitches, rgba(0x000000, 0.6), 5.0)
+  run track(&mut list, &model.pitches, rgb(PITCH), 2.5)
+  model.spectro = move list
+}
+
+/// The current spectrum, frequency upwards so it lines up with the spectrogram's rows.
+effect fn drawSlice(model: &mut Vocalis) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, SLICE_W, SPEC_H, rgb(PANEL))
+  let binHz = SAMPLE_RATE / usize.toF32(dsp.FFT_SIZE)
+  let topBin = f32.toUsize(TOP_HZ / binHz)
+  let mut bin: usize = 1
+  let mut first = true
+  while bin < topBin {
+    let db = model.db.get(bin)
+    let x = f32.max(0.0, f32.min(1.0, (db + 100.0) / 100.0)) * SLICE_W
+    let y = SPEC_H - usize.toF32(bin) * binHz / TOP_HZ * SPEC_H
+    if first {
+      run list.append(CanvasCommand.MoveTo { x: 0.0, y: y })
+      first = false
+    }
+    run list.append(CanvasCommand.LineTo { x: x, y: y })
+    bin = bin + 1
+  }
+  run list.append(CanvasCommand.LineTo { x: 0.0, y: 0.0 })
+  run list.append(CanvasCommand.Close)
+  run list.append(CanvasCommand.Fill { color: rgba(ACCENT, 0.28) })
+  // Markers for the formants.
+  if model.f1 > 0.0 {
+    run rect(&mut list, 0.0, SPEC_H - model.f1 / TOP_HZ * SPEC_H - 1.0, SLICE_W, 2.0, rgb(F1C))
+  }
+  if model.f2 > 0.0 {
+    run rect(&mut list, 0.0, SPEC_H - model.f2 / TOP_HZ * SPEC_H - 1.0, SLICE_W, 2.0, rgb(F2C))
+  }
+  if model.f3 > 0.0 {
+    run rect(&mut list, 0.0, SPEC_H - model.f3 / TOP_HZ * SPEC_H - 1.0, SLICE_W, 2.0, rgb(F3C))
+  }
+  model.slice = move list
+
+  // The loudness meter, -60..0 dB.
+  let mut meter = List<CanvasCommand>.make()
+  run rect(&mut meter, 0.0, 0.0, 200.0, 10.0, rgb(LINE))
+  let fill = f32.max(0.0, f32.min(1.0, (model.level + 60.0) / 60.0)) * 200.0
+  let color = if model.level > -6.0 {
+    rgb(0xFF5D5D)
+  } else {
+    rgb(ACCENT)
+  }
+  run rect(&mut meter, 0.0, 0.0, fill, 10.0, color)
+  model.meter = move meter
+}
+
+effect fn redraw(model: &mut Vocalis) -> () ! OutOfMemoryError ? &mut Allocator {
+  run drawSpectrogram(model)
+  run drawSlice(model)
+}
+
+effect fn say(model: &mut Vocalis, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  model.status = run String.copy(text)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The program
+
+impl Program<Message, Command> for Vocalis {
+  effect fn init() -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut model = Vocalis {
+      source: Source.Demo,
+      paused: false,
+      status: run String.copy("Demo voice: a synthetic singer gliding through a, e, i, o, u"),
+      window: run zeros(dsp.FFT_SIZE),
+      pending: List<f32>.make(),
+      clip: List<f32>.make(),
+      clipAt: 0,
+      demoTime: 0.0,
+      demoPhase: 0.0,
+      windowed: run zeros(dsp.FFT_SIZE),
+      re: run zeros(dsp.FFT_SIZE),
+      im: run zeros(dsp.FFT_SIZE),
+      db: run zeros(dsp.BINS),
+      scratch: run zeros(dsp.FFT_SIZE),
+      formantOut: run zeros(8),
+      cells: run zeroBytes(COLS * ROWS),
+      pitches: run zeros(COLS),
+      f1s: run zeros(COLS),
+      f2s: run zeros(COLS),
+      f3s: run zeros(COLS),
+      pitch: 0.0,
+      level: -100.0,
+      f1: 0.0,
+      f2: 0.0,
+      f3: 0.0,
+      spectro: List<CanvasCommand>.make(),
+      slice: List<CanvasCommand>.make(),
+      meter: List<CanvasCommand>.make(),
+    }
+    run redraw(&mut model)
+    return Next.of(move model)
+  }
+
+  effect fn update(mut model: Vocalis, message: Message) -> Next
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move message {
+      Message.Frame { time } => {
+        drop time
+        if model.paused {
+          return Next.of(move model)
+        }
+        match model.source {
+          Source.Mic => {
+            return run Next.with(move model, Command.Pull)
+          }
+          Source.Demo => {
+            let samples = run synthesize(&mut model, PER_FRAME)
+            if run feed(&mut model, &samples) {
+              run redraw(&mut model)
+            }
+          }
+          Source.File => {
+            let mut samples = List<f32>.make()
+            let mut i: usize = 0
+            while i < PER_FRAME && model.clipAt < model.clip.length() {
+              run samples.append(model.clip.get(model.clipAt))
+              model.clipAt = model.clipAt + 1
+              i = i + 1
+            }
+            if model.clipAt >= model.clip.length() {
+              model.clipAt = 0
+            }
+            if run feed(&mut model, &samples) {
+              run redraw(&mut model)
+            }
+          }
+          Source.Off => {}
+        }
+      }
+      Message.Arrived { samples } => {
+        if run feed(&mut model, &samples) {
+          run redraw(&mut model)
+        }
+      }
+      Message.ClickedMic => {
+        model.source = Source.Mic
+        run say(&mut model, "Starting the microphone…")
+        return run Next.with(move model, Command.StartMic)
+      }
+      Message.MicStarted { ok } => {
+        if ok {
+          run say(&mut model, "Listening to the microphone")
+        } else {
+          model.source = Source.Demo
+          run say(&mut model, "No microphone available (needs parec, arecord or sox); showing the demo voice")
+        }
+      }
+      Message.ClickedDemo => {
+        let wasMic = match model.source {
+          Source.Mic => true,
+          _ => false,
+        }
+        model.source = Source.Demo
+        run say(&mut model, "Demo voice: a synthetic singer gliding through a, e, i, o, u")
+        if wasMic {
+          return run Next.with(move model, Command.StopMic)
+        }
+      }
+      Message.ClickedOpen => {
+        return run Next.with(move model, Command.AskOpen)
+      }
+      Message.ClosedDialog { request, paths } => {
+        let mut chosen = move paths
+        if request != OPENING || chosen.length() == 0 {
+          return Next.of(move model)
+        }
+        let path = chosen.remove(0)
+        run say(&mut model, "Loading…")
+        return run Next.with(move model, Command.Load { path: move path })
+      }
+      Message.LoadedClip { samples } => {
+        if samples.length() == 0 {
+          run say(&mut model, "Could not read that WAV file (16-bit PCM or 32-bit float)")
+        } else {
+          model.clip = move samples
+          model.clipAt = 0
+          model.source = Source.File
+          run say(&mut model, "Playing the file through the analyser (looping)")
+        }
+      }
+      Message.ClickedPause => {
+        model.paused = !model.paused
+      }
+      Message.ClickedClear => {
+        let mut i: usize = 0
+        while i < model.cells.length() {
+          model.cells.set(i, 0)
+          i = i + 1
+        }
+        let mut c: usize = 0
+        while c < COLS {
+          model.pitches.set(c, 0.0)
+          model.f1s.set(c, 0.0)
+          model.f2s.set(c, 0.0)
+          model.f3s.set(c, 0.0)
+          c = c + 1
+        }
+        run redraw(&mut model)
+      }
+      Message.Done => {}
+    }
+    return Next.of(move model)
+  }
+
+  fn view(model: &Vocalis, h: &Document<Message>) -> Node {
+    return h.column(
+      &[
+        h.style(
+          &[
+            css.backgroundColor(rgb(BG)),
+            css.color(rgb(INK)),
+            css.padding(px(18.0)),
+            css.rowGap(px(14.0)),
+            css.flexGrow(1.0),
+          ],
+        ),
+      ],
+      &[
+        toolbar(model, h),
+        h.row(
+          &[h.style(&[css.columnGap(px(14.0)), css.alignItems(Align.Start)])],
+          &[
+            frequencyAxis(h),
+            h.canvas(
+              model.spectro.asSlice(),
+              &[h.style(&[css.width(px(SPEC_W)), css.height(px(SPEC_H)), css.borderRadius(px(6.0))])],
+            ),
+            h.canvas(
+              model.slice.asSlice(),
+              &[h.style(&[css.width(px(SLICE_W)), css.height(px(SPEC_H))])],
+            ),
+          ],
+        ),
+        readouts(model, h),
+        h.row(
+          &[h.style(&[css.color(rgb(MUTED)), css.fontSize(px(12.0))])],
+          &[h.text(String.view(&model.status))],
+        ),
+      ],
+    )
+  }
+
+  fn subscriptions(model: &Vocalis, subs: &mut Subscriptions<Message>) -> () {
+    if !model.paused {
+      subs.animationFrame(1, |time| Message.Frame { time: time })
+    }
+    subs.files(2, |request, paths| Message.ClosedDialog { request: request, paths: move paths })
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// View pieces
+
+fn button(h: &Document<Message>, label: string, message: Message, on: bool) -> Node {
+  let fill = if on {
+    rgb(ACCENT)
+  } else {
+    rgb(PANEL)
+  }
+  let ink = if on {
+    rgb(BG)
+  } else {
+    rgb(INK)
+  }
+  return h.button(
+    &[
+      h.onClick(move message),
+      h.style(
+        &[
+          css.paddingTop(px(7.0)),
+          css.paddingBottom(px(7.0)),
+          css.paddingLeft(px(16.0)),
+          css.paddingRight(px(16.0)),
+          css.borderWidth(px(1.0)),
+          css.borderStyle(BorderStyle.Solid),
+          css.borderColor(rgb(LINE)),
+          css.borderRadius(px(8.0)),
+          css.backgroundColor(fill),
+          css.color(ink),
+        ],
+      ),
+      h.hover(&[css.borderColor(rgb(ACCENT))]),
+    ],
+    &[h.text(label)],
+  )
+}
+
+fn isSource(model: &Vocalis, which: u32) -> bool {
+  return match model.source {
+    Source.Off => which == 0,
+    Source.Mic => which == 1,
+    Source.Demo => which == 2,
+    Source.File => which == 3,
+  }
+}
+
+fn toolbar(model: &Vocalis, h: &Document<Message>) -> Node {
+  return h.row(
+    &[h.style(&[css.columnGap(px(10.0)), css.alignItems(Align.Center)])],
+    &[
+      h.row(
+        &[h.style(&[css.fontSize(px(20.0)), css.fontWeight(700.0), css.minWidth(px(150.0))])],
+        &[h.text("Vocalis")],
+      ),
+      button(h, "Microphone", Message.ClickedMic, isSource(model, 1)),
+      button(h, "Demo voice", Message.ClickedDemo, isSource(model, 2)),
+      button(h, "Open WAV…", Message.ClickedOpen, isSource(model, 3)),
+      button(
+        h,
+        if model.paused {
+          "Resume"
+        } else {
+          "Pause"
+        },
+        Message.ClickedPause,
+        model.paused,
+      ),
+      button(h, "Clear", Message.ClickedClear, false),
+    ],
+  )
+}
+
+fn frequencyAxis(h: &Document<Message>) -> Node {
+  // Labels at 5, 4, 3, 2, 1 kHz, spaced to match the canvas.
+  let step = SPEC_H / 5.0
+  return h.column(
+    &[h.style(&[css.height(px(SPEC_H)), css.width(px(44.0)), css.fontSize(px(11.0)), css.color(rgb(MUTED))])],
+    &[
+      h.row(&[h.style(&[css.height(px(step))])], &[h.text("5 kHz")]),
+      h.row(&[h.style(&[css.height(px(step))])], &[h.text("4 kHz")]),
+      h.row(&[h.style(&[css.height(px(step))])], &[h.text("3 kHz")]),
+      h.row(&[h.style(&[css.height(px(step))])], &[h.text("2 kHz")]),
+      h.row(&[h.style(&[css.height(px(step))])], &[h.text("1 kHz")]),
+    ],
+  )
+}
+
+fn noteName(index: i64) -> string {
+  let names: [string; 12] = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
+  return names[i64.toUsize(((index % 12) + 12) % 12)]
+}
+
+fn stat(h: &Document<Message>, label: string, value: Node, color: Rgba<f32>) -> Node {
+  return h.column(
+    &[
+      h.style(
+        &[
+          css.backgroundColor(rgb(PANEL)),
+          css.borderRadius(px(8.0)),
+          css.padding(px(12.0)),
+          css.minWidth(px(120.0)),
+          css.rowGap(px(4.0)),
+        ],
+      ),
+    ],
+    &[
+      h.row(&[h.style(&[css.fontSize(px(11.0)), css.color(rgb(MUTED))])], &[h.text(label)]),
+      h.row(
+        &[h.style(&[css.fontSize(px(24.0)), css.fontWeight(600.0), css.color(color), css.columnGap(px(4.0))])],
+        &[value],
+      ),
+    ],
+  )
+}
+
+fn hertz(h: &Document<Message>, hz: f32) -> Node {
+  if hz <= 0.0 {
+    return h.text("—")
+  }
+  return h.row(&[], &[h.number(f32.toI64(f32.round(hz))), h.text(" Hz")])
+}
+
+fn readouts(model: &Vocalis, h: &Document<Message>) -> Node {
+  let mut note = h.text("—")
+  if model.pitch > 0.0 {
+    let midi = dsp.midiOf(model.pitch)
+    let nearest = f32.toI64(f32.round(midi))
+    let cents = f32.toI64(f32.round((midi - i64.toF32(nearest)) * 100.0))
+    note = h.row(
+      &[],
+      &[
+        h.text(noteName(nearest)),
+        h.number(nearest / 12 - 1),
+        h.text(if cents >= 0 { " +" } else { " " }),
+        h.number(cents),
+        h.text("¢"),
+      ],
+    )
+  }
+  return h.row(
+    &[h.style(&[css.columnGap(px(12.0)), css.alignItems(Align.Center)])],
+    &[
+      stat(h, "PITCH", hertz(h, model.pitch), rgb(PITCH)),
+      stat(h, "NOTE", note, rgb(PITCH)),
+      stat(h, "F1", hertz(h, model.f1), rgb(F1C)),
+      stat(h, "F2", hertz(h, model.f2), rgb(F2C)),
+      stat(h, "F3", hertz(h, model.f3), rgb(F3C)),
+      h.column(
+        &[h.style(&[css.rowGap(px(6.0)), css.padding(px(12.0))])],
+        &[
+          h.row(
+            &[h.style(&[css.fontSize(px(11.0)), css.color(rgb(MUTED)), css.columnGap(px(4.0))])],
+            &[h.text("LEVEL"), h.number(f32.toI64(f32.round(model.level))), h.text("dBFS")],
+          ),
+          h.canvas(model.meter.asSlice(), &[h.style(&[css.width(px(200.0)), css.height(px(10.0))])]),
+        ],
+      ),
+    ],
+  )
+}

@@ -1,0 +1,230 @@
+//! Vocalis in a native window. The window provides the `Shell` the program's commands ask
+//! for, and this file provides the `Sound`: the machine's microphone and WAV files.
+import vocalis { Command, Message, Vocalis }
+import source { Sound }
+import loom.lib { Shell }
+import loom_window.program { Launched, Window, failed, launch, show, systemFonts }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+
+/// The rate every source delivers, as `source.SAMPLE_RATE`.
+const TARGET_RATE: f32 = 44100.0
+
+/// The machine's microphone and files.
+struct MachineSound {
+  system: MachineFileSystem,
+  recording: bool,
+}
+
+/// The little-endian `u16` at `at`.
+fn le16(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at]) | u32.shiftLeft(u8.toU32(data[at + 1]), 8)
+}
+
+/// The little-endian `u32` at `at`.
+fn le32(data: &[u8], at: usize) -> u32 {
+  return u8.toU32(data[at])
+    | u32.shiftLeft(u8.toU32(data[at + 1]), 8)
+    | u32.shiftLeft(u8.toU32(data[at + 2]), 16)
+    | u32.shiftLeft(u8.toU32(data[at + 3]), 24)
+}
+
+/// Whether the four bytes at `at` spell `a b c d`.
+fn tagIs(data: &[u8], at: usize, a: u8, b: u8, c: u8, d: u8) -> bool {
+  return data[at] == a && data[at + 1] == b && data[at + 2] == c && data[at + 3] == d
+}
+
+/// One sample of `data` at `at`, in [-1, 1]: 16-bit PCM (format 1) or 32-bit float (format 3).
+fn sampleAt(data: &[u8], at: usize, format: u32) -> f32 {
+  if format == 3 {
+    return f32.fromBits(le32(data, at))
+  }
+  let raw = le16(data, at)
+  let signed = if raw >= 32768 {
+    u32.toF32(raw) - 65536.0
+  } else {
+    u32.toF32(raw)
+  }
+  return signed / 32768.0
+}
+
+/// The samples of a RIFF/WAVE file, mixed to mono and resampled to `TARGET_RATE`; empty when
+/// the file is not one this reads.
+effect fn decodeWav(data: &[u8]) -> List<f32>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = List<f32>.make()
+  if data.length < 12 {
+    return move out
+  }
+  if !tagIs(data, 0, 82, 73, 70, 70) || !tagIs(data, 8, 87, 65, 86, 69) {
+    return move out
+  }
+  // Walk the chunks for "fmt " and "data".
+  let mut format: u32 = 0
+  let mut channels: u32 = 0
+  let mut rate: u32 = 0
+  let mut bits: u32 = 0
+  let mut haveFormat = false
+  let mut dataStart: usize = 0
+  let mut dataLength: usize = 0
+  let mut haveData = false
+  let mut at: usize = 12
+  while at + 8 <= data.length && !haveData {
+    let size = u32.toUsize(le32(data, at + 4))
+    let body = at + 8
+    if tagIs(data, at, 102, 109, 116, 32) && body + 16 <= data.length {
+      format = le16(data, body)
+      channels = le16(data, body + 2)
+      rate = le32(data, body + 4)
+      bits = le16(data, body + 14)
+      // WAVE_FORMAT_EXTENSIBLE carries the real format in its sub-format GUID.
+      if format == 65534 && body + 26 <= data.length {
+        format = le16(data, body + 24)
+      }
+      haveFormat = true
+    }
+    if tagIs(data, at, 100, 97, 116, 97) {
+      dataStart = body
+      dataLength = if body + size > data.length {
+        data.length - body
+      } else {
+        size
+      }
+      haveData = true
+    }
+    at = body + size + size % 2
+  }
+  if !haveFormat || !haveData || channels == 0 || rate == 0 {
+    return move out
+  }
+  let supported = (format == 1 && bits == 16) || (format == 3 && bits == 32)
+  if !supported {
+    return move out
+  }
+  let width = u32.toUsize(bits / 8)
+  let channelCount = u32.toUsize(channels)
+  let frameSize = width * channelCount
+  let frames = dataLength / frameSize
+  if frames == 0 {
+    return move out
+  }
+  // Mix every frame down to one sample.
+  let mut mono = List<f32>.make()
+  let mut frame: usize = 0
+  while frame < frames {
+    let start = dataStart + frame * frameSize
+    let mut sum: f32 = 0.0
+    let mut c: usize = 0
+    while c < channelCount {
+      sum = sum + sampleAt(data, start + c * width, format)
+      c = c + 1
+    }
+    run mono.append(sum / usize.toF32(channelCount))
+    frame = frame + 1
+  }
+  // Resample linearly to the target rate.
+  let mixed = mono.asSlice()
+  let step = u32.toF32(rate) / TARGET_RATE
+  let count = f32.toUsize(usize.toF32(frames) / step)
+  let mut i: usize = 0
+  while i < count {
+    let position = usize.toF32(i) * step
+    let left = f32.toUsize(position)
+    if left + 1 < frames {
+      let t = position - usize.toF32(left)
+      run out.append(mixed[left] + (mixed[left + 1] - mixed[left]) * t)
+    } else if left < frames {
+      run out.append(mixed[left])
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+impl MachineSound {
+  effect fn load(self: &mut Self, path: string) -> List<f32>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let place = run Path.make(path)
+    let bytes = run FileSystem.readFile(&place) |> Effect.provideMut<FileSystem>(&mut self.system)
+    return run decodeWav(Bytes.asSlice(&bytes))
+  }
+}
+
+effect fn unread(error: FileError) -> List<f32> {
+  drop error
+  return List<f32>.make()
+}
+
+/// A command cannot fail, so a file that cannot be read is no samples, not an error.
+///
+/// The microphone is not wired up yet: the standard library has no way to spawn a recorder
+/// process and read its output without blocking, so `startMic` answers that it did not start.
+impl Sound for MachineSound {
+  effect fn startMic(self: &mut Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.recording = false
+    return false
+  }
+
+  effect fn stopMic(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.recording = false
+  }
+
+  effect fn readMic(self: &mut Self) -> List<f32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return List<f32>.make()
+  }
+
+  effect fn loadWav(self: &mut Self, path: string) -> List<f32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run Effect.catch<FileError>(self.load(path), unread)
+  }
+}
+
+effect fn vocalisApp(platform: Option<Launched>) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut window = run Window.make("Vocalis", 1180.0, 760.0)
+
+  // The shell of this window: its title, menu, dialogs and clipboard.
+  let mut shell = window.shell()
+  let mut machine = MachineSound { system: run MachineFileSystem.make(), recording: false }
+  let fonts = run systemFonts()
+  return run show<Vocalis, Message, Command, &mut Shell | &mut Sound | &mut Allocator>(
+    move window,
+    &fonts,
+    move platform,
+  )
+    |> Effect.provideMut<Shell>(&mut shell)
+    |> Effect.provideMut<Sound>(&mut machine)
+}
+
+fn app(platform: Option<Launched>) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(vocalisApp(move platform), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+pub fn main() -> i32 {
+  return launch(
+    fn(platform: Option<Launched>) -> i32 {
+      return app(move platform)
+    },
+  )
+}
