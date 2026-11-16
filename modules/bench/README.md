@@ -124,3 +124,28 @@ invalidation. Local class and hover changes currently repeat work across all row
 do not meet the target of similar per-frame cost to inline styles. The 5,000-row theme case
 contains 10,000 row/text nodes; instruction counts alone do not establish a 16 ms frame budget.
 Creation does not subtract idle because idle includes a separate initial frame.
+
+### Cascade-result cache
+
+SilkUI `8ed26e07` adds a cache of up to 128 repeated cascade results per root style pass.
+Keys compare candidate identities and priorities, inline declarations, variable scope and parent.
+Hits skip variable substitution and declaration resolution; each node still matches selectors and
+receives its own declarations. Starting-style resolution and inspector overrides bypass the cache.
+The cache resets with variable scopes. This does not yet share per-node storage or prune restyles.
+
+The same optimized benchmark and toolchain produce these counts:
+
+| Rows | Operation | Inline total | Cached Tailwind total | Inline minus idle | Cached Tailwind minus idle | Reduction in Tailwind update |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | create | 80,938,152 | 135,848,496 | — | — | — |
+| 1,000 | idle | 82,732,956 | 137,649,368 | — | — | — |
+| 1,000 | change_class | 86,567,985 | 203,687,217 | 3,835,029 | 66,037,849 | 68.5% |
+| 1,000 | hover | 83,991,594 | 200,837,283 | 1,258,638 | 63,187,915 | 69.2% |
+| 1,000 | theme | 93,186,788 | 208,470,787 | 10,453,832 | 70,821,419 | 69.9% |
+| 5,000 | idle | 394,659,840 | 662,360,199 | — | — | — |
+| 5,000 | theme | 446,501,891 | 1,014,881,073 | 51,842,051 | 352,520,874 | 70.0% |
+
+The style-object controls are 457,658,860 (-0.05% from the original) and 120,512,286 (+0.04% from the original),
+respectively. Local stylesheet updates still cost substantially more than inline updates.
+The next performance work is sharing variable scopes and resolved storage, plus dependency-based
+invalidation; these numbers do not establish a frame-time budget.
