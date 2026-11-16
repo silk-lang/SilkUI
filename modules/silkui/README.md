@@ -102,7 +102,8 @@ JavaScript release builds also pick up `dist/app.sheet` from `@silkui/vite`, val
 format, and embed it after the explicitly configured CSS files.
 
 A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
-CSS to the configured path. Custom hosts adopt their compiled sheets directly. On `window`,
+CSS to the configured path. The optional [`ui-tailwind` package](../tailwind) supplies a
+project CLI or checksum-pinned standalone CLI, with build and watch steps. Custom hosts adopt their compiled sheets directly. On `window`,
 `web-canvas`, and `web-dom`, `dev` replaces changed stylesheets without restarting the application or
 resetting its state. Native hosts validate an atomically published set of compiled sheets
 before updating their application roots. A missing or invalid update leaves the active styles
