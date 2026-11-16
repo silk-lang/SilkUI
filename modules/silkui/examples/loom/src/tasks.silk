@@ -2,7 +2,8 @@
 //! src/ changes (`--target web-canvas` or `web-dom` serves it as a page that reloads instead);
 //! `silk task build` writes the release program to dist/window/ and the pages to
 //! dist/web-canvas/ and dist/web-dom/.
-import silkui.app { App, Framework, Target, Window, Page, Mode, Built, Running }
+import silkui.app { App, Framework, Target, Window, Page, Built, Running }
+import silk.build.graph { Options, BuildError }
 import silk.cli.command { Command, CommandLine, Opt }
 import silk.cli.task { Task, TaskError, TaskSet }
 import silk.io.writer { WriterError }
@@ -12,7 +13,9 @@ import silk.system.filesystem { FileError, FileSystem }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.text.string { String }
 
-effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
+effect fn app() -> App
+  ! OutOfMemoryError
+  ? &mut Allocator {
   return run App.make("loom-counter")
     |> App.framework(Framework.loom("app"))
     |> App.target(Target.window(Window { title: "Counter", width: 420.0, height: 200.0 }))
@@ -21,8 +24,9 @@ effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
 }
 
 union Tasks {
-  Dev { pub target: String },
-  Build { pub target: String },
+  Dev { pub platform: String, pub options: Options },
+  Build { pub platform: String, pub options: Options },
+  Plan { pub platform: String, pub options: Options },
 }
 
 impl CommandLine for Tasks {
@@ -30,27 +34,45 @@ impl CommandLine for Tasks {
     return Command<Tasks>.make("tasks", "Build and run the app")
       |> Command.variant("Dev", "Open the app with the development tools, rebuilding on change")
       |> Command.variant("Build", "Write the release programs to dist/<target>/")
-      |> Command.option("target", Opt.about("Only this target (window, web-canvas, web-dom)"))
+      |> Command.flatten("options")
+      |> Command.variant("Plan", "Write the editor compilation requests")
+      |> Command.option("platform", Opt.about("Only this target (window, web-canvas, web-dom)"))
   }
 }
 
 impl TaskSet for Tasks {
   effect fn perform(self: Tasks) -> ()
-    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ! BuildError
+      | TaskError
+      | ProcessError
+      | FileError
+      | HostInputError
+      | OutOfMemoryError
+      | WriterError
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
     match move self {
-      Tasks.Dev { target } => run app()
-        |> App.only(String.view(&target))
-        |> App.build(Mode.Dev)
+      Tasks.Dev { platform, options } => run app()
+        |> App.only(String.view(&platform))
+        |> App.build(&options)
         |> Built.launch()
         |> Running.watch()
-      Tasks.Build { target } => run app()
-        |> App.only(String.view(&target))
-        |> App.build(Mode.Release)
+      Tasks.Build { platform, options } => run app()
+        |> App.only(String.view(&platform))
+        |> App.build(&options)
         |> Built.tap(Built.sizes)
         |> Built.write("dist")
+      Tasks.Plan { platform, options } => {
+        let configured = run app() |> App.only(platform.view())
+        let graph = run configured.compilations(&options)
+        drop run graph.write()
+      }
     }
   }
 }
 
-pub effect fn main() -> i32 ? &mut HostInput { return run Task.main<Tasks>() }
+pub const COMMANDS: string = Task.commands<Tasks>()
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  return run Task.main<Tasks>()
+}
