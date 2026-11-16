@@ -73,6 +73,7 @@ import style { Computed, TextStyle, NO_SHADOW }
 import paint_css { Effects }
 import paint_css
 import font_units
+import font_units { Source as FontSource }
 import motion
 import motion { Running }
 import animation
@@ -1101,10 +1102,18 @@ impl<'a> UiTree<'a> {
     return &self.nodes.asSlice()[u32.toUsize(slot)]
   }
 
-  /// Says that the style inputs of the node at `slot` changed (its declarations, its
-  /// parent, its hover, press or focus state): the next resolve restyles it, and its
-  /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
-  /// finds it from the root.
+  effect fn richDeclarations(self: &mut Self, declarations: List<Declaration>) -> List<Declaration>
+    ! OutOfMemoryError ? &mut Allocator {
+    let expanded = match move run expand.prepared(declarations.asSlice()) {
+      Option.Some { value } => move value
+      Option.None => move declarations
+    }
+    return match move run self.namedFamilies(expanded.asSlice()) {
+      Option.Some { value } => move value
+      Option.None => move expanded
+    }
+  }
+
   /// `declared` with each `font-family` written as CSS text (`Inter, sans-serif`) turned into
   /// the family list id the computed style reads, or None when none is written so.
   effect fn namedFamilies(self: &mut Self, declared: &[Declaration]) -> Option<List<Declaration>>
@@ -1527,11 +1536,13 @@ impl<'a> UiTree<'a> {
       }
       Mutation.DefineMark { id, mark, declarations } => {
         let slot = run self.requireInput(index, id)
-        run edit.defineStyle(&mut self, slot, false, mark, move declarations)
+        let prepared = run self.richDeclarations(move declarations)
+        run edit.defineStyle(&mut self, slot, false, mark, move prepared)
       }
       Mutation.DefineAtom { id, kind, declarations } => {
         let slot = run self.requireInput(index, id)
-        run edit.defineStyle(&mut self, slot, true, kind, move declarations)
+        let prepared = run self.richDeclarations(move declarations)
+        run edit.defineStyle(&mut self, slot, true, kind, move prepared)
       }
       Mutation.Format { id, mark, on } => {
         let slot = run self.requireInput(index, id)
@@ -4258,6 +4269,50 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  effect fn applyNodeLengths(self: &Self, slot: u32, computed: &mut Computed, parentStyle: &Computed,
+    stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
+    let node = self.node(slot)
+    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+      run applyUsing(&mut computed.*, &value.declarations, parentStyle, &mut stops.*, units)
+    } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
+      run applyUsing(&mut computed.*, &node.base, parentStyle, &mut stops.*, units)
+      if node.hovered {
+        run applyUsing(&mut computed.*, &node.hover, parentStyle, &mut stops.*, units)
+      }
+      if node.pressed {
+        run applyUsing(&mut computed.*, &node.active, parentStyle, &mut stops.*, units)
+      }
+      if self.focused == slot {
+        run applyUsing(&mut computed.*, &node.focus, parentStyle, &mut stops.*, units)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          run applyUsing(&mut computed.*, &node.focusVisible, parentStyle, &mut stops.*, units)
+        }
+      }
+    } else if node.kind != NodeKind.Text {
+      run self.applyOverridden(&mut computed.*, node.id, StyleState.Base, &node.base, &mut stops.*, parentStyle, units)
+      if node.hovered {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Hover, &node.hover, &mut stops.*, parentStyle, units)
+      }
+      if node.pressed {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Active, &node.active, &mut stops.*, parentStyle, units)
+      }
+      if self.focused == slot {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Focus, &node.focus, &mut stops.*, parentStyle, units)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          run self.applyOverridden(
+            &mut computed.*,
+            node.id,
+            StyleState.FocusVisible,
+            &node.focusVisible,
+            &mut stops.*,
+            parentStyle,
+            units,
+          )
+        }
+      }
+    }
+  }
+
   effect fn resolve(self: &mut Self, slot: u32) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
@@ -4304,48 +4359,10 @@ impl<'a> UiTree<'a> {
       computed.outline.auto = true
       computed.outline.width = FOCUS_RING_WIDTH
     }
-    let units = run font_units.prepare(&mut self, slot, &mut computed, false)
+    let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
     let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
     let node = self.node(slot)
-    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      run applyUsing(&mut computed, &value.declarations, &parentStyle, &mut stops, &units)
-    } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
-      run applyUsing(&mut computed, &node.base, &parentStyle, &mut stops, &units)
-      if node.hovered {
-        run applyUsing(&mut computed, &node.hover, &parentStyle, &mut stops, &units)
-      }
-      if node.pressed {
-        run applyUsing(&mut computed, &node.active, &parentStyle, &mut stops, &units)
-      }
-      if self.focused == slot {
-        run applyUsing(&mut computed, &node.focus, &parentStyle, &mut stops, &units)
-        if self.focusVisible || node.kind == NodeKind.Input {
-          run applyUsing(&mut computed, &node.focusVisible, &parentStyle, &mut stops, &units)
-        }
-      }
-    } else if node.kind != NodeKind.Text {
-      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base, &mut stops, &parentStyle, &units)
-      if node.hovered {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover, &mut stops, &parentStyle, &units)
-      }
-      if node.pressed {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active, &mut stops, &parentStyle, &units)
-      }
-      if self.focused == slot {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus, &mut stops, &parentStyle, &units)
-        if self.focusVisible || node.kind == NodeKind.Input {
-          run self.applyOverridden(
-            &mut computed,
-            node.id,
-            StyleState.FocusVisible,
-            &node.focusVisible,
-            &mut stops,
-            &parentStyle,
-            &units,
-          )
-        }
-      }
-    }
+    run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let animationUnits = animation.relativeUnits(&self, slot, &computed.animation, &stops)
     if animationUnits & 2 != 0 && !computed.usesContainer {
@@ -4357,39 +4374,60 @@ impl<'a> UiTree<'a> {
     let kind = node.kind
     if node.generatedSuppressed { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
-    let motionNode = self.node(slot)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
     if kind != NodeKind.Text {
       let mut before = style_change.before(&self, slot)
       let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
-      let mut sheetStarting = false
-      if !hasBefore && rendered {
-        if let Option<&Resolved>.Some { value } = motionNode.sheetStyle() {
-          if let Option<List<Declaration>>.Some { value: start } = &value.starting {
-            let parentStyle = style_sheets.parentStyle(&self, slot)
-            before = computed
-            run applyResolved(&mut before, &start, &parentStyle, &mut stops)
-            sheetStarting = true
-            hasBefore = true
+      let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
+      if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
+        before = computed
+        let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
+        run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
+        if sheetStarting {
+          if let Option.Some { value } = self.node(slot).sheetStyle() {
+            if let Option.Some { value: start } = &value.starting {
+              run applyUsing(&mut before, &start, &parentStyle, &mut stops, &startUnits)
+            }
           }
+        } else {
+          run applyUsing(&mut before, &self.node(slot).starting, &parentStyle, &mut stops, &startUnits)
         }
-        if !sheetStarting && motionNode.starting.length() != 0 {
-          before = computed
-          run applyAll(&mut before, &motionNode.starting, &mut stops)
-          hasBefore = true
-        }
+        hasBefore = true
       }
       self.easingStops = move stops
+      let underlyingFontSize = computed.text.size
       let animated = run animation.update(&mut self, slot, rendered, &computed)
       if self.node(slot).generatedSuppressed { run motion.cancelAll(&mut self, slot) }
       else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
+      if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
+        let fontUnits = run font_units.inherited(&mut self, slot, &computed)
+        run animation.apply(&self, slot, &mut computed, &fontUnits, true)
+      }
+      if computed.text.size != underlyingFontSize {
+        let moving = computed
+        let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
+        let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
+        run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
+        self.easingStops = move currentStops
+        let transitions = self.transitions.asSlice()
+        let mut i: usize = 0
+        while i < transitions.length {
+          let item = transitions[i]
+          if item.slot == slot && item.id == self.node(slot).id {
+            motion.write(&mut computed, item.field, motion.sample(&moving, item.field))
+          }
+          i = i + 1
+        }
+      }
       if animated != 0 {
-        run animation.apply(&self, slot, &mut computed)
+        let key = run self.fontKeyOf(computed.text)
+        let currentUnits = font_units.context(&self, slot, &computed, key)
+        run animation.apply(&self, slot, &mut computed, &currentUnits, false)
       }
     }
     if kind != NodeKind.Text && !self.node(slot).isGenerated() && self.overrides.length() != 0 {
-      let finalUnits = run font_units.prepare(&mut self, slot, &mut computed, true)
+      let finalUnits = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Overrides)
       let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
       let node = self.node(slot)
       if let Option<&Resolved>.Some { value } = node.sheetStyle() {

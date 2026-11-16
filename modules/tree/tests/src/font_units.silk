@@ -1,4 +1,4 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Keyframe, MarkSpan, Atom }
 import ui_tree.inspect
 import ui_fixtures.fixtures as fixtures
 import svg_css.compile { CompileError, Options }
@@ -7,6 +7,7 @@ import svg_css.written
 import svg_css.tokens { CssError }
 import svg_css.effect_values { Filter, Size as LayerSize }
 import silk.core.option { Option }
+import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
@@ -159,4 +160,203 @@ test effect fn fontMetricsDriveLengthsTransformsGridAndPaintThroughRootChanges()
   let mut allocator = Allocator.systemAllocatorProvider()
   run measuredUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run measuredUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+
+fn fontMoment(time: f64) -> FrameInput {
+  return FrameInput { width: 500.0, height: 400.0, scale: 1.0, time: time }
+}
+
+effect fn defineFontFrames(batch: &mut Batch, name: string, from: &[u8], to: &[u8])
+  ! CssError | OutOfMemoryError ? &mut Allocator {
+  let mut frames = List<Keyframe>.make()
+  run frames.append(Keyframe { offset: 0.0, declarations: run written.declarations(from) })
+  run frames.append(Keyframe { offset: 1.0, declarations: run written.declarations(to) })
+  run batch.keyframes(name, move frames)
+}
+
+effect fn animatedUnits(sheet: bool) ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"font-family:'Noto Sans';font-size:10px;line-height:20px")
+  run batch.style(1, root.asSlice())
+  let names = ["sample both", "sample font", "sample relative", "sample metric", "sample stacked"]
+  let animations = [b"animation:grow 1s linear forwards", b"animation:font 1s linear forwards", b"animation:relative 1s linear forwards", b"animation:metric 1s linear forwards", b"animation:grow 1s linear forwards,overlay 1s linear forwards"]
+  let common = run written.declarations(b"font-size:20px;line-height:2em;width:2em;height:1lh;padding-right:1ch")
+  let mut i: usize = 0
+  while i < 5 {
+    let id = usize.toU32(i) + 2
+    run batch.create(id, NodeKind.Box)
+    run batch.append(1, id)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy(names[i]) })
+    if !sheet {
+      run batch.style(id, common.asSlice())
+      let animated = run written.declarations(animations[i])
+      run batch.style(id, animated.asSlice())
+    }
+    i = i + 1
+  }
+  if sheet {
+    let compiled = run compile.compile(b".sample{font-size:20px;line-height:2em;width:2em;height:1lh;padding-right:1ch}.both{animation:grow 1s linear forwards}.font{animation:font 1s linear forwards}.relative{animation:relative 1s linear forwards}.metric{animation:metric 1s linear forwards}.stacked{animation:grow 1s linear forwards,overlay 1s linear forwards}@keyframes grow{from{font-size:10px;width:1em;translate:1em 0px;opacity:0}to{font-size:20px;width:2em;translate:2em 0px;opacity:1}}@keyframes font{from{font-size:10px}to{font-size:20px}}@keyframes relative{from{font-size:2em}to{font-size:3em}}@keyframes metric{from{width:1ch}to{width:2ch}}@keyframes overlay{to{font-size:40px;width:4em;opacity:.8}}", &Options.make())
+    let bytes = run compiled.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  } else {
+    run defineFontFrames(&mut batch, "grow", b"font-size:10px;width:1em;translate:1em 0px;opacity:0", b"font-size:20px;width:2em;translate:2em 0px;opacity:1")
+    run defineFontFrames(&mut batch, "font", b"font-size:10px", b"font-size:20px")
+    run defineFontFrames(&mut batch, "relative", b"font-size:2em", b"font-size:3em")
+    run defineFontFrames(&mut batch, "metric", b"width:1ch", b"width:2ch")
+    run defineFontFrames(&mut batch, "overlay", b"", b"font-size:40px;width:4em;opacity:.8")
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.0))
+  run tree.frame(fontMoment(0.5))
+  let both = tree.node(tree.slotOf(2)).computed
+  let font = tree.node(tree.slotOf(3)).computed
+  let relative = tree.node(tree.slotOf(4)).computed
+  let metric = tree.node(tree.slotOf(5)).computed
+  run Testing.expect(close(both.text.size, 15.0) && close(both.layout.width.value, 22.5)
+    && close(both.transform.translate.x, 22.5) && close(both.paint.opacity, 0.5), "keyframe lengths use the current animated font before interpolation without resetting other animations")
+  run Testing.expect(close(font.text.size, 15.0) && close(font.layout.width.value, 30.0)
+    && close(font.layout.height.value, 30.0) && close(font.layout.padding.right.value, 8.58), "unanimated lengths and line height track the current animated font")
+  run Testing.expect(close(relative.text.size, 25.0) && close(relative.layout.width.value, 50.0), "relative font-size keyframes resolve against the parent font")
+  run Testing.expect(close(metric.layout.width.value, 17.16), "keyframes without font-size animation still use measured font units")
+  let stacked = tree.node(tree.slotOf(6)).computed
+  run Testing.expect(close(stacked.text.size, 27.5) && close(stacked.layout.width.value, 75.625)
+    && close(stacked.paint.opacity, 0.65), "implicit keyframe endpoints use earlier animations as their underlying values")
+  let resized = run written.declarations(b"font-size:20px")
+  run batch.style(1, resized.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.5))
+  let enlarged = tree.node(tree.slotOf(4)).computed
+  run Testing.expect(close(enlarged.text.size, 50.0) && close(enlarged.layout.width.value, 100.0), "parent font changes recompute keyframe endpoints without restarting the animation")
+  let family = run written.declarations(b"font-family:'Geist Mono'")
+  run batch.style(1, family.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.5))
+  run Testing.expect(close(tree.node(tree.slotOf(5)).computed.layout.width.value, 18.0)
+    && close(tree.node(tree.slotOf(3)).computed.layout.padding.right.value, 9.0), "font replacement updates both animated and unanimated metric lengths at the same animation time")
+}
+
+effect fn startingFontUnits(sheet: bool) ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"font-family:'Noto Sans';font-size:10px;line-height:20px")
+  run batch.style(1, root.asSlice())
+  let base = run written.declarations(b"font-size:20px;line-height:2em;width:2ch;height:1lh;padding-right:1ch;transition:font-size 1s linear,width 1s linear")
+  let start = run written.declarations(b"font-size:1em;font-family:'Geist Mono'")
+  let mut id: u32 = 2
+  while id < 4 {
+    run batch.create(id, NodeKind.Box)
+    run batch.append(1, id)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy(if id == 2 { "sample" } else { "sample only-font" }) })
+    if !sheet {
+      run batch.style(id, base.asSlice())
+      run batch.styleFor(id, StyleState.Starting, start.asSlice())
+      if id == 3 {
+        let onlyFont = run written.declarations(b"transition:font-size 1s linear")
+        run batch.style(id, onlyFont.asSlice())
+      }
+    }
+    id = id + 1
+  }
+  if sheet {
+    let compiled = run compile.compile(b".sample{font-size:20px;line-height:2em;width:2ch;height:1lh;padding-right:1ch;transition:font-size 1s linear,width 1s linear}.only-font{transition:font-size 1s linear}@starting-style{.sample{font-size:1em;font-family:'Geist Mono'}}", &Options.make())
+    let bytes = run compiled.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.0))
+  let first = tree.node(tree.slotOf(2)).computed
+  run Testing.expect(close(first.text.size, 10.0) && close(first.layout.width.value, 12.0), "starting styles compute their own font family and parent-relative size before transition endpoints")
+  run tree.frame(fontMoment(0.5))
+  let both = tree.node(tree.slotOf(2)).computed
+  let font = tree.node(tree.slotOf(3)).computed
+  run Testing.expect(close(both.text.size, 15.0) && close(both.layout.width.value, 17.44)
+    && close(both.layout.height.value, 30.0), "font-dependent recomputation preserves independently transitioning lengths")
+  run Testing.expect(close(font.text.size, 15.0) && close(font.layout.width.value, 17.16)
+    && close(font.layout.height.value, 30.0) && close(font.layout.padding.right.value, 8.58), "unanimated lengths follow a font-size transition using the target font family")
+}
+
+test effect fn animatedFontSizeControlsKeyframeAndUnderlyingLengths() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run animatedUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run animatedUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn startingFontsResolveBeforeTransitionEndpoints() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run startingFontUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run startingFontUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+
+effect fn richMetrics(tree: &UiTree<'_>, input: u32, size: f32, line: f32, root: f32) ! AssertionError<'static> {
+  let runs = tree.node(tree.slotOf(input)).edit().runs.asSlice()
+  let mut found: u32 = 0
+  let mut i: usize = 0
+  while i < runs.length {
+    let r = runs[i]
+    let c = r.computed
+    if r.atom {
+      let own = size * 0.572 * 2.0
+      run Testing.expect(close(c.text.size, own) && close(c.layout.width.value, own)
+        && close(c.layout.height.value, line) && close(c.layout.padding.right.value, own * 0.6)
+        && close(c.layout.margin.left.value, root), "rich atoms use parent font-size metrics, their selected own font, and the actual root")
+      found = found + 1
+    } else if !r.filler && r.start < 2 {
+      let multiple: f32 = if r.start == 0 { 2.0 } else { 3.0 }
+      let own = size * multiple
+      let ch: f32 = if r.start == 0 { 0.572 } else { 0.6 }
+      let lineMultiple: f32 = if r.start == 0 { 1.0 } else { 2.0 }
+      let height = line * lineMultiple
+      run Testing.expect(close(c.text.size, own) && close(c.layout.padding.right.value, own * ch)
+        && close(c.layout.height.value, height) && close(c.layout.width.value, root)
+        && close(c.layout.margin.left.value, root * 0.572), "overlapping rich marks resolve against the input instead of multiplying each other, while root units keep the real root font")
+      found = found + 1
+    }
+    i = i + 1
+  }
+  run Testing.expect(found == 3, "both marked spans and the styled atom are present")
+}
+
+effect fn richFontUnits(rootInput: bool) ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, if rootInput { NodeKind.Input } else { NodeKind.Box })
+  run batch.root(1)
+  let root = run written.declarations(b"font-family:'Noto Sans';font-size:30px;line-height:42px;width:500px")
+  run batch.style(1, root.asSlice())
+  let input: u32 = if rootInput { 1 } else { 2 }
+  if !rootInput { run batch.create(2, NodeKind.Input) run batch.append(1, 2) }
+  let base = run written.declarations(b"font-size:20px;line-height:30px;width:300px;height:100px")
+  run batch.style(input, base.asSlice())
+  let first = run written.declarations(b"font-size:2em;line-height:1lh;padding-right:1ch;margin-left:1rch;width:1rem;height:1lh")
+  let second = run written.declarations(b"font-size:3em;font-family:'Geist Mono';line-height:2lh")
+  let atomStyle = run written.declarations(b"font-size:2ch;font-family:'Geist Mono';line-height:1lh;width:1em;height:1lh;padding-right:1ch;margin-left:1rem")
+  run batch.defineMark(input, 0, first.asSlice())
+  run batch.defineMark(input, 1, second.asSlice())
+  run batch.defineAtom(input, 0, atomStyle.asSlice())
+  let atom = Atom { kind: 0, label: run String.copy("A"), data: run String.copy("unit-test") }
+  run batch.richText(input, "ab\u{fffc}", &[MarkSpan { start: 0, end: 1, marks: 1 }, MarkSpan { start: 1, end: 2, marks: 3 }], &[move atom])
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.0))
+  run richMetrics(&tree, input, 20.0, 30.0, if rootInput { 20.0 } else { 30.0 })
+  let larger = run written.declarations(b"font-size:25px;line-height:40px")
+  run batch.style(input, larger.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(fontMoment(0.0))
+  run richMetrics(&tree, input, 25.0, 40.0, if rootInput { 25.0 } else { 30.0 })
+}
+
+test effect fn richRunsResolveParentElementAndRootFontMetrics() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run richFontUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run richFontUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
 }

@@ -9,7 +9,9 @@
 //! for paint. Every offset is still a display offset, so the caret code reads them as pieces
 //! of one text.
 pub import ui_protocol.rich { MarkSpan, Atom, OBJECT }
-import engine { UiTree, applyAll }
+import engine { UiTree, applyUsing }
+import font_units
+import properties.convert { Context, FontMetrics }
 import timing { EasingStops }
 import style { Computed }
 import mutation { Declaration }
@@ -606,49 +608,72 @@ fn inline(outside: DisplayOutside, inside: DisplayInside) -> CssDisplay {
   return CssDisplay.Box { outside: outside, inside: inside }
 }
 
+effect fn runPass(tree: &UiTree<'_>, slot: u32, r: Run, computed: &mut Computed, parent: &Computed,
+  units: &Context, phase: u32, stops: &mut EasingStops) ! OutOfMemoryError ? &mut Allocator {
+  if r.atom {
+    let styles = tree.node(slot).edit().atomStyles.asSlice()
+    let mut s: usize = 0
+    while s < styles.length {
+      if styles[s].key == r.key {
+        if phase == 0 { run applyUsing(&mut computed.*, &styles[s].declarations, parent, &mut stops.*, units) }
+        else { run font_units.declarations(&mut computed.*, &styles[s].declarations, parent, units, phase) }
+      }
+      s = s + 1
+    }
+  } else {
+    let styles = tree.node(slot).edit().markStyles.asSlice()
+    let mut bit: u32 = 0
+    while bit < 32 {
+      if u32.bitAnd(r.key, u32.shiftLeft(1, bit)) != 0 {
+        let mut s: usize = 0
+        while s < styles.length {
+          if styles[s].key == bit {
+            if phase == 0 { run applyUsing(&mut computed.*, &styles[s].declarations, parent, &mut stops.*, units) }
+            else { run font_units.declarations(&mut computed.*, &styles[s].declarations, parent, units, phase) }
+          }
+          s = s + 1
+        }
+      }
+      bit = bit + 1
+    }
+  }
+}
+
 /// Resolves the look of every run of rich input `slot` from the input's computed style and
 /// hands it to css-layout. Runs after the input's own style is resolved.
 pub effect fn styleRuns(tree: &mut UiTree<'_>, slot: u32) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
+  ! OutOfMemoryError ? &mut Allocator {
   let count = tree.node(slot).edit().runs.length()
-  let base = tree.node(slot).computed.text
+  let parent = tree.node(slot).computed
+  let parentKey = tree.node(slot).fontKey
   let mut i: usize = 0
   while i < count {
     let r = tree.node(slot).edit().runs.get(i)
-    let mut computed = Computed.inheriting(base)
-    let mut stops = EasingStops.make()
+    let mut computed = Computed.inViewport(parent.text, parent.viewportWidth, parent.viewportHeight)
+    computed.containerWidth = parent.containerWidth
+    computed.containerHeight = parent.containerHeight
     computed.layout.display = if r.atom {
       inline(DisplayOutside.Inline, DisplayInside.FlowRoot)
     } else {
       inline(DisplayOutside.Inline, DisplayInside.Flow)
     }
-    if r.atom {
-      let styles = tree.node(slot).edit().atomStyles.asSlice()
-      let mut s: usize = 0
-      while s < styles.length {
-        if styles[s].key == r.key {
-          run applyAll(&mut computed, &styles[s].declarations, &mut stops)
-        }
-        s = s + 1
-      }
-    } else {
-      let styles = tree.node(slot).edit().markStyles.asSlice()
-      let mut bit: u32 = 0
-      while bit < 32 {
-        if u32.bitAnd(r.key, u32.shiftLeft(1, bit)) != 0 {
-          let mut s: usize = 0
-          while s < styles.length {
-            if styles[s].key == bit {
-              run applyAll(&mut computed, &styles[s].declarations, &mut stops)
-            }
-            s = s + 1
-          }
-        }
-        bit = bit + 1
-      }
+    let mut fontKey = parentKey
+    if r.atom || r.key != 0 {
+      let mut stops = EasingStops.make()
+      let mut parentUnits = font_units.context(&tree.*, slot, &parent, parentKey)
+      run runPass(&tree.*, slot, r, &mut computed, &parent, &parentUnits, 1, &mut stops)
+      parentUnits.vertical = computed.unitContext().vertical
+      run runPass(&tree.*, slot, r, &mut computed, &parent, &parentUnits, 2, &mut stops)
+      let selected = run tree.fontKeyOf(computed.text)
+      let mut lineUnits = font_units.descendantContext(&tree.*, &computed, selected)
+      let mut lineMetrics = lineUnits.metrics()
+      lineMetrics.lineHeight = parentUnits.metrics().lineHeight
+      lineUnits.fontMetrics = Option<FontMetrics>.some(lineMetrics)
+      run runPass(&tree.*, slot, r, &mut computed, &parent, &lineUnits, 3, &mut stops)
+      let units = font_units.descendantContext(&tree.*, &computed, selected)
+      run runPass(&tree.*, slot, r, &mut computed, &parent, &units, 0, &mut stops)
+      fontKey = run tree.fontKeyOf(computed.text)
     }
-    let fontKey = run tree.fontKeyOf(computed.text)
     computed.finish(fontKey)
     run Effect.catchAll(tree.layout.setStyle(NodeId { index: r.css }, computed.layout), ignoreAny)
     let runs = tree.nodes.asMutSlice()[u32.toUsize(slot)].editMut().runs.asMutSlice()

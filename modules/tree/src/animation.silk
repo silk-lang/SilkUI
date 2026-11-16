@@ -8,6 +8,8 @@
 //! restyles the nodes whose animations move.
 import engine { UiTree }
 import style_change
+import font_units
+import properties.convert { Context }
 import engine
 import style { Computed, TextStyle }
 import style
@@ -417,7 +419,7 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
 
 /// Writes the values of the node's animations at the frame clock over `computed`; later
 /// animations in its list win.
-pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed) -> ()
+pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, units: &Context, fonts: bool) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if tree.animations.length() == 0 {
@@ -425,31 +427,35 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed) -> ()
   }
   let id = tree.node(slot).id
   let now = tree.input.time
-  let base = computed.*
   let blocked = importantFields(tree, slot)
   let list = tree.animations.asSlice()
   let mut i: usize = 0
   while i < list.length {
     if list[i].slot == slot && list[i].id == id {
-      run applyOne(tree, &list[i], &base, now, blocked, &mut computed)
+      let base = computed.*
+      run applyOne(tree, &list[i], &base, now, blocked, &mut computed, units, fonts)
     }
     i = i + 1
   }
 }
 
 // The value of `field` at frame `frame`: its declarations over the underlying style.
-effect fn frameValue(tree: &UiTree<'_>, slot: u32, rule: &Rule, frame: usize, field: u32, base: &Computed) -> Sample
+effect fn frameValue(tree: &UiTree<'_>, slot: u32, rule: &Rule, frame: usize, field: u32, base: &Computed, units: &Context) -> Sample
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut styled = base.*
   let parent = tree.node(slot).parent
   let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { tree.node(parent).computed }
   let mut stops = EasingStops.make()
-  run engine.applyResolved(&mut styled, &rule.frames.asSlice()[frame].declarations, &parentStyle, &mut stops)
+  if field == motion.FONT_SIZE {
+    run font_units.declarations(&mut styled, &rule.frames.asSlice()[frame].declarations, &parentStyle, units, 2)
+  } else {
+    run engine.applyUsing(&mut styled, &rule.frames.asSlice()[frame].declarations, &parentStyle, &mut stops, units)
+  }
   return motion.sample(&styled, field)
 }
 
-effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f64, blocked: u64, computed: &mut Computed) -> ()
+effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f64, blocked: u64, computed: &mut Computed, units: &Context, fonts: bool) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut overall: f64 = 0.0
@@ -466,7 +472,7 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
   let mut field: u32 = 0
   while field < motion.FIELDS {
     let bit = u64.shiftLeft(1, u32.toU64(field))
-    if u64.bitAnd(rule.fields, bit) != 0 && u64.bitAnd(blocked, bit) == 0 {
+    if (field == motion.FONT_SIZE) == fonts && u64.bitAnd(rule.fields, bit) != 0 && u64.bitAnd(blocked, bit) == 0 {
       // The frames around p that set the field; a missing end is the underlying value.
       let mut before = usize.MAX
       let mut after = usize.MAX
@@ -486,12 +492,12 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       let from = if before == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(tree, playing.slot, rule, before, field, base)
+        run frameValue(tree, playing.slot, rule, before, field, base, units)
       }
       let to = if after == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(tree, playing.slot, rule, after, field, base)
+        run frameValue(tree, playing.slot, rule, after, field, base, units)
       }
       let easing = if before != usize.MAX && frames[before].eased {
         frames[before].easing

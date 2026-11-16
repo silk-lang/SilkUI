@@ -38,16 +38,21 @@ fn metrics(tree: &UiTree<'_>, text: TextStyle, key: usize) -> FontMetrics {
 /// Call after registering the final font key. The root's own declarations use
 /// its new font bases without waiting for its Computed record to be installed.
 pub fn context(tree: &UiTree<'_>, slot: u32, computed: &Computed, key: usize) -> Context {
+  if slot != tree.root { return descendantContext(tree, computed, key) }
   let mut result = computed.unitContext()
   result.fontMetrics = Option<FontMetrics>.some(metrics(tree, computed.text, key))
-  if slot == tree.root {
-    result.rootFontSize = computed.text.size
-    result.rootFontMetrics = result.fontMetrics
-  } else {
-    let root = tree.node(tree.root)
-    result.rootFontSize = root.computed.text.size
-    result.rootFontMetrics = Option<FontMetrics>.some(metrics(tree, root.computed.text, root.fontKey))
-  }
+  result.rootFontSize = computed.text.size
+  result.rootFontMetrics = result.fontMetrics
+  return result
+}
+
+/// A rich run is a descendant even when its input owns the root slot.
+pub fn descendantContext(tree: &UiTree<'_>, computed: &Computed, key: usize) -> Context {
+  let mut result = computed.unitContext()
+  result.fontMetrics = Option<FontMetrics>.some(metrics(tree, computed.text, key))
+  let root = tree.node(tree.root)
+  result.rootFontSize = root.computed.text.size
+  result.rootFontMetrics = Option<FontMetrics>.some(metrics(tree, root.computed.text, root.fontKey))
   return result
 }
 
@@ -87,18 +92,30 @@ pub effect fn declarations(computed: &mut Computed, list: &List<Declaration>, pa
   }
 }
 
+pub enum Source { Node, Overrides, Starting }
+
 effect fn nodePass(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, parent: &Computed,
-  units: &Context, pass: u32, overridesOnly: bool) ! OutOfMemoryError ? &mut Allocator {
+  units: &Context, pass: u32, source: Source) ! OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
+  if source == Source.Starting {
+    if let Option.Some { value } = node.sheetStyle() {
+      if let Option.Some { value: start } = &value.starting {
+        run declarations(&mut computed.*, &start, parent, units, pass)
+        return ()
+      }
+    }
+    run declarations(&mut computed.*, &node.starting, parent, units, pass)
+    return ()
+  }
   if let Option.Some { value } = node.sheetStyle() {
-    if !overridesOnly { run declarations(&mut computed.*, &value.declarations, parent, units, pass) }
+    if source != Source.Overrides { run declarations(&mut computed.*, &value.declarations, parent, units, pass) }
     run declarations(&mut computed.*, &value.overrides, parent, units, pass)
     return ()
   }
   if node.kind == NodeKind.Text { return () }
   let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
   let mut i: usize = 0
-  if !overridesOnly {
+  if source != Source.Overrides {
     while i < states.length {
       let state = states[i]
       if style_sheets.active(tree, slot, state) {
@@ -129,9 +146,7 @@ effect fn nodePass(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, parent
   }
 }
 
-/// Font-size uses the parent's font and the root's initial font when resolving
-/// the root itself; lh in font-size and line-height uses the parent's line height.
-pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed, overridesOnly: bool) -> Context
+pub effect fn inherited(tree: &mut UiTree<'_>, slot: u32, computed: &Computed) -> Context
   ! OutOfMemoryError ? &mut Allocator {
   let parentSlot = tree.node(slot).parent
   let parent = if parentSlot == NONE { Computed.inheriting(TextStyle.initial()) } else { tree.node(parentSlot).computed }
@@ -147,9 +162,30 @@ pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed,
     inherited.rootFontSize = root.computed.text.size
     inherited.rootFontMetrics = Option<FontMetrics>.some(metrics(&tree.*, root.computed.text, root.fontKey))
   }
-  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 1, overridesOnly)
+  return inherited
+}
+
+/// Font-size uses parent metrics; lh in font-size and line-height uses parent line height.
+pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed, source: Source) -> Context
+  ! OutOfMemoryError ? &mut Allocator {
+  if tree.node(slot).kind == NodeKind.Text { return computed.unitContext() }
+  let parent = style_sheets.parentStyle(&tree.*, slot)
+  let mut inherited = run inherited(&mut tree.*, slot, &computed.*)
+  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 1, source)
   inherited.vertical = computed.unitContext().vertical
-  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 2, overridesOnly)
+  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 2, source)
+  return run finish(&mut tree.*, slot, &mut computed.*, &parent, &inherited, source)
+}
+
+pub effect fn refresh(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed) -> Context
+  ! OutOfMemoryError ? &mut Allocator {
+  let parent = style_sheets.parentStyle(&tree.*, slot)
+  let inherited = run inherited(&mut tree.*, slot, &computed.*)
+  return run finish(&mut tree.*, slot, &mut computed.*, &parent, &inherited, Source.Node)
+}
+
+effect fn finish(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed, parent: &Computed,
+  inherited: &Context, source: Source) -> Context ! OutOfMemoryError ? &mut Allocator {
   let key = run tree.fontKeyOf(computed.text)
   let mut line = context(&tree.*, slot, &computed.*, key)
   let mut lineMetrics = line.metrics()
@@ -160,6 +196,7 @@ pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed,
     rootMetrics.lineHeight = inherited.rootMetrics().lineHeight
     line.rootFontMetrics = Option<FontMetrics>.some(rootMetrics)
   }
-  run nodePass(&tree.*, slot, &mut computed.*, &parent, &line, 3, overridesOnly)
+  if source == Source.Starting { run nodePass(&tree.*, slot, &mut computed.*, parent, &line, 3, Source.Node) }
+  run nodePass(&tree.*, slot, &mut computed.*, parent, &line, 3, source)
   return context(&tree.*, slot, &computed.*, key)
 }
