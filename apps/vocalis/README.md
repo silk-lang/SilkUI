@@ -4,7 +4,7 @@ A voice analysis studio written in Silk with Loom and drawn with WebGPU in a nat
 
 ![Vocalis showing the demo voice](docs/screenshot.png)
 
-- **Spectrogram**: scrolling, 0–5 kHz, 2048-point FFT, 512-sample hop, with an inferno-style colour ramp
+- **Spectrogram**: 4096-point Blackman-Nuttall FFT every 512 samples, log or linear from 29 Hz. It is drawn as a fine grid of cells (about 2 px) whose values are interpolated between analysis columns and between FFT bins, so it reads as a smooth field rather than as blocks
 - **Pitch**: YIN pitch detection drawn as a green track over the spectrogram, with Hz, note name and cents
 - **Formants**: F1, F2 and F3 from LPC (order 14), drawn as coloured dots and shown as readouts
 - **Spectrum slice**: the current spectrum next to the spectrogram, with the formants marked
@@ -34,6 +34,14 @@ Sources: **Demo voice** (a built-in synthetic singer gliding through a-e-i-o-u w
 ```sh
 cd apps/vocalis && silk build && ./build/llvm/x86_64-unknown-linux-gnu/debug/vocalis
 ```
+
+## Why the spectrogram is a canvas, not an image
+
+The smooth look would come most cheaply from a texture stretched with bilinear filtering, and the
+renderer does sample images bilinearly. But Loom only names images by URL and never releases one,
+so a new data URL every frame leaks (and new images stop appearing). The protocol can already
+redefine an image from pixels (`DefineDecodedImage`). A Loom API for an image node fed with pixels
+(or a canvas command that draws pixels) would let this become a texture.
 
 ## Status
 

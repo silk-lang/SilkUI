@@ -274,18 +274,12 @@ fn binOf(hz: f32) -> usize {
 // ---------------------------------------------------------------------------------------------
 // Spectrogram
 
-/// The spectrogram of a view as a small RGB image: one pixel per analysis column (fewer when
-/// zoomed far out, keeping the loudest), and rows sampled at their own frequency, interpolated
-/// between FFT bins. Stretched over the view with bilinear filtering, it reads as a smooth field
-/// rather than as blocks.
-pub struct Pixels {
-  pub width: usize,
-  pub height: usize,
-  pub rgb: List<u8>,
-}
-
-pub const MAX_IMAGE_W: usize = 640
-pub const MAX_IMAGE_H: usize = 300
+/// The spectrogram of a view, drawn as a fine grid (about 2 CSS px per cell) whose values are
+/// interpolated on the CPU: between neighbouring analysis columns in time, and between FFT bins
+/// in frequency, each row sampled at its own (log or linear) frequency. Colors are continuous,
+/// quantised to `SHADES` steps so that equal runs down a column merge into one rectangle.
+pub const CELL: f32 = 2.0
+pub const SHADES: u32 = 96
 
 /// The spectrum byte of column `c` at fractional bin `b`, interpolated between bins.
 fn sampleBin(t: &Track, c: usize, b: f32) -> f32 {
@@ -322,17 +316,11 @@ fn sampleBand(t: &Track, c: usize, b0: f32, b1: f32) -> f32 {
   return u8.toF32(best)
 }
 
-fn colorByte(value: f32) -> u8 {
-  return f32.toU8(f32.max(0.0, f32.min(255.0, value * 255.0 + 0.5)))
-}
-
-pub effect fn spectrogramPixels(t: &Track, v: &View, look: &Look) -> Pixels
+/// One spectrum byte (or -1 for no data) per cell, column-major.
+effect fn sampleGrid(t: &Track, v: &View, width: usize, height: usize) -> List<f32>
   ! OutOfMemoryError
   ? &mut Allocator {
   let total = t.columns()
-  let width = umax(2, umin(MAX_IMAGE_W, f32.toUsize(f32.ceil(f32.max(1.0, v.cols)))))
-  let height = umax(2, umin(MAX_IMAGE_H, f32.toUsize(f32.ceil(v.height * 0.7))))
-  let mut rgb = run List<u8>.makeWithCapacity(width * height * 3)
   // The bin span of every row, computed once.
   let perBin = usize.toF32(dsp.FFT_SIZE) / RATE
   let mut b0s = List<f32>.make()
@@ -386,29 +374,64 @@ pub effect fn spectrogramPixels(t: &Track, v: &View, look: &Look) -> Pixels
     }
     x = x + 1
   }
-  let floor = look.top - look.range
-  let gamma = f32.max(0.05, look.gamma)
-  let mut y: usize = 0
-  while y < height {
-    let mut x2: usize = 0
-    while x2 < width {
-      let q = values.get(x2 * height + y)
-      let mut color = Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
-      if q >= 0.0 {
-        let db = q * 0.5 - 120.0
-        let level = (db - floor) / look.range
-        if level > 0.0 {
-          color = colormap(look.colormap, f32.pow(f32.min(1.0, level), gamma))
-        }
-      }
-      run rgb.append(colorByte(color.r))
-      run rgb.append(colorByte(color.g))
-      run rgb.append(colorByte(color.b))
-      x2 = x2 + 1
-    }
-    y = y + 1
+  return move values
+}
+
+/// The shade of a spectrum byte: 0 is background, 1..SHADES are colors.
+fn shadeOf(look: &Look, q: f32) -> u32 {
+  if q < 0.0 {
+    return 0
   }
-  return Pixels { width: width, height: height, rgb: move rgb }
+  let level = (q * 0.5 - 120.0 - (look.top - look.range)) / look.range
+  if level <= 0.0 {
+    return 0
+  }
+  let g = f32.pow(f32.min(1.0, level), f32.max(0.05, look.gamma))
+  return 1 + f32.toU32(g * u32.toF32(SHADES - 1) + 0.5)
+}
+
+pub effect fn spectrogramCells(t: &Track, v: &View, look: &Look) -> List<CanvasCommand>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let width = umax(2, f32.toUsize(f32.ceil(v.width / CELL)))
+  let height = umax(2, f32.toUsize(f32.ceil(v.height / CELL)))
+  let values = run sampleGrid(t, v, width, height)
+  let mut palette = List<Rgba<f32>>.make()
+  let mut i: u32 = 0
+  while i <= SHADES {
+    run palette.append(colormap(look.colormap, u32.toF32(i) / u32.toF32(SHADES)))
+    i = i + 1
+  }
+  let cellW = v.width / usize.toF32(width)
+  let cellH = v.height / usize.toF32(height)
+  let mut list = List<CanvasCommand>.make()
+  run rect(&mut list, 0.0, 0.0, v.width, v.height, rgb(0x000000))
+  let mut x: usize = 0
+  while x < width {
+    let base = x * height
+    let mut y: usize = 0
+    while y < height {
+      let shade = shadeOf(look, values.get(base + y))
+      let mut end = y + 1
+      while end < height && shadeOf(look, values.get(base + end)) == shade {
+        end = end + 1
+      }
+      if shade > 0 {
+        // A hair of overlap hides seams between neighbouring cells.
+        run rect(
+          &mut list,
+          usize.toF32(x) * cellW,
+          usize.toF32(y) * cellH,
+          cellW + 0.35,
+          usize.toF32(end - y) * cellH + 0.35,
+          palette.get(u32.toUsize(shade)),
+        )
+      }
+      y = end
+    }
+    x = x + 1
+  }
+  return move list
 }
 
 pub effect fn spectrogram(
