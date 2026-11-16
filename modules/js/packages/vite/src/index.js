@@ -122,6 +122,7 @@ export default function silk(options = {}) {
       }
       const owner = ownerOf(id, root);
       for (const { name, area } of missingApis(ast)) {
+        if (serving && (name === "TextEncoder" || name === "TextDecoder")) continue;
         if (allow.has(name) || (node && !NOT_IN_NODE.has(area))) continue;
         let use = uses.get(name);
         if (!use) uses.set(name, (use = { area, owners: new Set() }));

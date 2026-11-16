@@ -38,6 +38,11 @@ export default defineConfig({ plugins: [silk({ entry: "src/main.tsx" }), react()
   `<bundle>.stamp` after each successful build. A host that watches it reloads the whole app.
   This is the production code path, so it is the mode to check a bundle in.
 
+The development runner supplies UTF-8 `TextEncoder` and `TextDecoder` for dependencies
+that initialize them before production tree shaking, including Effect. Decoding supports
+streaming, fatal errors and BOM options; other encoding labels throw. Release engine hosts
+still lack these APIs, and the production API report continues to flag retained uses.
+
 ## Stylesheets
 
 Import CSS from the application entry or its modules. Vite runs any configured CSS processors
