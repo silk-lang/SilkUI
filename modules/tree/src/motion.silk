@@ -10,7 +10,7 @@
 //! frame, which also carries an eased inherited value (a color) down to the children.
 import engine { UiTree }
 import style { Computed }
-import timing { EasingStops, Easing, TransitionLists, TransitionSpec, Span, LIST, ALL }
+import timing { EasingStops, Easing, TransitionLists, TransitionSpec, TransitionItem, TimingList, Span, ALL }
 import timing
 import node { NONE, Event, EventKind }
 import mutation {
@@ -31,6 +31,7 @@ import silk.num.f32
 import silk.num.f64
 import silk.num.u32
 import silk.num.u64
+import silk.num.usize
 import silk.text.string { String }
 
 // Fields: what the tree transitions, one longhand each.
@@ -205,110 +206,77 @@ pub const BEHAVIOR: u32 = 5
 
 /// Sets the lists that `which` (`SHORTHAND`, `PROPERTY`, ...) declares as CSS `text`. An
 /// invalid value leaves them as they were, as an invalid declaration does.
-pub fn declare(lists: &mut TransitionLists, which: u32, text: &[u8]) -> () {
-  let mut spans = [Span { start: 0, end: 0 }; 8]
-  let count = timing.items(text, &mut spans)
-  let mut next = lists.*
-  let mut i: usize = 0
-  while i < count {
-    let item = timing.part(text, spans[i].start, spans[i].end)
-    if item.length == 0 {
-      return ()
-    }
+pub effect fn declare(lists: &mut TransitionLists, which: u32, text: &[u8], store: &mut EasingStops) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if let Option<TimingList>.Some { value } = store.transitionList(which, text) {
+    assign(&mut lists, which, value)
+    return ()
+  }
+  let mut parsed = List<TransitionItem>.make()
+  let mut at: usize = 0
+  while at <= text.length {
+    let end = timing.itemEnd(text, at, true)
+    let item = timing.trimmed(timing.part(text, at, end))
+    if item.length == 0 { return () }
+    let single = at == 0 && end == text.length
+    let mut next = TransitionItem.initial()
     if which == SHORTHAND {
-      if !shorthandItem(&mut next, i, item, count == 1) {
-        return ()
-      }
+      if !shorthandItem(&mut next, item, single) { return () }
     } else if which == PROPERTY {
       if timing.named(item, b"none") {
-        if count != 1 {
-          return ()
-        }
-        next.none = true
-      } else {
-        next.none = false
-        next.properties[i] = propertyMask(item)
-      }
-    } else if which == DURATION {
+        if !single { return () }
+        next.property = 0
+      } else { next.property = propertyMask(item) }
+    } else if which == DURATION || which == DELAY {
       match timing.time(item) {
         Option<f32>.Some { value } => {
-          if value < 0.0 {
-            return ()
-          }
-          next.durations[i] = value
+          if which == DURATION {
+            if value < 0.0 { return () }
+            next.duration = value
+          } else { next.delay = value }
         }
-        Option<f32>.None => {
-          return ()
-        }
-      }
-    } else if which == DELAY {
-      match timing.time(item) {
-        Option<f32>.Some { value } => {
-          next.delays[i] = value
-        }
-        Option<f32>.None => {
-          return ()
-        }
+        Option<f32>.None => { return () }
       }
     } else if which == TIMING {
       match timing.easing(item) {
-        Option<Easing>.Some { value } => {
-          next.easings[i] = value
-        }
-        Option<Easing>.None => {
-          return ()
-        }
+        Option<Easing>.Some { value } => { next.easing = value }
+        Option<Easing>.None => { return () }
       }
     } else {
-      if timing.named(item, b"allow-discrete") {
-        next.discrete[i] = true
-      } else if timing.named(item, b"normal") {
-        next.discrete[i] = false
-      } else {
-        return ()
-      }
+      if timing.named(item, b"allow-discrete") { next.discrete = true }
+      else if !timing.named(item, b"normal") { return () }
     }
-    i = i + 1
+    run parsed.append(next)
+    at = end + 1
   }
-  if which == SHORTHAND {
-    next.propertyCount = count
-    next.durationCount = count
-    next.delayCount = count
-    next.easingCount = count
-    next.discreteCount = count
-  } else if which == PROPERTY {
-    next.propertyCount = if next.none {
-      0
-    } else {
-      count
-    }
-  } else if which == DURATION {
-    next.durationCount = count
-  } else if which == DELAY {
-    next.delayCount = count
-  } else if which == TIMING {
-    next.easingCount = count
-  } else {
-    next.discreteCount = count
-  }
-  lists.* = next
+  let kept = run store.keepTransition(which, text, parsed.asSlice())
+  assign(&mut lists, which, kept)
+}
+
+fn assign(lists: &mut TransitionLists, which: u32, list: TimingList) -> () {
+  if which == SHORTHAND || which == PROPERTY { lists.properties = list }
+  if which == SHORTHAND || which == DURATION { lists.durations = list }
+  if which == SHORTHAND || which == DELAY { lists.delays = list }
+  if which == SHORTHAND || which == TIMING { lists.easings = list }
+  if which == SHORTHAND || which == BEHAVIOR { lists.discrete = list }
 }
 
 // One item of the `transition` shorthand: a property, up to two times, an easing and a
 // behavior, in any order. `none` is valid only alone.
-fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single: bool) -> bool {
+fn shorthandItem(next: &mut TransitionItem, item: &[u8], single: bool) -> bool {
   let mut spans = [Span { start: 0, end: 0 }; 8]
   let count = timing.words(item, &mut spans)
+  if count == 8 && timing.trimmed(timing.part(item, spans[7].end, item.length)).length != 0 { return false }
   let mut property: u64 = ALL
   let mut named = false
   let mut none = false
   let mut times: u32 = 0
   let mut eased = false
   let mut behaved = false
-  lists.durations[index] = 0.0
-  lists.delays[index] = 0.0
-  lists.easings[index] = Easing.ease()
-  lists.discrete[index] = false
+  next.duration = 0.0
+  next.delay = 0.0
+  next.easing = Easing.ease()
+  next.discrete = false
   let mut i: usize = 0
   while i < count {
     let word = timing.part(item, spans[i].start, spans[i].end)
@@ -320,9 +288,9 @@ fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single:
             if value < 0.0 {
               return false
             }
-            lists.durations[index] = value
+            next.duration = value
           } else {
-            lists.delays[index] = value
+            next.delay = value
           }
           times = times + 1
           done = true
@@ -333,7 +301,7 @@ fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single:
     if !done && !eased {
       match timing.easing(word) {
         Option<Easing>.Some { value } => {
-          lists.easings[index] = value
+          next.easing = value
           eased = true
           done = true
         }
@@ -341,7 +309,7 @@ fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single:
       }
     }
     if !done && !behaved && (timing.named(word, b"allow-discrete") || timing.named(word, b"normal")) {
-      lists.discrete[index] = timing.named(word, b"allow-discrete")
+      next.discrete = timing.named(word, b"allow-discrete")
       behaved = true
       done = true
     }
@@ -362,8 +330,7 @@ fn shorthandItem(lists: &mut TransitionLists, index: usize, item: &[u8], single:
   if none && !single {
     return false
   }
-  lists.properties[index] = property
-  lists.none = none
+  next.property = property
   return true
 }
 
@@ -1015,7 +982,7 @@ fn find(tree: &UiTree<'_>, slot: u32, id: u32, field: u32) -> usize {
     }
     i = i + 1
   }
-  return LIST * 1000
+  return usize.MAX
 }
 
 /// Whether the node at `slot` has a running transition.
@@ -1104,7 +1071,7 @@ pub effect fn transition(
   ? &mut Allocator {
   let lists = computed.transition
   let mine = tree.transitions.length() != 0 && running(&tree.*, slot)
-  if !mine && (!hasBefore || !lists.any()) {
+  if !mine && (!hasBefore || !lists.any(&tree.easingStops)) {
     return ()
   }
   let now = tree.input.time
@@ -1117,9 +1084,9 @@ pub effect fn transition(
       continue
     }
     let after = sample(&computed.*, field)
-    let spec = lists.spec(field)
+    let spec = lists.spec(field, &tree.easingStops)
     let at = find(&tree.*, slot, id, field)
-    if at != LIST * 1000 {
+    if at != usize.MAX {
       let old = tree.transitions.asSlice()[at]
       if same(old.to, after) {
         // Still heading where it was.

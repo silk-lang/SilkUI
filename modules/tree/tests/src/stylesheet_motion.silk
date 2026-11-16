@@ -152,3 +152,112 @@ test effect fn stylesheetKeyframesAcceptQuotedAndEscapedNames() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run names() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import ui_tree.css
+import ui_tree.css { Property, px }
+import ui_tree.legacy { StyleState, Input }
+
+effect fn longTransitions(repeated: bool) -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run nodes(&mut batch)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("parent") })
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("inline") })
+  let properties = b"width, color, background-color, border-color, outline-color, text-decoration-color, box-shadow, fill, stroke, opacity, width, height"
+  let durations = if repeated { b"1s, 2s" } else { b"9s, 9s, 9s, 9s, 9s, 9s, 9s, 9s, 9s, 1s, 2s, 4s" }
+  let mut source = String.make()
+  run source.append(".parent{transition-property:")
+  run source.append(unsafe String.fromUtf8Unchecked(properties))
+  run source.append(";transition-duration:")
+  run source.append(unsafe String.fromUtf8Unchecked(durations))
+  run source.append(";transition-timing-function:linear}.subject{width:10px;height:10px;opacity:1;transition-property:inherit;transition-duration:inherit;transition-timing-function:inherit}.changed{width:110px;height:110px;opacity:0}")
+  let bytes = run sheet(source.ownedUtf8Bytes())
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run batch.style(3, &[
+    css.width(px(10.0)), css.height(px(10.0)), css.opacity(1.0),
+    css.declare(Property.TransitionProperty, run css.text(properties)),
+    css.declare(Property.TransitionDuration, run css.text(durations)),
+    css.declare(Property.TransitionTimingFunction, run css.text(b"linear")),
+  ])
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("subject changed") })
+  run batch.style(3, &[css.width(px(110.0)), css.height(px(110.0)), css.opacity(0.0)])
+  run tree.apply(run batch.take())
+  run tree.frame(at(10.0))
+  run tree.frame(at(10.5))
+  let mut id: u32 = 2
+  while id <= 3 {
+    run Testing.expect(near(width(&tree, id), if repeated { 60.0 } else { 35.0 }), "the final property match beyond eight entries selects its duration in sheets, inheritance and inline styles")
+    run Testing.expect(near(height(&tree, id), if repeated { 35.0 } else { 22.5 }), "long duration lists retain their last entries and short lists repeat")
+    run Testing.expect(near(opacity(&tree, id), if repeated { 0.75 } else { 0.5 }), "opacity late in a utility transition list still transitions")
+    id = id + 1
+  }
+}
+
+test effect fn stylesheetTransitionListsKeepAllEntriesAndRepeatShortLists() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run longTransitions(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run longTransitions(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn invalidTransitionTail() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[
+    css.width(px(100.0)), css.height(px(100.0)), css.opacity(1.0),
+    css.declare(Property.Transition, run css.text(b"color 1s,background-color 1s,border-color 1s,outline-color 1s,text-decoration-color 1s,box-shadow 1s,fill 1s,stroke 1s,opacity 2s linear")),
+  ])
+  run batch.styleFor(2, StyleState.Hover, &[
+    css.opacity(0.0),
+    css.declare(Property.TransitionDuration, run css.text(b"1s,1s,1s,1s,1s,1s,1s,1s,-1s")),
+  ])
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.dispatch(Input.PointerMove { x: 10.0, y: 10.0, modifiers: 0 })
+  run tree.frame(at(1.0))
+  run tree.frame(at(1.5))
+  run Testing.expect(near(opacity(&tree, 2), 0.75), "a long shorthand reaches opacity, and an invalid trailing duration does not replace the valid base list")
+}
+
+test effect fn stylesheetTransitionListsRejectInvalidTrailingEntries() -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run invalidTransitionTail() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn longAnimations() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run nodes(&mut batch)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("parent") })
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("inline") })
+  let bytes = run sheet(b".parent{animation-name:a,b,c,d,e,f,g,h,fade,grow;animation-duration:9s,9s,9s,9s,9s,9s,9s,9s,1s,2s;animation-timing-function:linear;animation-fill-mode:forwards}.subject{animation-name:inherit;animation-duration:inherit;animation-timing-function:inherit;animation-fill-mode:inherit}@keyframes fade{from{opacity:0}to{opacity:1}}@keyframes grow{from{width:10px}to{width:110px}}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run batch.style(3, &[
+    css.declare(Property.Animation, run css.text(b"a 9s,b 9s,c 9s,d 9s,e 9s,f 9s,g 9s,h 9s,fade 1s linear forwards,grow 2s linear forwards")),
+  ])
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.frame(at(0.5))
+  let mut id: u32 = 1
+  while id <= 3 {
+    run Testing.expect(near(width(&tree, id), 35.0) && near(opacity(&tree, id), 0.5), "animation names and durations beyond eight entries work through sheets, inheritance, and inline shorthand")
+    id = id + 1
+  }
+}
+
+test effect fn stylesheetAnimationListsKeepAllEntries() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run longAnimations() |> Effect.provideMut<Allocator>(&mut allocator)
+}
