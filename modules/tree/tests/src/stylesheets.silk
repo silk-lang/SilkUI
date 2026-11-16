@@ -722,3 +722,81 @@ test effect fn stylesheetSharingPreservesCascadeInputsAndInvalidatesAcrossPasses
   let mut allocator = Allocator.systemAllocatorProvider()
   run repeatedCascadeInputs() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+fn blurAmount(tree: &UiTree<'_>, id: u32) -> f32 {
+  if let Option.Some { value } = tree.node(tree.slotOf(id)).paintEffects() {
+    if value.filters.length() == 1 {
+      if let Filter.Function { amount, .. } = &value.filters.asSlice()[0] { return value.number(amount) }
+    }
+  }
+  return 0.0
+}
+
+fn redShadow(tree: &UiTree<'_>, id: u32, offset: f32) -> bool {
+  if let Option.Some { value } = tree.node(tree.slotOf(id)).paintEffects() {
+    if value.shadows.length() == 1 {
+      let shadow = value.shadows.asSlice()[0]
+      return shadow.x == offset && shadow.color.r == 1.0 && shadow.color.b == 0.0
+    }
+  }
+  return false
+}
+
+effect fn paintOverrideParity(sheet: bool, inherited: bool) -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  if sheet {
+    let bytes = run sheetBytes(b":root{font-size:20px;color:red;filter:blur(1em);text-shadow:1em 0 currentColor}")
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  } else {
+    let base = run written.declarations(if inherited { b"font-size:20px;color:red;filter:blur(1em);text-shadow:1em 0 currentColor" } else { b"font-size:20px;color:red;filter:blur(1em);text-shadow:1em 0 red" })
+    run batch.style(1, base.asSlice())
+  }
+  let hover = run written.declarations(if inherited { b"filter:blur(2em);text-shadow:2em 0 currentColor" } else { b"filter:blur(2em);text-shadow:2em 0 red" })
+  run batch.styleFor(1, StyleState.Hover, hover.asSlice())
+  let child = run written.declarations(if inherited { b"font-size:10px;color:blue;filter:inherit;text-shadow:inherit" } else { b"font-size:10px;color:blue" })
+  run batch.style(2, child.asSlice())
+  run tree.apply(run batch.take())
+  let slot = tree.slotOf(1)
+  let node = tree.nodeMut(slot)
+  node.hovered = true
+  let frame = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  run Testing.expect(blurAmount(&tree, 1) == 40.0 && (!inherited || blurAmount(&tree, 2) == 40.0 && redShadow(&tree, 2, 40.0)), "inherited effects use the active ancestor look and freeze its font and currentColor")
+  let override = run written.declarations(if inherited { b"filter:blur(3em);text-shadow:3em 0 currentColor" } else { b"filter:blur(3em);text-shadow:3em 0 red" })
+  drop run tree.setOverride(1, StyleState.Base, move override, false)
+  run tree.frame(frame)
+  run Testing.expect(blurAmount(&tree, 1) == 60.0 && (!inherited || blurAmount(&tree, 2) == 60.0 && redShadow(&tree, 2, 60.0)), "base inspector effects beat hover and reach inheriting descendants")
+  drop tree.clearOverride(1, StyleState.Base)
+  let replacement = run written.declarations(b"opacity:.5")
+  drop run tree.setOverride(1, StyleState.Hover, move replacement, true)
+  run tree.frame(frame)
+  run Testing.expect(blurAmount(&tree, 1) == 20.0 && (!inherited || blurAmount(&tree, 2) == 20.0 && redShadow(&tree, 2, 20.0)), "replacing a look removes its effects from both paint and inheritance")
+  drop tree.clearOverride(1, StyleState.Hover)
+  run tree.frame(frame)
+  run Testing.expect(blurAmount(&tree, 1) == 40.0 && (!inherited || blurAmount(&tree, 2) == 40.0), "clearing an inspector replacement restores the active effects")
+  if !sheet && !inherited {
+    run Testing.expect(tree.node(slot).sheetStyle().isNone(), "ordinary style objects exercise the direct effects path")
+  }
+  let beforeReset = tree.node(slot).computed.effects.hash
+  let reset = run written.declarations(b"filter:inherit;text-shadow:initial")
+  drop run tree.setOverride(1, StyleState.Base, move reset, false)
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).computed.effects.hash != beforeReset, "effect resets invalidate retained paint")
+  run Testing.expect(blurAmount(&tree, 1) == 0.0 && blurAmount(&tree, 2) == 0.0 && !redShadow(&tree, 1, 40.0) && !redShadow(&tree, 2, 40.0), "root inheritance and initial replace earlier effects without leaking them to descendants")
+}
+
+test effect fn paintEffectsHonorInspectorAndInheritedWinners() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run paintOverrideParity(false, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run paintOverrideParity(true, false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run paintOverrideParity(false, true) |> Effect.provideMut<Allocator>(&mut allocator)
+  run paintOverrideParity(true, true) |> Effect.provideMut<Allocator>(&mut allocator)
+}

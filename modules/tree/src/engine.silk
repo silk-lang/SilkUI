@@ -4426,31 +4426,30 @@ impl<'a> UiTree<'a> {
     let mut effects = Effects.make()
     let node = self.node(slot)
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      let declarations = value.declarations.asSlice()
+      run self.applyEffects(&mut effects, value.declarations.asSlice(), node.parent, basis)
+      run self.applyEffects(&mut effects, value.overrides.asSlice(), node.parent, basis)
+    } else {
+      let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
       let mut i: usize = 0
-      while i < declarations.length {
-        let declaration = &declarations[i]
-        if paint_css.handles(declaration.property) {
-          if properties_convert.isKeyword(&declaration.value, Keyword.Inherit) {
-            run self.inheritEffect(&mut effects, node.parent, declaration.property)
-          } else { run paint_css.apply(&mut effects, declaration, basis) }
+      while i < states.length {
+        let state = states[i]
+        if style_sheets.active(&self, slot, state) {
+          let replace = match self.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
+          if !replace { run self.applyEffects(&mut effects, effectLook(node, state), node.parent, basis) }
         }
         i = i + 1
       }
-    } else {
-    run paint_css.applyAll(&mut effects, node.base.asSlice(), basis)
-    if node.hovered {
-      run paint_css.applyAll(&mut effects, node.hover.asSlice(), basis)
-    }
-    if node.pressed {
-      run paint_css.applyAll(&mut effects, node.active.asSlice(), basis)
-    }
-    if self.focused == slot {
-      run paint_css.applyAll(&mut effects, node.focus.asSlice(), basis)
-      if self.focusVisible || node.kind == NodeKind.Input {
-        run paint_css.applyAll(&mut effects, node.focusVisible.asSlice(), basis)
+      if self.overrides.length() != 0 {
+        i = 0
+        while i < states.length {
+          if style_sheets.active(&self, slot, states[i]) {
+            if let Option.Some { value } = self.overrideOf(node.id, states[i]) {
+              run self.applyEffects(&mut effects, value.declarations.asSlice(), node.parent, basis)
+            }
+          }
+          i = i + 1
+        }
       }
-    }
     }
     computed.effects.hash = effects.hash
     computed.effects.layered = effects.layered()
@@ -4468,28 +4467,81 @@ impl<'a> UiTree<'a> {
     target.effects = Option<Box<Effects>>.Some { value: move boxed }
   }
 
-  /// Replay only the inherited effect's already substituted longhand, against
-  /// the defining ancestor's computed font and foreground. This freezes em and
-  /// currentColor there while retaining percentages for the descendant's box.
+  effect fn applyEffects(self: &Self, effects: &mut Effects, declarations: &[Declaration], parent: u32, basis: paint_css.Basis) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < declarations.length {
+      let declaration = &declarations[i]
+      let property = declaration.property
+      if paint_css.handles(property) {
+        let inherited = properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+          || properties_convert.isKeyword(&declaration.value, Keyword.Unset) && catalog.inherited(property)
+        if inherited {
+          // Inheritance with no defining ancestor still replaces an earlier look.
+          run paint_css.initial(&mut effects.*, property, basis)
+          run self.inheritEffect(&mut effects.*, parent, property)
+        } else if properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+          || properties_convert.isKeyword(&declaration.value, Keyword.Unset) {
+          run paint_css.initial(&mut effects.*, property, basis)
+        } else { run paint_css.apply(&mut effects.*, declaration, basis) }
+      }
+      i = i + 1
+    }
+  }
+
+  /// The winning active declaration, with inspector overrides above all client looks.
+  fn effectDeclaration(self: &Self, slot: u32, property: CssProperty) -> Option<&Declaration> {
+    let node = self.node(slot)
+    if let Option.Some { value } = node.sheetStyle() {
+      let override = lastEffect(value.overrides.asSlice(), property)
+      if override.isSome() { return override }
+      return lastEffect(value.declarations.asSlice(), property)
+    }
+    let states = [StyleState.FocusVisible, StyleState.Focus, StyleState.Active, StyleState.Hover, StyleState.Base]
+    let mut i: usize = 0
+    if self.overrides.length() != 0 {
+      while i < states.length {
+        if style_sheets.active(&self, slot, states[i]) {
+          if let Option.Some { value } = self.overrideOf(node.id, states[i]) {
+            let found = lastEffect(value.declarations.asSlice(), property)
+            if found.isSome() { return found }
+          }
+        }
+        i = i + 1
+      }
+    }
+    i = 0
+    while i < states.length {
+      if style_sheets.active(&self, slot, states[i]) {
+        let replace = match self.overrideOf(node.id, states[i]) { Option.Some { value } => value.replace _ => false }
+        if !replace {
+          let found = lastEffect(effectLook(node, states[i]), property)
+          if found.isSome() { return found }
+        }
+      }
+      i = i + 1
+    }
+    return Option<&Declaration>.None
+  }
+
+  /// Replay the inherited longhand against its defining ancestor's computed font
+  /// and foreground, freezing em/currentColor but retaining box percentages.
   effect fn inheritEffect(self: &Self, effects: &mut Effects, parent: u32, property: CssProperty) -> ()
     ! OutOfMemoryError ? &mut Allocator {
     let mut ancestor = parent
     while ancestor != NONE {
       let node = self.node(ancestor)
       let mut inherit = catalog.inherited(property)
-      if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-        let declarations = value.declarations.asSlice()
-        let mut i: usize = 0
-        while i < declarations.length {
-          if declarations[i].property == property {
-            if !properties_convert.isKeyword(&declarations[i].value, Keyword.Inherit) {
-              run paint_css.apply(&mut effects.*, &declarations[i], node.computed.paintBasis())
-              return ()
-            }
-            inherit = true
-            break
-          }
-          i = i + 1
+      if let Option.Some { value } = self.effectDeclaration(ancestor, property) {
+        if properties_convert.isKeyword(&value.value, Keyword.Inherit) {
+          inherit = true
+        } else if properties_convert.isKeyword(&value.value, Keyword.Unset) {
+          inherit = catalog.inherited(property)
+        } else if properties_convert.isKeyword(&value.value, Keyword.Initial) {
+          return ()
+        } else {
+          run paint_css.apply(&mut effects.*, value, node.computed.paintBasis())
+          return ()
         }
       }
       if !inherit { return () }
@@ -5519,4 +5571,23 @@ impl<'a> Backend for UiTree<'a> {
   fn range(self: &Self, id: u32) -> Option<VirtualRange> {
     return self.virtualRange(id)
   }
+}
+
+fn effectLook<'a>(node: &'a Node, state: StyleState) -> &'a [Declaration] {
+  return match state {
+    StyleState.Hover => node.hover.asSlice()
+    StyleState.Active => node.active.asSlice()
+    StyleState.Focus => node.focus.asSlice()
+    StyleState.FocusVisible => node.focusVisible.asSlice()
+    _ => node.base.asSlice()
+  }
+}
+
+fn lastEffect<'a>(declarations: &'a [Declaration], property: CssProperty) -> Option<&'a Declaration> {
+  let mut i = declarations.length
+  while i != 0 {
+    i = i - 1
+    if declarations[i].property == property { return Option<&'a Declaration>.some(&declarations[i]) }
+  }
+  return Option<&'a Declaration>.None
 }
