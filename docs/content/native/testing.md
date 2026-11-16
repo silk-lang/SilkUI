@@ -55,6 +55,42 @@ A dialog that was cancelled is the request with no paths: `"2"`.
 
 The program's own service gets the same treatment. This disk holds one file, in memory. After the test, `disk.text` is what the app saved.
 
+## The whole app, with no display
+
+The tests above run the program. A **headless run** runs the whole app: the same binary, its real window host, its fonts and its frames, with no display, no GPU and no window. Point `SILK_UI_HEADLESS` at a script and start a debug build:
+
+```sh
+SILK_UI_HEADLESS=pad.script ./build/llvm/x86_64-unknown-linux-gnu/debug/pad
+```
+
+```sh
+# pad.script
+size 640 440
+screenshot empty.png
+record typing.mp4
+type "Tide tables" --test-id note
+wait 500ms
+stop
+wait --text "Tide tables"
+screenshot edited.png
+snapshot tree.txt
+silk-ui.model
+```
+
+Each line is a command of [`ui-inspect-cli`](/native/devtools/#from-the-command-line), with the same names for nodes, run inside the app. There is no system around the app, so menus, dialogs and other parts of [the shell](/native/shell/) do nothing. A few lines are the run's own:
+
+| Line | Does |
+| --- | --- |
+| `wait 500ms`, `wait 2s` | Lets that much time pass |
+| `size 640 440`, `size 640 440 2` | Resizes the window, optionally with a device pixel ratio |
+| `record pad.mp4` ... `stop` | Records the frames in between as a 60 fps video, with ffmpeg. A name ending in `/` keeps the frames as PNG files instead |
+
+`snapshot` without a file and commands that answer with data, such as `query` or `silk-ui.model`, print to standard output. `#` starts a comment.
+
+Time in a headless run is not the clock's. Every frame moves it exactly 1/60 of a second, however long the frame took to draw, and frames are drawn on the CPU. So the same script gives the same pixels on every machine, and `wait 2s` takes as long as drawing 120 frames, often far less than two seconds. Work outside the program, such as JavaScript timers and network requests, still runs on the real clock.
+
+A command that fails, or a `wait` for a node that does not appear within 10 seconds of the run's time, stops the run: it says which line and exits with status 1. A script that reaches its end exits with 0. That makes a script a test of the real app, for CI machines without a display.
+
 ## The real window, checked
 
 The tests above cover the program. One thing they cannot cover is the window itself: that the GPU draws what the program describes.
