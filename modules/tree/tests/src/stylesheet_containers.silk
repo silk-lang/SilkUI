@@ -1,10 +1,11 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Mutation, Grid, GridTrack, GridBreadth }
 import properties.catalog { Property }
 import properties.values { Declaration }
 import properties.values
 import properties.keywords { Keyword }
 import svg_css.written
 import ui_tree.selector_tree { SelectorTree }
+import ui_tree.inspect
 import svg_css.compile { CompileError, Options }
 import svg_css.compile
 import svg_css.element { ElementTree, PseudoTarget }
@@ -13,9 +14,11 @@ import svg_css.media_features { Environment, QuerySize }
 import silk.core.option { Option }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.box { Box }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
 import silk.num.u32
+import silk.num.usize
 import ui_fixtures.fixtures as fixtures
 
 fn width(environment: Option<Environment>) -> f64 {
@@ -146,4 +149,129 @@ effect fn objectUnits() ! TreeError | CssError | OutOfMemoryError | AssertionErr
 test effect fn containerStyleObjectsAndVerticalUnitFallback() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run objectUnits() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn gridWidths(tree: &UiTree<'_>, expected: &[f32]) ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut i: usize = 0
+  while i < expected.length {
+    let info = run inspect.infoSlot(tree, tree.slotOf(usize.toU32(i) + 4))
+    run Testing.expect(match info { Option.Some { value } => value.bounds.width() == expected[i] _ => false }, "grid tracks resolve font, viewport and independent container lengths")
+    i = i + 1
+  }
+}
+
+effect fn gridUnits(sheetStyles: bool) ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  let names = ["outer", "inner", "grid"]
+  let mut i: usize = 0
+  while i < names.length {
+    let id = usize.toU32(i) + 1
+    run batch.create(id, NodeKind.Box)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy(names[i]) })
+    if i != 0 { run batch.append(id - 1, id) }
+    i = i + 1
+  }
+  run batch.root(1)
+  i = 0
+  while i < 9 {
+    let id = usize.toU32(i) + 4
+    run batch.create(id, NodeKind.Box)
+    run batch.append(3, id)
+    let height = run written.declarations(b"height:1px")
+    run batch.style(id, height.asSlice())
+    i = i + 1
+  }
+  if sheetStyles {
+    let sheet = run compile.compile(b".outer{container-type:size;width:400px;height:300px}.inner{container-type:inline-size;width:200px;height:100px}.grid{display:grid;width:1000px;grid-template-columns:10cqw 10cqh repeat(2,minmax(0,10cqi)) 10cqb 10cqmin 10cqmax 2em 10vw;font-size:10px}", &Options.make())
+    let bytes = run sheet.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  } else {
+    let outer = run written.declarations(b"container-type:size;width:400px;height:300px")
+    let inner = run written.declarations(b"container-type:inline-size;width:200px;height:100px")
+    let grid = run written.declarations(b"display:grid;width:1000px;grid-template-columns:10cqw 10cqh repeat(2,minmax(0,10cqi)) 10cqb 10cqmin 10cqmax 2em 10vw;font-size:10px")
+    run batch.style(1, outer.asSlice())
+    run batch.style(2, inner.asSlice())
+    run batch.style(3, grid.asSlice())
+  }
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  run gridWidths(&tree, &[20.0, 30.0, 20.0, 20.0, 30.0, 20.0, 30.0, 20.0, 80.0])
+  let width = run written.declarations(b"width:100px")
+  let height = run written.declarations(b"height:200px")
+  let font = run written.declarations(b"font-size:15px")
+  run batch.style(1, height.asSlice())
+  run batch.style(2, width.asSlice())
+  run batch.style(3, font.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  run gridWidths(&tree, &[10.0, 20.0, 10.0, 10.0, 20.0, 10.0, 20.0, 30.0, 80.0])
+  let smaller = FrameInput { width: 700.0, height: 500.0, scale: 1.0, time: 0.0 }
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[10.0, 20.0, 10.0, 10.0, 20.0, 10.0, 20.0, 30.0, 70.0])
+  let normal = run written.declarations(b"container-type:normal")
+  run batch.style(1, normal.asSlice())
+  run batch.style(2, normal.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[70.0, 50.0, 70.0, 70.0, 50.0, 50.0, 70.0, 30.0, 70.0])
+  let hovered = run written.declarations(b"grid-template-columns:repeat(9,5cqw)")
+  run batch.styleFor(3, StyleState.Hover, hovered.asSlice())
+  run tree.apply(run batch.take())
+  let slot = tree.slotOf(3)
+  let node = tree.nodeMut(slot)
+  node.hovered = true
+  tree.restyle(slot)
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[35.0; 9])
+  let override = run written.declarations(b"grid-template-columns:repeat(9,2em)")
+  drop run tree.setOverride(3, StyleState.Base, move override, false)
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[30.0; 9])
+  drop tree.clearOverride(3, StyleState.Base)
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[35.0; 9])
+  run batch.push(Mutation.ClearStyle { id: 3, state: StyleState.Hover })
+  run tree.apply(run batch.take())
+  run tree.frame(smaller)
+  run gridWidths(&tree, &[70.0, 50.0, 70.0, 70.0, 50.0, 50.0, 70.0, 30.0, 70.0])
+  if sheetStyles {
+    run batch.removeStyleSheet(0, 1)
+    run tree.apply(run batch.take())
+    run tree.frame(smaller)
+    run gridWidths(&tree, &[100.0; 9])
+  } else {
+    let mut explicit = Grid.make()
+    i = 0
+    while i < 9 {
+      run explicit.template.columns.tracks.append(GridTrack.breadth(GridBreadth.fixed(42.0)))
+      i = i + 1
+    }
+    run batch.push(Mutation.SetGrid { id: 3, value: run Box<Grid>.make(move explicit) })
+    run tree.apply(run batch.take())
+    run tree.frame(smaller)
+    run gridWidths(&tree, &[42.0; 9])
+    let font = run written.declarations(b"font-size:25px")
+    run batch.style(3, font.asSlice())
+    run tree.apply(run batch.take())
+    run tree.frame(smaller)
+    run gridWidths(&tree, &[42.0; 9])
+    let columns = run written.declarations(b"grid-template-columns:repeat(9,3em)")
+    run batch.style(3, columns.asSlice())
+    run tree.apply(run batch.take())
+    run tree.frame(smaller)
+    run gridWidths(&tree, &[75.0; 9])
+  }
+}
+
+test effect fn containerGridTracksUseTheFinalStyleContext() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run gridUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run gridUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
 }

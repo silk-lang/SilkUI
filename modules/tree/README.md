@@ -76,6 +76,10 @@ let records = run tree.events()
   created)`. An id is not handed out again after its node is destroyed, so an old handle fails
   and never names a newer node.
 
+Grid track lengths resolve after the node's font size and writing mode, using the current
+viewport. State looks and overrides can replace tracks. An explicit `setGrid` survives
+unrelated style changes; a later grid declaration replaces it.
+
 ## The mutation protocol
 
 A JavaScript or remote host drives the same tree with plain data. It chooses its own node, font

@@ -403,6 +403,14 @@ effect fn generatedFailed(error: CssError | OutOfMemoryError) -> Option<String>
   }
 }
 
+effect fn appendGrid(target: &mut List<Declaration>, declarations: &[Declaration]) ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if grid_css.isGridProperty(declarations[i].property) { run target.append(run values.cloneDeclaration(&declarations[i])) }
+    i = i + 1
+  }
+}
+
 fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   return match kind {
     NodeKind.Box => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
@@ -1084,14 +1092,48 @@ impl<'a> UiTree<'a> {
     return Option<List<Declaration>>.Some { value: move out }
   }
 
-  /// Installs the grid the base look's grid properties describe, replacing any earlier
-  /// template, as `Mutation.SetGrid` does.
-  effect fn styleGrid(self: &mut Self, slot: u32) -> ()
+  effect fn resolveGrid(self: &mut Self, slot: u32, computed: &Computed) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    let grid = run grid_css.gridOf(self.node(slot).base.asSlice())
-    let css = self.node(slot).css
+    let node = self.node(slot)
+    let mut declarations = List<Declaration>.make()
+    if let Option.Some { value } = node.sheetStyle() {
+      run appendGrid(&mut declarations, value.declarations.asSlice())
+      run appendGrid(&mut declarations, value.overrides.asSlice())
+    } else {
+      if !node.gridDeclared && !node.gridStyled && self.overrides.length() == 0 { return () }
+      let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+      let mut i: usize = 0
+      while i < states.length {
+        let state = states[i]
+        if style_sheets.active(&self, slot, state) {
+          let list = match state {
+            StyleState.Hover => &node.hover
+            StyleState.Active => &node.active
+            StyleState.Focus => &node.focus
+            StyleState.FocusVisible => &node.focusVisible
+            _ => &node.base
+          }
+          let replace = match self.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
+          if node.gridDeclared && !replace { run appendGrid(&mut declarations, list.asSlice()) }
+        }
+        i = i + 1
+      }
+      i = 0
+      while i < states.length {
+        if style_sheets.active(&self, slot, states[i]) {
+          if let Option.Some { value } = self.overrideOf(node.id, states[i]) { run appendGrid(&mut declarations, value.declarations.asSlice()) }
+        }
+        i = i + 1
+      }
+    }
+    let styled = declarations.length() != 0
+    if !styled && !node.gridStyled { return () }
+    let css = node.css
+    let grid = run grid_css.gridOfWith(declarations.asSlice(), &computed.unitContext())
     run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    let target = self.nodeMut(slot)
+    target.gridStyled = styled
     self.paintDirty = true
   }
 
@@ -1368,6 +1410,7 @@ impl<'a> UiTree<'a> {
           Option.None => expanded
         }
         let node = self.nodeMut(slot)
+        if grid_css.mentionsGrid(values) { node.gridDeclared = true }
         let mut i: usize = 0
         while i < values.length {
           match state {
@@ -1393,14 +1436,10 @@ impl<'a> UiTree<'a> {
           i = i + 1
         }
         self.restyle(slot)
-        if state == StyleState.Base && grid_css.mentionsGrid(values) {
-          run self.styleGrid(slot)
-        }
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
-        let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
         if node.selectorIdentity.isSome() {
           let identity = run node.identityMut()
           identity.clearCustom(state)
@@ -1425,10 +1464,9 @@ impl<'a> UiTree<'a> {
             node.starting.clear()
           }
         }
+        node.gridDeclared = grid_css.mentionsGrid(node.base.asSlice()) || grid_css.mentionsGrid(node.hover.asSlice())
+          || grid_css.mentionsGrid(node.active.asSlice()) || grid_css.mentionsGrid(node.focus.asSlice()) || grid_css.mentionsGrid(node.focusVisible.asSlice())
         self.restyle(slot)
-        if hadGrid {
-          run self.styleGrid(slot)
-        }
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
         let slot = run self.requireInput(index, id)
@@ -1818,6 +1856,9 @@ impl<'a> UiTree<'a> {
         let css = self.node(slot).css
         let grid = Box<Grid>.into(move value)
         run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        let node = self.nodeMut(slot)
+        node.gridStyled = false
+        node.gridDeclared = false
         self.paintDirty = true
       }
       Mutation.SetSource { id, resource } => {
@@ -2097,6 +2138,8 @@ impl<'a> UiTree<'a> {
       hovered: false,
       pressed: false,
       styleDirty: true,
+      gridDeclared: false,
+      gridStyled: false,
       subtreeDirty: false,
       rendered: false,
       transition: String.make(),
@@ -3940,10 +3983,6 @@ impl<'a> UiTree<'a> {
 
   effect fn installResolved(self: &mut Self, slot: u32, resolvedStyle: Resolved) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
-    let hadGrid = match self.node(slot).sheetStyle() {
-      Option.Some { value } => grid_css.mentionsGrid(value.declarations.asSlice())
-      _ => false
-    }
     let mut value = move resolvedStyle
     if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
       value.declarations = move named
@@ -3955,12 +3994,6 @@ impl<'a> UiTree<'a> {
     if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
       value.starting = Option<List<Declaration>>.some(move named)
     }
-    if hadGrid || grid_css.mentionsGrid(value.declarations.asSlice()) {
-      let grid = run grid_css.gridOf(value.declarations.asSlice())
-      let css = self.node(slot).css
-      run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
-      self.paintDirty = true
-    }
     let boxed = run Box<Resolved>.make(move value)
     let node = self.nodeMut(slot)
     node.resolvedSheet = Option<Box<Resolved>>.some(move boxed)
@@ -3969,14 +4002,9 @@ impl<'a> UiTree<'a> {
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    let hadGrid = match self.node(slot).sheetStyle() {
-      Option.Some { value } => grid_css.mentionsGrid(value.declarations.asSlice())
-      Option.None => false
-    }
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Box<Resolved>>.None
-      if hadGrid { run self.styleGrid(slot) }
       return ()
     }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
@@ -4317,6 +4345,7 @@ impl<'a> UiTree<'a> {
         self.layout.setStyle(NodeId { index: css }, computed.layout),
         layoutFailed,
       )
+      run self.resolveGrid(slot, &computed)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
