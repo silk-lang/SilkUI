@@ -4,6 +4,7 @@
 import mutation { Declaration, Value, Keyword, CssProperty, Cursor }
 import layout.lib {
   Style as CssStyle,
+  SizeContainment,
   Edges,
   Dimension,
   DimensionKind,
@@ -18,7 +19,7 @@ import properties.computed { WritingMode, Direction, VerticalAlignKind }
 import properties.convert { Context }
 import timing { TransitionLists, AnimationLists }
 import transform { Transform }
-import properties.values { Unit }
+import properties.values { Unit, Separator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
@@ -52,6 +53,9 @@ pub struct Computed {
   pub viewportHeight: f32,
   /// A declaration used a viewport unit, so the style changes when the viewport does.
   pub usesViewport: bool,
+  pub containerWidth: Option<f32>,
+  pub containerHeight: Option<f32>,
+  pub usesContainer: bool,
   /// The `transition-*` lists.
   pub transition: TransitionLists,
   /// The `animation-*` lists.
@@ -379,6 +383,31 @@ fn setColor(target: &mut Rgba<f32>, value: &Value) -> bool {
   }
 }
 
+pub fn containerDependent(declaration: &Declaration) -> bool { return hasContainerUnit(&declaration.value) }
+fn hasContainerUnit(value: &Value) -> bool {
+  match &value.* {
+    Value.Unit { unit, .. } => { return unit == Unit.Cqw || unit == Unit.Cqh || unit == Unit.Cqi || unit == Unit.Cqb || unit == Unit.Cqmin || unit == Unit.Cqmax }
+    Value.Math { values, .. } => { return anyContainerUnit(values.asSlice()) }
+    Value.Function { values, .. } => { return anyContainerUnit(values.asSlice()) }
+    Value.Sequence { values, .. } => { return anyContainerUnit(values.asSlice()) }
+    Value.Text { css } => {
+      let bytes = css.asSlice()
+      let mut i: usize = 1
+      while i + 1 < bytes.length {
+        if isDigit(bytes[i - 1]) && (bytes[i] | 32) == 99 && (bytes[i + 1] | 32) == 113 { return true }
+        i = i + 1
+      }
+      return false
+    }
+    _ => { return false }
+  }
+}
+fn anyContainerUnit(values: &[Value]) -> bool {
+  let mut i: usize = 0
+  while i < values.length { if hasContainerUnit(&values[i]) { return true } i = i + 1 }
+  return false
+}
+
 /// Whether `declaration` uses a viewport unit.
 pub fn viewportDependent(declaration: &Declaration) -> bool {
   return hasViewportUnit(&declaration.value)
@@ -400,6 +429,7 @@ impl Computed {
       viewportWidth: width,
       viewportHeight: height,
       usesViewport: false,
+      containerWidth: Option<f32>.None, containerHeight: Option<f32>.None, usesContainer: false,
       transition: TransitionLists.initial(),
       animation: AnimationLists.initial(),
       transform: Transform.initial(),
@@ -414,6 +444,8 @@ impl Computed {
   /// Applies one declaration. A value that does not fit its property is ignored, as an
   /// invalid declaration is in CSS.
   pub fn apply(self: &mut Self, declaration: &Declaration) -> () {
+    if !self.usesContainer && containerDependent(declaration) { self.usesContainer = true
+      self.usesViewport = true }
     if !self.usesViewport && hasViewportUnit(&declaration.value) {
       self.usesViewport = true
     }
@@ -499,13 +531,29 @@ impl Computed {
       self.effects.declared = true
       return ()
     }
-    let context = Context {
-      fontSize: self.text.size,
-      rootFontSize: 16.0,
-      viewportWidth: self.viewportWidth,
-      viewportHeight: self.viewportHeight,
-    }
+    let mut context = Context.make()
+    context.fontSize = self.text.size
+    context.viewportWidth = self.viewportWidth
+    context.viewportHeight = self.viewportHeight
+    context.vertical = self.text.writingMode != WritingMode.HorizontalTb
+    context.containerWidth = self.containerWidth
+    context.containerHeight = self.containerHeight
+    context.containerInlineSize = if context.vertical { self.containerHeight } else { self.containerWidth }
+    context.containerBlockSize = if context.vertical { self.containerWidth } else { self.containerHeight }
     match property {
+      CssProperty.ContainerType => {
+        if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+          if word == Keyword.Normal { self.layout.sizeContainment = SizeContainment.None }
+          if word == Keyword.Size { self.layout.sizeContainment = SizeContainment.Size }
+          if word == Keyword.InlineSize { self.layout.sizeContainment = SizeContainment.InlineSize }
+        }
+      }
+      CssProperty.Container => {
+        self.layout.sizeContainment = SizeContainment.None
+        if let Value.Sequence { separator: Separator.Slash, values } = &value.* {
+          if values.length() == 2 { self.set(CssProperty.ContainerType, &values.asSlice()[1]) }
+        }
+      }
       // Shorthands.
       CssProperty.Margin => {
         self.four(value, CssProperty.MarginTop, CssProperty.MarginRight, CssProperty.MarginBottom, CssProperty.MarginLeft)

@@ -1,0 +1,130 @@
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import properties.catalog { Property }
+import properties.values { Declaration }
+import properties.values
+import properties.keywords { Keyword }
+import svg_css.written
+import ui_tree.selector_tree { SelectorTree }
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.element { ElementTree, PseudoTarget }
+import svg_css.tokens { CssError }
+import svg_css.media_features { Environment, QuerySize }
+import silk.core.option { Option }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+import silk.num.u32
+import ui_fixtures.fixtures as fixtures
+
+fn width(environment: Option<Environment>) -> f64 {
+  if let Option<Environment>.Some { value } = environment {
+    if let Option<QuerySize>.Some { value: size } = value.querySize { return size.width }
+  }
+  return -1.0
+}
+
+effect fn selection() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("outer") })
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("inner") })
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("subject") })
+  let source = b".outer{container:outer card red currentcolor / size;width:400px;height:300px;font-size:20px}.inner{--name:ca\\72 d;container:var(--name) / inline-size;width:200px;height:100px;font-size:10px}.subject{container-name:inherit;container-type:size;width:100cqw;height:100cqh}.subject::before{content:'';width:1px;height:1px}@container (width>49cqw){.subject{border-top-width:3px}}@container (width>50cqw){.subject{border-bottom-width:4px}}@container card (width>250px){.subject{padding-top:11px}}@container card (height>250px){.subject{margin-top:13px}}@container (width>100px) and (height>250px){.subject{padding-bottom:7px}}@container card (inline-size>15em){.subject{padding-left:9px}}@container (width:200px){.subject::before{margin-left:17px}}"
+  let sheet = run compile.compile(source, &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let outer = tree.slotOf(1)
+  let inner = tree.slotOf(2)
+  let subject = tree.slotOf(3)
+  run Testing.expect(tree.node(outer).computed.layout.containsSize(true) && tree.node(outer).computed.layout.containsSize(false) && tree.node(inner).computed.layout.containsSize(true) && !tree.node(inner).computed.layout.containsSize(false), "container shorthand projects layout containment")
+  let adapter = SelectorTree { tree: &tree }
+  run Testing.expect(width(adapter.container(u32.toUsize(subject), b"card", 1, PseudoTarget.None)) == 200.0, "width query selects the nearest named eligible ancestor")
+  run Testing.expect(width(adapter.container(u32.toUsize(subject), b"card", 2, PseudoTarget.None)) == 400.0, "height query skips an inline-size-only ancestor")
+  run Testing.expect(adapter.container(u32.toUsize(subject), b"Card", 1, PseudoTarget.None).isNone(), "container names are case-sensitive")
+  run Testing.expect(width(adapter.container(u32.toUsize(inner), b"card", 1, PseudoTarget.None)) == 400.0, "ordinary elements do not query themselves")
+  // Exercise the host adapter after geometry exists. The bounded settling phase
+  // will request this restyle automatically when the recorded results change.
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  let computed = tree.node(subject).computed
+  run Testing.expect(computed.layout.width.value == 200.0 && computed.layout.height.value == 300.0 && computed.usesContainer, "physical container units select ancestors independently")
+  run Testing.expect(computed.layout.padding.top.value == 0.0, "a failed query does not try a more distant same-named container")
+  run Testing.expect(computed.paint.border.top == 3.0 && computed.paint.border.bottom == 0.0, "container units in conditions resolve on the selected container against its own ancestors")
+  run Testing.expect(computed.layout.margin.top.value == 13.0 && computed.layout.padding.bottom.value == 7.0, "one selected size container satisfies all required physical axes")
+  run Testing.expect(computed.layout.padding.left.value == 9.0, "query em values use the selected container's font size")
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  let before = tree.node(subject).identity()
+  if let Option.Some { value } = before {
+    run Testing.expect(tree.node(value.before).computed.layout.margin.left.value == 17.0, "pseudo-element queries can select their originating element")
+  }
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"outer", 3, PseudoTarget.None)) == 400.0, "all names in a container-name list participate")
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"red", 1, PseudoTarget.None)) == 400.0, "color-named containers remain identifiers")
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"currentcolor", 1, PseudoTarget.None)) == 400.0, "contextual color keywords also remain container identifiers")
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"card", 1, PseudoTarget.Before)) == 200.0, "container-name inheritance preserves the originating element's names")
+  let mut edit = Batch.make()
+  run edit.style(2, &[Declaration { property: Property.ContainerName, important: false, value: values.keyword(Keyword.None) }])
+  run tree.apply(run edit.take())
+  run tree.frame(frame)
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"card", 1, PseudoTarget.None)) == 400.0, "removing a nearer name exposes the next named eligible ancestor")
+  run Testing.expect(tree.node(subject).computed.layout.padding.top.value == 11.0, "descendant query styles follow a container-name change")
+}
+
+test effect fn containerSelectionUsesNamesAxesPseudoOriginsAndLastLayout() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run selection() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn objectUnits() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  let outer = run written.declarations(b"container:red / size;width:400px;height:300px")
+  let inner = run written.declarations(b"container-type:inline-size;width:200px;height:100px")
+  let subject = run written.declarations(b"width:100cqi;height:100cqb;writing-mode:vertical-rl")
+  run batch.style(1, outer.asSlice())
+  run batch.style(2, inner.asSlice())
+  run batch.style(3, subject.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  tree.stylesDirty = true
+  run tree.frame(frame)
+  let slot = tree.slotOf(3)
+  let computed = tree.node(slot).computed
+  run Testing.expect(computed.layout.width.value == 300.0 && computed.layout.height.value == 200.0, "style-object logical units follow the subject writing mode and independently selected physical ancestors")
+  run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(slot), b"red", 3, PseudoTarget.None)) == 400.0, "style objects install container shorthand names and type")
+  let mut edit = Batch.make()
+  let normal = run written.declarations(b"container-type:normal")
+  run edit.style(1, normal.asSlice())
+  run edit.style(2, normal.asSlice())
+  run tree.apply(run edit.take())
+  run tree.frame(frame)
+  let fallback = tree.node(slot).computed
+  run Testing.expect(fallback.layout.width.value == 600.0 && fallback.layout.height.value == 800.0, "missing containers fall back to the subject's logical viewport axes")
+  run tree.frame(FrameInput { width: 700.0, height: 500.0, scale: 1.0, time: 0.0 })
+  let resized = tree.node(slot).computed
+  run Testing.expect(resized.layout.width.value == 500.0 && resized.layout.height.value == 700.0, "container-unit fallbacks invalidate when the viewport changes")
+}
+test effect fn containerStyleObjectsAndVerticalUnitFallback() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run objectUnits() |> Effect.provideMut<Allocator>(&mut allocator)
+}

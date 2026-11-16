@@ -4,6 +4,7 @@ import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as St
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import style_inherit
 import generated
+import containers
 import style_media { Preferences }
 import properties.convert as properties_convert
 import properties.catalog
@@ -487,13 +488,16 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
   ? &mut Allocator {
   let items = list.asSlice()
 
-  // Font size first: `em` lengths in the same patch refer to it.
+  let dependencies = [CssProperty.WritingMode, CssProperty.Direction, CssProperty.FontSize]
+  let mut dependency: usize = 0
   let mut i: usize = 0
-  while i < items.length {
-    if items[i].property == CssProperty.FontSize {
-      computed.apply(&items[i])
+  while dependency < dependencies.length {
+    i = 0
+    while i < items.length {
+      if items[i].property == dependencies[dependency] { computed.apply(&items[i]) }
+      i = i + 1
     }
-    i = i + 1
+    dependency = dependency + 1
   }
   i = 0
   while i < items.length {
@@ -508,7 +512,7 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
       run stops.read(text.asSlice())
       run timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice(), &mut stops)
     } else if run applyWritten(&mut computed, &items[i]) {
-    } else if property != CssProperty.FontSize {
+    } else if property != CssProperty.FontSize && property != CssProperty.WritingMode && property != CssProperty.Direction {
       computed.apply(&items[i])
     }
     i = i + 1
@@ -520,6 +524,12 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
 pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if declaration.property == CssProperty.Container {
+    if let Option<Value>.Some { value } = move run containers.typeOf(declaration) {
+      computed.apply(&Declaration { property: CssProperty.ContainerType, important: declaration.important, value: move value })
+    }
+    return true
+  }
   if run font_features.apply(&mut computed.text, declaration) {
     return true
   }
@@ -4096,10 +4106,12 @@ impl<'a> UiTree<'a> {
         let events = node.computed.paint.pointerEvents
         let shadow = node.computed.effects
         let wasRendered = node.rendered
-        run self.resolve(slot)
+        let containment = node.computed.layout.sizeContainment
+        let namesChanged = run self.resolve(slot)
         run self.syncGenerated(slot)
         let after = &self.node(slot).computed
         changed = full || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+          || namesChanged || containment != after.layout.sizeContainment
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
@@ -4135,7 +4147,7 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  effect fn resolve(self: &mut Self, slot: u32) -> ()
+  effect fn resolve(self: &mut Self, slot: u32) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
@@ -4147,6 +4159,12 @@ impl<'a> UiTree<'a> {
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let node = self.node(slot)
     let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
+    if containers.usesUnits(&self, slot) {
+      computed.containerWidth = containers.physicalUnit(&self, slot, true)
+      computed.containerHeight = containers.physicalUnit(&self, slot, false)
+      computed.usesContainer = true
+      computed.usesViewport = true
+    }
 
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
@@ -4293,12 +4311,23 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
     }
+    let mut namesChanged = false
+    if kind != NodeKind.Text {
+      let names = run containers.names(&self, slot)
+      namesChanged = !containers.sameNames(&self, slot, names.asSlice())
+      if names.length() != 0 || self.node(slot).identity().isSome() {
+        let node = self.nodeMut(slot)
+        let identity = run node.identityMut()
+        identity.containerNames = move names
+      }
+    }
     if kind == NodeKind.Icon && sizeChanged {
       run self.updateNatural(slot)
     }
     if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
       run rich.styleRuns(&mut self, slot)
     }
+    return namesChanged
   }
 
   /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
