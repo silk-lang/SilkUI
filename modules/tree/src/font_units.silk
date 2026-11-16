@@ -1,5 +1,17 @@
 //! Font bases shared by the typed length converter and parsed paint grammars.
 import engine { UiTree }
+import engine
+import node { NONE }
+import mutation { NodeKind, StyleState }
+import style_sheets
+import style_inherit
+import font_features
+import properties.catalog { Property }
+import properties.values { Declaration }
+import properties.keywords { Keyword }
+import properties.convert
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import style { Computed, TextStyle }
 import paint_css { Basis }
 import properties.convert { Context, FontMetrics }
@@ -41,4 +53,113 @@ pub fn context(tree: &UiTree<'_>, slot: u32, computed: &Computed, key: usize) ->
 
 pub fn paintBasis(tree: &UiTree<'_>, slot: u32, computed: &Computed, key: usize) -> Basis {
   return Basis { units: context(tree, slot, computed, key), color: computed.text.color }
+}
+
+
+pub fn phase(property: Property) -> u32 {
+  return match property {
+    Property.WritingMode | Property.Direction | Property.TextOrientation => 1
+    Property.FontSize | Property.FontFamily | Property.FontStyle | Property.FontWeight
+      | Property.FontWidth | Property.FontStretch | Property.FontVariant
+      | Property.FontVariantLigatures | Property.FontVariantCaps | Property.FontVariantNumeric
+      | Property.FontVariantPosition | Property.FontKerning | Property.FontFeatureSettings => 2
+    Property.LineHeight => 3
+    _ => 0
+  }
+}
+
+pub effect fn declarations(computed: &mut Computed, list: &List<Declaration>, parent: &Computed,
+  units: &Context, pass: u32) ! OutOfMemoryError ? &mut Allocator {
+  let items = list.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    let declaration = &items[i]
+    if phase(declaration.property) == pass {
+      if convert.isKeyword(&declaration.value, Keyword.Initial) {
+        run engine.applyInitial(&mut computed.*, declaration.property)
+      } else if convert.isKeyword(&declaration.value, Keyword.Inherit) {
+        drop style_inherit.apply(&mut computed.*, parent, declaration.property)
+      } else if !run font_features.apply(&mut computed.text, declaration) {
+        computed.applyIn(declaration, units)
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn nodePass(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, parent: &Computed,
+  units: &Context, pass: u32, overridesOnly: bool) ! OutOfMemoryError ? &mut Allocator {
+  let node = tree.node(slot)
+  if let Option.Some { value } = node.sheetStyle() {
+    if !overridesOnly { run declarations(&mut computed.*, &value.declarations, parent, units, pass) }
+    run declarations(&mut computed.*, &value.overrides, parent, units, pass)
+    return ()
+  }
+  if node.kind == NodeKind.Text { return () }
+  let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+  let mut i: usize = 0
+  if !overridesOnly {
+    while i < states.length {
+      let state = states[i]
+      if style_sheets.active(tree, slot, state) {
+        let replace = match tree.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
+        if !replace {
+          let client = match state {
+            StyleState.Hover => &node.hover
+            StyleState.Active => &node.active
+            StyleState.Focus => &node.focus
+            StyleState.FocusVisible => &node.focusVisible
+            _ => &node.base
+          }
+          run declarations(&mut computed.*, client, parent, units, pass)
+        }
+      }
+      i = i + 1
+    }
+  }
+  if tree.styleOverrides().length == 0 { return () }
+  i = 0
+  while i < states.length {
+    if style_sheets.active(tree, slot, states[i]) {
+      if let Option.Some { value } = tree.overrideOf(node.id, states[i]) {
+        run declarations(&mut computed.*, &value.declarations, parent, units, pass)
+      }
+    }
+    i = i + 1
+  }
+}
+
+/// Font-size uses the parent's font and the root's initial font when resolving
+/// the root itself; lh in font-size and line-height uses the parent's line height.
+pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, computed: &mut Computed, overridesOnly: bool) -> Context
+  ! OutOfMemoryError ? &mut Allocator {
+  let parentSlot = tree.node(slot).parent
+  let parent = if parentSlot == NONE { Computed.inheriting(TextStyle.initial()) } else { tree.node(parentSlot).computed }
+  let parentKey = if parentSlot == NONE { run tree.fontKeyOf(parent.text) } else { tree.node(parentSlot).fontKey }
+  let mut inherited = computed.unitContext()
+  inherited.fontSize = parent.text.size
+  inherited.fontMetrics = Option<FontMetrics>.some(metrics(&tree.*, parent.text, parentKey))
+  if slot == tree.root {
+    inherited.rootFontSize = parent.text.size
+    inherited.rootFontMetrics = inherited.fontMetrics
+  } else {
+    let root = tree.node(tree.root)
+    inherited.rootFontSize = root.computed.text.size
+    inherited.rootFontMetrics = Option<FontMetrics>.some(metrics(&tree.*, root.computed.text, root.fontKey))
+  }
+  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 1, overridesOnly)
+  inherited.vertical = computed.unitContext().vertical
+  run nodePass(&tree.*, slot, &mut computed.*, &parent, &inherited, 2, overridesOnly)
+  let key = run tree.fontKeyOf(computed.text)
+  let mut line = context(&tree.*, slot, &computed.*, key)
+  let mut lineMetrics = line.metrics()
+  lineMetrics.lineHeight = inherited.metrics().lineHeight
+  line.fontMetrics = Option<FontMetrics>.some(lineMetrics)
+  if slot == tree.root {
+    let mut rootMetrics = line.rootMetrics()
+    rootMetrics.lineHeight = inherited.rootMetrics().lineHeight
+    line.rootFontMetrics = Option<FontMetrics>.some(rootMetrics)
+  }
+  run nodePass(&tree.*, slot, &mut computed.*, &parent, &line, 3, overridesOnly)
+  return context(&tree.*, slot, &computed.*, key)
 }

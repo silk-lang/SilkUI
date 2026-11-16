@@ -11,6 +11,7 @@ import style_change { Change }
 import container_watch { Watch }
 import style_media { Preferences }
 import properties.convert as properties_convert
+import properties.convert { Context }
 import properties.catalog
 import svg_css.written as css_written
 import properties.keywords { Keyword }
@@ -437,7 +438,7 @@ effect fn invalidInitial(error: CssError) -> Value {
   return values.keyword(Keyword.Initial)
 }
 
-effect fn applyInitial(computed: &mut Computed, property: CssProperty) -> ()
+pub effect fn applyInitial(computed: &mut Computed, property: CssProperty) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   let mut initial = Computed.inViewport(TextStyle.initial(), computed.viewportWidth, computed.viewportHeight)
   // Start with native initial representations for values such as font-size:
@@ -498,6 +499,47 @@ pub effect fn applyResolved(computed: &mut Computed, list: &List<Declaration>, p
   }
 }
 
+/// Applies non-font declarations after the node's font dependencies have resolved.
+pub effect fn applyUsing(computed: &mut Computed, list: &List<Declaration>, parent: &Computed,
+  stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
+  let items = list.asSlice()
+  let mut pass: u32 = 0
+  while pass < 2 {
+    let mut i: usize = 0
+    while i < items.length {
+      let declaration = &items[i]
+      let property = declaration.property
+      if font_units.phase(property) == 0 && (property == CssProperty.Color) == (pass == 0) {
+        if properties_convert.isKeyword(&declaration.value, Keyword.Initial) {
+          run applyInitial(&mut computed.*, property)
+        } else if properties_convert.isKeyword(&declaration.value, Keyword.Inherit) {
+          if paint_css.handles(property) { computed.effects.declared = true }
+          drop style_inherit.apply(&mut computed.*, parent, property)
+        } else {
+          let which = transitionList(property)
+          if which != NONE {
+            let text = run values.cssText(&declaration.value)
+            run stops.read(text.asSlice())
+            run motion.declare(&mut computed.transition, which, text.asSlice(), &mut stops)
+          } else if animationList(property) != NONE {
+            let text = run values.cssText(&declaration.value)
+            run stops.read(text.asSlice())
+            run timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice(), &mut stops)
+          } else if property == CssProperty.Container {
+            if let Option.Some { value } = move run containers.typeOf(declaration) {
+              computed.applyIn(&Declaration { property: CssProperty.ContainerType, important: declaration.important, value: move value }, units)
+            }
+          } else if !run applyTransformIn(&mut computed.*, declaration, units) {
+            computed.applyIn(declaration, units)
+          }
+        }
+      }
+      i = i + 1
+    }
+    pass = pass + 1
+  }
+}
+
 pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops: &mut EasingStops) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -555,20 +597,18 @@ pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -
 pub effect fn applyTransform(computed: &mut Computed, declaration: &Declaration) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  let units = computed.unitContext()
+  return run applyTransformIn(&mut computed.*, declaration, &units)
+}
+
+pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaration, context: &Context) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
   let which = transformProperty(declaration.property)
   if which == NONE {
     return false
   }
   let text = run values.cssText(&declaration.value)
-  let units = transform.Units {
-    fontSize: computed.text.size,
-    rootFontSize: 16.0,
-    viewportWidth: computed.viewportWidth,
-    viewportHeight: computed.viewportHeight,
-    containerWidth: computed.containerWidthBasis(),
-    containerHeight: computed.containerHeightBasis(),
-    vertical: computed.text.writingMode != WritingMode.HorizontalTb,
-  }
+  let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
   if !computed.usesViewport && style.viewportDependent(declaration) {
     computed.usesViewport = true
@@ -4228,7 +4268,7 @@ impl<'a> UiTree<'a> {
       inherited = self.node(parent).computed.text
     }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
-    let node = self.node(slot)
+    let initialNode = self.node(slot)
     let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
     if containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
@@ -4241,10 +4281,10 @@ impl<'a> UiTree<'a> {
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
     }
-    computed.layout.display = defaultDisplay(if node.isGenerated() { NodeKind.Text } else { node.kind })
-    if node.kind == NodeKind.Input {
+    computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
+    if initialNode.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
-      if node.edit().multiline {
+      if initialNode.edit().multiline {
         computed.apply(&declare.whiteSpace(WhiteSpace.PreWrap))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Auto
@@ -4254,43 +4294,45 @@ impl<'a> UiTree<'a> {
         computed.layout.overflowY = Overflow.Hidden
       }
     }
-    if node.transition.ownedByteLength() != 0 {
-      run stops.read(String.utf8Bytes(String.view(&node.transition)))
-      run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&node.transition)), &mut stops)
+    if initialNode.transition.ownedByteLength() != 0 {
+      run stops.read(String.utf8Bytes(String.view(&initialNode.transition)))
+      run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&initialNode.transition)), &mut stops)
     }
     // The user agent's `:focus-visible { outline: auto }`, under every look the app sets, so
     // `outline: none` or another outline in any of them replaces it, as in a browser.
-    if self.focused == slot && node.kind != NodeKind.Text && (self.focusVisible || node.kind == NodeKind.Input) {
+    if self.focused == slot && initialNode.kind != NodeKind.Text && (self.focusVisible || initialNode.kind == NodeKind.Input) {
       computed.outline.auto = true
       computed.outline.width = FOCUS_RING_WIDTH
     }
+    let units = run font_units.prepare(&mut self, slot, &mut computed, false)
+    let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+    let node = self.node(slot)
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
-      run applyResolved(&mut computed, &value.declarations, &parentStyle, &mut stops)
+      run applyUsing(&mut computed, &value.declarations, &parentStyle, &mut stops, &units)
     } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
-      run applyAll(&mut computed, &node.base, &mut stops)
+      run applyUsing(&mut computed, &node.base, &parentStyle, &mut stops, &units)
       if node.hovered {
-        run applyAll(&mut computed, &node.hover, &mut stops)
+        run applyUsing(&mut computed, &node.hover, &parentStyle, &mut stops, &units)
       }
       if node.pressed {
-        run applyAll(&mut computed, &node.active, &mut stops)
+        run applyUsing(&mut computed, &node.active, &parentStyle, &mut stops, &units)
       }
       if self.focused == slot {
-        run applyAll(&mut computed, &node.focus, &mut stops)
+        run applyUsing(&mut computed, &node.focus, &parentStyle, &mut stops, &units)
         if self.focusVisible || node.kind == NodeKind.Input {
-          run applyAll(&mut computed, &node.focusVisible, &mut stops)
+          run applyUsing(&mut computed, &node.focusVisible, &parentStyle, &mut stops, &units)
         }
       }
     } else if node.kind != NodeKind.Text {
-      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base, &mut stops)
+      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base, &mut stops, &parentStyle, &units)
       if node.hovered {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover, &mut stops)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover, &mut stops, &parentStyle, &units)
       }
       if node.pressed {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active, &mut stops)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active, &mut stops, &parentStyle, &units)
       }
       if self.focused == slot {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus, &mut stops)
+        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus, &mut stops, &parentStyle, &units)
         if self.focusVisible || node.kind == NodeKind.Input {
           run self.applyOverridden(
             &mut computed,
@@ -4298,6 +4340,8 @@ impl<'a> UiTree<'a> {
             StyleState.FocusVisible,
             &node.focusVisible,
             &mut stops,
+            &parentStyle,
+            &units,
           )
         }
       }
@@ -4345,11 +4389,12 @@ impl<'a> UiTree<'a> {
       }
     }
     if kind != NodeKind.Text && !self.node(slot).isGenerated() && self.overrides.length() != 0 {
+      let finalUnits = run font_units.prepare(&mut self, slot, &mut computed, true)
       let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
       let node = self.node(slot)
       if let Option<&Resolved>.Some { value } = node.sheetStyle() {
         let parentStyle = style_sheets.parentStyle(&self, slot)
-        run applyResolved(&mut computed, &value.overrides, &parentStyle, &mut finalStops)
+        run applyUsing(&mut computed, &value.overrides, &parentStyle, &mut finalStops, &finalUnits)
       } else {
         let mut declarations = List<Declaration>.make()
         let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
@@ -4366,7 +4411,7 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        run applyAll(&mut computed, &declarations, &mut finalStops)
+        run applyUsing(&mut computed, &declarations, &parentStyle, &mut finalStops, &finalUnits)
       }
       self.easingStops = move finalStops
     }
@@ -4580,12 +4625,14 @@ impl<'a> UiTree<'a> {
     state: StyleState,
     client: &List<Declaration>,
     stops: &mut EasingStops,
+    parent: &Computed,
+    units: &Context,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let at = self.overrideIndex(id, state)
     if at == usize.MAX {
-      run applyAll(&mut computed, client, &mut stops)
+      run applyUsing(&mut computed, client, parent, &mut stops, units)
       return ()
     }
     let laid = &self.overrides.asSlice()[at]
@@ -4604,7 +4651,7 @@ impl<'a> UiTree<'a> {
       run css.set(&mut merged, &over[j])
       j = j + 1
     }
-    run applyAll(&mut computed, &merged, &mut stops)
+    run applyUsing(&mut computed, &merged, parent, &mut stops, units)
   }
 
   /// Whether node `id` has an override in `state`. Costs nothing while there are none.

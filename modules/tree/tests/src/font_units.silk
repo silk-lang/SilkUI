@@ -1,4 +1,4 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState }
 import ui_tree.inspect
 import ui_fixtures.fixtures as fixtures
 import svg_css.compile { CompileError, Options }
@@ -17,6 +17,14 @@ import silk.num.usize
 fn close(a: f32, b: f32) -> bool { return f32.abs(a - b) < 0.02 }
 
 effect fn tracks(tree: &UiTree<'_>, expected: &[f32]) ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let computed = tree.node(tree.slotOf(3)).computed
+  run Testing.expect(close(computed.layout.height.value, 2.0 * expected[8])
+    && close(computed.layout.padding.top.value, expected[4]) && close(computed.layout.padding.right.value, expected[2])
+    && close(computed.layout.padding.bottom.value, expected[6]) && close(computed.layout.padding.left.value, expected[3])
+    && close(computed.layout.margin.top.value, expected[1]) && close(computed.layout.margin.bottom.value, expected[9]), "ordinary lengths use the same measured element and root bases as grid tracks")
+  run Testing.expect(computed.transform.list.count == 1 && close(computed.transform.list.op(0).x, expected[2])
+    && close(computed.transform.list.op(0).y, expected[8]) && close(computed.transform.translate.x, expected[7])
+    && close(computed.transform.translate.y, expected[9]) && close(computed.transform.perspective, 2.0 * expected[6]), "transforms resolve font and root metric units through the shared length converter")
   let mut i: usize = 0
   while i < expected.length {
     let bounds = run inspect.infoSlot(tree, tree.slotOf(usize.toU32(i) + 4))
@@ -59,16 +67,16 @@ effect fn measuredUnits(sheet: bool) ! TreeError | CompileError | CssError | Out
   run batch.create(3, NodeKind.Box)
   run batch.append(2, 3)
   run batch.attribute(3, Attribute.ClassName { value: run String.copy("grid") })
-  let root = run written.declarations(b"font-family:'Noto Sans';font-size:30px;line-height:42px;text-shadow:1rem 1rlh red")
+  let root = run written.declarations(b"font-family:'Noto Sans';font-size:30px;line-height:42px;padding-bottom:1rlh;min-width:1rem;text-shadow:1rem 1rlh red")
   let barrier = run written.declarations(b"font-size:10px;line-height:20px")
   run batch.style(1, root.asSlice())
   run batch.style(2, barrier.asSlice())
   if sheet {
-    let compiled = run compile.compile(b".grid{display:grid;width:1000px;font-size:20px;line-height:28px;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh}", &Options.make())
+    let compiled = run compile.compile(b".grid{display:grid;width:1000px;font-size:2em;line-height:28px;height:2lh;padding:1ex 1ch 1cap 1rch;margin-top:1rem;margin-bottom:1rlh;transform:translate(1ch,1lh);translate:1rcap 1rlh;perspective:2cap;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh}", &Options.make())
     let bytes = run compiled.encode()
     run batch.adoptStyleSheet(0, 1, bytes.asSlice())
   } else {
-    let style = run written.declarations(b"display:grid;width:1000px;font-size:20px;line-height:28px;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh")
+    let style = run written.declarations(b"display:grid;width:1000px;font-size:2em;line-height:28px;height:2lh;padding:1ex 1ch 1cap 1rch;margin-top:1rem;margin-bottom:1rlh;transform:translate(1ch,1lh);translate:1rcap 1rlh;perspective:2cap;grid-template-columns:1em 1rem 1ch 1rch 1ex 1rex 1cap 1rcap 1lh 1rlh 1ic 1ric;filter:blur(1cap);text-shadow:1ch 1lh 1rcap red;background-size:25% 1rlh")
     run batch.style(3, style.asSlice())
   }
   let mut id: u32 = 4
@@ -83,6 +91,8 @@ effect fn measuredUnits(sheet: bool) ! TreeError | CompileError | CssError | Out
     run Testing.expect(value.shadows.length() == 1 && close(value.shadows.asSlice()[0].x, 30.0)
       && close(value.shadows.asSlice()[0].y, 42.0), "root paint uses its newly computed root font and line height on the first frame")
   } else { run Testing.expect(false, "root shadow is present") }
+  let rootComputed = tree.node(tree.slotOf(1)).computed
+  run Testing.expect(close(rootComputed.layout.minWidth.value, 30.0) && close(rootComputed.layout.padding.bottom.value, 42.0), "root lengths use its new font and line height on the first frame")
   let previousHash = tree.node(tree.slotOf(3)).computed.effects.hash
   let largerRoot = run written.declarations(b"font-size:40px;line-height:50px")
   run batch.style(1, largerRoot.asSlice())
@@ -118,9 +128,34 @@ effect fn measuredUnits(sheet: bool) ! TreeError | CompileError | CssError | Out
   run tree.apply(run batch.take())
   run tree.frame(frame)
   run paint(&tree, 20, 12.0, 24.0, 14.2, 28.4, 70.0)
+  let hover = run written.declarations(b"font-size:3em;line-height:2lh")
+  run batch.styleFor(3, StyleState.Hover, hover.asSlice())
+  run tree.apply(run batch.take())
+  let subject = tree.slotOf(3)
+  let subjectNode = tree.nodeMut(subject)
+  subjectNode.hovered = true
+  tree.restyleLocal(subject)
+  run tree.frame(frame)
+  run Testing.expect(close(tree.node(subject).computed.text.size, 30.0), "relative font-size in a state look uses the parent instead of multiplying the base look")
+  run tracks(&tree, &[30.0, 40.0, 18.0, 24.0, 15.9, 21.2, 21.3, 28.4, 40.0, 70.0, 30.0, 40.0])
+  run batch.create(21, NodeKind.Box)
+  run batch.append(3, 21)
+  let ownFont = run written.declarations(b"font-family:'Noto Sans';font-size:2ch;line-height:1lh;width:1em;height:1lh;padding-right:1ch")
+  run batch.style(21, ownFont.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  let child = tree.node(tree.slotOf(21)).computed
+  run Testing.expect(close(child.text.size, 36.0) && close(child.layout.width.value, 36.0)
+    && close(child.layout.height.value, 40.0) && close(child.layout.padding.right.value, 20.592), "font-size uses parent metrics while ordinary lengths use the newly selected own font")
+  let rootRelative = run written.declarations(b"font-size:2rem")
+  run batch.style(1, rootRelative.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  let resizedRoot = tree.node(tree.slotOf(1)).computed
+  run Testing.expect(close(resizedRoot.text.size, 32.0) && close(resizedRoot.layout.minWidth.value, 32.0), "root font-size rem uses the initial root size, then root lengths use the resulting size")
 }
 
-test effect fn fontMetricsDriveGridAndPaintThroughRootChanges() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+test effect fn fontMetricsDriveLengthsTransformsGridAndPaintThroughRootChanges() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run measuredUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run measuredUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
