@@ -115,7 +115,7 @@ On `web-dom`, the browser implements CSS. Window and canvas targets use the tree
 - Generated pseudo-elements and part styling, container queries and container units are not implemented yet.
 - Use the app's font-loading API for fonts. Sheet `@font-face` loading and nested `@import` loading are not implemented on tree targets. Font-metric units and some compound value grammars also remain incomplete.
 - Unknown properties, vendor selectors and other dropped features produce compiler diagnostics. Vite's `strictStylesheets: true` option can turn diagnostics into a build failure. Tailwind preflight includes browser-specific form-control rules that the tree drops.
-- Sheet changes and relevant node changes currently restyle the root. Repeated cascade results and identical custom-property scopes, including registered defaults, are shared within each style pass; matching caches and narrower invalidation are still being developed. Style-object-only roots retain their existing path.
+- Local class and pointer-state changes restyle the affected subtree when selector dependencies allow it. Ancestor and sibling dependencies, custom-property inputs, display changes, and other mutations conservatively restyle the root. Identical variable scopes, including registered defaults, survive partial passes; inline custom properties or scope-cache pressure require a full reset. Repeated cascade results are shared within each pass. Per-node resolved storage and matching caches are still being developed. Style-object-only roots retain their existing path.
 
 The tree's property coverage suite checks the supported declarations through both style objects and compiled sheets. A stylesheet does not add rendering support for a property the tree does not yet implement.
 

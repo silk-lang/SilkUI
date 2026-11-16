@@ -1,0 +1,207 @@
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Input, StyleState, BUTTON_PRIMARY }
+import font_collection.lib { FontCollection }
+import svg_css.compile { Options, CompileError }
+import svg_css.compile
+import svg_css.tokens { CssError }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn frame() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
+fn width(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.width.value }
+fn height(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.height.value }
+fn opacity(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.paint.opacity }
+fn scope(tree: &UiTree<'_>, id: u32) -> usize {
+  return match tree.node(tree.slotOf(id)).sheetStyle() { Option.Some { value } => value.scope.index _ => 999999 }
+}
+
+effect fn node(batch: &mut Batch, id: u32, parent: u32, classes: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  run batch.create(id, NodeKind.Box)
+  if parent == 0 { run batch.root(id) } else { run batch.append(parent, id) }
+  run batch.attribute(id, Attribute.ClassName { value: run String.copy(classes) })
+}
+
+effect fn sheet(batch: &mut Batch, source: &[u8]) -> () ! CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let compiled = run compile.compile(source, &Options.make())
+  let bytes = run compiled.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+}
+
+effect fn localChanges() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "row")
+  run node(&mut batch, 3, 1, "row")
+  run node(&mut batch, 4, 2, "leaf")
+  run sheet(&mut batch, b"@property --unit{syntax:'<length>';inherits:false;initial-value:10px}.host{display:block;width:400px;height:300px}.row{display:block;width:100px;height:50px;--unit:10px}.wide{width:120px}.leaf{width:inherit;height:var(--unit)}.row:hover{opacity:.5}.row:active{opacity:.25}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  let rowScope = scope(&tree, 2)
+  let leafScope = scope(&tree, 4)
+  let mut wide = false
+  let mut i: usize = 0
+  while i < 200 {
+    wide = !wide
+    run batch.attribute(2, Attribute.ClassName { value: run String.copy(if wide { "row wide" } else { "row" }) })
+    run tree.apply(run batch.take())
+    run Testing.expect(!tree.stylesDirty && tree.stylesPending && !tree.node(tree.slotOf(3)).styleDirty, "a local class change does not dirty the root or sibling")
+    run tree.frame(frame())
+    let expected: f32 = if wide { 120.0 } else { 100.0 }
+    run Testing.expect(width(&tree, 2) == expected && width(&tree, 4) == expected, "partial restyles propagate explicit inheritance of non-text properties")
+    run Testing.expect(height(&tree, 4) == 10.0 && scope(&tree, 2) == rowScope && scope(&tree, 4) == leafScope
+      && tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "repeated ordinary class changes retain registered variable scopes")
+    i = i + 1
+  }
+  run tree.dispatch(Input.PointerMove { x: 20.0, y: 20.0, modifiers: 0 })
+  run Testing.expect(!tree.stylesDirty && tree.stylesPending && !tree.node(tree.slotOf(1)).styleDirty, "hover dirties only nodes with candidate state dependencies")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 0.5 && opacity(&tree, 3) == 1.0, "local hover applies without changing the sibling")
+  run tree.dispatch(Input.PointerDown { x: 20.0, y: 20.0, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 })
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 0.25, "active state uses the same incremental path")
+  run tree.dispatch(Input.PointerUp { x: 20.0, y: 20.0, button: BUTTON_PRIMARY, modifiers: 0 })
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 0.5, "release restores hover")
+  run tree.dispatch(Input.PointerMove { x: 350.0, y: 250.0, modifiers: 0 })
+  run tree.frame(frame())
+  run tree.dispatch(Input.PointerMove { x: 360.0, y: 250.0, modifiers: 0 })
+  run Testing.expect(!tree.stylesDirty && !tree.stylesPending && opacity(&tree, 2) == 1.0, "pointer movement over plain nodes does no stylesheet work")
+}
+
+test effect fn stylesheetLocalClassesAndPointerStatesRetainScopes() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run localChanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn relationalChanges() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "row eligible")
+  run node(&mut batch, 3, 1, "row eligible")
+  run node(&mut batch, 4, 1, "row eligible")
+  run sheet(&mut batch, b".host{display:block;width:400px;height:300px}.row{width:100px;height:50px}.selected+.row{width:130px}.row:nth-child(2 of .eligible){height:25px}.host:has(.selected){opacity:.5}.row:nth-last-child(1 of :hover){opacity:.25}.host:has(.row:hover){opacity:.75}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 25.0, "initial nth-of membership")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("row eligible selected") })
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.stylesDirty, "sibling and has dependencies require conservative root invalidation")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 130.0 && opacity(&tree, 1) == 0.5, "class changes update siblings and ancestors")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("row selected") })
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.stylesDirty, "changing a filtered nth-child member dirties siblings")
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 50.0 && height(&tree, 4) == 25.0, "nth-of filtering recomputes the affected sibling positions")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("row") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 100.0 && opacity(&tree, 1) == 1.0, "removing a relational class clears prior matches")
+  run tree.dispatch(Input.PointerMove { x: 20.0, y: 20.0, modifiers: 0 })
+  run Testing.expect(tree.stylesDirty, "state changes inside has and nth-of invalidate outside the hovered subtree")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 0.25 && opacity(&tree, 1) == 0.75, "relational hover updates sibling filtering and the ancestor")
+  run tree.dispatch(Input.PointerMove { x: 20.0, y: 70.0, modifiers: 0 })
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 1.0 && opacity(&tree, 3) == 0.25, "moving between siblings updates the filtered hover subject")
+  run tree.dispatch(Input.PointerLeave)
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 1) == 1.0 && opacity(&tree, 3) == 1.0, "leaving clears relational state matches")
+}
+
+test effect fn stylesheetInvalidationReachesSiblingsAncestorsAndNthFilters() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run relationalChanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn descendantsAndVariables() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "group")
+  run node(&mut batch, 3, 2, "leaf")
+  run sheet(&mut batch, b".host{display:block;width:400px;height:300px}.group{width:200px;height:100px;--v:10px}.leaf{width:50px;height:var(--v)}.hot .leaf{width:70px}.group:hover .leaf{width:80px}.variable{--v:23px}.hidden{display:none}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("group hot") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty, "ordinary descendant selectors stay within the changed subtree")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 70.0, "descendant class dependencies restyle children")
+  run tree.dispatch(Input.PointerMove { x: 20.0, y: 20.0, modifiers: 0 })
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 80.0, "an ancestor's state invalidates descendant rules even when it has no own hover rule")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("group hot variable") })
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.stylesDirty, "custom-property candidate changes start a new scope epoch")
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 23.0, "inherited variables update after a full scope reset")
+  run batch.customProperty(2, StyleState.Hover, "--v", Option<string>.some("31px"), false)
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 31.0 && !tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "inline state variables bypass scope retention")
+  run tree.dispatch(Input.PointerLeave)
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 23.0, "leaving an inline variable state restores the sheet scope")
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("leaf hidden") })
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.stylesDirty, "display changes retain the full starting-style path")
+  run tree.frame(frame())
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("leaf") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(tree.node(tree.slotOf(3)).rendered && height(&tree, 3) == 23.0, "reentry uses current inherited variables")
+}
+
+test effect fn stylesheetPartialRestylesPreserveDescendantsAndVariableEpochs() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run descendantsAndVariables() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pressureFallback() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  let mut id: u32 = 2
+  while id <= 300 {
+    run node(&mut batch, id, id / 2, "branch")
+    id = id + 1
+  }
+  run sheet(&mut batch, b"@property --unit{syntax:'<length>';inherits:false;initial-value:3px}.host{--unit:99px}.branch{width:100px;height:var(--unit)}.branch:nth-child(even){--unit:3px}.wide{width:120px}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  let initial = scope(&tree, 300)
+  run Testing.expect(!tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "distinct parent scopes exhaust the bounded scope cache")
+  let mut wide = false
+  let mut i: usize = 0
+  while i < 20 {
+    wide = !wide
+    run batch.attribute(300, Attribute.ClassName { value: run String.copy(if wide { "branch wide" } else { "branch" }) })
+    run tree.apply(run batch.take())
+    run tree.frame(frame())
+    let expected: f32 = if wide { 120.0 } else { 100.0 }
+    run Testing.expect(scope(&tree, 300) == initial && height(&tree, 300) == 3.0 && width(&tree, 300) == expected, "pressure falls back to full restyles without accumulating stale scopes")
+    i = i + 1
+  }
+}
+
+test effect fn stylesheetScopePressureFallsBackToFullRestyles() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pressureFallback() |> Effect.provideMut<Allocator>(&mut allocator)
+}

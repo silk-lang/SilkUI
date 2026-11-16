@@ -76,6 +76,8 @@ import style
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
+import style_invalidation
+import svg_css.element as css_element
 import style_sheets { RootSheets, Resolved }
 import svg_css.adopted { AdoptionError }
 import svg_css.sheet { Sheet }
@@ -1067,6 +1069,15 @@ impl<'a> UiTree<'a> {
   }
 
   pub fn restyle(self: &mut Self, slot: u32) -> () {
+    if self.styleSheets.length() != 0 {
+      let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+      if at != usize.MAX && (self.styleSheets.asSlice()[at].sheets.length() != 0 || self.styleSheets.asSlice()[at].inlineVariables) { self.stylesDirty = true }
+    }
+    self.restyleLocal(slot)
+  }
+
+  // Callers must rule out selector changes outside this subtree and changed variable inputs.
+  pub fn restyleLocal(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
     nodes[u32.toUsize(slot)].styleDirty = true
@@ -1079,6 +1090,40 @@ impl<'a> UiTree<'a> {
       nodes[at].subtreeDirty = true
       up = nodes[at].parent
     }
+  }
+
+  fn classesNeedRoot(self: &Self, slot: u32, after: &[usize]) -> bool {
+    if self.stylesDirty || self.styleSheets.length() == 0 { return false }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return false }
+    let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms.asSlice() _ => &[] }
+    return style_invalidation.classesNeedRoot(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
+  }
+
+  pub fn pointerStyleChanged(self: &mut Self, slot: u32, state: StyleState, inline: bool) -> () {
+    if self.stylesDirty { self.restyleLocal(slot)
+      return () }
+    let node = self.node(slot)
+    if node.kind == NodeKind.Text && !inline { return () }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) {
+      if inline { self.restyleLocal(slot) }
+      return ()
+    }
+    let mut custom = false
+    if let Option.Some { value } = node.identity() {
+      let mut i: usize = 0
+      while i < value.custom.length() {
+        if value.custom.asSlice()[i].state == state { custom = true }
+        i = i + 1
+      }
+    }
+    let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
+    let reach = &self.styleSheets.asSlice()[at].states
+    if inline || custom || u32.bitAnd(reach.external, mask) != 0 { self.restyle(slot)
+      return () }
+    let own = match node.sheetStyle() { Option.Some { value } => value.states _ => 0 }
+    if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { self.restyleLocal(slot) }
   }
 
   pub fn nodeMut(self: &mut Self, slot: u32) -> &mut Node {
@@ -1388,6 +1433,10 @@ impl<'a> UiTree<'a> {
           Attribute.ClassName { value } => run self.styleAtoms.classes(String.utf8Bytes(String.view(&value)))
           _ => List<usize>.make()
         }
+        let partialClass = match &attribute {
+          Attribute.ClassName { .. } => !self.classesNeedRoot(slot, classAtoms.asSlice())
+          _ => false
+        }
         let node = self.nodeMut(slot)
         run style_attributes.reflect(&mut node, &attribute)
         match move attribute {
@@ -1626,7 +1675,7 @@ impl<'a> UiTree<'a> {
             identity.hasId = true
           }
         }
-        self.restyle(slot)
+        if partialClass { self.restyleLocal(slot) } else { self.restyle(slot) }
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
@@ -3892,10 +3941,12 @@ impl<'a> UiTree<'a> {
     }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
-      // A full walk is the conservative invalidation fallback until dependency sets prune it.
-      self.stylesDirty = true
       let roots = self.styleSheets.asMutSlice()
-      roots[sheetIndex].sheets.resetScopes()
+      if !roots[sheetIndex].sheets.canRetainScopes() { self.stylesDirty = true }
+      if self.stylesDirty {
+        roots[sheetIndex].sheets.resetScopes()
+        roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
+      }
       roots[sheetIndex].cache.reset()
     }
     let full = self.stylesDirty
@@ -3925,7 +3976,7 @@ impl<'a> UiTree<'a> {
         let wasRendered = node.rendered
         run self.resolve(slot)
         let after = &self.node(slot).computed
-        changed = full || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        changed = full || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
