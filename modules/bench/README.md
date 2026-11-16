@@ -180,3 +180,39 @@ SilkUI `6d1991cd`. The benchmark source, compiler flags and toolchain are the sa
 The style-object controls are 457,518,423 (-0.08% from the original) and 120,562,315 (+0.08% from the original),
 respectively. All 21 stylesheet cases pass their result checks. Full-root matching and per-node
 declaration storage remain; narrower invalidation and shared resolved storage are still needed.
+
+### Incremental class and pointer updates
+
+SilkUI `3c71534` with lib-css `9b3915e` uses selector dependency sets to keep ordinary
+class changes and pointer states within the affected subtree. Candidate state masks include
+rules whose state test failed, so entering a state still invalidates the right nodes. Relational
+selectors, variable inputs and display changes retain the full-root fallback. Cached variable
+scopes survive partial passes; inline custom properties and cache pressure force a full reset.
+Cascade results reset each pass so inherited computed values cannot reuse stale declarations.
+
+Measured with the same optimized toolchain and fixtures as above:
+
+| Rows | Operation | Inline total | Tailwind total | Registered Tailwind total |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000 | create | 80,959,752 | 136,256,139 | 142,756,062 |
+| 1,000 | idle | 82,754,653 | 138,057,521 | 144,556,710 |
+| 1,000 | change_class | 86,588,875 | 142,169,607 | 148,656,219 |
+| 1,000 | hover | 84,013,294 | 139,544,976 | 146,066,078 |
+| 1,000 | theme | 93,190,136 | 209,001,593 | 219,395,985 |
+| 5,000 | idle | 394,759,537 | 663,861,058 | 692,442,323 |
+| 5,000 | theme | 446,509,267 | 1,017,129,212 | 1,062,871,865 |
+
+Subtracting each build's corresponding idle total gives these update estimates. Before uses
+SilkUI `6d1991cd` with scope sharing already enabled; after uses `3c71534`.
+
+| Rows | Operation | Tailwind before | Tailwind after | Reduction | Registered before | Registered after | Reduction |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | change_class | 65,643,322 | 4,112,086 | 93.7% | 71,545,620 | 4,099,509 | 94.3% |
+| 1,000 | hover | 62,816,454 | 1,487,455 | 97.6% | 69,077,098 | 1,509,368 | 97.8% |
+| 1,000 | theme | 70,726,269 | 70,944,072 | -0.3% | 74,645,584 | 74,839,275 | -0.3% |
+| 5,000 | theme | 351,995,000 | 353,268,154 | -0.4% | 369,376,160 | 370,429,542 | -0.3% |
+
+The style-object controls are 457,598,505 (-0.07% from the original) and
+120,607,214 (+0.12%), respectively. All 21 stylesheet result checks pass.
+Theme changes still traverse the rows, and each node still owns its resolved declarations.
+These instruction counts do not establish the frame-time or 64-byte per-node memory budgets.
