@@ -20,10 +20,10 @@ product once.
 ## Get started
 
 ```sh
-silk init my-app -t ui-react   # or ui-loom, ui-foldkit, ui-js
+silk init my-app -t ui-react  # or ui-loom, ui-foldkit, ui-js
 cd my-app
-silk task dev                  # opens the app in a window, reloading as you edit
-silk task build                # writes the release program to dist/window/
+silk task dev                 # opens the app in a window, reloading as you edit
+silk task build --release     # writes the release program to dist/window/
 ```
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
@@ -38,7 +38,7 @@ Loom apps, native apps, and the UI tree, plus a [Products](docs/content/products
 Every example in them is a real program under `docs/examples`, tested by `docs/tests`.
 
 ```sh
-docs/build.sh serve   # builds the site and serves it on http://localhost:8017
+docs/build.sh serve  # builds the site and serves it on http://localhost:8017
 ```
 
 ## Run a demo locally
@@ -63,7 +63,7 @@ For the versioned Homebrew toolchain, run these in the same terminal:
 export SILK_CLANG=/opt/homebrew/opt/llvm@22/bin/clang
 export PATH="/opt/homebrew/opt/lld@22/bin:$PATH"
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-"$SILK_CLANG" --version # must report clang 22, not Apple clang
+"$SILK_CLANG" --version  # must report clang 22, not Apple clang
 silk task native demo modules/tree/demo
 ```
 
@@ -168,7 +168,7 @@ UI-to-UI dependencies stay local, except in the packages built with Loom (`docs`
 From this repository root, with the toolchain on `PATH`:
 
 ```sh
-silk check --manifest-path modules/tree/window/silk.toml # serial first Git fetch
+silk check --manifest-path modules/tree/window/silk.toml  # serial first Git fetch
 silk check --workspace
 silk build --manifest-path modules/inspect/cli/silk.toml
 silk task check

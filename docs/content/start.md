@@ -39,8 +39,8 @@ A JavaScript template has three parts:
 
 | Path | What it is |
 | --- | --- |
-| `silk.toml` | The manifest. Its one dependency, `silkui`, is for the tasks |
-| `src/tasks.silk` | The app definition, and the `dev` and `build` tasks |
+| `silk.toml` | The manifest. Its explicit dependencies include the tasks, hosts and runtime packages |
+| `src/tasks.silk` | The app definition, and the `dev`, `build` and `plan` tasks |
 | `web/` | A Vite project with `@silkui/vite` in its config. This is the app |
 
 A Loom template has `src/app.silk` in place of `web/`, and depends on `loom` as well.
@@ -55,12 +55,12 @@ effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
 }
 ```
 
-Below it, `dev` and `build` are pipelines of steps, written out so you can read and change them. silkui generates the program that opens the window into `.silk/`, so there is no host code in the project.
+Below it, `dev` and `build` are pipelines of steps, written out so you can read and change them. silkui generates the window entry module as a cached build step, so there is no host code to maintain in the project.
 
 ## Build it
 
 ```sh
-silk task build
+silk task build --release
 ```
 
 `dist/window/my-app` is the release program, with the bundle inside and no development tools. Copy it anywhere and run it.
@@ -74,7 +74,7 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
     |> App.target(Target.webCanvas(Page { title: "My app" }))
 ```
 
-`silk task dev --target web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `src/` changes. `silk task build` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
+`silk task dev --platform web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `src/` changes. `silk task build --release` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
 
 ## Next
 
