@@ -1,6 +1,8 @@
 import selection
 import style_load { Status }
-import sheet_cache { Cache }
+import sheet_cache { Cache, Pending }
+import silk.mem.frozen { Frozen }
+import svg_css.adopted { Candidate }
 import style_invalidation { States }
 import animation { Rule }
 import animation
@@ -66,17 +68,21 @@ pub struct RootSheets {
   pub hasSelection: bool,
   pub hasPlaceholder: bool,
   pub hasScrollbars: bool,
+  /// No rule reads an element's place among its siblings or its descendants.
+  pub siblingsShare: bool,
   pub sheets: StyleSheets,
   pub environment: Environment,
   pub systemColors: [Color; 19],
 }
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
-    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasSelection: false, hasPlaceholder: false, hasScrollbars: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasSelection: false, hasPlaceholder: false, hasScrollbars: false, siblingsShare: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
       systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
 pub struct Resolved {
+  /// The result depends only on the cascade inputs and the parent, so equal nodes may share it.
+  pub plain: bool,
   pub states: u32,
   pub keyframes: List<Rule>,
   pub overrides: List<Declaration>,
@@ -91,6 +97,9 @@ pub struct Resolution {
   pub highlightBackground: Option<ColorProgram>,
   pub style: Resolved,
   pub containers: List<ContainerDependency>,
+  /// An equal node's style from this pass; `style` is empty then.
+  pub hit: Option<Frozen<Resolved>>,
+  pub pending: Option<Pending>,
 }
 
 pub fn index(roots: &[RootSheets], root: u32) -> usize {
@@ -116,9 +125,11 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
 
 pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
-  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false, PseudoTarget.None, StateBits.empty())
-  if !style_change.rendered(tree, slot) && (hasStarting || tree.node(slot).starting.length() != 0) {
-    let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true, PseudoTarget.None, StateBits.empty())
+  let enters = !style_change.rendered(tree, slot) && (hasStarting || tree.node(slot).starting.length() != 0)
+  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false, PseudoTarget.None, StateBits.empty(), !enters)
+  if resolved.hit.isSome() { return move resolved }
+  if enters {
+    let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true, PseudoTarget.None, StateBits.empty(), false)
     let style = &mut resolved.style
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
@@ -133,10 +144,10 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
   tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   if target == PseudoTarget.None { return run resolve(&mut sheets, &mut cache, system, hasStarting, tree, origin, &mut stops) }
-  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states)
+  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states, false)
   if target != PseudoTarget.Before && target != PseudoTarget.After { return move resolved }
   if !rendered && hasStarting {
-    let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states)
+    let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states, false)
     let style = &mut resolved.style
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
@@ -147,7 +158,7 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
   return move resolved
 }
 
-effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool, target: PseudoTarget, states: StateBits) -> Resolution
+effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool, target: PseudoTarget, states: StateBits, shareable: bool) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
   let parentSlot = if target == PseudoTarget.None { node.parent } else { slot }
@@ -206,14 +217,12 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     }
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
-  let share = !starting && target != PseudoTarget.Selection && tree.styleOverrides().length == 0
+  let share = shareable && tree.styleOverrides().length == 0 && context.containers.length() == 0
   if share {
-    let cached = cache.find(scope, parentSlot, sheets.candidates(), inline.asSlice())
-    if cached != usize.MAX {
-      let mut matches = List<MatchedRule>.make()
-      run matches.appendSlice(sheets.matches())
-      return Resolution { highlightBackground: Option<ColorProgram>.None, containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
-        declarations: run cache.declarations(cached), matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
+    if let Option<Frozen<Resolved>>.Some { value } = move cache.find(scope, parentSlot, sheets.stateDependencies(), sheets.candidates(), sheets.matches(), inline.asSlice()) {
+      return Resolution { highlightBackground: Option<ColorProgram>.None, containers: List<ContainerDependency>.make(), hit: Option<Frozen<Resolved>>.some(move value), pending: Option<Pending>.None,
+        style: Resolved { plain: false, states: 0, keyframes: List<Rule>.make(), overrides: List<Declaration>.make(), declarations: List<Declaration>.make(),
+          matches: List<MatchedRule>.make(), scope: scope, starting: Option<List<Declaration>>.None } }
     }
   }
   let mut declarations = List<Declaration>.make()
@@ -256,10 +265,16 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     i = i + 1
   }
   let finished = run finish(move declarations, move ranks, move expressions, system, tree, parentSlot, Option<Color>.None, target == PseudoTarget.Selection)
-  if share { run cache.insert(scope, parentSlot, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
+  let mut pending = Option<Pending>.None
+  if share {
+    let mut inputs = List<Candidate>.make()
+    run inputs.appendSlice(sheets.candidates())
+    pending = Option<Pending>.some(Pending { scope: scope, parent: parentSlot, candidates: move inputs, inline: move inline })
+  }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
-  return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
+  return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, hit: Option<Frozen<Resolved>>.None, pending: move pending,
+    style: Resolved { plain: share, states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
 }
 
 effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets,

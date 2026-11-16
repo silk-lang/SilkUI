@@ -162,9 +162,8 @@ and class storage, root caches, allocator headers and the base tree.
 
 Keyframe-array capacities are zero in these fixtures. The 64 B per-node target is not met:
 the lower bound is about 2,480 B per total node for Tailwind, before identity and class costs.
-Each resolved record alone occupies 224 B. Cascade and variable caches reduce computation,
-but nodes still own cloned winning declarations; sharing those immutable results is the main
-remaining memory optimization. The 1,000-row Tailwind fixture additionally retains 400,000 B
+Each resolved record alone occupies 224 B. At this revision nodes owned cloned winning
+declarations; [Shared sibling styles](#shared-sibling-styles) replaces that with shared records. The 1,000-row Tailwind fixture additionally retains 400,000 B
 of fixed selector identities and 231,000 B of class string/atom capacity, excluded above.
 
 ### Initial instruction counts
@@ -280,3 +279,49 @@ The style-object controls are 457,598,505 (-0.07% from the original) and
 120,607,214 (+0.12%), respectively. All 21 stylesheet result checks pass.
 Theme changes still traverse the rows, and each node still owns its resolved declarations.
 These instruction counts do not establish the frame-time or 64-byte per-node memory budgets.
+
+### Shared sibling styles
+
+Nodes now hold their matched style behind a shared immutable record. The per-pass cascade cache
+returns that record instead of cloning its declarations, and a box whose tag, classes,
+attributes, states and style objects equal its previous sibling's takes the sibling's record
+without matching selectors again. The shortcut is off for a root whose sheets contain a sibling
+combinator, a positional pseudo-class, `:empty` or `:has()`, for elements with an id or inline
+custom properties, and while `@starting-style` or inspector overrides apply; those elements
+still share through the cascade cache after matching.
+
+Measured with the same toolchain, machine and fixtures as above. Executable SHA-256:
+`a7b5f9ab456c4f7cf38a253f63fe5cb61f6f470b4bebf4515bf12a770aed3543`; local runtime sources
+were used for all UI and Loom dependencies.
+
+| Rows | Operation | Inline total | Tailwind total | Registered Tailwind total |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000 | create | 81,617,375 | 95,566,305 | 95,279,779 |
+| 1,000 | idle | 83,422,892 | 97,382,729 | 97,093,531 |
+| 1,000 | change_class | 87,399,257 | 101,609,428 | 101,267,809 |
+| 1,000 | hover | 84,729,837 | 98,926,251 | 98,660,257 |
+| 1,000 | theme | 93,545,358 | 120,747,588 | 119,997,597 |
+| 5,000 | idle | 398,003,617 | 461,305,583 | 458,851,167 |
+| 5,000 | theme | 448,183,656 | 576,323,843 | 571,480,301 |
+
+| Rows | Update minus corresponding idle | Inline | Tailwind | Registered Tailwind |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000 | change_class | 3,976,365 | 4,226,699 | 4,174,278 |
+| 1,000 | hover | 1,306,945 | 1,543,522 | 1,566,726 |
+| 1,000 | theme | 10,122,466 | 23,364,859 | 22,904,066 |
+| 5,000 | theme | 50,180,039 | 115,018,260 | 112,629,134 |
+
+Creating 1,000 Tailwind rows costs 17% more than inline rows (was 77%), and a theme change costs
+2.3 times the inline update (was 7.6 times). The style-object controls are 459,216,121 and
+120,533,059. All 21 stylesheet result checks pass.
+
+The 1,001 resolved nodes of the 1,000-row fixture now hold two records, one for the root and one
+shared by every row, plus one pointer per node. Peak heap for the idle case, from Valgrind Massif,
+is 21,386,398 B for Tailwind and 21,450,510 B for inline at 1,000 rows, and 118,940,318 B and
+121,060,430 B at 5,000 rows, so the retained-storage difference of the earlier section is gone
+for repeated rows. Elements with distinct cascade inputs still own one record each.
+
+What remains of the theme cost is applying each row's roughly 40 winning declarations to its
+computed style (about 9,500 instructions per row) and the rest of the per-node style pass; rows
+do not share computed values. Unshared elements still pay full selector matching, about 22,000
+instructions each in this fixture.
