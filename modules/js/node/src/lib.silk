@@ -1,6 +1,6 @@
 //! A ui-js application on the SilkJS runtime, in a platform window: Node's APIs and the web
 //! APIs Node has (`fetch`, `WebSocket`, `URL`, `TextEncoder`, `crypto`, `AbortController`,
-//! `structuredClone`, `Intl` and the rest) beside `@silk/ui`.
+//! `structuredClone`, `Intl` and the rest) beside `@silkui/core`.
 //!
 //! The runtime runs on the window's UI thread and its loop turns there: the window host
 //! waits in the runtime ([`NodeClient`] waits itself), and window events end that wait. Timers,
@@ -8,15 +8,18 @@
 //!
 //! ```silk
 //! let mut app = NodeWindow.make(fonts, options, client)
-//! run app.define(b"@silk/ui", uiPackage())
+//! run app.define(b"@silkui/core", uiPackage())
 //! run app.entry(b"/app/app.js", source)
 //! let status = run app.start(b"my-app")
 //! ```
-import ui_js.lib { Bridge, Outcome, kindCode, numbersOf, firstString, secondString }
+import ui_js.lib { StylesheetCompiler, Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
-import ui_js_window.lib { write }
+import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
 import ui_tree.lib { EventRecord }
+import ui_tree.style_assets { StyleAssets }
+import ui_tree_window.style_watch { SheetWatch }
+import ui_tree.legacy { FrameInput }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
 import ui_tree_window.host { WindowClient, RunOptions, runWindow }
@@ -127,11 +130,16 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     let memory = engine.memory
     let realm = unsafe lendRealm(&context, context)
     let ui = run objects.newObject(&mut engine.*, memory, realm)
-    let mut id: u32 = 1
-    while id <= bridge.LAST {
-      let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: embedder.FIRST + id }, bridge.name(id), bridge.arity(id), NativeCallProtocol.Generic, 0)
-      run common.define(&mut engine.*, realm, ui.borrow(), bridge.name(id), unsafe Value.adoptBits(function), 7)
-      id = id + 1
+    let mut at: usize = 0
+    while true {
+      match bridge.native(at) {
+        Option.Some { value } => {
+          let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: embedder.FIRST + bridge.nativeId(value.name) }, value.name, value.arity, NativeCallProtocol.Generic, 0)
+          run common.define(&mut engine.*, realm, ui.borrow(), value.name, unsafe Value.adoptBits(function), 7)
+        }
+        Option.None => { break }
+      }
+      at = at + 1
     }
     run common.define(&mut engine.*, realm, realm.globalObject(), b"__ui", move ui, 7)
   }
@@ -199,23 +207,28 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       Result<Value, OutOfMemoryError | JsException>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
         JsException _ => {
-          let context = self.runtime.rawContext()
-          let realm = unsafe lendRealm(&context, context)
-          let thrown = realm.takeException()
-          let reported = run Effect.result(self.callUi(b"report", &[thrown.borrow().view()]))
-          self.release(move thrown)
-          match move reported {
-            Result<Value, OutOfMemoryError | JsException>.Success { value } => { self.release(move value) }
-            Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => match move failure {
-              OutOfMemoryError allocation => { fail move allocation }
-              JsException _ => {
-                let again = realm.takeException()
-                self.release(move again)
-                write("Uncaught exception, and __ui.report threw too\n")
-              }
-            }
-          }
+          run self.reportPending()
           Value.immediate(ValueBits.Undefined)
+        }
+      }
+    }
+  }
+
+  /// Prints the pending exception as uncaught, with its stack (`__ui.report`).
+  effect fn reportPending(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let context = self.runtime.rawContext()
+    let realm = unsafe lendRealm(&context, context)
+    let thrown = realm.takeException()
+    let reported = run Effect.result(self.callUi(b"report", &[thrown.borrow().view()]))
+    self.release(move thrown)
+    match move reported {
+      Result<Value, OutOfMemoryError | JsException>.Success { value } => { self.release(move value) }
+      Result<Value, OutOfMemoryError | JsException>.Failure { error: failure } => match move failure {
+        OutOfMemoryError allocation => { fail move allocation }
+        JsException _ => {
+          let again = realm.takeException()
+          self.release(move again)
+          write("Uncaught exception, and __ui.report threw too\n")
         }
       }
     }
@@ -240,6 +253,31 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     return true
   }
 
+  /// Answers JavaScript's clipboard calls through `platform`, and the calls their promise
+  /// jobs made, then applies what it built. Says whether there were calls.
+  pub effect fn clipboard(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let requests = Intrinsic.replace(self.bridge.clipboard, List<bridge.ClipboardRequest>.make())
+      if requests.length() == 0 { break }
+      let mut answers = run serveClipboard(move requests, &mut platform)
+      while answers.length() > 0 {
+        let ClipboardAnswer { call, text: answer } = answers.remove(0)
+        let value = match move answer {
+          Option.Some { value } => run text(String.utf8Bytes(String.view(&value)))
+          Option.None => Value.immediate(ValueBits.Undefined)
+        }
+        let returned = run self.callReporting(b"clipboard", &[ValueBits.number(u32.toF64(call)), value.borrow().view()])
+        self.release(move returned)
+        self.release(move value)
+      }
+      round = round + 1
+    }
+    if round == 0 { return false }
+    drop run self.flush(&mut tree)
+    return true
+  }
+
   /// Hands the tree's queued event records to JavaScript, then applies what it queued. Says
   /// whether a handler prevented a default.
   pub effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -259,12 +297,14 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     return prevented
   }
 
-  /// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second)` with `record`
+  /// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second, third, fourth)` with `record`
   /// (as the engine-only host does), and says whether it returned true.
   effect fn dispatch(self: &mut Self, record: &EventRecord) -> bool ! OutOfMemoryError ? &mut Allocator {
     let numbers = numbersOf(&record.event)
     let first = run firstString(&record.event)
     let second = run secondString(&record.event)
+    let third = run thirdString(&record.event)
+    let fourth = run fourthString(&record.event)
     let arguments = [
       ValueBits.number(u32.toF64(kindCode(record.event.kind()))),
       ValueBits.number(u32.toF64(record.target.raw())),
@@ -275,12 +315,16 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       ValueBits.number(numbers[4]),
       first.borrow().view(),
       second.borrow().view(),
+      third.borrow().view(),
+      fourth.borrow().view(),
     ]
     let returned = run self.callReporting(b"dispatch", &arguments)
     let prevented = match returned.borrow().view() { ValueBits.Bool { value } => value _ => false }
     self.release(move returned)
     self.release(move first)
     self.release(move second)
+    self.release(move third)
+    self.release(move fourth)
     return prevented
   }
 
@@ -308,12 +352,7 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       }
       Result<Turn, OutOfMemoryError | JsException>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
-        JsException _ => {
-          let context = self.runtime.rawContext()
-          let thrown = (unsafe lendRealm(&context, context)).takeException()
-          self.release(move thrown)
-          write("The JavaScript runtime's loop failed\n")
-        }
+        JsException _ => { run self.reportPending() }
       }
     }
   }
@@ -345,6 +384,10 @@ effect fn text(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
 
 /// The window client of a [`NodeApp`].
 pub struct NodeClient {
+  pub stylesheetCompiler: StylesheetCompiler,
+  /// Compiled application stylesheets, installed before each root first paints.
+  pub stylesheets: StyleAssets,
+  pub stylesheetUpdates: SheetWatch,
   /// How the window's title bar is drawn (see `ui_js_window.lib.JsClient.titleBar`).
   pub titleBar: TitleBar,
   pub titleBarHeight: f64,
@@ -353,11 +396,24 @@ pub struct NodeClient {
 
 impl NodeClient {
   pub fn make() -> NodeClient {
-    return NodeClient { titleBar: TitleBar.Standard, titleBarHeight: 0.0, windowDrag: false }
+    return NodeClient { stylesheetCompiler: StylesheetCompiler.off(), titleBar: TitleBar.Standard, titleBarHeight: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make() }
   }
 }
 
 impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient {
+  effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let root = tree.current
+    drop run self.stylesheets.serve(&mut tree.*, root)
+    run tree.frame(input)
+  }
+
+  effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    drop run self.stylesheets.serve(&mut tree.*, root)
+    run tree.frameRoot(root, input)
+  }
+
   fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm>, options: &mut WindowOptions<'_>) -> () {
     options.titleBar = self.titleBar
     options.titleBarHeight = self.titleBarHeight
@@ -384,7 +440,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
-    return false
+    return run state.clipboard(&mut tree, &mut platform.*)
   }
 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
@@ -398,6 +454,15 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
     platform.alsoWake(AlsoWake { wake: wakeRuntime, token: state.runtime.wakerAddress() })
+  }
+
+  effect fn poll(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError ? &mut Allocator {
+    return run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
+  }
+
+  fn wakeAfter(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> Option<f64> {
+    return self.stylesheetUpdates.wakeAfter(Option<f64>.None)
   }
 
   fn quitting(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
@@ -512,6 +577,7 @@ impl<'f> NodeWindow<'f> {
 impl<'f> Host for NodeWindow<'f> {
   effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     let mut app = run NodeApp.make(&mut runtime.*)
+    app.bridge.stylesheetCompiler = self.client.stylesheetCompiler
     let items = self.modules.asSlice()
     let mut i: usize = 0
     while i < items.length {

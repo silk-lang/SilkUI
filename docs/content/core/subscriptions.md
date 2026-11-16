@@ -38,7 +38,7 @@ A native app has a few more, for its menu bar, file dialogs and window: see [The
 ## Keyboard shortcuts
 
 ```silk
-import ui_app.keys { MOD_CONTROL }
+import loom.keys { MOD_CONTROL }
 
 fn subscriptions(model: &Editor, subs: &mut Subscriptions<Message>) -> () {
   subs.keyBinding(1, "s", MOD_CONTROL, || Message.PressedSave)

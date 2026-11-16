@@ -56,7 +56,7 @@ The harness closes that gap. It runs the program on the real UI tree, with real 
 
 If the field were covered by another node, or the button were off screen, the click would miss and the test would fail. That is the kind of bug a message-only test cannot find.
 
-| From `ui_app.harness` | Does |
+| From `loom_tree.harness` | Does |
 | --- | --- |
 | `click`, `clickRole`, `clickAt` | Clicks a node by name, by role and name, or at a point |
 | `typeText`, `press` | Types text, presses a key |

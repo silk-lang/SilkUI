@@ -1,5 +1,5 @@
 // `<box>` on the web: a div with the tree's props that React DOM does not have.
-// - `ref` gets the @silk/ui-like node (silk-ui.js), not the element.
+// - `ref` gets the @silkui/core-like node (silk-ui.js), not the element.
 // - `hoverStyle` is laid over `style` while the pointer is on the box or inside it.
 // - `href` makes it a link: a click that nothing prevented opens it.
 // - `onLayout` gets `{ bounds }` when the box's size changes, and once at first.

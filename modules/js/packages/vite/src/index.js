@@ -6,38 +6,47 @@
 // and `vite build --watch`, the plugin starts the host after the first build.
 //
 // Under `vite` (the dev server) the host runs the application's modules as Vite serves
-// them, and an edit replaces only the modules it touches: see dev.js.
+// them, and an edit replaces only the modules it touches: see dev.js. The plugin knows no
+// UI framework: `@silkui/react/vite` adds React's JSX, its reconciler fix and Fast Refresh.
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, rmSync } from "node:fs";
+import { builtinModules } from "node:module";
 import { resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
-import { reconcilerPlugin } from "./reconciler.js";
 import { resolveOptions } from "./resolve.js";
+import { compileStylesheet } from "./compiler.js";
+import { stylesheetDevPlugin } from "./stylesheets.js";
+import { fontAssetResolver } from "./font-assets.js";
 
 /**
  * @param {object} [options]
  * @param {string} [options.entry] Entry module, relative to the Vite root. Default `src/main.jsx`.
  * @param {string} [options.fileName] Name of the bundle in `build.outDir`. Default `app.js`.
- * @param {string | false} [options.jsx] Package whose JSX runtime compiles JSX, or false to
- *   leave JSX settings alone. Default `@silk/ui-react`.
- * @param {{ command: string, args?: string[], cwd?: string }} [options.host] Host binary to
+ * @param {{ command: string, args?: readonly string[], cwd?: string }} [options.host] Host binary to
  *   start. In watch mode it is given `--watch <bundle>` after `args`, under the dev
  *   server `--dev <port>`.
- * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
  * @param {number} [options.port] Port the dev server listens on for the host. Default: any
  *   free one.
  * @param {"warn" | "error" | "off"} [options.apis] What to do when the application or one
  *   of its libraries uses a web or Node API a ui-js runtime does not have. Default `warn`.
  * @param {string[]} [options.allow] Such APIs the application provides itself.
+ * @param {boolean} [options.node] The host runs the full SilkJS runtime (ui-js-node): Node
+ *   builtins stay `node:` imports instead of empty stubs, and the API report leaves out
+ *   what that runtime has.
  */
 export default function silk(options = {}) {
+  // silkui's tasks start Vite with the host they built in SILKUI_HOST.
+  if (options.host === undefined && process.env.SILKUI_HOST) options = { ...options, host: { command: process.env.SILKUI_HOST } };
   const entry = options.entry ?? "src/main.jsx";
   const fileName = options.fileName ?? "app.js";
-  const jsx = options.jsx ?? "@silk/ui-react";
+  const node = options.node === true;
   let bundle = "";
   let watching = false;
   let child = null;
+  let stylesheetPath = "";
+  let emittedStylesheet = false;
+  let stylesheetConfig;
 
   function startHost() {
     const { command, args = [], cwd } = options.host;
@@ -62,11 +71,11 @@ export default function silk(options = {}) {
         build: {
           target: "es2022",
           minify: mode !== "development",
-          lib: { entry, formats: ["es"], fileName: () => fileName },
+          cssCodeSplit: false,
+          lib: { entry, formats: ["es"], fileName: () => fileName, cssFileName: "app" },
           rolldownOptions: { output: { codeSplitting: false } },
         },
       };
-      if (jsx !== false) config.oxc = { jsx: { runtime: "automatic", importSource: jsx } };
       return config;
     },
 
@@ -113,7 +122,8 @@ export default function silk(options = {}) {
       }
       const owner = ownerOf(id, root);
       for (const { name, area } of missingApis(ast)) {
-        if (allow.has(name)) continue;
+        if (serving && (name === "TextEncoder" || name === "TextDecoder")) continue;
+        if (allow.has(name) || (node && !NOT_IN_NODE.has(area))) continue;
         let use = uses.get(name);
         if (!use) uses.set(name, (use = { area, owners: new Set() }));
         if (use.owners.has(owner)) continue;
@@ -130,5 +140,63 @@ export default function silk(options = {}) {
     },
   };
 
-  return [buildPlugin, apiPlugin, reconcilerPlugin(), ...devPlugins({ entry, jsx, refresh: options.refresh ?? true, port: options.port ?? 0, host: options.host })];
+  const cssPlugin = {
+    name: "silk:stylesheets",
+    apply: "build",
+    enforce: "post",
+    configResolved(config) {
+      stylesheetPath = resolve(config.root, config.build.outDir, "app.sheet");
+      stylesheetConfig = config;
+    },
+    generateBundle: {
+      order: "post",
+      handler(_options, output) {
+        const sheets = Object.values(output).filter(item => item.type === "asset" && item.fileName.endsWith(".css"));
+        emittedStylesheet = sheets.length !== 0;
+        if (!sheets.length) return;
+        const css = sheets.map(sheet => typeof sheet.source === "string" ? sheet.source : new TextDecoder().decode(sheet.source)).join("\n");
+        let compiled;
+        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
+        catch (error) {
+          const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
+          this.error(error.message + (dropped ? `\n${dropped}` : ""));
+        }
+        for (const diagnostic of compiled.diagnostics) {
+          this.warn(`dropped ${diagnostic.count} ${diagnostic.kind} occurrence(s): ${diagnostic.feature}`);
+        }
+        for (const sheet of sheets) {
+          delete output[sheet.fileName];
+          delete output[sheet.fileName + ".map"];
+        }
+        this.emitFile({ type: "asset", fileName: "app.sheet", source: compiled.bytes });
+      },
+    },
+    writeBundle() {
+      if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
+    },
+  };
+  const plugins = [buildPlugin, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
+  if (node) plugins.push(builtinsPlugin);
+  return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }
+
+/** The areas of `MISSING` the SilkJS runtime does not have either. */
+const NOT_IN_NODE = new Set(["dom", "storage", "workers"]);
+
+const BUILTINS = new Set(builtinModules);
+
+/** `node:<name>` when `id` names a Node builtin, with or without the prefix. */
+function builtinOf(id) {
+  if (id.startsWith("node:")) return id;
+  return BUILTINS.has(id) ? `node:${id}` : null;
+}
+
+// Before Vite's resolver, which turns builtins into empty browser stubs: the runtime has them.
+const builtinsPlugin = {
+  name: "silk:node-builtins",
+  enforce: "pre",
+  resolveId(id) {
+    const builtin = builtinOf(id);
+    if (builtin) return { id: builtin, external: true };
+  },
+};

@@ -1,0 +1,129 @@
+# @silkui/react
+
+A React renderer for the [Silk UI](https://github.com/silk-lang/SilkUI) tree, for apps that
+run on the SilkJS engine embedded in a Silk UI program. Components render to the tree's own
+nodes (`<box>`, `<input>`, `<richinput>`, `<image>`, `<icon>`, `<canvas>`), not to a DOM, and
+React itself runs unmodified. It is a reconciler only: React is your app's own dependency.
+
+## Install
+
+The quickest start is the React template:
+
+```sh
+silk init my-app -t ui-react
+cd my-app
+silk task dev   # opens the window; edits keep component state (Fast Refresh)
+```
+
+See [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an
+existing Silk UI web project:
+
+```sh
+npm install @silkui/react @silkui/core react
+npm install -D @silkui/vite vite @types/react
+```
+
+## Usage
+
+```tsx
+import { useState } from "react";
+import { createRoot } from "@silkui/react";
+
+function Counter() {
+  const [clicks, setClicks] = useState(0);
+  return (
+    <box
+      tabIndex={0}
+      style={{ paddingTop: 12, paddingBottom: 12, paddingLeft: 20, paddingRight: 20, borderRadius: 10, backgroundColor: "rgb(37, 99, 235)", color: "white" }}
+      hoverStyle={{ backgroundColor: "rgb(59, 130, 246)" }}
+      onClick={() => setClicks(clicks + 1)}
+    >
+      Clicked {clicks} times
+    </box>
+  );
+}
+
+createRoot().render(<Counter />);
+```
+
+With Vite, add `react()` from `@silkui/react/vite` beside `silk()` from `@silkui/vite`:
+
+```js
+// vite.config.js
+import { defineConfig } from "vite";
+import silk from "@silkui/vite";
+import react from "@silkui/react/vite";
+
+export default defineConfig({ plugins: [silk({ entry: "src/main.tsx" }), react()] });
+```
+
+It compiles JSX with this package's runtime, fixes a quadratic sibling walk in
+`react-reconciler` for long lists, and adds React Fast Refresh under the dev server.
+`react({ refresh: false })` turns Fast Refresh off.
+
+## API
+
+| Export | What it does |
+| --- | --- |
+| `createRoot(container?)` | A React root in a `@silkui/core` node. Without one it renders into the window's root, mounting a new box when there is none |
+| `root.render(element)` | Renders and commits before it returns, so the window's first frame has the content |
+| `root.unmount()` | Unmounts what the root rendered |
+| `flushSync(callback)` | Runs `callback` and commits its updates before returning |
+| `@silkui/react/vite` | The Vite plugin above (`react(options?)`) |
+| `@silkui/react/jsx-runtime` | The JSX runtime, for `"jsxImportSource": "@silkui/react"` |
+
+### Elements and props
+
+Host elements are the tree's node kinds, and strings in children become text nodes.
+
+- **Style.** `style` is the base look, as a `@silkui/core` style object (numbers are CSS
+  pixels). `hoverStyle`, `activeStyle`, `focusStyle` and `focusVisibleStyle` are the looks the
+  tree lays over it in those states, and `startingStyle` is what transitions start from when
+  the node first shows (`@starting-style`).
+- **Events.** `onClick`, `onPointerDown`, `onKeyDown`, `onInput`, `onSelectionChange`,
+  `onScroll`, `onLayout`, `onTransitionEnd` and the rest, one for every event of the tree,
+  with a `Capture` suffix for the capture phase. Listeners receive the `@silkui/core` event.
+- **Attributes.** `id`, `role`, `tabIndex`, `testId`, `label`, `disabled`, `inert`,
+  `focusTrap`, `cursor`, `href`, and `aria-*` as in React DOM.
+- **Inputs.** `value` on `<input>` is controlled as in React DOM (`defaultValue` for an
+  uncontrolled one), with `placeholder`, `multiline` and `readOnly`. `<richinput>` takes
+  `marks` and `atoms` (name to style) and a controlled `document` (`defaultDocument` for an
+  uncontrolled one): keep `event.document` from `onInput`.
+- **Icons.** `<icon svg={markup}>` draws SVG markup at its CSS size, with its `color` as
+  `currentColor`.
+- **Refs** are the `@silkui/core` nodes (`Node`, `Input`, `RichInput`, `Icon`), for code that
+  draws on the tree directly, such as animation on every frame.
+
+### Timing
+
+A state change in a click, key or input listener commits before the host applies the
+mutations, so the next frame shows it. Other updates go through React's scheduler on the
+host's timers.
+
+## TypeScript
+
+The package types every element against its props and events. Set the JSX import source in
+`tsconfig.json` and install `@types/react`:
+
+```json
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "@silkui/react"
+  }
+}
+```
+
+`<box onClick={(event) => event.clientX}>` then knows `event` is a pointer event, a ref on
+`<input>` is a `RefObject<Input>`, and an unknown prop is an error.
+
+## Requirements
+
+React 19.3 or newer. `vite` 8 for `@silkui/react/vite`.
+
+## More
+
+- [The ui-js reference](https://github.com/silk-lang/SilkUI/blob/main/modules/js/README.md#silkuireact)
+  and [`@silkui/core`](https://www.npmjs.com/package/@silkui/core) for nodes, styles and events.
+- [The React template](https://github.com/silk-lang/examples/tree/main/ui-react).
+- [Source](https://github.com/silk-lang/SilkUI/tree/main/modules/js/packages/react). MIT license.

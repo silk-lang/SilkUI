@@ -7,18 +7,19 @@ native window (macOS, Windows, X11, Wayland) through [modules/platform/window](h
 
 | Package | What it is |
 | --- | --- |
+| [modules/silkui](silkui) | The front door: an app definition in `tasks.silk` and the pipeline steps that build and run it (`silk task dev`, `silk task build`) for Loom, React, Foldkit and plain JS apps; it generates each target's host |
 | [modules/text](text) | Text for layout: font fallback, line breaking, bidi, shaping |
 | [modules/tree](tree) | The retained tree: nodes, typed styles, layout, paint, input, focus, scrolling, text editing. Driven by plain-data `Mutation`s, reports plain-data `Event`s |
-| [modules/app](app) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations. Its inspector extension is [modules/app/inspect](app/inspect) |
-| [modules/components](components) | Buttons, checkboxes, switches, sliders, fields, lists, tabs, menus, selects, dialogs, popovers, tooltips, and a theme |
-| [modules/inspect](inspect) | Queries, highlights and recording; a socket protocol with a CLI, an MCP server for agents, and a devtools window |
-| [modules/js](js) | Early: a JavaScript application on the tree with the SilkJS engine embedded. `@silk/ui` gives JavaScript the tree's nodes with DOM style methods and events, and `@silk/ui-react` renders React components to them; listeners run between the tree's `begin` and `finish`, so `preventDefault` works as on the web. |
-| [modules/ghostty](ghostty) | Terminals through libghostty-vt: a `TerminalView` component (selection, scrollback, keys, IME, paste, mouse reporting), a terminal app on a PTY, and the same component in a browser page |
+| [loom](https://github.com/silk-lang/loom/tree/main/modules/loom) (silk-lang/loom) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations. Its inspector extension is [loom-inspect](https://github.com/silk-lang/loom/tree/main/modules/loom/inspect) |
+| [loom-components](https://github.com/silk-lang/loom/tree/main/modules/loom-components) (silk-lang/loom) | Buttons, checkboxes, switches, sliders, fields, lists, tabs, menus, selects, dialogs, popovers, tooltips, and a theme |
+| [modules/inspect](inspect) | Queries, highlights and recording; a socket protocol with a CLI and an MCP server for agents. The devtools window is a Loom app, in [silk-lang/loom](https://github.com/silk-lang/loom/tree/main/modules/devtools) |
+| [modules/js](js) | Early: a JavaScript application on the tree with the SilkJS engine embedded. `@silkui/core` gives JavaScript the tree's nodes with DOM style methods and events, and `@silkui/react` renders React components to them; listeners run between the tree's `begin` and `finish`, so `preventDefault` works as on the web. |
+| [ghostty](https://github.com/silk-lang/loom/tree/main/modules/ghostty) (silk-lang/loom) | Terminals through libghostty-vt: a `TerminalView` component (selection, scrollback, keys, IME, paste, mouse reporting), a terminal app on a PTY, and the same component in a browser page |
 | [examples/notes](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/notes) | The example app: a notes app with a file, search, sorting, an editor, a dialog, shortcuts and a dark theme |
 | [examples/showcase](https://github.com/silk-lang/nonstd/tree/7d6c3693a9ad1fec24127985626ab4224f9f1995/examples/showcase) | Silk Loom, a showcase of the drawing layer |
 
-Start with the owned [todo demo](app/demo/src/main.silk), then the
-[ui-app README](app/README.md) for the framework and [ui-components README](components/README.md)
+Start with Loom's [todo demo](https://github.com/silk-lang/loom/tree/main/modules/loom/demo/src/main.silk), then the
+[loom README](https://github.com/silk-lang/loom/tree/main/modules/loom/README.md) for the framework and [loom-components README](https://github.com/silk-lang/loom/tree/main/modules/loom-components/README.md)
 for components. Notes and Showcase above are external application examples.
 
 ## Writing an app
@@ -26,9 +27,9 @@ for components. Notes and Showcase above are external application examples.
 An app is a model, a message union, and three functions. A small one, all of it:
 
 ```silk
-import ui_components.lib { Theme, surface, heading, button, primaryButton }
-import ui_app.app { App, Context, NoCommand }
-import ui_app.ui { Ui }
+import loom_components.lib { Theme, surface, heading, button, primaryButton }
+import loom.app { App, Context, NoCommand }
+import loom.ui { Ui }
 
 pub struct Counter {
   pub theme: Theme,
@@ -64,7 +65,7 @@ impl App<Message, NoCommand> for Counter {
 }
 ```
 
-Run it in a window with `runWindow` from `ui-app-window` (see `app/demo/src/main.silk` for
+Run it in a window with `runWindow` from `loom-window` (see `modules/loom/demo/src/main.silk` in silk-lang/loom for
 a complete `main`: fonts, the runtime, the inspector, error handling), or headless with the
 runtime and the `harness` functions, which is how the tests drive apps.
 
@@ -99,5 +100,5 @@ let text = run snapshot(&mut tree, viewport)        // the describe snapshot
 ```
 
 Golden tests render a scene with `CpuSnapshot` and compare its PNG and `describe` text; see
-`app/tests/src/main.silk`. A window check (`silk task native demo modules/app/demo -- check`)
+`modules/loom/tests/src/main.silk` in silk-lang/loom. A window check there (`silk task native demo modules/loom/demo -- check`)
 compares a real GPU frame against the CPU reference.

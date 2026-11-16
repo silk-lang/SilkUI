@@ -25,7 +25,7 @@ own 56-pixel title bar on macOS where the window controls sit.
   on a click nothing prevented, `onLayout` gets `{ bounds }` from a `ResizeObserver`,
   `cursor` and `testId` become CSS and `data-testid`, and `ref` gets a node like the
   tree's.
-- **`@silk/ui`** is [web/silk-ui.js](web/silk-ui.js): `createBox` and the node's
+- **`@silkui/core`** is [web/silk-ui.js](web/silk-ui.js): `createBox` and the node's
   `style.set`, `append` and `destroy` on elements, which is what
   [src/motion.js](src/motion.js) draws with.
 

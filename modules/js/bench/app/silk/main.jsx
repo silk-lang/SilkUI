@@ -1,4 +1,4 @@
-import { createRoot } from "@silk/ui-react";
+import { createRoot } from "@silkui/react";
 import { Counter } from "../Counter.jsx";
 import { mark } from "platform";
 

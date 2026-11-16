@@ -1,0 +1,368 @@
+//! The web targets' pages: [`site`] puts a page, its program and the scripts that load it into
+//! one folder that any static file server can serve, and [`Server`] serves that folder while
+//! `dev` runs.
+import stylesheets
+import manifest { Project, checkout, loomDir, pinned, resolved, silkuiDir }
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { String }
+import silk.num.usize
+
+effect fn joined(base: string, child: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = run String.copy(base)
+  if !String.endsWith(base, "/") { run String.append(&mut out, "/") }
+  run String.append(&mut out, child)
+  return move out
+}
+
+/// `text` with every `from` replaced by `to`.
+effect fn replaced(text: string, from: string, to: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = String.make()
+  let mut rest = text
+  while true {
+    match String.find(rest, from) {
+      Option<usize>.Some { value: at } => {
+        run String.append(&mut out, String.slice(rest, 0, at))
+        run String.append(&mut out, to)
+        let skip = at + String.utf8Bytes(from).length
+        rest = String.slice(rest, skip, String.utf8Bytes(rest).length - skip)
+      }
+      Option<usize>.None => { break }
+    }
+  }
+  run String.append(&mut out, rest)
+  return move out
+}
+
+/// Copies `from` to `to`. With `scripts`, the TypeScript imports of lib-native's WebGPU host
+/// (ECMAScript inside) are renamed to `.js`, so a static server sends them as JavaScript.
+effect fn copied(from: string, to: string, scripts: bool) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let source = run Path.make(from)
+  if !run FileSystem.exists(&source) {
+    let mut message = run String.copy("silkui: a file the page needs is missing: ")
+    run String.append(&mut message, from)
+    fail TaskError { message: move message, status: 1 }
+  }
+  let bytes = run FileSystem.readFile(&source)
+  let destination = run Path.make(to)
+  if !scripts {
+    run FileSystem.writeFileWithParents(&destination, Bytes.asSlice(&bytes))
+    return ()
+  }
+  let text = match String.fromUtf8(Bytes.asSlice(&bytes)) {
+    Result.Success { value } => value
+    Result.Failure { .. } => run Task.abort("silkui: a page script is not UTF-8")
+  }
+  let mut fixed = run replaced(text, "/host.ts'", "/host.js'")
+  fixed = run replaced(String.view(&fixed), "/generated_schema.ts'", "/generated_schema.js'")
+  run FileSystem.writeFileWithParents(&destination, String.utf8Bytes(String.view(&fixed)))
+}
+
+/// Writes the page of `target` (`web-canvas` or `web-dom`) into `dir`: `index.html` (from the
+/// host folder `host`), the program as `app.wasm`, and the scripts that load it, from the
+/// silkui repository checkout the package is in, the Loom one the app's `loom` comes from and, for
+/// `web-canvas`, the lib-native one Loom's canvas target pins.
+pub effect fn site(project: &Project, target: string, host: string, wasm: string, dir: string, sheetCount: usize, dev: bool) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let silkui = run silkuiDir(project)
+  // The silkui package is modules/silkui of the silkui repository.
+  let ui = run resolved(String.view(&silkui), "../..")
+  let loom = run loomDir(project)
+  run copied(String.view(&run joined(host, "index.html")), String.view(&run joined(dir, "index.html")), false)
+  run copied(wasm, String.view(&run joined(dir, "app.wasm")), false)
+  if target == "web-dom" {
+    let mut i: usize = 0
+    while i < sheetCount {
+      let name = run stylesheets.name(i, true)
+      run copied(String.view(&run joined(host, String.view(&name))), String.view(&run joined(dir, String.view(&name))), false)
+      i = i + 1
+    }
+    run copied(String.view(&run joined(String.view(&loom), "modules/loom/dom/js/silk-ui-dom.js")), String.view(&run joined(dir, "silk-ui-dom.js")), false)
+    return ()
+  }
+  let window = run joined(String.view(&ui), "modules/tree/window/browser/")
+  let pageWindow = run joined(dir, "ui/tree/window/browser/")
+  if dev && sheetCount != 0 {
+    run copied(String.view(&run joined(host, "styles.update")), String.view(&run joined(dir, "styles.update")), false)
+    run copied(String.view(&run joined(String.view(&window), "style-updates.mjs")), String.view(&run joined(String.view(&pageWindow), "style-updates.mjs")), false)
+  } else {
+    let update = run Path.make(String.view(&run joined(dir, "styles.update")))
+    if run FileSystem.exists(&update) { run FileSystem.removeFile(&update) }
+    let helper = run Path.make(String.view(&run joined(String.view(&pageWindow), "style-updates.mjs")))
+    if run FileSystem.exists(&helper) { run FileSystem.removeFile(&helper) }
+    let mut i: usize = 0
+    while i < sheetCount {
+      let oldSheet = run Path.make(String.view(&run joined(dir, String.view(&run stylesheets.name(i, false)))))
+      if run FileSystem.exists(&oldSheet) { run FileSystem.removeFile(&oldSheet) }
+      i = i + 1
+    }
+  }
+  run copied(String.view(&run joined(String.view(&window), "app-host.js")), String.view(&run joined(String.view(&pageWindow), "app-host.js")), true)
+  run copied(String.view(&run joined(String.view(&window), "access-mirror.js")), String.view(&run joined(String.view(&pageWindow), "access-mirror.js")), false)
+  run copied(String.view(&run joined(String.view(&window), "media.mjs")), String.view(&run joined(String.view(&pageWindow), "media.mjs")), false)
+  run copied(String.view(&run joined(String.view(&window), "sheet-fetch.mjs")), String.view(&run joined(String.view(&pageWindow), "sheet-fetch.mjs")), false)
+  let canvasManifest = run joined(String.view(&loom), "modules/silkui/web/canvas/silk.toml")
+  let rev = run pinned(String.view(&canvasManifest), "webgpu")
+  if String.view(&rev) == "" { run Task.abort("silkui: silkui-web-canvas pins no lib-native revision") }
+  let native = run checkout(String.view(&rev))
+  let platform = run joined(String.view(&native), "modules/platform/window/browser/")
+  let pagePlatform = run joined(dir, "native/platform/window/browser/")
+  let names = ["window-host.js", "imports.js", "keys.js"]
+  let mut at: usize = 0
+  while at < 3 {
+    run copied(String.view(&run joined(String.view(&platform), names[at])), String.view(&run joined(String.view(&pagePlatform), names[at])), false)
+    at = at + 1
+  }
+  let gpu = run joined(String.view(&native), "modules/gpu/webgpu/browser/")
+  let pageGpu = run joined(dir, "native/gpu/webgpu/browser/")
+  run copied(String.view(&run joined(String.view(&gpu), "host.ts")), String.view(&run joined(String.view(&pageGpu), "host.js")), true)
+  run copied(String.view(&run joined(String.view(&gpu), "generated_schema.ts")), String.view(&run joined(String.view(&pageGpu), "generated_schema.js")), false)
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import silk.net.address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.net.socket_native { Accepted, BoundAddress, Connection, Incoming, Listener, ListenOptions, NativeSocketError, Received, Sent, listen }
+import silk.num.i32
+import silk.num.u8
+import silk.num.u16
+import silk.num.u64
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+
+struct Client { socket: Connection, request: Bytes, header: Bytes, body: Bytes, sent: usize, ready: bool }
+
+/// A static file server for one folder, on the loopback address. `/__silkui/build` answers
+/// the build number, which a `Mode.Dev` page polls to reload after a rebuild.
+pub struct Server {
+  listener: Listener,
+  clients: List<Client>,
+  root: String,
+  pub build: u64,
+  pub styles: u64,
+}
+
+effect fn socketFailure(error: NativeSocketError) -> never ! TaskError | OutOfMemoryError ? &mut Allocator {
+  drop error
+  run Task.abort("silkui: the page server's socket failed")
+}
+
+effect fn noListener(error: NativeSocketError) -> Option<Listener> {
+  drop error
+  return Option<Listener>.None
+}
+
+effect fn bound(port: u16) -> Option<Listener> ! NativeSocketError {
+  let endpoint = Endpoint.make(IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) }, Port.fromU16(port))
+  return Option<Listener>.Some { value: run listen(endpoint, ListenOptions.defaults()) }
+}
+
+effect fn decimal(value: u64) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut digits = String.make()
+  let mut rest = value
+  if rest == 0 { run String.append(&mut digits, "0") }
+  while rest > 0 {
+    let mut one = run String.copy(String.slice("0123456789", u64.toUsize(rest % 10), 1))
+    run String.append(&mut one, String.view(&digits))
+    digits = move one
+    rest = rest / 10
+  }
+  return move digits
+}
+
+impl Server {
+  /// Serves `root` on port `port`, or on a port the system picks when that one is taken.
+  pub effect fn open(root: string, port: u16) -> Server ! TaskError | OutOfMemoryError ? &mut Allocator {
+    let mut listener = match move run Effect.catch(bound(port), noListener) {
+      Option<Listener>.Some { value } => move value
+      Option<Listener>.None => match move run Effect.catch(bound(0), noListener) {
+        Option<Listener>.Some { value } => move value
+        Option<Listener>.None => run Task.abort("silkui: the page server could not listen on the loopback address")
+      }
+    }
+    let actual = match Listener.boundAddress(&listener) {
+      BoundAddress.Tcp { endpoint } => Port.value(&Endpoint.port(&endpoint))
+      _ => port
+    }
+    StderrWriter.print("silkui: serving the page on http://127.0.0.1:{}/\n", &.(actual))
+    return Server { listener: move listener, clients: List<Client>.make(), root: run String.copy(root), build: 1, styles: 1 }
+  }
+
+  /// Answers requests for about `milliseconds`.
+  pub effect fn serveFor(self: &mut Self, milliseconds: u64) -> ()
+    ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+    let mut clock = OsMonotonicClock.make()
+    run Effect.catch(self.loop(milliseconds), socketFailure)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+
+  effect fn loop(self: &mut Self, milliseconds: u64) -> ()
+    ! NativeSocketError | TaskError | FileError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem | &mut MonotonicClock {
+    let start = run MonotonicClock.now()
+    let until = SystemClock.make(SystemClock.seconds(&start), SystemClock.nanoseconds(&start) + u64.toI64(milliseconds) * 1000000)
+    let mut watches = List<ReadyWatch>.make()
+    while true {
+      while true {
+        match move (run self.listener.tryAccept()) {
+          Incoming.WouldBlock => { break }
+          Incoming.Client { accepted } => run self.clients.append(Client {
+            socket: Accepted.intoConnection(move accepted), request: Bytes.make(), header: Bytes.make(), body: Bytes.make(), sent: 0, ready: false,
+          })
+        }
+      }
+      let mut index: usize = 0
+      while index < self.clients.length() {
+        let finished = run Effect.catch(self.step(index), dropped)
+        if finished { drop self.clients.remove(index) } else { index = index + 1 }
+      }
+      watches.clear()
+      run watches.append(ReadyWatch.forRead(i32.toUsize(self.listener.rawDescriptor())))
+      let clients = self.clients.asSlice()
+      index = 0
+      while index < clients.length {
+        let handle = i32.toUsize(clients[index].socket.rawDescriptor())
+        run watches.append(if clients[index].ready { ReadyWatch.forWrite(handle) } else { ReadyWatch.forRead(handle) })
+        index = index + 1
+      }
+      let now = run MonotonicClock.now()
+      let seconds = SystemClock.seconds(&now)
+      let ends = SystemClock.seconds(&until)
+      if seconds > ends || (seconds == ends && SystemClock.nanoseconds(&now) >= SystemClock.nanoseconds(&until)) { return () }
+      drop run MonotonicClock.waitReady(watches.asMutSlice(), Option<Instant>.some(SystemClock.make(ends, SystemClock.nanoseconds(&until))))
+    }
+  }
+
+  effect fn step(self: &mut Self, index: usize) -> bool
+    ! NativeSocketError | TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+    let root = String.view(&self.root)
+    let build = self.build
+    let styles = self.styles
+    let client = &mut self.clients.asMutSlice()[index]
+    if !client.ready {
+      let mut buffer: [u8; 8192] = [0; 8192]
+      match move (run client.socket.tryRead(&mut buffer)) {
+        Received.End => { return true }
+        Received.WouldBlock => { return false }
+        Received.Data { count } => run client.request.append(Slice.view<u8>(&buffer, 0, count))
+      }
+      let request = match String.fromUtf8(client.request.asSlice()) {
+        Result.Success { value } => run String.copy(value)
+        Result.Failure { .. } => { return true }
+      }
+      if !String.contains(String.view(&request), "\r\n\r\n") {
+        return client.request.length() > 65536
+      }
+      run answer(&mut client, String.view(&request), root, build, styles)
+    }
+    let headLength = client.header.length()
+    let bodyLength = client.body.length()
+    let data = if client.sent < headLength {
+      Slice.view<u8>(client.header.asSlice(), client.sent, headLength - client.sent)
+    } else { Slice.view<u8>(client.body.asSlice(), client.sent - headLength, bodyLength - (client.sent - headLength)) }
+    match move (run client.socket.tryWrite(data)) {
+      Sent.Count { count } => { client.sent = client.sent + count }
+      Sent.WouldBlock => {}
+    }
+    return client.sent == headLength + bodyLength
+  }
+}
+
+effect fn dropped(error: NativeSocketError) -> bool {
+  // A page that navigates away cancels its requests; that ends only its connection.
+  drop error
+  return true
+}
+
+fn mime(path: string) -> string<'static> {
+  if String.endsWith(path, ".html") { return "text/html; charset=utf-8" }
+  if String.endsWith(path, ".js") || String.endsWith(path, ".mjs") { return "text/javascript" }
+  if String.endsWith(path, ".wasm") { return "application/wasm" }
+  if String.endsWith(path, ".css") { return "text/css" }
+  if String.endsWith(path, ".json") { return "application/json" }
+  if String.endsWith(path, ".svg") { return "image/svg+xml" }
+  if String.endsWith(path, ".png") { return "image/png" }
+  if String.endsWith(path, ".ttf") { return "font/ttf" }
+  if String.endsWith(path, ".woff2") { return "font/woff2" }
+  return "application/octet-stream"
+}
+
+effect fn answer(client: &mut Client, request: string, root: string, build: u64, styles: u64) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  if !String.startsWith(request, "GET ") {
+    run respond(&mut client, "405 Method Not Allowed", "text/plain", Bytes.make())
+    return ()
+  }
+  let bytes = String.utf8Bytes(request)
+  let mut end: usize = 4
+  while end < bytes.length && bytes[end] != 32 && bytes[end] != 63 { end = end + 1 }
+  let path = String.slice(request, 4, end - 4)
+  if path == "/__silkui/build" || path == "/__silkui/styles" {
+    let number = run decimal(if path == "/__silkui/build" { build } else { styles })
+    run respond(&mut client, "200 OK", "text/plain", run Bytes.copy(String.utf8Bytes(String.view(&number))))
+    return ()
+  }
+  // Paths are the page's own; anything that could leave the folder is not found.
+  if !String.startsWith(path, "/") || String.contains(path, "..") || String.contains(path, "\\") || String.contains(path, "%") {
+    run respond(&mut client, "404 Not Found", "text/plain", Bytes.make())
+    return ()
+  }
+  let mut file = run String.copy(root)
+  run String.append(&mut file, path)
+  if String.endsWith(path, "/") { run String.append(&mut file, "index.html") }
+  let found = run Path.make(String.view(&file))
+  if !run FileSystem.exists(&found) {
+    run respond(&mut client, "404 Not Found", "text/plain", Bytes.make())
+    return ()
+  }
+  let body = run FileSystem.readFile(&found)
+  if String.endsWith(String.view(&file), "/index.html") {
+    // A dev page polls for a build number other than the one it was served with.
+    if let Result.Success { value: text } = String.fromUtf8(body.asSlice()) {
+      let number = run decimal(build)
+      let numbered = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+      let styleNumber = run decimal(styles)
+      let page = run replaced(String.view(&numbered), "__SILKUI_STYLES__", String.view(&styleNumber))
+      run respond(&mut client, "200 OK", "text/html; charset=utf-8", run Bytes.copy(String.utf8Bytes(String.view(&page))))
+      return ()
+    }
+  }
+  run respond(&mut client, "200 OK", mime(String.view(&file)), move body)
+}
+
+effect fn respond(client: &mut Client, status: string, kind: string, body: Bytes) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let length = run decimal(usize.toU64(body.length()))
+  run client.header.append(b"HTTP/1.1 ")
+  run client.header.append(String.utf8Bytes(status))
+  run client.header.append(b"\r\nContent-Type: ")
+  run client.header.append(String.utf8Bytes(kind))
+  run client.header.append(b"\r\nContent-Length: ")
+  run client.header.append(String.utf8Bytes(String.view(&length)))
+  run client.header.append(b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
+  client.body = move body
+  client.ready = true
+}
+} else {
+/// Serving pages needs sockets Silk has on macOS and Linux only here.
+pub struct Server { pub build: u64 }
+
+impl Server {
+  pub effect fn open(root: string, port: u16) -> Server ! TaskError | OutOfMemoryError ? &mut Allocator {
+    run Task.abort("silkui: serving the page needs macOS or Linux")
+  }
+  pub effect fn serveFor(self: &mut Self, milliseconds: u64) -> ()
+    ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {}
+}
+}

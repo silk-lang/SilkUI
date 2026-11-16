@@ -1,6 +1,6 @@
-// A counter on @silk/ui: the same tree as counter.js (1 the root, 2 the field, 3 the button,
+// A counter on @silkui/core: the same tree as counter.js (1 the root, 2 the field, 3 the button,
 // 4 the label), built with the node API and handled with DOM style listeners.
-import { createBox, createText, createInput, mount } from "@silk/ui";
+import { createBox, createText, createInput, mount } from "@silkui/core";
 
 const root = mount(createBox({ width: 400, height: 300 }));
 const field = createInput({ width: 200, height: 30 });
@@ -41,4 +41,4 @@ field.addEventListener("keydown", (event) => {
 
 globalThis.keepFocus = true;
 globalThis.log = log;
-globalThis.app = { root, field, button, label };
+globalThis.app = { root, field, button, label, createBox };

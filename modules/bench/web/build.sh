@@ -35,5 +35,7 @@ after="$(sed '1,/<!--shell-->/d' "$here/page/index.html")"
   printf '%s\n' "$after"
 } > "$target/index.html"
 cp "$root/build/llvm/wasm32-unknown-unknown/$profile/ui-bench-web" "$target/dist/bench.wasm"
-cp "$root/modules/app/dom/js/silk-ui-dom.js" "$target/dist/silk-ui-dom.js"
+# loom-dom's page script, from Silk's checkout of the Loom commit this package pins.
+loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\([0-9a-f]*\)".*/\1/p' "$here/silk.toml" | head -1)"
+cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$target/dist/silk-ui-dom.js"
 echo "Built $target"

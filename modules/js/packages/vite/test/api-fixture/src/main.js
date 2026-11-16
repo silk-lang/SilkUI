@@ -1,4 +1,4 @@
-import { createText, mount } from "@silk/ui";
+import { createText, mount } from "@silkui/core";
 import { readFileSync } from "node:fs";
 import { load } from "./library.js";
 

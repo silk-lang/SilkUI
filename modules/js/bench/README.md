@@ -132,7 +132,7 @@ Memory (MB, all processes of the app) and idle CPU
   Vulkan drivers the loader opens and does not use (nouveau, radeon, intel, asahi and
   others) about 12 MB, and our binary's code 30 MB of clean, shared pages. The JavaScript
   side (engine, React, the app) costs about 20 MB.
-- **Startup** (see [Startup after lib-ui#66](#startup-after-lib-ui66) for the current numbers).
+- **Startup** (see [Startup after silkui#66](#startup-after-silkui66) for the current numbers).
   A warm first frame took 245 ms, against Electron's 168 ms and Tauri's
   808 ms. Of the 245 ms, 200 ms is creating the GPU device (lavapipe), which happens after
   the window opens and before anything is drawn; the JavaScript adds about 15 ms (window
@@ -148,7 +148,7 @@ Memory (MB, all processes of the app) and idle CPU
   each (184 MB after, from 154 MB), against 17 KB in Electron.
 - **Idle CPU** is zero for everything but Tauri (0.2 % of a core).
 
-### Startup after lib-ui#66
+### Startup after silkui#66
 
 The window host now starts the GPU (device and pipelines) on its render thread before the
 client runs and the window opens, the renderer compiles its pipelines side by side and a
@@ -177,7 +177,7 @@ time; what is left is lavapipe: about 30 ms for the adapter (the Vulkan loader a
 the difference is reading the driver (libLLVM is about 100 MB) back from disk. On a machine
 with a GPU both should be much smaller; that is not measured here.
 
-Then (lib-ui, `startGpu`): the app starts the GPU first thing, before it loads fonts and the
+Then (silkui, `startGpu`): the app starts the GPU first thing, before it loads fonts and the
 script, and hands it to the host in `RunOptions.gpu`. With the production host, 5 cold and
 7 warm runs: ui-js 87 ms warm (from 101), 252 ms cold (from 289), 238 ms first launch; the
 native counter 93 ms warm (from 101).

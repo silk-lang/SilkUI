@@ -2,7 +2,8 @@
 
 Status: steps 1–6 of the [order of work](#order-of-work) are implemented; the rest is a draft
 for review.
-Code sketches show shape only, not final names or syntax.
+Code sketches show shape only, not final names or syntax. Paths under `modules/loom`,
+`modules/loom-components` and `modules/devtools` are in [silk-lang/loom](https://github.com/silk-lang/loom).
 
 ## Summary
 
@@ -24,7 +25,7 @@ Code sketches show shape only, not final names or syntax.
 |---|---|---|
 | Tree | `ui-protocol`, `ui-tree`, `ui-tree-window` | Nodes, styles, events, roots. Roots are opened imperatively. |
 | Inspector | `ui-inspect`, `ui-inspect-server`, cli, mcp | The tree layer only: tree, roots, styles, events, input, highlight, pick, screenshots, frames, audit, edits. Plus the extension API. |
-| Framework | `ui-app` (silk-ui), or any other | Model, messages, commands. Wraps roots however it likes. Registers its own inspector extension (silk-ui's is `ui-app-inspect`, so `ui-app` itself stays free of the inspector). |
+| Framework | `loom` (silk-ui), or any other | Model, messages, commands. Wraps roots however it likes. Registers its own inspector extension (silk-ui's is `loom-inspect`, so `loom` itself stays free of the inspector). |
 | Devtools UI | `ui-inspect-devtools` | An inspector client. Built with silk-ui, which is an implementation choice and leaks nothing into the protocol. In the app's process it is a window-host companion (`ui-tree-window`), so it also needs that host. |
 
 Two things in the code broke this until step 5:
@@ -32,7 +33,7 @@ Two things in the code broke this until step 5:
 - `ui-inspect-server` owned the program log: `program`, `messages`, `model`
   and the model diff lived in `modules/inspect/server/src/program.silk`, fed by
   `Inspector.program`. They are now the `silk-ui` extension, in
-  `modules/app/inspect` (`ui-app-inspect`).
+  `modules/loom/inspect` (`loom-inspect`).
 - Devtools had a hard-wired Program tab (`Panel` enum). It is now a panel
   silk-ui supplies as a remote view.
 
@@ -43,29 +44,29 @@ Frame timings stay in the inspector: the window host produces them.
 | Area | Fact | Where |
 |---|---|---|
 | Root | One root per tree; `setRoot` detaches the previous one | `modules/tree/src/engine.silk:187`, `:1026` |
-| Root | `ROOT_ID = 1`; `dispatch` drops events whose path starts at neither it nor a declared window's root node | `modules/app/src/ui.silk:75`, `runtime.silk` |
-| Backend | `Backend` has `mutate`, `events`, `viewport`, `measure`, `range`, `navigate`; no root parameter | `modules/app/src/backend.silk:26` |
+| Root | `ROOT_ID = 1`; `dispatch` drops events whose path starts at neither it nor a declared window's root node | `modules/loom/src/ui.silk:75`, `runtime.silk` |
+| Backend | `Backend` has `mutate`, `events`, `viewport`, `measure`, `range`, `navigate`; no root parameter | `modules/loom/src/backend.silk:26` |
 | Events | `Event.path` runs from the root node to the target; no window field | `modules/protocol/src/record.silk:33` |
 | Native | The host runs one tree, with a window per open root | `modules/tree/window/src/host.silk` |
 | Native | The platform thread is already keyed by `WindowId` | `modules/tree/window/src/platform_thread.silk:57` |
-| DOM | One `Runtime` + one `Dom` per page; JS tracks one `rootId` | `modules/app/dom/src/page.silk:68` |
+| DOM | One `Runtime` + one `Dom` per page; JS tracks one `rootId` | `modules/loom/dom/src/page.silk:68` |
 | Inspector | One JSON line in, one out, then close | `modules/inspect/server/README.md:73` |
-| Inspector | Devtools polls every 0.5 s; each sync is 6–8 requests, each a new connection | `modules/inspect/devtools/src/devtools.silk:64`, `:452` |
+| Inspector | Devtools polls every 0.5 s; each sync is 6–8 requests, each a new connection | `modules/devtools/src/devtools.silk:64`, `:452` |
 | Inspector | The host loop wakes every 20 ms while the inspector is on | `modules/inspect/server/src/server.silk:366` |
 | Inspector | `Protocol.handle` has no socket code; devtools already has a `Link` service with socket and in-process implementations | `protocol.silk:378`, `devtools/src/link.silk:8` |
 | Inspector | Everything is typed against `UiTree`, not `Backend` | `protocol.silk:378` |
 | Inspector | Hidden roots: left out of replies, queries, the event log and topics | `protocol.silk` (`Protocol.hide`) |
 | Inspector | A session in the same process: `openLocal`, served on the spot by `serveLocal` | `server.silk` |
 | Native | A companion beside the client: input, records and frames of its roots, every key first; its root in a window or docked in the first | `modules/tree/window/src/companion.silk` |
-| Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/inspect/devtools/src/embedded.silk` |
+| Devtools | Run in the app's process as that companion, on a hidden root set aside in the tree | `modules/devtools/src/embedded.silk` |
 | Inspector | Built-in commands are an if/else chain; `<id>.<command>` goes to the extension registry. The MCP tool list is the built-in array plus the tools of the extensions `hello` lists | `protocol.silk` (`execute`), `extension.silk`, `mcp.silk` |
 | Inspector | Extensions: registered with `Inspector.extend`, served from the app's loop with `Inspector.serveExtension`; topics by name, views on `<id>.view.<panel>` | `modules/inspect/server/src/extension.silk` |
 | Inspector | Mutation batches and event records as JSON, `mutationFormat` 1 | `modules/inspect/server/src/remote.silk` |
-| Framework | silk-ui's extension: program log, `silk-ui.*` commands, the Program panel as a silk-ui program on a `ViewBackend` | `modules/app/inspect/src/{extension,program,panel}.silk` |
-| Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/inspect/devtools/src/{devtools,remote}.silk` |
+| Framework | silk-ui's extension: program log, `silk-ui.*` commands, the Program panel as a silk-ui program on a `ViewBackend` | `modules/loom/inspect/src/{extension,program,panel}.silk` |
+| Devtools | Tabs past their own come from `hello`; data panels in rows; views replayed by `ViewHost`, their records sent back | `modules/devtools/src/{devtools,remote}.silk` |
 | Inspector | `highlight` exists; devtools only calls it on click | `protocol.silk:784`, `devtools.silk:1128` |
 | Styles | `setStyle` lays an override over the node (`UiTree.setOverride`), kept until reset or resolved; each property is an edit in the app's edit log, with comments | `tree/src/engine.silk` (`StyleOverride`), `server/src/{tools,edits}.silk` |
-| Theme | `Theme` is a struct passed by hand in ui-components; no variables in css | `modules/components/src/theme.silk:16` |
+| Theme | `Theme` is a struct passed by hand in loom-components; no variables in css | `modules/loom-components/src/theme.silk:16` |
 | std | `silk.toml` exists: parser, scanner with byte spans, comment-preserving formatter | `stdlib/silk/toml/` |
 | std | `accept` returns an owned `Accepted`; the connection is reachable only inside `withAccepted`, which closes it on return | `stdlib/silk/net/socket_native.silk:2736`, `:2823` |
 | std | No call-site intrinsic; no file watcher | intrinsic list of dev.67; `stdlib/silk/system/` |
@@ -221,7 +222,7 @@ its records, and hidden from the inspector (`Protocol.hide`) so the devtools nev
 themselves. A docked root is laid out at the window's size with its content in the dock; the
 host draws its scene over the app's. Each root counts its own revision (`UiTree.revisionOf`),
 so the devtools drawing is no `tree` news. `SILK_UI_DEVTOOLS=window|dock|1` opens them, F12
-toggles them. ui-app-window runs every silk-ui app with them; a tree client calls
+toggles them. loom-window runs every silk-ui app with them; a tree client calls
 `host.runWindowWith` with them.
 
 **Inspecting other backends.** `Protocol` takes `UiTree`. To inspect a DOM
@@ -278,7 +279,7 @@ inspector.extend(Extension {
   own builder.
 
 silk-ui's Program tab, message list and model diff move into this extension
-in `ui-app`. Router, store or user panels register the same way.
+in `loom`. Router, store or user panels register the same way.
 
 ### As built (step 5)
 
@@ -311,8 +312,8 @@ run inspector.serveExtension("silk-ui", &mut silkUi)   // silkUi: an ExtensionHa
   the notifications: a client in the app's own process cannot wait for the
   app's next turn. The window content's `intercept` hook takes a replayed
   view's records before the devtools' program sees them.
-- silk-ui's extension lives in a new package, `ui-app-inspect`, which
-  `ui-app-window` registers and serves; `ui-app` stays inspector-free.
+- silk-ui's extension lives in a new package, `loom-inspect`, which
+  `loom-window` registers and serves; `loom` stays inspector-free.
 
 ### Risks
 
@@ -469,7 +470,7 @@ demo restyles Archive when New adds a row.
 | 2 | Protocol 3 sessions, `Channel` with memory and socket, pushed topics, hover highlight | Snappy devtools; 4, 5, 6 |
 | 3 | Native host with several windows; `windows` in silk-ui | Multi-window apps |
 | 4 | Embedded and same-process windowed devtools (done) | — |
-| 5 | Extension API; move the program log out of the inspector into `ui-app`; panels with data, then remote views (done) | Framework tabs |
+| 5 | Extension API; move the program log out of the inspector into `loom`; panels with data, then remote views (done) | Framework tabs |
 | 6 | Override layer, edit log, comments, MCP tools (done) | Agent workflow |
 | 7 | Tokens, TOML file, two-way editing | Theme editing |
 
@@ -541,7 +542,7 @@ until the remote view works.**
 - Order inside the step:
   1. Extension registry, namespaced commands and topics, `hello` listing, MCP
      tools generated from it.
-  2. Move `program.silk` to `ui-app` as the `silk-ui` extension. Devtools
+  2. Move `program.silk` to `loom` as the `silk-ui` extension. Devtools
      keeps its current Program tab for now, shown only when the extension is
      present.
   3. Remote view replay in devtools. silk-ui supplies the Program panel as a
@@ -550,7 +551,7 @@ until the remote view works.**
   extension API is sufficient for any framework.
 
 Done as recommended. Deviations: the program log went to a new package beside
-`ui-app` (`ui-app-inspect`) rather than into `ui-app` itself; there is no
+`loom` (`loom-inspect`) rather than into `loom` itself; there is no
 `silk-ui.frames` (frame timings stay the inspector's `frames`, as the window
 host produces them) and no `silk-ui.subscriptions` (they are in
 `silk-ui.program`); the devtools' own tabs (Styles to Stats) stay theirs, and

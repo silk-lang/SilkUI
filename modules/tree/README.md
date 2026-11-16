@@ -76,6 +76,10 @@ let records = run tree.events()
   created)`. An id is not handed out again after its node is destroyed, so an old handle fails
   and never names a newer node.
 
+Grid track lengths resolve after the node's font size and writing mode, using the current
+viewport. State looks and overrides can replace tracks. An explicit `setGrid` survives
+unrelated style changes; a later grid declaration replaces it.
+
 ## The mutation protocol
 
 A JavaScript or remote host drives the same tree with plain data. It chooses its own node, font
@@ -167,7 +171,7 @@ flags); each has the direct call listed above.
 
 ## Virtual scrolling
 
-Variable-height virtualization belongs to the retained tree. `ui-app` uses the same
+Variable-height virtualization belongs to the retained tree. `loom` uses the same
 mutation/query protocol available to a direct Silk client or a future JS binding;
 it does not maintain a separate geometry algorithm.
 
@@ -222,7 +226,7 @@ match the anchor width. The tree chooses above/below placement and viewport limi
 after continuous viewport layout, then updates them on scroll and resize without a framework render.
 The popup uses fixed viewport positioning; put it after ordinary content so it draws
 and receives hits above that content. This API does not change parentage or event
-bubbling. Menus and popovers in `ui-components` use it through `Ui.anchored`.
+bubbling. Menus and popovers in `loom-components` use it through `Ui.anchored`.
 Width matching includes the popup's padding and border; menus no longer add those
 on top of the trigger width.
 
@@ -253,7 +257,7 @@ by `begin`, test `accepts(token)` before installing pixels, then call `finish`.
 Replacement and cancellation invalidate old tokens. Native or browser hosts supply
 file/network I/O and decoding; the tree continues to accept `DefineImage` and
 `DefineDecodedImage` mutations. The native worker implementation is available through
-`ui-tree-window.images`, with compatibility exports from `ui-app-window.images`.
+`ui-tree-window.images`, with compatibility exports from `loom-window.images`.
 
 ## Interaction
 
@@ -324,7 +328,7 @@ input against the last frame's layout, and the changes show at the next frame
   uses a 250 ms ease-out. Wheel, pointer-down, and key-down input interrupt pending motion.
 
 Call geometry APIs after current layout has been produced. This adapter does not add a CSS
-parser-to-`Style` bridge, browser browsing contexts, general element transforms, or
+parser-to-`Style` bridge, browser browsing contexts, or
 `content-visibility` to the renderer. Unsupported host features are not represented by
 fabricated geometry.
 
@@ -368,6 +372,19 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
   input scrolls so the caret is in view (a single-line input scrolls back to its start on
   blur). `CaretColor`, `SelectionColor` and `PlaceholderColor` style it. `caretRect(id)` and
   `selection(id)` report it, and `describe` writes `selection=`, `preedit=` and the input flags.
+- **Rich inputs.** `SetRichText` gives an input a document: its value, mark spans (`MarkSpan`,
+  bits over value bytes) and atoms (`Atom { kind, label, data }`), each atom one `OBJECT`
+  (U+FFFC) in the value, so offsets stay value bytes and the caret steps over an atom as one
+  unit. `DefineMark` and `DefineAtom` give a mark bit or atom kind its declarations. The input
+  lays out one inline run per stretch of equal marks and an inline-block per atom (its
+  label), under the input's own text style. Typing takes the marks before the caret (or the
+  ones `Format` set at the caret), `Format` over a range and `InsertAtom` are undo steps with
+  their own `inputType`, and `Input` records carry the marks, atoms and active marks.
+- **Selection changes.** After each input and each batch, a focused input whose selection
+  (or, in a rich input, the marks typing would get) moved since the last report queues a
+  `SelectionChange` record for `LISTEN_SELECTION_CHANGE` listeners on its path, as DOM
+  `selectionchange` at an input: caret keys, clicks, drags, `Select` and edits (after their
+  `Input` record) all report, and a key that moves nothing does not.
 
 ## Frames
 
@@ -383,6 +400,13 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
   span split across lines gets one background per line with the outer edges only on its first
   and last pieces. Underline, overline and line-through follow the text color or a decoration
   color, wavy or straight. Glyphs, icons and images go through the shared atlas as sprites.
+- **Stacking** follows CSS 2 Appendix E (`src/stacking.silk`). The viewport makes the root
+  stacking context, and so do boxes with a `z-index` other than `auto` (positioned boxes and
+  flex or grid items), `opacity` below 1, a backdrop blur, `position: fixed` or `sticky`. The
+  root context paints the root element's background first. Each context paints negative
+  `z-index`, then its in-flow content, `z-index: auto` and 0 in document order, then positive `z-index`. Positioned boxes
+  paint from their context inside the clips and scroll groups of the boxes they sit in. Hit
+  testing walks the same order backwards. A snapshot of one node paints in tree order.
 - **Replay.** Each fragment gets a hash of everything that affects its subtree's paint. When a
   subtree's hash, clip and scale match the previous frame, its operations are copied with
   `Scene.replay` instead of being painted again. `tree.stats` (`FrameStats`) counts replayed and
@@ -482,7 +506,8 @@ the wasm build draw the same bytes.
 
 ## Limits
 
-- Paint follows tree order: no `z-index` stacking contexts yet.
+- In-flow content of a stacking context paints in tree order, without CSS's split into block
+  backgrounds, floats and inline content; positioned inline boxes paint in flow.
 - One box shadow per box, and the `overflow: hidden` clip is the padding box rectangle, not
   rounded.
 - Styles are resolved for the whole tree whenever any style changes (cheap next to layout, but
@@ -492,7 +517,10 @@ the wasm build draw the same bytes.
 - Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
   scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
 - Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
-- No style transitions yet.
+- Transforms flatten into their parent's plane (no `transform-style: preserve-3d`), and a
+  transformed box that is not a pure translation is resampled from its own layer, so magnified
+  content is softer than content painted at that size. Caret and range rectangles ignore
+  transforms.
 - Editing moves logically: in right-to-left text the arrows follow the text order, not the
   screen, and a caret at a direction boundary is drawn on one side only. No password masking,
   no drag and drop of text, no maximum length, and text outside inputs is not selectable.
@@ -511,3 +539,73 @@ Archive removes the focused row). `silk task native demo modules/tree/demo -- ch
 scroll, and a Tab, then reads the surface back and compares it with the CPU reference,
 on X11 and Wayland under Xvfb and Weston with lavapipe.
 
+
+## Compiled stylesheet input
+
+`Batch.adoptStyleSheet(root, sheet, bytes)` appends a compiled `css-style` sheet to that
+root's cascade. `replaceStyleSheet` keeps its position; `removeStyleSheet` removes its rules.
+`styleSheetOrder(root, ids)` changes their order without recompiling. Sheet ids are local to a root. Invalid compiled bytes fail with `TreeError.StyleSheet` and
+leave the previous sheet intact. Closing a root releases its sheets.
+
+The tree matches native tags, ids, classes, named attributes and interaction state. Layer
+order is shared across adopted sheets. Inline looks participate in the same ordered list;
+important declarations preserve CSS precedence. Sheet custom properties inherit, registered
+properties use their declared inheritance/defaults, and inline `var()` can read that scope. `Batch.customProperty` sets or removes a custom
+property in a look; `ClearStyle` clears that look's custom properties too. JS style objects
+forward `--name` entries, preserving their case and numeric tokens.
+The resolved list feeds both layout and paint effects. Matched sheet/rule ids remain on the
+node's resolved style.
+
+Named ARIA relation attributes resolve literal element IDs for accessibility, within their
+root and in tree order. Typed `LabelledBy`, `DescribedBy`, `Controls`, and `ActiveDescendant`
+attributes still take client node numbers. The most recent typed or named write wins; a
+numeric-looking literal ID is an element ID, not a client node number.
+
+Hosts may call `UiTree.setStyleEnvironment(root, environment, systemColors)` to supply media
+preferences, input capabilities and the system-color palette. Frame dimensions and scale
+supply viewport queries and resolution. The default environment is headless. Class and pointer-state changes invalidate affected subtrees when selector dependencies
+permit it. Ancestor/sibling selectors and scope-changing declarations conservatively
+restyle the root; roots that only use style objects retain their existing path.
+
+`StyleSheet.load(&mut tree, run StyleSource.text(bytes))` loads runtime CSS into root 0.
+`tree.loadStyleSheet(root, run StyleSource.url(url))` targets another root. Hosts serve
+these requests through `Loader` with an explicitly installed runtime compiler; compiled-only
+hosts leave it disabled. A handle's `state`, `replace`, and `remove` methods observe or
+change the load. The batch equivalent is `loadStyleSheet(root, id, source)`.
+Loads reserve their cascade position before I/O, preserve the previous sheet on failure,
+and discard stale completions after replacement, removal, or root closure.
+
+`::before` and `::after` on box elements generate private layout boxes for string content
+and `attr(name[, "fallback"])`. Empty strings generate boxes; `normal`, `none`, and invalid
+computed content do not. `content: inherit` receives the ordinary origin's computed
+`normal` value and generates no box, matching CSS 2.2 and Chromium. The boxes inherit from their origin and participate in layout,
+paint, transitions, animations, and accessible names. Selectors and public child queries
+see only application nodes. Pointer and accessibility actions target the origin; motion
+events carry `pseudoElement`. Generated overflow scrolls independently, with offsets
+baked into paint rather than exported under the origin's compositor scroll ID.
+
+Input, image, icon, and canvas nodes do not generate these boxes. Counters, quotes, images,
+alternative content, typed `attr()`, and other pseudo-elements remain unsupported. The compiler diagnoses unsupported static content and pseudo-state suffixes;
+origin states such as `.button:hover::before` work.
+
+Size container queries support named containers, `size` and `inline-size` containment,
+physical and logical dimensions, ranges, boolean conditions, and query lists. Each query
+selects the nearest eligible ancestor for all required axes; pseudo-elements can select their
+origin. `cqw`, `cqh`, `cqi`, `cqb`, `cqmin`, and `cqmax` work in styles, grid tracks, transforms,
+paint effects, and keyframes. Missing unit axes fall back to the viewport.
+
+Grid tracks and paint effects resolve `ch`, `ex`, `cap`, `lh`, and their root-relative forms
+against the selected font and computed line height. Root font changes cross ancestors with
+independent fonts; inherited effects retain their defining font bases. These measured bases
+are not yet wired into every ordinary length or transform property.
+
+Frames, immediate geometry reads, and fragmented layout settle changed query results and unit
+bases within a pass budget derived from container depth. Only dependent nodes and their inherited
+subtrees are restyled. Intermediate passes retain the original transition state and animation
+clock, including starting styles and generated boxes whose final query still matches. Idle and
+scroll-only layout does not re-evaluate container conditions. Style and scroll-state queries
+remain unsupported.
+
+The stylesheet/style-object parity suite covers every `css_coverage` row. Generated-content
+tests also exercise real pixels, public structure, accessibility, media changes, sheet
+replacement/removal, scrolling, motion cancellation, and private slot reuse.

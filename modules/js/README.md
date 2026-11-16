@@ -1,18 +1,23 @@
 # ui-js
 
 Runs a JavaScript application on a UI tree, with the [SilkJS](https://github.com/silk-lang/lib-silkjs)
-engine embedded in the process. Four parts are here: the Silk host with its native bridge,
-`@silk/ui`, the node and event API, `@silk/ui-react`, a React renderer on it, and `@silk/vite`,
+engine embedded in the process. Five parts are here: the Silk host with its native bridge,
+`@silkui/core`, the node and event API, `@silkui/react`, a React renderer on it, `@silkui/foldkit`,
+which runs Foldkit programs on it, and `@silkui/vite`,
 a Vite plugin that builds an application and, in development, replaces edited modules in
 the running window.
 
-## @silk/ui
+To start an app, use a template: `silk init my-app -t ui-react` (or `ui-foldkit`, `ui-js`)
+gives a project whose `silk task dev` builds and opens it through [silkui](../silkui). This
+page is the reference for the packages and the host underneath.
 
-[packages/ui](packages/ui) is the node and event API. Its primitives are the tree's own (box,
+## @silkui/core
+
+[packages/core](packages/core) is the node and event API. Its primitives are the tree's own (box,
 text, input, image, icon, canvas). Its methods and its event flow are the DOM's.
 
 ```js
-import { createBox, createText, mount } from "@silk/ui";
+import { createBox, createText, mount } from "@silkui/core";
 
 const label = createText("Click me");
 const button = createBox({ width: 180, height: 70, backgroundColor: "rgb(0, 100, 200)" }, label);
@@ -38,7 +43,9 @@ mount(createBox({ width: 400, height: 300 }, button));
   (`gridTemplateColumns: "auto 1fr"`, `repeat()`, `minmax()`, named lines and
   `gridTemplateAreas`, `gridArea`, `gridColumn: "span 2"`); numbers for the placement
   properties are line numbers. Grid properties apply from the base look only. `node.look("hover")` (also `active`, `focus`, `focusVisible`) is the look the
-  tree lays over the base in that state.
+  tree lays over the base in that state; `node.look("starting")` is what transitions start
+  from when the node first shows. `defineKeyframes(name, { from: {...}, to: {...} })` defines
+  `@keyframes` for `animation` styles.
 - **Events.** `addEventListener(type, listener, options)` with `capture` and `once`. An event
   runs the capture phase from the root down, the target, then bubbles, with
   `stopPropagation`, `stopImmediatePropagation` and `preventDefault`. Listeners run before
@@ -46,6 +53,19 @@ mount(createBox({ width: 400, height: 300 }, button));
   is, as on the web. Events carry the DOM members of their kind (`clientX`, `button`,
   `detail`, `shiftKey`, `key`, `code`, `deltaY`, `inputType`). An `input` event has the new
   `value`.
+- **Rich inputs.** `createRichInput(style)` (or `createNode("richinput")`) edits a document
+  of styled text and inline atoms: `{ text, marks: [{ start, end, marks: ["bold"] }], atoms:
+  [{ kind, label, data }] }`. An atom (a mention, a chip) sits in `text` as one `OBJECT`
+  character, so the caret steps over it and Backspace deletes it whole. `defineMark(name,
+  style)` and `defineAtom(kind, style)` say what they look like; `document` reads and replaces
+  the document; `format(name, on)` and `toggleMark(name)` mark the selection, or the text typed
+  next at a caret; `insertAtom(start, end, atom)` replaces a range with an atom (a `@` trigger
+  turning into a mention). Offsets are string indices. An `input` event also has `document`,
+  and `activeMarks` holds the marks typed text gets. A `selectionchange` event (bubbling, as
+  on the web) follows every caret or selection move and every change of `activeMarks`, with
+  `selectionStart` and `selectionEnd`: listen for it to open a picker by a `@` the caret moved
+  next to. Typing takes the marks before the caret;
+  undo, IME and copy (which writes atom labels) work as in a plain input.
 - **Attributes.** `setAttribute(name, value)` for the tree's attributes (`tabIndex`,
   `disabled`, `label`, `testId`, `placeholder`, `multiline`, `readOnly`, `checked`,
   `selected`, `expanded`, `focusTrap`, `href`, `cursor`, `transition`). A name the tree does
@@ -53,23 +73,36 @@ mount(createBox({ width: 400, height: 300 }, button));
   `not-allowed` and the resize ones); the `cursor` style property does the same, and a node
   without one shows its nearest ancestor's.
 - **Accessibility.** `role` and `aria-*` work as in the DOM, as `aria-label` or `ariaLabel`.
-  `role` takes the first word that names a role the tree has (`"switch checkbox"`), and
-  `aria-label`, `aria-checked`, `aria-selected`, `aria-expanded` and `aria-valuemin`,
-  `aria-valuemax`, `aria-valuenow` set the tree's attributes. Other roles and ARIA names are
-  ignored with one console warning each, until the tree has them.
+  `role` takes the first word that names a role the tree has (`"switch checkbox"`). The
+  tree has the ARIA states and properties for names, values, levels, sets, toggles, validity
+  and live regions (`aria-level`, `aria-pressed`, `aria-live`, `aria-checked="mixed"` and so
+  on), and `aria-labelledby`, `aria-describedby`, `aria-controls` and
+  `aria-activedescendant` name other nodes by their `id`. Other roles and ARIA names are
+  ignored with one console warning each. `announce(message, { politeness })` has screen
+  readers say a message that nothing on screen shows. `inert` puts a subtree out of reach of
+  focus, pointers and screen readers, as in HTML.
 - **Links.** A node with an `href` is a link, as an `<a>` is: a click on it or inside it that
   no listener prevented calls `open(href)`, which hands the address to the host.
+- **Markdown.** `parseMarkdown(text, options)` returns the syntax tree of the text in
+  the shape of [mdast](https://github.com/syntax-tree/mdast), the tree remark gives, so
+  renderers written for remark's tree work on it, and an application needs no Markdown
+  parser in its bundle. The parser is the Silk standard library's (`silk.markdown`):
+  CommonMark with GitHub's tables, strikethrough, task lists and autolinks. `gfm: false`
+  turns those four off, each can be set alone (`tables`, `strikethrough`, `taskLists`,
+  `autolinkLiterals`), and `footnotes`, `frontmatter` (a `yaml` or `toml` node) and
+  `alerts` (`> [!NOTE]`, a node of type `alert` with a `kind`) turn on more. Nodes have no
+  `position`.
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
-## @silk/ui-react
+## @silkui/react
 
-[packages/ui-react](packages/ui-react) renders React components to the tree. Host elements are the
+[packages/react](packages/react) renders React components to the tree. Host elements are the
 tree's node kinds, and strings in children become text nodes.
 
 ```jsx
 import { useState } from "react";
-import { createRoot } from "@silk/ui-react";
+import { createRoot } from "@silkui/react";
 
 function Counter() {
   const [clicks, setClicks] = useState(0);
@@ -89,17 +122,20 @@ createRoot().render(<Counter />);
 ```
 
 - **Props.** `style`, and `hoverStyle`, `activeStyle`, `focusStyle` and `focusVisibleStyle`
-  for the looks of those states. `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
+  for the looks of those states. `startingStyle` is what transitions start from when the node
+  first shows (CSS `@starting-style`). `onClick`, `onPointerDown`, `onKeyDown`, `onInput` and so
   on for every event of the tree, with a `Capture` suffix for the capture phase. Listeners
-  receive the `@silk/ui` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
+  receive the `@silkui/core` event. Every other prop is a tree attribute (`tabIndex`, `testId`,
   `label`, `disabled`, `placeholder`), and `role` and `aria-*` work as in React DOM.
 - **Inputs.** `value` on `<input>` is controlled as in React DOM: the field shows what the
-  component keeps, whatever was typed.
+  component keeps, whatever was typed. `<richinput>` takes `marks` and `atoms` (name to
+  style), and `document` controlled the same way (`defaultDocument` for an uncontrolled one):
+  keep `event.document` from `onInput`.
 - **Timing.** `root.render` commits before it returns, so the first frame of a window has
   the content. A state change in a click, key or input listener commits before the host
   applies the mutations, so the next frame shows it. Other updates go through React's
   scheduler on the host's timers.
-- **JSX.** Set the JSX import source to `@silk/ui-react`, or use React's own runtime: both
+- **JSX.** Set the JSX import source to `@silkui/react`, or use React's own runtime: both
   work.
 
 [examples/react-counter](examples/react-counter) is a starter page in React where the counter
@@ -119,18 +155,88 @@ runs in a browser from the same files for comparison.
 React 19.3 with react-reconciler 0.34 runs on the engine as it is: the bundle needs only
 the web globals below.
 
-## @silk/vite
+## @silkui/foldkit
+
+[packages/foldkit](packages/foldkit) runs [Foldkit](https://foldkit.dev) programs (the
+Elm architecture on Effect) on the tree, with the `foldkit` package as it is published.
+Foldkit has no renderer interface: its virtual DOM patches through `document`. So the package
+provides a `document` and the DOM members Foldkit uses, and every element is a tree node.
+Import it before `foldkit`:
+
+```ts
+import '@silkui/foldkit'
+import { Runtime } from 'foldkit'
+import { Model, init, update, view } from './main'
+
+Runtime.run(Runtime.makeApplication({ Model, init, update, view, container: document.getElementById('root') }))
+```
+
+```ts
+export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
+  title: `Counter: ${model.count}`,
+  body: h.div(
+    [h.Style({ display: 'flex', gap: '12px', padding: '24px' })],
+    [
+      h.p([], [model.count.toString()]),
+      h.button([h.OnClick(Message.ClickedIncrement()), HoverStyle({ color: 'rgb(0, 120, 230)' })], ['+']),
+    ],
+  ),
+})
+```
+
+- **The page.** The document is `<html><body><div id="root">`, filling the window, so a
+  program boots in `document.getElementById('root')` as it does from a browser's
+  `index.html`. Foldkit puts the view's root element in its place.
+- **Elements.** Every tag is a box, except `input` and `textarea` (the tree's input), `img`
+  (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
+  `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
+  `li` have theirs, and nothing has a default style.
+- **Style.** `h.Style` with CSS values (`fontSize: '13px'`) and `h.Class` for adopted
+  stylesheets. `HoverStyle`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle`
+  and `StartingStyle` from this package are the looks the tree lays over an element in those
+  states, as attributes.
+- **Events.** The `On*` attributes of the events the tree has: clicks, pointers, keys, focus,
+  input, scroll, wheel, and the transition and animation ones. Mouse events arrive as the
+  pointer events they are. For an event the tree does not have (drag and drop, clipboard,
+  `change`, `submit`) the listener never runs, with one console warning.
+- **Attributes.** `Id`, `Role` and the `Aria*` ones, `Tabindex`, `Disabled`, `Readonly`,
+  `Placeholder`, `Value`, `Href` (a click opens it), `Hidden`, `Inert`, and `data-testid` as
+  the tree's test id. Others are kept on the element (`getAttribute`, selectors) and do
+  nothing else.
+- **Mounts and Commands.** An element is `Element`-shaped where Foldkit and its `Dom`
+  commands reach: `querySelector` with tag, `#id`, `.class` and `[attribute="value"]`
+  selectors, `focus`, `closest`, `contains`, `textContent`. `element.node` is the
+  `@silkui/core` node behind it, for code that draws on the tree itself. Layout reads
+  (`getBoundingClientRect`) are not there.
+- **Routing.** `location` and `history` keep an address in memory, starting at
+  `http://localhost/`, where the realm has `URL` (the [SilkJS runtime](node) does).
+- **Timing.** The first render is there for the window's first frame. After that Foldkit
+  renders the Model in an animation frame, as in a browser.
+- **Building.** `silk({ entry: "src/entry.ts", allow: provided })` with
+  `provided` from `@silkui/foldkit/apis`, so the missing API report leaves out what this
+  package provides. `vite build --watch` reloads the application on every change; the dev
+  server's module replacement does not run Foldkit programs yet.
+
+[examples/foldkit-counter](examples/foldkit-counter) is the starter page as a Foldkit
+program, the React example's twin: the count, the streak and the theme are the Model, and
+the same `motion.js` draws every frame, started by a Mount on the page element.
+
+## @silkui/vite
 
 [packages/vite](packages/vite) is the Vite plugin. A host evaluates one ES module, so the
-plugin sets up a library build with a single output file, the JSX runtime of
-`@silk/ui-react`, and `process.env.NODE_ENV` from the Vite mode.
+plugin sets up a library build with a single output file and `process.env.NODE_ENV` from
+the Vite mode. It knows no UI framework. For React, add `@silkui/react/vite` beside it: it
+compiles JSX with the `@silkui/react` runtime, applies the reconciler's sibling-walk fix
+(see [reconciler.js](packages/react/src/reconciler.js)), and adds Fast Refresh under the dev
+server (`react({ refresh: false })` turns it off).
 
 ```js
 import { defineConfig } from "vite";
-import silk from "@silk/vite";
+import silk from "@silkui/vite";
+import react from "@silkui/react/vite";
 
 export default defineConfig({
-  plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } })],
+  plugins: [silk({ entry: "src/main.jsx", host: { command: "path/to/host" } }), react()],
 });
 ```
 
@@ -138,7 +244,7 @@ export default defineConfig({
 
 ### APIs the runtime does not have
 
-A realm has ECMAScript, the web globals below and `@silk/ui`: no `fetch`, `URL`, `Intl`,
+A realm has ECMAScript, the web globals below and `@silkui/core`: no `fetch`, `URL`, `Intl`,
 `document`, `process` or Node modules. Libraries written for browsers or Node often expect
 them, so the plugin reads every module of a build and reports the ones that are used, and
 by whom:
@@ -166,8 +272,9 @@ features can be picked for each build.
 Under the dev server the host runs the application's modules as Vite serves them, and an
 edit replaces only the modules it touches:
 
-- A component file (every export is a React component) is swapped where it is with React
-  Fast Refresh. Component state and the rest of the application stay as they were.
+- With `@silkui/react/vite`, a component file (every export is a React component) is
+  swapped where it is with React Fast Refresh. Component state and the rest of the
+  application stay as they were.
 - Any other module passes the update on to its importers. When nothing accepts it, the
   window gets a new realm and the application starts again.
 - `import.meta.hot` works as in Vite: `accept`, `dispose`, `invalidate`, `data`.
@@ -216,7 +323,7 @@ JavaScript runs on the thread that owns the tree.
 
 ```silk
 let mut host = run JsHost.open(&memory, domain.handle())
-run host.define(b"@silk/ui", package)
+run host.define(b"@silkui/core", package)
 run host.module(source, b"app.js")
 run host.flush(&mut tree)
 run host.input(&mut tree, Input.press(10.0, 50.0))
@@ -248,15 +355,23 @@ Provide the `RuntimeAllocator` that `memory` observes as the `Allocator` of thes
 
 Every realm starts with the globals of [src/prelude.js](src/prelude.js) on top of the
 engine's ECMAScript: `setTimeout`, `setInterval`, `requestAnimationFrame`, `queueMicrotask`,
-`performance.now`, `console`, `reportError` and `open`. They sit on native timer, clock, frame and
-log functions, and the host decides what those mean:
+`performance.now`, `console`, `reportError`, `open` and `navigator.clipboard` (`readText` and
+`writeText`). They sit on native timer, clock, frame and log functions, and the host decides
+what those mean:
 
 - `JsHost.tick(seconds, animation)` moves the clock, runs the timers that are due, and with
   `animation` the frame callbacks. `nextDeadline` and `wantsFrame` tell a loop when to wake.
 - `JsHost.takeLogs` hands over the console lines.
+- A promise that is still rejected with no handler once the promise jobs ran becomes a
+  console error, `Uncaught (in promise) …`, as in a browser. A handler added later is too
+  late. A module that fails is reported by `JsHost.module` alone.
 - `JsHost.takeOpened` hands over the addresses `open(url)` asked for (http, https and mailto
   only). The window opens them with `xdg-open` on Linux and `open` on macOS, without waiting
   for it; other systems print that they could not.
+- `JsHost.takeClipboard` hands over the `navigator.clipboard` calls, and
+  `JsHost.answerClipboard` settles each one. Both windows do them on the system clipboard
+  once the code that asked has run, so a copy button works from any listener, timer or
+  promise job. A host that has no clipboard leaves the promises pending.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
@@ -284,9 +399,9 @@ their title bar.
 silk run --manifest-path modules/js/demo/silk.toml
 ```
 
-`@silk/ui` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
+`@silkui/core` and the starter page are part of the binary (`uiPackage()` from `ui_js.lib` and
 `Source.read("app.js")`), so the executable runs from any directory. After an edit to
-`packages/ui/src/index.js`, `silk task embed-assets` regenerates
+`packages/core/src/index.js`, `silk task embed-assets` regenerates
 `src/generated_library.silk`. `silk task native check` runs the demo with `--check`.
 
 ### Production builds
@@ -310,6 +425,18 @@ demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 
 the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
 the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
+## On the web canvas
+
+[web](web) (`ui-js-web`) runs the same bundle in a browser: the tree compiled to WebAssembly
+draws on a canvas and the application runs on the browser's JavaScript engine, through a
+second implementation of the `__ui` natives. Foldkit bundles add `define: pageGlobals` from
+`@silkui/foldkit/apis`. See [web/README.md](web/README.md) for how it works and its first
+frame numbers.
+
+```sh
+silk task browser serve --app modules/js/examples/plain-counter/dist/app.js
+```
+
 ## Status
 
 - Tests: `silk test --manifest-path modules/js/tests/silk.toml --root src/tests.silk` from the
@@ -317,10 +444,28 @@ the engine here (it lives in the SilkJS runtime, which ui-js does not link).
   against a stand-in for the native functions, and
   `silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk` for
   the bundled examples on the engine (build them first).
-- Not here yet: unhandled rejection reports, images and canvas commands from JavaScript,
-  source maps for errors under the dev server, and choosing engine features beyond Intl and
-  Temporal for each build.
 - Memory, release builds on Linux x86-64 under Xvfb with a software GPU, resident after six
   seconds: the Silk window demo 155 MB, the JavaScript counter 169 MB, the React counter
-  174 MB. The GPU stack is most of each; the engine with `@silk/ui` adds about 14 MB and
+  174 MB. The GPU stack is most of each; the engine with `@silkui/core` adds about 14 MB and
   React about 5 MB more.
+
+### Selector identity
+
+Core nodes expose a string `id`, `className`, a live `classList` (`add`, `remove`,
+`toggle`, `contains`, `replace`), and `getAttribute`, `hasAttribute`, and
+`removeAttribute`. `setAttribute` accepts `data-*`, `aria-*`, `lang`, and `dir`;
+empty strings and `"false"` are present values, while null removes the attribute.
+React passes `className`, `id`, `data-*`, and `aria-*` props through. Foldkit's
+existing class and data attributes reach the same native nodes.
+
+The numeric handle formerly exposed as `node.id` is now the read-only
+`node.nodeId`. Use it with `nodeById` and low-level host calls; changing the CSS
+`id` does not change that handle or event routing. Existing accessibility
+relations continue to resolve by the string id.
+
+CSS imports processed by `@silkui/vite` are compiled and adopted by the native tree.
+Production sheets embed local font assets, including Vite public-directory fonts.
+Development sheets use the Vite asset server; CSS and font edits preserve the mounted
+application. Middleware-mode integrations that serve fonts must set `server.origin`.
+See the [stylesheet guide](../../docs/content/core/stylesheets.md) for adoption APIs,
+runtime loading, and supported CSS.

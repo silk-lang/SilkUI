@@ -1,8 +1,11 @@
+import window_sheets as _window_sheets
+import window_frames as _window_frames
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError }
-import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets }
+import ui_js.bridge as bridge
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.runtime_memory { RuntimeAllocator }
@@ -13,6 +16,8 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import silk.io.writer_native { StderrWriter }
+import silk.io.writer { Writer }
 
 fn viewport() -> Viewport {
   return Viewport { width: 400.0, height: 300.0, scale: 1.0 }
@@ -104,14 +109,14 @@ effect fn click(host: &mut JsHost<'_>, tree: &mut Tree<'_>, x: f32, y: f32) -> (
   run host.input(&mut tree, Input.release(x, y))
 }
 
-/// The same counter as an ES module on @silk/ui: DOM style listeners with capture and
+/// The same counter as an ES module on @silkui/core: DOM style listeners with capture and
 /// bubbling, promise jobs before the mutations apply, typing, removal, and a listener that
 /// throws.
 effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
-  let package = run platform.readFile(b"modules/js/packages/ui/src/index.js")
-  run host.define(b"@silk/ui", package.asSlice())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
   let source = run platform.readFile(b"modules/js/tests/fixtures/app.js")
   run host.module(source.asSlice(), b"app.js")
   run host.flush(&mut tree)
@@ -155,6 +160,30 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run host.input(&mut tree, run Input.key("Escape"))
   run host.evaluate(b"if (lastKey !== 'Escape') throw new Error('key was ' + lastKey)", b"test")
 
+  // Transforms from a style object: pointers find a turned box where it shows, and
+  // transitions and linear() easings read from the same text.
+  run host.evaluate(b"const turned = app.createBox({ position: 'absolute', left: 300, top: 200, width: 40, height: 20, transform: 'rotate(90deg)', transformOrigin: '50% 50%', transition: 'transform 1s linear(0, 0.5 25%, 1)' }); turned.addEventListener('click', () => { globalThis.turnedHit = true }); app.root.append(turned); globalThis.turned = turned", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.5)
+  run click(&mut host, &mut tree, 320.0, 195.0)
+  run host.evaluate(b"if (!turnedHit) throw new Error('the turned box missed its click'); turned.remove()", b"test")
+  run host.flush(&mut tree)
+
+  run host.evaluate(b"app.root.style.set({'--Native-Gap': '13px'}); app.button.style.set({width: 'calc(var(--Native-Gap) * 10)'})", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.6)
+  run Testing.expect(match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.computed().layout.width.value == 130.0
+    Option.None => false
+  }, "JavaScript custom properties inherit into style-object calc values")
+  run host.evaluate(b"app.root.style.set({'--Native-Gap': null}); app.button.style.set({width: 'var(--Native-Gap,120px)'})", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.7)
+  run Testing.expect(match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.computed().layout.width.value == 120.0
+    Option.None => false
+  }, "removing a JavaScript custom property clears native tokens and restores the fallback")
+
   // A listener that throws does not stop the others, and the host reports it afterwards.
   run host.evaluate(b"log.length = 0; app.root.addEventListener('click', () => { throw new Error('boom') }, true)", b"test")
   let failed = run Effect.result(click(&mut host, &mut tree, 10.0, 50.0))
@@ -173,7 +202,7 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run fails(&mut host, b"app.root.setAttribute('nope', 1)", "TypeError: the tree has no attribute 'nope'", "an unknown attribute throws")
 
   // role takes the first ARIA role the tree has, and aria-* reach the tree's attributes.
-  run host.evaluate(b"globalThis.warnings = []; console.warn = (m) => warnings.push(m); app.button.setAttribute('role', 'fancy switch checkbox'); app.button.setAttribute('aria-label', 'Save'); app.button.setAttribute('aria-checked', 'true'); app.button.setAttribute('aria-valuenow', 3); app.button.setAttribute('aria-valuemax', 5); if (warnings.length !== 0) throw new Error('warned ' + warnings)", b"test")
+  run host.evaluate(b"globalThis.warnings = []; console.warn = (m) => warnings.push(m); app.button.setAttribute('role', 'fancy switch checkbox'); app.button.setAttribute('aria-label', 'Save'); app.button.setAttribute('aria-checked', 'true'); app.button.setAttribute('aria-valuenow', 3); app.button.setAttribute('aria-valuemax', 5); app.button.setAttribute('ariaLevel', 2); app.button.setAttribute('aria-live', 'assertive'); app.button.setAttribute('aria-pressed', 'mixed'); if (warnings.length !== 0) throw new Error('warned ' + warnings)", b"test")
   run host.flush(&mut tree)
   let semantics = match tree.view(NodeId.of(3)) {
     Option.Some { value } => {
@@ -182,6 +211,7 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
         Option.None => false
       }
       value.accessRole() == Role.Switch && value.label() == "Save" && value.checked() && ranged
+        && value.level() == 2 && value.live() == Live.Assertive && value.pressed() == TriState.Mixed
     }
     Option.None => false
   }
@@ -230,6 +260,15 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(lines[0].level == 1 && String.view(&lines[0].text) == "hello { a: [1, \"x\"] } 2", "console.log formats its values")
   run Testing.expect(lines[1].level == 3 && String.view(&lines[1].text) == "bad", "console.error has the error level")
 
+  // A rejection nothing handles by the end of the promise jobs is a console error; one
+  // that gets a handler in the same turn is not.
+  run host.evaluate(b"Promise.reject(new Error('lost')); const kept = Promise.reject(1); kept.catch(() => {}); (async () => { throw new TypeError('async') })()", b"test")
+  let rejected = host.takeLogs()
+  let reports = rejected.asSlice()
+  run Testing.expect(reports.length == 2, "two rejections went unhandled")
+  run Testing.expect(reports[0].level == 3 && String.view(&reports[0].text) == "Uncaught (in promise) Error: lost", "the report carries the reason")
+  run Testing.expect(String.view(&reports[1].text) == "Uncaught (in promise) TypeError: async", "an async function that throws is reported")
+
   // The development server's lines reach JavaScript, and what it sends and asks comes back.
   run host.evaluate(b"__ui.devMessage = (line) => { __ui.devSend('echo ' + line); Promise.resolve().then(() => __ui.devReload()) }", b"test")
   run Testing.expect(!host.takeReload(), "nothing asked for a reload yet")
@@ -237,6 +276,39 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   let sent = host.takeOutbox()
   run Testing.expect(sent.length() == 1 && String.view(&sent.asSlice()[0]) == "echo hi", "devSend queued one line for the server")
   run Testing.expect(host.takeReload() && !host.takeReload(), "devReload asked once, from a promise job")
+
+  // navigator.clipboard asks the host, and its promises settle with the host's answers.
+  run host.evaluate(b"globalThis.copied = []; navigator.clipboard.writeText('hi').then((value) => copied.push('wrote ' + value)); navigator.clipboard.readText().then((text) => { copied.push('read ' + text); return navigator.clipboard.readText() }).then((text) => copied.push('empty ' + JSON.stringify(text)))", b"test")
+  let mut requests = host.takeClipboard()
+  run Testing.expect(requests.length() == 2, "two clipboard calls reached the host")
+  let write = match requests.remove(0) {
+    ClipboardRequest.Write { call, text } => if String.view(&text) == "hi" { call } else { 0 }
+    ClipboardRequest.Read { .. } => 0
+  }
+  let read = match requests.remove(0) {
+    ClipboardRequest.Read { call } => call
+    ClipboardRequest.Write { .. } => 0
+  }
+  run Testing.expect(write != 0 && read != 0, "a write of the text, then a read")
+  run host.answerClipboard(write, Option<String>.none())
+  let pasted = run String.copy("from the system")
+  run host.answerClipboard(read, Option<String>.some(move pasted))
+  let mut again = host.takeClipboard()
+  let next = match again.remove(0) {
+    ClipboardRequest.Read { call } => call
+    ClipboardRequest.Write { .. } => 0
+  }
+  run Testing.expect(next != 0, "the read's promise job read again")
+  run host.answerClipboard(next, Option<String>.none())
+  run host.evaluate(b"if (copied.join() !== 'wrote undefined,read from the system,empty \"\"') throw new Error('clipboard calls settled as ' + copied.join())", b"test")
+}
+
+/// `__ui.markdown` gives the tree remark gives for a sample with every construct of GFM.
+effect fn markdown(host: &mut JsHost<'_>) -> ()
+  ! OutOfMemoryError | JsError | platform.PlatformError
+  ? &mut Allocator {
+  let source = run platform.readFile(b"modules/js/tests/fixtures/markdown.js")
+  run host.evaluate(source.asSlice(), b"markdown.js")
 }
 
 effect fn withHost(scenario: u32) -> ()
@@ -248,7 +320,11 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 0 {
+  let ran = if scenario == 4 {
+    run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 3 {
+    run Effect.result(stylesheets(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 0 {
     run Effect.result(counter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else {
     run Effect.result(library(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -258,7 +334,22 @@ effect fn withHost(scenario: u32) -> ()
   } else {
     run Effect.result(errors(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   }
+  let parsed = if scenario == 2 {
+    run Effect.result(markdown(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { value: () }
+  }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  match move parsed {
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { .. } => ()
+    Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
+  }
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
@@ -281,7 +372,7 @@ test effect fn libraryModuleRunsDomStyleEvents() -> ()
   run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-test effect fn timersFramesAndConsoleReachTheHost() -> ()
+test effect fn timersFramesConsoleAndMarkdownReachTheHost() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -291,8 +382,8 @@ test effect fn timersFramesAndConsoleReachTheHost() -> ()
 effect fn load(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
-  let package = run platform.readFile(b"modules/js/packages/ui/src/index.js")
-  run host.define(b"@silk/ui", package.asSlice())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
   let source = run platform.readFile(b"modules/js/tests/fixtures/app.js")
   run host.module(source.asSlice(), b"app.js")
   run host.flush(&mut tree)
@@ -335,4 +426,141 @@ test effect fn reloadStartsANewRealmOnAnEmptyTree() -> ()
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
   }
+}
+
+/// Each `__ui` native's id is the hash of its name, as its constant spells it, and no two
+/// natives share an id.
+test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
+  run Testing.expect(bridge.APPEND == bridge.nativeId(b"append"), "APPEND")
+  run Testing.expect(bridge.ATOM_STYLE == bridge.nativeId(b"atomStyle"), "ATOM_STYLE")
+  run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
+  run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
+  run Testing.expect(bridge.CLEAR_STYLE == bridge.nativeId(b"clearStyle"), "CLEAR_STYLE")
+  run Testing.expect(bridge.CLIPBOARD_READ == bridge.nativeId(b"clipboardRead"), "CLIPBOARD_READ")
+  run Testing.expect(bridge.CLIPBOARD_WRITE == bridge.nativeId(b"clipboardWrite"), "CLIPBOARD_WRITE")
+  run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
+  run Testing.expect(bridge.DEFINE_ICON == bridge.nativeId(b"defineIcon"), "DEFINE_ICON")
+  run Testing.expect(bridge.DESTROY == bridge.nativeId(b"destroy"), "DESTROY")
+  run Testing.expect(bridge.DEV_RELOAD == bridge.nativeId(b"devReload"), "DEV_RELOAD")
+  run Testing.expect(bridge.DEV_SEND == bridge.nativeId(b"devSend"), "DEV_SEND")
+  run Testing.expect(bridge.FOCUS == bridge.nativeId(b"focus"), "FOCUS")
+  run Testing.expect(bridge.FONT_FAMILY == bridge.nativeId(b"fontFamily"), "FONT_FAMILY")
+  run Testing.expect(bridge.FORMAT == bridge.nativeId(b"format"), "FORMAT")
+  run Testing.expect(bridge.INSERT_ATOM == bridge.nativeId(b"insertAtom"), "INSERT_ATOM")
+  run Testing.expect(bridge.INSERT_BEFORE == bridge.nativeId(b"insertBefore"), "INSERT_BEFORE")
+  run Testing.expect(bridge.KEYFRAME == bridge.nativeId(b"keyframe"), "KEYFRAME")
+  run Testing.expect(bridge.KEYFRAMES == bridge.nativeId(b"keyframes"), "KEYFRAMES")
+  run Testing.expect(bridge.LISTEN == bridge.nativeId(b"listen"), "LISTEN")
+  run Testing.expect(bridge.LOG == bridge.nativeId(b"log"), "LOG")
+  run Testing.expect(bridge.MARK == bridge.nativeId(b"mark"), "MARK")
+  run Testing.expect(bridge.MARKDOWN == bridge.nativeId(b"markdown"), "MARKDOWN")
+  run Testing.expect(bridge.NOW == bridge.nativeId(b"now"), "NOW")
+  run Testing.expect(bridge.OPEN == bridge.nativeId(b"open"), "OPEN")
+  run Testing.expect(bridge.RELEASE == bridge.nativeId(b"release"), "RELEASE")
+  run Testing.expect(bridge.REMOVE == bridge.nativeId(b"remove"), "REMOVE")
+  run Testing.expect(bridge.REQUEST_FRAME == bridge.nativeId(b"requestFrame"), "REQUEST_FRAME")
+  run Testing.expect(bridge.RICH_TEXT == bridge.nativeId(b"richText"), "RICH_TEXT")
+  run Testing.expect(bridge.ROOT == bridge.nativeId(b"root"), "ROOT")
+  run Testing.expect(bridge.SCROLL_TO == bridge.nativeId(b"scrollTo"), "SCROLL_TO")
+  run Testing.expect(bridge.SELECT == bridge.nativeId(b"select"), "SELECT")
+  run Testing.expect(bridge.SET_TEXT == bridge.nativeId(b"setText"), "SET_TEXT")
+  run Testing.expect(bridge.SOURCE == bridge.nativeId(b"source"), "SOURCE")
+  run Testing.expect(bridge.COMPILE_STYLE_SHEET == bridge.nativeId(b"compileStyleSheet"), "COMPILE_STYLE_SHEET")
+  run Testing.expect(bridge.STYLE_SHEET == bridge.nativeId(b"styleSheet"), "STYLE_SHEET")
+  run Testing.expect(bridge.STYLE == bridge.nativeId(b"style"), "STYLE")
+  run Testing.expect(bridge.TIMER == bridge.nativeId(b"timer"), "TIMER")
+  let mut at: usize = 0
+  while true {
+    let native = match bridge.native(at) {
+      Option.Some { value } => value
+      Option.None => { return }
+    }
+    let mut other: usize = 0
+    while other < at {
+      match bridge.native(other) {
+        Option.Some { value } => {
+          run Testing.expect(bridge.nativeId(value.name) != bridge.nativeId(native.name), "two natives share an id")
+        }
+        Option.None => {}
+      }
+      other = other + 1
+    }
+    at = at + 1
+  }
+}
+
+fn sheetWidth(tree: &Tree<'_>) -> f32 {
+  return match tree.view(NodeId.of(1)) {
+    Option.Some { value } => value.computed().layout.width.value
+    Option.None => 0.0
+  }
+}
+
+effect fn stylesheets(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  run host.evaluate(b"let disabled = false; try { __ui.compileStyleSheet('.card{width:1px}') } catch { disabled = true } if (!disabled) throw new Error('release compiler was enabled')", b"test")
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { CSSStyleSheet, createBox, mount } from '@silkui/core'; globalThis.sheet = new CSSStyleSheet(); sheet.replaceSync('.card{width:111px;height:20px}'); globalThis.rootView = createBox(); rootView.className = 'card'; rootView.adoptedStyleSheets.push(sheet); mount(rootView);", b"sheets.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(sheetWidth(&tree.*) == 111.0, "runtime CSS compiles and adopts before the first frame")
+  run host.evaluate(b"sheet.replaceSync('.card{width:222px}');", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.1)
+  run Testing.expect(sheetWidth(&tree.*) == 222.0, "replaceSync updates an adopted native sheet")
+  run host.evaluate(b"let rejected = false; try { sheet.replaceCompiled('invalid') } catch { rejected = true } if (!rejected) throw new Error('bad bytes were accepted');", b"test")
+  run Testing.expect(host.pending() == 0, "invalid bytes queue no mutations")
+  run host.evaluate(b"sheet.replace('.card{width:333px}').then(value => { if(value !== sheet) throw new Error('wrong sheet'); globalThis.replaced = true; });", b"test")
+  run host.drain()
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.2)
+  run Testing.expect(sheetWidth(&tree.*) == 333.0, "asynchronous replace updates the native tree")
+  run host.evaluate(b"if (!replaced) throw new Error('replace did not settle'); rootView.adoptedStyleSheets.length = 0;", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.3)
+  run Testing.expect(sheetWidth(&tree.*) != 333.0, "mutating adoptedStyleSheets removes rules")
+}
+
+test effect fn constructedStylesheetsCompileReplaceAndRemoveInTheNativeTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(3) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.access { accessibleName }
+
+effect fn literalAria(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { CSSStyleSheet, createBox, createInput, mount } from '@silkui/core'; const root = createBox(); globalThis.title = createBox(); globalThis.field = createInput(); title.id = 'title'; title.setAttribute('aria-label', 'Title'); field.setAttribute('aria-label', 'Fallback'); field.setAttribute('aria-labelledby', 'title'); root.appendChild(title); root.appendChild(field); const sheet = new CSSStyleSheet(); sheet.replaceSync('[aria-labelledby=title] { width: 123px }'); root.adoptedStyleSheets.push(sheet); mount(root);", b"aria.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  let mut name = String.make()
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "JavaScript literal relations reach native accessibility")
+  run Testing.expect(tree.engine().node(tree.engine().slotOf(3)).computed.layout.width.value == 123.0, "CSS selectors see the literal ARIA attribute, not translated node numbers")
+  run host.evaluate(b"title.id = 'renamed'", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "renaming the referenced element changes the native name without rewriting the attribute")
+  run host.evaluate(b"title.id = 'title'", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Title", "restoring an ID restores the relation")
+  run host.evaluate(b"title.destroy()", b"test")
+  run host.flush(&mut tree)
+  run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
+  run Testing.expect(String.view(&name) == "Fallback", "destroying a referenced element clears its name")
+}
+
+test effect fn literalAriaIdsReachNativeSelectorsAndAccessibility() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(4) |> Effect.provideMut<Allocator>(&mut allocator)
 }

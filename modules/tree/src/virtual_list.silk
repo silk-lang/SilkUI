@@ -1,9 +1,8 @@
 //! Tree-owned variable-height virtualization for native and foreign-language clients.
 //! Only the visible range and an overscan region need UI nodes. Measured heights
 //! replace estimates, while the tree preserves the first visible item.
-pub import ui_protocol.options { VirtualOptions, VirtualItem }
+pub import ui_protocol.options { VirtualOptions, VirtualItem, VirtualRange }
 import silk.collections.list { List }
-import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
@@ -149,23 +148,6 @@ impl VirtualList {
   }
 }
 
-/// A requested mounted range. Indices in `[first, end)` and `pinned` must remain mounted.
-/// A pinned item outside the range retains focus. `usize.MAX` means no pinned item.
-pub struct VirtualRange {
-  /// Logical number of items.
-  pub count: usize,
-  /// First requested item index.
-  pub first: usize,
-  /// Exclusive end of the requested range.
-  pub end: usize,
-  /// Focused item index, or `usize.MAX`.
-  pub pinned: usize,
-  /// Focused item's wrapper node ID, or `NONE`.
-  pub pinnedId: u32,
-}
-
-impl Copy for VirtualRange {}
-
 import engine { UiTree, TreeError }
 import node { NONE }
 import mutation { NodeKind }
@@ -283,6 +265,11 @@ pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<
   }
   let mut children = List<u32>.make()
   run tree.childSlots(tree.slotOf(id), &mut children)
+  let mut child = children.length()
+  while child > 0 {
+    child = child - 1
+    if tree.node(children.get(child)).isGenerated() { drop children.remove(child) }
+  }
   let values = items.asSlice()
   if children.length() != values.length {
     fail TreeError.BadVirtualList { index: mutation, id: id }
@@ -354,6 +341,10 @@ pub effect fn prepare(tree: &mut UiTree<'_>) -> ()
         r = r + 1
       }
     }
+    let after = match tree.node(port).identity() {
+      Option.Some { value } => if value.after != NONE { tree.node(value.after).css } else { usize.MAX }
+      _ => usize.MAX
+    }
     let list = &mut tree.virtualLists.asMutSlice()[v]
     while list.spacers.length() > list.rows.length() + 1 {
       let at = list.spacers.length() - 1
@@ -395,7 +386,7 @@ pub effect fn prepare(tree: &mut UiTree<'_>) -> ()
         list.spacerHeights.set(i, height)
       }
       let before = if last {
-        Option<NodeId>.None
+        if after == usize.MAX { Option<NodeId>.None } else { Option<NodeId>.some(NodeId { index: after }) }
       } else {
         Option<NodeId>.some(NodeId { index: rowCss.get(i) })
       }

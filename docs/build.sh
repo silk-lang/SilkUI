@@ -34,14 +34,15 @@ silk build --manifest-path docs/examples/apps/tree-hello/silk.toml
 
 rm -rf "$out"
 mkdir -p "$out"
-cp "$root/modules/app/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
+# loom-dom's page script, from Silk's checkout of the Loom commit this package pins.
+loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\([0-9a-f]*\)".*/\1/p' "$here/silk.toml" | head -1)"
+cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
 cp "$here/web/favicon.svg" "$out/favicon.svg"
 cp -R "$here/web/fonts" "$out/fonts"
-# The album's photos and icons, at the root as its relative URLs name them, and its fonts.
+# The album's photos, icons and fonts, at the root as its relative URLs name them.
 cp -R "$here/examples/apps/album/assets/photos" "$out/photos"
 cp -R "$here/examples/apps/album/assets/icons" "$out/icons"
-mkdir -p "$out/album"
-cp -R "$here/examples/apps/album/assets/fonts" "$out/album/fonts"
+cp "$here/examples/apps/album/assets/fonts/"*.ttf "$out/fonts/"
 cp "$root/build/llvm/wasm32-unknown-unknown/release-size/ui-docs-site" "$out/site.wasm"
 debug="$(ls -d "$root"/build/llvm/*/debug | grep -v wasm32 | head -1)"
 mkdir -p "$out/shots"

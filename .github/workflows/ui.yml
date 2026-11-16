@@ -1,4 +1,8 @@
 name: UI
+# Linux runs everything. macOS and Windows run one job each with only what differs there:
+# the window hosts, the accessibility adapters and linking. Loom, the DevTools and the
+# terminal are tested in silk-lang/loom.
+# ui-full.yml runs the complete suite on every platform nightly.
 on:
   push:
     branches: [main]
@@ -11,141 +15,108 @@ concurrency:
   cancel-in-progress: true
 jobs:
   packages:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, macos-26, windows-2025-vs2026]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
+      - uses: actions/setup-node@v4
         with:
-          arch: x64
+          node-version: 22
       - name: Install Linux window headers
-        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols
       - uses: ./.github/actions/setup-silk
       - name: Provision pinned LLVM and native tools
         run: silk task setup-ci
       - name: Every package, tests, HTTP images, goldens and wasm API checks
-        if: runner.os != 'Windows'
         run: silk task check
-      # Managed HTTP/native fixtures require silk-lang/silk#3034 on Windows.
-      - name: Windows package checks
-        if: runner.os == 'Windows'
-        run: silk task check-packages
-      - name: Windows unit tests
-        if: runner.os == 'Windows'
-        run: silk task unit-tests
-      - name: Windows goldens
-        if: runner.os == 'Windows'
-        run: silk task goldens
-      - name: Windows tools
-        if: runner.os == 'Windows'
-        run: silk task build-tools
-      - name: Windows embedded asset freshness
-        if: runner.os == 'Windows'
-        run: silk task embed-assets --check
-      - name: Windows browser export freshness
-        if: runner.os == 'Windows'
-        run: silk task generate-browser-exports --check
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: ui-package-failures-${{ runner.os }}
-          path: |
-            build/test-results
-            modules/**/actual*
-  native:
-    strategy:
-      fail-fast: false
-      matrix:
-        # Windows managed integration is blocked by silk-lang/silk#3034.
-        os: [ubuntu-26.04, macos-26]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Linux window hosts
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols xvfb xauth weston
-      - uses: ./.github/actions/setup-silk
-      - if: runner.os == 'Linux'
-        run: silk task setup-ci --linux-gpu
-      - if: runner.os != 'Linux'
-        run: silk task setup-ci
-      - name: Native rendering, input, inspector, MCP and devtools
-        run: silk task native check
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ui-inspector-${{ runner.os }}
-          path: .cache/ui-inspect/*.png
-          if-no-files-found: ignore
-  ghostty:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, macos-26, windows-2025-vs2026]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ilammy/msvc-dev-cmd@v1
-        if: runner.os == 'Windows'
-        with:
-          arch: x64
-      - name: Install Linux window headers
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols
-      # Linux and the browser build libghostty-vt from source; macOS and Windows download it.
-      - uses: mlugg/setup-zig@v2
-        if: runner.os == 'Linux'
-        with:
-          version: 0.17.1
-      - uses: ./.github/actions/setup-silk
-      - name: Provision pinned LLVM and native tools
-        run: silk task setup-ci
-      - name: Prepare libghostty-vt
-        if: runner.os != 'Linux'
-        run: python3 modules/ghostty/vt/scripts/prepare
-      - name: Prepare libghostty-vt, native and WebAssembly
-        if: runner.os == 'Linux'
-        run: python3 modules/ghostty/vt/scripts/prepare --wasm
-      - name: Wrapper tests
-        run: silk test --manifest-path modules/ghostty/vt/silk.toml --root src/tests.silk
-      - name: Component tests
-        run: silk test --manifest-path modules/ghostty/tests/silk.toml --root src/tests.silk
-      - name: Demo PTY tests
-        if: runner.os != 'Windows'
-        run: silk test --manifest-path modules/ghostty/demo/silk.toml --root src/tests.silk
-      - name: Demo app builds
-        run: silk build --manifest-path modules/ghostty/demo/silk.toml
-      - name: Browser page tests and build
-        if: runner.os == 'Linux'
-        run: |
-          silk test --manifest-path modules/ghostty/web/silk.toml --root src/tests.silk
-          sh modules/ghostty/web/build.sh
-  javascript:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - uses: ./.github/actions/setup-silk
-      - name: Provision pinned LLVM and native tools
-        run: silk task setup-ci
       - name: JavaScript package tests and example bundles
         working-directory: modules/js
         run: npm ci && npm test && npm run build
       - name: Bundled examples on the embedded engine
         run: silk test --manifest-path modules/js/examples/tests/silk.toml --root src/tests.silk
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ui-package-failures
+          path: |
+            build/test-results
+            modules/**/actual*
+  native:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux window hosts
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols xvfb xauth weston
+      - uses: ./.github/actions/setup-silk
+      - run: silk task setup-ci --linux-gpu
+      # Debug builds: a release build of each demo takes four minutes, and ui-full.yml makes them.
+      - name: Window demos on X11 and Wayland
+        run: |
+          for demo in tree/demo tree/window/demo js/demo; do
+            silk task native demo "modules/$demo" -- check
+          done
+      - name: Inspector and MCP
+        run: |
+          silk task native inspect
+          silk task native mcp
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-inspector-Linux
+          path: .cache/ui-inspect/*.png
+          if-no-files-found: ignore
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-silk
+      - name: Provision pinned LLVM and native tools
+        run: silk task setup-ci
+      - name: Accessibility adapter and window host tests
+        run: |
+          for tests in accesskit/macos tree/window/tests; do
+            silk test --manifest-path "modules/$tests/silk.toml" --root src/tests.silk
+          done
+      - name: Window demos
+        run: |
+          for demo in tree/demo tree/window/demo js/demo; do
+            silk task native demo "modules/$demo" -- check
+          done
+      - name: Inspector and MCP
+        run: |
+          silk task native inspect
+          silk task native mcp
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-inspector-macOS
+          path: .cache/ui-inspect/*.png
+          if-no-files-found: ignore
+  # Managed HTTP/native fixtures and window checks require silk-lang/silk#3034 on Windows.
+  # Checking the whole workspace takes over ten minutes here; ui-full.yml does it.
+  windows:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: ./.github/actions/setup-silk
+      - name: Provision pinned LLVM and native tools
+        run: silk task setup-ci
+      - name: Accessibility adapter tests
+        run: silk test --manifest-path modules/accesskit/windows/silk.toml --root src/tests.silk
+      - name: Tree window host tests
+        run: silk test --manifest-path modules/tree/window/tests/silk.toml --root src/tests.silk
+      - name: Inspector socket tests
+        run: silk test --manifest-path modules/inspect/server/tests/silk.toml --root src/tests.silk
+      - name: Tools link
+        run: silk task build-tools
   node:
-    # ui-js-node: the runtime's natives come from the distribution's static archives.
+    # Exercise the runtime-backed realm separately from the embedded-engine tests.
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -153,26 +124,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Install Linux window headers
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols
       - uses: ./.github/actions/setup-silk
       - name: Provision pinned LLVM and native tools
         run: silk task setup-ci
-      - name: Runtime native libraries
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake pkg-config libuv1-dev libssl-dev libnghttp2-dev libzstd-dev libbrotli-dev libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols
-      - name: Prepare the runtime
-        run: python3 modules/js/node/scripts/prepare
+      # Silk builds the runtime's pinned native sources; no prepare script or system archives.
       - name: Network check
         run: |
           silk build --manifest-path modules/js/node/tests/silk.toml --progress plain
           python3 modules/js/node/scripts/check modules/js/node/tests/build/llvm/x86_64-unknown-linux-gnu/debug/ui-js-node-check
   browser:
     runs-on: ubuntu-26.04
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libx11-dev libxkbcommon-dev libwayland-dev wayland-protocols xvfb xauth
       - uses: ./.github/actions/setup-silk
-      - name: Select existing Chromium
-        run: silk task setup-ci --browser
+      - name: Provision Vulkan and select existing Chromium
+        run: silk task setup-ci --browser --linux-gpu
       # Ubuntu's AppArmor profile denies unprivileged user namespaces, which Chromium's sandbox
       # needs. Without this Chromium aborts at startup with "No usable sandbox".
       - name: Allow the Chromium sandbox
@@ -182,4 +152,6 @@ jobs:
       - name: Warm up Chromium
         run: time timeout 300 "$CHROMIUM_EXECUTABLE" --headless=new --password-store=basic --user-data-dir="$(mktemp -d)" --dump-dom about:blank > /dev/null
       - name: Chrome text, GPU fixtures and real browser input
-        run: silk task browser check
+        run: |
+          silk test --manifest-path silk.toml --root src/task_browser_server.silk
+          silk task browser check

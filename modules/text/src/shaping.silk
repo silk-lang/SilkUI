@@ -8,10 +8,12 @@
 import layout.lib { WritingMode, TextOrientation }
 import silk.text.vertical_text { Orientation, OrientationRun }
 import silk.text.vertical_text
-import fonts { FontState, RawGlyph }
+import fonts { FontState, RawGlyph, Treatment }
+import transform
+import properties.computed { TextTransform }
 import glyphs { GlyphStore, PositionedGlyph }
 import analysis { tokenLength }
-import layout.lib { TextTokenKind, TextCursor, TextShapeRequest, TextRun, TextError, TextJustify }
+import layout.lib { TextToken, TextTokenKind, TextCursor, TextShapeRequest, TextRun, TextError, TextJustify }
 import font_collection.lib { Selection, continuesCluster }
 import set { Link }
 import silk.text.script_itemization
@@ -61,6 +63,8 @@ struct Item {
   key: usize,
   glyphStart: usize,
   glyphEnd: usize,
+  // How the glyphs' clusters run: 1 never falling, -1 never rising, 0 neither.
+  order: i8,
 }
 
 impl Copy for Item {}
@@ -153,6 +157,33 @@ fn separatorClass(cp: u32) -> bool {
 }
 
 /// CSS Text 3 §7.1 word-separator characters.
+// The character before `offset` in token `unit`, looking back into the token before it, for
+// `text-transform: capitalize`; 0 where a word starts.
+fn before(tokens: &[TextToken<'_>], unit: usize, offset: usize) -> u32 {
+  let mut token = unit
+  let mut at = offset
+  while true {
+    let kind = tokens[token].kind
+    if kind != TextTokenKind.Text && token != unit {
+      return 0
+    }
+    if at > 0 {
+      let bytes = String.utf8Bytes(tokens[token].text)
+      let mut start = at - 1
+      while start > 0 && (bytes[start] & 0xC0) == 0x80 {
+        start = start - 1
+      }
+      return utf8_scan.decode(bytes, start).scalar
+    }
+    if token == 0 {
+      return 0
+    }
+    token = token - 1
+    at = String.byteLength(tokens[token].text)
+  }
+  return 0
+}
+
 fn wordSeparator(cp: u32) -> bool {
   return cp == 0x20 || cp == 0xA0 || cp == 0x1361 || cp == 0x10100 || cp == 0x10101 || cp == 0x1039F
     || cp == 0x1091F
@@ -492,6 +523,7 @@ effect fn shapeItem<'a>(
   let key = run fonts.keyFor(style, selection)
   let glyphStart = state.raw.length()
   let instance = fonts.instanceOf(key)
+  let features = fonts.treatment(key).features
   run fonts.shapeTextOriented(
     instance,
     state.segment.view(),
@@ -500,8 +532,30 @@ effect fn shapeItem<'a>(
     rtl,
     script,
     upright,
+    &features,
     &mut state.raw,
   )
+  let glyphEnd = state.raw.length()
+  let mut rising = true
+  let mut falling = true
+  let mut index = glyphStart + 1
+  while index < glyphEnd {
+    let before = state.raw.get(index - 1).cluster
+    let cluster = state.raw.get(index).cluster
+    if cluster < before {
+      rising = false
+    }
+    if cluster > before {
+      falling = false
+    }
+    index = index + 1
+  }
+  let mut order: i8 = 0
+  if rising {
+    order = 1
+  } else if falling {
+    order = -1
+  }
   run state.items.append(
     Item {
       upright: upright,
@@ -509,9 +563,44 @@ effect fn shapeItem<'a>(
       end: end,
       key: key,
       glyphStart: glyphStart,
-      glyphEnd: state.raw.length(),
+      glyphEnd: glyphEnd,
+      order: order,
     },
   )
+}
+
+// The first glyph of `item` whose cluster is at or past `cluster` in the item's cluster order
+// (at or before it when the clusters fall). Needs `item.order != 0`.
+fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
+  let mut low = item.glyphStart
+  let mut high = item.glyphEnd
+  while low < high {
+    let middle = low + (high - low) / 2
+    let at = u32.toUsize(state.raw.get(middle).cluster)
+    let mut earlier = at < cluster
+    if item.order < 0 {
+      earlier = at > cluster
+    }
+    if earlier {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+
+// The letter-spacing and word-spacing after raw glyph `index`: letter-spacing follows the last
+// glyph of each cluster, and word-spacing follows a word separator's.
+fn spacing(state: &Shaping, bytes: &[u8], treatment: Treatment, index: usize, end: usize, rawCluster: u32, cluster: usize) -> f32 {
+  if index + 1 < end && state.raw.get(index + 1).cluster == rawCluster {
+    return 0.0
+  }
+  let mut extra = treatment.letterSpacing
+  if treatment.wordSpacing != 0.0 && cluster < bytes.length && wordSeparator(utf8_scan.decode(bytes, cluster).scalar) {
+    extra = extra + treatment.wordSpacing
+  }
+  return extra
 }
 
 // Moves the glyphs of `piece` that item `item` shaped into a pending run.
@@ -540,16 +629,31 @@ effect fn emit<'a>(
   }
   let token = &request.context.tokens[piece.unit]
   let scale = fonts.scale(item.key)
+  let treatment = fonts.treatment(item.key)
+  let spaced = treatment.letterSpacing != 0.0 || treatment.wordSpacing != 0.0
   let bytes = String.utf8Bytes(state.segment.view())
   let glyphStart = state.glyphs.length()
   let mut pen: f32 = 0.0
   let mut previous = u32.MAX
+  // A segment has a piece per word, so each piece finds its own glyphs instead of reading them all.
   let mut index = item.glyphStart
-  while index < item.glyphEnd {
+  let mut glyphEnd = item.glyphEnd
+  if item.order > 0 {
+    index = firstGlyphAt(&state, item, low)
+    glyphEnd = firstGlyphAt(&state, item, high)
+  } else if item.order < 0 {
+    // Falling clusters: those below `high` start after the last one at or above it.
+    index = firstGlyphAt(&state, item, high - 1)
+    glyphEnd = item.glyphEnd
+    if low > 0 {
+      glyphEnd = firstGlyphAt(&state, item, low - 1)
+    }
+  }
+  while index < glyphEnd {
     let raw = state.raw.get(index)
     let cluster = u32.toUsize(raw.cluster)
     if cluster >= low && cluster < high {
-      let advance = i32.toF32(
+      let mut advance = i32.toF32(
         if item.upright {
           -raw.yAdvance
         } else {
@@ -557,6 +661,9 @@ effect fn emit<'a>(
         },
       )
         * scale
+      if spaced {
+        advance = advance + spacing(&state, bytes, treatment, index, item.glyphEnd, raw.cluster, cluster)
+      }
       let offset = piece.start + cluster - piece.segmentStart
       run state.glyphs.append(
         PositionedGlyph {
@@ -655,12 +762,22 @@ effect fn shapeSegments<'a>(
     // Gather the segment.
     let mut last = index
     state.segment.clear()
+    let change = fonts.treatment(piece.fontKey).transform
+    let mut previous: u32 = 0
+    if change != TextTransform.None {
+      previous = before(tokens, piece.unit, piece.start)
+    }
     while last < state.pieces.length() && state.pieces.get(last).segment == piece.segment {
       let mut member = state.pieces.get(last)
       member.segmentStart = String.byteLength(state.segment.view())
       state.pieces.set(last, member)
       let text = tokens[member.unit].text
-      run state.segment.append(String.slice(text, member.start, member.end - member.start))
+      let part = String.slice(text, member.start, member.end - member.start)
+      if change == TextTransform.None {
+        run state.segment.append(part)
+      } else {
+        previous = run transform.append(&mut state.segment, part, change, previous)
+      }
       last = last + 1
     }
     run itemize(

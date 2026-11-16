@@ -2,6 +2,8 @@
 
 A native app is a Silk UI program plus one small file that opens a window. This page takes the counter from [Your first program](/core/first-program/), unchanged, and runs it as a desktop app.
 
+> **Note:** A project made with `silk init -t ui-loom` gets this file generated, and `silk task dev` opens it (see [Get started](/start/)). This page writes it by hand, to show what is in it and for apps that need their own.
+
 ## The app
 
 ::shot native-hello "The counter, as a window would show it."
@@ -37,8 +39,7 @@ sudo apt-get install libx11-dev libxkbcommon-dev libwayland-dev wayland-protocol
 ::source examples/apps/hello/src/main.silk "effect fn counter"
 
 - `Window.make(title, width, height)` describes the window. Nothing opens yet.
-- `window.font(1, "system-ui, sans-serif")` says what font family number 1 means here. Styles name families by number, as in `css.fontFamily(1)`, and each host decides which fonts that is. A list of names works as in CSS: the first one that is installed wins.
-- `systemFonts()` loads the fonts installed on the machine. An app that ships its own fonts makes a `FontCollection` from those instead.
+- `systemFonts()` loads the fonts installed on the machine: the ones text uses unless the program declares its own (see [Images and fonts](/core/images-and-fonts/#fonts)).
 - `show` opens the window and runs the program in it. It returns when the window closes, with the exit code.
 
 The four type arguments of `show` are the model, the message type, the command type, and what the commands need. The counter has no commands, so those are `NoCommand` and `never`.

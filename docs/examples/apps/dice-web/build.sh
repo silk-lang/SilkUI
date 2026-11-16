@@ -11,7 +11,9 @@ silk build --manifest-path "$here/silk.toml" \
 rm -rf "$here/dist"
 mkdir -p "$here/dist"
 cp "$root/build/llvm/wasm32-unknown-unknown/release-size/dice-web" "$here/dist/dice.wasm"
-cp "$root/modules/app/dom/js/silk-ui-dom.js" "$here/dist/silk-ui-dom.js"
+# loom-dom's page script, from Silk's checkout of the Loom commit this package pins.
+loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\([0-9a-f]*\)".*/\1/p' "$here/silk.toml" | head -1)"
+cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$here/dist/silk-ui-dom.js"
 cp "$here/web/index.html" "$here/dist/index.html"
 echo "Built $here/dist"
 

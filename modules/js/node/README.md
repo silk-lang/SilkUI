@@ -3,7 +3,7 @@
 Runs a ui-js application on the SilkJS runtime instead of the bare engine: the realm has
 Node's APIs and the web APIs Node has (`fetch`, `WebSocket`, `URL`, `TextEncoder`,
 `crypto`, `AbortController`, `structuredClone`, `Intl`, timers, `process` and the rest), with
-`@silk/ui` beside them. Use it when an application needs the network or other platform APIs;
+`@silkui/core` beside them. Use it when an application needs the network or other platform APIs;
 `ui-js-window` stays the smaller choice for one that does not.
 
 The runtime runs on the window's UI thread. The window host waits in the runtime's loop
@@ -13,7 +13,7 @@ cost nothing while idle. Animation frames and events are the window's, as with
 
 ```silk
 let mut window = NodeWindow.make(&fonts, options, NodeClient.make())
-run window.define(b"@silk/ui", uiPackage())
+run window.define(b"@silkui/core", uiPackage())
 run window.entry(b"/app/app.js", source)
 let status = run window.start(b"my-app")
 ```
@@ -23,27 +23,19 @@ resolve from it.
 
 ## Building
 
-The runtime's built-in JavaScript and its native libraries are made by lib-silkjs's own
-tools, not by Silk. Once per lib-silkjs revision, before the first build:
+A plain `silk build` of the program builds everything, the runtime included. Silk downloads the
+pinned source releases of the C libraries the runtime uses (libuv, OpenSSL, nghttp2, zlib,
+Zstandard, Brotli) on the first build and compiles them itself; nothing needs installing besides
+Silk and Clang. The runtime does not build for Windows yet.
 
-```sh
-python3 modules/js/node/scripts/prepare
-```
-
-It needs pkg-config to find static libuv 1.50 or newer, OpenSSL 3.2 or newer, nghttp2, zstd
-and Brotli (lib-silkjs's `modules/runtime/README.md` says how to build them; nghttp2 wants
-`-DENABLE_LIB_ONLY=ON -DBUILD_TESTING=OFF`). The runtime does not build for Windows yet.
-
-The script downloads the runtime's vendored sources from codeload.github.com. Where a proxy
-refuses that, put `git archive` tarballs of the pinned commits in the runtime's `build/deps`
-(the checksums match). The first link of a program takes a while and needs memory: allow
-about 9 GB for silkc.
+The first build compiles about 1,300 C files and takes a few minutes more; later builds reuse
+them. The first link of a program needs memory: allow about 9 GB for silkc.
 
 ## Checking
 
 `tests` is a program that runs `fixtures/net.js` in the runtime-backed realm against a local
 HTTP and WebSocket server (`fixtures/server.mjs`, run by Node). CI's `node` job runs it on Linux,
-with the natives from Ubuntu's static archives:
+building the runtime and its pinned native dependencies with Silk:
 
 ```sh
 silk build --manifest-path modules/js/node/tests/silk.toml

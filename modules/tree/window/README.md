@@ -4,7 +4,7 @@
 
 `host.runWindow` owns the native window, GPU surface, input adapter, accessibility
 publication, inspector integration, frame requests, and presentation. It requires no
-`ui-app` runtime. Implement `host.WindowClient<State, Errors, Requirements>` and pass
+`loom` runtime. Implement `host.WindowClient<State, Errors, Requirements>` and pass
 ordinary client state, a font collection, initial resource mutations, window options,
 and an inspector. The app window package now adapts its existing runtime and custom
 `WindowContent` hooks to this host.
@@ -130,6 +130,12 @@ How it differs from a native window:
   `browser.stored(key)` reads it back on the next visit (both do nothing natively). The page
   puts `silk-app:` before each key, and gives the app no storage in check mode, so a check
   always starts from nothing.
+- **Screen readers read a hidden DOM copy of the tree.** [browser/access-mirror.js](browser/access-mirror.js)
+  keeps one element per accessibility node over the canvas, with its ARIA role, name and
+  states, from the updates [web_access.silk](src/web_access.silk) sends. A screen reader's click
+  or focus on an element comes back to the app as an AccessKit action. The keyboard stays on the
+  window host's text area, which names the focused node with `aria-activedescendant`. Pass
+  `accessibility: false` to `runApp` to turn the copy off.
 - **An 8 MiB stack.** Browser tasks set the compiler's declarative `stackSize` profile input to
   `8MiB` on every platform. No clang or shell wrapper is generated. The compiler's default 1 MiB
   stack is too small for deep layouts, which otherwise trap with "memory access out of bounds".
@@ -159,10 +165,10 @@ results. `release` cancels work and releases the installed resource. The request
 and generation checks come from portable `ui-tree.image_load` code; OS threads and
 I/O stay in this native package.
 
-`background.Background` and `Cancellation` are also available without `ui-app`.
+`background.Background` and `Cancellation` are also available without `loom`.
 Work and results must own transferable storage. Keep cancelled jobs until completion:
 dropping an unfinished job joins the worker. Compatibility imports remain available
-under `ui-app-window.background` and `ui-app-window.images`.
+under `loom-window.background` and `loom-window.images`.
 
 ## Extraction validation
 
