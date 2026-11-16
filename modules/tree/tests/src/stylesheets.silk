@@ -655,3 +655,65 @@ test effect fn compiledStartingStylesRespectInlinePriorityAndMedia() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run startingPriority() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn repeatedCascadeInputs() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.create(3, NodeKind.Box)
+  run batch.append(1, 3)
+  let blue = run written.declarations(b"color:blue")
+  let red = run written.declarations(b"color:red")
+  run batch.style(2, blue.asSlice())
+  run batch.style(3, red.asSlice())
+  let mut id: u32 = 4
+  while id < 22 {
+    run batch.create(id, NodeKind.Box)
+    run batch.append(if id == 21 { 3 } else { 2 }, id)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy("row override") })
+    id = id + 1
+  }
+  run batch.attribute(4, Attribute.ElementId { value: run String.copy("strong") })
+  let forty = run written.declarations(b"width:40px")
+  let fifty = run written.declarations(b"width:50px")
+  run batch.style(5, forty.asSlice())
+  run batch.style(6, fifty.asSlice())
+  run batch.style(7, forty.asSlice())
+  let source = b":root{--height:12px}:root.theme{--height:24px}#strong,.row{width:10px;height:var(--height);background:currentColor}.override{width:30px}"
+  let bytes = run sheetBytes(source)
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(0.0))
+  id = 4
+  while id < 22 {
+    let expected: f32 = if id == 4 { 10.0 } else if id == 5 || id == 7 { 40.0 } else if id == 6 { 50.0 } else { 30.0 }
+    let node = tree.node(tree.slotOf(id))
+    run Testing.expect(node.computed.layout.width.value == expected, "repeated rule lists retain selector-list specificity and distinct inline values")
+    run Testing.expect(node.computed.layout.height.value == 12.0, "repeated rows share their parent's variable values")
+    let background: f32 = match node.computed.paint.background { Fill.Solid { color } => color.r _ => -1.0 }
+    let expectedColor: f32 = if id == 21 { 1.0 } else { 0.0 }
+    run Testing.expect(background == expectedColor, "currentColor comes from the matching parent")
+    id = id + 1
+  }
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("theme") })
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(1.0))
+  run Testing.expect(tree.node(tree.slotOf(8)).computed.layout.height.value == 24.0, "a new pass cannot reuse results from a previous variable scope generation")
+  let replacement = run sheetBytes(b":root{--height:13px}#strong,.row{width:11px;height:var(--height);background:currentColor}.override{width:31px}")
+  run batch.replaceStyleSheet(0, 1, replacement.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(2.0))
+  run Testing.expect(tree.node(tree.slotOf(8)).computed.layout.height.value == 13.0
+    && tree.node(tree.slotOf(8)).computed.layout.width.value == 31.0, "sheet replacement invalidates results even when rule indices are reused")
+}
+
+test effect fn stylesheetSharingPreservesCascadeInputsAndInvalidatesAcrossPasses() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run repeatedCascadeInputs() |> Effect.provideMut<Allocator>(&mut allocator)
+}

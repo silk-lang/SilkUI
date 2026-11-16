@@ -1,4 +1,5 @@
 import style_load { Status }
+import sheet_cache { Cache }
 import animation { Rule }
 import animation
 import timing { AnimationLists, EasingStops }
@@ -52,6 +53,7 @@ import silk.num.usize
 struct Expression { index: usize, program: ColorProgram }
 
 pub struct RootSheets {
+  pub cache: Cache,
   pub loads: List<Status>,
   pub root: u32,
   pub inlineVariables: bool,
@@ -62,7 +64,7 @@ pub struct RootSheets {
 }
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
-    return RootSheets { loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+    return RootSheets { cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
       systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
@@ -96,18 +98,18 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
   }
 }
 
-pub effect fn resolve(sheets: &mut StyleSheets, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolved
+pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolved
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
-  let mut resolved = run resolveWith(&mut sheets, system, tree, slot, false)
+  let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false)
   if !tree.node(slot).rendered && (hasStarting || tree.node(slot).starting.length() != 0) {
-    let before = run resolveWith(&mut sheets, system, tree, slot, true)
+    let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true)
     resolved.starting = Option<List<Declaration>>.some(move before.declarations)
   }
   resolved.keyframes = run keyframes(&sheets.*, system, tree, slot, &resolved, &mut stops)
   return move resolved
 }
 
-effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool) -> Resolved
+effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool) -> Resolved
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
   let mut inline = List<Declaration>.make()
@@ -159,6 +161,16 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
     }
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
+  let share = !starting && tree.styleOverrides().length == 0
+  if share {
+    let cached = cache.find(scope, node.parent, sheets.candidates(), inline.asSlice())
+    if cached != usize.MAX {
+      let mut matches = List<MatchedRule>.make()
+      run matches.appendSlice(sheets.matches())
+      return Resolved { keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
+        declarations: run cache.declarations(cached), matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
+    }
+  }
   let mut declarations = List<Declaration>.make()
   let mut ranks = List<Priority>.make()
   let mut expressions = List<Expression>.make()
@@ -199,6 +211,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, system: [Color; 19], tree: &UiTr
     i = i + 1
   }
   let finished = run finish(move declarations, move ranks, move expressions, system, tree, slot, Option<Color>.None)
+  if share { run cache.insert(scope, node.parent, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
   return Resolved { keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
