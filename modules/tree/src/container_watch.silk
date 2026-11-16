@@ -19,10 +19,14 @@ struct Read {
 }
 impl Copy for Read {}
 
+struct PartUnits { pseudo: PseudoTarget, width: Option<f32>, height: Option<f32> }
+impl Copy for PartUnits {}
+
 pub struct Watch {
   slot: u32,
   id: u32,
   queries: List<Read>,
+  parts: List<PartUnits>,
 }
 
 fn index(tree: &UiTree<'_>, slot: u32) -> usize {
@@ -40,7 +44,7 @@ effect fn ensure(tree: &mut UiTree<'_>, slot: u32) -> usize ! OutOfMemoryError ?
   if found != usize.MAX { return found }
   let at = tree.containerWatches.length()
   let id = tree.node(slot).id
-  run tree.containerWatches.append(Watch { slot: slot, id: id, queries: List<Read>.make() })
+  run tree.containerWatches.append(Watch { slot: slot, id: id, queries: List<Read>.make(), parts: List<PartUnits>.make() })
   let node = tree.nodeMut(slot)
   node.containerWatch = usize.toU32(at)
   return at
@@ -69,6 +73,21 @@ pub effect fn record(tree: &mut UiTree<'_>, slot: u32, pseudo: PseudoTarget, dep
 
 pub effect fn units(tree: &mut UiTree<'_>, slot: u32) ! OutOfMemoryError ? &mut Allocator {
   if tree.node(slot).computed.usesContainer { drop run ensure(&mut tree, slot) }
+}
+
+/// Virtual parts select unit containers from their origin, independently of its own lengths.
+pub effect fn partUnits(tree: &mut UiTree<'_>, slot: u32, pseudo: PseudoTarget, used: bool, width: Option<f32>, height: Option<f32>)
+  ! OutOfMemoryError ? &mut Allocator {
+  if !used && index(&tree, slot) == usize.MAX { return () }
+  let at = run ensure(&mut tree, slot)
+  let watches = tree.containerWatches.asMutSlice()
+  let parts = &mut watches[at].parts
+  let mut i: usize = 0
+  while i < parts.length() {
+    if parts.get(i).pseudo == pseudo { drop parts.remove(i) break }
+    i = i + 1
+  }
+  if used { run parts.append(PartUnits { pseudo: pseudo, width: width, height: height }) }
 }
 
 fn same(left: Option<f32>, right: Option<f32>) -> bool {
@@ -100,6 +119,13 @@ pub effect fn changed(tree: &UiTree<'_>) -> List<u32> ! CssError | OutOfMemoryEr
       let mut changed = computed.usesContainer && (
         !same(computed.containerWidth, containers.physicalUnit(tree, watch.slot, true))
         || !same(computed.containerHeight, containers.physicalUnit(tree, watch.slot, false)))
+      let mut part: usize = 0
+      while !changed && part < watch.parts.length() {
+        let units = watch.parts.get(part)
+        changed = !same(units.width, containers.physicalUnitFor(tree, watch.slot, units.pseudo, true))
+          || !same(units.height, containers.physicalUnitFor(tree, watch.slot, units.pseudo, false))
+        part = part + 1
+      }
       let mut query: usize = 0
       while !changed && query < watch.queries.length() {
         let read = watch.queries.get(query)
@@ -117,7 +143,7 @@ pub effect fn changed(tree: &UiTree<'_>) -> List<u32> ! CssError | OutOfMemoryEr
 
 pub fn queries(tree: &UiTree<'_>, slot: u32) -> bool {
   let at = index(tree, slot)
-  return at != usize.MAX && tree.containerWatches.asSlice()[at].queries.length() != 0
+  return at != usize.MAX && (tree.containerWatches.asSlice()[at].queries.length() != 0 || tree.containerWatches.asSlice()[at].parts.length() != 0)
 }
 
 pub fn depth(tree: &UiTree<'_>) -> usize {
