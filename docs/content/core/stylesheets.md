@@ -13,7 +13,7 @@ App.make("my-app")
   |> App.stylesheet("styles/theme.css")
 ```
 
-The pipeline accepts ordinary CSS. It compiles and embeds sheets for native windows and WebGPU canvas apps, and links the original CSS for DOM pages. Compiled sheets are adopted before the first layout. Release apps do not parse CSS at startup.
+The pipeline accepts ordinary CSS. It compiles and embeds sheets for native windows and WebGPU canvas apps, and links the original CSS for DOM pages. Compiled sheets are adopted before the first layout. Release hosts decode compiled sheets instead of parsing stylesheet text at startup.
 
 In the view, use a literal class string:
 
