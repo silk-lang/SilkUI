@@ -1,5 +1,5 @@
 import silk.io.writer_native { StderrWriter }
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, Role, NOT_FOCUSABLE }
+import ui_tree.legacy { Mutation, UiTree, TreeError, Batch, NodeKind, Attribute, Role, NOT_FOCUSABLE }
 import ui_tree.selector_tree { SelectorTree }
 import ui_tree.style_identity { NodeIdentity }
 import font_collection.lib { FontCollection }
@@ -921,4 +921,45 @@ effect fn opacityPercentages() ! TreeError | CompileError | CssError | OutOfMemo
 test effect fn opacityPercentagesMatchNumbersAndClamp() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run opacityPercentages() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pixelAndRelativeStates() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let base = run written.declarations(b"font-size:16px;padding:8px")
+  let hover = run written.declarations(b"font-size:20px")
+  run batch.style(1, base.asSlice())
+  run batch.styleFor(1, StyleState.Hover, hover.asSlice())
+  run tree.apply(run batch.take())
+  let slot = tree.slotOf(1)
+  let hoveredNode = tree.nodeMut(slot)
+  hoveredNode.hovered = true
+  let viewport = FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 }
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(slot).computed.text.size == 20.0 && tree.node(slot).computed.layout.padding.left.value == 8.0, "pixel styles compose active font states")
+  let relative = run written.declarations(b"padding:1em")
+  run batch.style(1, relative.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(slot).computed.layout.padding.left.value == 20.0, "adding relative units uses the final active font")
+  run batch.push(Mutation.ClearStyle { id: 1, state: StyleState.Base })
+  run batch.style(1, base.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(slot).computed.text.size == 20.0 && tree.node(slot).computed.layout.padding.left.value == 8.0, "clearing relative styles restores pixel values without losing the active font")
+  let logical = run written.declarations(b"inline-size:40px;padding-inline-start:12px")
+  let axes = run written.declarations(b"writing-mode:vertical-rl;direction:rtl")
+  run batch.style(1, logical.asSlice())
+  run batch.styleFor(1, StyleState.Hover, axes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport)
+  run Testing.expect(tree.node(slot).computed.layout.height.value == 40.0 && tree.node(slot).computed.layout.padding.bottom.value == 12.0, "logical pixel values use writing mode and direction from every active state")
+}
+
+test effect fn pixelStylesTrackRelativeAndLogicalStateChanges() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pixelAndRelativeStates() |> Effect.provideMut<Allocator>(&mut allocator)
 }

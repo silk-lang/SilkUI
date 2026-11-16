@@ -103,6 +103,69 @@ count to estimate an update's additional instructions. Use the same row count, b
 for both runs. The difference still includes the operation's dispatch, verification and reporting;
 it is not a pure selector-matching measurement.
 
+### Complete runtime measurements
+
+The runtime with font metrics, generated content, container queries and motion retains a direct
+path for typed pixel/percentage styles that need no ordered resolution. Context-dependent values,
+font features, transforms, motion, sheets and inspector overrides use the full resolver. Both
+paths apply the same `Computed` property implementation.
+
+Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,
+`--release` and Valgrind 3.24.0. Executable SHA-256:
+`59c61a512c558b7e1af145cba778364ccb7c47ea4d864b0f02dc5b4f9d5cb18e`.
+The local runtime sources were used for all UI and Loom dependencies. The original executable
+uses SilkUI `9f7ea7e5`; its benchmark controls are unchanged.
+
+| Style-object control | Original | Complete runtime | Change |
+| --- | ---: | ---: | ---: |
+| `trees::Lifetime.first_frame[Tiles=2000]` | 457,904,947 | 457,458,253 | -0.10% |
+| `layout_subsystem::Invalidation.resize_one_leaf[Leaves=4000]` | 120,463,174 | 120,040,356 | -0.35% |
+
+| Rows | Operation | Inline total | Tailwind total | Registered Tailwind total |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000 | create | 81,266,414 | 143,628,899 | 148,743,901 |
+| 1,000 | idle | 83,061,643 | 145,434,474 | 150,548,606 |
+| 1,000 | change_class | 86,964,458 | 149,606,430 | 154,715,369 |
+| 1,000 | hover | 84,358,218 | 146,975,031 | 152,117,399 |
+| 1,000 | theme | 93,133,768 | 222,107,928 | 231,117,148 |
+| 5,000 | idle | 396,356,459 | 697,985,388 | 725,333,043 |
+| 5,000 | theme | 446,291,329 | 1,079,852,638 | 1,125,260,826 |
+
+| Rows | Update minus corresponding idle | Inline | Tailwind | Registered Tailwind |
+| ---: | --- | ---: | ---: | ---: |
+| 1,000 | change_class | 3,902,815 | 4,171,956 | 4,166,763 |
+| 1,000 | hover | 1,296,575 | 1,540,557 | 1,568,793 |
+| 1,000 | theme | 10,072,125 | 76,673,454 | 80,568,542 |
+| 5,000 | theme | 49,934,870 | 381,867,250 | 399,927,783 |
+
+All 21 stylesheet cases pass their computed-result checks. Local class and hover changes keep
+the narrow invalidation path. Theme changes still rebuild scopes and cascade results throughout
+the tree and cost substantially more than inline updates. These process-count differences include
+operation dispatch, verification and reporting; they do not measure selector matching alone or
+establish a 16 ms frame budget. The 5,000-row scene has 10,001 total nodes including text and root.
+
+### Retained stylesheet storage
+
+Measured on the same x86-64 layout at runtime revision `514fa523`. After the idle frame,
+sum `sizeof(Resolved)` for each resolved node plus the capacities of its declaration,
+matched-rule and keyframe arrays multiplied by their element sizes. This is a retained-storage
+lower bound, not total heap use or RSS: it excludes nested value allocations, selector identity
+and class storage, root caches, allocator headers and the base tree.
+
+| Fixture | Rows | Total nodes | Resolved nodes | Fixed records | Declaration arrays | Matched-rule arrays | Lower bound |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Inline | 1,000 | 2,001 | 0 | 0 | 0 | 0 | 0 B |
+| Tailwind | 1,000 | 2,001 | 1,001 | 224,224 | 4,610,304 | 128,064 | 4,962,592 B |
+| Tailwind | 5,000 | 10,001 | 5,001 | 1,120,224 | 23,042,304 | 640,064 | 24,802,592 B |
+| Registered Tailwind | 1,000 | 2,001 | 1,001 | 224,224 | 4,610,304 | 256,064 | 5,090,592 B |
+
+Keyframe-array capacities are zero in these fixtures. The 64 B per-node target is not met:
+the lower bound is about 2,480 B per total node for Tailwind, before identity and class costs.
+Each resolved record alone occupies 224 B. Cascade and variable caches reduce computation,
+but nodes still own cloned winning declarations; sharing those immutable results is the main
+remaining memory optimization. The 1,000-row Tailwind fixture additionally retains 400,000 B
+of fixed selector identities and 231,000 B of class string/atom capacity, excluded above.
+
 ### Initial instruction counts
 
 Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,

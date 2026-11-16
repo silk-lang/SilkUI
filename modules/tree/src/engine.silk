@@ -584,6 +584,16 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
   }
 }
 
+fn applyPixelList(computed: &mut Computed, list: &List<Declaration>) {
+  let items = list.asSlice()
+  let units = computed.unitContext()
+  let mut i: usize = 0
+  while i < items.length {
+    computed.applyFixed(&items[i], &units)
+    i = i + 1
+  }
+}
+
 /// Applies `declaration` when it sets a property read from its CSS text (a transform or a font
 /// feature); false when it does not.
 pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -> bool
@@ -605,6 +615,7 @@ pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -
 pub effect fn applyTransform(computed: &mut Computed, declaration: &Declaration) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if transformProperty(declaration.property) == NONE { return false }
   let units = computed.unitContext()
   return run applyTransformIn(&mut computed.*, declaration, &units)
 }
@@ -1482,6 +1493,7 @@ impl<'a> UiTree<'a> {
         }
         let node = self.nodeMut(slot)
         if grid_css.mentionsGrid(values) { node.gridDeclared = true }
+        if !node.styleNeedsContext && style.requiresContext(values) { node.styleNeedsContext = true }
         let mut i: usize = 0
         while i < values.length {
           match state {
@@ -1537,6 +1549,9 @@ impl<'a> UiTree<'a> {
         }
         node.gridDeclared = grid_css.mentionsGrid(node.base.asSlice()) || grid_css.mentionsGrid(node.hover.asSlice())
           || grid_css.mentionsGrid(node.active.asSlice()) || grid_css.mentionsGrid(node.focus.asSlice()) || grid_css.mentionsGrid(node.focusVisible.asSlice())
+        node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover.asSlice())
+          || style.requiresContext(node.active.asSlice()) || style.requiresContext(node.focus.asSlice())
+          || style.requiresContext(node.focusVisible.asSlice()) || style.requiresContext(node.starting.asSlice())
         self.restyle(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
@@ -2216,6 +2231,7 @@ impl<'a> UiTree<'a> {
       styleDirty: true,
       gridDeclared: false,
       gridStyled: false,
+      styleNeedsContext: false,
       containerWatch: NONE,
       styleChange: NONE,
       generatedSuppressed: false,
@@ -4345,6 +4361,20 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  fn applyPixelStyles(self: &Self, slot: u32, computed: &mut Computed) {
+    let node = self.node(slot)
+    if node.kind == NodeKind.Text { return () }
+    applyPixelList(&mut computed.*, &node.base)
+    if node.hovered { applyPixelList(&mut computed.*, &node.hover) }
+    if node.pressed { applyPixelList(&mut computed.*, &node.active) }
+    if self.focused == slot {
+      applyPixelList(&mut computed.*, &node.focus)
+      if self.focusVisible || node.kind == NodeKind.Input {
+        applyPixelList(&mut computed.*, &node.focusVisible)
+      }
+    }
+  }
+
   effect fn applyNodeLengths(self: &Self, slot: u32, computed: &mut Computed, parentStyle: &Computed,
     stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
     let node = self.node(slot)
@@ -4400,8 +4430,9 @@ impl<'a> UiTree<'a> {
     }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
+    let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
     let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
-    if containers.usesUnits(&self, slot) {
+    if !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
       computed.usesContainer = true
@@ -4435,12 +4466,16 @@ impl<'a> UiTree<'a> {
       computed.outline.auto = true
       computed.outline.width = FOCUS_RING_WIDTH
     }
-    let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
-    let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+    if simpleStyles {
+      self.applyPixelStyles(slot, &mut computed)
+    } else {
+      let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
+      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+      run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
+    }
     let node = self.node(slot)
-    run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
-    let animationUnits = animation.relativeUnits(&self, slot, &computed.animation, &stops)
+    let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
     if animationUnits & 2 != 0 && !computed.usesContainer {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
@@ -4452,12 +4487,15 @@ impl<'a> UiTree<'a> {
     run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
-    if kind != NodeKind.Text {
+    let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).transition.ownedByteLength() != 0
+      || self.node(slot).starting.length() != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+    if needsMotion {
       let mut before = style_change.before(&self, slot)
       let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
       if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
         before = computed
+        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
         let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
         run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
         if sheetStarting {
@@ -4482,6 +4520,7 @@ impl<'a> UiTree<'a> {
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
+        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
         let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
         let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
         run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
@@ -4501,13 +4540,15 @@ impl<'a> UiTree<'a> {
         let currentUnits = font_units.context(&self, slot, &computed, key)
         run animation.apply(&self, slot, &mut computed, &currentUnits, false)
       }
+    } else {
+      self.easingStops = move stops
     }
     if kind != NodeKind.Text && !self.node(slot).isGenerated() && self.overrides.length() != 0 {
       let finalUnits = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Overrides)
+      let parentStyle = style_sheets.parentStyle(&self, slot)
       let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
       let node = self.node(slot)
       if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-        let parentStyle = style_sheets.parentStyle(&self, slot)
         run applyUsing(&mut computed, &value.overrides, &parentStyle, &mut finalStops, &finalUnits)
       } else {
         let mut declarations = List<Declaration>.make()
@@ -4536,7 +4577,7 @@ impl<'a> UiTree<'a> {
       computed.effects.shadowFrom = above.shadowFrom
       computed.effects.shadowHash = above.shadowHash
     }
-    let fontKey = run self.fontKeyOf(computed.text)
+    let fontKey = if simpleStyles && kind == NodeKind.Text && parent != NONE { self.node(parent).fontKey } else { run self.fontKeyOf(computed.text) }
     run self.resolveEffects(slot, &mut computed, fontKey)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
@@ -4556,7 +4597,7 @@ impl<'a> UiTree<'a> {
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
-      let names = run containers.names(&self, slot)
+      let names = if simpleStyles { List<Bytes>.make() } else { run containers.names(&self, slot) }
       namesChanged = !containers.sameNames(&self, slot, names.asSlice())
       if names.length() != 0 || self.node(slot).identity().isSome() {
         let node = self.nodeMut(slot)
