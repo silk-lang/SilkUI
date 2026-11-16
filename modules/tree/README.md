@@ -552,6 +552,11 @@ forward `--name` entries, preserving their case and numeric tokens.
 The resolved list feeds both layout and paint effects. Matched sheet/rule ids remain on the
 node's resolved style.
 
+Named ARIA relation attributes resolve literal element IDs for accessibility, within their
+root and in tree order. Typed `LabelledBy`, `DescribedBy`, `Controls`, and `ActiveDescendant`
+attributes still take client node numbers. The most recent typed or named write wins; a
+numeric-looking literal ID is an element ID, not a client node number.
+
 Hosts may call `UiTree.setStyleEnvironment(root, environment, systemColors)` to supply media
 preferences, input capabilities and the system-color palette. Frame dimensions and scale
 supply viewport queries and resolution. The default environment is headless. A root with
