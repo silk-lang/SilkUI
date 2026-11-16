@@ -1,6 +1,7 @@
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
 import style_inherit
+import style_media { Preferences }
 import properties.convert as properties_convert
 import properties.catalog
 import svg_css.written as css_written
@@ -623,6 +624,7 @@ pub struct UiTree<'a> {
   pub nodes: List<Node>,
   pub styleAtoms: Atoms,
   pub styleSheets: List<RootSheets>,
+  hostStylePreferences: Option<Preferences>,
   free: List<u32>,
   ids: HashMap<Word, u32>,
   /// The slot of each css-layout node, or NONE.
@@ -820,6 +822,7 @@ impl<'a> UiTree<'a> {
       nodes: List<Node>.make(),
       styleAtoms: Atoms.make(),
       styleSheets: List<RootSheets>.make(),
+      hostStylePreferences: Option<Preferences>.None,
       free: List<u32>.make(),
       ids: HashMap<Word, u32>.make(seed),
       slotOfCss: List<u32>.make(),
@@ -3601,12 +3604,35 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  /// Recomputes every node's style from its patches, variants and parent.
+  /// Updates host media inputs without restyling until a condition changes truth.
+  pub fn setStylePreferences(self: &mut Self, preferences: Preferences) -> bool {
+    if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      if value.bits() == preferences.bits() { return false }
+    }
+    self.hostStylePreferences = Option<Preferences>.some(preferences)
+    let roots = self.styleSheets.asMutSlice()
+    let mut i: usize = 0
+    while i < roots.length {
+      preferences.apply(&mut roots[i].environment)
+      i = i + 1
+    }
+    return true
+  }
+
+  fn rootSheets(self: &Self, root: u32) -> RootSheets {
+    let mut sheets = RootSheets.make(root)
+    if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      value.apply(&mut sheets.environment)
+    }
+    return move sheets
+  }
+
   effect fn enableInlineScope(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX {
       at = self.styleSheets.length()
-      run self.styleSheets.append(RootSheets.make(self.current))
+      let sheets = self.rootSheets(self.current)
+      run self.styleSheets.append(move sheets)
     }
     let roots = self.styleSheets.asMutSlice()
     roots[at].inlineVariables = true
@@ -3618,7 +3644,8 @@ impl<'a> UiTree<'a> {
     let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
     if at == usize.MAX {
       at = self.styleSheets.length()
-      run self.styleSheets.append(RootSheets.make(root))
+      let sheets = self.rootSheets(root)
+      run self.styleSheets.append(move sheets)
     }
     let roots = self.styleSheets.asMutSlice()
     roots[at].environment = environment
@@ -3646,7 +3673,8 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX {
       if replace { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
       at = self.styleSheets.length()
-      run self.styleSheets.append(RootSheets.make(root))
+      let sheets = self.rootSheets(root)
+      run self.styleSheets.append(move sheets)
     }
     let roots = self.styleSheets.asMutSlice()
     let changed = if replace { run Effect.result(roots[at].sheets.replace(id, move sheet)) }

@@ -480,6 +480,54 @@ test effect fn styleObjectCurrentColorUsesComputedForegroundWithoutSheets() -> (
 }
 
 import ui_tree.style_assets { StyleAssets }
+import ui_tree.style_media { Preferences }
+
+effect fn hostMediaPreferences() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  drop tree.setStylePreferences(Preferences.desktop(true))
+  run Testing.expect(tree.styleSheets.length() == 0, "host preferences allocate no stylesheet state in an unstyled app")
+  let source = run sheetBytes(b"div{width:10px;height:10px}@media(hover:hover) and (pointer:fine){div{width:20px}}@media(prefers-color-scheme:dark){div{height:30px}}@media(prefers-reduced-motion:reduce){div{padding:7px}}@media(any-pointer:coarse){div{margin:5px}}@media(forced-colors:active){div{height:60px}}")
+  let fixed = run sheetBytes(b"div{width:33px;height:12px}")
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.openRoot(1, 2, RootOptions.default())
+  run batch.adoptStyleSheet(0, 1, source.asSlice())
+  run batch.adoptStyleSheet(1, 1, fixed.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frameRoot(0, frame)
+  run tree.frameRoot(1, frame)
+  let initial = &tree.node(tree.slotOf(1)).computed
+  run Testing.expect(initial.layout.width.value == 20.0 && initial.layout.height.value == 30.0,
+    "the first adopted sheet sees the host's hover, pointer and dark appearance")
+  run Testing.expect(!tree.setStylePreferences(Preferences.desktop(true)), "identical host preferences do not request a frame")
+  run tree.frameRoot(0, frame)
+  run Testing.expect(tree.stats.layoutSkipped, "unchanged media preferences retain cached layout")
+  drop tree.setStylePreferences(Preferences.fromBits(299))
+  run tree.frameRoot(0, frame)
+  let changed = &tree.node(tree.slotOf(1)).computed
+  run Testing.expect(changed.layout.width.value == 10.0 && changed.layout.padding.top.value == 7.0
+    && changed.layout.margin.left.value == 5.0 && changed.layout.height.value == 60.0, "coarse pointer, reduced motion and forced colors replace the active media rules")
+  run tree.frameRoot(1, frame)
+  run Testing.expect(tree.stats.layoutSkipped, "a root without changed conditions is not restyled")
+  run batch.create(3, NodeKind.Box)
+  run batch.openRoot(2, 3, RootOptions.default())
+  run batch.adoptStyleSheet(2, 1, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frameRoot(2, frame)
+  run Testing.expect(tree.node(tree.slotOf(3)).computed.layout.padding.top.value == 7.0,
+    "roots opened after a preference change inherit current host media inputs")
+}
+
+test effect fn stylesheetMediaTracksHostPreferencesAcrossRoots() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hostMediaPreferences() |> Effect.provideMut<Allocator>(&mut allocator)
+}
 
 effect fn compiledAssetsBeforeLayout() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {

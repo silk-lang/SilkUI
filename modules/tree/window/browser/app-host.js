@@ -16,6 +16,7 @@
 import { WindowHost } from '/native/platform/window/browser/window-host.js';
 import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
 import { AccessMirror } from './access-mirror.js';
+import { MediaPreferences } from './media.mjs';
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -98,6 +99,7 @@ export async function runApp({
   const gpuHost = new WebGPUHost();
   const mirror = new AccessMirror(windowHost);
   let memory;
+  let media;
   let styles;
   let line = '';
   const print = text => {
@@ -115,6 +117,7 @@ export async function runApp({
       write: (pointer, length) => print(decoder.decode(new Uint8Array(memory.buffer, pointer, length))),
       now: () => performance.now(),
       check: () => (check ? 1 : 0),
+      media: () => media?.bits ?? 212,
       stylesheet_length: () => styles?.length ?? 0,
       stylesheet_read: (pointer, length) => styles?.read(memory, pointer, length) ?? -1,
       // A turn of the page's event loop, so pending WebGPU promises settle.
@@ -158,6 +161,9 @@ export async function runApp({
   started?.({ instance, windowHost });
   let status;
   try {
+    if (!check) media = new MediaPreferences(() => {
+      for (const id of windowHost.windows.keys()) windowHost.silk_window_request_frame(id);
+    });
     if (stylesheetUpdates) {
       const { StyleUpdates } = await import('./style-updates.mjs');
       styles = new StyleUpdates(stylesheetUpdates);
@@ -167,6 +173,7 @@ export async function runApp({
     const text = report();
     throw new Error(text ? `${text}\n${error?.message ?? error}` : String(error?.message ?? error), { cause: error });
   } finally {
+    media?.close();
     styles?.close();
     if (line) log(line);
   }

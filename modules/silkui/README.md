@@ -109,6 +109,12 @@ before updating their application roots. A missing or invalid update leaves the 
 intact until a valid update is available. Release hosts do not watch stylesheet files.
 Canvas updates fetch the same compiled bundles; development polling is omitted from release pages.
 
+Media queries use each root's viewport and scale. Window hosts supply system light/dark
+appearance and desktop pointer capabilities. Canvas hosts read the browser's appearance,
+reduced-motion, forced-colors, hover, and primary/secondary pointer preferences, and respond when they
+change. A root is restyled only when a media condition changes its result. Native
+reduced-motion and forced-colors preferences are not exposed by the window platform API yet.
+
 The browser integration test runs the real dev task in a temporary project and checks
 replacement order, preserved state, missing-file recovery, and a subsequent code rebuild:
 `node modules/silkui/tests/stylesheets-browser.mjs` from the repository root. It needs
