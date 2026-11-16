@@ -74,9 +74,6 @@ function cssValue(name, value) {
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }
 
-// ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
-// the other ARIA names as they are; one it does not know is ignored, with one warning.
-const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
 const warned = new Set();
 
 function warnOnce(message) {
@@ -375,8 +372,6 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
-  // aria-valuemin, aria-valuemax and aria-valuenow, which the tree takes as one range.
-  #range = null;
   #attributes = null;
   #classList = null;
 
@@ -525,7 +520,7 @@ export class Node {
     } else if (name === "id") {
       this.#identify(text);
     } else if (aria !== null) {
-      this.#aria(aria, text);
+      native.attribute(this.nodeId, name, text);
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -536,19 +531,6 @@ export class Node {
     }
     if (text === null) this.#attributes?.delete(name);
     else (this.#attributes ??= new Map()).set(name, text);
-  }
-
-  #aria(name, value) {
-    if (name in ARIA_RANGE) {
-      const range = (this.#range ??= [undefined, undefined, undefined]);
-      range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
-      const [min = 0, max = 100, now] = range;
-      if (now === undefined || Number.isNaN(now)) native.attribute(this.nodeId, "valueRange");
-      else native.attribute(this.nodeId, "valueRange", min, max, now);
-      native.attribute(this.nodeId, "aria-" + name, value);
-    } else {
-      native.attribute(this.nodeId, "aria-" + name, value);
-    }
   }
 
   // The `id` other nodes' relations name this node by.

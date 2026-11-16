@@ -45,7 +45,7 @@ Sheet declarations follow CSS specificity, source order, layers and `!important`
 
 Custom properties inherit through the tree and can be written on either side. `h.customProperty("--card-gap", "16px")` sets an inline variable; a declaration using `var(--card-gap)` can read a value from a sheet or an ancestor. `@property` supplies registered defaults and inheritance behavior. Values such as `var()`, `calc()`, `oklch()` and `color-mix()` share the resolver used by style objects.
 
-Selectors read element tags, IDs, classes, named attributes and state. `data-*` and literal `aria-*` attributes can be matched. Literal ARIA relation values name element IDs within the same root; typed protocol relations continue to use node numbers.
+Selectors read element tags, IDs, classes, named attributes and state. `data-*` and literal `aria-*` attributes can be matched. Literal ARIA relation values name element IDs within the same root; typed protocol relations continue to use node numbers. Numeric `aria-valuemin`, `aria-valuemax`, and `aria-valuenow` values also update native accessibility while retaining their literal spelling for selectors. Native `ValueRange` attributes expose the corresponding selector attributes. Explicit native roles and tab indices can be matched with `[role]` and `[tabindex]`; implicit defaults leave those attributes absent.
 
 ## Tailwind
 

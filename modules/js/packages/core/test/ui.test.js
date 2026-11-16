@@ -230,18 +230,20 @@ test("role and literal ARIA values reach the native attribute pipeline", () => {
   ]);
 });
 
-test("aria-value* make one range, and it clears without a value", () => {
+test("ARIA range values retain literal spelling and absent bounds", () => {
   const box = createBox();
   mock.take();
-  box.setAttribute("aria-valuenow", "30");
+  box.setAttribute("aria-valuenow", "2.00");
   box.setAttribute("ariaValueMax", 50);
-  box.setAttribute("aria-valuenow", null);
+  box.setAttribute("aria-valuemin", "-2.50e1");
+  box.removeAttribute("aria-valuenow");
+  assert.equal(box.getAttribute("aria-valuemin"), "-2.50e1");
+  assert.equal(box.getAttribute("aria-valuemax"), "50");
+  assert.equal(box.getAttribute("aria-valuenow"), null);
   assert.deepEqual(mock.take(), [
-    ["attribute", box.nodeId, "valueRange", 0, 100, 30],
-    ["attribute", box.nodeId, "aria-valuenow", "30"],
-    ["attribute", box.nodeId, "valueRange", 0, 50, 30],
+    ["attribute", box.nodeId, "aria-valuenow", "2.00"],
     ["attribute", box.nodeId, "aria-valuemax", "50"],
-    ["attribute", box.nodeId, "valueRange"],
+    ["attribute", box.nodeId, "aria-valuemin", "-2.50e1"],
     ["attribute", box.nodeId, "aria-valuenow", null],
   ]);
 });

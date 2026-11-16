@@ -1,7 +1,8 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, Role, NOT_FOCUSABLE }
 import ui_tree.selector_tree { SelectorTree }
 import ui_tree.style_identity { NodeIdentity }
 import font_collection.lib { FontCollection }
+import ui_fixtures.fixtures as fixtures
 import svg_css.element { ElementTree, MatchContext, NO_ELEMENT }
 import svg_css.selectors { SelectorList }
 import svg_css.selectors
@@ -799,4 +800,84 @@ test effect fn paintEffectsHonorInspectorAndInheritedWinners() -> ()
   run paintOverrideParity(true, false) |> Effect.provideMut<Allocator>(&mut allocator)
   run paintOverrideParity(false, true) |> Effect.provideMut<Allocator>(&mut allocator)
   run paintOverrideParity(true, true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn namedRange(batch: &mut Batch, id: u32, name: string, text: Option<string>) ! OutOfMemoryError ? &mut Allocator {
+  let value = match text { Option.Some { value } => Option<String>.some(run String.copy(value)) _ => Option<String>.None }
+  run batch.attribute(id, Attribute.Named { name: run String.copy(name), value: move value })
+}
+
+effect fn rangeAttributes() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ValueRange { min: -10.0, max: 100.0, value: 2.5 })
+  run batch.attribute(2, Attribute.Role { value: Role.Slider })
+  run batch.attribute(2, Attribute.TabIndex { value: -1 })
+  run batch.create(3, NodeKind.Input)
+  run batch.append(1, 3)
+  run batch.create(4, NodeKind.Box)
+  run batch.append(1, 4)
+  run batch.attribute(4, Attribute.Element { name: run String.copy("button") })
+  run batch.attribute(2, Attribute.Level { value: 2 })
+  run batch.attribute(2, Attribute.PosInSet { value: 3 })
+  run batch.attribute(2, Attribute.SetSize { value: -1 })
+  let bytes = run sheetBytes(b"[aria-valuenow='2.5']{width:25px}[aria-valuenow='2.00']{width:20px}[aria-valuenow='2.00'][aria-valuemax='50.00']{width:50px}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let slot = tree.slotOf(2)
+  run Testing.expect(run matches(&tree, 2, b"[role='slider'][tabindex='-1'][aria-valuemin='-10'][aria-valuemax='100'][aria-valuenow='2.5'][aria-level='2'][aria-posinset='3'][aria-setsize='-1']"), "native numeric accessibility attributes have selector-visible spellings")
+  run Testing.expect(tree.node(tree.slotOf(3)).tabIndex == 0 && (run matches(&tree, 3, b"input:not([tabindex]):not([role])"))
+    && (run matches(&tree, 4, b"button:not([role])")), "implicit focus and role defaults do not synthesize selector attributes")
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 25.0, "range selectors participate in the stylesheet cascade")
+  run batch.attribute(2, Attribute.Role { value: Role.None })
+  run batch.attribute(2, Attribute.TabIndex { value: NOT_FOCUSABLE })
+  run batch.attribute(2, Attribute.ClearValueRange)
+  run batch.attribute(2, Attribute.Level { value: 0 })
+  run batch.attribute(2, Attribute.PosInSet { value: 0 })
+  run batch.attribute(2, Attribute.SetSize { value: 0 })
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(!tree.node(slot).hasValueRange && run matches(&tree, 2, b":not([role]):not([tabindex]):not([aria-valuenow]):not([aria-valuemin]):not([aria-valuemax]):not([aria-level]):not([aria-posinset]):not([aria-setsize])"), "clearing native numeric state removes its reflected attributes")
+  run namedRange(&mut batch, 2, "aria-valuenow", Option<string>.some("2.00"))
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).hasValueRange && tree.node(slot).valueNow == 2.0 && tree.node(slot).valueMin == 0.0 && tree.node(slot).valueMax == 100.0, "literal numeric ARIA drives native range semantics with default bounds")
+  run Testing.expect(run matches(&tree, 2, b"[aria-valuenow='2.00']:not([aria-valuemin]):not([aria-valuemax])"), "semantic defaults do not synthesize absent literal bounds or normalize selector text")
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 20.0, "literal spelling selects its own rule")
+  run namedRange(&mut batch, 2, "aria-valuemin", Option<string>.some("-2.50e1"))
+  run namedRange(&mut batch, 2, "aria-valuemax", Option<string>.some("50.00"))
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(tree.node(slot).valueMin == -25.0 && tree.node(slot).valueMax == 50.0 && tree.node(slot).valueNow == 2.0, "independent named bounds update the existing native range")
+  run Testing.expect(tree.node(slot).computed.layout.width.value == 50.0 && run matches(&tree, 2, b"[aria-valuemin='-2.50e1'][aria-valuemax='50.00'][aria-valuenow='2.00']"), "a bound update retains all literal spellings and invalidates attribute selectors")
+  run namedRange(&mut batch, 2, "aria-valuenow", Option<string>.some("Infinity"))
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.node(slot).hasValueRange && run matches(&tree, 2, b"[aria-valuenow='Infinity']"), "invalid numeric text remains selectable but does not expose a nonfinite accessible value")
+  run namedRange(&mut batch, 2, "aria-valuenow", Option<string>.some(""))
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.node(slot).hasValueRange && run matches(&tree, 2, b"[aria-valuenow='']"), "an empty literal stays present without a numeric range")
+  run namedRange(&mut batch, 2, "aria-valuenow", Option<string<'static>>.None)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.node(slot).hasValueRange && run matches(&tree, 2, b":not([aria-valuenow])[aria-valuemin='-2.50e1'][aria-valuemax='50.00']"), "removing the value clears semantics while preserving independently declared bounds")
+  run batch.attribute(2, Attribute.ValueRange { min: 0.0, max: 1.0, value: -0.0 })
+  run tree.apply(run batch.take())
+  run Testing.expect(run matches(&tree, 2, b"[aria-valuenow='0']"), "typed negative zero has the DOM's zero spelling")
+  run batch.attribute(2, Attribute.ValueRange { min: 0.0, max: 1.0, value: 0.00000001 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!(run matches(&tree, 2, b"[aria-valuenow='0']")), "typed small values are not rounded to zero in selector text")
+  run namedRange(&mut batch, 2, "aria-valuemax", Option<string>.some("2"))
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.node(slot).hasValueRange && tree.node(slot).valueNow == 0.00000001 && tree.node(slot).valueMax == 2.0, "typed and literal mutations share a round-tripping numeric range")
+}
+
+test effect fn numericAriaAttributesShareSelectorsAndAccessibility() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run rangeAttributes() |> Effect.provideMut<Allocator>(&mut allocator)
 }
