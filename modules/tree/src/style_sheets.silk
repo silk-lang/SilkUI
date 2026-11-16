@@ -15,7 +15,7 @@ import style { TextStyle, Computed }
 import svg_css.adopted { StyleSheets, Source, MatchedRule }
 import svg_css.sheet { Declaration as SheetDeclaration }
 import svg_css.cascade { Priority, Origin }
-import svg_css.element { MatchContext, PseudoTarget, StateBits, NO_ELEMENT }
+import svg_css.element { MatchContext, PseudoTarget, StateBits, ContainerDependency, NO_ELEMENT }
 import svg_css.variables { ScopeId, RegistrationError }
 import svg_css.resolver { ResolverError }
 import svg_css.tokens { Limits, CssError, Buffers, TokenBuffer }
@@ -81,6 +81,11 @@ pub struct Resolved {
   pub scope: ScopeId,
 }
 
+pub struct Resolution {
+  pub style: Resolved,
+  pub containers: List<ContainerDependency>,
+}
+
 pub fn index(roots: &[RootSheets], root: u32) -> usize {
   let mut i: usize = 0
   while i < roots.length {
@@ -102,31 +107,39 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
   }
 }
 
-pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolved
+pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false, PseudoTarget.None, StateBits.empty())
   if !tree.node(slot).rendered && (hasStarting || tree.node(slot).starting.length() != 0) {
     let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true, PseudoTarget.None, StateBits.empty())
-    resolved.starting = Option<List<Declaration>>.some(move before.declarations)
+    let style = &mut resolved.style
+    style.starting = Option<List<Declaration>>.some(move before.style.declarations)
+    resolved.containers = move before.containers
   }
-  resolved.keyframes = run keyframes(&sheets.*, system, tree, tree.node(slot).parent, &resolved, &mut stops)
+  let frames = run keyframes(&sheets.*, system, tree, tree.node(slot).parent, &resolved.style, &mut stops)
+  let style = &mut resolved.style
+  style.keyframes = move frames
   return move resolved
 }
 
 pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool,
-  tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolved
+  tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   if target == PseudoTarget.None { return run resolve(&mut sheets, &mut cache, system, hasStarting, tree, origin, &mut stops) }
   let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states)
   if !rendered && hasStarting {
     let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states)
-    resolved.starting = Option<List<Declaration>>.some(move before.declarations)
+    let style = &mut resolved.style
+    style.starting = Option<List<Declaration>>.some(move before.style.declarations)
+    resolved.containers = move before.containers
   }
-  resolved.keyframes = run keyframes(&sheets.*, system, tree, origin, &resolved, &mut stops)
+  let frames = run keyframes(&sheets.*, system, tree, origin, &resolved.style, &mut stops)
+  let style = &mut resolved.style
+  style.keyframes = move frames
   return move resolved
 }
 
-effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool, target: PseudoTarget, states: StateBits) -> Resolved
+effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, slot: u32, starting: bool, target: PseudoTarget, states: StateBits) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
   let parentSlot = if target == PseudoTarget.None { node.parent } else { slot }
@@ -191,8 +204,8 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     if cached != usize.MAX {
       let mut matches = List<MatchedRule>.make()
       run matches.appendSlice(sheets.matches())
-      return Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
-        declarations: run cache.declarations(cached), matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
+      return Resolution { containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: List<Declaration>.make(),
+        declarations: run cache.declarations(cached), matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
     }
   }
   let mut declarations = List<Declaration>.make()
@@ -238,7 +251,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   if share { run cache.insert(scope, parentSlot, sheets.candidates(), inline.asSlice(), finished.declarations.asSlice()) }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
-  return Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None }
+  return Resolution { containers: move context.containers, style: Resolved { states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
 }
 
 effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets,

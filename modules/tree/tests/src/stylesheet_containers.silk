@@ -1,4 +1,5 @@
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Mutation, Grid, GridTrack, GridBreadth, Keyframe }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState, Mutation, Grid, GridTrack, GridBreadth, Keyframe, NONE }
+import ui_tree.lib { RootOptions }
 import properties.catalog { Property }
 import properties.values { Declaration }
 import properties.values
@@ -6,6 +7,7 @@ import properties.keywords { Keyword }
 import svg_css.written
 import ui_tree.selector_tree { SelectorTree }
 import ui_tree.inspect
+import ui_tree.container_watch
 import svg_css.compile { CompileError, Options }
 import svg_css.compile
 import svg_css.element { ElementTree, PseudoTarget }
@@ -63,6 +65,8 @@ effect fn selection() ! TreeError | CompileError | CssError | OutOfMemoryError |
   let outer = tree.slotOf(1)
   let inner = tree.slotOf(2)
   let subject = tree.slotOf(3)
+  let firstChanges = run container_watch.changed(&tree)
+  run Testing.expect(firstChanges.length() == 1 && firstChanges.get(0) == subject, "only the dependent subject needs an initial container refinement")
   run Testing.expect(tree.node(outer).computed.layout.containsSize(true) && tree.node(outer).computed.layout.containsSize(false) && tree.node(inner).computed.layout.containsSize(true) && !tree.node(inner).computed.layout.containsSize(false), "container shorthand projects layout containment")
   let adapter = SelectorTree { tree: &tree }
   run Testing.expect(width(adapter.container(u32.toUsize(subject), b"card", 1, PseudoTarget.None)) == 200.0, "width query selects the nearest named eligible ancestor")
@@ -79,12 +83,15 @@ effect fn selection() ! TreeError | CompileError | CssError | OutOfMemoryError |
   run Testing.expect(computed.paint.border.top == 3.0 && computed.paint.border.bottom == 0.0, "container units in conditions resolve on the selected container against its own ancestors")
   run Testing.expect(computed.layout.margin.top.value == 13.0 && computed.layout.padding.bottom.value == 7.0, "one selected size container satisfies all required physical axes")
   run Testing.expect(computed.layout.padding.left.value == 9.0, "query em values use the selected container's font size")
+  let pseudoChanges = run container_watch.changed(&tree)
+  run Testing.expect(pseudoChanges.length() == 1 && pseudoChanges.get(0) == subject, "pseudo query changes invalidate their originating element")
   tree.stylesDirty = true
   run tree.frame(frame)
   let before = tree.node(subject).identity()
   if let Option.Some { value } = before {
     run Testing.expect(tree.node(value.before).computed.layout.margin.left.value == 17.0, "pseudo-element queries can select their originating element")
   }
+  run Testing.expect((run container_watch.changed(&tree)).length() == 0, "stable query results and unit bases need no further refinement")
   run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"outer", 3, PseudoTarget.None)) == 400.0, "all names in a container-name list participate")
   run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"red", 1, PseudoTarget.None)) == 400.0, "color-named containers remain identifiers")
   run Testing.expect(width(SelectorTree { tree: &tree }.container(u32.toUsize(subject), b"currentcolor", 1, PseudoTarget.None)) == 400.0, "contextual color keywords also remain container identifiers")
@@ -336,4 +343,104 @@ test effect fn containerKeyframesResolveUnitsWithoutBaseDeclarations() ! TreeErr
   let mut allocator = Allocator.systemAllocatorProvider()
   run keyframeUnits(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run keyframeUnits(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn beforeExists(tree: &UiTree<'_>, slot: u32) -> bool {
+  return match tree.node(slot).identity() { Option.Some { value } => value.before != NONE _ => false }
+}
+
+effect fn absentPseudo() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("subject") })
+  let container = run written.declarations(b"container-type:size;width:400px;height:300px")
+  run batch.style(1, container.asSlice())
+  let sheet = run compile.compile(b".subject{width:100px;height:20px}@container(width>300px){.subject::before{content:'ready';display:block;width:10px;height:1px}}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let slot = tree.slotOf(2)
+  run Testing.expect(!beforeExists(&tree, slot), "a query with no previous layout initially generates no box")
+  let changes = run container_watch.changed(&tree)
+  run Testing.expect(changes.length() == 1 && changes.get(0) == slot, "false pseudo queries survive when there is no generated box")
+  tree.restyleLocal(slot)
+  run tree.frame(frame)
+  run Testing.expect(beforeExists(&tree, slot) && (run container_watch.changed(&tree)).length() == 0, "an origin refinement creates the newly matching pseudo")
+  let smaller = run written.declarations(b"width:200px")
+  run batch.style(1, smaller.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  let removed = run container_watch.changed(&tree)
+  run Testing.expect(removed.length() == 1 && removed.get(0) == slot, "a true-to-false pseudo condition marks the same origin")
+  tree.restyleLocal(slot)
+  run tree.frame(frame)
+  run Testing.expect(!beforeExists(&tree, slot) && (run container_watch.changed(&tree)).length() == 0, "removing a generated box retains its now-false dependency")
+}
+
+test effect fn containerDependenciesRetainAbsentPseudoQueries() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run absentPseudo() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rootWatches() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  let ids: [u32; 2] = [1, 11]
+  let rootStyles = [b"container-type:size;width:400px;height:300px", b"container-type:size;width:80px;height:50px"]
+  let mut i: usize = 0
+  while i < ids.length {
+    run batch.create(ids[i], NodeKind.Box)
+    let style = run written.declarations(rootStyles[i])
+    run batch.style(ids[i], style.asSlice())
+    run batch.create(ids[i] + 1, NodeKind.Box)
+    run batch.append(ids[i], ids[i] + 1)
+    let child = run written.declarations(b"width:100cqw;height:1px")
+    run batch.style(ids[i] + 1, child.asSlice())
+    i = i + 1
+  }
+  run batch.root(1)
+  run batch.openRoot(1, 11, RootOptions.default())
+  run tree.apply(run batch.take())
+  let wide = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  let narrow = FrameInput { width: 200.0, height: 100.0, scale: 1.0, time: 0.0 }
+  run tree.frameRoot(0, wide)
+  let first = tree.slotOf(2)
+  tree.restyleLocal(first)
+  run tree.frame(wide)
+  run Testing.expect((run container_watch.changed(&tree)).length() == 0, "the first root's unit dependency settles")
+  run tree.frameRoot(1, narrow)
+  let changes = run container_watch.changed(&tree)
+  run Testing.expect(changes.length() == 1 && changes.get(0) == tree.slotOf(12), "a root evaluates only its own container geometry")
+  let second = tree.slotOf(12)
+  tree.restyleLocal(second)
+  run tree.frame(narrow)
+  drop run tree.useRoot(0)
+  run Testing.expect((run container_watch.changed(&tree)).length() == 0, "parked query and unit records return with their original layout")
+  let old = tree.slotOf(2)
+  run batch.push(Mutation.Destroy { id: 2 })
+  run batch.create(3, NodeKind.Box)
+  run batch.append(1, 3)
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.slotOf(3) == old && (run container_watch.changed(&tree)).length() == 0, "a recycled node slot does not inherit an old dependency")
+  tree.stylesDirty = true
+  run tree.frame(wide)
+  run batch.append(1, 12)
+  run tree.apply(run batch.take())
+  run tree.frameRoot(0, wide)
+  run Testing.expect(tree.node(tree.slotOf(12)).computed.layout.width.value == 400.0, "a moved dependent selects its new root's container")
+  drop run tree.useRoot(1)
+  run Testing.expect((run container_watch.changed(&tree)).length() == 0, "a moved node cannot be reevaluated against its previous root's output")
+}
+
+test effect fn containerDependencyRecordsFollowRootsAndSlotReuse() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run rootWatches() |> Effect.provideMut<Allocator>(&mut allocator)
 }

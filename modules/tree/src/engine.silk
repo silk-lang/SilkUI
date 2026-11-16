@@ -5,6 +5,8 @@ import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as St
 import style_inherit
 import generated
 import containers
+import container_watch
+import container_watch { Watch }
 import style_media { Preferences }
 import properties.convert as properties_convert
 import properties.catalog
@@ -81,7 +83,7 @@ import style_sheets
 import style_invalidation
 import svg_css.element as css_element
 import svg_css.element { PseudoTarget, StateBits }
-import style_sheets { RootSheets, Resolved }
+import style_sheets { RootSheets, Resolved, Resolution }
 import svg_css.adopted { AdoptionError }
 import svg_css.sheet { Sheet }
 import svg_css.sheet_binary { DecodeError }
@@ -188,6 +190,7 @@ pub struct RootState {
   /// frame styles, lays out and hashes again.
   pub touched: bool,
   output: LayoutTree,
+  containerWatches: List<Watch>,
   sceneA: Scene,
   sceneB: Scene,
   flipped: bool,
@@ -246,6 +249,7 @@ impl RootState {
       paintedAt: 0,
       touched: false,
       output: LayoutTree.make(),
+      containerWatches: List<Watch>.make(),
       sceneA: Scene.make(),
       sceneB: Scene.make(),
       flipped: false,
@@ -660,6 +664,7 @@ pub struct UiTree<'a> {
   pub anchors: List<Anchored>,
   pub layout: Tree,
   pub output: LayoutTree,
+  pub containerWatches: List<Watch>,
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
   pub styleAtoms: Atoms,
@@ -858,6 +863,7 @@ impl<'a> UiTree<'a> {
       anchors: List<Anchored>.make(),
       layout: move layout,
       output: LayoutTree.make(),
+      containerWatches: List<Watch>.make(),
       provider: Provider<'a> {
         text: TextSystem.make(collection),
         naturals: List<NaturalDimensions>.make(),
@@ -2140,6 +2146,7 @@ impl<'a> UiTree<'a> {
       styleDirty: true,
       gridDeclared: false,
       gridStyled: false,
+      containerWatch: NONE,
       subtreeDirty: false,
       rendered: false,
       transition: String.make(),
@@ -2629,6 +2636,7 @@ impl<'a> UiTree<'a> {
       paintedAt: Intrinsic.replace(self.paintedAt, 0),
       touched: false,
       output: Intrinsic.replace(self.output, LayoutTree.make()),
+      containerWatches: Intrinsic.replace(self.containerWatches, List<Watch>.make()),
       sceneA: Intrinsic.replace(self.sceneA, Scene.make()),
       sceneB: Intrinsic.replace(self.sceneB, Scene.make()),
       flipped: Intrinsic.replace(self.flipped, false),
@@ -2687,6 +2695,7 @@ impl<'a> UiTree<'a> {
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
     self.output = Intrinsic.replace(s.output, LayoutTree.make())
+    self.containerWatches = Intrinsic.replace(s.containerWatches, List<Watch>.make())
     self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
     self.sceneB = Intrinsic.replace(s.sceneB, Scene.make())
     self.flipped = s.flipped
@@ -3974,8 +3983,11 @@ impl<'a> UiTree<'a> {
     self.easingStops = move stops
     self.styleSheets = move roots
     match move result {
-      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => { return move value }
-      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+        run container_watch.record(&mut self, origin, target, value.containers.asSlice())
+        return move value.style
+      }
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
       }
     }
@@ -4005,6 +4017,7 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Box<Resolved>>.None
+      run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
       return ()
     }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
@@ -4014,10 +4027,11 @@ impl<'a> UiTree<'a> {
     self.easingStops = move stops
     self.styleSheets = move roots
     match move resolved {
-      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: resolvedStyle } => {
-        run self.installResolved(slot, move resolvedStyle)
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+        run container_watch.record(&mut self, slot, PseudoTarget.None, value.containers.asSlice())
+        run self.installResolved(slot, move value.style)
       }
-      Result<Resolved, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
       }
     }
@@ -4117,6 +4131,7 @@ impl<'a> UiTree<'a> {
       roots[sheetIndex].cache.reset()
     }
     let full = self.stylesDirty
+    if full { self.containerWatches.clear() }
     self.stylesDirty = false
     self.stylesPending = false
     self.paintCachesStale = true
@@ -4346,6 +4361,7 @@ impl<'a> UiTree<'a> {
     target.rendered = rendered
     target.fontKey = fontKey
     target.paintHash = paintHash
+    run container_watch.units(&mut self, slot)
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
       run Effect.catchAll(
