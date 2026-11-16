@@ -1,8 +1,8 @@
-# Vocalis
+# Glint
 
 A voice analysis studio written in Silk with Loom and drawn with WebGPU in a native window.
 
-![Vocalis showing the demo voice](docs/screenshot.png)
+![Glint showing the demo voice](docs/screenshot.png)
 
 - **Spectrogram**: 4096-point Blackman-Nuttall FFT every 512 samples, log or linear from 29 Hz. It is drawn as a fine grid of cells (about 2 px) whose values are interpolated between analysis columns and between FFT bins, so it reads as a smooth field rather than as blocks
 - **Pitch**: YIN pitch detection drawn as a green track over the spectrogram, with Hz, note name and cents
@@ -32,7 +32,7 @@ Sources: **Demo voice** (a built-in synthetic singer gliding through a-e-i-o-u w
 | `src/main.silk` | the native window, the machine's `Sound` (WAV decoding, microphone) |
 
 ```sh
-cd apps/vocalis && silk build && ./build/llvm/x86_64-unknown-linux-gnu/debug/vocalis
+cd apps/glint && silk build && ./build/llvm/x86_64-unknown-linux-gnu/debug/glint
 ```
 
 ## Why the spectrogram is a canvas, not an image
