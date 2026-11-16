@@ -325,3 +325,25 @@ What remains of the theme cost is applying each row's roughly 40 winning declara
 computed style (about 9,500 instructions per row) and the rest of the per-node style pass; rows
 do not share computed values. Unshared elements still pay full selector matching, about 22,000
 instructions each in this fixture.
+
+### Rows with styled children
+
+The `[Rows=1000,Cells=3]` cases give every row three styled boxes besides its text, as a list
+item with an icon, a body and an action has. Sharing between siblings alone does not help these
+boxes: each has a different parent. A node therefore also takes the style of the matching child
+of its parent's twin, the node its parent took its own style from, while both parents still
+hold the same style class and the same computed color.
+
+Measured as above, before and after that step. Executable SHA-256 after:
+`ff528ea4ecb075c6d21b3049ab91acac2b76467d4c29f2485103f5a86cadfa7b`.
+
+| Operation | Inline total | Tailwind, siblings only | Tailwind, with twins |
+| --- | ---: | ---: | ---: |
+| create | 140,276,352 | 509,286,288 | 192,225,464 |
+| idle | 143,603,939 | 512,666,628 | 195,577,814 |
+| theme | 167,595,844 | 898,064,609 | 269,516,207 |
+| theme minus idle | 23,991,905 | 385,397,981 | 73,938,393 |
+
+Creating these 1,000 rows costs 37% more than inline styles (was 3.6 times as much), and the
+theme change 3.1 times the inline update (was 16 times). The flat-row totals above are unchanged
+within 0.1%. All 27 stylesheet result checks pass.

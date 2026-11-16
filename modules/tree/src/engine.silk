@@ -785,6 +785,8 @@ pub struct UiTree<'a> {
   pub stylesDirty: bool,
   /// Some nodes have `styleDirty`: the next resolve visits only their subtrees' paths.
   pub stylesPending: bool,
+  /// The last `Node.styleClass` handed out.
+  pub styleClasses: u32,
   pub frameNumber: u64,
   /// Changes to published semantics or allocated geometry.
   pub semanticRevision: u64,
@@ -974,6 +976,7 @@ impl<'a> UiTree<'a> {
       seed: seed,
       stylesDirty: true,
       stylesPending: false,
+      styleClasses: 0,
       frameNumber: 0,
       semanticRevision: 0,
       revision: 0,
@@ -2263,6 +2266,8 @@ impl<'a> UiTree<'a> {
       effects: Option<Box<Effects>>.None,
       semantics: Option<Box<Semantics>>.None,
       resolvedSheet: Option<Frozen<Resolved>>.None,
+      styleClass: 0,
+      styleTwin: NONE,
       selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
     }
@@ -4180,17 +4185,32 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Frozen<Resolved>>.None
+      node.styleClass = 0
+      node.styleTwin = NONE
       run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
       return ()
     }
     if self.styleSheets.asSlice()[at].siblingsShare && !self.styleSheets.asSlice()[at].hasStarting {
-      if let Option<Frozen<Resolved>>.Some { value } = move style_share.exemplar(&self, slot) {
+      let twin = style_share.twin(&self, slot)
+      if twin != NONE {
+        let shared = match &self.node(twin).resolvedSheet {
+          Option<Frozen<Resolved>>.Some { value } => Option<Frozen<Resolved>>.some(value.clone())
+          _ => Option<Frozen<Resolved>>.None
+        }
+        let class = self.node(twin).styleClass
         let node = self.nodeMut(slot)
-        node.resolvedSheet = Option<Frozen<Resolved>>.some(move value)
+        node.resolvedSheet = move shared
+        node.styleClass = class
+        node.styleTwin = twin
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
         return ()
       }
     }
+    let class = self.styleClasses + 1
+    self.styleClasses = class
+    let fresh = self.nodeMut(slot)
+    fresh.styleClass = class
+    fresh.styleTwin = NONE
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
@@ -4305,6 +4325,11 @@ impl<'a> UiTree<'a> {
           match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
         }
       }
+    }
+    // A full pass hands every node a fresh class long before the counter can wrap into a live one.
+    if self.styleClasses > 2147483647 {
+      self.styleClasses = 0
+      self.stylesDirty = true
     }
     if !self.stylesDirty && !self.stylesPending {
       return ()
