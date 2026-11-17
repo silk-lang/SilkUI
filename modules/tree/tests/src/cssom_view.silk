@@ -10,8 +10,13 @@ import ui_tree.legacy {
   Position,
   Overflow,
   Input,
+  Attribute,
   NONE
 }
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.tokens { CssError }
+import silk.text.string { String }
 import ui_tree.cssom_view as view
 import ui_fixtures.fixtures as fixtures
 import svg_css.cssom_view { ScrollBehavior, ScrollIntoViewOptions, CheckVisibilityOptions }
@@ -274,4 +279,43 @@ test effect fn viewCaretAndRangesUseNativeGlyphRunsAndDomOffsets() -> ()
   ! TreeError | CssomError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run rangeBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A stylesheet's `scroll-behavior: smooth` makes an `auto` scroll request animate, and
+/// `scroll-behavior: auto` makes it jump.
+effect fn cssSmoothBody() -> ()
+  ! TreeError | CssomError | CompileError | CssError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(300.0)), css.height(px(200.0))])
+  run batch.box(1, 2, &[css.width(px(100.0)), css.height(px(60.0)), css.overflowY(Overflow.Auto)])
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("smooth") })
+  run batch.box(2, 3, &[css.width(px(80.0)), css.height(px(240.0))])
+  let compiled = run compile.compile(b".smooth{scroll-behavior:smooth}", &Options.make())
+  let bytes = run compiled.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.0))
+  drop run view.requestScroll(&mut tree, 2, 0.0, 100.0, ScrollBehavior.Auto, false, true)
+  run Testing.expect(tree.scrollOffset(2).y == 0.0 && tree.needsFrame(), "an auto request under scroll-behavior: smooth waits for frames")
+  run tree.frame(frameAt(0.125))
+  let middle = tree.scrollOffset(2).y
+  run Testing.expect(middle > 0.0 && middle < 100.0, "and moves part of the way per frame")
+  run tree.frame(frameAt(0.25))
+  run Testing.expect(tree.scrollOffset(2).y == 100.0, "then lands on the destination")
+  run batch.removeStyleSheet(0, 1)
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.5))
+  drop run view.requestScroll(&mut tree, 2, 0.0, 0.0, ScrollBehavior.Auto, false, true)
+  run Testing.expect(tree.scrollOffset(2).y == 0.0, "without the sheet the same request jumps")
+}
+
+test effect fn viewCssScrollBehaviorSmoothAnimatesAutoRequests() -> ()
+  ! TreeError | CssomError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cssSmoothBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
