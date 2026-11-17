@@ -13,6 +13,7 @@ import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.num.f32
+import silk.num.u8
 import font_collection.lib { FontCollection }
 
 fn viewport() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
@@ -205,7 +206,6 @@ effect fn backgroundCenter(own: &[u8], sheet: &[u8]) -> [u8; 3] ! TreeError | Co
   let pixel = painted.pixel(50, 50)
   return [pixel.r, pixel.g, pixel.b]
 }
-
 effect fn backgroundShorthandGradients() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let size = b"display:block;width:100px;height:100px;"
   let inline = run backgroundCenter(b"display:block;width:100px;height:100px;background:radial-gradient(closest-side, #f00, transparent)", b"")
@@ -223,6 +223,14 @@ test effect fn pixelBackgroundShorthandPaintsGradients() ! TreeError | CompileEr
 
 /// The center pixel of a 100 by 100 box on white with `classes`, under `sheet`.
 effect fn classCenter(classes: string, sheet: &[u8]) -> [u8; 3]
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let points = run classPoints(classes, sheet)
+  return points[0]
+}
+
+/// The pixels at (50, 50), (25, 50) and (75, 30) of a 100px box with `classes` under `sheet`.
+effect fn classPoints(classes: string, sheet: &[u8]) -> [[u8; 3]; 3]
   ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -253,8 +261,76 @@ effect fn classCenter(classes: string, sheet: &[u8]) -> [u8; 3]
   let mut snapshot = CpuSnapshot.make()
   run snapshot.sync(&mut tree)
   let painted = run snapshot.render(&tree)
-  let pixel = painted.pixel(50, 50)
-  return [pixel.r, pixel.g, pixel.b]
+  let a = painted.pixel(50, 50)
+  let b = painted.pixel(25, 50)
+  let c = painted.pixel(75, 30)
+  return [[a.r, a.g, a.b], [b.r, b.g, b.b], [c.r, c.g, c.b]]
+}
+
+fn within(points: [[u8; 3]; 3], expected: [[u32; 3]; 3], tolerance: u32) -> bool {
+  let mut i: usize = 0
+  while i < 3 {
+    let mut j: usize = 0
+    while j < 3 {
+      let got = u8.toU32(points[i][j])
+      let want = expected[i][j]
+      if got > want + tolerance || want > got + tolerance { return false }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Gradients mix in their `<color-interpolation-method>`, else in sRGB for legacy stops and Oklab
+/// for others. Expected pixels are Chromium's (`--force-color-profile=srgb`) for the same box.
+effect fn interpolatedGradients()
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let cases: [&'static [u8]; 7] = [
+    b".g{background-image:linear-gradient(to bottom right in oklab, oklch(72% 0.21 305) 0%, oklch(78% 0.16 215) 100%)}",
+    b".g{background-image:linear-gradient(90deg, oklch(72% 0.21 305), oklch(78% 0.16 215))}",
+    b".g{background-image:linear-gradient(in oklch longer hue 90deg, red, blue)}",
+    b".g{background-image:radial-gradient(in oklab, red, blue)}",
+    b".g{background-image:conic-gradient(in hsl, red, blue, red)}",
+    b".g{background-image:linear-gradient(90deg, red, blue)}",
+    b".g{background-image:linear-gradient(90deg in oklch, oklch(70% 0.35 30), oklch(70% 0.3 250))}",
+  ]
+  let expected: [[[u32; 3]; 3]; 7] = [
+    [[136, 170, 255], [155, 160, 255], [133, 173, 255]],
+    [[136, 170, 255], [170, 149, 255], [85, 190, 253]],
+    [[0, 147, 0], [186, 101, 0], [0, 130, 181]],
+    [[252, 11, 16], [176, 80, 131], [151, 83, 154]],
+    [[127, 0, 255], [252, 0, 255], [255, 0, 149]],
+    [[126, 0, 128], [190, 0, 65], [63, 0, 193]],
+    [[238, 32, 255], [255, 0, 172], [150, 102, 255]],
+  ]
+  let names: [string<'static>; 7] = [
+    "in oklab, oklch stops",
+    "oklch stops without a method mix in oklab",
+    "in oklch longer hue",
+    "radial in oklab",
+    "conic in hsl",
+    "legacy stops without a method mix in sRGB",
+    "wide gamut stops keep their chroma until the mix",
+  ]
+  let mut i: usize = 0
+  while i < 7 {
+    let points = run classPoints("g", cases[i])
+    run Testing.expect(within(points, expected[i], 3), names[i])
+    i = i + 1
+  }
+}
+
+test effect fn pixelGradientsMixInTheirInterpolationSpace()
+  ! TreeError
+    | CompileError
+    | CssError
+    | GeometryError
+    | OutOfMemoryError
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run interpolatedGradients() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// Tailwind 4 `bg-linear-to-br from-* to-*`: the position is `to bottom right in oklab` once
