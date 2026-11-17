@@ -1232,3 +1232,73 @@ test effect fn structureAndStyleObjectsRestyleLocally() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run localStructure() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+/// Whether one holds the other's computed values, copied instead of computed again.
+fn sameValues(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
+  let one = tree.node(tree.slotOf(first)).computedStamp
+  return one != 0 && one == tree.node(tree.slotOf(second)).computedStamp
+}
+
+fn wideFrame(time: f64) -> FrameInput {
+  return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: time }
+}
+
+effect fn copiedValues() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let mut row: u32 = 10
+  while row < 60 {
+    run nestedRow(&mut batch, row, "row")
+    row = row + 10
+  }
+  let bytes = run sheetBytes(b".row{height:20px}.cell{height:10px}.icon{width:var(--icon,8px)}.label{width:10vw}.dark{--icon:12px}.on .label{width:90px}.row:hover .icon{width:9px}.slow{transition:width 1s linear}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(0.0))
+  run Testing.expect(sameValues(&tree, 10, 20) && sameValues(&tree, 11, 51) && sameValues(&tree, 12, 22) && sameValues(&tree, 13, 53) && sameValues(&tree, 13, 14) && !sameValues(&tree, 12, 13),
+    "equal rows and their descendants hold one set of computed values")
+  run Testing.expect(rowWidth(&tree, 12) == 8.0 && rowWidth(&tree, 52) == 8.0 && rowWidth(&tree, 13) == 80.0 && rowWidth(&tree, 54) == 80.0, "copied values are the computed ones")
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("dark") })
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(1.0))
+  run Testing.expect(rowWidth(&tree, 12) == 12.0 && rowWidth(&tree, 32) == 12.0 && rowWidth(&tree, 52) == 12.0 && sameValues(&tree, 12, 52), "a changed custom property reaches every copy")
+  run tree.frame(wideFrame(2.0))
+  run Testing.expect(rowWidth(&tree, 13) == 40.0 && rowWidth(&tree, 34) == 40.0 && rowWidth(&tree, 54) == 40.0, "a resized window reaches every copy")
+  run batch.attribute(30, Attribute.ClassName { value: run String.copy("row on") })
+  let tall = run written.declarations(b"height:7px")
+  run batch.style(41, tall.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(wideFrame(3.0))
+  run Testing.expect(rowWidth(&tree, 33) == 90.0 && rowWidth(&tree, 23) == 40.0 && !sameValues(&tree, 30, 20) && !sameValues(&tree, 31, 21) && !sameValues(&tree, 41, 21) && sameValues(&tree, 21, 11),
+    "rows with other inputs compute their own values")
+  run Testing.expect(tree.node(tree.slotOf(41)).computed.layout.height.value == 7.0 && tree.node(tree.slotOf(51)).computed.layout.height.value == 10.0, "a style object stays with its node")
+  run tree.dispatch(Input.PointerMove { x: 2.0, y: 25.0, modifiers: 0 })
+  run tree.frame(wideFrame(4.0))
+  run Testing.expect(rowWidth(&tree, 22) == 9.0 && rowWidth(&tree, 12) == 12.0 && rowWidth(&tree, 52) == 12.0 && !sameValues(&tree, 20, 10), "a hovered row computes its own values")
+  run batch.focus(50)
+  run tree.apply(run batch.take())
+  run tree.frame(wideFrame(5.0))
+  run Testing.expect(!sameValues(&tree, 50, 10), "a focused row computes its own values")
+  run batch.attribute(13, Attribute.ClassName { value: run String.copy("label slow") })
+  run batch.attribute(53, Attribute.ClassName { value: run String.copy("label slow") })
+  run tree.apply(run batch.take())
+  run tree.frame(wideFrame(6.0))
+  run Testing.expect(!sameValues(&tree, 13, 53) && rowWidth(&tree, 53) == 40.0, "nodes with transitions compute their own values")
+  run batch.attribute(10, Attribute.ClassName { value: run String.copy("row on") })
+  run batch.attribute(50, Attribute.ClassName { value: run String.copy("row on") })
+  run tree.apply(run batch.take())
+  run tree.frame(wideFrame(7.0))
+  run tree.frame(wideFrame(7.5))
+  run Testing.expect(closeTo(rowWidth(&tree, 13), 65.0) && closeTo(rowWidth(&tree, 53), 65.0) && rowWidth(&tree, 14) == 90.0 && rowWidth(&tree, 24) == 40.0 && rowWidth(&tree, 34) == 90.0,
+    "running transitions keep their own values while the rest stay right")
+}
+
+test effect fn equalRowsCopyComputedValues() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run copiedValues() |> Effect.provideMut<Allocator>(&mut allocator)
+}

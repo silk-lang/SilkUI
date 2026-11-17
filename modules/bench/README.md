@@ -371,3 +371,32 @@ Measured as above, before and after. Executable SHA-256 after: `f77d8c619d793f14
 | style_row minus idle | 1,903,524 | 74,075,463 | 2,508,365 |
 
 Both updates now cost about what they cost with inline styles. The other stylesheet totals are unchanged within 0.1%.
+
+### Computed values copied between equal rows
+
+A node that took its matched style from a twin still applied every declaration to get its
+computed values. Now it copies the twin's finished values when nothing else can differ: both
+are plain boxes with the same matched style and the same hover and pressed state, neither has
+focus, a style object that needs context or a transition of its own, their parents are the same
+node or hold copies of one set of values, the twin's values use no container units, and no
+transition, animation, inspector override or anchor exists in the tree. Each node carries a
+stamp of the values it holds, which is how two parents are known to hold the same ones.
+
+Measured as above, before and after. Executable SHA-256 after:
+`21c52c2d9480972521ad8ba2ed65ecb17e4227eaadf5c71e1a712560865920c0`.
+
+| Operation | Inline before | Inline after | Tailwind before | Tailwind after |
+| --- | ---: | ---: | ---: | ---: |
+| create `[Rows=1000,Cells=3]` | 140,220,787 | 140,471,800 | 192,139,318 | 145,258,863 |
+| idle | 143,584,536 | 143,836,372 | 195,527,865 | 148,647,212 |
+| theme | 167,481,412 | 167,867,792 | 269,434,035 | 175,672,392 |
+| theme minus idle | 23,896,876 | 24,031,420 | 73,906,170 | 27,025,180 |
+| append_row minus idle | 23,345,970 | 23,346,063 | 22,882,266 | 22,835,827 |
+| style_row minus idle | 1,903,508 | 1,903,119 | 2,508,345 | 2,508,718 |
+| create `[Rows=1000]` | 81,621,536 | 81,570,844 | 95,568,788 | 81,627,110 |
+| theme minus idle `[Rows=1000]` | 10,087,269 | 10,221,692 | 23,394,276 | 9,456,454 |
+
+Creating the 1,000 rows with styled children now costs 3.4% more than inline styles (was 37%),
+and their theme change 1.12 times the inline update (was 3.1 times). Flat rows cost the same
+to create as inline rows and 7% less to re-theme. Inline-styled trees pay up to 0.2% more per
+total and 0.6% to 1.3% more per theme change for the stamp. All 31 stylesheet result checks pass.
