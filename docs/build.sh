@@ -42,6 +42,7 @@ cp -R "$here/web/fonts" "$out/fonts"
 # The sheet of the stylesheet demo, linked by the page as any site links its CSS.
 mkdir -p "$out/styles"
 cp "$here/styles/plans.css" "$out/styles/plans.css"
+cp "$here/styles/inbox.tailwind.page.css" "$out/styles/inbox.tailwind.page.css"
 # The album's photos, icons and fonts, at the root as its relative URLs name them.
 cp -R "$here/examples/apps/album/assets/photos" "$out/photos"
 cp -R "$here/examples/apps/album/assets/icons" "$out/icons"

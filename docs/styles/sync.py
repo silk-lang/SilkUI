@@ -21,5 +21,7 @@ def literal(name):
     "/// `docs/styles/plans.css`, which `core/plans_sheet.silk` is written for.\n"
     f"pub const PLAIN: string = {literal('plans.css')}\n\n"
     "/// `docs/styles/plans.tailwind.css`, which Tailwind wrote for `core/plans_tailwind.silk`.\n"
-    f"pub const TAILWIND: string = {literal('plans.tailwind.css')}\n"
+    f"pub const TAILWIND: string = {literal('plans.tailwind.css')}\n\n"
+    "/// `docs/styles/inbox.tailwind.css`, which Tailwind wrote for `core/inbox_tailwind.silk`.\n"
+    f"pub const INBOX: string = {literal('inbox.tailwind.css')}\n"
 )
