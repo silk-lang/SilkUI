@@ -571,6 +571,9 @@ fn dimensioned(text: &[u8]) -> Option<Dimensioned> {
 
 /// A plain `<number>`.
 fn number(text: &[u8]) -> Option<f32> {
+  if let Option.Some { value: q } = mathValue(text, Option<Context>.None) {
+    return if q.kind == NUMBER { Option<f32>.some(q.value) } else { Option<f32>.None }
+  }
   match dimensioned(text) {
     Option.Some { value } => {
       if value.unitStart == text.length {
@@ -586,6 +589,12 @@ fn number(text: &[u8]) -> Option<f32> {
 
 /// A `<number>` or `<percentage>` as a factor: `50%` is 0.5.
 fn factor(text: &[u8]) -> Option<f32> {
+  if let Option.Some { value: q } = mathValue(text, Option<Context>.None) {
+    if q.kind == NUMBER {
+      return Option<f32>.some(q.value)
+    }
+    return if q.kind == PERCENT { Option<f32>.some(q.fraction) } else { Option<f32>.None }
+  }
   match dimensioned(text) {
     Option.Some { value } => {
       let unit = part(text, value.unitStart, text.length)
@@ -605,6 +614,12 @@ fn factor(text: &[u8]) -> Option<f32> {
 
 /// An `<angle>` in radians; a bare 0 too.
 fn angle(text: &[u8]) -> Option<f32> {
+  if let Option.Some { value: q } = mathValue(text, Option<Context>.None) {
+    if q.kind == ANGLE || (q.kind == NUMBER && q.value == 0.0) {
+      return Option<f32>.some(q.value)
+    }
+    return Option<f32>.None
+  }
   match dimensioned(text) {
     Option.Some { value } => {
       let unit = part(text, value.unitStart, text.length)
@@ -632,6 +647,245 @@ fn angle(text: &[u8]) -> Option<f32> {
   }
 }
 
+// Math functions (`calc()`, `min()`, `max()`, `clamp()`), reduced as each value is read.
+// Tailwind writes most transform utilities as `calc(var(--spacing) * -4)` and the like.
+
+const NUMBER: u8 = 0
+const LENGTH: u8 = 1
+const PERCENT: u8 = 2
+const ANGLE: u8 = 3
+
+/// A reduced math expression: `value` is a number, CSS pixels or radians as `kind` says, and
+/// `fraction` the percentage part (1 is 100%) of a PERCENT or LENGTH.
+struct Quantity {
+  kind: u8,
+  value: f32,
+  fraction: f32,
+  valid: bool,
+}
+
+impl Copy for Quantity {}
+
+fn invalidQuantity() -> Quantity {
+  return Quantity { kind: NUMBER, value: 0.0, fraction: 0.0, valid: false }
+}
+
+fn startsWith(text: &[u8], at: usize, name: &[u8]) -> bool {
+  if at + name.length > text.length {
+    return false
+  }
+  return named(part(text, at, at + name.length), name)
+}
+
+fn mathFunction(text: &[u8]) -> bool {
+  return startsWith(text, 0, b"calc(") || startsWith(text, 0, b"min(") || startsWith(text, 0, b"max(")
+    || startsWith(text, 0, b"clamp(")
+}
+
+fn skipSpaces(text: &[u8], at: &mut usize) -> () {
+  while at.* < text.length && isSpace(text[at.*]) {
+    at.* = at.* + 1
+  }
+}
+
+fn isUnitByte(byte: u8) -> bool {
+  let l = lower(byte)
+  return (l >= 97 && l <= 122) || byte == 37
+}
+
+/// `text` as one math function, or None when it is not one or does not reduce. Lengths need
+/// `context`; without it only numbers, percentages and angles reduce.
+fn mathValue(text: &[u8], context: Option<Context>) -> Option<Quantity> {
+  if !mathFunction(text) {
+    return Option<Quantity>.None
+  }
+  let mut at: usize = 0
+  let q = mathPrimary(text, &mut at, &context, 0)
+  skipSpaces(text, &mut at)
+  if !q.valid || at != text.length {
+    return Option<Quantity>.None
+  }
+  return Option<Quantity>.some(q)
+}
+
+fn mathNumber(text: &[u8], at: &mut usize, context: &Option<Context>) -> Quantity {
+  let rest = part(text, at.*, text.length)
+  let used = numberLength(rest)
+  if used == 0 {
+    return invalidQuantity()
+  }
+  let v = numberValue(part(rest, 0, used))
+  let mut end = used
+  while end < rest.length && isUnitByte(rest[end]) {
+    end = end + 1
+  }
+  at.* = at.* + end
+  let unit = part(rest, used, end)
+  if unit.length == 0 {
+    return Quantity { kind: NUMBER, value: v, fraction: 0.0, valid: true }
+  }
+  if named(unit, b"%") {
+    return Quantity { kind: PERCENT, value: 0.0, fraction: v / 100.0, valid: true }
+  }
+  if named(unit, b"deg") {
+    return Quantity { kind: ANGLE, value: v * PI / 180.0, fraction: 0.0, valid: true }
+  }
+  if named(unit, b"rad") {
+    return Quantity { kind: ANGLE, value: v, fraction: 0.0, valid: true }
+  }
+  if named(unit, b"grad") {
+    return Quantity { kind: ANGLE, value: v * PI / 200.0, fraction: 0.0, valid: true }
+  }
+  if named(unit, b"turn") {
+    return Quantity { kind: ANGLE, value: v * 2.0 * PI, fraction: 0.0, valid: true }
+  }
+  if let Option.Some { value: c } = context.* {
+    if let Option.Some { value: parsed } = values.unitLookup(unit) {
+      if let Option.Some { value: scale } = convert.pixelsPer(parsed, &c) {
+        return Quantity { kind: LENGTH, value: v * scale, fraction: 0.0, valid: true }
+      }
+    }
+  }
+  return invalidQuantity()
+}
+
+/// A number, a dimension, a parenthesized sum or a math function.
+fn mathPrimary(text: &[u8], at: &mut usize, context: &Option<Context>, depth: u32) -> Quantity {
+  skipSpaces(text, &mut at.*)
+  if depth > 32 || at.* >= text.length {
+    return invalidQuantity()
+  }
+  if text[at.*] == 40 || startsWith(text, at.*, b"calc(") {
+    while text[at.*] != 40 {
+      at.* = at.* + 1
+    }
+    at.* = at.* + 1
+    let q = mathSum(text, &mut at.*, context, depth + 1)
+    skipSpaces(text, &mut at.*)
+    if at.* >= text.length || text[at.*] != 41 {
+      return invalidQuantity()
+    }
+    at.* = at.* + 1
+    return q
+  }
+  let least = startsWith(text, at.*, b"min(")
+  let most = startsWith(text, at.*, b"max(")
+  let clamp = startsWith(text, at.*, b"clamp(")
+  if least || most || clamp {
+    while text[at.*] != 40 {
+      at.* = at.* + 1
+    }
+    at.* = at.* + 1
+    let mut args: [Quantity; 3] = [invalidQuantity(); 3]
+    let mut count: usize = 0
+    let mut result = invalidQuantity()
+    while true {
+      let q = mathSum(text, &mut at.*, context, depth + 1)
+      // Comparing percentages needs the reference size, which only paint time knows.
+      if !q.valid || q.fraction != 0.0 || (count > 0 && q.kind != result.kind) {
+        return invalidQuantity()
+      }
+      if clamp {
+        if count == 3 {
+          return invalidQuantity()
+        }
+        args[count] = q
+      }
+      if count == 0 || (least && q.value < result.value) || (most && q.value > result.value) {
+        result = q
+      }
+      count = count + 1
+      skipSpaces(text, &mut at.*)
+      if at.* < text.length && text[at.*] == 44 {
+        at.* = at.* + 1
+      } else {
+        break
+      }
+    }
+    if at.* >= text.length || text[at.*] != 41 {
+      return invalidQuantity()
+    }
+    at.* = at.* + 1
+    if clamp {
+      if count != 3 {
+        return invalidQuantity()
+      }
+      // clamp(MIN, VAL, MAX) is max(MIN, min(VAL, MAX)).
+      result = args[1]
+      if args[2].value < result.value {
+        result.value = args[2].value
+      }
+      if args[0].value > result.value {
+        result.value = args[0].value
+      }
+    }
+    return result
+  }
+  return mathNumber(text, &mut at.*, context)
+}
+
+fn mathProduct(text: &[u8], at: &mut usize, context: &Option<Context>, depth: u32) -> Quantity {
+  let mut total = mathPrimary(text, &mut at.*, context, depth)
+  while total.valid {
+    skipSpaces(text, &mut at.*)
+    if at.* >= text.length || (text[at.*] != 42 && text[at.*] != 47) {
+      break
+    }
+    let divide = text[at.*] == 47
+    at.* = at.* + 1
+    let next = mathPrimary(text, &mut at.*, context, depth)
+    if !next.valid {
+      return invalidQuantity()
+    }
+    if divide {
+      if next.kind != NUMBER || next.value == 0.0 {
+        return invalidQuantity()
+      }
+      total.value = total.value / next.value
+      total.fraction = total.fraction / next.value
+    } else if next.kind == NUMBER {
+      total.value = total.value * next.value
+      total.fraction = total.fraction * next.value
+    } else if total.kind == NUMBER {
+      let factor = total.value
+      total = next
+      total.value = total.value * factor
+      total.fraction = total.fraction * factor
+    } else {
+      return invalidQuantity()
+    }
+  }
+  return total
+}
+
+fn mathSum(text: &[u8], at: &mut usize, context: &Option<Context>, depth: u32) -> Quantity {
+  let mut total = mathProduct(text, &mut at.*, context, depth)
+  while total.valid {
+    skipSpaces(text, &mut at.*)
+    // `+` and `-` need white space on both sides in CSS math.
+    if at.* + 1 >= text.length || (text[at.*] != 43 && text[at.*] != 45) || !isSpace(text[at.* + 1]) {
+      break
+    }
+    let negate = text[at.*] == 45
+    at.* = at.* + 1
+    let next = mathProduct(text, &mut at.*, context, depth)
+    if !next.valid {
+      return invalidQuantity()
+    }
+    let sign: f32 = if negate { -1.0 } else { 1.0 }
+    let lengths = (total.kind == LENGTH || total.kind == PERCENT) && (next.kind == LENGTH || next.kind == PERCENT)
+    if total.kind != next.kind && !lengths {
+      return invalidQuantity()
+    }
+    if lengths && total.kind != next.kind {
+      total.kind = LENGTH
+    }
+    total.value = total.value + sign * next.value
+    total.fraction = total.fraction + sign * next.fraction
+  }
+  return total
+}
+
 /// A `<length-percentage>`: pixels and a fraction of the reference size.
 struct Length {
   pixels: f32,
@@ -641,6 +895,13 @@ struct Length {
 impl Copy for Length {}
 
 fn length(text: &[u8], units: &Units, percent: bool) -> Option<Length> {
+  if let Option.Some { value: q } = mathValue(text, Option<Context>.some(units.context)) {
+    let fits = q.kind == LENGTH || q.kind == PERCENT || (q.kind == NUMBER && q.value == 0.0)
+    if !fits || (!percent && q.fraction != 0.0) {
+      return Option<Length>.None
+    }
+    return Option<Length>.some(Length { pixels: q.value, fraction: q.fraction })
+  }
   match dimensioned(text) {
     Option.Some { value } => {
       let unit = part(text, value.unitStart, text.length)
