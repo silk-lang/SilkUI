@@ -37,7 +37,6 @@ Tasks.Dev { target } => run app()
 Tasks.Build { target } => run app()
   |> App.only(String.view(&target))
   |> App.build(Mode.Release)
-  |> Built.tap(Built.sizes)
   |> Built.write("dist")
 ```
 
@@ -53,7 +52,7 @@ An app goes through three stages, and each step is scoped under the stage it tak
 | `App.host(mode)` | App | Writes the host of each target into `.silk/<target>/`; `Mode.Dev` hosts have the development tools |
 | `App.compile(mode)` | Built | Runs `silk build` on each host |
 | `App.build(mode)` | Built | The three above, in order |
-| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>`, and each page to `<dir>/<target>/` |
+| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<project name>`, and each page to `<dir>/<target>/`, and lists them with their sizes and the build time |
 | `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
 | `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
 
