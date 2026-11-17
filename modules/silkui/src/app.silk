@@ -51,6 +51,7 @@ import silk.num.i32
 import silk.num.u8
 import process { Child, Variable, start, pause }
 import output { now, say as tell, done, artifact as listArtifact, built as finished }
+import compiling
 
 /// A desktop window's options.
 pub struct Window {
@@ -384,21 +385,31 @@ effect fn sizeOf(path: string) -> usize ! FileError | OutOfMemoryError ? &mut Al
   }
 }
 
-effect fn compileHost(dir: string, mode: Mode, web: bool) -> ()
+/// Builds the host in `dir`, showing `text` on a live status line, or quietly when it is empty.
+effect fn compileHost(dir: string, mode: Mode, web: bool, text: string) -> ()
   ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let manifest = run joined(dir, "silk.toml")
+  let mut arguments = List<string>.make()
+  run arguments.append("build")
+  run arguments.append("--manifest-path")
+  run arguments.append(String.view(&manifest))
   if web {
     // The page's WebGPU host waits on the GPU through JSPI, which needs a deep stack.
-    let profile = if mode == Mode.Release {
+    run arguments.append("--profile-input")
+    run arguments.append(if mode == Mode.Release {
       "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"speed\",\"debug\":false,\"stackSize\":\"8MiB\"}"
     } else {
       "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"none\",\"debug\":true,\"stackSize\":\"8MiB\"}"
-    }
-    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest), "--profile-input", profile])
+    })
   } else if mode == Mode.Release {
-    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest), "--release"])
+    run arguments.append("--release")
+  }
+  if text == "" {
+    run arguments.append("--progress")
+    run arguments.append("never")
+    run Task.silk(arguments.asSlice())
   } else {
-    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest)])
+    run compiling.silk(arguments.asSlice(), text, mode == Mode.Release)
   }
 }
 
@@ -668,10 +679,8 @@ impl App {
       run String.append(&mut line, String.view(&what))
       if mode == Mode.Release { run String.append(&mut line, " (release)") }
       if mode == Mode.Debug { run String.append(&mut line, " (debug)") }
-      run String.append(&mut line, "...")
-      run say(String.view(&line))
       let started = now()
-      run compileHost(dir, mode, hosts[at].target.web())
+      run compileHost(dir, mode, hosts[at].target.web(), String.view(&line))
       let mut compiled = run String.copy("compiled the ")
       run String.append(&mut compiled, String.view(&what))
       done(String.view(&compiled), started)
@@ -928,7 +937,7 @@ effect fn rebuildHost(project: &Project, host: &Host, sheets: &[string<'static>]
   ! TaskError | FileError | HostInputError | OutOfMemoryError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   run stylesheets.emit(String.view(&project.root), sheets, String.view(&host.dir), host.target.id() == "web-dom")
-  run compileHost(String.view(&host.dir), Mode.Dev, host.target.web())
+  run compileHost(String.view(&host.dir), Mode.Dev, host.target.web(), "")
 }
 
 /// Builds a web host again and puts the new program in its page's folder.

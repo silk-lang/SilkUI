@@ -1,0 +1,177 @@
+//! `silk build` with a status line: on a terminal the compiler's phase rows become one line
+//! that names the phase running and the time so far, and clears when the build ends.
+//! Anything else the compiler writes, such as an error, passes through.
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+import output { now, status, clear, live }
+import silk.cli.task { Task, TaskError }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.native.descriptor { NativeDescriptor }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.monotonic_clock { MonotonicClock, ReadyWatch }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.subprocess { ExitStatus, ExitWatch, Subprocess, SubprocessError, SpawnOptions, Stdio }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.io.writer_native { StderrWriter }
+import silk.text.string { String }
+import silk.num.i32
+import silk.num.i64
+import silk.num.u64
+
+fn starts(line: &[u8], prefix: &[u8]) -> bool {
+  if line.length < prefix.length { return false }
+  let mut at: usize = 0
+  while at < prefix.length {
+    if line[at] != prefix[at] { return false }
+    at = at + 1
+  }
+  return true
+}
+
+// The phase after the one a row of `line` ends, or empty when `line` is no phase row.
+fn next(line: &[u8], release: bool) -> string<'static> {
+  if starts(line, b"  load ") || starts(line, b"  cache ") { return "check" }
+  if starts(line, b"  check ") { return "codegen" }
+  if starts(line, b"  codegen ") { return if release { "optimize" } else { "link" } }
+  if starts(line, b"  optimize ") { return "link" }
+  if starts(line, b"  borrow ") || starts(line, b"  link ") { return "-" }
+  return ""
+}
+
+/// Runs the task's compiler with `arguments` plus `--progress plain`, showing `text` and the
+/// phase on one status line. Fails as `Task.silk` does when the build fails.
+pub effect fn silk(arguments: &[string], text: string, release: bool) -> ()
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  if !live() {
+    let mut all = List<string>.make()
+    let mut at: usize = 0
+    while at < arguments.length {
+    run all.append(arguments[at])
+    at = at + 1
+  }
+    run all.append("--progress")
+    run all.append("never")
+    return run Task.silk(all.asSlice())
+  }
+  let compiler = match move run HostInput.variableNamed("SILK_COMPILER") {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => run Task.abort("silkui: SILK_COMPILER is not set; run the tasks with `silk task`")
+  }
+  let program = match move run Effect.result(Path.fromBytes(Bytes.asSlice(&compiler))) {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      run Task.abort("silkui: SILK_COMPILER is not a path")
+    }
+  }
+  let mut request = run ChildProcess.request(&program)
+  let mut at: usize = 0
+  while at < arguments.length {
+    run ChildProcess.addArgument(&mut request, arguments[at])
+    at = at + 1
+  }
+  run ChildProcess.addArgument(&mut request, "--progress")
+  run ChildProcess.addArgument(&mut request, "plain")
+  run Subprocess.inheritEnvironment(&mut request)
+  let mut options = SpawnOptions.make()
+  run options.setStdio(0, Stdio.inherit(0))
+  run options.setStdio(1, Stdio.inherit(1))
+  run options.setStdio(2, Stdio.pipe())
+  let mut child = match move run Effect.result(Subprocess.spawn(&request, &options)) {
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Success { value } => move value
+    Result<Subprocess, SubprocessError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      run Task.abort("silkui: silk build could not be started")
+    }
+  }
+  let fd = child.takePipe(2) |> Option<i32>.unwrapOr(-1)
+  if fd < 0 { run Task.abort("silkui: silk build's output could not be read") }
+  let started = now()
+  let mut phase: string<'static> = "load"
+  let mut frame: usize = 0
+  let mut line = Bytes.make()
+  let mut buffer: [u8; 4096] = [0; 4096]
+  let mut clock = OsMonotonicClock.make()
+  let mut open = true
+  status(frame, text, phase, started)
+  while open {
+    let mut watches = List<ReadyWatch>.make()
+    run watches.append(ReadyWatch.forRead(i32.toUsize(fd)))
+    let at = run MonotonicClock.now() |> Effect.provideMut<MonotonicClock>(&mut clock)
+    let until = SystemClock.make(SystemClock.seconds(&at), SystemClock.nanoseconds(&at) + 100000000)
+    drop run MonotonicClock.waitReady(watches.asMutSlice(), Option<Instant>.some(move until)) |> Effect.provideMut<MonotonicClock>(&mut clock)
+    let watched = watches.asSlice()
+    if watched[0].canRead() || watched[0].hungUp() || watched[0].failed() {
+      let mut count: usize = 0
+      let mut error: i32 = 0
+      let ok = run NativeDescriptor.read(fd, &mut buffer, &mut count, &mut error)
+      if !ok || count == 0 {
+        open = false
+      } else {
+        let mut index: usize = 0
+        while index < count {
+          let byte = buffer[index]
+          index = index + 1
+          if byte != 10 {
+            let one: [u8; 1] = [byte]
+            run line.append(&one)
+            continue
+          }
+          let text = Bytes.asSlice(&line)
+          let following = next(text, release)
+          if following == "-" {
+          } else if following != "" {
+            phase = following
+          } else if !starts(text, b"Compiling ") && !starts(text, b"Finished ") && text.length != 0 {
+            // Anything else, such as a diagnostic, reaches the terminal as written.
+            clear()
+            StderrWriter.print("{}\n", &.(String.fromUtf8(text) |> Result.unwrapOr("")))
+          }
+          line.clear()
+        }
+      }
+    }
+    frame = frame + 1
+    status(frame, text, phase, started)
+  }
+  Subprocess.closeDescriptor(fd)
+  clear()
+  let mut code: i32 = 1
+  match move run Effect.result(ExitWatch.open(child.pid())) {
+    Result<ExitWatch, SubprocessError>.Success { value: watch } => {
+      match move run Effect.result(watch.collect()) {
+        Result<ExitStatus, SubprocessError>.Success { value } => { code = if value.signaled { 128 + value.signal } else { value.code } }
+        Result<ExitStatus, SubprocessError>.Failure { error } => { drop error }
+      }
+    }
+    Result<ExitWatch, SubprocessError>.Failure { error } => { drop error }
+  }
+  if code != 0 { fail TaskError { message: run String.copy("silk build failed"), status: code } }
+}
+} else {
+import silk.cli.task { Task, TaskError }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+
+/// `silk build` with `arguments`, quietly: no status line here.
+pub effect fn silk(arguments: &[string], text: string, release: bool) -> ()
+  ! TaskError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  let mut all = List<string>.make()
+  let mut at: usize = 0
+  while at < arguments.length {
+    run all.append(arguments[at])
+    at = at + 1
+  }
+  run all.append("--progress")
+  run all.append("never")
+  run Task.silk(all.asSlice())
+}
+}
