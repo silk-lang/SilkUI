@@ -438,3 +438,38 @@ The three lists cost a quarter of what they did to create and a twelfth to re-th
 whose sheets hold none of these rules pay about 0.15% for recording what a match read. A row
 added under such a sheet still restyles its parent's whole list, which is why `append_row`
 stays at 2.6 times the plain Tailwind case (22.8M).
+
+### Updates that restyled the whole root
+
+Five updates still restyled every node of a root that holds sheets: a change below a `:has()`
+rule, focus moving while a rule uses `:focus-within`, a class change whose rules set `display`,
+`content` or `all`, an attribute other than the class on an attached node, and an inline custom
+property. Each now restyles what can change. Matching reports the elements it asked a `:has()`
+or `:focus-within` question, the tree remembers them, and a change below one restyles those
+elements' subtrees only. An attribute restyles by what the root's selectors read from it, and
+inline custom properties and `display` classes restyle the node's own subtree. `:has()` whose
+argument has no sibling combinator also stopped scanning the anchor's following siblings, which
+made creating the 1,000 rows under one such rule quadratic.
+
+`has_class`, `focus_within`, `display_class`, `attribute` and `custom_property`
+`[Rows=1000,Cells=3]` each change one row, with one extra rule adopted where the scenario needs
+it. Measured as above against SilkUI `af0b8a7`. Executable SHA-256 after:
+`5071f7123d7135a9ce1606db2589b6df9132d38d66fe80a3daca3db962b2c212`.
+
+| Operation | Tailwind before | Tailwind after |
+| --- | ---: | ---: |
+| idle | 148,851,718 | 149,187,968 |
+| has_class (create included) | 5,593,849,429 | 297,223,100 |
+| focus_within | 178,575,509 | 154,143,961 |
+| display_class | 196,783,329 | 172,291,971 |
+| attribute | 175,934,345 | 151,668,956 |
+| custom_property | 176,141,754 | 151,555,465 |
+| create | 145,460,203 | 145,796,381 |
+| theme | 175,752,867 | 176,246,900 |
+| append_row | 171,963,051 | 172,299,643 |
+| style_row | 151,133,461 | 151,471,119 |
+
+Each of the four narrowed updates drops about 24.5M instructions, the cost of restyling the
+root, and now sits 2.4M to 5.0M above idle (`display_class` 23.1M, which is layout). The
+`has_class` total is dominated by creating the rows under a `:has()` rule, 18.8 times cheaper
+now. The other totals pay 0.2% to 0.3% for recording what matching asked.
