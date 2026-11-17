@@ -35,7 +35,8 @@ import svg_css.effect_values {
   Composite,
   MaskMode,
 }
-import svg_css.transform_values { Position }
+import svg_css.transform_values { Position, PositionAxis, Edge }
+import svg_css.dimensions { Dimension, Unit }
 import svg_css.text_values
 import svg_css.text_values { Atom }
 import vector.layer {
@@ -112,6 +113,8 @@ fn isBackgroundLayer(property: CssProperty) -> bool {
     || property == CssProperty.BackgroundRepeat
     || property == CssProperty.BackgroundOrigin
     || property == CssProperty.BackgroundClip
+    || property == CssProperty.BackgroundPositionX
+    || property == CssProperty.BackgroundPositionY
 }
 
 /// One computed `text-shadow`, in CSS pixels.
@@ -496,6 +499,10 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     run applyClips(&mut effects.*, &source, &mut cursor)
     return
   }
+  if property == CssProperty.BackgroundPositionX || property == CssProperty.BackgroundPositionY {
+    run applyAxis(&mut effects.*, property == CssProperty.BackgroundPositionX, &source, &mut cursor, &context)
+    return
+  }
   // The background longhands share the mask longhands' grammar.
   let parsed = if property == CssProperty.BackgroundPosition {
     CssProperty.MaskPosition
@@ -681,6 +688,80 @@ effect fn applyImages(
 }
 
 /// `background-clip`: boxes or `text`, comma separated.
+/// `background-position-x` or `-y` (Backgrounds 4): a comma list of `[center | <edge>]?
+/// <length-percentage>?` that replaces one axis of each layer's position, adding layers at
+/// `0% 0%` when there are none.
+effect fn applyAxis(
+  effects: &mut Effects,
+  horizontal: bool,
+  source: &Input<'_>,
+  cursor: &mut Cursor,
+  context: &LengthContext,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut axes = List<PositionAxis>.make()
+  while true {
+    let mut edge = Edge.Start
+    let mut named = true
+    if cursor.ident(source, b"center") {
+      edge = Edge.Center
+    } else if cursor.ident(source, if horizontal { b"left" } else { b"top" }) {
+      edge = Edge.Start
+    } else if cursor.ident(source, if horizontal { b"right" } else { b"bottom" }) {
+      edge = Edge.End
+    } else {
+      named = false
+    }
+    let offset = if edge == Edge.Center {
+      Option<ExprId>.None
+    } else {
+      run dimensions.parse(&mut effects.numerics, source, &mut cursor.*, Dimension.LengthPercentage, false)
+    }
+    let value = match offset {
+      Option<ExprId>.Some { value } => run dimensions.compute(&mut effects.numerics, value, context)
+      _ => {
+        if !named {
+          return
+        }
+        run dimensions.literal(&mut effects.numerics, 0.0, Unit.Px)
+      }
+    }
+    run axes.append(PositionAxis { edge: edge, offset: value })
+    if !cursor.comma(source) {
+      break
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  let items = axes.asSlice()
+  let positions = &mut effects.backgrounds.positions
+  let existing = positions.length()
+  if existing == 0 {
+    let zero = run dimensions.literal(&mut effects.numerics, 0.0, Unit.Percent)
+    let start = PositionAxis { edge: Edge.Start, offset: zero }
+    run positions.append(Position { x: start, y: start })
+  }
+  // Both lists repeat to the layer count, so the longer one sets it.
+  let known = positions.length()
+  while positions.length() < items.length {
+    let repeated = positions.get(positions.length() % known)
+    run positions.append(repeated)
+  }
+  let mut i: usize = 0
+  while i < positions.length() {
+    let mut position = positions.get(i)
+    if horizontal {
+      position.x = items[i % items.length]
+    } else {
+      position.y = items[i % items.length]
+    }
+    positions.set(i, position)
+    i = i + 1
+  }
+}
+
 effect fn applyClips(effects: &mut Effects, source: &Input<'_>, cursor: &mut Cursor) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
