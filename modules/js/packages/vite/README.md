@@ -93,7 +93,7 @@ APIs used here that a ui-js runtime does not have:
 A name counts when a module reads it as a global. A `typeof` test for it, a local of the
 same name and `process.env.NAME` do not count. Under the dev server the warning comes when
 the module is first served. For Node's APIs at run time, build with `node: true` and give
-the app the full runtime (`App.runtime(Runtime.node())` in `src/tasks.silk`).
+the app the full runtime (`App.runtime(Runtime.node())` in `silk/tasks.silk`).
 
 ## TypeScript
 
