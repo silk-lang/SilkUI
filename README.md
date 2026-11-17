@@ -23,7 +23,7 @@ product once.
 silk init my-app -t ui-react   # or ui-loom, ui-foldkit, ui-js
 cd my-app
 silk task dev                  # opens the app in a window, reloading as you edit
-silk task build                # writes the release program to dist/window/
+silk task build --release      # writes the release program to dist/window/
 ```
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
