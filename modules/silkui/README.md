@@ -70,8 +70,9 @@ effect fn sign<'env, E, ?R>(built: once Effect<'env; Built ! E ? R>) -> Built ! 
 }
 ```
 
-`Mode.Release` builds never include the development tools: no reload, no development server,
-no inspector.
+`Mode.Release` and `Mode.Debug` builds never include the development tools: no reload, no
+development server, no inspector. `Mode.Debug` is the same program unoptimized, with debug
+information, as `silk build` makes without `--release`.
 
 ## The definition
 
