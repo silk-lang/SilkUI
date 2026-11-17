@@ -232,6 +232,22 @@ pub fn overflowClip(c: &Computed, f: &Fragment) -> Rect<f32> {
   )
 }
 
+/// The overflow clip of fragment `f` (node `slot`, style `c`) as a device-pixel mask. When both
+/// axes clip, the padding box's rounded corners clip too.
+fn clipMask(p: &Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment) -> ContentMask {
+  let clip = device(overflowClip(c, f), p.scale)
+  let both = usedOverflow(c, true) != Overflow.Visible && usedOverflow(c, false) != Overflow.Visible
+  if !(both || c.contain.paint()) {
+    return ContentMask.new(clip)
+  }
+  let r = radiiOf(p, slot, c, f)
+  if r.topLeft <= 0.0 && r.topRight <= 0.0 && r.bottomRight <= 0.0 && r.bottomLeft <= 0.0 {
+    return ContentMask.new(clip)
+  }
+  let radii = paint_effects.insetCorners(scaledCorners(r, p.scale), device(borderBox(f), p.scale), clip)
+  return ContentMask.rounded(clip, radii)
+}
+
 pub fn contentBox(f: &Fragment) -> Rect<f32> {
   let x = f.worldLocation.x + f.contentRect.x
   let y = f.worldLocation.y + f.contentRect.y
@@ -1425,7 +1441,7 @@ effect fn paintThrough(
   let f = p.output.fragments.values.asSlice()[at]
   let slot = slotIn(p.slotOfCss, f.source)
   let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
-  let mut inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+  let mut inner = mask.intersect(clipMask(&p.*, slot, &c, &f))
   if empty(inner) {
     return ()
   }
@@ -1450,7 +1466,7 @@ fn hoistedMask(p: &Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask
       let f = &p.output.fragments.values.asSlice()[at]
       let slot = slotIn(p.slotOfCss, f.source)
       let c = &p.nodes.asSlice()[u32.toUsize(slot)].computed
-      inner = inner.intersect(ContentMask.new(device(overflowClip(c, f), p.scale)))
+      inner = inner.intersect(clipMask(p, slot, c, f))
     }
     at = p.output.fragments.values.asSlice()[at].parent
   }
@@ -1848,7 +1864,7 @@ effect fn paintTransformed(p: &mut Painter<'_, '_>, index: usize, mask: ContentM
     } else {
       everywhere()
     }
-    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, mask.bounds, ink)
+    drop run p.scene.pushRoundedScrollGroup(ScrollLink { node: NONE, x: x, y: y }, mask, ink)
     p.cull = Rect<f32>.new(saved.xMin - dx, saved.yMin - dy, saved.xMax - dx, saved.yMax - dy)
     run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
     p.cull = saved
@@ -1922,7 +1938,7 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
       && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Text {
       let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
       if layers.scroller(&c) {
-        let inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+        let inner = mask.intersect(clipMask(&p.*, slot, &c, &f))
         let saved = p.cull
         let content = run openScroller(&mut p, slot, &c, &f, inner)
         run paintChildren(&mut p, index, content)
@@ -1992,7 +2008,7 @@ effect fn shiftCaches(
       return ()
     }
     if c.clips() {
-      inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &parent), p.scale)))
+      inner = mask.intersect(clipMask(&p.*, parentSlot, &c, &parent))
     }
   }
 
@@ -2152,7 +2168,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     }
     let mut inner = mask
     if c.clips() {
-      inner = mask.intersect(ContentMask.new(device(overflowClip(&c, &f), p.scale)))
+      inner = mask.intersect(clipMask(&p.*, slot, &c, &f))
     }
     let input = kind == NodeKind.Input && c.text.visible
     let scrolled = layers.scroller(&c)
@@ -2277,7 +2293,7 @@ effect fn openScroller(
     let mut y = ScrollAxis.fixed()
     x.base = -sx
     y.base = -sy
-    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, inner.bounds, inner.bounds)
+    drop run p.scene.pushRoundedScrollGroup(ScrollLink { node: NONE, x: x, y: y }, inner, inner.bounds)
   } else {
   run p.scene.setScroll(
     ScrollPosition {
@@ -2290,9 +2306,9 @@ effect fn openScroller(
       maxY: range.maxY * s,
     },
   )
-  drop run p.scene.pushScrollGroup(
+  drop run p.scene.pushRoundedScrollGroup(
     ScrollLink { node: id, x: ScrollAxis.content(), y: ScrollAxis.content() },
-    inner.bounds,
+    inner,
     inner.bounds,
   )
   }
