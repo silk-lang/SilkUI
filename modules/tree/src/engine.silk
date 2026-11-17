@@ -789,6 +789,8 @@ pub struct UiTree<'a> {
   pub stylesPending: bool,
   /// The last `Node.styleClass` handed out.
   pub styleClasses: u32,
+  /// The last `Node.computedStamp` handed out.
+  pub computedStamps: u32,
   pub frameNumber: u64,
   /// Changes to published semantics or allocated geometry.
   pub semanticRevision: u64,
@@ -979,6 +981,7 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       styleClasses: 0,
+      computedStamps: 0,
       frameNumber: 0,
       semanticRevision: 0,
       revision: 0,
@@ -2327,6 +2330,7 @@ impl<'a> UiTree<'a> {
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
       styleTwin: NONE,
+      computedStamp: 0,
       selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
     }
@@ -4316,6 +4320,48 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// The node whose computed values `slot` can copy, or NONE: the twin it just took its record
+  /// from, when both inherit from one parent, or from parents that hold one set of values, and
+  /// nothing feeds the style but that record and what is inherited. Motion, inspector
+  /// overrides, anchors and focus are per node, so any of them keeps the node computing.
+  fn computedLender(self: &Self, slot: u32) -> u32 {
+    if self.transitions.length() != 0 || self.animations.length() != 0 || self.overrides.length() != 0 || self.anchors.length() != 0 { return NONE }
+    let node = self.node(slot)
+    let lender = node.styleTwin
+    if lender == NONE || node.kind != NodeKind.Box || node.isGenerated() || self.focused == slot || self.focused == lender { return NONE }
+    if node.transition.ownedByteLength() != 0 || node.starting.length() != 0 || node.styleNeedsContext { return NONE }
+    let other = self.node(lender)
+    if !other.live || other.styleDirty || other.computedStamp == 0 || other.styleClass != node.styleClass { return NONE }
+    if other.kind != NodeKind.Box || other.isGenerated() || other.transition.ownedByteLength() != 0 || other.styleNeedsContext { return NONE }
+    if other.hovered != node.hovered || other.pressed != node.pressed { return NONE }
+    let same = match &node.resolvedSheet {
+      Option<Frozen<Resolved>>.Some { value: mine } => match &other.resolvedSheet {
+        Option<Frozen<Resolved>>.Some { value: theirs } => Frozen.same(&mine, &theirs) && mine.get().plain
+        _ => false
+      }
+      _ => false
+    }
+    if !same { return NONE }
+    let values = &other.computed
+    if values.viewportWidth != self.input.width || values.viewportHeight != self.input.height || values.usesContainer { return NONE }
+    let none = usize.MAX
+    if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
+      || values.transition.easings.start != none || values.transition.discrete.start != none || values.animation.names.start != none { return NONE }
+    if node.parent != other.parent {
+      if node.parent == NONE || other.parent == NONE { return NONE }
+      let above = self.node(node.parent)
+      let beside = self.node(other.parent)
+      if above.computedStamp == 0 || above.computedStamp != beside.computedStamp || above.rendered != beside.rendered { return NONE }
+    }
+    return lender
+  }
+
+  /// The lender's finished values, or the initial ones to apply this node's declarations to.
+  fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
+    if lender != NONE { return self.node(lender).computed }
+    return Computed.inViewport(inherited, self.input.width, self.input.height)
+  }
+
   effect fn syncGenerated(self: &mut Self, origin: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     if self.node(origin).isGenerated() || self.node(origin).kind != NodeKind.Box { return () }
@@ -4405,6 +4451,16 @@ impl<'a> UiTree<'a> {
     if self.styleClasses > 2147483647 {
       self.styleClasses = 0
       self.stylesDirty = true
+    }
+    // Before the stamp counter wraps, no node holds a stamp, so none lends until it computes again.
+    if self.computedStamps > 2147483647 {
+      self.computedStamps = 0
+      let nodes = self.nodes.asMutSlice()
+      let mut at: usize = 0
+      while at < nodes.length {
+        nodes[at].computedStamp = 0
+        at = at + 1
+      }
     }
     if !self.stylesDirty && !self.stylesPending {
       return ()
@@ -4569,14 +4625,17 @@ impl<'a> UiTree<'a> {
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
-    let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
-    if !simpleStyles && containers.usesUnits(&self, slot) {
+    let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
+    let mut computed = self.valuesToStartFrom(lender, inherited)
+    if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
       computed.usesContainer = true
       computed.usesViewport = true
     }
 
+    // A lender's values are the finished ones: everything below would write them again.
+    if lender == NONE {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
@@ -4610,6 +4669,7 @@ impl<'a> UiTree<'a> {
       let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
       let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
+    }
     }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
@@ -4719,8 +4779,11 @@ impl<'a> UiTree<'a> {
     run self.resolveEffects(slot, &mut computed, fontKey)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
+    let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
+    if lender == NONE { self.computedStamps = stamp }
     let target = self.nodeMut(slot)
     target.computed = computed
+    target.computedStamp = stamp
     target.rendered = rendered
     target.fontKey = fontKey
     target.paintHash = paintHash
