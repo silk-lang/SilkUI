@@ -34,7 +34,7 @@ const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 const UNITLESS = new Set([
   "opacity", "flexGrow", "flexShrink", "flex", "order", "zIndex", "fontWeight", "lineHeight",
   "aspectRatio", "tabSize", "scale", "animationIterationCount", "gridRow", "gridRowStart", "gridRowEnd",
-  "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea",
+  "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea", "columnCount", "columns", "orphans", "widows",
 ]);
 
 const nodes = new Map();
