@@ -421,6 +421,14 @@ pub interface WindowClient<S, E, ? R> {
   }
 }
 
+fn revealsWhenDrawn() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return true
+  } else {
+    return false
+  }
+}
+
 /// How to open the window.
 pub struct RunOptions {
   /// Native window title.
@@ -1054,6 +1062,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
   windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(240.0, 200.0))
   content.configure(&state.*, &mut windowOptions)
+  // On macOS the window shows once its first frame is presented, so it never shows blank
+  // (Electron's ready-to-show). AppKit sends no frames to a hidden window: this loop draws
+  // that first frame without waiting for one.
+  let mut reveal = !check && windowOptions.visible && revealsWhenDrawn()
+  if reveal {
+    windowOptions.visible = false
+  }
   let window = run platform.openWindow(&windowOptions)
   let owner = window
   if tracing {
@@ -1131,6 +1146,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
     let wait = if check {
       Wait.Seconds { seconds: 0.016 }
+    } else if reveal {
+      Wait.Poll
     } else {
       let mut deadline = match content.nextDeadline(&state.*) {
         Option<f64>.Some { value } => if value > now {
@@ -1235,7 +1252,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
     }
     let time = (run seconds(&mut clock)) - started
-    if check && next.isNone() {
+    if (check || reveal) && next.isNone() {
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
     }
     let mut redraw = backgroundChanged
@@ -1456,6 +1473,16 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               }
               if tracing {
                 StderrWriter.print("silk-ui: frame {} presented\n", &.(drawn))
+              }
+              if reveal {
+                reveal = false
+                if !tracing && !options.lowestLatency {
+                  drop run renderer.waitFrames(drawn)
+                }
+                platform.focus(owner)
+                if tracing {
+                  StderrWriter.print("silk-ui: window shown\n", &())
+                }
               }
               if content.profile(&state.*) {
                 let report = renderer.report()
