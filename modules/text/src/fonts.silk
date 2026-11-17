@@ -71,6 +71,7 @@ pub struct TextStyle {
   pub size: f32,
   pub request: Request,
   pub treatment: Treatment,
+  pub variations: Variations,
 }
 
 /// What a style does to its text besides choosing the font: CSS `letter-spacing`,
@@ -115,12 +116,47 @@ impl TextStyle {
       size: size,
       request: Request { weight: 400.0, width: 100.0, style: Style.Normal },
       treatment: Treatment.normal(),
+      variations: Variations.none(),
     }
+  }
+}
+
+/// `font-variation-settings`: up to six axis tags and their values.
+pub struct Variations {
+  pub tags: [u32; 6],
+  pub values: [f32; 6],
+  pub count: usize,
+}
+
+impl Copy for Variations {}
+
+/// How many `font-variation-settings` entries `Variations` keeps.
+pub const MAX_VARIATIONS: usize = 6
+
+impl Variations {
+  /// `normal`: no axis set.
+  pub fn none() -> Variations {
+    return Variations { tags: [0, 0, 0, 0, 0, 0], values: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], count: 0 }
+  }
+
+  pub fn same(self: &Self, other: &Variations) -> bool {
+    if self.count != other.count {
+      return false
+    }
+    let mut i: usize = 0
+    while i < self.count {
+      if self.tags[i] != other.tags[i] || self.values[i] != other.values[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
   }
 }
 
 struct StyleEntry {
   size: f32,
+  variations: Variations,
   treatment: Treatment,
   request: Request,
   chain: List<Link>,
@@ -132,6 +168,8 @@ struct Instance {
   face: usize,
   selection: Selection,
   opticalSize: f32,
+  /// The style's `font-variation-settings`.
+  settings: Variations,
   coords: List<F2Dot14>,
   unitsPerEm: f32,
 }
@@ -396,7 +434,8 @@ impl<'a> FontState<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let opticalSize = self.styles.asSlice()[style].size
-    let instance = run self.instanceFor(selection, opticalSize)
+    let settings = self.styles.asSlice()[style].variations
+    let instance = run self.instanceFor(selection, opticalSize, &settings)
     let mut index: usize = 0
     while index < self.keys.length() {
       let info = self.keys.get(index)
@@ -427,7 +466,7 @@ impl<'a> FontState<'a> {
     }
     let index = self.styles.length()
     run self.styles.append(
-      StyleEntry { size: style.size, treatment: style.treatment, request: style.request, chain: move chain, primary: primary },
+      StyleEntry { size: style.size, variations: style.variations, treatment: style.treatment, request: style.request, chain: move chain, primary: primary },
     )
     match primary {
       Option<Selection>.Some { value } => {
@@ -460,7 +499,7 @@ impl<'a> FontState<'a> {
     return false
   }
 
-  effect fn instanceFor(self: &mut Self, selection: Selection, size: f32) -> usize
+  effect fn instanceFor(self: &mut Self, selection: Selection, size: f32, settings: &Variations) -> usize
     ! OutOfMemoryError
     ? &mut Allocator {
     let opticalSize: f32 = if (self.set.face(selection.face).axes & AXIS_OPTICAL) != 0 {
@@ -471,7 +510,8 @@ impl<'a> FontState<'a> {
     let mut index: usize = 0
     while index < self.instances.length() {
       if sameSelection(&self.instances.asSlice()[index].selection, &selection)
-        && self.instances.asSlice()[index].opticalSize == opticalSize {
+        && self.instances.asSlice()[index].opticalSize == opticalSize
+        && self.instances.asSlice()[index].settings.same(settings) {
         return index
       }
       index = index + 1
@@ -504,6 +544,25 @@ impl<'a> FontState<'a> {
           run wanted.append(Variation { tag: Tag.fromU32(TAG_SLNT), value: f64.toF32(-value) })
         }
       }
+      // font-variation-settings come last and win over the values above (CSS Fonts 4 §7.2).
+      let mut axis: usize = 0
+      while axis < settings.count {
+        let tag = Tag.fromU32(settings.tags[axis])
+        let mut replaced = false
+        let list = wanted.asMutSlice()
+        let mut w: usize = 0
+        while w < list.length {
+          if list[w].tag.toU32() == settings.tags[axis] {
+            list[w].value = settings.values[axis]
+            replaced = true
+          }
+          w = w + 1
+        }
+        if !replaced {
+          run wanted.append(Variation { tag: tag, value: settings.values[axis] })
+        }
+        axis = axis + 1
+      }
       if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[selection.face] {
         unitsPerEm = u16.toF32(data.upem)
         if wanted.length() > 0 {
@@ -518,6 +577,7 @@ impl<'a> FontState<'a> {
         face: selection.face,
         selection: selection,
         opticalSize: opticalSize,
+        settings: settings.*,
         coords: move coords,
         unitsPerEm: unitsPerEm,
       },

@@ -392,8 +392,8 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
 
 - **Layout** is incremental. Style changes reach css-layout only when they change a layout
   input, and an unchanged tree at an unchanged size skips `compute`.
-- **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid or
-  linear gradient), border (solid or dashed, per side, with radii), outer and inset shadow,
+- **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid, or
+  linear, radial and conic gradients, and `url()` images the host loads), border (solid or dashed, per side, with radii), outer and inset shadow,
   opacity (an isolated layer) and `overflow: hidden` clip. Text is drawn from css-layout's text
   fragments: each fragment's `shapeKey` names the glyph run ui-text shaped during layout, so
   nothing is shaped twice. Inline boxes paint their decorations per fragment, so a highlighted
