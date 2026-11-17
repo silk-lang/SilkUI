@@ -12,7 +12,7 @@ const HTML = "http://www.w3.org/1999/xhtml";
 const SVG = "http://www.w3.org/2000/svg";
 
 // Tags that are not a box. Every other tag is one, as a <div> is.
-const KINDS = { input: "input", textarea: "input", img: "image", image: "image", icon: "icon", canvas: "canvas", richinput: "richinput" };
+const KINDS = { input: "input", textarea: "input", img: "image", image: "image", canvas: "canvas", richinput: "richinput" };
 
 const FOCUSABLE = new Set(["button", "a", "input", "textarea"]);
 
@@ -616,7 +616,7 @@ class SvgLook {
 }
 
 /**
- * An element of the SVG namespace. The root `<svg>` is an icon node; the elements inside are
+ * An element of the SVG namespace. The root `<svg>` is one tree node; the elements inside are
  * markup it draws (`SvgElement` of @silkui/core). Attributes keep their case, as SVG's do.
  */
 class SVGElement extends Element {
@@ -651,16 +651,6 @@ class SVGElement extends Element {
   get style() {
     if (!(this.node instanceof SvgMarkup)) return super.style;
     return (this.#style ??= new CSSStyleDeclaration(new SvgLook(this.node)));
-  }
-}
-
-class HTMLIconElement extends HTMLElement {
-  get svg() {
-    return this.node.svg;
-  }
-
-  set svg(markup) {
-    this.node.svg = markup;
   }
 }
 
@@ -766,7 +756,7 @@ export const document = {
     if (tag === "button" || tag === "a") node.setAttribute("tabIndex", 0);
     if (tag === "textarea") node.setAttribute("multiline", true);
     if (kind === "input" || kind === "richinput") return new HTMLInputElement(node, tag);
-    return kind === "icon" ? new HTMLIconElement(node, tag) : new HTMLElement(node, tag);
+    return new HTMLElement(node, tag);
   },
 
   createElementNS(namespace, name) {

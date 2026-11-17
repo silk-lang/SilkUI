@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createIcon, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut } = await import("../src/index.js");
+const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -163,29 +163,35 @@ test("keyframes are defined frame by frame, with CSS selectors", () => {
   assert.deepEqual(mock.take(), [["keyframes", "pulse"]]);
 });
 
-test("identical icon markup shares one resource, released when no icon shows it", () => {
+test("identical svg markup shares one resource, released when no svg shows it", () => {
   mock.take();
-  const check = "<svg viewBox='0 0 24 24'><path d='M20 6 9 17l-5-5'/></svg>";
-  const x = "<svg viewBox='0 0 24 24'><path d='M18 6 6 18'/></svg>";
-  const a = createIcon(check);
-  const b = createIcon(check);
+  const svgOf = (d) => {
+    const svg = createNode("svg");
+    const path = createSvgElement("path");
+    path.setAttribute("d", d);
+    svg.appendChild(path);
+    return [svg, path];
+  };
+  const [a, pathA] = svgOf("M20 6 9 17l-5-5");
+  const [b] = svgOf("M20 6 9 17l-5-5");
+  flushSvg();
   let calls = mock.take();
   const defined = calls.filter((call) => call[0] === "defineIcon");
-  assert.deepEqual(defined.map((call) => call[2]), [check]);
+  assert.equal(defined.length, 1);
   const id = defined[0][1];
   assert.deepEqual(calls.filter((call) => call[0] === "source"), [["source", a.nodeId, id], ["source", b.nodeId, id]]);
-  a.svg = x;
-  b.svg = check;
+  pathA.setAttribute("d", "M18 6 6 18");
+  flushSvg();
   calls = mock.take();
   assert.equal(calls.filter((call) => call[0] === "release").length, 0, "b still shows the check");
   b.destroy();
-  a.svg = "";
+  a.destroy();
   calls = mock.take();
-  assert.deepEqual(calls.filter((call) => call[0] === "release").map((call) => call[1]).length, 2, "both released");
-  assert.deepEqual(calls.find((call) => call[0] === "source"), ["source", a.nodeId, 0]);
+  assert.equal(calls.filter((call) => call[0] === "release").length, 2, "both released");
+  assert.throws(() => createNode("icon"), /no node kind 'icon'/);
 });
 
-test("an image or icon src loads its address once while some node shows it", () => {
+test("an image src loads its address once while some node shows it", () => {
   mock.take();
   const png = "data:image/png;base64,iVBORw0KGgo=";
   const a = createImage(png);
@@ -198,18 +204,12 @@ test("an image or icon src loads its address once while some node shows it", () 
   assert.deepEqual(loads[0].slice(2), [png, false]);
   assert.deepEqual(calls.filter((call) => call[0] === "source").map((call) => call[2]), [loads[0][1], loads[0][1]]);
   assert.ok(calls.some((call) => call[0] === "attribute" && call[2] === "label" && call[3] === "Logo"));
-  const icon = createIcon("<svg/>");
-  icon.src = "data:image/svg+xml,%3Csvg/%3E";
-  calls = mock.take();
-  assert.ok(calls.some((call) => call[0] === "release"), "the markup is released for the address");
-  assert.deepEqual(calls.find((call) => call[0] === "load").slice(2), ["data:image/svg+xml,%3Csvg/%3E", true]);
   a.destroy();
   b.src = "";
-  icon.destroy();
-  assert.equal(mock.take().filter((call) => call[0] === "release").length, 2);
+  assert.equal(mock.take().filter((call) => call[0] === "release").length, 1);
 });
 
-test("svg markup built from elements draws once as one icon, and again when it changes", async () => {
+test("svg markup built from elements draws once as one node, and again when it changes", async () => {
   mock.take();
   const svg = createNode("svg");
   svg.setAttribute("viewBox", "0 0 24 24");
