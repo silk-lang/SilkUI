@@ -11,6 +11,11 @@ import ui_text.set { FaceState }
 import font_web.stylesheet { parse as parseSheet }
 import web_fonts
 import silk.url.url { Url }
+import ui_tree.resources { Resource }
+import silk.system.filesystem { FileSystem, FileError, AtomicWriteError, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInputError }
+import test_paths { directory }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.effect { Effect }
@@ -19,6 +24,9 @@ import silk.testing.testing { AssertionError, Testing }
 import silk.text.string { String }
 
 const DOT: string<'static> = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8DwH4QBEfcD/ePF9e8AAAAASUVORK5CYII="
+
+const WIDE: [u8; 71] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 1, 8, 6, 0, 0, 0, 27, 224, 20, 180, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 31, 134, 1, 38, 230, 5, 251, 97, 44, 95, 8, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
+const TALL: [u8; 73] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 2, 8, 6, 0, 0, 0, 153, 129, 182, 39, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 240, 159, 1, 68, 0, 0, 19, 246, 3, 253, 184, 166, 241, 202, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130]
 
 effect fn heard(events: &List<Event>, kind: EventKind, target: u32) -> bool {
   let list = events.asSlice()
@@ -247,4 +255,72 @@ fn isOblique(style: FaceStyle, low: f64, high: f64) -> bool {
     FaceStyle.Oblique { min, max } => min == low && max == high
     _ => false
   }
+}
+
+fn widthOf(tree: &UiTree<'_>, resource: u32) -> u32 {
+  return match tree.resources.get(resource) {
+    Option<Resource>.Some { value } => match value {
+      Resource.Image { width, .. } => width
+      _ => 0
+    }
+    Option<Resource>.None => 0
+  }
+}
+
+/// Serves until nothing is left to load; the file loader reads off the UI thread.
+effect fn settled(loader: &mut Loader, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run loader.serve(&mut tree)
+  let mut turns: usize = 0
+  while loader.pending() && turns < 100000 {
+    drop run loader.serve(&mut tree)
+    turns = turns + 1
+  }
+}
+
+effect fn watchBody(path: &Path) -> ()
+  ! AssertionError<'static> | TreeError | AtomicWriteError | FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem {
+  run FileSystem.writeFileAtomic(path, &WIDE, FileSystem.replaceExisting(), FileSystem.buffered())
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut loader = Loader.make()
+  let mut url = run String.copy("file://")
+  run url.append(path.view().unwrapOr(""))
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.loadImage(7, String.view(&url))
+  run tree.apply(run batch.take())
+  run settled(&mut loader, &mut tree)
+  run Testing.expect(widthOf(&tree, 7) == 3, "the file loads")
+  run Testing.expect(loader.watchAfter(Option<f64>.None).isSome(), "a debug build wakes to read it again")
+
+  run loader.watch(0.0)
+  run settled(&mut loader, &mut tree)
+  run Testing.expect(widthOf(&tree, 7) == 3, "an unchanged file is not loaded again")
+  run FileSystem.writeFileAtomic(path, &TALL, FileSystem.replaceExisting(), FileSystem.buffered())
+  run loader.watch(0.1)
+  run settled(&mut loader, &mut tree)
+  run Testing.expect(widthOf(&tree, 7) == 3, "files are read again every half second")
+  run loader.watch(0.6)
+  run settled(&mut loader, &mut tree)
+  run Testing.expect(widthOf(&tree, 7) == 1, "an edited file replaces the image in place")
+  run FileSystem.removeFile(path)
+}
+
+effect fn watchFixture() -> ()
+  ! AssertionError<'static> | TreeError | AtomicWriteError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut files = run MachineFileSystem.make()
+  let parent = run directory()
+  let path = run Path.resolve(&parent, "loader-watch-test.png")
+  run watchBody(&path) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn aDebugBuildReloadsEditedImageFiles() -> ()
+  ! AssertionError<'static> | TreeError | AtomicWriteError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run watchFixture() |> Effect.provideMut<Allocator>(&mut allocator)
 }
