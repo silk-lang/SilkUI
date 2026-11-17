@@ -17,6 +17,8 @@ import layout.lib {
   CaptionSide,
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
+import properties.computed { Display }
+import svg_css.counter_styles
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
 import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle }
 import properties.convert { Context }
@@ -109,6 +111,7 @@ pub struct Computed {
   /// to flex and grid items (see `stacking`).
   pub zIndex: i32,
   pub zAuto: bool,
+  pub list: ListStyle,
   pub outline: Outline,
   pub columnRule: ColumnRule,
   pub scroll: ScrollStyle,
@@ -119,6 +122,55 @@ pub struct Computed {
 }
 
 impl Copy for Computed {}
+
+/// `display: list-item`, `list-style-type` and `list-style-position`, and whether the node
+/// changes counters, in one byte. Type and position inherit (copied in the engine's
+/// `resolve`); the other two bits do not. A string type is read back from the declarations.
+pub struct ListStyle { bits: u8 }
+
+impl Copy for ListStyle {}
+
+impl Equal for ListStyle {
+  fn equals(left: &ListStyle, right: &ListStyle) -> bool { return left.bits == right.bits }
+}
+
+const LIST_TYPE: u8 = 15
+/// `list-style-type: <string>`, after the counter styles' codes.
+pub const LIST_STRING: u8 = 13
+/// `list-style-type: none`.
+pub const LIST_NONE: u8 = 12
+const LIST_INSIDE: u8 = 16
+const LIST_ITEM: u8 = 32
+const LIST_COUNTERS: u8 = 64
+
+impl ListStyle {
+  pub fn initial() -> ListStyle { return ListStyle { bits: 0 } }
+  /// The counter style's code (`counter_styles.CounterStyle` order), or LIST_STRING.
+  pub fn typeCode(self: &Self) -> u8 { return u8.bitAnd(self.bits, LIST_TYPE) }
+  pub fn inside(self: &Self) -> bool { return u8.bitAnd(self.bits, LIST_INSIDE) != 0 }
+  pub fn item(self: &Self) -> bool { return u8.bitAnd(self.bits, LIST_ITEM) != 0 }
+  pub fn counters(self: &Self) -> bool { return u8.bitAnd(self.bits, LIST_COUNTERS) != 0 }
+  /// The inherited part of the parent's list style.
+  pub fn inherited(parent: ListStyle) -> ListStyle { return ListStyle { bits: u8.bitAnd(parent.bits, u8.bitOr(LIST_TYPE, LIST_INSIDE)) } }
+  fn flag(self: &mut Self, bit: u8, on: bool) { self.bits = if on { u8.bitOr(self.bits, bit) } else { u8.bitAnd(self.bits, u8.bitNot(bit)) } }
+  fn setType(self: &mut Self, code: u8) { self.bits = u8.bitOr(u8.bitAnd(self.bits, u8.bitNot(LIST_TYPE)), code) }
+}
+
+fn listTypeOf(value: &Value) -> Option<u8> {
+  return match &value.* {
+    Value.Keyword { value: word } => listTypeNamed(keywords.name(word))
+    Value.Text { css } => listTypeNamed(Bytes.asSlice(&css))
+    _ => Option<u8>.None
+  }
+}
+
+fn listTypeNamed(name: &[u8]) -> Option<u8> {
+  if name.length > 0 && (name[0] == 34 || name[0] == 39) { return Option<u8>.some(LIST_STRING) }
+  return match counter_styles.named(name) {
+    Option.Some { value: style } => Option<u8>.some(counter_styles.code(style))
+    _ => Option<u8>.None
+  }
+}
 
 /// `container-type`, `contain` and `content-visibility`, in one byte (the record is copied for
 /// every restyled node). css-layout reads the union of the two size containments, in
@@ -790,6 +842,7 @@ impl Computed {
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
       contain: Containment.initial(),
+      list: ListStyle.initial(),
     }
   }
 
@@ -988,9 +1041,31 @@ impl Computed {
         match convert.display(value) {
           Option.Some { value: found } => {
             self.layout.display = found
+            self.list.flag(LIST_ITEM, false)
           }
-          Option.None => {}
+          Option.None => {
+            if convert.isKeyword(value, Keyword.ListItem) {
+              self.layout.display = Display.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
+              self.list.flag(LIST_ITEM, true)
+            }
+          }
         }
+      }
+      CssProperty.ListStyleType => {
+        if let Option<u8>.Some { value: code } = listTypeOf(value) { self.list.setType(code) }
+      }
+      CssProperty.ListStylePosition => {
+        if convert.isKeyword(value, Keyword.Inside) { self.list.flag(LIST_INSIDE, true) }
+        if convert.isKeyword(value, Keyword.Outside) { self.list.flag(LIST_INSIDE, false) }
+      }
+      CssProperty.CounterReset => {
+        self.list.flag(LIST_COUNTERS, true)
+      }
+      CssProperty.CounterIncrement => {
+        self.list.flag(LIST_COUNTERS, true)
+      }
+      CssProperty.CounterSet => {
+        self.list.flag(LIST_COUNTERS, true)
       }
 
       // Logical properties, mapped to the physical ones.

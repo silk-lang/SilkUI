@@ -76,7 +76,9 @@ import layers
 import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
-import style { Computed, TextStyle, NO_SHADOW }
+import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE }
+import lists
+import lists { Scope }
 import paint_css { Effects }
 import paint_css
 import font_units
@@ -791,6 +793,9 @@ pub struct UiTree<'a> {
   pub stylesDirty: bool,
   /// Some nodes have `styleDirty`: the next resolve visits only their subtrees' paths.
   pub stylesPending: bool,
+  /// Some node is a list item or changes counters, or generated content names one: each
+  /// style pass ends with the counters pass (`lists.update`).
+  pub listsUsed: bool,
   /// The last `Node.styleClass` handed out.
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
@@ -987,6 +992,7 @@ impl<'a> UiTree<'a> {
       seed: seed,
       stylesDirty: true,
       stylesPending: false,
+      listsUsed: false,
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
       computedStamps: 0,
@@ -2070,6 +2076,7 @@ impl<'a> UiTree<'a> {
           }
           Attribute.Named { name, value } => {
             if !isNamedAttribute(String.view(&name)) { return () }
+            if self.listsUsed && (String.view(&name) == "start" || String.view(&name) == "value") { self.stylesPending = true }
             let words = match &value { Option<String>.Some { value: text } => String.view(&text) _ => "" }
             if String.view(&name) == "class" || String.view(&name) == "id" {
               let present = value.isSome()
@@ -2677,6 +2684,8 @@ impl<'a> UiTree<'a> {
       if parent != NONE { self.focusWithinMoved(parent, NONE) }
       run self.moveFocus(to, false)
     }
+    // Counters after it count one less.
+    if self.listsUsed { self.stylesPending = true }
     // The detached subtree is resolved when it is attached again.
     self.applied = true
   }
@@ -4641,7 +4650,9 @@ impl<'a> UiTree<'a> {
       if enabled {
         let rendered = old != NONE && style_change.rendered(&self, old)
         let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
-        content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice()), generatedFailed)
+        let mut counted = false
+        content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice(), &Scope.empty(), &mut counted), generatedFailed)
+        if counted { self.listsUsed = true }
         prepared = Option<Resolved>.some(move value)
       }
       if let Option<String>.Some { value: text } = move content {
@@ -4653,7 +4664,11 @@ impl<'a> UiTree<'a> {
           let parentCss = self.node(origin).css
           let boxCss = self.node(slot).css
           let textCss = self.node(child).css
-          let first = self.layout.nodes.asSlice()[parentCss].firstChild
+          let mut first = self.layout.nodes.asSlice()[parentCss].firstChild
+          // ::before follows the ::marker box, which stays first.
+          if let Option.Some { value } = self.node(origin).identity() {
+            if value.marker != NONE && first == self.node(value.marker).css { first = self.layout.nodes.asSlice()[first].nextSibling }
+          }
           let before = if target == PseudoTarget.Before && first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
           run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
           run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: textCss }, Option<NodeId>.None), layoutFailed)
@@ -4682,6 +4697,69 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+  }
+
+  /// Keeps the `::marker` box of a list item (CSS Lists 3 §3): the origin's first layout child,
+  /// holding one text node that the counters pass (`lists.update`) fills.
+  @inlineNever
+  effect fn syncMarker(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let node = self.node(origin)
+    if node.kind != NodeKind.Box || node.isGenerated() { return () }
+    let old = match node.identity() { Option.Some { value } => value.marker _ => NONE }
+    let list = node.computed.list
+    if !list.item() && old == NONE { return () }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let styled = list.item() && at != usize.MAX && self.styleSheets.asSlice()[at].hasMarker
+    let mut prepared = Option<Resolved>.None
+    let mut wanted = list.item() && list.typeCode() != LIST_NONE
+    if styled {
+      let rendered = old != NONE && style_change.rendered(&self, old)
+      let value = run self.resolveGeneratedStyle(origin, PseudoTarget.Marker, StateBits.empty(), rendered)
+      let content = lists.markerContent(value.declarations.asSlice())
+      if content == lists.CONTENT_NONE { wanted = false }
+      if content == lists.CONTENT_SET { wanted = true }
+      prepared = Option<Resolved>.some(move value)
+    }
+    if !wanted {
+      if old != NONE {
+        let originNode = self.nodeMut(origin)
+        let identity = run originNode.identityMut()
+        identity.marker = NONE
+        run self.destroy(0, old)
+      }
+      return ()
+    }
+    let mut slot = old
+    if slot == NONE {
+      let id = self.node(origin).id
+      slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.Marker)
+      let child = run self.createNode(0, id, NodeKind.Text, origin, PseudoTarget.Marker)
+      let parentCss = self.node(origin).css
+      let first = self.layout.nodes.asSlice()[parentCss].firstChild
+      let before = if first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
+      let boxCss = self.node(slot).css
+      let textCss = self.node(child).css
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: textCss }, Option<NodeId>.None), layoutFailed)
+      let boxNode = self.nodeMut(slot)
+      boxNode.parent = origin
+      let textNode = self.nodeMut(child)
+      textNode.parent = slot
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.marker = slot
+    }
+    self.listsUsed = true
+    if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+  }
+
+  /// Sets the text of generated box `slot` to `text`, when it differs.
+  pub effect fn fillGenerated(self: &mut Self, slot: u32, text: String) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+    if child == NONE || self.node(child).kind != NodeKind.Text { return () }
+    if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
   }
 
   effect fn resolveStyles(self: &mut Self) -> ()
@@ -4739,6 +4817,7 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasScrollbars = scrollbar_parts.present(&roots[sheetIndex].sheets)
@@ -4778,6 +4857,7 @@ impl<'a> UiTree<'a> {
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
         let barColors = node.computed.scroll.colors
+        let listStyle = node.computed.list
         let shadow = node.computed.effects
         let wasRendered = node.rendered
         let containment = node.computed.contain.query()
@@ -4787,10 +4867,11 @@ impl<'a> UiTree<'a> {
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
         run self.syncGenerated(slot)
+        if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || &barColors != &after.scroll.colors
+          || &barColors != &after.scroll.colors || &listStyle != &after.list
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -4825,6 +4906,7 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+    if self.listsUsed { run lists.update(&mut self) }
   }
 
   /// Forgets what matching watched under the current root: a root restyle asks it all again.
@@ -4925,7 +5007,10 @@ impl<'a> UiTree<'a> {
     let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
     let mut computed = self.valuesToStartFrom(lender, inherited)
     // border-collapse, border-spacing and caption-side inherit.
-    if lender == NONE && parent != NONE { inheritTable(&mut computed.layout, &self.node(parent).computed.layout) }
+    if lender == NONE && parent != NONE {
+      inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
+      computed.list = ListStyle.inherited(self.node(parent).computed.list)
+    }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
@@ -4972,6 +5057,8 @@ impl<'a> UiTree<'a> {
     }
     }
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
+    if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
+    if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
