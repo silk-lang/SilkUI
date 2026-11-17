@@ -35,8 +35,9 @@ test('ships generated pseudo programs and diagnoses unsupported content', () => 
   assert.equal(new DataView(bytes.buffer).getUint32(8, true), 8);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
-  const unsupported = '.card::before { content: counter(item); content: url(icon.png); }';
-  assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'content', count: 2 }]);
+  assert.deepEqual(compileStylesheet('.card::before { content: counter(item); }', { strict: true }).diagnostics, []);
+  const unsupported = '.card::before { content: url(icon.png); }';
+  assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'content', count: 1 }]);
   assert.throws(() => compileStylesheet(unsupported, { strict: true }));
   const suffix = '.card::before:hover { color: red }';
   assert.deepEqual(compileStylesheet(suffix).diagnostics, [{ kind: 'feature', feature: 'pseudo-element state', count: 1 }]);
@@ -55,13 +56,12 @@ test('ships container units and serialized condition programs', () => {
 
 
 test('compiles tree part targets and reports unavailable pseudo-elements', () => {
-  const css = '.input::placeholder{color:red}.input::selection{color:white;background-color:blue}.scroll::-webkit-scrollbar{width:8px}.scroll::-webkit-scrollbar-thumb{background-color:gray}.scroll::-webkit-scrollbar-track{background-color:white}';
+  const css = '.list::marker{color:green}.input::placeholder{color:red}.input::selection{color:white;background-color:blue}.scroll::-webkit-scrollbar{width:8px}.scroll::-webkit-scrollbar-thumb{background-color:gray}.scroll::-webkit-scrollbar-track{background-color:white}';
   assert.deepEqual(compileStylesheet(css, { strict: true }).diagnostics, []);
-  const unsupported = '.input::file-selector-button{color:red}.modal::backdrop{color:blue}.list::marker{color:green}';
+  const unsupported = '.input::file-selector-button{color:red}.modal::backdrop{color:blue}';
   assert.deepEqual(compileStylesheet(unsupported).diagnostics, [
     { kind: 'feature', feature: 'file-selector-button', count: 1 },
     { kind: 'feature', feature: 'backdrop', count: 1 },
-    { kind: 'feature', feature: 'marker', count: 1 },
   ]);
   assert.throws(() => compileStylesheet(unsupported, { strict: true }));
 });
