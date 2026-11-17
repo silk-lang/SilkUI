@@ -14,6 +14,10 @@ The sheet holds the values. The colors are custom properties on the picker, the 
 
 ::source styles/plans.css
 
+The frame above runs on the browser's DOM, so the browser applies the sheet. In a window or on a canvas there is no browser CSS: Silk UI's own tree matches the selectors, runs the cascade and draws the result on the GPU. This is the same program and the same file drawn that way:
+
+::shot native-plans-sheet "The plan picker in a window, styled by plans.css. Where the browser has WebGPU it runs here."
+
 ## Load CSS at build time
 
 In `src/tasks.silk`, add files to the app definition in cascade order:
@@ -68,6 +72,10 @@ Tailwind writes a CSS file from the classes it finds in your source, and the app
 Move the pointer over a row and over the Dark button, click a row, switch the theme. Every style here is a Tailwind class in the view:
 
 ::source examples/src/core/inbox_tailwind.silk
+
+And the same inbox in a window, where the tree applies the sheet Tailwind wrote and the GPU draws it:
+
+::shot native-inbox-tailwind "The Tailwind inbox in a window. Where the browser has WebGPU it runs here: hover a row, click it, switch the theme."
 
 ### Start with a template
 
