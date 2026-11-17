@@ -74,7 +74,6 @@ export default defineConfig({ plugins: [silk({ entry: "src/entry.ts", allow: pro
 | `document` | The same document, as an export |
 | `HoverStyle(style)`, `ActiveStyle`, `FocusStyle`, `FocusVisibleStyle` | Attributes for the looks the tree lays over an element in those states (`:hover`, `:active`, `:focus`, `:focus-visible`) |
 | `StartingStyle(style)` | What transitions start from when the element first shows (`@starting-style`) |
-| `Svg(markup)` | The SVG markup an `icon` element draws, with its `color` as `currentColor` |
 | `provided` from `@silkui/foldkit/apis` | The names this package provides, for `silk({ allow })` |
 | `pageGlobals` from `@silkui/foldkit/apis` | For `define` in a Vite config, when the bundle also runs on the web canvas, where the page's own `document` would win |
 
@@ -83,7 +82,10 @@ export default defineConfig({ plugins: [silk({ entry: "src/entry.ts", allow: pro
 - **The page.** The document is `<html><body><div id="root">`, filling the window. Foldkit
   puts the view's root element in place of `#root`.
 - **Elements.** Every tag is a box, except `input` and `textarea` (the tree's input), `img`
-  (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
+  (image, with `h.Src` a `data:` URL, a file or an `http(s):` address; an SVG draws as inline `<svg>`
+  does), `canvas`, and `h.svg` with its `h.path`, `h.circle` and the rest: the whole `<svg>`
+  is one node, its `currentColor` is its `color`, and
+  the elements inside are its markup, so classes, styles and events go on the `<svg>`. A tag brings what it means, not how a browser draws it:
   `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
   `li` have theirs, and nothing has a default style.
 - **Style.** `h.Style` takes CSS values (`fontSize: "13px"`). `h.Class` matches rules in

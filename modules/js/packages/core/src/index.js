@@ -1,6 +1,6 @@
 // @silkui/core: the nodes of a Silk UI tree and their events, for JavaScript that runs on the
-// embedded SilkJS engine. The primitives are the tree's own (box, text, input, image, icon,
-// canvas); the methods and the event flow are the DOM's, so code written for the web reads
+// embedded SilkJS engine. The primitives are the tree's own (box, text, input, image, canvas)
+// and inline svg; the methods and the event flow are the DOM's, so code written for the web reads
 // the same here.
 //
 // Every call queues a mutation through the native `__ui` functions. The host applies the
@@ -523,6 +523,12 @@ export class Node {
       this.#identify(text);
     } else if (aria !== null) {
       native.attribute(this.nodeId, name, text);
+    } else if (name === "src") {
+      // An image's address, as `<img src>`.
+      if ("src" in this) this.src = text ?? "";
+      else warnOnce("only an image has a src: it is ignored");
+    } else if (name === "alt") {
+      native.attribute(this.nodeId, "label", text ?? "");
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -630,6 +636,7 @@ export class Text extends Node {
     if (value === this.#data && value !== "") return;
     this.#data = value;
     native.setText(this.nodeId, value);
+    if (this._svgText) svgChanged(this);
   }
 
   get textContent() {
@@ -677,8 +684,8 @@ export class Input extends Node {
   }
 }
 
-// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
-// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+// Inline SVG markup as icon resources: identical markup shares one, freed when no `<svg>`
+// shows it. The ids start high, clear of resources a host or a URL table numbers from 1.
 const ICONS = new Map();
 let nextIcon = 0x40000000;
 
@@ -701,36 +708,416 @@ function dropIcon(markup) {
   }
 }
 
+// Addresses as image resources, shared and freed as markup is. The tree keeps a load state per
+// number, so these count from 1. The loader tells an SVG file from a bitmap by itself.
+const ADDRESSES = new Map();
+let nextAddress = 1;
+
+function holdAddress(url) {
+  let entry = ADDRESSES.get(url);
+  if (!entry) {
+    entry = { id: nextAddress++, count: 0 };
+    ADDRESSES.set(url, entry);
+    native.load(entry.id, url, false);
+  }
+  entry.count++;
+  return entry.id;
+}
+
+function dropAddress(url) {
+  const entry = ADDRESSES.get(url);
+  if (entry && --entry.count === 0) {
+    ADDRESSES.delete(url);
+    native.release(entry.id);
+  }
+}
+
 /**
- * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
- * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
- * text color, and any other keeps its own colors.
+ * An image, as an `<img>`: `src` is its address, a `data:` URL (base64 or percent-encoded),
+ * a file or `http(s):`. An SVG file draws as an inline `<svg>` does. It hears `load` and
+ * `error` when the address loads or fails.
  */
-export class Icon extends Node {
-  #svg = "";
+export class Image extends Node {
+  #src = "";
 
-  constructor(svg = "") {
-    super("icon");
-    this.svg = svg;
+  constructor(src = "") {
+    super("image");
+    this.src = src;
   }
 
-  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
-  get svg() {
-    return this.#svg;
+  get src() {
+    return this.#src;
   }
 
-  set svg(markup) {
-    markup = markup == null ? "" : String(markup);
-    if (markup === this.#svg) return;
-    if (this.#svg) dropIcon(this.#svg);
-    this.#svg = markup;
-    native.source(this.nodeId, markup ? holdIcon(markup) : 0);
+  set src(url) {
+    url = url == null ? "" : String(url);
+    if (url === this.#src) return;
+    if (this.#src) dropAddress(this.#src);
+    this.#src = url;
+    native.source(this.nodeId, url ? holdAddress(url) : 0);
   }
 
   _forget() {
-    if (this.#svg) dropIcon(this.#svg);
-    this.#svg = "";
+    if (this.#src) dropAddress(this.#src);
+    this.#src = "";
   }
+}
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+
+// SVG attribute names that are camel case in SVG itself. Any other name with a capital letter
+// is a React-style spelling of a hyphenated one (`strokeWidth` for `stroke-width`).
+const SVG_CAMEL = new Set([
+  "viewBox", "preserveAspectRatio", "gradientUnits", "gradientTransform", "patternUnits",
+  "patternContentUnits", "patternTransform", "clipPathUnits", "maskUnits", "maskContentUnits",
+  "markerUnits", "markerWidth", "markerHeight", "refX", "refY", "spreadMethod", "stdDeviation",
+  "textLength", "lengthAdjust", "startOffset", "pathLength", "baseFrequency", "numOctaves",
+  "filterUnits", "primitiveUnits", "kernelMatrix", "kernelUnitLength", "tableValues",
+  "surfaceScale", "specularConstant", "specularExponent", "diffuseConstant", "limitingConeAngle",
+  "pointsAtX", "pointsAtY", "pointsAtZ", "edgeMode", "targetX", "targetY", "xChannelSelector",
+  "yChannelSelector", "attributeName", "attributeType", "calcMode", "keyTimes", "keySplines",
+  "keyPoints", "repeatCount", "repeatDur", "systemLanguage", "requiredFeatures", "zoomAndPan",
+  "glyphRef", "stitchTiles", "viewTarget", "contentScriptType", "contentStyleType",
+]);
+const SVG_NAMES = new Map([
+  ["className", "class"], ["htmlFor", "for"], ["xlinkHref", "xlink:href"], ["xlinkTitle", "xlink:title"],
+  ["xmlSpace", "xml:space"], ["xmlLang", "xml:lang"], ["xmlnsXlink", "xmlns:xlink"],
+]);
+
+function svgName(name) {
+  name = String(name);
+  const named = SVG_NAMES.get(name);
+  if (named) return named;
+  if (SVG_CAMEL.has(name) || !/[A-Z]/.test(name)) return name;
+  return name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
+}
+
+function escaped(text, attribute) {
+  text = String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  return attribute ? text.replace(/"/g, "&quot;") : text;
+}
+
+// The svg roots whose markup changed, drawn again once, before the host applies the mutations.
+const changedSvgs = new Set();
+
+function drawSvgs() {
+  for (const svg of changedSvgs) svg._draw();
+  changedSvgs.clear();
+}
+
+/** The element of `node` in an `<svg>` subtree: its text, or its element. */
+function svgOwner(node) {
+  for (let at = node; at; at = at.parentNode) if (at instanceof Svg) return at;
+  return null;
+}
+
+function svgChanged(node) {
+  const svg = svgOwner(node);
+  if (!svg || changedSvgs.has(svg)) return;
+  if (changedSvgs.size === 0) queueMicrotask(drawSvgs);
+  changedSvgs.add(svg);
+}
+
+function svgStyle(value) {
+  if (typeof value !== "object" || value === null) return String(value);
+  let css = "";
+  for (const name of Object.keys(value)) {
+    const part = value[name];
+    if (part === null || part === undefined || part === "") continue;
+    css += cssName(name) + ":" + (typeof part === "number" && !UNITLESS.has(name) ? part + "px" : part) + ";";
+  }
+  return css;
+}
+
+// The children of an element of an `<svg>`: the markup they write, and how they move.
+const svgChildren = {
+  insertBefore(child, before = null) {
+    if (before && before.parentNode !== this) throw new Error("the node to insert before is not a child of this node");
+    if (before === child) return child;
+    for (let at = this; at; at = at.parentNode) if (at === child) throw new Error("a node cannot be inserted into itself or its own subtree");
+    const old = child.parentNode;
+    if (old) {
+      svgChanged(old);
+      old.childNodes.splice(old.childNodes.indexOf(child), 1);
+    }
+    child.parentNode = this;
+    if (before) this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
+    else this.childNodes.push(child);
+    if (child instanceof Text) child._svgText = true;
+    svgChanged(this);
+    return child;
+  },
+  appendChild(child) {
+    return this.insertBefore(child, null);
+  },
+  append(...children) {
+    for (const child of children) this.insertBefore(typeof child === "string" ? new SvgText(child) : child, null);
+  },
+  removeChild(child) {
+    if (child.parentNode !== this) throw new Error("the node to remove is not a child of this node");
+    svgChanged(this);
+    this.childNodes.splice(this.childNodes.indexOf(child), 1);
+    child.parentNode = null;
+    return child;
+  },
+  get textContent() {
+    let text = "";
+    for (const child of this.childNodes) text += child.textContent ?? child.data ?? "";
+    return text;
+  },
+  set textContent(value) {
+    for (const child of this.childNodes.slice()) this.removeChild(child);
+    if (value !== null && value !== undefined && value !== "") this.insertBefore(new SvgText(String(value)), null);
+  },
+  _markupOf(children) {
+    let markup = "";
+    for (const child of children) {
+      if (child instanceof SvgElement) markup += child._markup();
+      else markup += escaped(child.data ?? "", false);
+    }
+    return markup;
+  },
+};
+
+/** Text in an `<svg>`: its `<text>` and `<title>` contents. */
+export class SvgText {
+  #data;
+
+  constructor(data = "") {
+    this.#data = String(data);
+    this.parentNode = null;
+    this.childNodes = NO_CHILDREN;
+  }
+
+  get data() {
+    return this.#data;
+  }
+
+  set data(value) {
+    value = String(value);
+    if (value === this.#data) return;
+    this.#data = value;
+    svgChanged(this);
+  }
+
+  get textContent() {
+    return this.#data;
+  }
+
+  set textContent(value) {
+    this.data = value;
+  }
+
+  get nextSibling() {
+    const siblings = this.parentNode?.childNodes;
+    return siblings ? siblings[siblings.indexOf(this) + 1] ?? null : null;
+  }
+
+  get previousSibling() {
+    const siblings = this.parentNode?.childNodes;
+    return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
+  }
+
+  contains(other) {
+    for (let node = other; node; node = node.parentNode) if (node === this) return true;
+    return false;
+  }
+
+  remove() {
+    this.parentNode?.removeChild(this);
+  }
+
+  destroy() {
+    this.remove();
+  }
+}
+
+/**
+ * An element inside an `<svg>`: `path`, `circle`, `g`, `linearGradient` and the rest. It is
+ * no node of the tree: it is markup its `Svg` root draws. Its attributes take SVG's names or
+ * React's spellings (`strokeWidth`, `xlinkHref`).
+ */
+export class SvgElement {
+  #attributes = new Map();
+
+  constructor(tag) {
+    this.localName = String(tag);
+    this.tagName = this.localName;
+    this.namespaceURI = SVG_NAMESPACE;
+    this.parentNode = null;
+    this.childNodes = [];
+  }
+
+  getAttribute(name) {
+    return this.#attributes.get(svgName(name)) ?? null;
+  }
+
+  hasAttribute(name) {
+    return this.#attributes.has(svgName(name));
+  }
+
+  setAttribute(name, value) {
+    name = svgName(name);
+    if (value === null || value === undefined || value === false) {
+      this.removeAttribute(name);
+      return;
+    }
+    const text = name === "style" ? svgStyle(value) : String(value);
+    if (this.#attributes.get(name) === text) return;
+    this.#attributes.set(name, text);
+    svgChanged(this);
+  }
+
+  removeAttribute(name) {
+    if (this.#attributes.delete(svgName(name))) svgChanged(this);
+  }
+
+  get firstChild() {
+    return this.childNodes[0] ?? null;
+  }
+
+  get lastChild() {
+    return this.childNodes[this.childNodes.length - 1] ?? null;
+  }
+
+  get nextSibling() {
+    const siblings = this.parentNode?.childNodes;
+    return siblings ? siblings[siblings.indexOf(this) + 1] ?? null : null;
+  }
+
+  get previousSibling() {
+    const siblings = this.parentNode?.childNodes;
+    return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
+  }
+
+  contains(other) {
+    for (let node = other; node; node = node.parentNode) if (node === this) return true;
+    return false;
+  }
+
+  remove() {
+    this.parentNode?.removeChild(this);
+  }
+
+  /** Takes the element out of its `<svg>`. It is plain markup, so nothing else is freed. */
+  destroy() {
+    this.remove();
+  }
+
+  addEventListener(type) {
+    warnOnce("an element inside an <svg> hears no events: listen on the <svg> ('" + type + "')");
+  }
+
+  removeEventListener() {}
+
+  _markup() {
+    let markup = "<" + this.localName;
+    for (const [name, value] of this.#attributes) markup += " " + name + '="' + escaped(value, true) + '"';
+    if (this.childNodes.length === 0) return markup + "/>";
+    return markup + ">" + svgChildren._markupOf(this.childNodes) + "</" + this.localName + ">";
+  }
+}
+
+for (const name of ["insertBefore", "appendChild", "append", "removeChild"]) SvgElement.prototype[name] = svgChildren[name];
+Object.defineProperty(SvgElement.prototype, "textContent", Object.getOwnPropertyDescriptor(svgChildren, "textContent"));
+
+// Attributes of an `<svg>` root the tree has: they go to its node. Every other one is markup.
+function treeAttribute(name) {
+  return name === "class" || name === "className" || name === "id" || name === "role" || name === "tabIndex"
+    || name === "tabindex" || name === "testId" || name === "label" || name === "cursor" || name === "transition"
+    || name === "inert" || name === "disabled" || name === "element" || name === "lang" || name === "dir"
+    || name.startsWith("data-") || ariaName(name) !== null;
+}
+
+/**
+ * An inline `<svg>`, as the web has it: its children are `SvgElement`s and `SvgText`s, and
+ * the tree draws the markup they make as an icon. Its look, class, events and accessibility
+ * are the node's; `viewBox`, `fill`, `width` and the other SVG attributes are markup.
+ * Changes are drawn once, before the host applies the batch.
+ */
+export class Svg extends Node {
+  #attributes = new Map();
+  #markup = "";
+
+  constructor() {
+    // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
+    super("icon");
+    this.kind = "svg";
+    this.localName = "svg";
+    this.tagName = "svg";
+    this.namespaceURI = SVG_NAMESPACE;
+    svgChanged(this);
+  }
+
+  getAttribute(name) {
+    return treeAttribute(String(name)) ? super.getAttribute(name) : this.#attributes.get(svgName(name)) ?? null;
+  }
+
+  setAttribute(name, value) {
+    name = String(name);
+    if (treeAttribute(name)) {
+      super.setAttribute(name === "tabindex" ? "tabIndex" : name, value);
+      return;
+    }
+    name = svgName(name);
+    if (name === "xmlns") return;
+    if (value === null || value === undefined || value === false || value === "") {
+      this.removeAttribute(name);
+      return;
+    }
+    const text = name === "style" ? svgStyle(value) : String(value);
+    if (this.#attributes.get(name) === text) return;
+    this.#attributes.set(name, text);
+    svgChanged(this);
+  }
+
+  removeAttribute(name) {
+    name = String(name);
+    if (treeAttribute(name)) super.removeAttribute(name);
+    else if (this.#attributes.delete(svgName(name))) svgChanged(this);
+  }
+
+  /** The markup the tree draws, as `outerHTML` gives it. */
+  get outerHTML() {
+    let markup = '<svg xmlns="' + SVG_NAMESPACE + '"';
+    const children = svgChildren._markupOf(this.childNodes);
+    let xlink = this.#attributes.has("xmlns:xlink");
+    for (const [name, value] of this.#attributes) {
+      markup += " " + name + '="' + escaped(value, true) + '"';
+    }
+    if (!xlink && children.includes("xlink:")) markup += ' xmlns:xlink="http://www.w3.org/1999/xlink"';
+    return markup + ">" + children + "</svg>";
+  }
+
+  _draw() {
+    if (!nodes.has(this.nodeId)) return;
+    const markup = this.outerHTML;
+    if (markup === this.#markup) return;
+    this._forget();
+    this.#markup = markup;
+    native.source(this.nodeId, holdIcon(markup));
+  }
+
+  _forget() {
+    if (this.#markup) dropIcon(this.#markup);
+    this.#markup = "";
+  }
+}
+
+for (const name of ["insertBefore", "appendChild", "append", "removeChild"]) Svg.prototype[name] = svgChildren[name];
+Object.defineProperty(Svg.prototype, "textContent", Object.getOwnPropertyDescriptor(svgChildren, "textContent"));
+
+/**
+ * An element of tag `tag` in the SVG namespace: an `Svg` root for `svg`, an `SvgElement`
+ * inside one for anything else. `document.createElementNS` with the SVG namespace, as it were.
+ */
+export function createSvgElement(tag) {
+  return tag === "svg" ? new Svg() : new SvgElement(tag);
+}
+
+/** Draws the `<svg>` roots that changed now, instead of before the host applies the batch. */
+export function flushSvg() {
+  drawSvgs();
 }
 
 // Offsets cross the bridge as UTF-8 bytes; a rich input speaks JavaScript string indices.
@@ -931,10 +1318,12 @@ function forget(node) {
 
 export function createNode(kind) {
   if (kind === "richinput") return new RichInput();
-  if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
+  if (kind === "svg") return new Svg();
+  if (kind === "img") kind = "image";
+  if (!(kind in KINDS) || kind === "icon") throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
-  if (kind === "icon") return new Icon();
+  if (kind === "image") return new Image();
   return new Node(kind);
 }
 
@@ -950,11 +1339,11 @@ export function createText(data = "") {
   return new Text(data);
 }
 
-/** An icon showing `svg` markup, with `style` as its base look. */
-export function createIcon(svg, style) {
-  const icon = new Icon(svg);
-  if (style) icon.style.set(style);
-  return icon;
+/** An image showing `src` (see `Image`), with `style` as its base look. */
+export function createImage(src, style) {
+  const image = new Image(src);
+  if (style) image.style.set(style);
+  return image;
 }
 
 export function createInput(style) {

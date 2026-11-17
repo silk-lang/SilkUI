@@ -12,7 +12,7 @@ export function installMock() {
   for (const name of [
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
-    "defineIcon", "source", "release",
+    "defineIcon", "source", "release", "load",
     "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",
     "shell",

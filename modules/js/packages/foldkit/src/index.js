@@ -8,7 +8,8 @@
 //   Runtime.run(Runtime.makeApplication({ ..., container: document.getElementById("root") }));
 //
 // Every tag is a box except <input> and <textarea> (the tree's input), <img> (image),
-// <icon> and <canvas>. Elements are styled with `h.Style`; the looks the tree lays over an
+// <canvas> and <svg>, whose elements are the markup of one node. Elements are
+// styled with `h.Style`; the looks the tree lays over an
 // element in a state come from the attributes below.
 import "./dom.js";
 
@@ -29,6 +30,3 @@ export const FocusStyle = look("focusStyle");
 export const FocusVisibleStyle = look("focusVisibleStyle");
 /** What its transitions start from when it first shows, as `@starting-style`. */
 export const StartingStyle = look("startingStyle");
-
-/** The SVG markup an `icon` element draws, with the element's `color` as `currentColor`. */
-export const Svg = (markup) => Prop("svg", markup);

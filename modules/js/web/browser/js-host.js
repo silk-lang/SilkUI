@@ -24,7 +24,7 @@ const OP = {
   create: 1, append: 2, insertBefore: 3, root: 4, setText: 5, listen: 6, style: 7, clearStyle: 8,
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
-  richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27,
+  richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -155,6 +155,7 @@ export class JsHost {
       fontFamily(id, names) { write(OP.fontFamily, id); calls.text(names); },
       defineIcon(resource, markup) { write(OP.defineIcon, resource); calls.text(markup); },
       source(id, resource) { write(OP.source, id); calls.u32(resource); },
+      load(resource, url, icon) { write(OP.load, resource); calls.text(url); calls.byte(icon ? 1 : 0); },
       release(resource) { write(OP.release, resource); },
       keyframe(offset, css) { calls.byte(OP.keyframe); calls.f64(offset); calls.text(css); host.queueWake(); },
       keyframes(name) { calls.byte(OP.keyframes); calls.text(name); host.queueWake(); },

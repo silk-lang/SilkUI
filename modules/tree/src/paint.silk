@@ -1106,7 +1106,15 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
   let s = p.scale
   let content = device(contentBox(f), s)
   let corners = scaledCorners(radiiOf(&p.*, slot, &c, f), s)
-  if kind == NodeKind.Image {
+  // An image showing an SVG file draws it as an icon.
+  let bitmap = match p.resources.get(resource) {
+    Option<Resource>.Some { value } => match value {
+      Resource.Image { .. } => true
+      Resource.Icon { .. } => false
+    }
+    Option<Resource>.None => true
+  }
+  if kind == NodeKind.Image && bitmap {
     if let Option<Resource>.Some { value } = p.resources.get(resource) {
       if let Resource.Image { image, width, height } = value {
         let tile = run p.resources.imageTile(&mut p.atlas, image)
@@ -1135,7 +1143,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
         }
       }
     }
-  } else if kind == NodeKind.Icon {
+  } else if kind == NodeKind.Icon || kind == NodeKind.Image {
     if let Option<Resource>.Some { value } = p.resources.get(resource) {
       if let Resource.Icon { icon } = value {
         // An SVG keeps its aspect in a box of another shape (xMidYMid meet).
@@ -1784,6 +1792,31 @@ fn localInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
   return total
 }
 
+/// How far to move a transformed layer whose content covers `bounds` (device pixels, before
+/// `matrix`) so the part of it that can land inside `mask` lies inside the `width` by `height`
+/// target, in whole pixels. Zero when it already does.
+fn layerShift(matrix: Matrix3<f32>, bounds: Rect<f32>, mask: Rect<f32>, width: f32, height: f32) -> [f32; 2] {
+  if bounds.xMin >= 0.0 && bounds.yMin >= 0.0 && bounds.xMax <= width && bounds.yMax <= height {
+    return [0.0, 0.0]
+  }
+  let target = Rect<f32>.new(f32.max(mask.xMin, 0.0), f32.max(mask.yMin, 0.0), f32.min(mask.xMax, width), f32.min(mask.yMax, height))
+  let mut visible = bounds
+  if let Option.Some { value } = matrix.inverse() {
+    let back = transform.mapRect(&value, target)
+    visible = Rect<f32>.new(
+      f32.max(bounds.xMin, back.xMin),
+      f32.max(bounds.yMin, back.yMin),
+      f32.min(bounds.xMax, back.xMax),
+      f32.min(bounds.yMax, back.yMax),
+    )
+  }
+  if visible.xMin >= 0.0 && visible.yMin >= 0.0 && visible.xMax <= width && visible.yMax <= height
+    || visible.xMax <= visible.xMin || visible.yMax <= visible.yMin {
+    return [0.0, 0.0]
+  }
+  return [-f32.floor(visible.xMin), -f32.floor(visible.yMin)]
+}
+
 /// Paints fragment `index` through its transform, if it has one: a plain move is a scroll group
 /// with a fixed offset, anything else a layer drawn through the matrix. Inside, the subtree
 /// paints in its own layout space with an unbounded mask, so its cached paint replays however
@@ -1826,15 +1859,44 @@ effect fn paintTransformed(p: &mut Painter<'_, '_>, index: usize, mask: ContentM
   let a = flat.values
   let onDevice = Matrix3<f32>.new([a[0], a[1], a[2] / s, a[3], a[4], a[5] / s, a[6] * s, a[7] * s, a[8]])
   let bounds = device(localInk(&p.*, index), s)
+  // The layer is drawn into a target-sized texture before the matrix maps it, so its visible
+  // part must lie inside the target: shift it there and fold the shift into the matrix.
+  let shift = layerShift(onDevice, bounds, mask.bounds, p.width * s, p.height * s)
+  let tx = shift[0]
+  let ty = shift[1]
+  let shifted = tx != 0.0 || ty != 0.0
+  let b = onDevice.values
+  let matrix = if shifted {
+    Matrix3<f32>.new([
+      b[0], b[1], b[2], b[3], b[4], b[5],
+      b[6] - b[0] * tx - b[3] * ty,
+      b[7] - b[1] * tx - b[4] * ty,
+      b[8] - b[2] * tx - b[5] * ty,
+    ])
+  } else {
+    onDevice
+  }
+  let placed = Rect<f32>.new(bounds.xMin + tx, bounds.yMin + ty, bounds.xMax + tx, bounds.yMax + ty)
   drop run p.scene.pushTransformLayer(
-    bounds,
+    placed,
     mask,
     Isolation { opacity: 1.0, blend: 0 },
-    onDevice,
+    matrix,
   )
+  if shifted {
+    let fixed = ScrollAxis { factor: 0.0, base: 0.0, low: -UNBOUNDED_INK, high: UNBOUNDED_INK }
+    let mut x = fixed
+    x.base = tx
+    let mut y = fixed
+    y.base = ty
+    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, everywhere(), placed)
+  }
   p.cull = everywhere()
   run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
   p.cull = saved
+  if shifted {
+    run p.scene.popScrollGroup()
+  }
   run p.scene.popLayer()
 }
 

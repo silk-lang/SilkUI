@@ -155,7 +155,7 @@ import layout.lib {
   InvalidNode,
   NaturalDimensions,
   Style as CssStyle,
-  Dimension
+  SizeValue
 }
 import layout.lib as Engine
 import silk.collections.bytes { Bytes }
@@ -172,6 +172,7 @@ import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.num.f32
+import silk.num.f64
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
@@ -936,8 +937,8 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut viewport = CssStyle.make()
-    viewport.width = Dimension.px(0.0)
-    viewport.height = Dimension.px(0.0)
+    viewport.width = SizeValue.px(0.0)
+    viewport.height = SizeValue.px(0.0)
     let mut layout = run Tree.make(move viewport)
 
     // Scroll and sticky offsets are applied when painting, so scrolling needs no layout.
@@ -1289,11 +1290,23 @@ impl<'a> UiTree<'a> {
     self.restyleLocal(slot)
   }
 
+  /// The node at `slot` shows another moment of an animation or transition: it applies its
+  /// declarations again, with the match and the variables it has.
+  pub fn restyleTick(self: &mut Self, slot: u32) -> () {
+    let clean = !self.node(slot).styleDirty
+    self.restyleLocal(slot)
+    if clean {
+      let nodes = self.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].styleTick = true
+    }
+  }
+
   // Callers must rule out selector changes outside this subtree and changed variable inputs.
   pub fn restyleLocal(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
     nodes[u32.toUsize(slot)].styleDirty = true
+    nodes[u32.toUsize(slot)].styleTick = false
     let mut up = nodes[u32.toUsize(slot)].parent
     while up != NONE {
       let at = u32.toUsize(up)
@@ -2254,9 +2267,10 @@ impl<'a> UiTree<'a> {
         }
         match self.resources.get(resource) {
           Option<Resource>.Some { value } => {
+            // An image shows an SVG file as an icon, as an `<img>` shows one.
             let matches = match value {
               Resource.Image { .. } => kind == NodeKind.Image
-              Resource.Icon { .. } => kind == NodeKind.Icon
+              Resource.Icon { .. } => true
             }
             if !matches {
               fail TreeError.WrongKind { index: index, id: id }
@@ -2523,6 +2537,7 @@ impl<'a> UiTree<'a> {
       hovered: false,
       pressed: false,
       styleDirty: true,
+      styleTick: false,
       gridDeclared: false,
       gridStyled: false,
       styleNeedsContext: false,
@@ -3957,20 +3972,35 @@ impl<'a> UiTree<'a> {
     let fontSize = self.node(slot).computed.text.size
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
-    if kind == NodeKind.Image {
-      if let Option<Resource>.Some { value } = self.resources.get(resource) {
-        if let Resource.Image { width, height, .. } = value {
+    if kind != NodeKind.Image && kind != NodeKind.Icon {
+      return ()
+    }
+    let shown = self.resources.get(resource)
+    if let Option<Resource>.Some { value } = shown {
+      match value {
+        Resource.Image { width, height, .. } => {
           natural.size = OptionalSize.definite(u32.toF32(width), u32.toF32(height))
           if height != 0 {
             natural.aspectRatio = u32.toF32(width) / u32.toF32(height)
+          }
+        }
+        // The root's own width and height, as an inline `<svg>` has; a square of the
+        // font size where it gives none.
+        Resource.Icon { icon } => {
+          let width = self.resources.iconWidth(icon)
+          let height = self.resources.iconHeight(icon)
+          if width > 0.0 && height > 0.0 {
+            natural.size = OptionalSize.definite(f64.toF32(width), f64.toF32(height))
+            natural.aspectRatio = f64.toF32(width / height)
+          } else {
+            natural.size = OptionalSize.definite(fontSize, fontSize)
+            natural.aspectRatio = 1.0
           }
         }
       }
     } else if kind == NodeKind.Icon {
       natural.size = OptionalSize.definite(fontSize, fontSize)
       natural.aspectRatio = 1.0
-    } else {
-      return ()
     }
     let key = u32.toUsize(slot)
     let changed = key >= self.provider.naturals.length()
@@ -4850,6 +4880,7 @@ impl<'a> UiTree<'a> {
       let forced = full || rootFontChanged || u64.shiftRight(entry, 32) != 0
       let node = self.node(slot)
       let own = forced || node.styleDirty
+      let tick = !forced && node.styleTick
       let below = node.subtreeDirty
       let mut changed = full
       if own {
@@ -4862,7 +4893,8 @@ impl<'a> UiTree<'a> {
         let wasRendered = node.rendered
         let containment = node.computed.contain.query()
         let skips = node.computed.contain.hidden()
-        let namesChanged = run self.resolve(slot)
+        let namesChanged = run self.resolve(slot, tick)
+        self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
@@ -4870,7 +4902,8 @@ impl<'a> UiTree<'a> {
         if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
-        changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        // A tick leaves the variables below as they were: only inherited values can pass on.
+        changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || &barColors != &after.scroll.colors || &listStyle != &after.list
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
@@ -4879,6 +4912,7 @@ impl<'a> UiTree<'a> {
       }
       let cleared = self.nodeMut(slot)
       cleared.styleDirty = false
+      cleared.styleTick = false
       cleared.subtreeDirty = false
       if changed || below {
         let flag: u64 = if changed { 0x100000000 } else { 0 }
@@ -4992,10 +5026,10 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  effect fn resolve(self: &mut Self, slot: u32) -> bool
+  effect fn resolve(self: &mut Self, slot: u32, tick: bool) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
+    if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -5782,8 +5816,8 @@ impl<'a> UiTree<'a> {
     if self.input.width != self.styledViewport.width
       || self.input.height != self.styledViewport.height {
       let mut viewport = CssStyle.make()
-      viewport.width = Dimension.px(self.input.width)
-      viewport.height = Dimension.px(self.input.height)
+      viewport.width = SizeValue.px(self.input.width)
+      viewport.height = SizeValue.px(self.input.height)
       let viewportId = self.layout.root()
       run Effect.catchAll(self.layout.setStyle(viewportId, move viewport), layoutFailed)
       self.styledViewport = self.input
@@ -6429,8 +6463,9 @@ fn tableSpans(node: &Node, layout: &mut CssStyle) {
   }
 }
 
-/// Whether `url` names an SVG file, which loads as an icon.
-fn isSvgUrl(url: &[u8]) -> bool {
+/// Whether `url` names an SVG file: a `.svg` path (before any query or fragment) or a
+/// `data:image/svg` URL.
+pub fn isSvgUrl(url: &[u8]) -> bool {
   let svg = b".svg"
   let data = b"data:image/svg"
   let mut end = url.length
