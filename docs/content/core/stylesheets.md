@@ -61,32 +61,121 @@ Selectors read element tags, IDs, classes, named attributes and state. `data-*` 
 
 ## Tailwind
 
-Tailwind runs before the UI pipeline. Silk UI itself has no Tailwind dependency and can consume CSS from other processors too.
+Tailwind writes a CSS file from the classes it finds in your source, and the app loads that file like any other stylesheet. Silk UI itself has no Tailwind dependency.
 
-For a Loom app, use the optional `ui-tailwind` tasks package. Its `Tailwind.make("styles/input.css", "styles/app.css")` step builds the output before `App.build`; `processor.watching(...)` keeps its scanner running around a development task. The helper uses the project's installed CLI or the standalone version and SHA-256 pinned in `tailwind.lock.json`. A standalone build needs no Node installation.
+::demo inbox-tailwind
 
-```css
-@import "tailwindcss" source(none);
-@source "../src/**/*.silk";
+Move the pointer over a row and over the Dark button, click a row, switch the theme. Every style here is a Tailwind class in the view:
+
+::source examples/src/core/inbox_tailwind.silk
+
+### Start with a template
+
+The quickest way is a template that has everything below in place:
+
+```sh
+silk init my-app -t ui-loom-tailwind
+cd my-app
+silk task dev
 ```
+
+`ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` do the same for JavaScript apps.
+
+### Add Tailwind to a Loom app
+
+1. Add the Tailwind step to the tasks dependencies in `silk.toml`, at the same revision as `silkui`:
+
+   ```toml
+   [profiles.tasks.dependencies]
+   silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "<rev>", path = "modules/silkui", package = "silkui" }
+   tailwind = { git = "https://github.com/silk-lang/silkui.git", rev = "<rev>", path = "modules/tailwind", package = "ui-tailwind" }
+   ```
+
+2. Choose where Tailwind comes from. Either install it in the project with `npm install tailwindcss @tailwindcss/cli`, or copy [`tailwind.lock.json`](https://github.com/silk-lang/SilkUI/blob/main/modules/tailwind/tailwind.lock.json) into the project. With the lock file, the step downloads the standalone Tailwind program once, checks its SHA-256 and caches it, so the project needs no Node installation.
+
+3. Write `styles/input.css`. It imports Tailwind and names the Silk files to read classes from:
+
+   ```css
+   @import "tailwindcss" source(none);
+   @source "../src/**/*.silk";
+   ```
+
+4. In `src/tasks.silk`, load the file Tailwind writes, and run Tailwind around the build:
+
+   ```silk
+   import tailwind.tailwind { Tailwind }
+
+   effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
+     return run App.make("my-app")
+       |> App.framework(Framework.loom("app"))
+       |> App.stylesheet("styles/app.css")
+       |> App.target(Target.window(Window { title: "My app", width: 420.0, height: 200.0 }))
+   }
+   ```
+
+   ```silk
+   let processor = Tailwind.make("styles/input.css", "styles/app.css")
+   match move self {
+     // Builds the CSS, then keeps Tailwind watching while the app runs.
+     Tasks.Dev { target } => run processor.watching(app()
+       |> App.build(Mode.Dev)
+       |> Built.launch()
+       |> Running.watch())
+     Tasks.Build { target } => {
+       drop run processor.build()
+       run app() |> App.build(Mode.Release) |> Built.write("dist")
+     }
+   }
+   ```
+
+5. Add `styles/app.css` to `.gitignore`: it is build output.
+
+6. Use classes in the view, and run `silk task dev`. Saving a Silk file adds its new classes to the sheet, and the running app takes the new sheet without losing its state.
+
+The [Tailwind step's page](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) covers musl Linux, a project in a subfolder and updating the pinned version.
+
+### Classes in the view
+
+Tailwind finds classes by reading your source as text, so each class has to appear whole in a string. `"bg-" + color` is invisible to it; `if danger { "bg-red-600" } else { "bg-teal-600" }` works.
+
+Class attributes on one node add up, so a node can take its classes in pieces instead of in one long string:
 
 ```silk
-h.box(&[h.class("flex gap-3 p-4")], children)
+h.box(&[
+  h.class("rounded-xl border p-4"),
+  h.classWhen(model.busy, "opacity-50"),
+  h.classSelect(chosen, "border-teal-700 bg-teal-50", "border-gray-300 bg-white"),
+  h.classes(&[CARD, SPACING]),
+], children)
 ```
 
-Class strings must be literal so Tailwind can find them. Classes assembled at runtime need an explicit source declaration in the Tailwind input.
+`classWhen` adds its classes while the condition holds. `classSelect` adds the first string while it holds and the second otherwise. `classes` adds every string in a list. `className` replaces what the node has so far.
 
-Here is the same plan picker with Tailwind classes. The two class lists of a card are written out whole, so Tailwind finds every class by reading the file:
+Here is the plan picker of this page again with Tailwind. A card's fixed classes are one attribute and the chosen look is another:
 
 ::source examples/src/core/plans_tailwind.silk
 
-Its input file names the Silk source to scan:
+### Variants
 
-::source styles/plans.tailwind.input.css
+The inbox above uses these, and the tests of the docs examples check each one on a real tree:
 
-The tests of the docs examples compile both sheets, adopt them on a tree and check the computed styles of the cards.
+| In the example | What it does |
+| --- | --- |
+| `hover:bg-teal-50`, `focus-visible:…`, `active:…` | The node's own pointer and focus state |
+| `group` on the row, `group-hover:opacity-100` inside it | A descendant follows the row's state |
+| `group-data-[state=read]:text-gray-500` | A descendant follows an attribute of the row, set with `h.attribute("data-state", …)` |
+| `peer` on the button, `peer-hover:opacity-100` after it | A later sibling follows the button's state |
+| `has-[.dot]:font-semibold` | The row follows what it contains |
+| `odd:bg-gray-50`, `last:rounded-b-xl` | Position among siblings |
+| `divide-y divide-gray-200` | Lines between children |
+| `dark:bg-gray-900` | A `dark` class on an ancestor, see below |
+| `text-[13px]`, `w-[min(100%,26rem)]` | Arbitrary values |
 
-The `ui-loom-tailwind`, `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` templates show the complete setup, and the `ui-loom-css`, `ui-react-css`, `ui-foldkit-css` and `ui-js-css` templates do the same with one plain CSS file. The original templates keep their style-object defaults. See the [Tailwind helper](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) for build and watch examples and platform support.
+Hover variants are written inside `@media (hover: hover)`. Windows and pages report a pointer that can hover; a tree you build yourself in a test needs `tree.setStylePreferences(Preferences.desktop(false))` first.
+
+Without configuration, `dark:` follows the system's color scheme. To switch it from your model, declare the variant in the input file and put the class on a node around the themed part with `h.classWhen(model.dark, "dark")`:
+
+::source styles/inbox.tailwind.input.css
 
 ## JavaScript apps
 
@@ -103,7 +192,7 @@ export default { plugins: [tailwind(), silk({ entry: "src/main.ts" })] };
 import "./app.css";
 ```
 
-`@silkui/vite` compiles Vite's processed CSS into `dist/app.sheet`; the app pipeline embeds it. Development CSS updates replace sheets in the running tree. React uses `className`, Foldkit uses `h.Class`, and core nodes expose `className`, `classList`, `id` and named attribute methods.
+`@silkui/vite` compiles Vite's processed CSS into `dist/app.sheet`; the app pipeline embeds it. Development CSS updates replace sheets in the running tree. React uses `className`, Foldkit uses `h.Class`, and core nodes expose `className`, `classList`, `id` and named attribute methods. In JavaScript, build conditional class strings as you would on the web, with template strings or a helper such as `clsx`; the same rule holds that each class appears whole in the source.
 
 To construct a sheet dynamically, enable `App.runtimeStylesheets()` for a release host. Development hosts already include the text compiler. After mounting a root:
 
@@ -115,7 +204,7 @@ sheet.replaceSync(".card { padding: 20px; }");
 root().adoptedStyleSheets = [sheet];
 ```
 
-`replace(text)` returns a promise. `CSSStyleSheet.fromCompiled(bytes)` and `replaceCompiled(bytes)` need no text compiler. Replacing a sheet preserves its place in the adoption order.
+These are the browser's names: `replaceSync(text)` compiles the text and swaps the rules before it returns, and returns nothing. `replace(text)` is the other one: it returns a promise that resolves to the sheet once the rules are in. `CSSStyleSheet.fromCompiled(bytes)` and `replaceCompiled(bytes)` need no text compiler. Replacing a sheet preserves its place in the adoption order.
 
 ## Runtime sources
 
