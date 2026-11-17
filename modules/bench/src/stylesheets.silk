@@ -14,15 +14,24 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 
 pub enum Step { Create, Idle, Class, Hover, Theme, Append, Style }
-pub enum Mode { Inline, Tailwind, Registered }
+pub enum Mode { Inline, Tailwind, Registered, SpaceY, Owl, Zebra }
 
 const BASE: string = "flex items-center gap-2 p-2 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white"
 const CELLS: [string; 3] = ["flex items-center gap-2", "p-2 rounded-lg", "flex flex-col p-2"]
+const EVEN: string = "flex items-center gap-2 p-2 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white even:bg-black"
 const CHANGED: string = "flex items-center gap-2 p-4 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white"
 
 fn color(white: bool) -> Rgba<f32> {
   let value: f32 = if white { 1.0 } else { 0.0 }
   return Rgba<f32> { r: value, g: value, b: value, a: 1.0 }
+}
+
+fn rootClasses(mode: Mode, dark: bool) -> string<'static> {
+  return match mode {
+    Mode.SpaceY => if dark { "space-y-2 divide-y divide-black dark" } else { "space-y-2 divide-y divide-black" }
+    Mode.Owl => if dark { "owl dark" } else { "owl" }
+    _ => if dark { "dark" } else { "" }
+  }
 }
 
 effect fn protocol(error: ProtocolError) -> never ! TreeError { fail error.error }
@@ -36,6 +45,7 @@ pub struct Rows<'a> {
   /// Odd rows have another padding, so no row equals the one before it and none can take its style.
   distinct: bool,
   sheet: bool,
+  mode: Mode,
   step: Step,
   changed: bool,
 }
@@ -48,11 +58,14 @@ impl<'a> Rows<'a> {
     let sheet = mode != Mode.Inline
     if sheet {
       let mut batch = Batch.make()
-      run batch.adoptStyleSheet(0, 1, Source.read("fixtures/rows.sheet"))
+      // `siblings.sheet` holds `+`, `~`, `:nth-child()` and `:has()` rules whichever of them a case uses.
+      let siblings = mode == Mode.SpaceY || mode == Mode.Owl || mode == Mode.Zebra
+      run batch.adoptStyleSheet(0, 1, if siblings { Source.read("fixtures/siblings.sheet") } else { Source.read("fixtures/rows.sheet") })
       if mode == Mode.Registered { run batch.adoptStyleSheet(0, 2, Source.read("fixtures/registered.sheet")) }
       run Effect.catch<ProtocolError>(fixture.tree.apply(run batch.take()), protocol)
+      run fixture.tree.setAttribute(fixture.root, Attribute.ClassName { value: run String.copy(rootClasses(mode, false)) })
     }
-    return Rows { fixture: move fixture, rows: List<BoxNode>.make(), count: count, cells: cells, distinct: distinct, sheet: sheet, step: step, changed: false }
+    return Rows { fixture: move fixture, rows: List<BoxNode>.make(), count: count, cells: cells, distinct: distinct, sheet: sheet, mode: mode, step: step, changed: false }
   }
 
   effect fn build(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -69,7 +82,7 @@ impl<'a> Rows<'a> {
     ])
     let wide = self.distinct && self.rows.length() % 2 == 1
     if self.sheet {
-      run self.fixture.tree.setAttribute(row, Attribute.ClassName { value: run String.copy(if wide { CHANGED } else { BASE }) })
+      run self.fixture.tree.setAttribute(row, Attribute.ClassName { value: run String.copy(if wide { CHANGED } else if self.mode == Mode.Zebra { EVEN } else { BASE }) })
     } else {
       run self.fixture.tree.setStyle(row, &[
         css.display(Keyword.Flex), css.alignItems(Align.Center), css.gap(px(8.0)), css.padding(px(if wide { 16.0 } else { 8.0 })),
@@ -100,8 +113,14 @@ impl<'a> Rows<'a> {
 
   effect fn verify(self: &Self) -> () ! TreeError {
     let engine = self.fixture.tree.engine()
-    let mut i: usize = 0
-    while i < self.rows.length() {
+    let count = self.rows.length()
+    // The rows a sibling or index rule tells apart: both ends and their neighbours.
+    let checked: [usize; 5] = [0, 1, 2, count - 2, count - 1]
+    let mut at: usize = 0
+    while at < checked.length {
+      let i = checked[at]
+      at = at + 1
+      if i >= count { continue }
       let node = engine.node(engine.slotOf(self.rows.asSlice()[i].id().raw()))
       let padded = (self.changed && self.step == Step.Class && i == 0) || (self.distinct && i % 2 == 1)
       let dark = self.changed && self.step == Step.Theme
@@ -109,14 +128,19 @@ impl<'a> Rows<'a> {
       let background: f32 = match node.computed.paint.background { Fill.Solid { color } => color.r _ => -1.0 }
       let expectedPadding: f32 = if padded { 16.0 } else { 8.0 }
       let expectedColor: f32 = if dark { 1.0 } else { 0.0 }
-      let expectedBackground: f32 = if dark || hovered { 0.0 } else { 1.0 }
+      let expectedBackground: f32 = if dark || hovered || (self.mode == Mode.Zebra && i % 2 == 1) { 0.0 } else { 1.0 }
+      let expectedTop: f32 = if self.mode == Mode.Owl && i != 0 { 8.0 } else { 0.0 }
+      let spaced = self.mode == Mode.SpaceY && i != count - 1
+      let expectedBottom: f32 = if spaced { 8.0 } else { 0.0 }
+      let expectedRule: f32 = if spaced { 1.0 } else { 0.0 }
       if node.computed.layout.width.value != 240.0 || node.computed.layout.height.value != 40.0
         || node.computed.layout.rowGap.value != 8.0 || node.computed.layout.columnGap.value != 8.0
         || node.computed.layout.padding.left.value != expectedPadding
+        || node.computed.layout.margin.top.value != expectedTop
+        || node.computed.layout.margin.bottom.value != expectedBottom
+        || node.computed.layout.border.bottom.value != expectedRule
         || background != expectedBackground
         || node.computed.text.color.r != expectedColor { fail TreeError.Layout }
-      if i == self.rows.length() - 1 { break }
-      i = self.rows.length() - 1
     }
   }
 }
@@ -165,7 +189,7 @@ impl<'a> Bench for Rows<'a> {
       } else if self.step == Step.Hover {
         run self.fixture.tree.dispatch(Input.moveTo(if self.changed { 20.0 } else { 1100.0 }, 20.0))
       } else if self.sheet {
-        run self.fixture.tree.setAttribute(self.fixture.root, Attribute.ClassName { value: run String.copy(if self.changed { "dark" } else { "" }) })
+        run self.fixture.tree.setAttribute(self.fixture.root, Attribute.ClassName { value: run String.copy(rootClasses(self.mode, self.changed)) })
       } else {
         let mut i: usize = 0
         while i < self.rows.length() {
