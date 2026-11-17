@@ -72,11 +72,18 @@ Frames include style resolution, layout and painting.
 the one before it and no row or cell can take its style from a neighbor: every element matches
 selectors itself, and a cell reuses a finished cascade only through the pass cache, across parents.
 
+`stylesheets::{SpaceY,Owl,Zebra}.{create,idle,theme,append_row}[Rows=1000,Cells=3]` adopt
+`fixtures/siblings.sheet`, a Tailwind sheet that also holds `peer-checked:`, `even:` and
+`has-[.flex]:` rules and `.owl > * + *`: a sibling combinator, an index test and `:has()`,
+whichever of them a case uses. `SpaceY` puts `space-y-2 divide-y divide-black` on the list,
+`Owl` the `owl` class, and `Zebra` gives every row `even:bg-black`. Each case checks the rows
+at both ends and their neighbours.
+
 `RegisteredTailwind` runs the same seven Tailwind scenarios with a second compiled sheet,
 `fixtures/registered.css`. It adds a non-inheriting registered length, declares it on each row,
 and reads it for the unchanged 8 px gap. This exercises both registration-default isolation and
 repeated custom-property scopes without changing row geometry or visual results. The compiler
-script regenerates both binary fixtures.
+script regenerates every binary fixture.
 
 The Tailwind fixture includes preflight and was generated with `tailwindcss@4.3.5` and
 `@tailwindcss/cli@4.3.5` from `fixtures/rows.input.css`. The benchmark embeds `rows.sheet`:
@@ -86,6 +93,7 @@ repository root:
 
 ```sh
 tailwindcss -i modules/bench/fixtures/rows.input.css -o modules/bench/fixtures/rows.css
+tailwindcss -i modules/bench/fixtures/siblings.input.css -o modules/bench/fixtures/siblings.css
 node modules/bench/scripts/compile-stylesheet.mjs
 ```
 
@@ -404,3 +412,36 @@ Creating the 1,000 rows with styled children now costs 3.4% more than inline sty
 and their theme change 1.12 times the inline update (was 3.1 times). Flat rows cost the same
 to create as inline rows and 7% less to re-theme. Inline-styled trees pay up to 0.2% more per
 total and 0.6% to 1.3% more per theme change for the stamp. All 31 stylesheet result checks pass.
+
+### Sharing under sibling, index and `:has()` rules
+
+One rule with `+`, `~`, `:nth-*()`, `*-of-type` or `:has()` in a root's sheets used to switch
+the sharing of matched styles and computed values off for every element under it. A record
+now keeps what its match really read. An element no such test looked at shares as before. A
+match that read siblings or an index is shared with an element whose reachable siblings and
+index agree, within the bounds the sheets give: the earlier siblings one selector's steps
+reach, the period of the index tests, and the lead and tail of indexes they tell apart. A
+match that read descendants, or an ancestor's siblings, index or descendants, is not shared.
+
+Measured as above on SilkUI `fecfb05` with and without the change.
+
+| Operation `[Rows=1000,Cells=3]` | Before | After |
+| --- | ---: | ---: |
+| SpaceY create | 598,315,646 | 157,373,959 |
+| SpaceY theme minus idle | 478,542,565 | 38,458,889 |
+| SpaceY append_row minus idle | 494,748,244 | 59,405,876 |
+| Owl create | 584,196,296 | 156,709,637 |
+| Owl theme minus idle | 467,469,176 | 38,169,496 |
+| Owl append_row minus idle | 483,093,885 | 58,825,493 |
+| Zebra create | 637,488,379 | 157,639,067 |
+| Zebra theme minus idle | 524,130,453 | 38,915,770 |
+| Zebra append_row minus idle | 536,053,967 | 59,573,536 |
+| Tailwind create | 145,210,555 | 145,433,263 |
+| Tailwind theme minus idle | 27,173,758 | 27,267,207 |
+| Tailwind create `[Rows=1000]` | 81,562,205 | 81,666,067 |
+| Inline create | 140,606,391 | 140,517,616 |
+
+The three lists cost a quarter of what they did to create and a twelfth to re-theme. Trees
+whose sheets hold none of these rules pay about 0.15% for recording what a match read. A row
+added under such a sheet still restyles its parent's whole list, which is why `append_row`
+stays at 2.6 times the plain Tailwind case (22.8M).
