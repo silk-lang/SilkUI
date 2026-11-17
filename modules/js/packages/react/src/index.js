@@ -25,7 +25,7 @@ import { createContext } from "react";
 import { RichInput, createNode, createText, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
-const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout"]);
+const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
 const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "svg", "document", "defaultDocument", "marks", "atoms"]);
 
 let updatePriority = 0;

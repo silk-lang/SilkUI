@@ -26,7 +26,9 @@ const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
-const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup"]);
+const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop"]);
+// Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
+const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
@@ -571,14 +573,14 @@ export class Node {
    */
   addEventListener(type, listener, options) {
     const kind = KIND_OF.get(type);
-    if (kind === undefined) throw new TypeError("the tree has no event '" + type + "'");
+    if (kind === undefined && !DRAG_TYPES.has(type)) throw new TypeError("the tree has no event '" + type + "'");
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
     if (!list) this.#listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
-    this.#want(kind);
+    if (kind !== undefined) this.#want(kind);
   }
 
   removeEventListener(type, listener, options) {
@@ -588,7 +590,8 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    this.#want(KIND_OF.get(type));
+    const kind = KIND_OF.get(type);
+    if (kind !== undefined) this.#want(kind);
   }
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
@@ -1235,3 +1238,273 @@ native.takeError = function () {
   pendingError = null;
   throw error;
 };
+
+// The desktop around the window: files dragged in from other apps, notifications, the tray
+// and global shortcuts. The host serves `__ui.shell` calls after the code that made them has
+// run and answers through `__ui.shellAnswer`; desktop events arrive through `__ui.shellEvent`.
+
+const shellCalls = new Map();
+let nextShellCall = 0;
+
+function shellCall(op, fields) {
+  const call = ++nextShellCall;
+  return new Promise((resolve) => {
+    shellCalls.set(call, resolve);
+    native.shell(call, op, fields.join("\x1f"));
+  });
+}
+
+native.shellAnswer = function (call, value) {
+  const resolve = shellCalls.get(call);
+  if (!resolve) return;
+  shellCalls.delete(call);
+  resolve(value);
+};
+
+/** A file dragged in from the desktop, as the web's `File`, with its `path` on disk. */
+export class DroppedFile {
+  constructor(path) {
+    this.path = path;
+    this.name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+    this.type = "";
+  }
+}
+
+/**
+ * What a file drag carries, as the web's `DataTransfer`: `types` is `["Files"]` while files
+ * are over the window, and `files` lists them in `drop`, as on the web.
+ */
+export class DataTransfer {
+  constructor(paths) {
+    this.files = paths.map((path) => new DroppedFile(path));
+    this.items = this.files.map((file) => ({ kind: "file", type: "", getAsFile: () => file }));
+    this.types = ["Files"];
+    this.dropEffect = "copy";
+    this.effectAllowed = "copy";
+  }
+
+  getData() {
+    return "";
+  }
+}
+
+let dragTarget = null;
+
+function dragEvent(type, target, x, y, paths) {
+  const event = new Event(type, target);
+  event.clientX = event.x = x;
+  event.clientY = event.y = y;
+  event.dataTransfer = new DataTransfer(paths);
+  dispatchEvent(event);
+}
+
+// As the web: `dragenter` on the node now under the files, `dragleave` on the one before,
+// then `dragover` on the current one.
+function dragTo(target, x, y) {
+  if (target !== dragTarget) {
+    const before = dragTarget;
+    dragTarget = target;
+    if (target) dragEvent("dragenter", target, x, y, []);
+    if (before) dragEvent("dragleave", before, x, y, []);
+  }
+  if (target) dragEvent("dragover", target, x, y, []);
+}
+
+let trayMenu = new Map();
+let trayClick = null;
+const shortcuts = new Map();
+const shortcutIds = new Map();
+let nextShortcut = 0;
+const notifications = new Map();
+
+native.shellEvent = function (kind, a, x, y, text) {
+  if (kind <= 3) {
+    const target = nodes.get(a) ?? rootNode;
+    if (kind === 2) {
+      const before = dragTarget;
+      dragTarget = null;
+      if (before) dragEvent("dragleave", before, x, y, []);
+    } else if (kind === 3) {
+      if (target !== dragTarget) dragTo(target, x, y);
+      dragTarget = null;
+      if (target) dragEvent("drop", target, x, y, text ? text.split("\n") : []);
+    } else {
+      dragTo(target, x, y);
+    }
+  } else if (kind === 4) {
+    shortcuts.get(a)?.();
+  } else if (kind === 5) {
+    trayClick?.({ button: a });
+  } else if (kind === 6) {
+    trayMenu.get(a)?.();
+  } else if (kind === 7) {
+    const notification = notifications.get(a);
+    if (!notification) return;
+    notifications.delete(a);
+    notification._fire("click");
+  }
+};
+
+// Notifications nobody clicked are forgotten after this many newer ones.
+const NOTIFICATIONS_KEPT = 64;
+
+/**
+ * A desktop notification, as the web's: `new Notification(title, { body })`, with `onclick`
+ * or a `click` listener. Permission is always granted.
+ */
+export class Notification {
+  static permission = "granted";
+
+  static requestPermission(callback) {
+    callback?.("granted");
+    return Promise.resolve("granted");
+  }
+
+  #listeners = new Map();
+
+  constructor(title, options = {}) {
+    this.title = String(title);
+    this.body = String(options.body ?? "");
+    this.tag = String(options.tag ?? "");
+    this.data = options.data ?? null;
+    this.onclick = this.onshow = this.onerror = this.onclose = null;
+    shellCall(0, [this.title, this.body]).then((id) => {
+      if (!id) return this._fire("error");
+      notifications.set(id, this);
+      if (notifications.size > NOTIFICATIONS_KEPT) notifications.delete(notifications.keys().next().value);
+      this._fire("show");
+    });
+  }
+
+  /** The system keeps the notification until the user dismisses it. */
+  close() {}
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (!list.includes(listener)) list.push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(type);
+    const index = list ? list.indexOf(listener) : -1;
+    if (index >= 0) list.splice(index, 1);
+  }
+
+  _fire(type) {
+    const event = { type, target: this, currentTarget: this };
+    const handler = this["on" + type];
+    try {
+      if (typeof handler === "function") handler.call(this, event);
+      for (const listener of (this.#listeners.get(type) ?? []).slice()) listener.call(this, event);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+}
+
+globalThis.Notification ??= Notification;
+
+function hex(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i++) text += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+  return text;
+}
+
+function packMenu(items, lines) {
+  for (const item of items) {
+    if (item.type === "separator") lines.push("S");
+    else if (item.submenu) {
+      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
+      packMenu(item.submenu, lines);
+      lines.push("E");
+    } else {
+      const action = trayMenu.size + 1;
+      trayMenu.set(action, typeof item.click === "function" ? item.click : () => {});
+      const label = String(item.label ?? "").replace(/\n/g, " ");
+      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + label);
+    }
+  }
+}
+
+/**
+ * Shows an icon in the system tray (the macOS menu bar, the Windows notification area, a
+ * StatusNotifierItem on Linux). `icon` is RGBA pixels, as an `ImageData`: `{ width, height,
+ * data }`; macOS draws a `template` icon from its alpha in the menu bar's colours. `menu`
+ * items are `{ label, click, enabled, checked }`, `{ type: "separator" }` or `{ label,
+ * submenu }`. With no menu, `onClick({ button })` runs when the icon is clicked. Calling it
+ * again replaces the tray. Resolves to whether the system shows it.
+ */
+export function setTray({ icon, tooltip = "", template = false, menu = [], onClick = null }) {
+  if (!icon || !(icon.width > 0) || !(icon.height > 0) || icon.data?.length !== icon.width * icon.height * 4) {
+    throw new TypeError("setTray needs an icon of RGBA pixels: { width, height, data }");
+  }
+  trayMenu = new Map();
+  trayClick = typeof onClick === "function" ? onClick : null;
+  const lines = [];
+  packMenu(menu, lines);
+  const fields = [String(tooltip), icon.width, icon.height, template ? 1 : 0, hex(icon.data), lines.join("\n")];
+  return shellCall(1, fields).then((shown) => shown === 1);
+}
+
+/** Takes the tray icon away. */
+export function removeTray() {
+  trayMenu = new Map();
+  trayClick = null;
+  shellCall(2, []);
+}
+
+const MODIFIERS = { shift: 1, ctrl: 2, control: 2, alt: 4, option: 4, meta: 8, cmd: 8, command: 8, super: 8, mod: 16, cmdorctrl: 16, commandorcontrol: 16 };
+const KEY_NAMES = {
+  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", esc: "Escape", return: "Enter",
+  space: " ", plus: "Equal", "=": "Equal", "-": "Minus", ",": "Comma", ".": "Period", "/": "Slash",
+  ";": "Semicolon", "'": "Quote", "[": "BracketLeft", "]": "BracketRight", "\\": "Backslash", "`": "Backquote",
+};
+
+// "Mod+Shift+K" as the UI Events `code` of the key and the modifier bits; `Mod` (also
+// `CmdOrCtrl`) is Command on macOS and Control elsewhere.
+function parseShortcut(accelerator) {
+  const parts = String(accelerator).split("+").map((part) => part.trim()).filter(Boolean);
+  let bits = 0;
+  let code = "";
+  for (const part of parts) {
+    const modifier = MODIFIERS[part.toLowerCase()];
+    if (modifier !== undefined) {
+      bits |= modifier;
+      continue;
+    }
+    const named = KEY_NAMES[part.toLowerCase()] ?? part;
+    if (named === " ") code = "Space";
+    else if (/^[a-z]$/i.test(named)) code = "Key" + named.toUpperCase();
+    else if (/^[0-9]$/.test(named)) code = "Digit" + named;
+    else code = named[0].toUpperCase() + named.slice(1);
+  }
+  if (!code) throw new TypeError("'" + accelerator + "' names no key");
+  return { code, bits };
+}
+
+/**
+ * Runs `callback` when the keys of `accelerator` are pressed, whichever app has focus:
+ * `"Mod+Shift+K"`, where `Mod` is Command on macOS and Control elsewhere, and the key is a
+ * letter, a digit, a UI Events `code` (`"F5"`, `"ArrowUp"`, `"Slash"`) or a name such as
+ * `Space` or `Esc`. Registering it again replaces the callback. Resolves to whether the
+ * system took it: another app may hold it, and Wayland has no global shortcuts.
+ */
+export function registerShortcut(accelerator, callback) {
+  const { code, bits } = parseShortcut(accelerator);
+  const key = code + "+" + bits;
+  let id = shortcutIds.get(key);
+  if (id === undefined) shortcutIds.set(key, (id = ++nextShortcut));
+  shortcuts.set(id, callback);
+  return shellCall(3, [id, code, bits]).then((held) => held === 1);
+}
+
+/** Stops the shortcut of `accelerator`. */
+export function unregisterShortcut(accelerator) {
+  const { code, bits } = parseShortcut(accelerator);
+  const id = shortcutIds.get(code + "+" + bits);
+  if (id === undefined) return;
+  shortcutIds.delete(code + "+" + bits);
+  shortcuts.delete(id);
+  shellCall(4, [id]);
+}

@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createIcon, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce } = await import("../src/index.js");
+const { createBox, createText, createInput, createIcon, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -450,4 +450,69 @@ test("custom properties preserve case and unitless numeric tokens", () => {
     ["clearStyle", box.nodeId, 0],
     ["style", box.nodeId, "--Gap:8px;width:calc(var(--Gap) * var(--Scale));", 0],
   ]);
+});
+
+test("files dragged over the window enter, leave and drop as on the web", () => {
+  const outer = createBox();
+  const a = createBox();
+  const b = createBox();
+  outer.append(a, b);
+  mount(outer);
+  const seen = [];
+  for (const type of ["dragenter", "dragover", "dragleave", "drop"]) {
+    outer.addEventListener(type, (event) => seen.push([type, event.target === a ? "a" : event.target === b ? "b" : "outer", event.dataTransfer.files.map((file) => file.name)]));
+  }
+  mock.take();
+  mock.native.shellEvent(0, a.nodeId, 1, 2, "/tmp/x.txt");
+  mock.native.shellEvent(1, b.nodeId, 3, 4, "");
+  mock.native.shellEvent(3, b.nodeId, 3, 4, "/tmp/x.txt\n/home/me/y.png");
+  assert.deepEqual(seen, [
+    ["dragenter", "a", []],
+    ["dragover", "a", []],
+    ["dragenter", "b", []],
+    ["dragleave", "a", []],
+    ["dragover", "b", []],
+    ["drop", "b", ["x.txt", "y.png"]],
+  ]);
+  // Drag listeners need no listen flags: the host sends every drag.
+  assert.deepEqual(mock.take(), []);
+  seen.length = 0;
+  mock.native.shellEvent(0, a.nodeId, 1, 2, "");
+  mock.native.shellEvent(2, 0, 0, 0, "");
+  assert.deepEqual(seen.map(([type, target]) => type + " " + target), ["dragenter a", "dragover a", "dragleave a"]);
+});
+
+test("notifications, the tray and global shortcuts go to the host and come back", async () => {
+  mock.take();
+  let clicked = 0;
+  const notification = new Notification("Built", { body: "In 2 s" });
+  notification.onclick = () => clicked++;
+  const [[, call, op, text]] = mock.take();
+  assert.equal(op, 0);
+  assert.deepEqual(text.split("\x1f"), ["Built", "In 2 s"]);
+  mock.native.shellAnswer(call, 7);
+  await Promise.resolve();
+  mock.native.shellEvent(7, 7, 0, 0, "");
+  mock.native.shellEvent(7, 7, 0, 0, "");
+  assert.equal(clicked, 1);
+
+  let quit = 0;
+  const shown = setTray({ icon: { width: 1, height: 1, data: [255, 0, 16, 255] }, tooltip: "App", menu: [{ label: "Quit, now", click: () => quit++ }, { type: "separator" }, { label: "More", submenu: [{ label: "Off", enabled: false }] }] });
+  const [[, trayCall, trayOp, packed]] = mock.take();
+  assert.equal(trayOp, 1);
+  assert.deepEqual(packed.split("\x1f"), ["App", "1", "1", "0", "ff0010ff", "A1,1,0,Quit, now\nS\nBMore\nA2,0,0,Off\nE"]);
+  mock.native.shellAnswer(trayCall, 1);
+  assert.equal(await shown, true);
+  mock.native.shellEvent(6, 1, 0, 0, "");
+  assert.equal(quit, 1);
+
+  let pressed = 0;
+  const held = registerShortcut("Mod+Shift+k", () => pressed++);
+  const [[, keyCall, keyOp, keys]] = mock.take();
+  assert.equal(keyOp, 3);
+  assert.deepEqual(keys.split("\x1f"), ["1", "KeyK", "17"]);
+  mock.native.shellAnswer(keyCall, 0);
+  assert.equal(await held, false);
+  mock.native.shellEvent(4, 1, 0, 0, "");
+  assert.equal(pressed, 1);
 });

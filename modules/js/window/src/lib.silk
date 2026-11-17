@@ -23,6 +23,7 @@
 //! ```
 import ui_js.lib { JsHost, JsError, ClipboardRequest }
 import opener { Openers }
+import shell { serveShell, deliverShell, ShellAnswer }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
@@ -61,6 +62,10 @@ pub struct JsApp<'m> {
   source: List<u8>,
   /// The system programs started for `window.open`.
   openers: Openers,
+}
+
+effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+  was.* = run deliverShell(&mut host, tree, event)
 }
 
 /// Writes `text` to standard error.
@@ -271,6 +276,37 @@ impl<'m> JsApp<'m> {
     return true
   }
 
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
+  /// `platform`, and the calls their promise jobs made, then applies what it built. Says
+  /// whether there were calls.
+  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut round: usize = 0
+    while round < CLIPBOARD_ROUNDS {
+      let requests = self.host.takeShell()
+      if requests.length() == 0 { break }
+      let mut answers = run serveShell(move requests, &mut platform)
+      while answers.length() > 0 {
+        let ShellAnswer { call, value } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerShell(call, value)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        run self.settle(move answered)
+      }
+      round = round + 1
+    }
+    if round == 0 { return false }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// Hands a desktop event (a file drag, a global shortcut, the tray, a notification click)
+  /// to JavaScript and applies what it built. Says whether `event` was one.
+  effect fn desktop(self: &mut Self, tree: &mut UiTree<'_>, event: &Event) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut was = false
+    let ran = run Effect.result(deliverShellInto(&mut self.host, &tree.*, event, &mut was)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    if was { run self.host.flushRaw(&mut tree) }
+    return was
+  }
+
   /// Delivers the tree's queued records and reports the listener exceptions. Says whether a
   /// listener prevented a default.
   effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -364,6 +400,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
   effect fn event(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, event: &Event) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if run state.desktop(&mut tree, event) { return true }
     // Only macOS draws the application under the bar; elsewhere the system's bar is there.
     static if Intrinsic.targetOperatingSystem() == "darwin" {
       if let Event.MouseDown { button, position, .. } = &event.* {
@@ -383,7 +420,9 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
-    return run state.clipboard(&mut tree, &mut platform.*)
+    let clipboard = run state.clipboard(&mut tree, &mut platform.*)
+    let shell = run state.shell(&mut tree, &mut platform.*)
+    return clipboard || shell
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()

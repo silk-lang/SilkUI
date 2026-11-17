@@ -23,6 +23,8 @@ import render_thread { Compositor, FastScrolled }
 import window.event { ScrollDelta }
 import silk.num.f32
 import window.event { Event, Modifiers, MouseButton, Phase }
+import window.keys { KeyCode }
+import window.shell { Notification, Tray, TrayIcon }
 import window.menu { MenuBar, MenuEntry, OpenDialog, SaveDialog }
 import window.native { NativePlatform, Waker }
 import window.headless { HeadlessPlatform }
@@ -103,6 +105,18 @@ union Command {
   },
   ReadClipboard,
   WriteClipboard { text: String },
+  SetTray {
+    pixels: List<u8>,
+    width: u32,
+    height: u32,
+    template: bool,
+    tooltip: String,
+    menu: MenuBar,
+  },
+  RemoveTray,
+  RegisterShortcut { id: u32, code: KeyCode, modifiers: Modifiers },
+  UnregisterShortcut { id: u32 },
+  Notify { title: String, body: String },
   Accessibility { window: WindowId, update: TreeUpdate },
 }
 
@@ -111,6 +125,8 @@ union Reply {
   Window { window: WindowId, size: Size2<f64>, scale: f64, raw: RawSurface },
   Dialog { dialog: DialogId },
   Clipboard { text: Option<String> },
+  Done { ok: bool },
+  Notified { id: u32 },
   Failed { error: WindowError },
 }
 
@@ -861,6 +877,34 @@ effect fn execute(
     Command.WriteClipboard { text } => {
       run platform.writeClipboard(String.view(&text))
     }
+    Command.SetTray { pixels, width, height, template, tooltip, menu } => {
+      let tray = Tray {
+        icon: TrayIcon {
+          width: width,
+          height: height,
+          pixels: pixels.asSlice(),
+          template: template,
+        },
+        tooltip: String.view(&tooltip),
+        menu: &menu,
+      }
+      let shown = run platform.setTray(&tray)
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.RemoveTray => platform.removeTray()
+    Command.RegisterShortcut { id, code, modifiers } => {
+      let held = run platform.registerShortcut(id, code, modifiers)
+      answer(link, wakeUi, Reply.Done { ok: held })
+    }
+    Command.UnregisterShortcut { id } => platform.unregisterShortcut(id)
+    Command.Notify { title, body } => {
+      let notification = Notification {
+        title: String.view(&title),
+        body: String.view(&body),
+      }
+      let id = run platform.notify(&notification)
+      answer(link, wakeUi, Reply.Notified { id: id })
+    }
     Command.Accessibility { window, update } => {
       let at = bridgeOf(&platform.*, &mut bridges, window.value)
       run bridges.asMutSlice()[at].bridge.update(move update, true)
@@ -1222,6 +1266,61 @@ impl Platform for PlatformProxy {
   fn appearance(self: &Self) -> Appearance {
     return self.link.get().lock().get().appearance
   }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(tray.icon.pixels) |> Effect.provideMut<Allocator>(&mut heap)
+    let tooltip = run PlatformProxy.copyOf(tray.tooltip)
+    let menu = run copyMenuBar(tray.menu)
+    let reply = run self.call(
+      Command.SetTray {
+        pixels: move pixels,
+        width: tray.icon.width,
+        height: tray.icon.height,
+        template: tray.icon.template,
+        tooltip: move tooltip,
+        menu: move menu,
+      },
+    )
+    return doneOf(move reply)
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    drop Effect.result(self.send(Command.RemoveTray))
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.RegisterShortcut { id: id, code: code, modifiers: modifiers })
+    return doneOf(move reply)
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    drop Effect.result(self.send(Command.UnregisterShortcut { id: id }))
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(notification.title)
+    let body = run PlatformProxy.copyOf(notification.body)
+    let reply = run self.call(Command.Notify { title: move title, body: move body })
+    return match move reply {
+      Reply.Notified { id } => id
+      _ => 0
+    }
+  }
+}
+
+fn doneOf(reply: Reply) -> bool {
+  return match move reply {
+    Reply.Done { ok } => ok
+    _ => false
+  }
 }
 
 effect fn dialogOf(reply: Reply) -> DialogId
@@ -1564,6 +1663,52 @@ impl Platform for HostPlatform {
       HostPlatform.Direct { platform } => platform.appearance()
       HostPlatform.Headless { platform } => Platform.appearance(&platform)
       HostPlatform.Proxied { proxy } => proxy.appearance()
+    }
+  }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setTray(tray)
+      HostPlatform.Headless { platform } => run platform.setTray(tray)
+      HostPlatform.Proxied { proxy } => run proxy.setTray(tray)
+    }
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.removeTray()
+      HostPlatform.Headless { platform } => platform.removeTray()
+      HostPlatform.Proxied { proxy } => proxy.removeTray()
+    }
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Headless { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Proxied { proxy } => run proxy.registerShortcut(id, code, modifiers)
+    }
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Headless { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Proxied { proxy } => proxy.unregisterShortcut(id)
+    }
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.notify(notification)
+      HostPlatform.Headless { platform } => run platform.notify(notification)
+      HostPlatform.Proxied { proxy } => run proxy.notify(notification)
     }
   }
 }

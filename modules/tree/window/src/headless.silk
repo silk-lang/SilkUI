@@ -11,6 +11,10 @@
 //! - `size W H [SCALE]`: resizes the window (CSS pixels, and the device pixel ratio).
 //! - `record FILE` ... `stop`: records every frame in between as a 60 fps video, with ffmpeg
 //!   (`SILK_UI_FFMPEG`, else the usual places). A FILE ending in `/` keeps the PNG frames.
+//! - `drop FILE... [at X Y]`: drags files in from the desktop and drops them at X, Y (the
+//!   window's middle without `at`).
+//! - `shortcut ID`, `tray [middle|right]`, `tray-item ACTION`, `click-notification ID`: a
+//!   global shortcut, a click on the tray icon or its menu item, a click on a notification.
 //!
 //! A command that fails, or a `wait` that does not hold within 10 seconds of the run's time, ends
 //! the run with status 1 after saying which line it was. Otherwise the run ends with status 0
@@ -79,8 +83,21 @@ pub union Turn {
   Next,
   /// Resizes the window, then goes on.
   Resize { pub width: f64, pub height: f64, pub scale: f64 },
+  /// Sends a desktop event to the app, then goes on.
+  Desktop { pub input: Desktop },
   /// The run is over, with this exit status.
   Done { pub status: i32 },
+}
+
+/// A desktop event a script line asked for.
+pub union Desktop {
+  /// Files dragged in and dropped at `x`, `y`; a negative `x` is the window's middle.
+  Drop { pub paths: List<String>, pub x: f64, pub y: f64 },
+  Shortcut { pub id: u32 },
+  /// `MouseEvent.button` numbering: 0 left, 1 middle, 2 right.
+  Tray { pub button: u32 },
+  TrayItem { pub action: u32 },
+  NotificationClick { pub id: u32 },
 }
 
 /// A request sent to the app, waiting for its reply.
@@ -244,6 +261,10 @@ impl Script {
       if first == "stop" {
         return run self.stop()
       }
+      if first == "drop" || first == "shortcut" || first == "tray" || first == "tray-item"
+        || first == "click-notification" {
+        return run self.desktop(list)
+      }
       if first == "capture" {
         return run self.abort("a headless run records video with record FILE ... stop instead")
       }
@@ -388,6 +409,56 @@ impl Script {
       return run self.abort("a video keeps one size: resize before record or after stop")
     }
     return Turn.Resize { width: width, height: height, scale: scale }
+  }
+
+  effect fn desktop(self: &mut Self, words: &[String]) -> Turn
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let first = String.view(&words[0])
+    if first == "drop" {
+      let mut paths = List<String>.make()
+      let mut x: f64 = -1.0
+      let mut y: f64 = -1.0
+      let mut i: usize = 1
+      while i < words.length {
+        if String.view(&words[i]) == "at" && i + 3 == words.length {
+          x = number(String.view(&words[i + 1]))
+          y = number(String.view(&words[i + 2]))
+          break
+        }
+        run paths.append(run String.copy(String.view(&words[i])))
+        i = i + 1
+      }
+      if paths.length() == 0 {
+        return run self.abort("drop takes the files to drop, then an optional at X Y")
+      }
+      return Turn.Desktop { input: Desktop.Drop { paths: move paths, x: x, y: y } }
+    }
+    if first == "tray" {
+      let button: u32 = if words.length < 2 {
+        0
+      } else if String.view(&words[1]) == "middle" {
+        1
+      } else if String.view(&words[1]) == "right" {
+        2
+      } else {
+        return run self.abort("tray takes an optional middle or right")
+      }
+      return Turn.Desktop { input: Desktop.Tray { button: button } }
+    }
+    if words.length != 2 || number(String.view(&words[1])) < 1.0 {
+      return run self.abort("this line takes one id, from 1")
+    }
+    let id = f64.toU32(number(String.view(&words[1])))
+    return Turn.Desktop {
+      input: if first == "shortcut" {
+        Desktop.Shortcut { id: id }
+      } else if first == "tray-item" {
+        Desktop.TrayItem { action: id }
+      } else {
+        Desktop.NotificationClick { id: id }
+      },
+    }
   }
 
   effect fn record(self: &mut Self, words: &[String]) -> Turn
