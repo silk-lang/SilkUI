@@ -19,7 +19,7 @@ import style { TextStyle, Computed }
 import svg_css.adopted { StyleSheets, Source, MatchedRule }
 import svg_css.sheet { Declaration as SheetDeclaration }
 import svg_css.cascade { Priority, Origin }
-import svg_css.element { MatchContext, PseudoTarget, StateBits, ContainerDependency, NO_ELEMENT }
+import svg_css.element { MatchContext, PseudoTarget, StateBits, ContainerDependency, Watch, NO_ELEMENT }
 import svg_css.variables { ScopeId, RegistrationError }
 import svg_css.resolver { ResolverError }
 import svg_css.selectors { Sharing }
@@ -73,13 +73,17 @@ pub struct RootSheets {
   pub reads: u32,
   /// The bounds a shared match has to respect, from `style_invalidation.sharing`.
   pub sharing: Sharing,
+  /// Since the last root restyle: a match watched more nodes than it could name, so every node
+  /// counts as watched; some node is watched with `WATCH_HAS_SIBLINGS`.
+  pub watchAll: bool,
+  pub siblingAnchors: bool,
   pub sheets: StyleSheets,
   pub environment: Environment,
   pub systemColors: [Color; 19],
 }
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
-    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasSelection: false, hasPlaceholder: false, hasScrollbars: false, reads: 0, sharing: Sharing.none(), sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
+    return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasSelection: false, hasPlaceholder: false, hasScrollbars: false, reads: 0, watchAll: false, siblingAnchors: false, sharing: Sharing.none(), sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
       systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
@@ -106,6 +110,9 @@ pub struct Resolution {
   /// An equal node's style from this pass; `style` is empty then.
   pub hit: Option<Frozen<Resolved>>,
   pub pending: Option<Pending>,
+  /// The nodes this match watched (`Node.styleWatch`); `watchAll` when there were too many.
+  pub watched: List<Watch>,
+  pub watchAll: bool,
 }
 
 pub fn index(roots: &[RootSheets], root: u32) -> usize {
@@ -136,6 +143,8 @@ pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   if resolved.hit.isSome() { return move resolved }
   if enters {
     let before = run resolveWith(&mut sheets, &mut cache, system, tree, slot, true, PseudoTarget.None, StateBits.empty(), false)
+    run resolved.watched.appendSlice(before.watched.asSlice())
+    resolved.watchAll = resolved.watchAll || before.watchAll
     let style = &mut resolved.style
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
@@ -165,6 +174,8 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
   if target != PseudoTarget.Before && target != PseudoTarget.After { return move resolved }
   if !rendered && hasStarting {
     let before = run resolveWith(&mut sheets, &mut cache, system, tree, origin, true, target, states, false)
+    run resolved.watched.appendSlice(before.watched.asSlice())
+    resolved.watchAll = resolved.watchAll || before.watchAll
     let style = &mut resolved.style
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
@@ -205,6 +216,9 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   context.pseudoStates = states
   run sheets.resolveWith(&adapter, u32.toUsize(slot), priorities.asSlice(), &mut context, starting)
   let reads = context.reads
+  let mut watched = List<Watch>.make()
+  run watched.appendSlice(context.watched())
+  let watchAll = context.watchOverflow
   let mut parent = Option<ScopeId>.None
   if parentSlot != NONE {
     if let Option<&Resolved>.Some { value } = tree.node(parentSlot).sheetStyle() {
@@ -239,7 +253,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   let inherited = Inherited { rooted: parentSlot == NONE, color: parentColor(tree, parentSlot) }
   if share {
     if let Option<Frozen<Resolved>>.Some { value } = move cache.find(scope, inherited, sheets.stateDependencies(), reads, sheets.candidates(), sheets.matches(), inline.asSlice()) {
-      return Resolution { highlightBackground: Option<ColorProgram>.None, containers: List<ContainerDependency>.make(), hit: Option<Frozen<Resolved>>.some(move value), pending: Option<Pending>.None,
+      return Resolution { highlightBackground: Option<ColorProgram>.None, containers: List<ContainerDependency>.make(), hit: Option<Frozen<Resolved>>.some(move value), pending: Option<Pending>.None, watched: move watched, watchAll: watchAll,
         style: Resolved { plain: false, reads: 0, states: 0, keyframes: List<Rule>.make(), overrides: List<Declaration>.make(), declarations: List<Declaration>.make(),
           matches: List<MatchedRule>.make(), scope: scope, starting: Option<List<Declaration>>.None } }
     }
@@ -292,7 +306,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
-  return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, hit: Option<Frozen<Resolved>>.None, pending: move pending,
+  return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, hit: Option<Frozen<Resolved>>.None, pending: move pending, watched: move watched, watchAll: watchAll,
     style: Resolved { plain: share, reads: reads, states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
 }
 

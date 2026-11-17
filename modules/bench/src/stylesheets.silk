@@ -4,16 +4,30 @@ import ui_tree.lib { BoxNode, TreeError, ProtocolError, Attribute, StyleState, F
 import ui_tree.batch { Batch }
 import ui_tree.style { Fill }
 import ui_tree.style_media { Preferences }
+import ui_tree.style_runtime
 import ui_tree.css
 import ui_tree.css { px, Keyword }
 import silk.build.source { Source }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 
-pub enum Step { Create, Idle, Class, Hover, Theme, Append, Style }
+pub enum Step { Create, Idle, Class, Hover, Theme, Append, Style, Has, FocusWithin, Display, Attribute, Custom }
+
+/// The rule a narrowed-restyle step adds, in a sheet of its own after the Tailwind one, or "".
+fn extra(step: Step) -> &'static [u8] {
+  return match step {
+    Step.Has => b".rounded-lg:has(.picked){opacity:.5}"
+    Step.FocusWithin => b".rounded-lg:focus-within{opacity:.5}"
+    Step.Display => b".gone{display:none}"
+    Step.Attribute => b"[aria-selected=true]{opacity:.5}"
+    Step.Custom => b".rounded-lg{opacity:var(--row-opacity,1)}"
+    _ => b""
+  }
+}
 pub enum Mode { Inline, Tailwind, Registered, SpaceY, Owl, Zebra }
 
 const BASE: string = "flex items-center gap-2 p-2 rounded-lg bg-white text-black hover:bg-black dark:bg-black dark:text-white"
@@ -39,6 +53,8 @@ effect fn protocol(error: ProtocolError) -> never ! TreeError { fail error.error
 pub struct Rows<'a> {
   fixture: Fixture<'a>,
   rows: List<BoxNode>,
+  /// The first cell of each row.
+  leads: List<BoxNode>,
   count: usize,
   /// Each row also holds three styled boxes, as a list item with an icon, a body and an action does.
   cells: bool,
@@ -62,10 +78,16 @@ impl<'a> Rows<'a> {
       let siblings = mode == Mode.SpaceY || mode == Mode.Owl || mode == Mode.Zebra
       run batch.adoptStyleSheet(0, 1, if siblings { Source.read("fixtures/siblings.sheet") } else { Source.read("fixtures/rows.sheet") })
       if mode == Mode.Registered { run batch.adoptStyleSheet(0, 2, Source.read("fixtures/registered.sheet")) }
+      if extra(step).length != 0 {
+        match style_runtime.runtime().call(extra(step)) {
+          Option.Some { value } => run batch.adoptStyleSheet(0, 3, value.asSlice())
+          _ => { fail TreeError.Layout }
+        }
+      }
       run Effect.catch<ProtocolError>(fixture.tree.apply(run batch.take()), protocol)
       run fixture.tree.setAttribute(fixture.root, Attribute.ClassName { value: run String.copy(rootClasses(mode, false)) })
     }
-    return Rows { fixture: move fixture, rows: List<BoxNode>.make(), count: count, cells: cells, distinct: distinct, sheet: sheet, mode: mode, step: step, changed: false }
+    return Rows { fixture: move fixture, rows: List<BoxNode>.make(), leads: List<BoxNode>.make(), count: count, cells: cells, distinct: distinct, sheet: sheet, mode: mode, step: step, changed: false }
   }
 
   effect fn build(self: &mut Self) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -103,6 +125,10 @@ impl<'a> Rows<'a> {
         run self.fixture.tree.setStyle(child, &[css.padding(px(8.0)), css.borderRadius(px(8.0))])
       } else {
         run self.fixture.tree.setStyle(child, &[css.display(Keyword.Flex), css.flexDirection(FlexDirection.Column), css.padding(px(8.0))])
+      }
+      if cell == 0 {
+        if self.step == Step.FocusWithin { run self.fixture.tree.setAttribute(child, Attribute.TabIndex { value: 0 }) }
+        run self.leads.append(child)
       }
       run self.fixture.tree.append(row, child)
       cell = cell + 1
@@ -142,6 +168,11 @@ impl<'a> Rows<'a> {
         || background != expectedBackground
         || node.computed.text.color.r != expectedColor { fail TreeError.Layout }
     }
+    let first = engine.node(engine.slotOf(self.rows.asSlice()[0].id().raw()))
+    let faded = self.changed && (self.step == Step.Has || self.step == Step.FocusWithin || self.step == Step.Attribute || self.step == Step.Custom)
+    let expectedOpacity: f32 = if faded { 0.5 } else { 1.0 }
+    if extra(self.step).length != 0 && first.computed.paint.opacity != expectedOpacity { fail TreeError.Layout }
+    if self.step == Step.Display && engine.node(engine.slotOf(self.leads.asSlice()[0].id().raw())).rendered == self.changed { fail TreeError.Layout }
   }
 }
 
@@ -153,6 +184,7 @@ impl<'a> Bench for Rows<'a> {
         run self.fixture.tree.destroy(self.rows.get(last))
         self.rows.truncate(last)
       }
+      self.leads.clear()
     } else if self.rows.length() == 0 {
       run self.build()
       run self.fixture.frame()
@@ -186,6 +218,18 @@ impl<'a> Bench for Rows<'a> {
             css.borderRadius(px(8.0)), css.backgroundColor(color(true)), css.color(color(false)), css.opacity(opacity),
           ])
         }
+      } else if self.step == Step.Has || self.step == Step.Display {
+        let added = if self.step == Step.Has { "flex items-center gap-2 picked" } else { "flex items-center gap-2 gone" }
+        run self.fixture.tree.setAttribute(self.leads.get(0), Attribute.ClassName { value: run String.copy(if self.changed { added } else { CELLS[0] }) })
+      } else if self.step == Step.FocusWithin {
+        // Focus goes between the first row and the second; the first row holds it when `changed`.
+        run self.fixture.tree.focus(self.leads.get(if self.changed { 0 } else { 1 }))
+      } else if self.step == Step.Attribute {
+        run self.fixture.tree.setAttribute(self.rows.get(0), Attribute.Selected { value: self.changed })
+      } else if self.step == Step.Custom {
+        let mut batch = Batch.make()
+        run batch.customProperty(self.rows.get(0).id().raw(), StyleState.Base, "--row-opacity", Option<string>.some(if self.changed { "0.5" } else { "1" }), false)
+        run Effect.catch<ProtocolError>(self.fixture.tree.apply(run batch.take()), protocol)
       } else if self.step == Step.Hover {
         run self.fixture.tree.dispatch(Input.moveTo(if self.changed { 20.0 } else { 1100.0 }, 20.0))
       } else if self.sheet {

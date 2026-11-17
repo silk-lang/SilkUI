@@ -1,10 +1,13 @@
 import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Input, StyleState, BUTTON_PRIMARY }
+import ui_tree.mutation { Mutation }
 import font_collection.lib { FontCollection }
+import ui_fixtures.fixtures as fixtures
 import svg_css.compile { Options, CompileError }
 import svg_css.compile
 import svg_css.tokens { CssError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
@@ -95,7 +98,7 @@ effect fn relationalChanges() -> ()
   run Testing.expect(height(&tree, 3) == 25.0, "initial nth-of membership")
   run batch.attribute(2, Attribute.ClassName { value: run String.copy("row eligible selected") })
   run tree.apply(run batch.take())
-  run Testing.expect(tree.stylesDirty, "sibling and has dependencies require conservative root invalidation")
+  run Testing.expect(!tree.stylesDirty && tree.node(tree.slotOf(1)).styleDirty, "a class read by a sibling rule and by :has() restyles the parent, which is also the anchor")
   run tree.frame(frame())
   run Testing.expect(width(&tree, 3) == 130.0 && opacity(&tree, 1) == 0.5, "class changes update siblings and ancestors")
   run batch.attribute(2, Attribute.ClassName { value: run String.copy("row selected") })
@@ -108,7 +111,7 @@ effect fn relationalChanges() -> ()
   run tree.frame(frame())
   run Testing.expect(width(&tree, 3) == 100.0 && opacity(&tree, 1) == 1.0, "removing a relational class clears prior matches")
   run tree.dispatch(Input.PointerMove { x: 20.0, y: 20.0, modifiers: 0 })
-  run Testing.expect(tree.stylesDirty, "state changes inside has and nth-of invalidate outside the hovered subtree")
+  run Testing.expect(!tree.stylesDirty && tree.node(tree.slotOf(1)).styleDirty, "state changes inside has and nth-of reach the anchor and the siblings, not the root")
   run tree.frame(frame())
   run Testing.expect(opacity(&tree, 2) == 0.25 && opacity(&tree, 1) == 0.75, "relational hover updates sibling filtering and the ancestor")
   run tree.dispatch(Input.PointerMove { x: 20.0, y: 70.0, modifiers: 0 })
@@ -152,13 +155,13 @@ effect fn descendantsAndVariables() -> ()
   run batch.customProperty(2, StyleState.Hover, "--v", Option<string>.some("31px"), false)
   run tree.apply(run batch.take())
   run tree.frame(frame())
-  run Testing.expect(height(&tree, 3) == 31.0 && !tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "inline state variables bypass scope retention")
+  run Testing.expect(height(&tree, 3) == 31.0 && tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "inline state variables keep the retained scopes")
   run tree.dispatch(Input.PointerLeave)
   run tree.frame(frame())
   run Testing.expect(height(&tree, 3) == 23.0, "leaving an inline variable state restores the sheet scope")
   run batch.attribute(3, Attribute.ClassName { value: run String.copy("leaf hidden") })
   run tree.apply(run batch.take())
-  run Testing.expect(tree.stylesDirty, "display changes retain the full starting-style path")
+  run Testing.expect(!tree.stylesDirty && tree.node(tree.slotOf(3)).styleDirty, "a display change restyles the node's subtree")
   run tree.frame(frame())
   run batch.attribute(3, Attribute.ClassName { value: run String.copy("leaf") })
   run tree.apply(run batch.take())
@@ -206,6 +209,285 @@ test effect fn stylesheetScopePressureFallsBackToFullRestyles() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pressureFallback() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn dirty(tree: &UiTree<'_>, id: u32) -> bool { return tree.node(tree.slotOf(id)).styleDirty }
+
+/// A host, a list, two rows with a cell each: ids 1, 2, 3 and 4, 5 (in row 3) and 6 (in row 4).
+effect fn rows(batch: &mut Batch) -> () ! OutOfMemoryError ? &mut Allocator {
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "list")
+  run node(&mut batch, 3, 2, "row")
+  run node(&mut batch, 4, 2, "row")
+  run node(&mut batch, 5, 3, "cell")
+  run node(&mut batch, 6, 4, "cell")
+}
+
+const ROWS: &[u8] = b".host{display:block;width:400px;height:300px}.list{display:block;width:200px;height:60px}.row{display:block;width:100px;height:20px}.cell{width:10px;height:10px}"
+
+effect fn hasAnchors() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".row:has(.on){width:120px}.row:has(.on) .cell{height:12px}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.attribute(5, Attribute.ClassName { value: run String.copy("cell on") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 4) && !dirty(&tree, 2) && !dirty(&tree, 1), "a class read inside :has() restyles the anchors above it, not the root")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 120.0 && height(&tree, 5) == 12.0 && width(&tree, 4) == 100.0 && height(&tree, 6) == 10.0, "the anchor and what its match reaches take the new style")
+  run batch.attribute(5, Attribute.ClassName { value: run String.copy("cell") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 100.0 && height(&tree, 5) == 10.0, "removing the class clears the anchor's match")
+  run node(&mut batch, 8, 6, "on")
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 4) && !dirty(&tree, 3) && !dirty(&tree, 1), "an insert restyles the anchors that hold it")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 4) == 120.0 && height(&tree, 6) == 12.0 && width(&tree, 3) == 100.0, "an inserted descendant matches its ancestor's :has()")
+  run batch.push(Mutation.Remove { id: 8 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 4) && !dirty(&tree, 3), "a removal restyles the anchors that held it")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 4) == 100.0 && height(&tree, 6) == 10.0, "a removed descendant no longer matches")
+}
+
+effect fn hasStatesAndEmptiness() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  run node(&mut batch, 7, 1, "list")
+  run node(&mut batch, 8, 7, "row")
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".list:has(.cell:hover){opacity:.75}.list:has(> :empty){width:150px}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 7) == 150.0 && width(&tree, 2) == 200.0, "the second list holds an empty row")
+  run tree.dispatch(Input.PointerMove { x: 300.0, y: 200.0, modifiers: 0 })
+  run tree.frame(frame())
+  run tree.dispatch(Input.PointerMove { x: 5.0, y: 5.0, modifiers: 0 })
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1) && !dirty(&tree, 7), "a state read inside :has() restyles its anchor")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 0.75, "hover inside the anchor matches")
+  run tree.dispatch(Input.PointerLeave)
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 1.0, "leaving clears it")
+  run batch.push(Mutation.Remove { id: 6 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1) && !dirty(&tree, 7), "emptiness read inside :has() reaches the anchor above the emptied node")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 2) == 150.0, "the emptied row matches :empty for its list")
+  run batch.text(4, 9, "x")
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1), "a text child ends emptiness for the anchor too")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 2) == 200.0 && width(&tree, 7) == 150.0, "text makes the row non-empty")
+}
+
+test effect fn stylesheetHasRestylesAnchorsNotTheRoot() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hasAnchors() |> Effect.provideMut<Allocator>(&mut allocator)
+  run hasStatesAndEmptiness() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn siblingAnchors() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  run node(&mut batch, 7, 1, "list")
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".row:has(+ .row .on){height:25px}.row:has(~ .mark){opacity:.5}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.attribute(6, Attribute.ClassName { value: run String.copy("cell on") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1) && !dirty(&tree, 7), "a class read past a sibling combinator in :has() restyles the earlier siblings' parent")
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 3) == 25.0 && height(&tree, 4) == 20.0, "the earlier sibling is the anchor")
+  run node(&mut batch, 8, 2, "mark")
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && !dirty(&tree, 1), "an appended sibling restyles the anchors before it")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 0.5 && opacity(&tree, 4) == 0.5, "both earlier rows see the new sibling")
+  run batch.push(Mutation.Remove { id: 8 })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 1.0 && opacity(&tree, 4) == 1.0 && height(&tree, 3) == 25.0, "removing it clears their match")
+}
+
+test effect fn stylesheetHasWithSiblingArgumentsRestylesEarlierSiblings() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run siblingAnchors() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn focusWithin() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  run batch.attribute(5, Attribute.TabIndex { value: 0 })
+  run batch.attribute(6, Attribute.TabIndex { value: 0 })
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".row:focus-within{opacity:.5}.row:focus-within .cell{width:14px}.list:focus-within{opacity:.75}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(tree.node(tree.slotOf(4)).styleTwin == tree.slotOf(3), "the second row took the first row's matched style")
+  run batch.focus(5)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1), "focus restyles the ancestors asked :focus-within, not the root")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 0.5 && width(&tree, 5) == 14.0 && opacity(&tree, 4) == 1.0 && width(&tree, 6) == 10.0 && opacity(&tree, 2) == 0.75, "the focused cell's ancestors match")
+  run batch.focus(6)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && dirty(&tree, 4) && !dirty(&tree, 2) && !dirty(&tree, 1), "moving focus restyles the rows that lost and gained it, not their common ancestors")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 1.0 && width(&tree, 5) == 10.0 && opacity(&tree, 4) == 0.5 && width(&tree, 6) == 14.0 && opacity(&tree, 2) == 0.75, "a row that shared its style still follows focus")
+  run batch.push(Mutation.Blur)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1), "blur restyles what held focus")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 4) == 1.0 && width(&tree, 6) == 10.0 && opacity(&tree, 2) == 1.0, "nothing holds focus")
+  run batch.focus(6)
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.push(Mutation.Remove { id: 4 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2), "removing the subtree that holds focus restyles its former ancestors")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 2) == 1.0, "the list no longer holds focus")
+}
+
+test effect fn stylesheetFocusWithinRestylesTheAncestorsThatChange() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run focusWithin() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn attributes() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".row[aria-selected=true]{opacity:.25}.row[aria-selected=true] .cell{width:14px}[data-lead]+.row{height:25px}#pick{opacity:.75}.row:disabled .cell{height:12px}.cell:lang(fr){width:13px}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.attribute(3, Attribute.Selected { value: true })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 4) && !dirty(&tree, 2), "an attribute a rule reads restyles the node's subtree, not the root")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 0.25 && width(&tree, 5) == 14.0 && opacity(&tree, 4) == 1.0, "the attribute selector matches")
+  run batch.attribute(3, Attribute.Selected { value: false })
+  run batch.attribute(4, Attribute.Label { value: run String.copy("second") })
+  run batch.attribute(4, Attribute.ValueRange { min: 0.0, max: 10.0, value: 4.0 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 4), "attributes no rule reads restyle nothing")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 3) == 1.0 && width(&tree, 5) == 10.0, "the attribute selector stops matching")
+  run batch.attribute(3, Attribute.Named { name: run String.copy("data-lead"), value: Option<String>.some(run String.copy("")) })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 2) && !dirty(&tree, 1), "an attribute read across a sibling combinator restyles the parent's subtree")
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 4) == 25.0, "the later sibling matches")
+  run batch.attribute(4, Attribute.ElementId { value: run String.copy("pick") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 4) && !dirty(&tree, 2), "an id a rule names restyles the node")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 4) == 0.75, "the id selector matches")
+  run batch.attribute(4, Attribute.ElementId { value: run String.copy("other") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 4) == 1.0, "the old id stops matching")
+  run batch.attribute(3, Attribute.Disabled { value: true })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 2), "a state an attribute sets restyles the subtree that reads it")
+  run tree.frame(frame())
+  run Testing.expect(height(&tree, 5) == 12.0 && height(&tree, 6) == 10.0, "the state selector matches")
+  run batch.attribute(4, Attribute.Named { name: run String.copy("lang"), value: Option<String>.some(run String.copy("fr")) })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 6) == 13.0 && width(&tree, 5) == 10.0, "what the host derives from an attribute, as :lang() from lang, still restyles")
+}
+
+test effect fn stylesheetAttributeChangesRestyleWhatReadsThem() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run attributes() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn displayAndVariables() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run rows(&mut batch)
+  let mut source = List<u8>.make()
+  run source.appendSlice(ROWS)
+  run source.appendSlice(b".cell{width:var(--w,10px)}.gone{display:none}.reset{all:unset;display:block}.mark::before{content:'x'}")
+  run sheet(&mut batch, source.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("row gone") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 2), "a class that sets display restyles the node's subtree, not the root")
+  run tree.frame(frame())
+  run Testing.expect(!tree.node(tree.slotOf(3)).rendered && !tree.node(tree.slotOf(5)).rendered && tree.node(tree.slotOf(4)).rendered, "the subtree leaves the rendering")
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("row reset") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3), "a class that sets all stays local")
+  run tree.frame(frame())
+  run Testing.expect(tree.node(tree.slotOf(5)).rendered && width(&tree, 5) == 10.0, "the subtree is rendered again")
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("row mark") })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3), "a class that sets content stays local")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 3) == 100.0, "the row's own rules apply again")
+  let leaf = scope(&tree, 6)
+  let mut i: usize = 0
+  while i < 200 {
+    let wide = i % 2 == 0
+    run batch.customProperty(3, StyleState.Base, "--w", Option<string>.some(if wide { "33px" } else { "34px" }), false)
+    run tree.apply(run batch.take())
+    run Testing.expect(!tree.stylesDirty && dirty(&tree, 3) && !dirty(&tree, 4) && !dirty(&tree, 2), "an inline custom property restyles the node's subtree, not the root")
+    run tree.frame(frame())
+    let expected: f32 = if wide { 33.0 } else { 34.0 }
+    run Testing.expect(width(&tree, 5) == expected && width(&tree, 6) == 10.0 && scope(&tree, 6) == leaf
+      && tree.styleSheets.asSlice()[0].sheets.canRetainScopes(), "repeated inline values keep the retained variable scopes")
+    i = i + 1
+  }
+  run batch.customProperty(3, StyleState.Base, "--w", Option<string<'static>>.None, false)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && dirty(&tree, 3), "removing the property stays local")
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 5) == 10.0, "the fallback applies again")
+}
+
+test effect fn stylesheetDisplayAndInlineVariablesRestyleTheSubtree() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run displayAndVariables() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 fn red(tree: &UiTree<'_>, id: u32) -> f32 {

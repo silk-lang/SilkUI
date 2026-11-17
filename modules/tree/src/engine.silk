@@ -92,7 +92,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach }
+import style_invalidation { Reach, Extent }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
 import svg_css.element { PseudoTarget, StateBits }
@@ -107,6 +107,7 @@ import svg_css.sheet_binary { DecodeError }
 import svg_css.resolver { ResolverError }
 import svg_css.variables { RegistrationError }
 import svg_css.tokens { CssError, Limits, TokenBuffer }
+import svg_css.tokens as css_tokens
 import svg_css.declaration_values
 import svg_css.media_features { Environment }
 import svg_css.colors { Color as SheetColor }
@@ -114,6 +115,7 @@ import style_attributes
 import ui_protocol.aria { isNamedAttribute }
 import node {
   NONE,
+  WATCH_OUTSIDE,
   NO_INDEX,
   FrameInput,
   FrameStats,
@@ -1258,10 +1260,11 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  fn classReach(self: &Self, slot: u32, after: &[usize]) -> Reach {
-    if self.stylesDirty || self.styleSheets.length() == 0 { return Reach.Subtree }
+  fn classReach(self: &Self, slot: u32, after: &[usize]) -> Extent {
+    let subtree = Extent { reach: Reach.Subtree, anchors: false }
+    if self.stylesDirty || self.styleSheets.length() == 0 { return subtree }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    if at == usize.MAX { return Reach.Subtree }
+    if at == usize.MAX { return subtree }
     let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms.asSlice() _ => &[] }
     return style_invalidation.classReach(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
   }
@@ -1284,15 +1287,20 @@ impl<'a> UiTree<'a> {
   /// Restyles what a change in `parent`'s child list reaches besides the child itself, given the
   /// element siblings on either side of the place it entered or left. A text child is `text`.
   fn restyleAround(self: &mut Self, reads: u32, parent: u32, previous: u32, next: u32, text: bool) -> () {
-    if u32.bitAnd(reads, css_selectors.READS_DESCENDANTS) != 0 {
-      self.stylesDirty = true
-      self.restyleLocal(parent)
-      return ()
-    }
+    let has = u32.bitAnd(reads, css_selectors.READS_DESCENDANTS) != 0
     if text {
-      if u32.bitAnd(reads, css_selectors.READS_EMPTY) != 0 { self.restyleLocal(parent) }
+      if u32.bitAnd(reads, css_selectors.READS_EMPTY) != 0 {
+        self.restyleLocal(parent)
+        // `:has(:empty)` above the parent, whose emptiness changed.
+        if has {
+          let above = self.node(parent).parent
+          let beside = self.elementBeside(parent, true)
+          self.restyleAnchors(above, beside)
+        }
+      }
       return ()
     }
+    if has { self.restyleAnchors(parent, previous) }
     if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS | css_selectors.READS_EMPTY) != 0 {
       self.restyleLocal(parent)
       return ()
@@ -1300,6 +1308,135 @@ impl<'a> UiTree<'a> {
     if u32.bitAnd(reads, css_selectors.READS_EDGE) != 0 {
       if previous != NONE { self.restyleLocal(previous) }
       if next != NONE { self.restyleLocal(next) }
+    }
+  }
+
+  /// Restyles the `:has()` anchors that can see a change in `parent`'s child list after the
+  /// element `previous` (NONE for the start): `parent` and its ancestors, which hold the place
+  /// in their subtrees, and, for arguments that start with `+` or `~`, the elements before it
+  /// and before each ancestor. Only nodes a match asked `:has()` of are anchors
+  /// (`Node.styleWatch`); what follows from an anchor's match lies in its subtree, or in its
+  /// parent's when a `:has()` rule also relates siblings.
+  fn restyleAnchors(self: &mut Self, parent: u32, previous: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || self.stylesDirty { return () }
+    let sheets = &self.styleSheets.asSlice()[at]
+    if sheets.watchAll {
+      self.stylesDirty = true
+      self.stylesPending = true
+      return ()
+    }
+    let wide = sheets.states.wide
+    let siblings = sheets.siblingAnchors
+    let mut before = previous
+    let mut up = parent
+    while true {
+      while siblings && before != NONE {
+        if u32.bitAnd(self.node(before).styleWatch, css_element.WATCH_HAS_SIBLINGS) != 0 {
+          if wide { self.restyleSiblings(before) } else { self.restyleLocal(before) }
+        }
+        before = self.elementBeside(before, true)
+      }
+      if up == NONE { break }
+      if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_HAS) != 0 {
+        if wide { self.restyleSiblings(up) } else { self.restyleLocal(up) }
+      }
+      before = if siblings { self.elementBeside(up, true) } else { NONE }
+      up = self.node(up).parent
+    }
+  }
+
+  fn selectorStates(self: &Self, slot: u32) -> u32 {
+    let adapter = SelectorTree { tree: self }
+    return adapter.state(u32.toUsize(slot)).bits
+  }
+
+  /// What rules that read one of the attributes `names` reach from a node that changed it; an
+  /// empty name is skipped. `ids` are the node's id before and after when `id` is among them.
+  fn attributeReach(self: &Self, names: &[&[u8]], ids: &[&[u8]]) -> Extent {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return Extent.none() }
+    let sheets = &self.styleSheets.asSlice()[at]
+    let mut any = false
+    let mut i: usize = 0
+    while i < names.length {
+      if names[i].length != 0 { any = true }
+      // `:lang()` and `:link` are no invalidation key.
+      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")) {
+        return Extent { reach: Reach.Root, anchors: false }
+      }
+      i = i + 1
+    }
+    if !any { return Extent.none() }
+    // Generated content can read any attribute of its origin with attr().
+    let least = Extent { reach: if sheets.hasGenerated { Reach.Subtree } else { Reach.None }, anchors: false }
+    if !sheets.states.attributes { return least }
+    return least.with(style_invalidation.attributeReach(&sheets.sheets, &self.styleAtoms, names, ids))
+  }
+
+  fn idReach(self: &Self, slot: u32, after: &[u8]) -> Extent {
+    let before = match self.node(slot).identity() {
+      Option.Some { value } => String.utf8Bytes(String.view(&value.id))
+      _ => b""
+    }
+    return self.attributeReach(&[b"id"], &[before, after])
+  }
+
+  /// Restyles what `change` at `slot` reaches.
+  fn restyleExtent(self: &mut Self, slot: u32, change: Extent) -> () {
+    if change.anchors {
+      let above = self.node(slot).parent
+      let beside = self.elementBeside(slot, true)
+      self.restyleAnchors(above, beside)
+    }
+    match change.reach {
+      Reach.None => {}
+      Reach.Subtree => self.restyleLocal(slot)
+      Reach.Siblings => self.restyleSiblings(slot)
+      Reach.Root => self.restyle(slot)
+    }
+  }
+
+  /// What a change of the state bits `mask` on `slot` reaches. The node's own record names the
+  /// states its candidate rules read.
+  fn stateReach(self: &Self, slot: u32, mask: u32) -> Extent {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if mask == 0 || at == usize.MAX { return Extent.none() }
+    let reach = &self.styleSheets.asSlice()[at].states
+    let own = match self.node(slot).sheetStyle() { Option.Some { value } => value.states _ => 0 }
+    return Extent {
+      reach: if u32.bitAnd(reach.siblings, mask) != 0 { Reach.Siblings }
+        else if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { Reach.Subtree }
+        else { Reach.None },
+      anchors: u32.bitAnd(reach.has, mask) != 0,
+    }
+  }
+
+  /// Restyles the nodes whose `:focus-within` changes when focus moves from `from` to `to`
+  /// (either may be NONE): each one's ancestors, and itself, that do not hold the other. Only
+  /// nodes a match asked `:focus-within` of can change style.
+  fn focusWithinMoved(self: &mut Self, from: u32, to: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || self.stylesDirty { return () }
+    let sheets = &self.styleSheets.asSlice()[at]
+    if u32.bitAnd(sheets.states.any, css_element.FOCUS_WITHIN) == 0 { return () }
+    if sheets.watchAll {
+      self.stylesDirty = true
+      self.stylesPending = true
+      return ()
+    }
+    let siblings = u32.bitAnd(sheets.states.siblings, css_element.FOCUS_WITHIN) != 0
+    let mut side: usize = 0
+    while side < 2 {
+      let other = if side == 0 { to } else { from }
+      let mut up = if side == 0 { from } else { to }
+      while up != NONE && !(other != NONE && self.within(other, up)) {
+        if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_FOCUS_WITHIN) != 0 {
+          if siblings { self.restyleSiblings(up) } else { self.restyleLocal(up) }
+        }
+        up = self.node(up).parent
+      }
+      side = side + 1
     }
   }
 
@@ -1313,15 +1450,11 @@ impl<'a> UiTree<'a> {
   fn focusStyleChanged(self: &mut Self, slot: u32) -> () {
     if self.sheetReads().isNone() { self.restyle(slot)
       return () }
-    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    let reach = self.styleSheets.asSlice()[at].states
-    let mask = css_element.FOCUS | css_element.FOCUS_VISIBLE
-    // :focus-within holds on every ancestor of the focused node.
-    if u32.bitAnd(reach.any, css_element.FOCUS_WITHIN) != 0 || u32.bitAnd(reach.external, mask) != 0 { self.restyle(slot)
-      return () }
-    if u32.bitAnd(reach.siblings, mask) != 0 { self.restyleSiblings(slot)
-      return () }
-    self.restyleLocal(slot)
+    let mut change = self.stateReach(slot, css_element.FOCUS | css_element.FOCUS_VISIBLE)
+    // `:has(:focus-within)` anchors lie above the node as those of `:has(:focus)` do.
+    if self.stateReach(slot, css_element.FOCUS_WITHIN).anchors { change.anchors = true }
+    if change.reach == Reach.None { change.reach = Reach.Subtree }
+    self.restyleExtent(slot, change)
   }
 
   pub fn pointerStyleChanged(self: &mut Self, slot: u32, state: StyleState, inline: bool) -> () {
@@ -1343,13 +1476,10 @@ impl<'a> UiTree<'a> {
       }
     }
     let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
-    let reach = &self.styleSheets.asSlice()[at].states
-    if inline || custom || u32.bitAnd(reach.external, mask) != 0 { self.restyle(slot)
-      return () }
-    if u32.bitAnd(reach.siblings, mask) != 0 { self.restyleSiblings(slot)
-      return () }
-    let own = match node.sheetStyle() { Option.Some { value } => value.states _ => 0 }
-    if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { self.restyleLocal(slot) }
+    let mut change = self.stateReach(slot, mask)
+    // The node's own looks and variables change what it and its subtree compute, no selector.
+    if inline || custom { change.reach = style_invalidation.wider(change.reach, Reach.Subtree) }
+    self.restyleExtent(slot, change)
   }
 
   pub fn nodeMut(self: &mut Self, slot: u32) -> &mut Node {
@@ -1551,7 +1681,8 @@ impl<'a> UiTree<'a> {
         let identity = run node.identityMut()
         run identity.setCustom(state, move name, move tokens, important)
         run self.enableInlineScope()
-        self.restyle(slot)
+        // The node's variable scope changes: it and what inherits from it, and no selector.
+        self.restyleLocal(slot)
       }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
@@ -1599,12 +1730,9 @@ impl<'a> UiTree<'a> {
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
-        let mut variables = false
         if node.selectorIdentity.isSome() {
           let identity = run node.identityMut()
-          let before = identity.custom.length()
           identity.clearCustom(state)
-          variables = identity.custom.length() != before
         }
         match state {
           StyleState.Base => {
@@ -1631,7 +1759,7 @@ impl<'a> UiTree<'a> {
         node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover.asSlice())
           || style.requiresContext(node.active.asSlice()) || style.requiresContext(node.focus.asSlice())
           || style.requiresContext(node.focusVisible.asSlice()) || style.requiresContext(node.starting.asSlice())
-        if variables { self.restyle(slot) } else { self.restyleLocal(slot) }
+        self.restyleLocal(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
         let slot = run self.requireInput(index, id)
@@ -1665,13 +1793,22 @@ impl<'a> UiTree<'a> {
           Attribute.ClassName { value } => run self.styleAtoms.classes(String.utf8Bytes(String.view(&value)))
           _ => List<usize>.make()
         }
-        // No selector outside a detached subtree can see it; attaching it restyles what the insert reaches.
-        let classReach = if self.rootHolding(slot) == NONE { Reach.Subtree } else { match &attribute {
+        // No selector outside a detached subtree can see it; attaching it restyles what the insert
+        // reaches. Without sheets, or with a root restyle due, there is nothing to narrow.
+        let attached = self.rootHolding(slot) != NONE
+        let tracked = attached && self.sheetReads().isSome()
+        let statesBefore = if tracked { self.selectorStates(slot) } else { 0 }
+        let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
           Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
-          _ => Reach.Root
+          Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
+          // Type selectors are no invalidation key.
+          Attribute.Element { .. } => Extent { reach: Reach.Root, anchors: false }
+          Attribute.Named { name, .. } => self.attributeReach(&[String.utf8Bytes(String.view(&name))], &[])
+          _ => Extent.none()
         } }
+        let reflected = run style_attributes.reflect(self.nodeMut(slot), &attribute)
+        if tracked { change = change.with(self.attributeReach(&[String.utf8Bytes(reflected[0]), String.utf8Bytes(reflected[1]), String.utf8Bytes(reflected[2])], &[])) }
         let node = self.nodeMut(slot)
-        run style_attributes.reflect(&mut node, &attribute)
         match move attribute {
           Attribute.ValueRange { min, max, value } => {
             node.hasValueRange = true
@@ -1910,11 +2047,8 @@ impl<'a> UiTree<'a> {
             identity.hasId = true
           }
         }
-        match classReach {
-          Reach.Subtree => self.restyleLocal(slot)
-          Reach.Siblings => self.restyleSiblings(slot)
-          Reach.Root => self.restyle(slot)
-        }
+        if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
+        self.restyleExtent(slot, change)
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
@@ -2333,6 +2467,7 @@ impl<'a> UiTree<'a> {
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
       styleTwin: NONE,
+      styleWatch: 0,
       computedStamp: 0,
       selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
@@ -2469,6 +2604,8 @@ impl<'a> UiTree<'a> {
     }
     if self.focused != NONE && self.within(self.focused, slot) {
       let to = self.returnSlot(self.focused, slot)
+      // The removed subtree took focus out of its former ancestors.
+      if parent != NONE { self.focusWithinMoved(parent, NONE) }
       run self.moveFocus(to, false)
     }
     // The detached subtree is resolved when it is attached again.
@@ -3386,12 +3523,14 @@ impl<'a> UiTree<'a> {
     if slot != NONE && u32.bitAnd(self.node(slot).listeners, LISTEN_FOCUS) != 0 {
       run self.queue(EventKind.Focus, slot)
     }
-    if previous != NONE && self.node(previous).live {
-      self.focusStyleChanged(previous)
+    let left = if previous != NONE && self.node(previous).live { previous } else { NONE }
+    if left != NONE {
+      self.focusStyleChanged(left)
     }
     if slot != NONE {
       self.focusStyleChanged(slot)
     }
+    self.focusWithinMoved(left, slot)
   }
 
   /// The node ids from the root down to `slot`.
@@ -4234,6 +4373,7 @@ impl<'a> UiTree<'a> {
     match move result {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
         run container_watch.record(&mut self, origin, target, value.containers.asSlice())
+        self.noteWatches(origin, value.watched.asSlice(), value.watchAll)
         return move value
       }
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -4280,10 +4420,13 @@ impl<'a> UiTree<'a> {
           _ => Option<Frozen<Resolved>>.None
         }
         let class = self.node(twin).styleClass
+        // An equal node is asked the same of itself; the twin's own match asked no other node.
+        let watch = self.node(twin).styleWatch
         let node = self.nodeMut(slot)
         node.resolvedSheet = move shared
         node.styleClass = class
         node.styleTwin = twin
+        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, 7), watch)
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
         return ()
       }
@@ -4293,6 +4436,7 @@ impl<'a> UiTree<'a> {
     let fresh = self.nodeMut(slot)
     fresh.styleClass = class
     fresh.styleTwin = NONE
+    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, 7)
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
@@ -4302,6 +4446,7 @@ impl<'a> UiTree<'a> {
     match move resolved {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
         run container_watch.record(&mut self, slot, PseudoTarget.None, value.containers.asSlice())
+        self.noteWatches(slot, value.watched.asSlice(), value.watchAll)
         let key = style_share.modelKey(&self, slot)
         if key != 0 { drop run self.styleModels.insert(key, slot) }
         if let Option<Frozen<Resolved>>.Some { value: shared } = move value.hit {
@@ -4322,6 +4467,30 @@ impl<'a> UiTree<'a> {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
         match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
       }
+    }
+  }
+
+  /// Flags the nodes that the match for `slot` (or a part of it) watched.
+  fn noteWatches(self: &mut Self, slot: u32, watched: &[css_element.Watch], all: bool) -> () {
+    if watched.length == 0 && !all { return () }
+    let mut outside = all
+    let mut siblings = false
+    let nodes = self.nodes.asMutSlice()
+    let mut i: usize = 0
+    while i < watched.length {
+      let at = watched[i].node
+      nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, watched[i].bits)
+      if at != u32.toUsize(slot) { outside = true }
+      if u32.bitAnd(watched[i].bits, css_element.WATCH_HAS_SIBLINGS) != 0 { siblings = true }
+      i = i + 1
+    }
+    if outside { nodes[u32.toUsize(slot)].styleWatch = u32.bitOr(nodes[u32.toUsize(slot)].styleWatch, WATCH_OUTSIDE) }
+    if all || siblings {
+      let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+      if at == usize.MAX { return () }
+      let roots = self.styleSheets.asMutSlice()
+      if all { roots[at].watchAll = true }
+      if siblings { roots[at].siblingAnchors = true }
     }
   }
 
@@ -4476,6 +4645,8 @@ impl<'a> UiTree<'a> {
       let roots = self.styleSheets.asMutSlice()
       if !roots[sheetIndex].sheets.canRetainScopes() { self.stylesDirty = true }
       if self.stylesDirty {
+        roots[sheetIndex].watchAll = false
+        roots[sheetIndex].siblingAnchors = false
         roots[sheetIndex].sheets.resetScopes()
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
@@ -4490,7 +4661,10 @@ impl<'a> UiTree<'a> {
     // Only a node styled earlier in this pass is known to hold its current match.
     self.styleModels.clear()
     let full = self.stylesDirty
-    if full { self.containerWatches.clear() }
+    if full {
+      self.containerWatches.clear()
+      self.clearWatches()
+    }
     self.stylesDirty = false
     self.stylesPending = false
     self.paintCachesStale = true
@@ -4560,6 +4734,31 @@ impl<'a> UiTree<'a> {
           a = a + 1
         }
       }
+    }
+  }
+
+  /// Forgets what matching watched under the current root: a root restyle asks it all again.
+  /// A match can watch a node the pass has not reached yet, so this cannot wait for the visit.
+  fn clearWatches(self: &mut Self) -> () {
+    if self.root == NONE { return () }
+    let index = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if index == usize.MAX { return () }
+    let sheets = &self.styleSheets.asSlice()[index]
+    if u32.bitAnd(sheets.reads, css_selectors.READS_DESCENDANTS) == 0 && u32.bitAnd(sheets.states.any, css_element.FOCUS_WITHIN) == 0 { return () }
+    let top = self.node(self.root).css
+    let mut at = top
+    while true {
+      let slot = self.slotOfCssNode(at)
+      if slot != NONE {
+        let watched = self.nodeMut(slot)
+        watched.styleWatch = 0
+      }
+      let links = self.layout.nodes.asSlice()
+      if links[at].firstChild != NO_INDEX { at = links[at].firstChild
+        continue }
+      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      if at == top { break }
+      at = links[at].nextSibling
     }
   }
 
