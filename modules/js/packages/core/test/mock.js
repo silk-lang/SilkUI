@@ -15,6 +15,7 @@ export function installMock() {
     "defineIcon", "source", "release",
     "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",
+    "shell",
   ]) {
     native[name] = record(name);
   }

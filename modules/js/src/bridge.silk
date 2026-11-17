@@ -98,6 +98,10 @@ pub const CLIPBOARD_READ: u32 = 868924 // nativeId(b"clipboardRead")
 /// `__ui.clipboardWrite(call, text)`: asks the host to put `text` on the system clipboard,
 /// answered with `__ui.clipboard(call)`.
 pub const CLIPBOARD_WRITE: u32 = 623693 // nativeId(b"clipboardWrite")
+/// `__ui.shell(call, op, text)`: asks the host for a desktop feature, answered with
+/// `__ui.shellAnswer(call, value)`. The ops and how `text` packs their arguments are
+/// [`ShellRequest`]'s.
+pub const SHELL: u32 = 417640 // nativeId(b"shell")
 /// `__ui.cancelTimer(id)`.
 pub const CANCEL_TIMER: u32 = 88792 // nativeId(b"cancelTimer")
 /// `__ui.requestFrame()`: asks for `__ui.frame(time)` before the next frame.
@@ -193,6 +197,24 @@ pub struct Bridge {
   pub frames: List<Keyframe>,
   /// Clipboard reads and writes JavaScript asked for (`navigator.clipboard`), oldest first.
   pub clipboard: List<ClipboardRequest>,
+  /// Desktop calls JavaScript asked for (notifications, the tray, global shortcuts).
+  pub shell: List<ShellRequest>,
+}
+
+/// A `__ui.shell` call waiting for the host. `text` holds the op's fields, separated by U+001F:
+/// - 0, notify: title, body; answered with the notification's id, 0 when none was shown.
+/// - 1, set the tray: tooltip, width, height, template (0 or 1), RGBA pixels as hex, then the
+///   menu, one entry per line: `B<title>` opens a submenu, `E` closes it, `S` is a separator
+///   and `A<action>,<enabled>,<checked>,<title>` an item. Answered with 1 when it shows.
+/// - 2, remove the tray.
+/// - 3, register a global shortcut: id, UI Events `code`, modifier bits (shift 1, control 2,
+///   alt 4, meta 8, 16 for Command on macOS and Control elsewhere); answered with 1 when
+///   the system took it.
+/// - 4, unregister a global shortcut: id.
+pub struct ShellRequest {
+  pub call: u32,
+  pub op: u32,
+  pub text: String,
 }
 
 /// A `navigator.clipboard` call waiting for the host: `call` names it in the answer.
@@ -222,6 +244,7 @@ impl Bridge {
       opened: List<String>.make(),
       frames: List<Keyframe>.make(),
       clipboard: List<ClipboardRequest>.make(),
+      shell: List<ShellRequest>.make(),
     }
   }
 
@@ -296,6 +319,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"scrollTo", arity: 3 },
     Native { name: b"select", arity: 3 },
     Native { name: b"setText", arity: 2 },
+    Native { name: b"shell", arity: 3 },
     Native { name: b"source", arity: 2 },
     Native { name: b"style", arity: 3 },
     Native { name: b"styleSheet", arity: 3 },
@@ -455,6 +479,9 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == CLIPBOARD_WRITE {
     let value = run text(argv.get(1))
     run bridge.clipboard.append(ClipboardRequest.Write { call: first, text: move value })
+  } else if function == SHELL {
+    let packed = run text(argv.get(2))
+    run bridge.shell.append(ShellRequest { call: first, op: id(argv.get(1).view()), text: move packed })
   } else if function == DEV_RELOAD {
     bridge.reload = true
   } else if function == FONT_FAMILY {

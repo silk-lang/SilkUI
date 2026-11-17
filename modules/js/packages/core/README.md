@@ -115,9 +115,39 @@ through the tree.
 | `layout` | `bounds`: where layout put the node, in window pixels |
 | `transitionrun`, `transitionstart`, `transitionend`, `transitioncancel` | `propertyName`, `elapsedTime` |
 | `animationstart`, `animationiteration`, `animationend`, `animationcancel` | `animationName`, `elapsedTime` |
+| `dragenter`, `dragover`, `dragleave`, `drop` | `clientX`, `clientY`, `dataTransfer` (files dragged in from other apps) |
 
 A listener that throws does not stop the dispatch. `setErrorHandler(handler)` receives the
 exception; without one the host reports it.
+
+### The desktop
+
+Files dragged in from other apps fire `dragenter`, `dragover`, `dragleave` and `drop` on the
+node under them, and bubble, as on the web. `event.dataTransfer.types` is `["Files"]` while
+they are over the window, and `drop` lists them in `dataTransfer.files`, each with its `name`
+and its `path` on disk.
+
+```ts
+zone.addEventListener("drop", (event) => open(event.dataTransfer.files[0].path));
+```
+
+`Notification` is the web's: `new Notification("Built", { body: "In 2 s" })`, with `onclick`.
+Permission is always granted. Two things the web has no API for come from the package:
+
+```ts
+import { setTray, registerShortcut } from "@silkui/core";
+
+setTray({
+  icon: { width: 32, height: 32, data: pixels }, // RGBA, as an ImageData
+  tooltip: "Builds",
+  menu: [{ label: "Build now", click: build }, { type: "separator" }, { label: "Quit", click: quit }],
+});
+registerShortcut("Mod+Shift+B", build); // Mod is Command on macOS, Control elsewhere
+```
+
+`setTray` and `registerShortcut` resolve to whether the system took them. A shortcut works
+whichever app has focus; another app may hold it, and Wayland has none. `removeTray()` and
+`unregisterShortcut(accelerator)` undo them.
 
 ### Attributes and accessibility
 

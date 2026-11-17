@@ -298,6 +298,10 @@ export interface EventMap {
   animationiteration: AnimationEvent;
   animationend: AnimationEvent;
   animationcancel: AnimationEvent;
+  dragenter: DragEvent;
+  dragover: DragEvent;
+  dragleave: DragEvent;
+  drop: DragEvent;
 }
 
 export function createNode(kind: "text"): Text;
@@ -354,3 +358,80 @@ export function parseMarkdown(text: string, options?: MarkdownOptions): import("
 
 /** What happens to an exception a listener throws. Without a handler, the host reports it. */
 export function setErrorHandler(handler: ((error: unknown) => void) | null): void;
+
+/** A file dragged in from the desktop, as the web's `File`, with its `path` on disk. */
+export class DroppedFile {
+  readonly name: string;
+  readonly path: string;
+  readonly type: string;
+}
+
+/** What a file drag carries. `files` is filled in `drop`, as on the web. */
+export class DataTransfer {
+  readonly files: DroppedFile[];
+  readonly items: { kind: "file"; type: string; getAsFile(): DroppedFile }[];
+  readonly types: string[];
+  dropEffect: string;
+  effectAllowed: string;
+  getData(format: string): string;
+}
+
+/** Files dragged from another app over the window (`dragenter`, `dragover`, `dragleave`, `drop`). */
+export interface DragEvent extends Event {
+  clientX: number;
+  clientY: number;
+  x: number;
+  y: number;
+  dataTransfer: DataTransfer;
+}
+
+export interface NotificationOptions {
+  body?: string;
+  tag?: string;
+  data?: unknown;
+}
+
+/** A desktop notification, as the web's. Permission is always granted. */
+export class Notification {
+  static readonly permission: "granted";
+  static requestPermission(callback?: (permission: "granted") => void): Promise<"granted">;
+  constructor(title: string, options?: NotificationOptions);
+  readonly title: string;
+  readonly body: string;
+  readonly tag: string;
+  readonly data: unknown;
+  onclick: ((event: { type: "click"; target: Notification }) => void) | null;
+  onshow: ((event: { type: "show"; target: Notification }) => void) | null;
+  onerror: ((event: { type: "error"; target: Notification }) => void) | null;
+  onclose: ((event: { type: "close"; target: Notification }) => void) | null;
+  close(): void;
+  addEventListener(type: "click" | "show" | "error" | "close", listener: (event: { type: string; target: Notification }) => void): void;
+  removeEventListener(type: "click" | "show" | "error" | "close", listener: (event: { type: string; target: Notification }) => void): void;
+}
+
+export type TrayMenuItem =
+  | { label: string; click?: () => void; enabled?: boolean; checked?: boolean }
+  | { type: "separator" }
+  | { label: string; submenu: TrayMenuItem[] };
+
+export interface TrayOptions {
+  /** RGBA pixels, as an `ImageData`. 32 by 32 looks right everywhere. */
+  icon: { width: number; height: number; data: ArrayLike<number> };
+  tooltip?: string;
+  /** macOS draws the icon from its alpha, in the menu bar's colours. */
+  template?: boolean;
+  menu?: TrayMenuItem[];
+  /** Runs on a click when there is no menu. `button` is `MouseEvent.button`'s. */
+  onClick?: (event: { button: number }) => void;
+}
+
+/** Shows an icon in the system tray; calling it again replaces it. Resolves to whether it shows. */
+export function setTray(options: TrayOptions): Promise<boolean>;
+export function removeTray(): void;
+
+/**
+ * Runs `callback` when `accelerator` (`"Mod+Shift+K"`; `Mod` is Command on macOS, Control
+ * elsewhere) is pressed, whichever app has focus. Resolves to whether the system took it.
+ */
+export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
+export function unregisterShortcut(accelerator: string): void;

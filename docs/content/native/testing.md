@@ -77,13 +77,15 @@ snapshot tree.txt
 silk-ui.model
 ```
 
-Each line is a command of [`ui-inspect-cli`](/native/devtools/#from-the-command-line), with the same names for nodes, run inside the app. There is no system around the app, so menus, dialogs and other parts of [the shell](/native/shell/) do nothing. A few lines are the run's own:
+Each line is a command of [`ui-inspect-cli`](/native/devtools/#from-the-command-line), with the same names for nodes, run inside the app. There is no system around the app, so menus, dialogs and other parts of [the shell](/native/shell/) do nothing, but the script can play the desktop's part. A few lines are the run's own:
 
 | Line | Does |
 | --- | --- |
 | `wait 500ms`, `wait 2s` | Lets that much time pass |
 | `size 640 440`, `size 640 440 2` | Resizes the window, optionally with a device pixel ratio |
 | `record pad.mp4` ... `stop` | Records the frames in between as a 60 fps video, with ffmpeg. A name ending in `/` keeps the frames as PNG files instead |
+| `drop notes.txt at 120 80` | Drags files in from the desktop and drops them there, the window's middle without `at` |
+| `shortcut 1`, `tray`, `tray right`, `tray-item 3`, `click-notification 1` | A global shortcut, a click on the tray icon or an item of its menu, a click on a notification |
 
 `snapshot` without a file and commands that answer with data, such as `query` or `silk-ui.model`, print to standard output. `#` starts a comment.
 

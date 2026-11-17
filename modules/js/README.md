@@ -372,6 +372,12 @@ what those mean:
   `JsHost.answerClipboard` settles each one. Both windows do them on the system clipboard
   once the code that asked has run, so a copy button works from any listener, timer or
   promise job. A host that has no clipboard leaves the promises pending.
+- Desktop calls from `@silkui/core` (`new Notification`, `setTray`, `registerShortcut`) go
+  the same way: `JsHost.takeShell` hands them over (`ShellRequest` says how each packs its
+  arguments) and `JsHost.answerShell` settles them. Both windows serve them on the
+  platform (`ui_js_window.shell`). File drags, global shortcuts, tray clicks and
+  notification clicks come back through `JsHost.shellEvent`; the window aims a drag at the
+  node under it.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
