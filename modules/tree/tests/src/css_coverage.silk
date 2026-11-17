@@ -9,6 +9,10 @@ import ui_fixtures.fixtures as fixtures
 import svg_css.written as written
 import svg_css.tokens { CssError }
 import properties.catalog
+import silk.num.usize
+import silk.io.writer_native { StderrWriter }
+import caniuse_probes
+import caniuse_probe { Probe }
 import silk.collections.hash { Hash }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
@@ -860,4 +864,101 @@ test effect fn cssCoverageFontShorthands() -> ()
   ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run fontShorthands() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// What the fixture's boxes are painted with for a probe, so that a box that moves or changes
+/// size shows in the pixels. In a layer, so any probe's own rule wins over it.
+const PROBE_PAINT: string = "@layer fixture { .root { background-color: white } .lead { background-color: #ddd; min-height: 6px } .inner { background-color: #888 } .after { background-color: #444 } }"
+
+/// The fixture set up for `probe` in `tree`, with the probe's sheet adopted or not. Its nodes
+/// carry the classes `root`, `lead`, `sample`, `inner` and `after`.
+effect fn probeFixture(tree: &mut Tree<'_>, probe: Probe, adopted: bool) -> Fixture
+  ! TreeError | ProtocolError | CssError | CompileError | OutOfMemoryError
+  ? &mut Allocator {
+  let f = run fixture(&mut tree, Row { root: probe.root, lead: probe.lead, setup: probe.setup, sample: b"" })
+  run tree.setAttribute(f.root, Attribute.ClassName { value: run String.copy("root") })
+  run tree.setAttribute(f.lead, Attribute.ClassName { value: run String.copy("lead") })
+  run tree.setAttribute(f.target, Attribute.ClassName { value: run String.copy("sample") })
+  run tree.setAttribute(f.inner, Attribute.ClassName { value: run String.copy("inner") })
+  run tree.setAttribute(f.after, Attribute.ClassName { value: run String.copy("after") })
+  let sheets = [PROBE_PAINT, probe.base, probe.sheet]
+  let mut batch = Batch.make()
+  let mut i: usize = 0
+  while i < sheets.length {
+    if (i < 2 || adopted) && String.byteLength(sheets[i]) != 0 {
+      let compiled = run compile.compile(String.utf8Bytes(sheets[i]), &Options.make())
+      let bytes = run compiled.encode()
+      run batch.adoptStyleSheet(0, usize.toU32(i) + 1, bytes.asSlice())
+    }
+    i = i + 1
+  }
+  run tree.apply(run batch.take())
+  drop run tree.frame(Viewport { width: 420.0, height: 320.0, scale: 1.0 }, 0.0)
+  return f
+}
+
+/// Whether adopting `probe.sheet` moves a box of the fixture or changes a pixel of what the
+/// tree draws.
+effect fn probeChanges(probe: Probe) -> bool
+  ! TreeError | ProtocolError | CssError | CompileError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut plain = run Tree.make(&fonts)
+  let a = run probeFixture(&mut plain, probe, false)
+  let mut styled = run Tree.make(&fonts)
+  let b = run probeFixture(&mut styled, probe, true)
+  let mut unused = List<u64>.make()
+  let before = run look(&plain, a, &mut unused)
+  let after = run look(&styled, b, &mut unused)
+  if !sameFloats(&before, &after) { return true }
+  let mut first = CpuSnapshot.make()
+  run first.copyUploads(plain.engine())
+  let firstPixels = run first.render(plain.engine())
+  let mut second = CpuSnapshot.make()
+  run second.copyUploads(styled.engine())
+  let secondPixels = run second.render(styled.engine())
+  let left = firstPixels.data()
+  let right = secondPixels.data()
+  if left.length != right.length { return true }
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return true }
+    i = i + 1
+  }
+  return false
+}
+
+/// The "Can I use" page says a feature works when its probes change the fixture, and that
+/// one is missing when they do not: each probe is held to what the page says.
+effect fn canIUseProbes() -> ()
+  ! TreeError | ProtocolError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut wrong: usize = 0
+  let mut area: usize = 0
+  while area < caniuse_probes.AREAS {
+    let mut i: usize = 0
+    while true {
+      let probe = match caniuse_probes.probe(area, i) {
+        Option.Some { value } => value
+        Option.None => { break }
+      }
+      let changed = run probeChanges(probe)
+      if changed != probe.works {
+        // A probe that stopped working is a regression. One that started working asks for
+        // docs/caniuse/support to be corrected: the page says the feature is missing.
+        let what = if probe.works { "changes nothing" } else { "now changes something" }
+        StderrWriter.print("can I use, {}: this sheet {}: {}\n", &.(probe.feature, what, probe.sheet))
+        wrong = wrong + 1
+      }
+      i = i + 1
+    }
+    area = area + 1
+  }
+  run Testing.expect(wrong == 0, "every probe does what docs/caniuse/support says (the ones that do not are listed above)")
+}
+
+test effect fn cssCoverageCanIUseProbes() -> ()
+  ! TreeError | ProtocolError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run canIUseProbes() |> Effect.provideMut<Allocator>(&mut allocator)
 }
