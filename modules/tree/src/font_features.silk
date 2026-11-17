@@ -1,8 +1,14 @@
-//! `font-variant` and its longhands, `font-kerning`, `font-feature-settings` and `font-width`
+//! `font-variant` and its longhands, `font-kerning`, `font-feature-settings`,
+//! `font-variation-settings` and `font-width`
 //! (`font-stretch`), read from their CSS text into the computed text, where ui-text hands them
 //! to the shaper.
 import mutation { Declaration, CssProperty }
 import properties.computed { Text, FontFeatures, MAX_FEATURE_SETTINGS }
+import properties.convert
+import ui_text.fonts { Variations, MAX_VARIATIONS }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.num.f32
 import properties.computed as computed
 import properties.values
 import silk.collections.bytes { Bytes }
@@ -10,6 +16,7 @@ import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
+import silk.num.usize
 
 /// Applies `declaration` to `text` when it sets one of these properties; false when it does
 /// not. A value that does not parse leaves `text` as it was, as CSS drops it.
@@ -19,7 +26,7 @@ pub effect fn apply(text: &mut Text, declaration: &Declaration) -> bool
   let property = declaration.property
   let group = groupOf(property)
   if group == 0 && property != CssProperty.FontVariant && property != CssProperty.FontFeatureSettings
-    && property != CssProperty.FontWidth && property != CssProperty.FontStretch {
+    && property != CssProperty.FontVariationSettings && property != CssProperty.FontWidth && property != CssProperty.FontStretch {
     return false
   }
   let written = run values.cssText(&declaration.value)
@@ -28,6 +35,13 @@ pub effect fn apply(text: &mut Text, declaration: &Declaration) -> bool
     let mut parsed = text.features
     if featureSettings(css, &mut parsed) {
       text.features = parsed
+    }
+  } else if property == CssProperty.FontVariationSettings {
+    // The tree turns the settings into a VariationTable id first (UiTree.namedFamilies).
+    if let Option.Some { value } = convert.number(&declaration.value) {
+      if value >= 0.0 {
+        text.features.variations = f32.toU32(value)
+      }
     }
   } else if property == CssProperty.FontWidth || property == CssProperty.FontStretch {
     let width = widthOf(css)
@@ -276,6 +290,185 @@ fn featureSettings(css: &[u8], out: &mut FontFeatures) -> bool {
     at = at + 1
   }
   out.* = result
+  return true
+}
+
+struct VariationEntry {
+  text: Bytes,
+  axes: Variations,
+}
+
+/// The `font-variation-settings` values met so far, by id. Id 0 is `normal`; a value's id
+/// stays the same while the tree lives, so it is a computed value that compares cheaply.
+pub struct VariationTable {
+  entries: List<VariationEntry>,
+}
+
+impl VariationTable {
+  pub fn make() -> VariationTable {
+    return VariationTable { entries: List<VariationEntry>.make() }
+  }
+
+  /// The id of the settings written as `css`, or None when they do not parse.
+  pub effect fn intern(self: &mut Self, css: &[u8]) -> Option<u32>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let entries = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if Bytes.asSlice(&entries[i].text) == css {
+        return Option<u32>.Some { value: usize.toU32(i + 1) }
+      }
+      i = i + 1
+    }
+    let mut axes = Variations.none()
+    if !variationSettings(css, &mut axes) {
+      return Option<u32>.None
+    }
+    if axes.count == 0 {
+      return Option<u32>.Some { value: 0 }
+    }
+    run self.entries.append(VariationEntry { text: run Bytes.copy(css), axes: axes })
+    return Option<u32>.Some { value: usize.toU32(self.entries.length()) }
+  }
+
+  /// The axes of id `id`; none for 0 or an id it did not give.
+  pub fn axes(self: &Self, id: u32) -> Variations {
+    let index = u32.toUsize(id)
+    if index == 0 || index > self.entries.length() {
+      return Variations.none()
+    }
+    return self.entries.asSlice()[index - 1].axes
+  }
+}
+
+/// `font-variation-settings`: `normal`, or a comma-separated list of a quoted four-letter axis
+/// tag and a number. Says whether it parsed.
+fn variationSettings(css: &[u8], out: &mut Variations) -> bool {
+  let mut at: usize = 0
+  while at < css.length && space(css[at]) {
+    at = at + 1
+  }
+  if named(trimmed(Slice.view(css, at, css.length - at)), b"normal") {
+    out.count = 0
+    return true
+  }
+  let mut result = out.*
+  result.count = 0
+  while true {
+    while at < css.length && space(css[at]) {
+      at = at + 1
+    }
+    if at + 6 > css.length || (css[at] != 34 && css[at] != 39) || css[at + 5] != css[at] {
+      return false
+    }
+    let mut tag: u32 = 0
+    let mut k: usize = 1
+    while k <= 4 {
+      let byte = css[at + k]
+      if byte < 32 || byte > 126 {
+        return false
+      }
+      tag = u32.shiftLeft(tag, 8) | u8.toU32(byte)
+      k = k + 1
+    }
+    at = at + 6
+    while at < css.length && space(css[at]) {
+      at = at + 1
+    }
+    let start = at
+    while at < css.length && css[at] != 44 && !space(css[at]) {
+      at = at + 1
+    }
+    let mut value: f32 = 0.0
+    if !numberOf(Slice.view(css, start, at - start), &mut value) {
+      return false
+    }
+    while at < css.length && space(css[at]) {
+      at = at + 1
+    }
+    // An axis named again replaces its earlier value.
+    let mut slot = result.count
+    let mut s: usize = 0
+    while s < result.count {
+      if result.tags[s] == tag {
+        slot = s
+      }
+      s = s + 1
+    }
+    if slot < MAX_VARIATIONS {
+      result.tags[slot] = tag
+      result.values[slot] = value
+      if slot == result.count {
+        result.count = result.count + 1
+      }
+    }
+    if at >= css.length {
+      break
+    }
+    if css[at] != 44 {
+      return false
+    }
+    at = at + 1
+  }
+  out.* = result
+  return true
+}
+
+/// A CSS number: an optional sign, digits with an optional fraction, and an optional exponent.
+fn numberOf(word: &[u8], out: &mut f32) -> bool {
+  let mut i: usize = 0
+  let mut negative = false
+  if i < word.length && (word[i] == 43 || word[i] == 45) {
+    negative = word[i] == 45
+    i = i + 1
+  }
+  let mut whole: f32 = 0.0
+  let mut digits: usize = 0
+  while i < word.length && digit(word[i]) {
+    whole = whole * 10.0 + u32.toF32(u8.toU32(word[i] - 48))
+    digits = digits + 1
+    i = i + 1
+  }
+  if i < word.length && word[i] == 46 {
+    i = i + 1
+    let mut scale: f32 = 0.1
+    while i < word.length && digit(word[i]) {
+      whole = whole + u32.toF32(u8.toU32(word[i] - 48)) * scale
+      scale = scale / 10.0
+      digits = digits + 1
+      i = i + 1
+    }
+  }
+  if digits == 0 {
+    return false
+  }
+  if i < word.length && (word[i] == 101 || word[i] == 69) {
+    i = i + 1
+    let mut down = false
+    if i < word.length && (word[i] == 43 || word[i] == 45) {
+      down = word[i] == 45
+      i = i + 1
+    }
+    let mut power: u32 = 0
+    let mut powerDigits: usize = 0
+    while i < word.length && digit(word[i]) && power < 100 {
+      power = power * 10 + u8.toU32(word[i] - 48)
+      powerDigits = powerDigits + 1
+      i = i + 1
+    }
+    if powerDigits == 0 {
+      return false
+    }
+    while power > 0 {
+      if down { whole = whole / 10.0 } else { whole = whole * 10.0 }
+      power = power - 1
+    }
+  }
+  if i != word.length {
+    return false
+  }
+  out.* = if negative { -whole } else { whole }
   return true
 }
 

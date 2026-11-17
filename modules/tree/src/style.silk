@@ -12,10 +12,13 @@ import layout.lib {
   TextWrap,
   WhiteSpaceCollapse,
   Visibility,
+  TableLayout,
+  BorderCollapse,
+  CaptionSide,
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
-import properties.computed { WritingMode, Direction, VerticalAlignKind }
+import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle }
 import properties.convert { Context }
 import timing { TransitionLists, AnimationLists }
 import transform { Transform }
@@ -227,8 +230,8 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
     || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
 }
 
-/// What a node's style says about its paint effects, which `paint_css` reads into the node.
 // Widest fields first: in declaration order the flags between them padded this to 40 bytes.
+/// What a node's style says about its paint effects, which `paint_css` reads into the node.
 pub struct EffectState {
   /// `paint_css.Effects.hash` of the node's effects.
   pub hash: u64,
@@ -237,6 +240,11 @@ pub struct EffectState {
   pub shadowFrom: u32,
   /// Whether the node's looks set a property `paint_css` reads.
   pub declared: bool,
+  /// Whether `will-change` makes the box a stacking context.
+  pub stacks: bool,
+  /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
+  /// `paint.radii` holds the length part.
+  pub radiusShare: bool,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
   pub layered: bool,
@@ -522,6 +530,14 @@ fn setDimension(target: &mut Dimension, value: &Value, context: &Context) -> () 
   }
 }
 
+// A `border-spacing` length in px; negative for anything else, which CSS rejects.
+fn spacingOf(value: &Value, context: &Context) -> f32 {
+  return match convert.dimension(value, context) {
+    Option.Some { value: found } => if found.kind == DimensionKind.Length && found.value >= 0.0 { found.value } else { -1.0 }
+    Option.None => -1.0
+  }
+}
+
 fn setGap(target: &mut Dimension, value: &Value, context: &Context) -> () {
   match convert.dimension(value, context) {
     Option.Some { value: found } => {
@@ -549,6 +565,33 @@ fn setPixels(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.length(value, context) {
     Option.Some { value: found } => {
       target.* = found
+    }
+    Option.None => {}
+  }
+}
+
+/// Whether `value` is a percentage or a math function, which may hold one.
+fn hasPercent(value: &Value) -> bool {
+  return match &value.* {
+    Value.Unit { unit, .. } => unit == Unit.Percent
+    Value.Math { .. } => true
+    _ => false
+  }
+}
+
+/// A corner radius with a percentage: its length part in `length`, and a percentage part noted in `effects` for
+/// `paint_css` to read.
+fn setRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context: &Context) -> () {
+  match convert.dimension(value, context) {
+    Option.Some { value: found } => {
+      if (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+        || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0 {
+        length.* = found.value
+        if found.percent > 0.0 {
+          effects.radiusShare = true
+          effects.declared = true
+        }
+      }
     }
     Option.None => {}
   }
@@ -623,7 +666,7 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
     match declaration.property {
       CssProperty.WritingMode | CssProperty.Direction | CssProperty.TextOrientation
         | CssProperty.ContainerName | CssProperty.Container
-        | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontWidth | CssProperty.FontStretch
+        | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontVariationSettings | CssProperty.FontWidth | CssProperty.FontStretch
         | CssProperty.FontVariantLigatures | CssProperty.FontVariantCaps | CssProperty.FontVariantNumeric
         | CssProperty.FontVariantPosition | CssProperty.FontKerning
         | CssProperty.Transform | CssProperty.Translate | CssProperty.Rotate | CssProperty.Scale
@@ -700,7 +743,7 @@ impl Computed {
       layout: CssStyle.make(),
       paint: Paint.initial(),
       text: text,
-      effects: EffectState { declared: false, hash: 0, shadowFrom: NO_SHADOW, shadowHash: 0, layered: false },
+      effects: EffectState { declared: false, hash: 0, shadowFrom: NO_SHADOW, shadowHash: 0, layered: false, stacks: false, radiusShare: false },
       viewportWidth: width,
       viewportHeight: height,
       usesViewport: false,
@@ -1195,16 +1238,16 @@ impl Computed {
         setBorderWidth(&mut self.paint.border.left, value, &context)
       }
       CssProperty.BorderTopLeftRadius => {
-        setPixels(&mut self.paint.radii.topLeft, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topLeft, value, &context) }
       }
       CssProperty.BorderTopRightRadius => {
-        setPixels(&mut self.paint.radii.topRight, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topRight, value, &context) }
       }
       CssProperty.BorderBottomRightRadius => {
-        setPixels(&mut self.paint.radii.bottomRight, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomRight, value, &context) }
       }
       CssProperty.BorderBottomLeftRadius => {
-        setPixels(&mut self.paint.radii.bottomLeft, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomLeft, value, &context) }
       }
       // Keywords.
       CssProperty.Position => {
@@ -1218,6 +1261,56 @@ impl Computed {
             }
           }
           Option.None => {}
+        }
+      }
+      // CSS 2 §17: the table reads these from its own style, a caption its side.
+      CssProperty.BorderCollapse => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Collapse { self.layout.borderCollapse = BorderCollapse.Collapse }
+            if word == Keyword.Separate { self.layout.borderCollapse = BorderCollapse.Separate }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TableLayout => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Fixed { self.layout.tableLayout = TableLayout.Fixed }
+            if word == Keyword.Auto { self.layout.tableLayout = TableLayout.Auto }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.CaptionSide => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Top { self.layout.captionSide = CaptionSide.Top }
+            if word == Keyword.Bottom { self.layout.captionSide = CaptionSide.Bottom }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.BorderSpacing => {
+        match &value.* {
+          Value.Sequence { separator: _, values } => {
+            let items = values.asSlice()
+            if items.length == 2 {
+              let x = spacingOf(&items[0], &context)
+              let y = spacingOf(&items[1], &context)
+              if x >= 0.0 && y >= 0.0 {
+                self.layout.borderSpacingX = x
+                self.layout.borderSpacingY = y
+              }
+            }
+          }
+          _ => {
+            let both = spacingOf(value, &context)
+            if both >= 0.0 {
+              self.layout.borderSpacingX = both
+              self.layout.borderSpacingY = both
+            }
+          }
         }
       }
       CssProperty.BoxSizing => {
@@ -1478,6 +1571,20 @@ impl Computed {
                 self.text.textWrap = found
               }
               Option.None => {}
+            }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextWrapStyle => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Auto || word == Keyword.Stable || word == Keyword.AvoidOrphans {
+              self.text.textWrapStyle = TextWrapStyle.Auto
+            } else if word == Keyword.Balance {
+              self.text.textWrapStyle = TextWrapStyle.Balance
+            } else if word == Keyword.Pretty {
+              self.text.textWrapStyle = TextWrapStyle.Pretty
             }
           }
           Option.None => {}
@@ -2024,6 +2131,10 @@ impl Computed {
           self.text.hasPlaceholderColor = true
         }
       }
+      // Read with the paint effects (`paint_css.reads`), but not in its hot `handles` test.
+      CssProperty.Isolation | CssProperty.WillChange => {
+        self.effects.declared = true
+      }
       // Properties the tree does not support are ignored.
       _ => {}
     }
@@ -2162,6 +2273,7 @@ impl Computed {
     self.layout.textOrientation = text.textOrientation
     self.layout.textAlignLast = text.textAlignLast
     self.layout.textWrap = text.textWrap
+    self.layout.textWrapStyle = text.textWrapStyle
     self.layout.whiteSpaceCollapse = text.whiteSpaceCollapse
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
