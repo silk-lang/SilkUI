@@ -6,7 +6,7 @@ import { provided } from "@silkui/foldkit/apis";
 export default defineConfig({
   plugins: [
     silk({
-      entry: "src/entry.ts",
+      entry: "js/entry.ts",
       // The document and the DOM classes are there at run time.
       allow: provided,
     }),

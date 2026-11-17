@@ -7,7 +7,7 @@
 //! ```silk,ignore
 //! effect fn app() -> App {
 //!   return run App.make("my-app")
-//!     |> App.framework(Framework.react("web"))
+//!     |> App.framework(Framework.react("."))
 //!     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
 //! }
 //!
@@ -95,7 +95,8 @@ impl Target {
 }
 
 /// What the app is written in. The JavaScript ones name the directory of a Vite project with
-/// `@silkui/vite` in its config, which bundles to `dist/app.js`.
+/// `@silkui/vite` in its config, `.` when `package.json` sits beside `silk.toml`. silkui has
+/// Vite bundle it into `.silk/bundle/`.
 pub union Framework {
   /// Loom: `module` in the project's sources has a `Model` (a `Program<Message, C>`) and its
   /// `Message`; `command` names its command type, or is empty for none.
@@ -109,7 +110,7 @@ impl Copy for Framework {}
 
 impl Framework {
   /// A Loom app whose `Model` and `Message` are in the project module `module`, such as `app`
-  /// for `src/app.silk`. The project's manifest exports it.
+  /// for `silk/app.silk` when the manifest sets `source = "silk"`. The project's manifest exports it.
   pub fn loom(module: string<'static>) -> Framework { return Framework.Loom { module: module, command: "" } }
   /// A Loom app with commands: `command` is the name of its command type in `module`.
   pub fn loomWithCommands(module: string<'static>, command: string<'static>) -> Framework {
@@ -348,7 +349,7 @@ impl App {
   pub effect fn make(name: string<'static>) -> App {
     return App {
       named: name,
-      writtenIn: Framework.Js { dir: "web" },
+      writtenIn: Framework.Js { dir: "." },
       runsOn: Runtime.Engine,
       runtimeCss: false,
       places: List<Target>.make(),
@@ -360,7 +361,8 @@ impl App {
     }
   }
 
-  /// What the app is written in. Plain JS in `web/` until this says otherwise.
+  /// What the app is written in. Plain JS, its Vite project at the root, until this says
+  /// otherwise.
   pub effect fn framework<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, framework: Framework) -> App ! E ? R {
     let mut app = run move self
     app.writtenIn = framework
@@ -444,7 +446,8 @@ impl App {
     return move app
   }
 
-  /// Runs Vite for a JavaScript app: `vite build` into the Vite project's `dist/app.js`. In
+  /// Runs Vite for a JavaScript app: `vite build` into `.silk/bundle/app.js`, out of the way of
+  /// `dist/` when the Vite project is the project root. In
   /// `Mode.Dev` on the Engine it only installs the packages, because the development server
   /// serves the modules to the window. Does nothing for a Loom app.
   pub effect fn bundle<'env, E, ?R>(self: once Effect<'env; App ! E ? R>, mode: Mode) -> App
@@ -456,16 +459,14 @@ impl App {
     let project = run readProject()
     let web = run fromRoot(&project, dir)
     run installed(String.view(&web))
-    app.bundled = run joined(String.view(&web), "dist/app.js")
+    let out = run fromRoot(&project, ".silk/bundle")
+    app.bundled = run joined(String.view(&out), "app.js")
     app.compiledSheet = String.make()
     if mode == Mode.Dev && app.runsOn == Runtime.Engine { return move app }
     run say("bundling with Vite")
-    if mode == Mode.Release {
-      run npm(String.view(&web), &["exec", "--", "vite", "build"])
-    } else {
-      run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", "development"])
-    }
-    let sheet = run joined(String.view(&web), "dist/app.sheet")
+    let viteMode = if mode == Mode.Release { "production" } else { "development" }
+    run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", viteMode, "--outDir", String.view(&out), "--emptyOutDir"])
+    let sheet = run joined(String.view(&out), "app.sheet")
     if run exists(String.view(&sheet)) { app.compiledSheet = move sheet }
     return move app
   }
@@ -784,10 +785,18 @@ static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOpera
       run excluded.append(run stylesheets.sourcePath(String.view(&project.root), css[at]))
       at = at + 1
     }
-    let src = run Path.make(String.view(&run joined(String.view(&project.root), "src")))
+    let src = run Path.make(String.view(&run joined(String.view(&project.root), String.view(&project.source))))
     if run FileSystem.exists(&src) { run fingerprint(&src, &mut hash, excluded.asSlice()) }
     return hash
   }
+}
+
+/// `before`, the Silk source directory, then `after`.
+effect fn sourceNote(project: &Project, before: string, after: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut note = run String.copy(before)
+  run String.append(&mut note, String.view(&project.source))
+  run String.append(&mut note, after)
+  return move note
 }
 
 effect fn ended(code: i32) -> () ! TaskError | OutOfMemoryError ? &mut Allocator {
@@ -841,7 +850,8 @@ impl Running {
   /// Keeps the app running until its window closes, or for a web target serves its page
   /// until the task is stopped. Fails when the program ends with a nonzero status.
   /// For a JavaScript app in `Mode.Dev`, Vite replaces edited modules in place. For a Loom
-  /// app in `Mode.Dev`, a change under `src/` rebuilds the host and restarts the app (a page
+  /// app in `Mode.Dev`, a change in the Silk sources (`src/`, or the
+  /// manifest's `source`) rebuilds the host and restarts the app (a page
   /// reloads itself); after a build that fails, the previous build runs.
   pub effect fn watch<'env, E, ?R>(self: once Effect<'env; Running ! E ? R>) -> ()
     ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
@@ -859,7 +869,7 @@ impl Running {
         }
         let watchesStyles = rebuilds && running.launched.source.stylePaths.length() != 0
         let mut styled = Option<u64>.None
-        if rebuilds { run say("watching src/ for changes") }
+        if rebuilds { run say(String.view(&run sourceNote(&project, "watching ", "/ for changes"))) }
         if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
         while true {
           run server.serveFor(300)
@@ -887,7 +897,7 @@ impl Running {
           let now = run sources(&project, running.launched.source.stylePaths.asSlice())
           if now == seen { continue }
           seen = now
-          run say("src/ changed: rebuilding")
+          run say(String.view(&run sourceNote(&project, "", "/ changed: rebuilding")))
           let artifact = &running.launched.outputs.asSlice()[0]
           let host = &running.launched.source.hosts.asSlice()[0]
           let rebuilt = run Effect.result(rebuildPage(&project, host, artifact, running.launched.source.stylePaths.asSlice()))
@@ -907,7 +917,7 @@ impl Running {
       }
       let watchesStyles = running.launched.madeIn == Mode.Dev && running.launched.source.stylePaths.length() != 0
       if !rebuilds && !watchesStyles { return run ended(child.wait()) }
-      if rebuilds { run say("watching src/ for changes") }
+      if rebuilds { run say(String.view(&run sourceNote(&project, "watching ", "/ for changes"))) }
       if watchesStyles { run say("watching stylesheets: CSS edits preserve application state") }
       let mut styled = Option<u64>.None
       while !child.ended() {
@@ -933,7 +943,7 @@ impl Running {
         let now = run sources(&project, running.launched.source.stylePaths.asSlice())
         if now == seen { continue }
         seen = now
-        run say("src/ changed: rebuilding")
+        run say(String.view(&run sourceNote(&project, "", "/ changed: rebuilding")))
         let artifact = &running.launched.outputs.asSlice()[0]
         let host = &running.launched.source.hosts.asSlice()[0]
         // The program is linked in place, so it stops before the build. A failed build

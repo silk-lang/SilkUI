@@ -28,7 +28,7 @@ silk task build                # writes the release program to dist/window/
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
 [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/) walks through one. Each
-project's `src/tasks.silk` defines the app through [`silkui`](modules/silkui). The JavaScript
+project's `silk/tasks.silk` defines the app through [`silkui`](modules/silkui). The JavaScript
 templates install the `@silkui/*` packages from npm.
 
 ## Documentation

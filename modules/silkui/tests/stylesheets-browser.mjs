@@ -47,21 +47,21 @@ async function stop(child, group = false) {
 }
 
 try {
-  await mkdir(join(temporary, 'src'));
+  await mkdir(join(temporary, 'silk'));
   await mkdir(join(temporary, 'styles'));
   await mkdir(join(temporary, 'fonts'));
   const font = join(temporary, 'fonts/brand.ttf');
   const monoFont = new URL('../../assets/assets/fonts/GeistMono.subset.ttf', import.meta.url);
   const sansFont = new URL('../../assets/assets/fonts/NotoSans-Regular.subset.ttf', import.meta.url);
   await copyFile(monoFont, font);
-  await copyFile(join(fixture, 'src/app.silk'), join(temporary, 'src/app.silk'));
+  await copyFile(join(fixture, 'silk/app.silk'), join(temporary, 'silk/app.silk'));
   await copyFile(join(fixture, 'styles/app.css'), join(temporary, 'styles/app.css'));
-  const theme = join(temporary, 'src/theme.css');
+  const theme = join(temporary, 'silk/theme.css');
   const original = (await readFile(join(fixture, 'styles/theme.css'), 'utf8')) + '\n@font-face{font-family:Bundled;src:url("../fonts/brand.ttf");font-display:swap}.font-probe{display:inline-block;font:16px Bundled}';
   await writeFile(theme, original);
-  // A configured CSS file under src/ must not also trigger a program rebuild.
-  const tasks = (await readFile(join(fixture, 'src/tasks.silk'), 'utf8')).replace('styles/theme.css', 'src/theme.css');
-  await writeFile(join(temporary, 'src/tasks.silk'), tasks);
+  // A configured CSS file under silk/ must not also trigger a program rebuild.
+  const tasks = (await readFile(join(fixture, 'silk/tasks.silk'), 'utf8')).replace('styles/theme.css', 'silk/theme.css');
+  await writeFile(join(temporary, 'silk/tasks.silk'), tasks);
   const manifest = (await readFile(join(fixture, 'silk.toml'), 'utf8')).replace('path = "../.."', 'path = ' + JSON.stringify(modulePath));
   await writeFile(join(temporary, 'silk.toml'), manifest);
   app = spawn(process.env.SILK ?? 'silk', ['task', 'dev', '--target', 'web-dom'], {
@@ -149,11 +149,11 @@ try {
   assert.deepEqual(await waitForColor('rgb(22, 101, 52)'), expected);
   await writeFile(theme, original);
   assert.deepEqual(await waitForColor('rgb(22, 78, 99)'), expected);
-  assert.doesNotMatch(buildLog, /src\/ changed: rebuilding/);
+  assert.doesNotMatch(buildLog, /silk\/ changed: rebuilding/);
   // A subsequent source rebuild must carry the current CSS, not the initial host copy.
   await writeFile(theme, original.replace('#164e63', '#166534'));
   assert.deepEqual(await waitForColor('rgb(22, 101, 52)'), expected);
-  const appSource = join(temporary, 'src/app.silk');
+  const appSource = join(temporary, 'silk/app.silk');
   await writeFile(appSource, (await readFile(appSource, 'utf8')) + '\n// Rebuild after CSS hot replacement.\n');
   await evaluate(`(async () => {
     for (let i = 0; i < 200; i++) {

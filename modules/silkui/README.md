@@ -1,14 +1,17 @@
 # silkui
 
-The front door of Silk UI. A project defines its app once, in `src/tasks.silk`, and builds and
+The front door of Silk UI. A project defines its app once, in `silk/tasks.silk`, and builds and
 runs it with pipelines of steps: `silk task dev` opens it with the development tools, and
 `silk task build` writes the release program. silkui generates the Silk host for each target,
 so the project never assembles hosts, fonts, GPU start-up or bundles by hand.
 
 | Written in | Files the project owns | What silkui generates |
 | --- | --- | --- |
-| React, Foldkit, plain JS | `silk.toml`, `src/tasks.silk`, a Vite project in `web/` | The window host in `.silk/window/`, with the bundle embedded in release builds |
-| Loom | `silk.toml`, `src/tasks.silk`, `src/app.silk` with the model, view and update | A host per target in `.silk/<target>/` that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
+| React, Foldkit, plain JS | `silk.toml`, `silk/tasks.silk`, the JavaScript in `js/`, and `package.json` and `vite.config.js` beside `silk.toml` | The window host in `.silk/window/`, with the bundle embedded in release builds |
+| Loom | `silk.toml`, `silk/tasks.silk`, `silk/app.silk` with the model, view and update | A host per target in `.silk/<target>/` that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
+
+One root holds both projects, so `silk` and `npm` commands both run there. The manifest's
+`source = "silk"` points Silk at `silk/` (without it, Silk reads `src/`).
 
 `.silk/` is git-ignored (silkui writes its `.gitignore`) and rewritten on every build. It is
 readable: each host is a manifest and a `main.silk` of a few lines that call into
@@ -21,7 +24,7 @@ import silkui.app { App, Framework, Target, Window, Mode, Built, Running }
 
 effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
   return run App.make("my-app")
-    |> App.framework(Framework.react("web"))
+    |> App.framework(Framework.react("."))
     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
 }
 
@@ -74,7 +77,7 @@ no inspector.
 
 | Setting | Choices | Notes |
 | --- | --- | --- |
-| `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
+| `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react(".")`, `Framework.foldkit(".")`, `Framework.js(".")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project's directory (`.` for the project root), whose config has `@silkui/vite`; silkui has it bundle into `.silk/bundle/` |
 | `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
