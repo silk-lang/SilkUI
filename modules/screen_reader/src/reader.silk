@@ -179,6 +179,11 @@ impl Reader {
     return self.said.asSlice()
   }
 
+  /// Whether something waits to be said.
+  pub fn hasSpeech(self: &Self) -> bool {
+    return self.speech.length() != 0
+  }
+
   pub effect fn takeSpeech(self: &mut Self, out: &mut List<Utterance>) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -904,6 +909,31 @@ impl Reader {
   // Quick navigation
 
   /// The item where the next (or previous) element of `kind` starts.
+  /// The items of the element of kind `kind` that starts at item `at`: the innermost one, its
+  /// own item or a field around it.
+  fn matchedSpan(self: &Self, kind: Kind, at: usize) -> Span {
+    let item = self.doc.item(at)
+    let own = self.doc.info(item.info)
+    let mut info = item.info
+    if !kindMatches(kind, own.kind, own.level) {
+      let fields = self.doc.fieldsOf(at)
+      let mut f = fields.length
+      while f > 0 {
+        f = f - 1
+        let field = self.doc.info(fields[f])
+        if kindMatches(kind, field.kind, field.level) {
+          info = fields[f]
+          break
+        }
+      }
+    }
+    let mut end = at + 1
+    while end < self.doc.items.length() && self.doc.within(end, info) {
+      end = end + 1
+    }
+    return Span { start: at, end: end }
+  }
+
   fn find(self: &Self, kind: Kind, forward: bool, from: usize) -> Option<usize> {
     let count = self.doc.items.length()
     let own = self.doc.fieldsOf(from)
@@ -952,14 +982,22 @@ impl Reader {
         let before = self.cursor
         self.cursor = value
         self.offset = 0
-        if self.playing == Flavor.VoiceOver {
-          let span = self.elementAround(value)
+        let container = kind == Kind.Table || kind == Kind.List || kind == Kind.Landmark
+        if self.playing == Flavor.Orca || container && self.playing != Flavor.VoiceOver {
+          // Orca's structural navigation presents the line the element is on, and so do the
+          // others for a table, list or landmark: its first line.
+          run self.sayLine(Option.Some { value: before }, true)
+        } else {
+          // The others read the element they moved to, not the rest of its line.
+          let span = if self.playing == Flavor.VoiceOver {
+            self.elementAround(value)
+          } else {
+            self.matchedSpan(kind, value)
+          }
           let mut text = String.make()
           run self.speakRange(Option.Some { value: before }, span.start, span.end, &mut text)
           run self.say(text.view(), true)
           run self.scrollTo(value)
-        } else {
-          run self.sayLine(Option.Some { value: before }, true)
         }
       }
       Option.None => {

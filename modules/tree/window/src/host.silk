@@ -25,7 +25,8 @@ import window.types { Appearance }
 import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
 import render_thread { FastScroll, FastScrolled, RenderSettings }
-import companion { Companion, Dock, NoCompanion, dockTarget, pointed }
+import companion { Companion, Dock, NoCompanion, Paired, dockTarget, pointed }
+import screen_reader { ScreenReader, VARIABLE as SCREEN_READER_VARIABLE }
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
   // No threads in the browser: frames are drawn on this thread (render_inline.silk).
@@ -520,7 +521,7 @@ fn windowOf(event: &Event) -> u32 {
 /// Opens a window for each root past the first that opened since, applies the title and size
 /// of the ones that changed, and closes the windows of the roots that closed. A root whose
 /// window cannot open is closed again and hears `Failed`. Root `docked` (a companion's, or
-/// NONE) is drawn in the first window and has none. Returns whether a root event was reported,
+/// NONE) is drawn in the first window and has none, as has root `overlay`. Returns whether a root event was reported,
 /// for the client to hear.
 effect fn syncWindows(
   tree: &mut UiTree<'_>,
@@ -528,6 +529,7 @@ effect fn syncWindows(
   renderer: &mut RenderThread,
   windows: &mut List<RootWindow>,
   docked: u32,
+  overlay: u32,
 ) -> bool
   ! GpuError | TreeError | OutOfMemoryError
   ? &mut Allocator {
@@ -539,7 +541,7 @@ effect fn syncWindows(
   let mut w: usize = 0
   while w < windows.length() {
     let root = windows.asSlice()[w].root
-    if contains(&open, root) && root != docked {
+    if contains(&open, root) && root != docked && root != overlay {
       w = w + 1
     } else {
       let gone = windows.remove(w)
@@ -552,7 +554,7 @@ effect fn syncWindows(
   while i < roots.length {
     let root = roots[i]
     i = i + 1
-    if root == FIRST_ROOT || root == docked {
+    if root == FIRST_ROOT || root == docked || root == overlay {
       continue
     }
     let mut title = String.make()
@@ -850,6 +852,7 @@ fn keyInput(input: &Input) -> bool {
   return match &input.* {
     Input.KeyDown { .. } => true
     Input.KeyUp { .. } => true
+    Input.TextInput { .. } => true
     _ => false
   }
 }
@@ -929,8 +932,46 @@ pub effect fn runWindow<H: WindowClient<S, E, R>, S, E, ? R>(
 }
 
 /// [`runWindow`] with `companion` beside the client, in the same tree (see `companion.silk`).
-/// Check mode runs no companion.
+/// Check mode runs no companion. A debug build runs the development screen reader
+/// (`screen_reader.silk`) beside `companion` too.
 pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  collection: &FontCollection,
+  resources: List<Mutation>,
+  options: RunOptions,
+  inspector: Inspector,
+  content: &mut H,
+  companion: &mut K,
+) -> i32
+  ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? R | &mut Allocator {
+  static if Intrinsic.profileText("optimization") == "none" {
+    let asked = run environmentVariable(SCREEN_READER_VARIABLE)
+    let mut reader = run ScreenReader.make(!options.check, move asked)
+    let mut paired = Paired<K, ScreenReader> { first: &mut companion, second: &mut reader }
+    return run hostWindow<H, Paired<K, ScreenReader>, S, E, R>(
+      &mut state,
+      collection,
+      move resources,
+      move options,
+      move inspector,
+      &mut content,
+      &mut paired,
+    )
+  } else {
+    return run hostWindow<H, K, S, E, R>(
+      &mut state,
+      collection,
+      move resources,
+      move options,
+      move inspector,
+      &mut content,
+      &mut companion,
+    )
+  }
+}
+
+effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   state: &mut S,
   collection: &FontCollection,
   resources: List<Mutation>,
@@ -1065,7 +1106,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // The windows of the roots past the first, with those `start` opened.
   let mut others = List<RootWindow>.make()
-  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock)) {
+  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock), companion.overlay()) {
     run content.pump(&mut state, &mut tree)
   }
   let mut drawn: u64 = 0
@@ -1316,16 +1357,35 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 run companion.layout(&mut tree, &mut inspector, docked.root, whole)
                 drop run tree.useRoot(FIRST_ROOT)
               }
+              // The overlay goes over both, laid out at the client's part of the window, so
+              // what it draws at the bottom stays clear of a dock.
+              let overlay = companion.overlay()
+              if overlay != NONE {
+                let whole = FrameInput {
+                  width: f64.toF32(area.width),
+                  height: f64.toF32(area.height),
+                  scale: f64.toF32(scale),
+                  time: targetTime,
+                }
+                run companion.layout(&mut tree, &mut inspector, overlay, whole)
+                drop run tree.useRoot(FIRST_ROOT)
+              }
+              let layered = dock.isSome() || overlay != NONE
               run serve(&mut platform, owner, &mut tree, &mut host)
               if serves { run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree)) }
-              if let Option<Dock>.Some { value: docked } = dock {
+              if layered {
                 composed.clear()
                 run composed.replay(
                   if serves { inspector.sceneWith(content.scene(&state.*, &tree)) } else { content.scene(&state.*, &tree) },
                   0,
                   usize.MAX,
                 )
-                run composed.replay(tree.sceneOf(docked.root), 0, usize.MAX)
+                if let Option<Dock>.Some { value: docked } = dock {
+                  run composed.replay(tree.sceneOf(docked.root), 0, usize.MAX)
+                }
+                if overlay != NONE {
+                  run composed.replay(tree.sceneOf(overlay), 0, usize.MAX)
+                }
                 run composed.finish()
               }
               run snapshot.copyUploads(&tree)
@@ -1359,8 +1419,12 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   ),
                 )
               }
+              if overlay != NONE {
+                // What the overlay draws stays put: the frame cannot scroll under it alone.
+                run fast.blocked.append(Rect<f32>.new(0.0, 0.0, f32.MAX, f32.MAX))
+              }
               run renderer.submit(
-                if dock.isSome() {
+                if layered {
                   &composed
                 } else if serves {
                   inspector.sceneWith(content.scene(&state.*, &tree))
@@ -1417,6 +1481,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
             }
             redraw = check || content.wantsFrames(&state.*) || content.needsFrame(&state.*, &tree)
               || dock.isSome() && tree.needsFrameOf(dockRoot(&dock))
+              || companion.overlay() != NONE && tree.needsFrameOf(companion.overlay())
           }
           Event.Resized { size, scaleFactor, .. } => {
             width = size.width
@@ -1562,7 +1627,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     // its root between a window and the dock; the client's root then has the window's rest.
     if !check {
       let changed = run companion.pump(&mut tree, &mut inspector, time)
-      if changed && dock.isSome() {
+      if changed && (dock.isSome() || companion.overlay() != NONE) {
         redraw = true
       }
       drop run tree.useRoot(FIRST_ROOT)
@@ -1579,14 +1644,15 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         run content.resize(&mut state, &mut tree, f64.toF32(area.width), f64.toF32(area.height))
         redraw = true
       }
-      if dock.isSome() && tree.needsFrameOf(dockRoot(&dock)) {
+      if dock.isSome() && tree.needsFrameOf(dockRoot(&dock))
+        || companion.overlay() != NONE && tree.needsFrameOf(companion.overlay()) {
         redraw = true
       }
       redraw = redraw || (serves && inspector.wantsFrame())
     }
 
     // Windows open, change and close with their roots; each is framed when its root needs it.
-    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock)) {
+    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock), companion.overlay()) {
       run content.pump(&mut state, &mut tree)
       drop run tree.useRoot(FIRST_ROOT)
       redraw = redraw || content.needsFrame(&state.*, &tree)
