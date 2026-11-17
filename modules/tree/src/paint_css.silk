@@ -77,6 +77,8 @@ pub fn handles(property: CssProperty) -> bool {
   return property == CssProperty.Filter || property == CssProperty.ClipPath
     || property == CssProperty.MixBlendMode
     || property == CssProperty.TextShadow
+    || property == CssProperty.ShapeOutside
+    || property == CssProperty.ShapeMargin
     || isMask(property)
     || isBackgroundLayer(property)
 }
@@ -279,6 +281,11 @@ pub struct Effects {
   pub isolate: bool,
   /// `will-change` names a property that makes a stacking context.
   pub stacks: bool,
+  /// Zero or one `shape-outside`, for floats. `shapeBox` says it names its reference box.
+  pub shape: List<ClipSource>,
+  pub shapeBox: bool,
+  /// `shape-margin`, a length or percentage in `numerics`.
+  pub shapeMargin: Option<ExprId>,
   /// Same declarations at the same font size and color hash alike.
   pub hash: u64,
 }
@@ -297,6 +304,9 @@ impl Effects {
       radii: Corners<f32>.zero(),
       isolate: false,
       stacks: false,
+      shape: List<ClipSource>.make(),
+      shapeBox: false,
+      shapeMargin: Option<ExprId>.None,
       hash: 0,
     }
   }
@@ -515,6 +525,10 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     run applyClips(&mut effects.*, &source, &mut cursor)
     return
   }
+  if property == CssProperty.ShapeOutside || property == CssProperty.ShapeMargin {
+    run applyShape(&mut effects.*, property, css, &source, &mut cursor, &context)
+    return
+  }
   if property == CssProperty.BackgroundPositionX || property == CssProperty.BackgroundPositionY {
     run applyAxis(&mut effects.*, property == CssProperty.BackgroundPositionX, &source, &mut cursor, &context)
     return
@@ -568,6 +582,69 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
       drop other
     }
   }
+}
+
+/// `shape-outside` takes `clip-path`'s shapes and boxes, with the margin box as the default
+/// reference; images are not read. `shape-margin` is one nonnegative length or percentage.
+effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], source: &Input<'_>, cursor: &mut Cursor, context: &LengthContext) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if property == CssProperty.ShapeMargin {
+    match run dimensions.parse(&mut effects.numerics, source, &mut cursor.*, Dimension.LengthPercentage, false) {
+      Option<ExprId>.Some { value } => {
+        if cursor.done(source) && !dimensions.negativeLiteral(&effects.numerics, value) {
+          effects.shapeMargin = Option<ExprId>.some(run dimensions.compute(&mut effects.numerics, value, context))
+        }
+      }
+      _ => {}
+    }
+    return
+  }
+  if cursor.ident(source, b"none") {
+    if cursor.done(source) {
+      effects.shape.clear()
+    }
+    return
+  }
+  let named = namesBox(css)
+  let value = match run effect_values.parse(&mut effects.numerics, CssProperty.ClipPath, source, &mut cursor.*, false) {
+    Option<EffectValue>.Some { value } => move value
+    _ => {
+      return
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  let colors = ColorContext.make(black, [black; 19])
+  let computed = run effect_values.compute(&value, &mut effects.numerics, context, &colors)
+  match move computed {
+    EffectValue.ClipPath { source: clip } => {
+      match &clip {
+        ClipSource.Url { .. } => {
+          return
+        }
+        _ => {}
+      }
+      effects.shape.clear()
+      run effects.shape.append(move clip)
+      effects.shapeBox = named
+    }
+    EffectValue other => {
+      drop other
+    }
+  }
+}
+
+/// Whether `css` names a reference box (`margin-box`, `border-box` and so on).
+fn namesBox(css: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i + 4 <= css.length {
+    if css[i] == 45 && css[i + 1] == 98 && css[i + 2] == 111 && css[i + 3] == 120 { return true }
+    i = i + 1
+  }
+  return false
 }
 
 /// Sets the longhand lists of `target` that `property` names from parsed `layers`.
