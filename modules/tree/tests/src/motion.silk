@@ -431,3 +431,53 @@ test effect fn startingStyleIsWhereTransitionsBegin() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run startingBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import svg_css.compile
+import svg_css.compile { Options, CompileError }
+import svg_css.tokens { CssError }
+
+effect fn inspectorAfterMotion(withSheet: bool) -> ()
+  ! AssertionError<'static> | TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  run frames.append(run frameOf(0.0, &[css.opacity(0.0)]))
+  run frames.append(run frameOf(1.0, &[css.opacity(1.0)]))
+  run batch.keyframes("fade", move frames)
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[
+    css.width(px(10.0)), css.height(px(10.0)),
+    css.declare(Property.Animation, run css.text(b"fade 1s linear forwards")),
+    css.declare(Property.Transition, run css.text(b"width 1s linear")),
+  ])
+  if withSheet {
+    let sheet = run compile.compile(b".unused{opacity:1}", &Options.make())
+    let bytes = run sheet.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.frame(at(0.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.25), "the animation is running before the inspector edits it")
+  let mut over = List<Declaration>.make()
+  run over.append(css.opacity(0.7))
+  run over.append(css.width(px(70.0)))
+  drop run tree.setOverride(2, StyleState.Base, move over, false)
+  run tree.frame(at(0.25))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.7), "the inspector overrides the animated opacity")
+  run Testing.expect(near(run widthOf(&tree, 2), 70.0), "the inspector overrides a transition immediately")
+  run tree.frame(at(0.5))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.7) && near(run widthOf(&tree, 2), 70.0), "animation ticks cannot overwrite inspector values")
+  drop tree.clearOverride(2, StyleState.Base)
+  run tree.frame(at(0.75))
+  run Testing.expect(near(opacityOf(&tree, 2), 0.75), "clearing the inspector reveals the continuing animation")
+}
+
+test effect fn inspectorOverridesWinAfterMotionWithAndWithoutSheets() -> ()
+  ! AssertionError<'static> | TreeError | CompileError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run inspectorAfterMotion(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run inspectorAfterMotion(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}

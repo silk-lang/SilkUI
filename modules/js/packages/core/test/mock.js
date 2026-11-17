@@ -6,15 +6,16 @@ export function installMock() {
     calls.push([name, ...args]);
     // The host says whether a role is one the tree has.
     if (name === "attribute" && args[1] === "role") return !/\bunknown\b/.test(args[2]);
-    if (name === "attribute" && args[1].startsWith("aria-")) return args[1] !== "aria-braillelabel";
+    if (name === "attribute" && args[1].startsWith("aria-")) return true;
   };
   const native = {};
   for (const name of [
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
     "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release",
-    "keyframe", "keyframes",
+    "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",
+    "shell",
   ]) {
     native[name] = record(name);
   }

@@ -57,13 +57,13 @@ await settle();
 // A running program holds the process open, as a page stays open.
 after(() => setImmediate(() => process.exit()));
 
-const tree = (id) => document.getElementById(id).node.id;
+const tree = (id) => document.getElementById(id).node.nodeId;
 
 test("the first render replaces #root with the view, made of tree nodes", () => {
   const page = document.getElementById("page");
   assert.equal(page.parentNode, document.body);
   assert.equal(document.getElementById("root"), null);
-  assert.deepEqual(calls("style").filter((call) => call[1] === page.node.id).map((call) => call[2]), ["display:flex;", "font-size:13px;"]);
+  assert.deepEqual(calls("style").filter((call) => call[1] === page.node.nodeId).map((call) => call[2]), ["display:flex;", "font-size:13px;"]);
   assert.equal(document.getElementById("field").node.kind, "input");
   assert.equal(page.textContent, "0addabc");
   assert.equal(document.title, "count 0");
@@ -85,7 +85,7 @@ test("a click runs update and the next frame patches the tree", async () => {
 });
 
 test("an element the view drops is freed, with its subtree", async () => {
-  const once = document.getElementById("once").node.id;
+  const once = document.getElementById("once").node.nodeId;
   ui.take();
   ui.click(tree("add"));
   await settle();
@@ -110,12 +110,41 @@ test("a controlled input shows what the Model holds", async () => {
 });
 
 test("keyed children move instead of being made again", async () => {
-  const before = document.querySelectorAll("li").map((item) => item.node.id);
+  const before = document.querySelectorAll("li").map((item) => item.node.nodeId);
   ui.take();
   ui.click(tree("reverse"));
   await settle();
-  assert.deepEqual(document.querySelectorAll("li").map((item) => item.node.id), before.toReversed());
+  assert.deepEqual(document.querySelectorAll("li").map((item) => item.node.nodeId), before.toReversed());
   assert.equal(document.querySelector('ul [data-item="c"]').nextSibling.textContent, "b");
   assert.equal(calls("create").length, 0);
   assert.equal(calls("destroy").length, 0);
+});
+
+test("the document shim forwards literal classes, attributes and their removal", () => {
+  const element = document.createElement("button");
+  element.className = "primary";
+  element.setAttribute("data-state", "open");
+  element.setAttribute("aria-expanded", "false");
+  assert.equal(element.node.getAttribute("element"), "button");
+  assert.equal(element.node.className, "primary");
+  assert.equal(element.node.getAttribute("data-state"), "open");
+  assert.equal(element.node.getAttribute("aria-expanded"), "false");
+  element.removeAttribute("class");
+  element.removeAttribute("data-state");
+  element.removeAttribute("aria-expanded");
+  assert.equal(element.node.getAttribute("class"), null);
+  assert.equal(element.node.getAttribute("data-state"), null);
+  assert.equal(element.node.getAttribute("aria-expanded"), null);
+});
+
+test("data-testid remains available to both stylesheet selectors and the inspector", () => {
+  const element = document.createElement("button");
+  for (const value of ["counter", "renamed"]) {
+    element.setAttribute("data-testid", value);
+    assert.equal(element.node.getAttribute("data-testid"), value);
+    assert.equal(element.node.getAttribute("testId"), value);
+  }
+  element.removeAttribute("data-testid");
+  assert.equal(element.node.getAttribute("data-testid"), null);
+  assert.equal(element.node.getAttribute("testId"), "");
 });

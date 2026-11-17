@@ -1,5 +1,27 @@
+import sheet_urls
+import sheet_faces
+import sheet_faces { Registry as SheetFaces }
+import ui_protocol.stylesheet { StyleSource }
+import style_load { Request as StyleRequest, Ticket as StyleTicket, Status as StyleStatus, LoadState as StyleLoadState }
 //! [`UiTree`]: the retained tree. Clients change it with [`Mutation`] batches, call
 //! [`UiTree.frame`] once per frame, and read the finished `Scene` and the event records.
+import style_inherit
+import generated
+import selection
+import placeholder
+import scrollbar_parts
+import containers
+import container_watch
+import style_change
+import style_change { Change }
+import container_watch { Watch }
+import style_media { Preferences }
+import properties.convert as properties_convert
+import properties.convert { Context }
+import properties.catalog
+import svg_css.written as css_written
+import properties.keywords { Keyword }
+import properties.values { Value }
 import layout.lib { Fragmentainers, computeFragmented }
 import virtual_list { VirtualList, VirtualRange }
 import virtual_list as virtual
@@ -54,8 +76,10 @@ import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import style { Computed, TextStyle, NO_SHADOW }
-import paint_css { Effects, Basis }
+import paint_css { Effects }
 import paint_css
+import font_units
+import font_units { Source as FontSource }
 import motion
 import motion { Running }
 import animation
@@ -64,9 +88,34 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode }
+import style_identity { Atoms, NodeIdentity }
+import style_sheets
+import style_invalidation
+import style_invalidation { Reach, Extent }
+import svg_css.element as css_element
+import svg_css.selectors as css_selectors
+import svg_css.element { PseudoTarget, StateBits }
+import style_sheets { RootSheets, Resolved, Resolution }
+import style_share
+import selector_tree { SelectorTree }
+import sheet_cache { Pending as PendingStyle }
+import silk.mem.frozen { Frozen }
+import svg_css.adopted { AdoptionError }
+import svg_css.sheet { Sheet }
+import svg_css.sheet_binary { DecodeError }
+import svg_css.resolver { ResolverError }
+import svg_css.variables { RegistrationError }
+import svg_css.tokens { CssError, Limits, TokenBuffer }
+import svg_css.tokens as css_tokens
+import svg_css.declaration_values
+import svg_css.media_features { Environment }
+import svg_css.colors { Color as SheetColor }
+import style_attributes
+import ui_protocol.aria { isNamedAttribute }
 import node {
   NONE,
+  WATCH_OUTSIDE,
   NO_INDEX,
   FrameInput,
   FrameStats,
@@ -84,7 +133,7 @@ import resources { Families, Resources, Resource, ResourceError }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
-import ui_text.set { FaceRule, UnicodeRange }
+import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
 import font_collection.lib { FontCollection, Family, Request, Style as FaceStyle }
@@ -160,6 +209,7 @@ pub struct RootState {
   /// frame styles, lays out and hashes again.
   pub touched: bool,
   output: LayoutTree,
+  containerWatches: List<Watch>,
   sceneA: Scene,
   sceneB: Scene,
   flipped: bool,
@@ -218,6 +268,7 @@ impl RootState {
       paintedAt: 0,
       touched: false,
       output: LayoutTree.make(),
+      containerWatches: List<Watch>.make(),
       sceneA: Scene.make(),
       sceneB: Scene.make(),
       flipped: false,
@@ -279,6 +330,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.Remove { id } => id
     Mutation.Destroy { id } => id
     Mutation.SetStyle { id, .. } => id
+    Mutation.SetCustomProperty { id, .. } => id
     Mutation.ClearStyle { id, .. } => id
     Mutation.SetText { id, .. } => id
     Mutation.SetSelection { id, .. } => id
@@ -308,6 +360,11 @@ fn reachesEveryRoot(mutation: &Mutation) -> bool {
     Mutation.OpenRoot { .. } => false
     Mutation.UpdateRoot { .. } => false
     Mutation.CloseRoot { .. } => false
+    Mutation.LoadStyleSheet { .. } => false
+    Mutation.AdoptStyleSheet { .. } => false
+    Mutation.ReplaceStyleSheet { .. } => false
+    Mutation.RemoveStyleSheet { .. } => false
+    Mutation.SetStyleSheetOrder { .. } => false
     _ => true
   }
 }
@@ -333,6 +390,7 @@ struct FontFaceEntry {
 impl Copy for FontFaceEntry {}
 
 struct FontKeyEntry {
+  root: u32,
   family: u32,
   size: f32,
   weight: f32,
@@ -361,6 +419,22 @@ effect fn viewFailed(error: CssomError) -> never
   fail TreeError.View { error: error }
 }
 
+effect fn generatedFailed(error: CssError | OutOfMemoryError) -> Option<String>
+  ! OutOfMemoryError {
+  match move error {
+    OutOfMemoryError allocation => { fail move allocation }
+    CssError invalid => { drop invalid return Option<String>.None }
+  }
+}
+
+effect fn appendGrid(target: &mut List<Declaration>, declarations: &[Declaration]) ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if grid_css.isGridProperty(declarations[i].property) { run target.append(run values.cloneDeclaration(&declarations[i])) }
+    i = i + 1
+  }
+}
+
 fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   return match kind {
     NodeKind.Box => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
@@ -375,18 +449,128 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
   }
 }
 
+effect fn invalidInitial(error: CssError) -> Value {
+  drop error
+  return values.keyword(Keyword.Initial)
+}
+
+pub effect fn applyInitial(computed: &mut Computed, property: CssProperty) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut initial = Computed.inViewport(TextStyle.initial(), computed.viewportWidth, computed.viewportHeight)
+  // Start with native initial representations for values such as font-size:
+  // medium, then let the catalog override native user-agent defaults.
+  let value = run Effect.catch<CssError>(css_written.value(catalog.initial(property)), invalidInitial)
+  let mut declaration = Declaration { property: property, important: false, value: move value }
+  if properties_convert.isKeyword(&declaration.value, Keyword.Currentcolor) { declaration.value = values.color(computed.text.color) }
+  if !run applyWritten(&mut initial, &declaration) { initial.apply(&declaration) }
+  drop style_inherit.apply(&mut computed.*, &initial, property)
+}
+
+/// Sheet winners have already been selected per longhand. Copy explicit inheritance from computed
+/// parent values, and establish writing mode/direction/font size before dependents.
+pub effect fn applyResolved(computed: &mut Computed, list: &List<Declaration>, parent: &Computed, stops: &mut EasingStops) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let items = list.asSlice()
+  let dependencies = [CssProperty.WritingMode, CssProperty.Direction, CssProperty.FontSize, CssProperty.Color]
+  let mut dependency: usize = 0
+  while dependency < dependencies.length {
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].property == dependencies[dependency] {
+        if properties_convert.isKeyword(&items[i].value, Keyword.Initial) {
+          run applyInitial(&mut computed.*, items[i].property)
+        } else if properties_convert.isKeyword(&items[i].value, Keyword.Inherit) {
+          drop style_inherit.apply(&mut computed.*, parent, items[i].property)
+        } else { computed.apply(&items[i]) }
+      }
+      i = i + 1
+    }
+    dependency = dependency + 1
+  }
+  let mut i: usize = 0
+  while i < items.length {
+    let property = items[i].property
+    if property != CssProperty.FontSize && property != CssProperty.WritingMode && property != CssProperty.Direction && property != CssProperty.Color {
+      if properties_convert.isKeyword(&items[i].value, Keyword.Initial) {
+        run applyInitial(&mut computed.*, property)
+      } else if properties_convert.isKeyword(&items[i].value, Keyword.Inherit) {
+        if paint_css.handles(property) { computed.effects.declared = true }
+        drop style_inherit.apply(&mut computed.*, parent, property)
+      } else {
+        let which = transitionList(property)
+        if which != NONE {
+          let text = run values.cssText(&items[i].value)
+          run stops.read(text.asSlice())
+          run motion.declare(&mut computed.transition, which, text.asSlice(), &mut stops)
+        } else if animationList(property) != NONE {
+          let text = run values.cssText(&items[i].value)
+          run stops.read(text.asSlice())
+          run timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice(), &mut stops)
+        } else if !run applyWritten(&mut computed.*, &items[i]) {
+          computed.apply(&items[i])
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+/// Applies non-font declarations after the node's font dependencies have resolved.
+pub effect fn applyUsing(computed: &mut Computed, list: &List<Declaration>, parent: &Computed,
+  stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
+  let items = list.asSlice()
+  let mut pass: u32 = 0
+  while pass < 2 {
+    let mut i: usize = 0
+    while i < items.length {
+      let declaration = &items[i]
+      let property = declaration.property
+      if font_units.phase(property) == 0 && (property == CssProperty.Color) == (pass == 0) {
+        if properties_convert.isKeyword(&declaration.value, Keyword.Initial) {
+          run applyInitial(&mut computed.*, property)
+        } else if properties_convert.isKeyword(&declaration.value, Keyword.Inherit) {
+          if paint_css.handles(property) { computed.effects.declared = true }
+          drop style_inherit.apply(&mut computed.*, parent, property)
+        } else {
+          let which = transitionList(property)
+          if which != NONE {
+            let text = run values.cssText(&declaration.value)
+            run stops.read(text.asSlice())
+            run motion.declare(&mut computed.transition, which, text.asSlice(), &mut stops)
+          } else if animationList(property) != NONE {
+            let text = run values.cssText(&declaration.value)
+            run stops.read(text.asSlice())
+            run timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice(), &mut stops)
+          } else if property == CssProperty.Container {
+            if let Option.Some { value } = move run containers.typeOf(declaration) {
+              computed.applyIn(&Declaration { property: CssProperty.ContainerType, important: declaration.important, value: move value }, units)
+            }
+          } else if !run applyTransformIn(&mut computed.*, declaration, units) {
+            computed.applyIn(declaration, units)
+          }
+        }
+      }
+      i = i + 1
+    }
+    pass = pass + 1
+  }
+}
+
 pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops: &mut EasingStops) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let items = list.asSlice()
 
-  // Font size first: `em` lengths in the same patch refer to it.
+  let dependencies = [CssProperty.WritingMode, CssProperty.Direction, CssProperty.FontSize]
+  let mut dependency: usize = 0
   let mut i: usize = 0
-  while i < items.length {
-    if items[i].property == CssProperty.FontSize {
-      computed.apply(&items[i])
+  while dependency < dependencies.length {
+    i = 0
+    while i < items.length {
+      if items[i].property == dependencies[dependency] { computed.apply(&items[i]) }
+      i = i + 1
     }
-    i = i + 1
+    dependency = dependency + 1
   }
   i = 0
   while i < items.length {
@@ -395,15 +579,25 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
     if which != NONE {
       let text = run values.cssText(&items[i].value)
       run stops.read(text.asSlice())
-      motion.declare(&mut computed.transition, which, text.asSlice())
+      run motion.declare(&mut computed.transition, which, text.asSlice(), &mut stops)
     } else if animationList(property) != NONE {
       let text = run values.cssText(&items[i].value)
       run stops.read(text.asSlice())
-      timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice())
+      run timing.declareAnimation(&mut computed.animation, animationList(property), text.asSlice(), &mut stops)
     } else if run applyWritten(&mut computed, &items[i]) {
-    } else if property != CssProperty.FontSize {
+    } else if property != CssProperty.FontSize && property != CssProperty.WritingMode && property != CssProperty.Direction {
       computed.apply(&items[i])
     }
+    i = i + 1
+  }
+}
+
+fn applyPixelList(computed: &mut Computed, list: &List<Declaration>) {
+  let items = list.asSlice()
+  let units = computed.unitContext()
+  let mut i: usize = 0
+  while i < items.length {
+    computed.applyFixed(&items[i], &units)
     i = i + 1
   }
 }
@@ -413,6 +607,12 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
 pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if declaration.property == CssProperty.Container {
+    if let Option<Value>.Some { value } = move run containers.typeOf(declaration) {
+      computed.apply(&Declaration { property: CssProperty.ContainerType, important: declaration.important, value: move value })
+    }
+    return true
+  }
   if run font_features.apply(&mut computed.text, declaration) {
     return true
   }
@@ -423,19 +623,25 @@ pub effect fn applyWritten(computed: &mut Computed, declaration: &Declaration) -
 pub effect fn applyTransform(computed: &mut Computed, declaration: &Declaration) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if transformProperty(declaration.property) == NONE { return false }
+  let units = computed.unitContext()
+  return run applyTransformIn(&mut computed.*, declaration, &units)
+}
+
+pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaration, context: &Context) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
   let which = transformProperty(declaration.property)
   if which == NONE {
     return false
   }
   let text = run values.cssText(&declaration.value)
-  let units = transform.Units {
-    fontSize: computed.text.size,
-    rootFontSize: 16.0,
-    viewportWidth: computed.viewportWidth,
-    viewportHeight: computed.viewportHeight,
-  }
+  let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
   if !computed.usesViewport && style.viewportDependent(declaration) {
+    computed.usesViewport = true
+  }
+  if style.containerDependent(declaration) {
+    computed.usesContainer = true
     computed.usesViewport = true
   }
   return true
@@ -528,8 +734,17 @@ pub struct UiTree<'a> {
   pub anchors: List<Anchored>,
   pub layout: Tree,
   pub output: LayoutTree,
+  pub containerWatches: List<Watch>,
+  pub styleChanges: List<Change>,
+  pub changingStyles: bool,
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
+  pub styleAtoms: Atoms,
+  pub styleSheets: List<RootSheets>,
+  styleLoads: List<StyleRequest>,
+  styleGeneration: u64,
+  nextStyleId: u32,
+  hostStylePreferences: Option<Preferences>,
   free: List<u32>,
   ids: HashMap<Word, u32>,
   /// The slot of each css-layout node, or NONE.
@@ -555,6 +770,7 @@ pub struct UiTree<'a> {
   sourceTells: List<u32>,
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
+  pub sheetFaces: SheetFaces,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -573,6 +789,12 @@ pub struct UiTree<'a> {
   pub stylesDirty: bool,
   /// Some nodes have `styleDirty`: the next resolve visits only their subtrees' paths.
   pub stylesPending: bool,
+  /// The last `Node.styleClass` handed out.
+  pub styleClasses: u32,
+  /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
+  pub styleModels: HashMap<u64, u32>,
+  /// The last `Node.computedStamp` handed out.
+  pub computedStamps: u32,
   pub frameNumber: u64,
   /// Changes to published semantics or allocated geometry.
   pub semanticRevision: u64,
@@ -720,11 +942,20 @@ impl<'a> UiTree<'a> {
       anchors: List<Anchored>.make(),
       layout: move layout,
       output: LayoutTree.make(),
+      containerWatches: List<Watch>.make(),
+      styleChanges: List<Change>.make(),
+      changingStyles: false,
       provider: Provider<'a> {
         text: TextSystem.make(collection),
         naturals: List<NaturalDimensions>.make(),
       },
       nodes: List<Node>.make(),
+      styleAtoms: Atoms.make(),
+      styleSheets: List<RootSheets>.make(),
+      styleLoads: List<StyleRequest>.make(),
+      styleGeneration: 0,
+      nextStyleId: 1,
+      hostStylePreferences: Option<Preferences>.None,
       free: List<u32>.make(),
       ids: HashMap<Word, u32>.make(seed),
       slotOfCss: List<u32>.make(),
@@ -739,6 +970,7 @@ impl<'a> UiTree<'a> {
       sourceTells: List<u32>.make(),
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
+      sheetFaces: SheetFaces.make(),
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -752,6 +984,9 @@ impl<'a> UiTree<'a> {
       seed: seed,
       stylesDirty: true,
       stylesPending: false,
+      styleClasses: 0,
+      styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
+      computedStamps: 0,
       frameNumber: 0,
       semanticRevision: 0,
       revision: 0,
@@ -904,13 +1139,21 @@ impl<'a> UiTree<'a> {
     return &self.nodes.asSlice()[u32.toUsize(slot)]
   }
 
-  /// Says that the style inputs of the node at `slot` changed (its declarations, its
-  /// parent, its hover, press or focus state): the next resolve restyles it, and its
-  /// descendants as far as what they inherit changed. Its ancestors are marked so the resolve
-  /// finds it from the root.
+  effect fn richDeclarations(self: &mut Self, declarations: List<Declaration>) -> List<Declaration>
+    ! OutOfMemoryError ? &mut Allocator {
+    let expanded = match move run expand.prepared(declarations.asSlice()) {
+      Option.Some { value } => move value
+      Option.None => move declarations
+    }
+    return match move run self.namedFamilies(expanded.asSlice()) {
+      Option.Some { value } => move value
+      Option.None => move expanded
+    }
+  }
+
   /// `declared` with each `font-family` written as CSS text (`Inter, sans-serif`) turned into
   /// the family list id the computed style reads, or None when none is written so.
-  effect fn namedFamilies(self: &mut Self, declared: &[Declaration]) -> Option<List<Declaration>>
+  pub effect fn namedFamilies(self: &mut Self, declared: &[Declaration]) -> Option<List<Declaration>>
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut found = false
@@ -948,18 +1191,61 @@ impl<'a> UiTree<'a> {
     return Option<List<Declaration>>.Some { value: move out }
   }
 
-  /// Installs the grid the base look's grid properties describe, replacing any earlier
-  /// template, as `Mutation.SetGrid` does.
-  effect fn styleGrid(self: &mut Self, slot: u32) -> ()
+  effect fn resolveGrid(self: &mut Self, slot: u32, computed: &Computed) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    let grid = run grid_css.gridOf(self.node(slot).base.asSlice())
-    let css = self.node(slot).css
+    let node = self.node(slot)
+    let mut declarations = List<Declaration>.make()
+    if let Option.Some { value } = node.sheetStyle() {
+      run appendGrid(&mut declarations, value.declarations.asSlice())
+      run appendGrid(&mut declarations, value.overrides.asSlice())
+    } else {
+      if !node.gridDeclared && !node.gridStyled && self.overrides.length() == 0 { return () }
+      let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+      let mut i: usize = 0
+      while i < states.length {
+        let state = states[i]
+        if style_sheets.active(&self, slot, state) {
+          let list = match state {
+            StyleState.Hover => &node.hover
+            StyleState.Active => &node.active
+            StyleState.Focus => &node.focus
+            StyleState.FocusVisible => &node.focusVisible
+            _ => &node.base
+          }
+          let replace = match self.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
+          if node.gridDeclared && !replace { run appendGrid(&mut declarations, list.asSlice()) }
+        }
+        i = i + 1
+      }
+      i = 0
+      while i < states.length {
+        if style_sheets.active(&self, slot, states[i]) {
+          if let Option.Some { value } = self.overrideOf(node.id, states[i]) { run appendGrid(&mut declarations, value.declarations.asSlice()) }
+        }
+        i = i + 1
+      }
+    }
+    let styled = declarations.length() != 0
+    if !styled && !node.gridStyled { return () }
+    let css = node.css
+    let grid = run grid_css.gridOfWith(declarations.asSlice(), &font_units.context(&self, slot, computed, node.fontKey))
     run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    let target = self.nodeMut(slot)
+    target.gridStyled = styled
     self.paintDirty = true
   }
 
   pub fn restyle(self: &mut Self, slot: u32) -> () {
+    if self.styleSheets.length() != 0 {
+      let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+      if at != usize.MAX && (self.styleSheets.asSlice()[at].sheets.length() != 0 || self.styleSheets.asSlice()[at].inlineVariables) { self.stylesDirty = true }
+    }
+    self.restyleLocal(slot)
+  }
+
+  // Callers must rule out selector changes outside this subtree and changed variable inputs.
+  pub fn restyleLocal(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
     nodes[u32.toUsize(slot)].styleDirty = true
@@ -972,6 +1258,228 @@ impl<'a> UiTree<'a> {
       nodes[at].subtreeDirty = true
       up = nodes[at].parent
     }
+  }
+
+  fn classReach(self: &Self, slot: u32, after: &[usize]) -> Extent {
+    let subtree = Extent { reach: Reach.Subtree, anchors: false }
+    if self.stylesDirty || self.styleSheets.length() == 0 { return subtree }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return subtree }
+    let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms.asSlice() _ => &[] }
+    return style_invalidation.classReach(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
+  }
+
+  /// Restyles the subtree of `slot`'s parent, which holds every sibling a selector can relate it to.
+  fn restyleSiblings(self: &mut Self, slot: u32) -> () {
+    let parent = self.node(slot).parent
+    self.restyleLocal(if parent == NONE { slot } else { parent })
+  }
+
+  /// The relations the current root's sheets read, or None when it resolves no sheet styles or
+  /// a root restyle is already due.
+  fn sheetReads(self: &Self) -> Option<u32> {
+    if self.stylesDirty || self.styleSheets.length() == 0 { return Option<u32>.None }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) { return Option<u32>.None }
+    return Option<u32>.some(self.styleSheets.asSlice()[at].reads)
+  }
+
+  /// Restyles what a change in `parent`'s child list reaches besides the child itself, given the
+  /// element siblings on either side of the place it entered or left. A text child is `text`.
+  fn restyleAround(self: &mut Self, reads: u32, parent: u32, previous: u32, next: u32, text: bool) -> () {
+    let has = u32.bitAnd(reads, css_selectors.READS_DESCENDANTS) != 0
+    if text {
+      if u32.bitAnd(reads, css_selectors.READS_EMPTY) != 0 {
+        self.restyleLocal(parent)
+        // `:has(:empty)` above the parent, whose emptiness changed.
+        if has {
+          let above = self.node(parent).parent
+          let beside = self.elementBeside(parent, true)
+          self.restyleAnchors(above, beside)
+        }
+      }
+      return ()
+    }
+    if has { self.restyleAnchors(parent, previous) }
+    if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS | css_selectors.READS_EMPTY) != 0 {
+      self.restyleLocal(parent)
+      return ()
+    }
+    if u32.bitAnd(reads, css_selectors.READS_EDGE) != 0 {
+      if previous != NONE { self.restyleLocal(previous) }
+      if next != NONE { self.restyleLocal(next) }
+    }
+  }
+
+  /// Restyles the `:has()` anchors that can see a change in `parent`'s child list after the
+  /// element `previous` (NONE for the start): `parent` and its ancestors, which hold the place
+  /// in their subtrees, and, for arguments that start with `+` or `~`, the elements before it
+  /// and before each ancestor. Only nodes a match asked `:has()` of are anchors
+  /// (`Node.styleWatch`); what follows from an anchor's match lies in its subtree, or in its
+  /// parent's when a `:has()` rule also relates siblings.
+  fn restyleAnchors(self: &mut Self, parent: u32, previous: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || self.stylesDirty { return () }
+    let sheets = &self.styleSheets.asSlice()[at]
+    if sheets.watchAll {
+      self.stylesDirty = true
+      self.stylesPending = true
+      return ()
+    }
+    let wide = sheets.states.wide
+    let siblings = sheets.siblingAnchors
+    let mut before = previous
+    let mut up = parent
+    while true {
+      while siblings && before != NONE {
+        if u32.bitAnd(self.node(before).styleWatch, css_element.WATCH_HAS_SIBLINGS) != 0 {
+          if wide { self.restyleSiblings(before) } else { self.restyleLocal(before) }
+        }
+        before = self.elementBeside(before, true)
+      }
+      if up == NONE { break }
+      if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_HAS) != 0 {
+        if wide { self.restyleSiblings(up) } else { self.restyleLocal(up) }
+      }
+      before = if siblings { self.elementBeside(up, true) } else { NONE }
+      up = self.node(up).parent
+    }
+  }
+
+  fn selectorStates(self: &Self, slot: u32) -> u32 {
+    let adapter = SelectorTree { tree: self }
+    return adapter.state(u32.toUsize(slot)).bits
+  }
+
+  /// What rules that read one of the attributes `names` reach from a node that changed it; an
+  /// empty name is skipped. `ids` are the node's id before and after when `id` is among them.
+  fn attributeReach(self: &Self, names: &[&[u8]], ids: &[&[u8]]) -> Extent {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return Extent.none() }
+    let sheets = &self.styleSheets.asSlice()[at]
+    let mut any = false
+    let mut i: usize = 0
+    while i < names.length {
+      if names[i].length != 0 { any = true }
+      // `:lang()` and `:link` are no invalidation key.
+      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")) {
+        return Extent { reach: Reach.Root, anchors: false }
+      }
+      i = i + 1
+    }
+    if !any { return Extent.none() }
+    // Generated content can read any attribute of its origin with attr().
+    let least = Extent { reach: if sheets.hasGenerated { Reach.Subtree } else { Reach.None }, anchors: false }
+    if !sheets.states.attributes { return least }
+    return least.with(style_invalidation.attributeReach(&sheets.sheets, &self.styleAtoms, names, ids))
+  }
+
+  fn idReach(self: &Self, slot: u32, after: &[u8]) -> Extent {
+    let before = match self.node(slot).identity() {
+      Option.Some { value } => String.utf8Bytes(String.view(&value.id))
+      _ => b""
+    }
+    return self.attributeReach(&[b"id"], &[before, after])
+  }
+
+  /// Restyles what `change` at `slot` reaches.
+  fn restyleExtent(self: &mut Self, slot: u32, change: Extent) -> () {
+    if change.anchors {
+      let above = self.node(slot).parent
+      let beside = self.elementBeside(slot, true)
+      self.restyleAnchors(above, beside)
+    }
+    match change.reach {
+      Reach.None => {}
+      Reach.Subtree => self.restyleLocal(slot)
+      Reach.Siblings => self.restyleSiblings(slot)
+      Reach.Root => self.restyle(slot)
+    }
+  }
+
+  /// What a change of the state bits `mask` on `slot` reaches. The node's own record names the
+  /// states its candidate rules read.
+  fn stateReach(self: &Self, slot: u32, mask: u32) -> Extent {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if mask == 0 || at == usize.MAX { return Extent.none() }
+    let reach = &self.styleSheets.asSlice()[at].states
+    let own = match self.node(slot).sheetStyle() { Option.Some { value } => value.states _ => 0 }
+    return Extent {
+      reach: if u32.bitAnd(reach.siblings, mask) != 0 { Reach.Siblings }
+        else if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { Reach.Subtree }
+        else { Reach.None },
+      anchors: u32.bitAnd(reach.has, mask) != 0,
+    }
+  }
+
+  /// Restyles the nodes whose `:focus-within` changes when focus moves from `from` to `to`
+  /// (either may be NONE): each one's ancestors, and itself, that do not hold the other. Only
+  /// nodes a match asked `:focus-within` of can change style.
+  fn focusWithinMoved(self: &mut Self, from: u32, to: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || self.stylesDirty { return () }
+    let sheets = &self.styleSheets.asSlice()[at]
+    if u32.bitAnd(sheets.states.any, css_element.FOCUS_WITHIN) == 0 { return () }
+    if sheets.watchAll {
+      self.stylesDirty = true
+      self.stylesPending = true
+      return ()
+    }
+    let siblings = u32.bitAnd(sheets.states.siblings, css_element.FOCUS_WITHIN) != 0
+    let mut side: usize = 0
+    while side < 2 {
+      let other = if side == 0 { to } else { from }
+      let mut up = if side == 0 { from } else { to }
+      while up != NONE && !(other != NONE && self.within(other, up)) {
+        if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_FOCUS_WITHIN) != 0 {
+          if siblings { self.restyleSiblings(up) } else { self.restyleLocal(up) }
+        }
+        up = self.node(up).parent
+      }
+      side = side + 1
+    }
+  }
+
+  fn elementBeside(self: &Self, slot: u32, backwards: bool) -> u32 {
+    let adapter = SelectorTree { tree: self }
+    let found = if backwards { adapter.previousSibling(u32.toUsize(slot)) } else { adapter.nextSibling(u32.toUsize(slot)) }
+    return if found == css_element.NO_ELEMENT { NONE } else { usize.toU32(found) }
+  }
+
+  /// Focus looks apply to the focused node alone; sheet rules can carry focus further.
+  fn focusStyleChanged(self: &mut Self, slot: u32) -> () {
+    if self.sheetReads().isNone() { self.restyle(slot)
+      return () }
+    let mut change = self.stateReach(slot, css_element.FOCUS | css_element.FOCUS_VISIBLE)
+    // `:has(:focus-within)` anchors lie above the node as those of `:has(:focus)` do.
+    if self.stateReach(slot, css_element.FOCUS_WITHIN).anchors { change.anchors = true }
+    if change.reach == Reach.None { change.reach = Reach.Subtree }
+    self.restyleExtent(slot, change)
+  }
+
+  pub fn pointerStyleChanged(self: &mut Self, slot: u32, state: StyleState, inline: bool) -> () {
+    if self.stylesDirty { self.restyleLocal(slot)
+      return () }
+    let node = self.node(slot)
+    if node.kind == NodeKind.Text && !inline { return () }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) {
+      if inline { self.restyleLocal(slot) }
+      return ()
+    }
+    let mut custom = false
+    if let Option.Some { value } = node.identity() {
+      let mut i: usize = 0
+      while i < value.custom.length() {
+        if value.custom.asSlice()[i].state == state { custom = true }
+        i = i + 1
+      }
+    }
+    let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
+    let mut change = self.stateReach(slot, mask)
+    // The node's own looks and variables change what it and its subtree compute, no selector.
+    if inline || custom { change.reach = style_invalidation.wider(change.reach, Reach.Subtree) }
+    self.restyleExtent(slot, change)
   }
 
   pub fn nodeMut(self: &mut Self, slot: u32) -> &mut Node {
@@ -1153,6 +1661,29 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         run self.destroy(index, slot)
       }
+      Mutation.SetCustomProperty { id, state, name, value, important } => {
+        let slot = run self.require(index, id)
+        if !declaration_values.customName(String.utf8Bytes(String.view(&name))) { return () }
+        let mut tokens = Option<TokenBuffer>.None
+        if let Option<String>.Some { value: text } = move value {
+          let parsed = run Effect.result(style_sheets.customValue(String.utf8Bytes(String.view(&text))))
+          match move parsed {
+            Result<Option<TokenBuffer>, CssError | OutOfMemoryError>.Success { value: buffer } => {
+              if buffer.isNone() { return () }
+              tokens = move buffer
+            }
+            Result<Option<TokenBuffer>, CssError | OutOfMemoryError>.Failure { error: why } => {
+              match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: self.current, sheet: 0 } } }
+            }
+          }
+        }
+        let node = self.nodeMut(slot)
+        let identity = run node.identityMut()
+        run identity.setCustom(state, move name, move tokens, important)
+        run self.enableInlineScope()
+        // The node's variable scope changes: it and what inherits from it, and no selector.
+        self.restyleLocal(slot)
+      }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
         let prepared = run expand.prepared(declarations.asSlice())
@@ -1160,12 +1691,15 @@ impl<'a> UiTree<'a> {
           Option.Some { value } => value.asSlice()
           Option.None => declarations.asSlice()
         }
+        if style_sheets.needsScope(expanded) { run self.enableInlineScope() }
         let named = run self.namedFamilies(expanded)
         let values = match &named {
           Option.Some { value } => value.asSlice()
           Option.None => expanded
         }
         let node = self.nodeMut(slot)
+        if grid_css.mentionsGrid(values) { node.gridDeclared = true }
+        if !node.styleNeedsContext && style.requiresContext(values) { node.styleNeedsContext = true }
         let mut i: usize = 0
         while i < values.length {
           match state {
@@ -1190,15 +1724,16 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        self.restyle(slot)
-        if state == StyleState.Base && grid_css.mentionsGrid(values) {
-          run self.styleGrid(slot)
-        }
+        // A style object changes no selector input: only this node and what inherits from it.
+        self.restyleLocal(slot)
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
-        let hadGrid = state == StyleState.Base && grid_css.mentionsGrid(node.base.asSlice())
+        if node.selectorIdentity.isSome() {
+          let identity = run node.identityMut()
+          identity.clearCustom(state)
+        }
         match state {
           StyleState.Base => {
             node.base.clear()
@@ -1219,10 +1754,12 @@ impl<'a> UiTree<'a> {
             node.starting.clear()
           }
         }
-        self.restyle(slot)
-        if hadGrid {
-          run self.styleGrid(slot)
-        }
+        node.gridDeclared = grid_css.mentionsGrid(node.base.asSlice()) || grid_css.mentionsGrid(node.hover.asSlice())
+          || grid_css.mentionsGrid(node.active.asSlice()) || grid_css.mentionsGrid(node.focus.asSlice()) || grid_css.mentionsGrid(node.focusVisible.asSlice())
+        node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover.asSlice())
+          || style.requiresContext(node.active.asSlice()) || style.requiresContext(node.focus.asSlice())
+          || style.requiresContext(node.focusVisible.asSlice()) || style.requiresContext(node.starting.asSlice())
+        self.restyleLocal(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
         let slot = run self.requireInput(index, id)
@@ -1230,11 +1767,13 @@ impl<'a> UiTree<'a> {
       }
       Mutation.DefineMark { id, mark, declarations } => {
         let slot = run self.requireInput(index, id)
-        run edit.defineStyle(&mut self, slot, false, mark, move declarations)
+        let prepared = run self.richDeclarations(move declarations)
+        run edit.defineStyle(&mut self, slot, false, mark, move prepared)
       }
       Mutation.DefineAtom { id, kind, declarations } => {
         let slot = run self.requireInput(index, id)
-        run edit.defineStyle(&mut self, slot, true, kind, move declarations)
+        let prepared = run self.richDeclarations(move declarations)
+        run edit.defineStyle(&mut self, slot, true, kind, move prepared)
       }
       Mutation.Format { id, mark, on } => {
         let slot = run self.requireInput(index, id)
@@ -1250,6 +1789,25 @@ impl<'a> UiTree<'a> {
       }
       Mutation.SetAttribute { id, attribute } => {
         let slot = run self.require(index, id)
+        let classAtoms = match &attribute {
+          Attribute.ClassName { value } => run self.styleAtoms.classes(String.utf8Bytes(String.view(&value)))
+          _ => List<usize>.make()
+        }
+        // No selector outside a detached subtree can see it; attaching it restyles what the insert
+        // reaches. Without sheets, or with a root restyle due, there is nothing to narrow.
+        let attached = self.rootHolding(slot) != NONE
+        let tracked = attached && self.sheetReads().isSome()
+        let statesBefore = if tracked { self.selectorStates(slot) } else { 0 }
+        let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
+          Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
+          Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
+          // Type selectors are no invalidation key.
+          Attribute.Element { .. } => Extent { reach: Reach.Root, anchors: false }
+          Attribute.Named { name, .. } => self.attributeReach(&[String.utf8Bytes(String.view(&name))], &[])
+          _ => Extent.none()
+        } }
+        let reflected = run style_attributes.reflect(self.nodeMut(slot), &attribute)
+        if tracked { change = change.with(self.attributeReach(&[String.utf8Bytes(reflected[0]), String.utf8Bytes(reflected[1]), String.utf8Bytes(reflected[2])], &[])) }
         let node = self.nodeMut(slot)
         match move attribute {
           Attribute.ValueRange { min, max, value } => {
@@ -1410,18 +1968,22 @@ impl<'a> UiTree<'a> {
           }
           Attribute.LabelledBy { ids } => {
             let semantics = run node.semanticsMut()
+            semantics.literalRelations = semantics.literalRelations & 14
             semantics.labelledBy = move ids
           }
           Attribute.DescribedBy { ids } => {
             let semantics = run node.semanticsMut()
+            semantics.literalRelations = semantics.literalRelations & 13
             semantics.describedBy = move ids
           }
           Attribute.Controls { ids } => {
             let semantics = run node.semanticsMut()
+            semantics.literalRelations = semantics.literalRelations & 11
             semantics.controls = move ids
           }
           Attribute.ActiveDescendant { ids } => {
             let semantics = run node.semanticsMut()
+            semantics.literalRelations = semantics.literalRelations & 7
             semantics.activeDescendant = move ids
           }
           Attribute.Element { name } => {
@@ -1438,14 +2000,55 @@ impl<'a> UiTree<'a> {
                 semantics.level = level
               }
             }
+            let identity = run node.identityMut()
+            identity.tag = move name
+          }
+          Attribute.Named { name, value } => {
+            if !isNamedAttribute(String.view(&name)) { return () }
+            let words = match &value { Option<String>.Some { value: text } => String.view(&text) _ => "" }
+            if String.view(&name) == "class" || String.view(&name) == "id" {
+              let present = value.isSome()
+              let isClass = String.view(&name) == "class"
+              let mapped = if isClass { Attribute.ClassName { value: run String.copy(words) } }
+                else { Attribute.ElementId { value: run String.copy(words) } }
+              run self.applyOne(index, Mutation.SetAttribute { id: id, attribute: move mapped })
+              let identity = run self.nodeMut(slot).identityMut()
+              if isClass { identity.hasClasses = present } else { identity.hasId = present }
+              return ()
+            }
+            let semantic = run style_attributes.semantic(String.view(&name), words)
+            if String.view(&name) == "aria-checked" {
+              run self.applyOne(index, Mutation.SetAttribute { id: id,
+                attribute: Attribute.Indeterminate { value: words == "mixed" } })
+            }
+            if let Option<Attribute>.Some { value: mapped } = move semantic {
+              run self.applyOne(index, Mutation.SetAttribute { id: id, attribute: move mapped })
+            }
+            let relation = style_attributes.relationBit(String.view(&name))
+            if relation != 0 {
+              let semantics = run self.nodeMut(slot).semanticsMut()
+              semantics.literalRelations = semantics.literalRelations & (15 - relation)
+              if value.isSome() { semantics.literalRelations = semantics.literalRelations | relation }
+            }
+            let range = style_attributes.isRange(String.view(&name))
+            let identity = run self.nodeMut(slot).identityMut()
+            run identity.set(move name, move value)
+            if range { style_attributes.syncRange(self.nodeMut(slot)) }
           }
           Attribute.ClassName { value } => {
-            drop value
+            let identity = run node.identityMut()
+            identity.classes = move value
+            identity.classAtoms = move classAtoms
+            identity.hasClasses = true
           }
           Attribute.ElementId { value } => {
-            drop value
+            let identity = run node.identityMut()
+            identity.id = move value
+            identity.hasId = true
           }
         }
+        if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
+        self.restyleExtent(slot, change)
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
@@ -1487,7 +2090,46 @@ impl<'a> UiTree<'a> {
         }
       }
       Mutation.CloseRoot { root } => {
+        run sheet_faces.close(&mut self, root)
         run self.closeRoot(index, root)
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if at != usize.MAX { drop self.styleSheets.remove(at) }
+      }
+      Mutation.LoadStyleSheet { root, sheet, source } => run self.requestStyleSheet(root, sheet, move source)
+      Mutation.AdoptStyleSheet { root, sheet, bytes } => {
+        run self.adoptSheet(index, root, sheet, bytes.asSlice(), false)
+        self.cancelStyleLoad(root, sheet)
+      }
+      Mutation.ReplaceStyleSheet { root, sheet, bytes } => {
+        run self.adoptSheet(index, root, sheet, bytes.asSlice(), true)
+        self.cancelStyleLoad(root, sheet)
+      }
+      Mutation.SetStyleSheetOrder { root, sheets } => {
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } }
+        if at == usize.MAX {
+          if sheets.length() == 0 { return () }
+          fail TreeError.StyleSheet { index: index, root: root, sheet: 0 }
+        }
+        let roots = self.styleSheets.asMutSlice()
+        let reordered = run Effect.result(roots[at].sheets.reorder(sheets.asSlice()))
+        if let Result<(), AdoptionError | OutOfMemoryError>.Failure { error: why } = move reordered {
+          match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } } }
+        }
+        drop run self.useRoot(root)
+        self.stylesDirty = true
+      }
+      Mutation.RemoveStyleSheet { root, sheet } => {
+        self.cancelStyleLoad(root, sheet)
+        if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: sheet } }
+        let at = style_sheets.index(self.styleSheets.asSlice(), root)
+        if at != usize.MAX {
+          let roots = self.styleSheets.asMutSlice()
+          if run roots[at].sheets.remove(sheet) {
+            drop run self.useRoot(root)
+            self.stylesDirty = true
+          }
+        }
       }
       Mutation.Focus { id } => {
         let slot = run self.require(index, id)
@@ -1523,6 +2165,9 @@ impl<'a> UiTree<'a> {
         let css = self.node(slot).css
         let grid = Box<Grid>.into(move value)
         run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        let node = self.nodeMut(slot)
+        node.gridStyled = false
+        node.gridDeclared = false
         self.paintDirty = true
       }
       Mutation.SetSource { id, resource } => {
@@ -1724,7 +2369,12 @@ impl<'a> UiTree<'a> {
   effect fn create(self: &mut Self, index: usize, id: u32, kind: NodeKind) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.contains(id) {
+    drop run self.createNode(index, id, kind, NONE, PseudoTarget.None)
+  }
+
+  effect fn createNode(self: &mut Self, index: usize, id: u32, kind: NodeKind, origin: u32, target: PseudoTarget) -> u32
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if origin == NONE && self.contains(id) {
       fail TreeError.IdInUse { index: index, id: id }
     }
     let mut css: usize = 0
@@ -1797,6 +2447,12 @@ impl<'a> UiTree<'a> {
       hovered: false,
       pressed: false,
       styleDirty: true,
+      gridDeclared: false,
+      gridStyled: false,
+      styleNeedsContext: false,
+      containerWatch: NONE,
+      styleChange: NONE,
+      generatedSuppressed: false,
       subtreeDirty: false,
       rendered: false,
       transition: String.make(),
@@ -1808,6 +2464,12 @@ impl<'a> UiTree<'a> {
       editing: move editing,
       effects: Option<Box<Effects>>.None,
       semantics: Option<Box<Semantics>>.None,
+      resolvedSheet: Option<Frozen<Resolved>>.None,
+      styleClass: 0,
+      styleTwin: NONE,
+      styleWatch: 0,
+      computedStamp: 0,
+      selectorIdentity: Option<Box<NodeIdentity>>.None,
       cache: PaintCache.empty(),
     }
     let mut slot: u32 = 0
@@ -1821,7 +2483,13 @@ impl<'a> UiTree<'a> {
       slot = usize.toU32(self.nodes.length())
       run self.nodes.append(move node)
     }
-    drop run self.ids.insert(Word { value: u32.toU64(id) }, slot)
+    if origin == NONE { drop run self.ids.insert(Word { value: u32.toU64(id) }, slot) }
+    else {
+      let node = self.nodeMut(slot)
+      let identity = run node.identityMut()
+      identity.generatedOrigin = origin
+      identity.generatedTarget = target
+    }
     run self.mapCss(css, slot)
     if inner != NO_INDEX {
       // The input's text node maps to no slot, but the table reaches it so `destroy` can clear it.
@@ -1837,6 +2505,7 @@ impl<'a> UiTree<'a> {
       run edit.syncDisplay(&mut self, slot)
     }
     // A new node is detached: it is resolved when it is attached (`restyle`).
+    return slot
   }
 
   fn canHaveChildren(kind: NodeKind) -> bool {
@@ -1882,6 +2551,8 @@ impl<'a> UiTree<'a> {
         return ()
       }
       beforeCss = Option<NodeId>.Some { value: NodeId { index: self.node(beforeSlot).css } }
+    } else if let Option.Some { value } = self.node(parentSlot).identity() {
+      if value.after != NONE { beforeCss = Option<NodeId>.some(NodeId { index: self.node(value.after).css }) }
     }
     let parentCss = self.node(parentSlot).css
     let childCss = self.node(childSlot).css
@@ -1892,7 +2563,16 @@ impl<'a> UiTree<'a> {
     )
     let moved = self.nodeMut(childSlot)
     moved.parent = parentSlot
-    self.restyle(childSlot)
+    match self.sheetReads() {
+      Option<u32>.Some { value: reads } => {
+        let text = self.node(childSlot).kind == NodeKind.Text
+        let before = self.elementBeside(childSlot, true)
+        let after = self.elementBeside(childSlot, false)
+        self.restyleLocal(childSlot)
+        self.restyleAround(reads, parentSlot, before, after, text)
+      }
+      Option<u32>.None => self.restyle(childSlot)
+    }
 
     // The child left another root, which is not current: that root changed all the same.
     if from != NONE && from != self.current {
@@ -1908,25 +2588,33 @@ impl<'a> UiTree<'a> {
     if parent == NONE && slot != self.root {
       return ()
     }
+    let before = if parent == NONE { NONE } else { self.elementBeside(slot, true) }
+    let after = if parent == NONE { NONE } else { self.elementBeside(slot, false) }
     run Effect.catchAll(self.layout.remove(NodeId { index: css }), layoutFailed)
     if slot == self.root {
       self.root = NONE
     }
     let detached = self.nodeMut(slot)
     detached.parent = NONE
+    if parent != NONE {
+      if let Option<u32>.Some { value: reads } = self.sheetReads() {
+        let text = self.node(slot).kind == NodeKind.Text
+        self.restyleAround(reads, parent, before, after, text)
+      }
+    }
     if self.focused != NONE && self.within(self.focused, slot) {
       let to = self.returnSlot(self.focused, slot)
+      // The removed subtree took focus out of its former ancestors.
+      if parent != NONE { self.focusWithinMoved(parent, NONE) }
       run self.moveFocus(to, false)
     }
-    // No style depends on a sibling or a child, so the nodes left behind keep theirs. The
-    // detached subtree is resolved when it is attached again.
+    // The detached subtree is resolved when it is attached again.
     self.applied = true
   }
 
   effect fn destroy(self: &mut Self, index: usize, slot: u32) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    run self.detach(index, slot)
     let mut doomed = List<u32>.make()
     run doomed.append(slot)
     let mut children = List<u32>.make()
@@ -1938,9 +2626,23 @@ impl<'a> UiTree<'a> {
     }
     let mut v: usize = 0
     while v < doomed.length() {
-      let id = self.node(doomed.get(v)).id
-      run virtual.clear(&mut self, id)
-      anchoring.clear(&mut self, id)
+      let gone = doomed.get(v)
+      if self.node(gone).isGenerated() {
+        let computed = self.node(gone).computed
+        drop run animation.update(&mut self, gone, false, &computed)
+        run motion.cancelAll(&mut self, gone)
+      }
+      v = v + 1
+    }
+    run self.detach(index, slot)
+    v = 0
+    while v < doomed.length() {
+      let gone = doomed.get(v)
+      if !self.node(gone).isGenerated() {
+        let id = self.node(gone).id
+        run virtual.clear(&mut self, id)
+        anchoring.clear(&mut self, id)
+      }
       v = v + 1
     }
     let css = self.node(slot).css
@@ -1975,14 +2677,15 @@ impl<'a> UiTree<'a> {
       let nodeCss = node.css
       let inner = node.inner
       let trap = node.focusTrap
+      let generated = node.isGenerated()
       if node.inert {
         self.inerts = self.inerts - 1
       }
-      drop self.ids.remove(Word { value: u32.toU64(id) })
+      if !generated { drop self.ids.remove(Word { value: u32.toU64(id) }) }
       if trap {
         self.forgetReturn(id)
       }
-      if self.overrides.length() != 0 {
+      if !generated && self.overrides.length() != 0 {
         // The id may name another node later: its overrides go with this one.
         self.dropOverrides(id)
       }
@@ -2261,6 +2964,7 @@ impl<'a> UiTree<'a> {
       paintedAt: Intrinsic.replace(self.paintedAt, 0),
       touched: false,
       output: Intrinsic.replace(self.output, LayoutTree.make()),
+      containerWatches: Intrinsic.replace(self.containerWatches, List<Watch>.make()),
       sceneA: Intrinsic.replace(self.sceneA, Scene.make()),
       sceneB: Intrinsic.replace(self.sceneB, Scene.make()),
       flipped: Intrinsic.replace(self.flipped, false),
@@ -2319,6 +3023,7 @@ impl<'a> UiTree<'a> {
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
     self.output = Intrinsic.replace(s.output, LayoutTree.make())
+    self.containerWatches = Intrinsic.replace(s.containerWatches, List<Watch>.make())
     self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
     self.sceneB = Intrinsic.replace(s.sceneB, Scene.make())
     self.flipped = s.flipped
@@ -2818,13 +3523,14 @@ impl<'a> UiTree<'a> {
     if slot != NONE && u32.bitAnd(self.node(slot).listeners, LISTEN_FOCUS) != 0 {
       run self.queue(EventKind.Focus, slot)
     }
-    // Focus variants apply to the focused node alone.
-    if previous != NONE && self.node(previous).live {
-      self.restyle(previous)
+    let left = if previous != NONE && self.node(previous).live { previous } else { NONE }
+    if left != NONE {
+      self.focusStyleChanged(left)
     }
     if slot != NONE {
-      self.restyle(slot)
+      self.focusStyleChanged(slot)
     }
+    self.focusWithinMoved(left, slot)
   }
 
   /// The node ids from the root down to `slot`.
@@ -2834,7 +3540,7 @@ impl<'a> UiTree<'a> {
     out.clear()
     let mut at = slot
     while at != NONE {
-      run out.append(self.node(at).id)
+      if !self.node(at).isGenerated() { run out.append(self.node(at).id) }
       at = self.node(at).parent
     }
     let values = out.asMutSlice()
@@ -3204,7 +3910,7 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < entries.length {
       let entry = entries[i]
-      if entry.family == text.family && entry.size == text.size && entry.weight == text.weight
+      if entry.root == self.current && entry.family == text.family && entry.size == text.size && entry.weight == text.weight
         && entry.italic == italic && entry.width == text.width
         && sameTreatment(entry.treatment, treatment) {
         return entry.key
@@ -3213,6 +3919,7 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
       weight: f32.toF64(text.weight),
@@ -3227,6 +3934,7 @@ impl<'a> UiTree<'a> {
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
+        root: self.current,
         family: text.family,
         size: text.size,
         weight: text.weight,
@@ -3246,18 +3954,24 @@ impl<'a> UiTree<'a> {
   effect fn fontFamilyChanged(self: &mut Self, family: &[u8]) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let mut actual = run Bytes.copy(family)
+    let mut root = NONE
+    if let Option.Some { value } = sheet_faces.original(&self.sheetFaces,family) {
+      actual = run Bytes.copy(value.name.asSlice())
+      root = value.root
+    }
     let mut changed = false
     let mut names = List<Family>.make()
     let mut i: usize = 0
     while i < self.fontKeys.length() {
       let list = self.fontKeys.get(i).family
-      if list != NONE {
+      if list != NONE && (root == NONE || self.fontKeys.get(i).root == root) {
         names.clear()
         run self.families.copyOf(list, &mut names)
         let mut j: usize = 0
         while j < names.length() {
           if let Family.Named { name } = &names.asSlice()[j] {
-            if sameFamilyName(Bytes.asSlice(&name), family) {
+            if sameFamilyName(Bytes.asSlice(&name), actual.asSlice()) {
               let entries = self.fontKeys.asMutSlice()
               entries[i].family = NONE
               changed = true
@@ -3345,6 +4059,7 @@ impl<'a> UiTree<'a> {
       run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(declared))
       run self.fontFamilyChanged(Bytes.asSlice(&family))
     }
+    if !ok && sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
     return ok
   }
 
@@ -3353,13 +4068,42 @@ impl<'a> UiTree<'a> {
     let declared = self.fontFaceIndex(id)
     if declared != usize.MAX {
       self.provider.text.fonts.set.markFailed(declared)
+      if sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
     }
+  }
+
+  pub effect fn loadLocalHostFontFace(self: &mut Self, id: u32, name: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index == usize.MAX || !self.provider.text.fonts.set.loadLocal(index,name) { return false }
+    let family = run Bytes.copy(self.provider.text.fonts.set.familyOf(index))
+    run self.fontFamilyChanged(family.asSlice())
+    return true
+  }
+
+  pub fn hostFontFaceFailed(self: &Self, id: u32) -> bool {
+    let index = self.fontFaceIndex(id)
+    return index != usize.MAX && self.provider.text.fonts.set.state(index) == FaceState.Failed
+  }
+
+  pub effect fn setHostFontFaceActive(self: &mut Self, id: u32, active: bool, order: usize) ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index != usize.MAX && self.provider.text.fonts.set.setActive(index,active,order) {
+      let family = run Bytes.copy(self.provider.text.fonts.set.familyOf(index))
+      run self.fontFamilyChanged(family.asSlice())
+    }
+  }
+
+  pub effect fn retryHostFontFace(self: &mut Self, id: u32, url: string) ! OutOfMemoryError ? &mut Allocator {
+    let index = self.fontFaceIndex(id)
+    if index == usize.MAX || !self.provider.text.fonts.set.retry(index) { return () }
+    run self.loads.append(Mutation.LoadFontFace { face: id, url: run String.copy(url) })
   }
 
   /// Moves the font faces text needed in the last layouts to the host requests.
   effect fn requestFontFaces(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run sheet_faces.retry(&mut self)
     if !self.provider.text.fonts.set.hasWanted() {
       return
     }
@@ -3403,14 +4147,456 @@ impl<'a> UiTree<'a> {
     let mut slot: usize = 0
     while slot < count {
       let node = &self.nodes.asSlice()[slot]
-      if node.live && node.computed.usesViewport {
+      if node.live && (node.computed.usesViewport || placeholder.usesViewport(node) || scrollbar_parts.usesViewport(node)) {
         self.restyle(usize.toU32(slot))
       }
       slot = slot + 1
     }
   }
 
-  /// Recomputes every node's style from its patches, variants and parent.
+  /// Updates host media inputs without restyling until a condition changes truth.
+  pub fn setStylePreferences(self: &mut Self, preferences: Preferences) -> bool {
+    if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      if value.bits() == preferences.bits() { return false }
+    }
+    self.hostStylePreferences = Option<Preferences>.some(preferences)
+    let roots = self.styleSheets.asMutSlice()
+    let mut i: usize = 0
+    while i < roots.length {
+      preferences.apply(&mut roots[i].environment)
+      i = i + 1
+    }
+    return true
+  }
+
+  pub effect fn loadStyleSheet(self: &mut Self, root: u32, source: StyleSource) -> u32
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    while self.nextStyleId < 2147483648 && self.styleLoadState(root, self.nextStyleId).isSome() {
+      self.nextStyleId = self.nextStyleId + 1
+    }
+    if self.nextStyleId >= 2147483648 { fail TreeError.StyleSheet { index: 0, root: root, sheet: 0 } }
+    let id = self.nextStyleId
+    self.nextStyleId = id + 1
+    run self.requestStyleSheet(root, id, move source)
+    return id
+  }
+
+  pub fn takeStyleLoads(self: &mut Self) -> List<StyleRequest> {
+    return Intrinsic.replace(self.styleLoads, List<StyleRequest>.make())
+  }
+
+  fn cancelStyleLoad(self: &mut Self, root: u32, sheet: u32) -> () {
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX { return () }
+    let roots = self.styleSheets.asMutSlice()
+    let mut i: usize = 0
+    while i < roots[at].loads.length() {
+      if roots[at].loads.asSlice()[i].sheet == sheet { drop roots[at].loads.remove(i) return () }
+      i = i + 1
+    }
+  }
+
+  pub fn styleLoadCurrent(self: &Self, ticket: StyleTicket) -> bool {
+    let at = style_sheets.index(self.styleSheets.asSlice(), ticket.root)
+    if at == usize.MAX { return false }
+    let loads = self.styleSheets.asSlice()[at].loads.asSlice()
+    let mut i: usize = 0
+    while i < loads.length {
+      if loads[i].sheet == ticket.sheet {
+        return loads[i].generation == ticket.generation && loads[i].state == StyleLoadState.Loading
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  pub fn styleLoadState(self: &Self, root: u32, sheet: u32) -> Option<StyleLoadState> {
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX { return Option<StyleLoadState>.None }
+    let scope = &self.styleSheets.asSlice()[at]
+    let mut i: usize = 0
+    while i < scope.loads.length() {
+      if scope.loads.asSlice()[i].sheet == sheet { return Option<StyleLoadState>.some(scope.loads.asSlice()[i].state) }
+      i = i + 1
+    }
+    i = 0
+    while i < scope.sheets.sheets().length {
+      if scope.sheets.sheets()[i].id == sheet { return Option<StyleLoadState>.some(StyleLoadState.Ready) }
+      i = i + 1
+    }
+    return Option<StyleLoadState>.None
+  }
+
+  pub effect fn requestStyleSheet(self: &mut Self, root: u32, sheet: u32, source: StyleSource) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) || self.styleGeneration == 18446744073709551615 {
+      fail TreeError.StyleSheet { index: 0, root: root, sheet: sheet }
+    }
+    if self.styleLoadState(root, sheet).isNone() {
+      let empty = run Sheet.make().encode()
+      run self.adoptSheet(0, root, sheet, empty.asSlice(), false)
+    }
+    self.styleGeneration = self.styleGeneration + 1
+    let ticket = StyleTicket { root: root, sheet: sheet, generation: self.styleGeneration }
+    self.cancelStyleLoad(root, sheet)
+    let at = style_sheets.index(self.styleSheets.asSlice(), root)
+    let roots = self.styleSheets.asMutSlice()
+    let base = match &source { StyleSource.Url { url } => run String.copy(String.view(&url)) _ => String.make() }
+    run roots[at].loads.append(StyleStatus { base: move base, sheet: sheet, generation: ticket.generation, state: StyleLoadState.Loading })
+    drop roots
+    run self.styleLoads.append(StyleRequest { ticket: ticket, source: move source })
+  }
+
+  pub effect fn settleStyleSheet(self: &mut Self, ticket: StyleTicket, bytes: Option<Bytes>) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    if !self.styleLoadCurrent(ticket) { return false }
+    let mut base = String.make()
+    let rootIndex = style_sheets.index(self.styleSheets.asSlice(),ticket.root)
+    let statuses = self.styleSheets.asSlice()[rootIndex].loads.asSlice()
+    let mut status: usize = 0
+    while status < statuses.length {
+      if statuses[status].sheet == ticket.sheet { base = run String.copy(String.view(&statuses[status].base)) break }
+      status = status + 1
+    }
+    let mut state = StyleLoadState.Failed
+    if let Option<Bytes>.Some { value } = move bytes {
+      let result = run Effect.result(self.adoptSheetFrom(0, ticket.root, ticket.sheet, value.asSlice(), true, String.view(&base)))
+      match move result {
+        Result.Success { .. } => { state = StyleLoadState.Ready }
+        Result.Failure { error } => match move error {
+          OutOfMemoryError allocation => { fail move allocation }
+          TreeError invalid => { drop invalid }
+        }
+      }
+    }
+    let at = style_sheets.index(self.styleSheets.asSlice(), ticket.root)
+    let roots = self.styleSheets.asMutSlice()
+    let loads = roots[at].loads.asMutSlice()
+    let mut i: usize = 0
+    while i < loads.length {
+      if loads[i].sheet == ticket.sheet { loads[i].state = state break }
+      i = i + 1
+    }
+    return true
+  }
+
+  fn rootSheets(self: &Self, root: u32) -> RootSheets {
+    let mut sheets = RootSheets.make(root)
+    if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      value.apply(&mut sheets.environment)
+    }
+    return move sheets
+  }
+
+  effect fn enableInlineScope(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX {
+      at = self.styleSheets.length()
+      let sheets = self.rootSheets(self.current)
+      run self.styleSheets.append(move sheets)
+    }
+    let roots = self.styleSheets.asMutSlice()
+    roots[at].inlineVariables = true
+  }
+
+  pub effect fn setStyleEnvironment(self: &mut Self, root: u32, environment: Environment, systemColors: [SheetColor; 19]) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) { fail TreeError.StyleSheet { index: 0, root: root, sheet: 0 } }
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX {
+      at = self.styleSheets.length()
+      let sheets = self.rootSheets(root)
+      run self.styleSheets.append(move sheets)
+    }
+    let roots = self.styleSheets.asMutSlice()
+    roots[at].environment = environment
+    roots[at].systemColors = systemColors
+    if root == self.current { self.stylesDirty = true }
+    else {
+      let parked = self.parkedIndex(root)
+      let states = self.parked.asMutSlice()
+      states[parked].stylesDirty = true
+      states[parked].touched = true
+    }
+  }
+
+  effect fn adoptSheet(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run self.adoptSheetFrom(index,root,id,bytes,replace,"")
+  }
+
+  effect fn adoptSheetFrom(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool, base: string) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.rootOpen(root) { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
+    let decoded = run Effect.result(Sheet.decode(bytes, &Limits.make()))
+    let mut sheet = match move decoded {
+      Result<Sheet, DecodeError | OutOfMemoryError>.Success { value } => move value
+      Result<Sheet, DecodeError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
+      }
+    }
+    run sheet_urls.rebase(&mut sheet,base)
+    let mut at = style_sheets.index(self.styleSheets.asSlice(), root)
+    if at == usize.MAX {
+      if replace { fail TreeError.StyleSheet { index: index, root: root, sheet: id } }
+      at = self.styleSheets.length()
+      let sheets = self.rootSheets(root)
+      run self.styleSheets.append(move sheets)
+    }
+    let roots = self.styleSheets.asMutSlice()
+    let changed = if replace { run Effect.result(roots[at].sheets.replace(id, move sheet)) }
+      else { run Effect.result(roots[at].sheets.adopt(id, move sheet)) }
+    if let Result<(), AdoptionError | OutOfMemoryError>.Failure { error: why } = move changed {
+      match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
+    }
+    drop run self.useRoot(root)
+    self.stylesDirty = true
+  }
+
+  pub effect fn resolveGeneratedStyle(self: &mut Self, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool) -> Resolved
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let resolved = run self.resolvePseudoStyle(origin, target, states, rendered)
+    return move resolved.style
+  }
+
+  pub effect fn resolvePseudoStyle(self: &mut Self, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool) -> Resolution
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } }
+    let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
+    let entries = roots.asMutSlice()
+    let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
+    let result = run Effect.result(style_sheets.resolvePseudo(&mut entries[at].sheets, &mut entries[at].cache,
+      entries[at].systemColors, entries[at].hasStarting, &self, origin, target, states, rendered, &mut stops))
+    self.easingStops = move stops
+    self.styleSheets = move roots
+    match move result {
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+        run container_watch.record(&mut self, origin, target, value.containers.asSlice())
+        self.noteWatches(origin, value.watched.asSlice(), value.watchAll)
+        return move value
+      }
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+      }
+    }
+  }
+
+  effect fn installResolved(self: &mut Self, slot: u32, resolvedStyle: Resolved) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut value = move resolvedStyle
+    if let Option<List<Declaration>>.Some { value: named } = move run self.namedFamilies(value.declarations.asSlice()) {
+      value.declarations = move named
+    }
+    let namedStarting = match &value.starting {
+      Option<List<Declaration>>.Some { value: before } => run self.namedFamilies(before.asSlice())
+      Option<List<Declaration>>.None => Option<List<Declaration>>.None
+    }
+    if let Option<List<Declaration>>.Some { value: named } = move namedStarting {
+      value.starting = Option<List<Declaration>>.some(move named)
+    }
+    let shared = run Frozen<Resolved>.make(move value)
+    let node = self.nodeMut(slot)
+    node.resolvedSheet = Option<Frozen<Resolved>>.some(move shared)
+  }
+
+  effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
+      let node = self.nodeMut(slot)
+      node.resolvedSheet = Option<Frozen<Resolved>>.None
+      node.styleClass = 0
+      node.styleTwin = NONE
+      run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
+      return ()
+    }
+    let reads = self.styleSheets.asSlice()[at].reads
+    if !self.styleSheets.asSlice()[at].hasStarting {
+      let twin = style_share.twin(&self, slot, reads, self.styleSheets.asSlice()[at].sharing)
+      if twin != NONE {
+        let shared = match &self.node(twin).resolvedSheet {
+          Option<Frozen<Resolved>>.Some { value } => Option<Frozen<Resolved>>.some(value.clone())
+          _ => Option<Frozen<Resolved>>.None
+        }
+        let class = self.node(twin).styleClass
+        // An equal node is asked the same of itself; the twin's own match asked no other node.
+        let watch = self.node(twin).styleWatch
+        let node = self.nodeMut(slot)
+        node.resolvedSheet = move shared
+        node.styleClass = class
+        node.styleTwin = twin
+        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, 7), watch)
+        run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
+        return ()
+      }
+    }
+    let class = self.styleClasses + 1
+    self.styleClasses = class
+    let fresh = self.nodeMut(slot)
+    fresh.styleClass = class
+    fresh.styleTwin = NONE
+    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, 7)
+    let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
+    let entries = roots.asMutSlice()
+    let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, entries[at].hasStarting, &self, slot, &mut stops))
+    self.easingStops = move stops
+    self.styleSheets = move roots
+    match move resolved {
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
+        run container_watch.record(&mut self, slot, PseudoTarget.None, value.containers.asSlice())
+        self.noteWatches(slot, value.watched.asSlice(), value.watchAll)
+        let key = style_share.modelKey(&self, slot)
+        if key != 0 { drop run self.styleModels.insert(key, slot) }
+        if let Option<Frozen<Resolved>>.Some { value: shared } = move value.hit {
+          let node = self.nodeMut(slot)
+          node.resolvedSheet = Option<Frozen<Resolved>>.some(move shared)
+          return ()
+        }
+        run self.installResolved(slot, move value.style)
+        if let Option<PendingStyle>.Some { value: pending } = move value.pending {
+          let style = match &self.node(slot).resolvedSheet {
+            Option<Frozen<Resolved>>.Some { value: installed } => installed.clone()
+            _ => { return () }
+          }
+          let roots = self.styleSheets.asMutSlice()
+          run roots[at].cache.insert(move pending, move style)
+        }
+      }
+      Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+      }
+    }
+  }
+
+  /// Flags the nodes that the match for `slot` (or a part of it) watched.
+  fn noteWatches(self: &mut Self, slot: u32, watched: &[css_element.Watch], all: bool) -> () {
+    if watched.length == 0 && !all { return () }
+    let mut outside = all
+    let mut siblings = false
+    let nodes = self.nodes.asMutSlice()
+    let mut i: usize = 0
+    while i < watched.length {
+      let at = watched[i].node
+      nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, watched[i].bits)
+      if at != u32.toUsize(slot) { outside = true }
+      if u32.bitAnd(watched[i].bits, css_element.WATCH_HAS_SIBLINGS) != 0 { siblings = true }
+      i = i + 1
+    }
+    if outside { nodes[u32.toUsize(slot)].styleWatch = u32.bitOr(nodes[u32.toUsize(slot)].styleWatch, WATCH_OUTSIDE) }
+    if all || siblings {
+      let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+      if at == usize.MAX { return () }
+      let roots = self.styleSheets.asMutSlice()
+      if all { roots[at].watchAll = true }
+      if siblings { roots[at].siblingAnchors = true }
+    }
+  }
+
+  /// The node whose computed values `slot` can copy, or NONE: the twin it just took its record
+  /// from, when both inherit from one parent, or from parents that hold one set of values, and
+  /// nothing feeds the style but that record and what is inherited. Motion, inspector
+  /// overrides, anchors and focus are per node, so any of them keeps the node computing.
+  fn computedLender(self: &Self, slot: u32) -> u32 {
+    if self.transitions.length() != 0 || self.animations.length() != 0 || self.overrides.length() != 0 || self.anchors.length() != 0 { return NONE }
+    let node = self.node(slot)
+    let lender = node.styleTwin
+    if lender == NONE || node.kind != NodeKind.Box || node.isGenerated() || self.focused == slot || self.focused == lender { return NONE }
+    if node.transition.ownedByteLength() != 0 || node.starting.length() != 0 || node.styleNeedsContext { return NONE }
+    let other = self.node(lender)
+    if !other.live || other.styleDirty || other.computedStamp == 0 || other.styleClass != node.styleClass { return NONE }
+    if other.kind != NodeKind.Box || other.isGenerated() || other.transition.ownedByteLength() != 0 || other.styleNeedsContext { return NONE }
+    if other.hovered != node.hovered || other.pressed != node.pressed { return NONE }
+    let same = match &node.resolvedSheet {
+      Option<Frozen<Resolved>>.Some { value: mine } => match &other.resolvedSheet {
+        Option<Frozen<Resolved>>.Some { value: theirs } => Frozen.same(&mine, &theirs) && mine.get().plain
+        _ => false
+      }
+      _ => false
+    }
+    if !same { return NONE }
+    let values = &other.computed
+    if values.viewportWidth != self.input.width || values.viewportHeight != self.input.height || values.usesContainer { return NONE }
+    let none = usize.MAX
+    if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
+      || values.transition.easings.start != none || values.transition.discrete.start != none || values.animation.names.start != none { return NONE }
+    if node.parent != other.parent {
+      if node.parent == NONE || other.parent == NONE { return NONE }
+      let above = self.node(node.parent)
+      let beside = self.node(other.parent)
+      if above.computedStamp == 0 || above.computedStamp != beside.computedStamp || above.rendered != beside.rendered { return NONE }
+    }
+    return lender
+  }
+
+  /// The lender's finished values, or the initial ones to apply this node's declarations to.
+  fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
+    if lender != NONE { return self.node(lender).computed }
+    return Computed.inViewport(inherited, self.input.width, self.input.height)
+  }
+
+  effect fn syncGenerated(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.node(origin).isGenerated() || self.node(origin).kind != NodeKind.Box { return () }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].sheets.length() != 0 && self.styleSheets.asSlice()[at].hasGenerated
+    let targets = [PseudoTarget.Before, PseudoTarget.After]
+    let mut i: usize = 0
+    while i < targets.length {
+      let target = targets[i]
+      let old = match self.node(origin).identity() {
+        Option.Some { value } => if target == PseudoTarget.Before { value.before } else { value.after }
+        _ => NONE
+      }
+      let mut prepared = Option<Resolved>.None
+      let mut content = Option<String>.None
+      if enabled {
+        let rendered = old != NONE && style_change.rendered(&self, old)
+        let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
+        content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice()), generatedFailed)
+        prepared = Option<Resolved>.some(move value)
+      }
+      if let Option<String>.Some { value: text } = move content {
+        let mut slot = old
+        if slot == NONE {
+          let id = self.node(origin).id
+          slot = run self.createNode(0, id, NodeKind.Box, origin, target)
+          let child = run self.createNode(0, id, NodeKind.Text, origin, target)
+          let parentCss = self.node(origin).css
+          let boxCss = self.node(slot).css
+          let textCss = self.node(child).css
+          let first = self.layout.nodes.asSlice()[parentCss].firstChild
+          let before = if target == PseudoTarget.Before && first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
+          run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
+          run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: textCss }, Option<NodeId>.None), layoutFailed)
+          let boxNode = self.nodeMut(slot)
+          boxNode.parent = origin
+          let textNode = self.nodeMut(child)
+          textNode.parent = slot
+          let originNode = self.nodeMut(origin)
+          let identity = run originNode.identityMut()
+          if target == PseudoTarget.Before { identity.before = slot } else { identity.after = slot }
+        }
+        let active = self.nodeMut(slot)
+        active.generatedSuppressed = false
+        let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+        if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
+        if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+      } else if old != NONE && style_change.tracks(&self, origin) {
+        let dormant = self.nodeMut(old)
+        dormant.generatedSuppressed = true
+        if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(old, move value) }
+      } else if old != NONE {
+        let originNode = self.nodeMut(origin)
+        let identity = run originNode.identityMut()
+        if target == PseudoTarget.Before { identity.before = NONE } else { identity.after = NONE }
+        run self.destroy(0, old)
+      }
+      i = i + 1
+    }
+  }
+
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
@@ -3419,16 +4605,74 @@ impl<'a> UiTree<'a> {
       self.unitsHeight = self.input.height
       self.restyleViewportUnits()
     }
+    let conditionIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if conditionIndex != usize.MAX {
+      let roots = self.styleSheets.asMutSlice()
+      let mut environment = roots[conditionIndex].environment
+      environment.initial.viewportWidth = f32.toF64(self.input.width)
+      environment.initial.viewportHeight = f32.toF64(self.input.height)
+      environment.resolutionDppx = f32.toF64(self.input.scale)
+      let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
+      roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
+      match move updated {
+        Result<bool, CssError | OutOfMemoryError>.Success { value } => { if value { self.stylesDirty = true } }
+        Result<bool, CssError | OutOfMemoryError>.Failure { error: why } => {
+          match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+        }
+      }
+    }
+    // A full pass hands every node a fresh class long before the counter can wrap into a live one.
+    if self.styleClasses > 2147483647 {
+      self.styleClasses = 0
+      self.stylesDirty = true
+    }
+    // Before the stamp counter wraps, no node holds a stamp, so none lends until it computes again.
+    if self.computedStamps > 2147483647 {
+      self.computedStamps = 0
+      let nodes = self.nodes.asMutSlice()
+      let mut at: usize = 0
+      while at < nodes.length {
+        nodes[at].computedStamp = 0
+        at = at + 1
+      }
+    }
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
+    if self.stylesDirty { run sheet_faces.sync(&mut self) }
+    let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
+      let roots = self.styleSheets.asMutSlice()
+      if !roots[sheetIndex].sheets.canRetainScopes() { self.stylesDirty = true }
+      if self.stylesDirty {
+        roots[sheetIndex].watchAll = false
+        roots[sheetIndex].siblingAnchors = false
+        roots[sheetIndex].sheets.resetScopes()
+        roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
+        roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
+        roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasScrollbars = scrollbar_parts.present(&roots[sheetIndex].sheets)
+      }
+      roots[sheetIndex].cache.reset()
+    }
+    // Only a node styled earlier in this pass is known to hold its current match.
+    self.styleModels.clear()
     let full = self.stylesDirty
+    if full {
+      self.containerWatches.clear()
+      self.clearWatches()
+    }
     self.stylesDirty = false
     self.stylesPending = false
     self.paintCachesStale = true
     if self.root == NONE {
       return ()
     }
+    // Root font units cross descendants with an independently specified font.
+    let mut rootFontChanged = false
     // Each entry is a slot and whether its parent's inherited values changed.
     let mut stack = List<u64>.make()
     run stack.append(u32.toU64(self.root))
@@ -3437,19 +4681,27 @@ impl<'a> UiTree<'a> {
       let entry = stack.get(last)
       stack.truncate(last)
       let slot = u64.toU32(u64.bitAnd(entry, 0xFFFFFFFF))
-      let forced = full || u64.shiftRight(entry, 32) != 0
+      let forced = full || rootFontChanged || u64.shiftRight(entry, 32) != 0
       let node = self.node(slot)
       let own = forced || node.styleDirty
       let below = node.subtreeDirty
       let mut changed = full
       if own {
         let before = node.computed.text
+        let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
         let shadow = node.computed.effects
         let wasRendered = node.rendered
-        run self.resolve(slot)
+        let containment = node.computed.layout.sizeContainment
+        let namesChanged = run self.resolve(slot)
+        if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
+        if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
+        if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
+        run self.syncGenerated(slot)
         let after = &self.node(slot).computed
-        changed = full || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
+        changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+          || namesChanged || containment != after.layout.sizeContainment
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
@@ -3485,26 +4737,120 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  effect fn resolve(self: &mut Self, slot: u32) -> ()
+  /// Forgets what matching watched under the current root: a root restyle asks it all again.
+  /// A match can watch a node the pass has not reached yet, so this cannot wait for the visit.
+  fn clearWatches(self: &mut Self) -> () {
+    if self.root == NONE { return () }
+    let index = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if index == usize.MAX { return () }
+    let sheets = &self.styleSheets.asSlice()[index]
+    if u32.bitAnd(sheets.reads, css_selectors.READS_DESCENDANTS) == 0 && u32.bitAnd(sheets.states.any, css_element.FOCUS_WITHIN) == 0 { return () }
+    let top = self.node(self.root).css
+    let mut at = top
+    while true {
+      let slot = self.slotOfCssNode(at)
+      if slot != NONE {
+        let watched = self.nodeMut(slot)
+        watched.styleWatch = 0
+      }
+      let links = self.layout.nodes.asSlice()
+      if links[at].firstChild != NO_INDEX { at = links[at].firstChild
+        continue }
+      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      if at == top { break }
+      at = links[at].nextSibling
+    }
+  }
+
+  fn applyPixelStyles(self: &Self, slot: u32, computed: &mut Computed) {
+    let node = self.node(slot)
+    if node.kind == NodeKind.Text { return () }
+    applyPixelList(&mut computed.*, &node.base)
+    if node.hovered { applyPixelList(&mut computed.*, &node.hover) }
+    if node.pressed { applyPixelList(&mut computed.*, &node.active) }
+    if self.focused == slot {
+      applyPixelList(&mut computed.*, &node.focus)
+      if self.focusVisible || node.kind == NodeKind.Input {
+        applyPixelList(&mut computed.*, &node.focusVisible)
+      }
+    }
+  }
+
+  effect fn applyNodeLengths(self: &Self, slot: u32, computed: &mut Computed, parentStyle: &Computed,
+    stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
+    let node = self.node(slot)
+    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+      run applyUsing(&mut computed.*, &value.declarations, parentStyle, &mut stops.*, units)
+    } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
+      run applyUsing(&mut computed.*, &node.base, parentStyle, &mut stops.*, units)
+      if node.hovered {
+        run applyUsing(&mut computed.*, &node.hover, parentStyle, &mut stops.*, units)
+      }
+      if node.pressed {
+        run applyUsing(&mut computed.*, &node.active, parentStyle, &mut stops.*, units)
+      }
+      if self.focused == slot {
+        run applyUsing(&mut computed.*, &node.focus, parentStyle, &mut stops.*, units)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          run applyUsing(&mut computed.*, &node.focusVisible, parentStyle, &mut stops.*, units)
+        }
+      }
+    } else if node.kind != NodeKind.Text {
+      run self.applyOverridden(&mut computed.*, node.id, StyleState.Base, &node.base, &mut stops.*, parentStyle, units)
+      if node.hovered {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Hover, &node.hover, &mut stops.*, parentStyle, units)
+      }
+      if node.pressed {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Active, &node.active, &mut stops.*, parentStyle, units)
+      }
+      if self.focused == slot {
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Focus, &node.focus, &mut stops.*, parentStyle, units)
+        if self.focusVisible || node.kind == NodeKind.Input {
+          run self.applyOverridden(
+            &mut computed.*,
+            node.id,
+            StyleState.FocusVisible,
+            &node.focusVisible,
+            &mut stops.*,
+            parentStyle,
+            units,
+          )
+        }
+      }
+    }
+  }
+
+  effect fn resolve(self: &mut Self, slot: u32) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    if self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
       inherited = self.node(parent).computed.text
     }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
-    let node = self.node(slot)
-    let mut computed = Computed.inViewport(inherited, self.input.width, self.input.height)
+    let initialNode = self.node(slot)
+    let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
+    let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
+    let mut computed = self.valuesToStartFrom(lender, inherited)
+    if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
+      computed.containerWidth = containers.physicalUnit(&self, slot, true)
+      computed.containerHeight = containers.physicalUnit(&self, slot, false)
+      computed.usesContainer = true
+      computed.usesViewport = true
+    }
 
+    // A lender's values are the finished ones: everything below would write them again.
+    if lender == NONE {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
     }
-    computed.layout.display = defaultDisplay(node.kind)
-    if node.kind == NodeKind.Input {
+    computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
+    if initialNode.kind == NodeKind.Input {
       // Inputs keep their spaces; one line scrolls sideways, several wrap and scroll down.
-      if node.edit().multiline {
+      if initialNode.edit().multiline {
         computed.apply(&declare.whiteSpace(WhiteSpace.PreWrap))
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Auto
@@ -3514,70 +4860,120 @@ impl<'a> UiTree<'a> {
         computed.layout.overflowY = Overflow.Hidden
       }
     }
-    if node.transition.ownedByteLength() != 0 {
-      run stops.read(String.utf8Bytes(String.view(&node.transition)))
-      motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&node.transition)))
+    if initialNode.transition.ownedByteLength() != 0 {
+      run stops.read(String.utf8Bytes(String.view(&initialNode.transition)))
+      run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&initialNode.transition)), &mut stops)
     }
     // The user agent's `:focus-visible { outline: auto }`, under every look the app sets, so
     // `outline: none` or another outline in any of them replaces it, as in a browser.
-    if self.focused == slot && node.kind != NodeKind.Text && (self.focusVisible || node.kind == NodeKind.Input) {
+    if self.focused == slot && initialNode.kind != NodeKind.Text && (self.focusVisible || initialNode.kind == NodeKind.Input) {
       computed.outline.auto = true
       computed.outline.width = FOCUS_RING_WIDTH
     }
-    if node.kind != NodeKind.Text && self.overrides.length() == 0 {
-      run applyAll(&mut computed, &node.base, &mut stops)
-      if node.hovered {
-        run applyAll(&mut computed, &node.hover, &mut stops)
-      }
-      if node.pressed {
-        run applyAll(&mut computed, &node.active, &mut stops)
-      }
-      if self.focused == slot {
-        run applyAll(&mut computed, &node.focus, &mut stops)
-        if self.focusVisible || node.kind == NodeKind.Input {
-          run applyAll(&mut computed, &node.focusVisible, &mut stops)
-        }
-      }
-    } else if node.kind != NodeKind.Text {
-      run self.applyOverridden(&mut computed, node.id, StyleState.Base, &node.base, &mut stops)
-      if node.hovered {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Hover, &node.hover, &mut stops)
-      }
-      if node.pressed {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Active, &node.active, &mut stops)
-      }
-      if self.focused == slot {
-        run self.applyOverridden(&mut computed, node.id, StyleState.Focus, &node.focus, &mut stops)
-        if self.focusVisible || node.kind == NodeKind.Input {
-          run self.applyOverridden(
-            &mut computed,
-            node.id,
-            StyleState.FocusVisible,
-            &node.focusVisible,
-            &mut stops,
-          )
-        }
-      }
+    if simpleStyles {
+      self.applyPixelStyles(slot, &mut computed)
+    } else {
+      let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
+      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+      run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
-    anchoring.apply(&self, node.id, &mut computed)
+    }
+    let node = self.node(slot)
+    if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
+    let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
+    if animationUnits & 2 != 0 && !computed.usesContainer {
+      computed.containerWidth = containers.physicalUnit(&self, slot, true)
+      computed.containerHeight = containers.physicalUnit(&self, slot, false)
+      computed.usesContainer = true
+    }
+    if animationUnits != 0 { computed.usesViewport = true }
     let kind = node.kind
+    if node.generatedSuppressed { computed.layout.display = CssDisplay.None }
+    run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
-    if kind != NodeKind.Text {
-      let mut before = node.computed
-      let mut hasBefore = node.rendered && parentRendered
-      if !hasBefore && rendered && node.starting.length() != 0 {
-        // First shown: transitions start from the starting style over the new one.
+    let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).transition.ownedByteLength() != 0
+      || self.node(slot).starting.length() != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+    if needsMotion {
+      let mut before = style_change.before(&self, slot)
+      let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
+      let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
+      if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
         before = computed
-        run applyAll(&mut before, &node.starting, &mut stops)
+        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
+        run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
+        if sheetStarting {
+          if let Option.Some { value } = self.node(slot).sheetStyle() {
+            if let Option.Some { value: start } = &value.starting {
+              run applyUsing(&mut before, &start, &parentStyle, &mut stops, &startUnits)
+            }
+          }
+        } else {
+          run applyUsing(&mut before, &self.node(slot).starting, &parentStyle, &mut stops, &startUnits)
+        }
         hasBefore = true
       }
       self.easingStops = move stops
+      let underlyingFontSize = computed.text.size
       let animated = run animation.update(&mut self, slot, rendered, &computed)
-      run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated)
-      if animated != 0 {
-        run animation.apply(&self, slot, &mut computed)
+      if self.node(slot).generatedSuppressed { run motion.cancelAll(&mut self, slot) }
+      else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
+      if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
+        let fontUnits = run font_units.inherited(&mut self, slot, &computed)
+        run animation.apply(&self, slot, &mut computed, &fontUnits, true)
       }
+      if computed.text.size != underlyingFontSize {
+        let moving = computed
+        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
+        let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
+        run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
+        self.easingStops = move currentStops
+        let transitions = self.transitions.asSlice()
+        let mut i: usize = 0
+        while i < transitions.length {
+          let item = transitions[i]
+          if item.slot == slot && item.id == self.node(slot).id {
+            motion.write(&mut computed, item.field, motion.sample(&moving, item.field))
+          }
+          i = i + 1
+        }
+      }
+      if animated != 0 {
+        let key = run self.fontKeyOf(computed.text)
+        let currentUnits = font_units.context(&self, slot, &computed, key)
+        run animation.apply(&self, slot, &mut computed, &currentUnits, false)
+      }
+    } else {
+      self.easingStops = move stops
+    }
+    if kind != NodeKind.Text && !self.node(slot).isGenerated() && self.overrides.length() != 0 {
+      let finalUnits = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Overrides)
+      let parentStyle = style_sheets.parentStyle(&self, slot)
+      let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
+      let node = self.node(slot)
+      if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+        run applyUsing(&mut computed, &value.overrides, &parentStyle, &mut finalStops, &finalUnits)
+      } else {
+        let mut declarations = List<Declaration>.make()
+        let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+        let mut i: usize = 0
+        while i < states.length {
+          if style_sheets.active(&self, slot, states[i]) {
+            if let Option<&StyleOverride>.Some { value } = self.overrideOf(node.id, states[i]) {
+              let mut j: usize = 0
+              while j < value.declarations.length() {
+                run css.set(&mut declarations, &value.declarations.asSlice()[j])
+                j = j + 1
+              }
+            }
+          }
+          i = i + 1
+        }
+        run applyUsing(&mut computed, &declarations, &parentStyle, &mut finalStops, &finalUnits)
+      }
+      self.easingStops = move finalStops
     }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
@@ -3586,21 +4982,36 @@ impl<'a> UiTree<'a> {
       computed.effects.shadowFrom = above.shadowFrom
       computed.effects.shadowHash = above.shadowHash
     }
-    run self.resolveEffects(slot, &mut computed)
-    let fontKey = run self.fontKeyOf(computed.text)
+    let fontKey = if simpleStyles && kind == NodeKind.Text && parent != NONE { self.node(parent).fontKey } else { run self.fontKeyOf(computed.text) }
+    run self.resolveEffects(slot, &mut computed, fontKey)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
+    let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
+    if lender == NONE { self.computedStamps = stamp }
     let target = self.nodeMut(slot)
     target.computed = computed
+    target.computedStamp = stamp
     target.rendered = rendered
     target.fontKey = fontKey
     target.paintHash = paintHash
+    run container_watch.units(&mut self, slot)
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
       run Effect.catchAll(
         self.layout.setStyle(NodeId { index: css }, computed.layout),
         layoutFailed,
       )
+      run self.resolveGrid(slot, &computed)
+    }
+    let mut namesChanged = false
+    if kind != NodeKind.Text {
+      let names = if simpleStyles { List<Bytes>.make() } else { run containers.names(&self, slot) }
+      namesChanged = !containers.sameNames(&self, slot, names.asSlice())
+      if names.length() != 0 || self.node(slot).identity().isSome() {
+        let node = self.nodeMut(slot)
+        let identity = run node.identityMut()
+        identity.containerNames = move names
+      }
     }
     if kind == NodeKind.Icon && sizeChanged {
       run self.updateNatural(slot)
@@ -3608,11 +5019,12 @@ impl<'a> UiTree<'a> {
     if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
       run rich.styleRuns(&mut self, slot)
     }
+    return namesChanged
   }
 
   /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
   /// rest of its style is in `computed`, so `em` and `currentColor` see its font and color.
-  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed) -> ()
+  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     if !computed.effects.declared {
@@ -3625,20 +5037,33 @@ impl<'a> UiTree<'a> {
       }
       return ()
     }
-    let basis = Basis { fontSize: computed.text.size, color: computed.text.color }
+    let basis = font_units.paintBasis(&self, slot, &computed.*, fontKey)
     let mut effects = Effects.make()
     let node = self.node(slot)
-    run paint_css.applyAll(&mut effects, node.base.asSlice(), basis)
-    if node.hovered {
-      run paint_css.applyAll(&mut effects, node.hover.asSlice(), basis)
-    }
-    if node.pressed {
-      run paint_css.applyAll(&mut effects, node.active.asSlice(), basis)
-    }
-    if self.focused == slot {
-      run paint_css.applyAll(&mut effects, node.focus.asSlice(), basis)
-      if self.focusVisible || node.kind == NodeKind.Input {
-        run paint_css.applyAll(&mut effects, node.focusVisible.asSlice(), basis)
+    if let Option<&Resolved>.Some { value } = node.sheetStyle() {
+      run self.applyEffects(&mut effects, value.declarations.asSlice(), node.parent, basis)
+      run self.applyEffects(&mut effects, value.overrides.asSlice(), node.parent, basis)
+    } else {
+      let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+      let mut i: usize = 0
+      while i < states.length {
+        let state = states[i]
+        if style_sheets.active(&self, slot, state) {
+          let replace = match self.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
+          if !replace { run self.applyEffects(&mut effects, effectLook(node, state), node.parent, basis) }
+        }
+        i = i + 1
+      }
+      if self.overrides.length() != 0 {
+        i = 0
+        while i < states.length {
+          if style_sheets.active(&self, slot, states[i]) {
+            if let Option.Some { value } = self.overrideOf(node.id, states[i]) {
+              run self.applyEffects(&mut effects, value.declarations.asSlice(), node.parent, basis)
+            }
+          }
+          i = i + 1
+        }
       }
     }
     computed.effects.hash = effects.hash
@@ -3655,6 +5080,88 @@ impl<'a> UiTree<'a> {
     let boxed = run Box<Effects>.make(move effects)
     let target = self.nodeMut(slot)
     target.effects = Option<Box<Effects>>.Some { value: move boxed }
+  }
+
+  effect fn applyEffects(self: &Self, effects: &mut Effects, declarations: &[Declaration], parent: u32, basis: paint_css.Basis) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < declarations.length {
+      let declaration = &declarations[i]
+      let property = declaration.property
+      if paint_css.handles(property) {
+        let inherited = properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+          || properties_convert.isKeyword(&declaration.value, Keyword.Unset) && catalog.inherited(property)
+        if inherited {
+          // Inheritance with no defining ancestor still replaces an earlier look.
+          run paint_css.initial(&mut effects.*, property, basis)
+          run self.inheritEffect(&mut effects.*, parent, property)
+        } else if properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+          || properties_convert.isKeyword(&declaration.value, Keyword.Unset) {
+          run paint_css.initial(&mut effects.*, property, basis)
+        } else { run paint_css.apply(&mut effects.*, declaration, basis) }
+      }
+      i = i + 1
+    }
+  }
+
+  /// The winning active declaration, with inspector overrides above all client looks.
+  fn effectDeclaration(self: &Self, slot: u32, property: CssProperty) -> Option<&Declaration> {
+    let node = self.node(slot)
+    if let Option.Some { value } = node.sheetStyle() {
+      let override = lastEffect(value.overrides.asSlice(), property)
+      if override.isSome() { return override }
+      return lastEffect(value.declarations.asSlice(), property)
+    }
+    let states = [StyleState.FocusVisible, StyleState.Focus, StyleState.Active, StyleState.Hover, StyleState.Base]
+    let mut i: usize = 0
+    if self.overrides.length() != 0 {
+      while i < states.length {
+        if style_sheets.active(&self, slot, states[i]) {
+          if let Option.Some { value } = self.overrideOf(node.id, states[i]) {
+            let found = lastEffect(value.declarations.asSlice(), property)
+            if found.isSome() { return found }
+          }
+        }
+        i = i + 1
+      }
+    }
+    i = 0
+    while i < states.length {
+      if style_sheets.active(&self, slot, states[i]) {
+        let replace = match self.overrideOf(node.id, states[i]) { Option.Some { value } => value.replace _ => false }
+        if !replace {
+          let found = lastEffect(effectLook(node, states[i]), property)
+          if found.isSome() { return found }
+        }
+      }
+      i = i + 1
+    }
+    return Option<&Declaration>.None
+  }
+
+  /// Replay the inherited longhand against its defining ancestor's computed font
+  /// and foreground, freezing em/currentColor but retaining box percentages.
+  effect fn inheritEffect(self: &Self, effects: &mut Effects, parent: u32, property: CssProperty) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut ancestor = parent
+    while ancestor != NONE {
+      let node = self.node(ancestor)
+      let mut inherit = catalog.inherited(property)
+      if let Option.Some { value } = self.effectDeclaration(ancestor, property) {
+        if properties_convert.isKeyword(&value.value, Keyword.Inherit) {
+          inherit = true
+        } else if properties_convert.isKeyword(&value.value, Keyword.Unset) {
+          inherit = catalog.inherited(property)
+        } else if properties_convert.isKeyword(&value.value, Keyword.Initial) {
+          return ()
+        } else {
+          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed, node.fontKey))
+          return ()
+        }
+      }
+      if !inherit { return () }
+      ancestor = node.parent
+    }
   }
 
   // Style overrides.
@@ -3681,12 +5188,14 @@ impl<'a> UiTree<'a> {
     state: StyleState,
     client: &List<Declaration>,
     stops: &mut EasingStops,
+    parent: &Computed,
+    units: &Context,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     let at = self.overrideIndex(id, state)
     if at == usize.MAX {
-      run applyAll(&mut computed, client, &mut stops)
+      run applyUsing(&mut computed, client, parent, &mut stops, units)
       return ()
     }
     let laid = &self.overrides.asSlice()[at]
@@ -3705,7 +5214,7 @@ impl<'a> UiTree<'a> {
       run css.set(&mut merged, &over[j])
       j = j + 1
     }
-    run applyAll(&mut computed, &merged, &mut stops)
+    run applyUsing(&mut computed, &merged, parent, &mut stops, units)
   }
 
   /// Whether node `id` has an override in `state`. Costs nothing while there are none.
@@ -3857,6 +5366,7 @@ impl<'a> UiTree<'a> {
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
     run animation.tick(&mut self)
+    style_change.begin(&mut self)
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()
@@ -3878,6 +5388,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run self.finishStyleChange()
     run self.notifyLayout()
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
@@ -3948,28 +5459,40 @@ impl<'a> UiTree<'a> {
     self.input = input
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
+    style_change.begin(&mut self)
     run self.resolveStyles()
     let mut viewport = CssStyle.make()
     let root = self.layout.root()
     run Effect.catchAll(self.layout.setStyle(root, move viewport), layoutFailed)
-    run Effect.catchAll(
-      computeFragmented(
-        &self.layout,
-        &mut self.output,
-        &mut self.provider,
-        OptionalSize.none(),
-        move frames,
-      ),
-      layoutFailed,
-    )
-    self.output.fragments.resolveLocations()
-    self.paintCachesStale = true
-    self.semanticRevision = self.semanticRevision + 1
-    self.revision = self.revision + 1
-    self.laidOutRevision = usize.MAX
-    self.stats.layout = self.output.stats
-    self.stats.layoutSkipped = false
-    run self.indexFragments()
+    let mut pass: usize = 0
+    let mut budget = container_watch.depth(&self)
+    while true {
+      run Effect.catchAll(
+        computeFragmented(
+          &self.layout,
+          &mut self.output,
+          &mut self.provider,
+          OptionalSize.none(),
+          Fragmentainers { rects: frames.rects, contexts: frames.contexts, ancestors: frames.ancestors,
+            repeatStep: frames.repeatStep, kind: frames.kind, writingMode: frames.writingMode,
+            direction: frames.direction, firstPageRight: frames.firstPageRight, rectoOnRight: frames.rectoOnRight },
+        ),
+        layoutFailed,
+      )
+      self.output.fragments.resolveLocations()
+      self.paintCachesStale = true
+      self.semanticRevision = self.semanticRevision + 1
+      self.revision = self.revision + 1
+      self.laidOutRevision = usize.MAX
+      self.stats.layout = self.output.stats
+      self.stats.layoutSkipped = false
+      run self.indexFragments()
+      let depth = container_watch.depth(&self)
+      if depth > budget { budget = depth }
+      if pass >= budget || !(run self.refineContainers()) { break }
+      pass = pass + 1
+    }
+    run self.finishStyleChange()
     self.layoutObserversDirty = true
     run self.notifyLayout()
     edit.beginPaint(&mut self)
@@ -4004,6 +5527,7 @@ impl<'a> UiTree<'a> {
   pub effect fn layoutNow(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    style_change.begin(&mut self)
     run self.resolveStyles()
     run virtual.prepare(&mut self)
     run self.layoutFrame()
@@ -4012,16 +5536,63 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run self.finishStyleChange()
   }
 
-  effect fn layoutFrame(self: &mut Self) -> ()
+  effect fn refineContainers(self: &mut Self) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let changed = run Effect.result(container_watch.changed(&self))
+    let slots = match move changed {
+      Result.Success { value } => move value
+      Result.Failure { error: why } => match move why {
+        OutOfMemoryError allocation => { fail move allocation }
+        CssError invalid => { drop invalid fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } }
+      }
+    }
+    let mut i: usize = 0
+    while i < slots.length() { self.restyleLocal(slots.get(i)) i = i + 1 }
+    if slots.length() == 0 { return false }
+    run self.resolveStyles()
+    return true
+  }
+
+  effect fn layoutFrame(self: &mut Self) ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !(run self.layoutPass()) || self.containerWatches.length() == 0 { return () }
+    let mut pass: usize = 0
+    let mut budget = container_watch.depth(&self)
+    while pass < budget && (run self.refineContainers()) {
+      if !(run self.layoutPass()) { break }
+      pass = pass + 1
+      let depth = container_watch.depth(&self)
+      if depth > budget { budget = depth }
+    }
+  }
+
+  effect fn finishStyleChange(self: &mut Self) ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < self.styleChanges.length() {
+      let entry = &self.styleChanges.asSlice()[i]
+      let slot = entry.slot
+      if self.node(slot).live && self.node(slot).id == entry.id && self.node(slot).generatedSuppressed {
+        let origin = self.node(slot).parent
+        let target = self.node(slot).pseudoElement()
+        let parent = self.nodeMut(origin)
+        let identity = run parent.identityMut()
+        if target == "::before" { identity.before = NONE } else { identity.after = NONE }
+        run self.destroy(0, slot)
+      }
+      i = i + 1
+    }
+    run style_change.finish(&mut self)
+  }
+
+  effect fn layoutPass(self: &mut Self) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if self.layout.revision() == self.laidOutRevision
       && self.layout.scrollRevision() == self.laidOutScrolls
       && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height {
-      return ()
+      return false
     }
 
     // css-layout has one viewport, sized by whichever root was laid out last.
@@ -4063,6 +5634,7 @@ impl<'a> UiTree<'a> {
       run self.indexFragments()
     }
     self.layoutObserversDirty = true
+    return !moved
   }
 
   /// Reports changed geometry once after layout, including scrolling and first attachment.
@@ -4549,6 +6121,11 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
 // A `font-family` written as CSS text rather than as a family list id.
 fn writtenFamily(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
 /// The width of the default focus ring, as Chromium draws `outline: auto`.
@@ -4611,4 +6188,23 @@ impl<'a> Backend for UiTree<'a> {
   fn range(self: &Self, id: u32) -> Option<VirtualRange> {
     return self.virtualRange(id)
   }
+}
+
+fn effectLook<'a>(node: &'a Node, state: StyleState) -> &'a [Declaration] {
+  return match state {
+    StyleState.Hover => node.hover.asSlice()
+    StyleState.Active => node.active.asSlice()
+    StyleState.Focus => node.focus.asSlice()
+    StyleState.FocusVisible => node.focusVisible.asSlice()
+    _ => node.base.asSlice()
+  }
+}
+
+fn lastEffect<'a>(declarations: &'a [Declaration], property: CssProperty) -> Option<&'a Declaration> {
+  let mut i = declarations.length
+  while i != 0 {
+    i = i - 1
+    if declarations[i].property == property { return Option<&'a Declaration>.some(&declarations[i]) }
+  }
+  return Option<&'a Declaration>.None
 }

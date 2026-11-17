@@ -1,10 +1,8 @@
-// What Vite's module runner touches that a ui-js realm does not have. Source map
-// interception is off, so the decoder is never asked for text.
-globalThis.TextDecoder ??= class TextDecoder {
-  decode() {
-    return "";
-  }
-};
+// Development dependencies (including Effect's barrel exports) instantiate encoders
+// before production tree shaking can remove them. Never substitute a no-op decoder.
+import { TextEncoder, TextDecoder } from "./dev-encoding.js";
+globalThis.TextEncoder ??= TextEncoder;
+globalThis.TextDecoder ??= TextDecoder;
 
 // The runner builds file URLs for import.meta: this covers `new URL("file://…").href`.
 globalThis.URL ??= class URL {

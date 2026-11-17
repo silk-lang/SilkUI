@@ -1,6 +1,7 @@
 //! The web targets' pages: [`site`] puts a page, its program and the scripts that load it into
 //! one folder that any static file server can serve, and [`Server`] serves that folder while
 //! `dev` runs.
+import stylesheets
 import manifest { Project }
 import silk.build.graph { Build, BuildError, Package, Deferred, Step, Key, Make }
 import silk.build.step { StepFailure, StepError }
@@ -130,7 +131,17 @@ effect fn asset(
 
 /// Assembles a page from the program and explicitly declared package resources.
 /// Every script is a deferred `Package.path` input, so only required packages are fetched.
-pub effect fn site(project: &Project, target: string, host: string, wasm: string, dir: string) -> ()
+/// `host` holds the page and the compiled stylesheets: a web-dom page links its `sheetCount`
+/// CSS files, and a development canvas page fetches its stylesheet updates.
+pub effect fn site(
+  project: &Project,
+  target: string,
+  host: string,
+  wasm: string,
+  dir: string,
+  sheetCount: usize,
+  dev: bool,
+) -> ()
   ! BuildError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
   let _project = project
@@ -151,8 +162,48 @@ pub effect fn site(project: &Project, target: string, host: string, wasm: string
     },
   )
   if target == "web-dom" {
+    let mut sheet: usize = 0
+    while sheet < sheetCount {
+      let name = run stylesheets.name(sheet, true)
+      let file = run joined(host, name.view())
+      run assets.append(
+        Asset { name: move name, input: run Deferred<Path>.external(file.view()), scripts: false },
+      )
+      sheet = sheet + 1
+    }
     run asset(&mut assets, "loom_dom", "js/silk-ui-dom.js", "silk-ui-dom.js", false)
   } else {
+    if dev && sheetCount != 0 {
+      let update = run joined(host, "styles.update")
+      run assets.append(
+        Asset {
+          name: run String.copy("styles.update"),
+          input: run Deferred<Path>.external(update.view()),
+          scripts: false,
+        },
+      )
+      run asset(
+        &mut assets,
+        "ui_tree_window",
+        "browser/style-updates.mjs",
+        "ui/tree/window/browser/style-updates.mjs",
+        false,
+      )
+    }
+    run asset(
+      &mut assets,
+      "ui_tree_window",
+      "browser/media.mjs",
+      "ui/tree/window/browser/media.mjs",
+      false,
+    )
+    run asset(
+      &mut assets,
+      "ui_tree_window",
+      "browser/sheet-fetch.mjs",
+      "ui/tree/window/browser/sheet-fetch.mjs",
+      false,
+    )
     run asset(
       &mut assets,
       "ui_tree_window",
@@ -229,6 +280,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
     clients: List<Client>,
     root: String,
     pub build: u64,
+    pub styles: u64,
   }
 
   effect fn socketFailure(error: NativeSocketError) -> never
@@ -293,6 +345,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
         clients: List<Client>.make(),
         root: run String.copy(root),
         build: 1,
+        styles: 1,
       }
     }
 
@@ -375,6 +428,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
       ? &mut Allocator | &mut FileSystem {
       let root = String.view(&self.root)
       let build = self.build
+      let styles = self.styles
       let client = &mut self.clients.asMutSlice()[index]
       if !client.ready {
         let mut buffer: [u8; 8192] = [0; 8192]
@@ -396,7 +450,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
         if !String.contains(String.view(&request), "\r\n\r\n") {
           return client.request.length() > 65536
         }
-        run answer(&mut client, String.view(&request), root, build)
+        run answer(&mut client, String.view(&request), root, build, styles)
       }
       let headLength = client.header.length()
       let bodyLength = client.body.length()
@@ -429,7 +483,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
     if String.endsWith(path, ".html") {
       return "text/html; charset=utf-8"
     }
-    if String.endsWith(path, ".js") {
+    if String.endsWith(path, ".js") || String.endsWith(path, ".mjs") {
       return "text/javascript"
     }
     if String.endsWith(path, ".wasm") {
@@ -456,7 +510,7 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
     return "application/octet-stream"
   }
 
-  effect fn answer(client: &mut Client, request: string, root: string, build: u64) -> ()
+  effect fn answer(client: &mut Client, request: string, root: string, build: u64, styles: u64) -> ()
     ! TaskError | FileError | OutOfMemoryError
     ? &mut Allocator | &mut FileSystem {
     if !String.startsWith(request, "GET ") {
@@ -469,8 +523,12 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
       end = end + 1
     }
     let path = String.slice(request, 4, end - 4)
-    if path == "/__silkui/build" {
-      let number = run decimal(build)
+    if path == "/__silkui/build" || path == "/__silkui/styles" {
+      let number = run decimal(if path == "/__silkui/build" {
+        build
+      } else {
+        styles
+      })
       run respond(
         &mut client,
         "200 OK",
@@ -501,7 +559,9 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
       // A dev page polls for a build number other than the one it was served with.
       if let Result.Success { value: text } = String.fromUtf8(body.asSlice()) {
         let number = run decimal(build)
-        let page = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+        let numbered = run replaced(text, "__SILKUI_BUILD__", String.view(&number))
+        let styleNumber = run decimal(styles)
+        let page = run replaced(String.view(&numbered), "__SILKUI_STYLES__", String.view(&styleNumber))
         run respond(
           &mut client,
           "200 OK",
@@ -531,7 +591,8 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
 } else {
   /// Serving pages needs sockets Silk has on macOS and Linux only here.
   pub struct Server {
-    pub build: u64
+    pub build: u64,
+    pub styles: u64,
   }
 
   impl Server {

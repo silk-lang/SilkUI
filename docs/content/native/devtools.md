@@ -51,7 +51,7 @@ The app prints `ui-inspect: listening on ...` and serves the socket `silk-ui-ins
 ```sh
 silk build --manifest-path modules/inspect/cli/silk.toml
 
-ui-inspect-cli snapshot                       # the tree, as text
+ui-inspect-cli snapshot                       # the tree, as text (or to a file: snapshot tree.txt)
 ui-inspect-cli click --test-id note           # a real click on a node
 ui-inspect-cli type "Hello from a script"     # typed into what has focus
 ui-inspect-cli screenshot pad.png             # the window as a PNG
@@ -62,7 +62,7 @@ ui-inspect-cli audit                          # accessibility problems
 
 A node is named the way a person would name it: `--test-id note`, `--role button --name Save`, `--text "Tide tables"`.
 
-The input commands go through the app's real input path. A click from the CLI is hit tested, focuses, and bubbles exactly as a click from a mouse does. That makes the CLI a way to script an app from outside, and to check it in CI.
+The input commands go through the app's real input path. A click from the CLI is hit tested, focuses, and bubbles exactly as a click from a mouse does. That makes the CLI a way to script an app from outside, and to check it in CI. The same commands, written in a file, also run an app with no display at all: see [headless runs](/native/testing/#the-whole-app-with-no-display).
 
 ## For coding agents
 

@@ -1,3 +1,13 @@
+/** A constructed stylesheet. Text loading requires runtime stylesheet compilation in the host. */
+export class CSSStyleSheet {
+  static fromCompiled(bytes: Uint8Array | ArrayBuffer | string): CSSStyleSheet;
+  replaceCompiled(bytes: Uint8Array | ArrayBuffer | string): void;
+  replaceSync(text: string): void;
+  replace(text: string): Promise<CSSStyleSheet>;
+}
+/** Used by build tools to replace or remove a compiled CSS import without restarting the app. */
+export function updateStyleSheet(id: string, compiled: Uint8Array | ArrayBuffer | string | null): void;
+
 import type * as CSS from "csstype";
 
 /** The node kinds of the tree. `richinput` is an `input` with marks and atoms. */
@@ -29,11 +39,34 @@ export interface Look {
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
 export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
 
+/** Live tokens in a node's class attribute. */
+export class ClassList implements Iterable<string> {
+  constructor(node: Node);
+  value: string;
+  readonly length: number;
+  item(index: number): string | null;
+  contains(token: string): boolean;
+  add(...tokens: string[]): void;
+  remove(...tokens: string[]): void;
+  toggle(token: string, force?: boolean): boolean;
+  replace(oldToken: string, newToken: string): boolean;
+  values(): IterableIterator<string>;
+  keys(): IterableIterator<number>;
+  entries(): IterableIterator<[number, string]>;
+  forEach(callback: (value: string, index: number, list: ClassList) => void, thisArg?: unknown): void;
+  [Symbol.iterator](): IterableIterator<string>;
+  toString(): string;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   constructor(kind: NodeKind);
-  /** The tree's number for the node (not the DOM `id`: that is `setAttribute("id", ...)`). */
-  readonly id: number;
+  /** Stable protocol identifier, independent of the CSS id attribute. */
+  readonly nodeId: number;
+  id: string;
+  className: string;
+  adoptedStyleSheets: CSSStyleSheet[];
+  readonly classList: ClassList;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
@@ -61,9 +94,13 @@ export class Node {
   /**
    * Sets a tree attribute (`tabIndex`, `disabled`, `label`, `testId`, `placeholder`, `href`,
    * `cursor`, `multiline`, `readOnly`, `inert`, `focusTrap`, `transition`), `id`, `role`, or
-   * an ARIA attribute spelled `aria-checked` or `ariaChecked`.
+   * an ARIA attribute spelled `aria-checked` or `ariaChecked`, or a `data-*` attribute.
+   * `null` and `undefined` remove an attribute.
    */
   setAttribute(name: string, value: unknown): void;
+  getAttribute(name: string): string | null;
+  hasAttribute(name: string): boolean;
+  removeAttribute(name: string): void;
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;
@@ -261,6 +298,10 @@ export interface EventMap {
   animationiteration: AnimationEvent;
   animationend: AnimationEvent;
   animationcancel: AnimationEvent;
+  dragenter: DragEvent;
+  dragover: DragEvent;
+  dragleave: DragEvent;
+  drop: DragEvent;
 }
 
 export function createNode(kind: "text"): Text;
@@ -317,3 +358,80 @@ export function parseMarkdown(text: string, options?: MarkdownOptions): import("
 
 /** What happens to an exception a listener throws. Without a handler, the host reports it. */
 export function setErrorHandler(handler: ((error: unknown) => void) | null): void;
+
+/** A file dragged in from the desktop, as the web's `File`, with its `path` on disk. */
+export class DroppedFile {
+  readonly name: string;
+  readonly path: string;
+  readonly type: string;
+}
+
+/** What a file drag carries. `files` is filled in `drop`, as on the web. */
+export class DataTransfer {
+  readonly files: DroppedFile[];
+  readonly items: { kind: "file"; type: string; getAsFile(): DroppedFile }[];
+  readonly types: string[];
+  dropEffect: string;
+  effectAllowed: string;
+  getData(format: string): string;
+}
+
+/** Files dragged from another app over the window (`dragenter`, `dragover`, `dragleave`, `drop`). */
+export interface DragEvent extends Event {
+  clientX: number;
+  clientY: number;
+  x: number;
+  y: number;
+  dataTransfer: DataTransfer;
+}
+
+export interface NotificationOptions {
+  body?: string;
+  tag?: string;
+  data?: unknown;
+}
+
+/** A desktop notification, as the web's. Permission is always granted. */
+export class Notification {
+  static readonly permission: "granted";
+  static requestPermission(callback?: (permission: "granted") => void): Promise<"granted">;
+  constructor(title: string, options?: NotificationOptions);
+  readonly title: string;
+  readonly body: string;
+  readonly tag: string;
+  readonly data: unknown;
+  onclick: ((event: { type: "click"; target: Notification }) => void) | null;
+  onshow: ((event: { type: "show"; target: Notification }) => void) | null;
+  onerror: ((event: { type: "error"; target: Notification }) => void) | null;
+  onclose: ((event: { type: "close"; target: Notification }) => void) | null;
+  close(): void;
+  addEventListener(type: "click" | "show" | "error" | "close", listener: (event: { type: string; target: Notification }) => void): void;
+  removeEventListener(type: "click" | "show" | "error" | "close", listener: (event: { type: string; target: Notification }) => void): void;
+}
+
+export type TrayMenuItem =
+  | { label: string; click?: () => void; enabled?: boolean; checked?: boolean }
+  | { type: "separator" }
+  | { label: string; submenu: TrayMenuItem[] };
+
+export interface TrayOptions {
+  /** RGBA pixels, as an `ImageData`. 32 by 32 looks right everywhere. */
+  icon: { width: number; height: number; data: ArrayLike<number> };
+  tooltip?: string;
+  /** macOS draws the icon from its alpha, in the menu bar's colours. */
+  template?: boolean;
+  menu?: TrayMenuItem[];
+  /** Runs on a click when there is no menu. `button` is `MouseEvent.button`'s. */
+  onClick?: (event: { button: number }) => void;
+}
+
+/** Shows an icon in the system tray; calling it again replaces it. Resolves to whether it shows. */
+export function setTray(options: TrayOptions): Promise<boolean>;
+export function removeTray(): void;
+
+/**
+ * Runs `callback` when `accelerator` (`"Mod+Shift+K"`; `Mod` is Command on macOS, Control
+ * elsewhere) is pressed, whichever app has focus. Resolves to whether the system took it.
+ */
+export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
+export function unregisterShortcut(accelerator: string): void;

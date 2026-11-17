@@ -336,7 +336,7 @@ effect fn route(request: string, roots: &Roots) -> Response
   if roots.script && path == "/app.js" {
     return Response { status: 200, mime: "text/javascript", body: run FileSystem.readFile(&roots.app) }
   }
-  if !String.endsWith(path, ".js") && !String.endsWith(path, ".ts") { return Response { status: 404, mime: "text/plain", body: Bytes.make() } }
+  if !String.endsWith(path, ".js") && !String.endsWith(path, ".mjs") && !String.endsWith(path, ".ts") { return Response { status: 404, mime: "text/plain", body: Bytes.make() } }
   // Reject traversal on decoded segments, including backslashes on hosts that interpret them.
   if String.contains(path, "\\") || String.contains(path, "\x00") || String.contains(path, "/../") || String.contains(path, "/./") {
     return Response { status: 404, mime: "text/plain", body: Bytes.make() }
@@ -409,4 +409,46 @@ effect fn respond(client: &mut Client, status: usize, mime: string, body: Bytes)
   run Bytes.append(&mut client.header, b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")
   client.body = move body
   client.ready = true
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+  import silk.platform.native.host_input { NativeHostInput }
+  import silk.system.filesystem_native { OsFileSystem }
+  import silk.testing.testing { Testing, AssertionError }
+
+  effect fn moduleResponses() -> ()
+    ! TaskError | FileError | OutOfMemoryError | AssertionError<'static>
+    ? &mut Allocator | &mut FileSystem {
+    let roots = Roots {
+      wasm: run Path.make("/silk.toml"), page: run Path.make("/modules/tree/window/browser/index.html"),
+      ui: run Path.make("/modules/tree/window/browser"), native: run Path.make("/"),
+      tree: false, script: false, app: run Path.make("/silk.toml"), js: run Path.make("/"),
+    }
+    let names = ["app-host.js", "media.mjs", "sheet-fetch.mjs", "style-updates.mjs"]
+    let mut index: usize = 0
+    while index < names.length {
+      let mut request = run String.copy("GET /ui/tree/window/browser/")
+      run String.append(&mut request, names[index])
+      run String.append(&mut request, " HTTP/1.1\r\n\r\n")
+      let response = run route(String.view(&request), &roots)
+      run Testing.expect(response.status == 200, "every browser host import is served")
+      run Testing.expect(response.mime == "text/javascript", "modules use a JavaScript MIME type")
+      run Testing.expect(response.body.length() > 0, "the module response contains its source")
+      index = index + 1
+    }
+  }
+
+  effect fn moduleResponsesWithFiles() -> ()
+    ! TaskError | FileError | HostInputError | OutOfMemoryError | AssertionError<'static>
+    ? &mut Allocator {
+    let directory = run NativeHostInput.workingDirectory()
+    let mut files = run OsFileSystem.makeBytes(directory.asSlice())
+    run moduleResponses() |> Effect.provideMut<FileSystem>(&mut files)
+  }
+
+  test effect fn browserHostModulesHaveExecutableResponses() -> ()
+    ! TaskError | FileError | HostInputError | OutOfMemoryError | AssertionError<'static> {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    run moduleResponsesWithFiles() |> Effect.provideMut<Allocator>(&mut allocator)
+  }
 }

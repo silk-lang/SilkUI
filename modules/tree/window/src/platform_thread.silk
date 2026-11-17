@@ -23,8 +23,15 @@ import render_thread { Compositor, FastScrolled }
 import window.event { ScrollDelta }
 import silk.num.f32
 import window.event { Event, Modifiers, MouseButton, Phase }
+import window.keys { KeyCode }
+import window.shell { Notification, Tray, TrayIcon }
 import window.menu { MenuBar, MenuEntry, OpenDialog, SaveDialog }
 import window.native { NativePlatform, Waker }
+import window.headless { HeadlessPlatform }
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import headless
+}
 import window.platform { Platform }
 import window.types {
   Appearance,
@@ -98,6 +105,18 @@ union Command {
   },
   ReadClipboard,
   WriteClipboard { text: String },
+  SetTray {
+    pixels: List<u8>,
+    width: u32,
+    height: u32,
+    template: bool,
+    tooltip: String,
+    menu: MenuBar,
+  },
+  RemoveTray,
+  RegisterShortcut { id: u32, code: KeyCode, modifiers: Modifiers },
+  UnregisterShortcut { id: u32 },
+  Notify { title: String, body: String },
   Accessibility { window: WindowId, update: TreeUpdate },
 }
 
@@ -106,6 +125,8 @@ union Reply {
   Window { window: WindowId, size: Size2<f64>, scale: f64, raw: RawSurface },
   Dialog { dialog: DialogId },
   Clipboard { text: Option<String> },
+  Done { ok: bool },
+  Notified { id: u32 },
   Failed { error: WindowError },
 }
 
@@ -368,6 +389,10 @@ pub effect fn launch<
   static if Intrinsic.targetArchitecture() == "wasm32" {
     return app(Option<Launched>.None)
   } else {
+    // A headless run opens no window system (see `headless.silk`).
+    if (run headless.requested()).isSome() {
+      return app(Option<Launched>.None)
+    }
     let mut heap = Allocator.systemAllocatorProvider()
     let started = run Effect.result(NativePlatform.start())
     let mut platform = match move started {
@@ -851,6 +876,34 @@ effect fn execute(
     Command.WriteClipboard { text } => {
       run platform.writeClipboard(String.view(&text))
     }
+    Command.SetTray { pixels, width, height, template, tooltip, menu } => {
+      let tray = Tray {
+        icon: TrayIcon {
+          width: width,
+          height: height,
+          pixels: pixels.asSlice(),
+          template: template,
+        },
+        tooltip: String.view(&tooltip),
+        menu: &menu,
+      }
+      let shown = run platform.setTray(&tray)
+      answer(link, wakeUi, Reply.Done { ok: shown })
+    }
+    Command.RemoveTray => platform.removeTray()
+    Command.RegisterShortcut { id, code, modifiers } => {
+      let held = run platform.registerShortcut(id, code, modifiers)
+      answer(link, wakeUi, Reply.Done { ok: held })
+    }
+    Command.UnregisterShortcut { id } => platform.unregisterShortcut(id)
+    Command.Notify { title, body } => {
+      let notification = Notification {
+        title: String.view(&title),
+        body: String.view(&body),
+      }
+      let id = run platform.notify(&notification)
+      answer(link, wakeUi, Reply.Notified { id: id })
+    }
     Command.Accessibility { window, update } => {
       let at = bridgeOf(&platform.*, &mut bridges, window.value)
       run bridges.asMutSlice()[at].bridge.update(move update, true)
@@ -1212,6 +1265,61 @@ impl Platform for PlatformProxy {
   fn appearance(self: &Self) -> Appearance {
     return self.link.get().lock().get().appearance
   }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(tray.icon.pixels) |> Effect.provideMut<Allocator>(&mut heap)
+    let tooltip = run PlatformProxy.copyOf(tray.tooltip)
+    let menu = run copyMenuBar(tray.menu)
+    let reply = run self.call(
+      Command.SetTray {
+        pixels: move pixels,
+        width: tray.icon.width,
+        height: tray.icon.height,
+        template: tray.icon.template,
+        tooltip: move tooltip,
+        menu: move menu,
+      },
+    )
+    return doneOf(move reply)
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    drop Effect.result(self.send(Command.RemoveTray))
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.RegisterShortcut { id: id, code: code, modifiers: modifiers })
+    return doneOf(move reply)
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    drop Effect.result(self.send(Command.UnregisterShortcut { id: id }))
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let title = run PlatformProxy.copyOf(notification.title)
+    let body = run PlatformProxy.copyOf(notification.body)
+    let reply = run self.call(Command.Notify { title: move title, body: move body })
+    return match move reply {
+      Reply.Notified { id } => id
+      _ => 0
+    }
+  }
+}
+
+fn doneOf(reply: Reply) -> bool {
+  return match move reply {
+    Reply.Done { ok } => ok
+    _ => false
+  }
 }
 
 effect fn dialogOf(reply: Reply) -> DialogId
@@ -1265,16 +1373,23 @@ effect fn copyMenuBar(bar: &MenuBar) -> MenuBar
 }
 
 /// The platform as the window host and its clients see it: the platform itself on a one-thread
-/// loop, or a [`PlatformProxy`] to the platform thread of a launched app.
+/// loop, a [`PlatformProxy`] to the platform thread of a launched app, or no display at all for
+/// a headless run (see `headless.silk`).
 pub union HostPlatform {
   Direct { platform: NativePlatform },
   Proxied { proxy: PlatformProxy },
+  Headless { platform: HeadlessPlatform },
 }
 
 impl HostPlatform {
   /// The platform on this thread.
   pub fn direct(platform: NativePlatform) -> HostPlatform {
     return HostPlatform.Direct { platform: move platform }
+  }
+
+  /// No display: windows are records and nothing is shown, for a headless run.
+  pub fn headless() -> HostPlatform {
+    return HostPlatform.Headless { platform: HeadlessPlatform.make() }
   }
 
   /// The platform thread of a launched app.
@@ -1357,6 +1472,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.openWindow(options)
+      HostPlatform.Headless { platform } => run platform.openWindow(options)
       HostPlatform.Proxied { proxy } => run proxy.openWindow(options)
     }
   }
@@ -1364,6 +1480,7 @@ impl Platform for HostPlatform {
   fn closeWindow(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.closeWindow(window)
+      HostPlatform.Headless { platform } => platform.closeWindow(window)
       HostPlatform.Proxied { proxy } => proxy.closeWindow(window)
     }
   }
@@ -1373,6 +1490,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.nextEvent(wait)
+      HostPlatform.Headless { platform } => run platform.nextEvent(wait)
       HostPlatform.Proxied { proxy } => run proxy.nextEvent(wait)
     }
   }
@@ -1380,6 +1498,7 @@ impl Platform for HostPlatform {
   fn requestFrame(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.requestFrame(window)
+      HostPlatform.Headless { platform } => platform.requestFrame(window)
       HostPlatform.Proxied { proxy } => proxy.requestFrame(window)
     }
   }
@@ -1387,6 +1506,7 @@ impl Platform for HostPlatform {
   fn contentSize(self: &Self, window: WindowId) -> Size2<f64> {
     return match &self.* {
       HostPlatform.Direct { platform } => platform.contentSize(window)
+      HostPlatform.Headless { platform } => platform.contentSize(window)
       HostPlatform.Proxied { proxy } => proxy.contentSize(window)
     }
   }
@@ -1394,6 +1514,7 @@ impl Platform for HostPlatform {
   fn scaleFactor(self: &Self, window: WindowId) -> f64 {
     return match &self.* {
       HostPlatform.Direct { platform } => platform.scaleFactor(window)
+      HostPlatform.Headless { platform } => platform.scaleFactor(window)
       HostPlatform.Proxied { proxy } => proxy.scaleFactor(window)
     }
   }
@@ -1401,6 +1522,7 @@ impl Platform for HostPlatform {
   fn rawSurface(self: &Self, window: WindowId) -> RawSurface {
     return match &self.* {
       HostPlatform.Direct { platform } => platform.rawSurface(window)
+      HostPlatform.Headless { platform } => platform.rawSurface(window)
       HostPlatform.Proxied { proxy } => proxy.rawSurface(window)
     }
   }
@@ -1410,6 +1532,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.setTitle(window, title)
+      HostPlatform.Headless { platform } => run platform.setTitle(window, title)
       HostPlatform.Proxied { proxy } => run proxy.setTitle(window, title)
     }
   }
@@ -1417,6 +1540,7 @@ impl Platform for HostPlatform {
   fn setContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.setContentSize(window, size)
+      HostPlatform.Headless { platform } => platform.setContentSize(window, size)
       HostPlatform.Proxied { proxy } => proxy.setContentSize(window, size)
     }
   }
@@ -1424,6 +1548,7 @@ impl Platform for HostPlatform {
   fn setMinContentSize(self: &mut Self, window: WindowId, size: Size2<f64>) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.setMinContentSize(window, size)
+      HostPlatform.Headless { platform } => platform.setMinContentSize(window, size)
       HostPlatform.Proxied { proxy } => proxy.setMinContentSize(window, size)
     }
   }
@@ -1431,6 +1556,7 @@ impl Platform for HostPlatform {
   fn setVisible(self: &mut Self, window: WindowId, visible: bool) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.setVisible(window, visible)
+      HostPlatform.Headless { platform } => platform.setVisible(window, visible)
       HostPlatform.Proxied { proxy } => proxy.setVisible(window, visible)
     }
   }
@@ -1438,6 +1564,7 @@ impl Platform for HostPlatform {
   fn focus(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.focus(window)
+      HostPlatform.Headless { platform } => platform.focus(window)
       HostPlatform.Proxied { proxy } => proxy.focus(window)
     }
   }
@@ -1445,6 +1572,7 @@ impl Platform for HostPlatform {
   fn minimize(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.minimize(window)
+      HostPlatform.Headless { platform } => platform.minimize(window)
       HostPlatform.Proxied { proxy } => proxy.minimize(window)
     }
   }
@@ -1452,6 +1580,7 @@ impl Platform for HostPlatform {
   fn toggleFullScreen(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.toggleFullScreen(window)
+      HostPlatform.Headless { platform } => platform.toggleFullScreen(window)
       HostPlatform.Proxied { proxy } => proxy.toggleFullScreen(window)
     }
   }
@@ -1459,6 +1588,7 @@ impl Platform for HostPlatform {
   fn startWindowDrag(self: &mut Self, window: WindowId) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.startWindowDrag(window)
+      HostPlatform.Headless { platform } => platform.startWindowDrag(window)
       HostPlatform.Proxied { proxy } => proxy.startWindowDrag(window)
     }
   }
@@ -1466,6 +1596,7 @@ impl Platform for HostPlatform {
   fn setCursor(self: &mut Self, window: WindowId, cursor: Cursor) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.setCursor(window, cursor)
+      HostPlatform.Headless { platform } => platform.setCursor(window, cursor)
       HostPlatform.Proxied { proxy } => proxy.setCursor(window, cursor)
     }
   }
@@ -1473,6 +1604,7 @@ impl Platform for HostPlatform {
   fn setIme(self: &mut Self, window: WindowId, ime: ImeState) -> () {
     return match &mut self.* {
       HostPlatform.Direct { platform } => platform.setIme(window, ime)
+      HostPlatform.Headless { platform } => platform.setIme(window, ime)
       HostPlatform.Proxied { proxy } => proxy.setIme(window, ime)
     }
   }
@@ -1482,6 +1614,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.setMenuBar(bar)
+      HostPlatform.Headless { platform } => run platform.setMenuBar(bar)
       HostPlatform.Proxied { proxy } => run proxy.setMenuBar(bar)
     }
   }
@@ -1491,6 +1624,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.openFileDialog(options)
+      HostPlatform.Headless { platform } => run platform.openFileDialog(options)
       HostPlatform.Proxied { proxy } => run proxy.openFileDialog(options)
     }
   }
@@ -1500,6 +1634,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.saveFileDialog(options)
+      HostPlatform.Headless { platform } => run platform.saveFileDialog(options)
       HostPlatform.Proxied { proxy } => run proxy.saveFileDialog(options)
     }
   }
@@ -1509,6 +1644,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.readClipboard()
+      HostPlatform.Headless { platform } => run platform.readClipboard()
       HostPlatform.Proxied { proxy } => run proxy.readClipboard()
     }
   }
@@ -1518,6 +1654,7 @@ impl Platform for HostPlatform {
     ? &mut Allocator {
     return match &mut self.* {
       HostPlatform.Direct { platform } => run platform.writeClipboard(text)
+      HostPlatform.Headless { platform } => run platform.writeClipboard(text)
       HostPlatform.Proxied { proxy } => run proxy.writeClipboard(text)
     }
   }
@@ -1525,7 +1662,54 @@ impl Platform for HostPlatform {
   fn appearance(self: &Self) -> Appearance {
     return match &self.* {
       HostPlatform.Direct { platform } => platform.appearance()
+      HostPlatform.Headless { platform } => Platform.appearance(&platform)
       HostPlatform.Proxied { proxy } => proxy.appearance()
+    }
+  }
+
+  effect fn setTray(self: &mut Self, tray: &Tray<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setTray(tray)
+      HostPlatform.Headless { platform } => run platform.setTray(tray)
+      HostPlatform.Proxied { proxy } => run proxy.setTray(tray)
+    }
+  }
+
+  fn removeTray(self: &mut Self) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.removeTray()
+      HostPlatform.Headless { platform } => platform.removeTray()
+      HostPlatform.Proxied { proxy } => proxy.removeTray()
+    }
+  }
+
+  effect fn registerShortcut(self: &mut Self, id: u32, code: KeyCode, modifiers: Modifiers) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Headless { platform } => run platform.registerShortcut(id, code, modifiers)
+      HostPlatform.Proxied { proxy } => run proxy.registerShortcut(id, code, modifiers)
+    }
+  }
+
+  fn unregisterShortcut(self: &mut Self, id: u32) -> () {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Headless { platform } => platform.unregisterShortcut(id)
+      HostPlatform.Proxied { proxy } => proxy.unregisterShortcut(id)
+    }
+  }
+
+  effect fn notify(self: &mut Self, notification: &Notification<'_>) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.notify(notification)
+      HostPlatform.Headless { platform } => run platform.notify(notification)
+      HostPlatform.Proxied { proxy } => run proxy.notify(notification)
     }
   }
 }

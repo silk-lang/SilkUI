@@ -43,7 +43,7 @@ type EventProps<T extends Silk.Node> = { [K in keyof Handlers<T>]?: ((event: Han
 
 type AriaProps = { [name: `aria-${string}`]: string | number | boolean | undefined };
 
-export type SilkProps<T extends Silk.Node = Silk.Node> = EventProps<T> & AriaProps & BaseProps<T>;
+export type SilkProps<T extends Silk.Node = Silk.Node> = EventProps<T> & AriaProps & { [name: `data-${string}`]: string | number | boolean | undefined } & BaseProps<T>;
 
 interface BaseProps<T extends Silk.Node> {
   key?: Key | null | undefined;
@@ -57,6 +57,7 @@ interface BaseProps<T extends Silk.Node> {
   /** What transitions start from when the node first shows, as `@starting-style`. */
   startingStyle?: Silk.Style | undefined;
   id?: string | undefined;
+  className?: string | undefined;
   role?: string | undefined;
   tabIndex?: number | undefined;
   testId?: string | undefined;

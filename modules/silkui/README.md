@@ -51,7 +51,7 @@ An app goes through three stages, and each step is scoped under the stage it tak
 | `App.build(&options)` | Built | Compiles the graph and assembles browser pages. Development builds also install the Vite packages needed to launch the dev server |
 | `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>`, and each page to `<dir>/<target>/` |
 | `Built.launch()` | Running | Starts the first target: Vite's dev server for an unoptimized JavaScript app, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
-| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window or reloads the page |
+| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, or reloads the page |
 
 `App.tap(fn)`, `Built.tap(fn)` and `Running.tap(fn)` run a function on the value and pass it
 on; `App.map` and `Built.map` take an effect closure that makes a new value of the same
@@ -78,12 +78,73 @@ packages while keeping the application unoptimized.
 | Setting | Choices | Notes |
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
-| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no hot reload yet: `dev` builds the bundle once |
+| `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
+| `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
+| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
 | `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
 Fonts are the ones installed on the machine. A `web-canvas` page has no access to those, so it
 gets the tree's own default fonts.
+
+## Stylesheets
+
+Add one or more files after the framework declaration:
+
+```silk
+    |> App.stylesheet("styles/app.css")
+    |> App.stylesheet("styles/theme.css")
+```
+
+The build compiles each file with `css-style`, reports unsupported constructs, and embeds
+compiled bytes in native and canvas hosts. Sheets are adopted before the application's
+first layout, including later windows. The embedded inspector has its own styles.
+DOM pages copy the CSS and link the files in the same order before mounting the app.
+Local `@font-face` files are embedded as data URLs in both outputs. Relative font paths
+start at the original CSS file; paths beginning with `/` start at the app root. Remote
+URLs remain host requests. Changes to a local font also trigger stylesheet hot replacement.
+Keep fonts outside `src/` to avoid also triggering the application source rebuild watcher.
+The [Loom counter](examples/loom) uses this path on all three targets.
+JavaScript release builds also pick up `dist/app.sheet` from `@silkui/vite`, validate its
+format, and embed it after the explicitly configured CSS files.
+
+A CSS processor such as Tailwind runs before `App.host` (or `App.build`) and writes ordinary
+CSS to the configured path. The optional [`ui-tailwind` package](../tailwind) supplies a
+project CLI or checksum-pinned standalone CLI, with build and watch steps. Custom hosts adopt their compiled sheets directly. On `window`,
+`web-canvas`, and `web-dom`, `dev` replaces changed stylesheets without restarting the application or
+resetting its state. Native hosts validate an atomically published set of compiled sheets
+before updating their application roots. A missing or invalid update leaves the active styles
+intact until a valid update is available. Release hosts do not watch stylesheet files.
+Canvas updates fetch the same compiled bundles; development polling is omitted from release pages.
+
+Runtime CSS text is optional in release: add `App.runtimeStylesheets()` to enable it.
+Silk code can use `StyleSheet.load(&mut tree, run StyleSource.text(bytes))`, or
+`tree.loadStyleSheet(root, run StyleSource.url("https://example.com/theme.css"))`.
+`StyleSource.url` accepts the same relative, `file:`, HTTP(S), and `data:` sources as
+images and fonts. Native file and HTTP reads run on workers; canvas URLs use browser fetch
+and its CORS rules. Local files on canvas must be served by the app's web server.
+Custom hosts configure `Loader.setStylesheetCompiler(ui_tree.style_runtime.runtime())`;
+the loader defaults to disabled and does not fetch CSS when disabled.
+
+A load reserves its adoption position immediately. Its handle exposes loading, ready,
+or failed state; `replace` keeps the previous sheet until the replacement succeeds.
+Removal, another replacement, or closing the root discards stale completions. Failed
+initial loads leave an empty slot that can be replaced or removed. Compiled sheet adoption
+never requires the text compiler. The DOM backend uses the browser's CSS parser and needs
+no compiler option.
+
+Media queries use each root's viewport and scale. Window hosts supply system light/dark
+appearance and desktop pointer capabilities. Canvas hosts read the browser's appearance,
+reduced-motion, forced-colors, hover, and primary/secondary pointer preferences, and respond when they
+change. A root is restyled only when a media condition changes its result. Native
+reduced-motion and forced-colors preferences are not exposed by the window platform API yet.
+
+The browser integration test runs the real dev task in a temporary project and checks
+replacement order, preserved state, missing-file recovery, and a subsequent code rebuild:
+`node modules/silkui/tests/stylesheets-browser.mjs` from the repository root. It needs
+`silk` and `chromium` on PATH (or the `SILK` and `CHROMIUM` environment variables).
+The native file-update test is `silk test --manifest-path modules/tree/window/tests/silk.toml --root src/stylesheet_updates.silk`; it checks complete-set validation, recovery, adoption
+order, repaint scheduling, and isolation between application and inspector roots.
 
 ## The web targets
 

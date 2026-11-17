@@ -1,3 +1,4 @@
+import ui_tree.mutation { StyleSource }
 //! Remote views on the wire: tree [`Mutation`] batches as JSON, and the event records a client
 //! sends back for the nodes they made. Any client that drives a tree can render a panel through
 //! it (see `extension.silk`); the devtools replay it into a subtree of their own tree.
@@ -30,13 +31,15 @@
 //! An event record is an object with `kind` (as the `events` command names it), `target`, `path`
 //! and the payload members that are not empty.
 import names { eventName, eventKindNamed, roleNamed, kindNamed, cursorNamed }
-import reply { writeString, textField, flagField, numberField, idField, has }
+import reply { writeString, textField, flagField, numberField, idField, has, idsField }
 import tools { stateNamed, stateName }
 import ui_inspect.view { cursorName, writeDeclaration }
 import ui_tree.css { Declaration }
 import ui_tree.inspect { roleName, kindName, writeInt, writeNumber }
 import ui_tree.mutation { Mutation, Attribute, Role, Cursor, NodeKind, StyleState, ariaText, ariaAttribute }
 import silk.collections.bytes { Bytes }
+import silk.encoding.base64 { Base64, Base64Error }
+import reply { writeBase64 }
 import ui_tree.node { Event, EventKind }
 import ui_tree.lib { RootOptions }
 import css_style.tokens { CssError }
@@ -239,6 +242,14 @@ effect fn attribute(out: &mut String, attribute: &Attribute) -> ()
       run out.append(",\"name\":\"elementId\"")
       run textMember(&mut out, "value", String.view(&value))
     }
+    Attribute.Named { name, value } => {
+      run textMember(&mut out, "name", "named")
+      run textMember(&mut out, "attribute", String.view(&name))
+      match &value {
+        Option<String>.Some { value: text } => run textMember(&mut out, "value", String.view(&text))
+        Option<String>.None => {}
+      }
+    }
     _ => {
       // The other accessibility attributes, by their ARIA names: "aria-level": "2".
       let mut text = Bytes.make()
@@ -285,6 +296,27 @@ pub effect fn writeMutations(out: &mut String, batch: &[Mutation]) -> ()
         run cssText(&mut out, &declarations)
         run out.append("}")
       }
+      Mutation.SetCustomProperty { id, state, name, value, important } => {
+        run begin(&mut out, &mut first, "customProperty")
+        run member(&mut out, "id", u32.toU64(id))
+        run textMember(&mut out, "state", stateName(state))
+        run textMember(&mut out, "name", String.view(&name))
+        if let Option<String>.Some { value: text } = &value { run textMember(&mut out, "value", String.view(&text)) }
+        run flagMember(&mut out, "important", important)
+        run out.append("}")
+      }
+      Mutation.SetStyleSheetOrder { root, sheets } => {
+        run begin(&mut out, &mut first, "styleSheetOrder")
+        run member(&mut out, "root", u32.toU64(root))
+        run out.append(",\"sheets\":[")
+        let mut at: usize = 0
+        while at < sheets.length() {
+          if at > 0 { run out.append(",") }
+          run writeInt(&mut out, u32.toU64(sheets.asSlice()[at]))
+          at = at + 1
+        }
+        run out.append("]}")
+      }
       Mutation.ClearStyle { id, state } => {
         run begin(&mut out, &mut first, "clearStyle")
         run member(&mut out, "id", u32.toU64(id))
@@ -328,6 +360,24 @@ pub effect fn writeMutations(out: &mut String, batch: &[Mutation]) -> ()
         run member(&mut out, "node", u32.toU64(node))
         run out.append("}")
       }
+      Mutation.LoadStyleSheet { root, sheet, source } => match &source {
+        StyleSource.Text { bytes } => run sheetOp(&mut out, &mut first, "loadStyleSheetText", root, sheet, bytes.asSlice())
+        StyleSource.Url { url } => {
+          run begin(&mut out, &mut first, "loadStyleSheetUrl")
+          run member(&mut out, "root", u32.toU64(root))
+          run member(&mut out, "sheet", u32.toU64(sheet))
+          run textMember(&mut out, "url", String.view(&url))
+          run out.append("}")
+        }
+      }
+      Mutation.AdoptStyleSheet { root, sheet, bytes } => run sheetOp(&mut out, &mut first, "adoptStyleSheet", root, sheet, bytes.asSlice())
+      Mutation.ReplaceStyleSheet { root, sheet, bytes } => run sheetOp(&mut out, &mut first, "replaceStyleSheet", root, sheet, bytes.asSlice())
+      Mutation.RemoveStyleSheet { root, sheet } => {
+        run begin(&mut out, &mut first, "removeStyleSheet")
+        run member(&mut out, "root", u32.toU64(root))
+        run member(&mut out, "sheet", u32.toU64(sheet))
+        run out.append("}")
+      }
       Mutation.CloseRoot { root } => {
         run begin(&mut out, &mut first, "closeRoot")
         run member(&mut out, "root", u32.toU64(root))
@@ -366,6 +416,13 @@ effect fn attributeOf(value: &Value) -> Option<Attribute>
   ! OutOfMemoryError
   ? &mut Allocator {
   let name = textField(value, "name")
+  if name == "named" {
+    return Option<Attribute>.some(Attribute.Named {
+      name: run String.copy(textField(value, "attribute")),
+      value: if has(value, "value") { Option<String>.some(run String.copy(textField(value, "value"))) }
+        else { Option<String>.None },
+    })
+  }
   if name == "valueRange" {
     return Option<Attribute>.some(
       Attribute.ValueRange {
@@ -513,6 +570,21 @@ pub effect fn readMutation(value: &Value) -> Option<Mutation>
   if op == "destroy" {
     return Option<Mutation>.some(Mutation.Destroy { id: id })
   }
+  if op == "styleSheetOrder" {
+    let mut sheets = List<u32>.make()
+    run idsField(value, "sheets", &mut sheets)
+    return Option<Mutation>.some(Mutation.SetStyleSheetOrder { root: idOf(value, "root"), sheets: move sheets })
+  }
+  if op == "customProperty" {
+    let state = match stateNamed(textField(value, "state")) {
+      Option<StyleState>.Some { value: named } => named
+      _ => { return Option<Mutation>.None }
+    }
+    return Option<Mutation>.some(Mutation.SetCustomProperty { id: id, state: state,
+      name: run String.copy(textField(value, "name")),
+      value: if has(value, "value") { Option<String>.some(run String.copy(textField(value, "value"))) } else { Option<String>.None },
+      important: flagField(value, "important", false) })
+  }
   if op == "style" || op == "clearStyle" {
     let state = match stateNamed(textField(value, "state")) {
       Option<StyleState>.Some { value: named } => named
@@ -565,6 +637,32 @@ pub effect fn readMutation(value: &Value) -> Option<Mutation>
         options: RootOptions.default(),
       },
     )
+  }
+  if op == "removeStyleSheet" {
+    return Option<Mutation>.some(Mutation.RemoveStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet") })
+  }
+  if op == "loadStyleSheetUrl" {
+    return Option<Mutation>.some(Mutation.LoadStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), source: run StyleSource.url(textField(value, "url")) })
+  }
+  if op == "adoptStyleSheet" || op == "replaceStyleSheet" || op == "loadStyleSheetText" {
+    let encoded = String.utf8Bytes(textField(value, "bytes"))
+    let length = match Base64.decodedLength(encoded) {
+      Result<usize, Base64Error>.Success { value: count } => count
+      _ => { return Option<Mutation>.None }
+    }
+    if length > 67108864 { return Option<Mutation>.None }
+    let mut bytes = run Bytes.zeroed(length)
+    match Base64.decodeInto(bytes.asMutSlice(), encoded) {
+      Result<usize, Base64Error>.Success { value: count } => bytes.truncate(count)
+      _ => { return Option<Mutation>.None }
+    }
+    if op == "loadStyleSheetText" {
+      return Option<Mutation>.some(Mutation.LoadStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), source: StyleSource.Text { bytes: move bytes } })
+    }
+    if op == "adoptStyleSheet" {
+      return Option<Mutation>.some(Mutation.AdoptStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), bytes: move bytes })
+    }
+    return Option<Mutation>.some(Mutation.ReplaceStyleSheet { root: idOf(value, "root"), sheet: idOf(value, "sheet"), bytes: move bytes })
   }
   if op == "closeRoot" {
     return Option<Mutation>.some(Mutation.CloseRoot { root: idOf(value, "root") })
@@ -705,4 +803,14 @@ pub effect fn readEvent(value: &Value) -> Option<Event>
   event.selectionStart = u32.toUsize(idOf(value, "selectionStart"))
   event.selectionEnd = u32.toUsize(idOf(value, "selectionEnd"))
   return Option<Event>.some(move event)
+}
+
+effect fn sheetOp(out: &mut String, first: &mut bool, op: string, root: u32, sheet: u32, bytes: &[u8]) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run begin(&mut out.*, &mut first.*, op)
+  run member(&mut out.*, "root", u32.toU64(root))
+  run member(&mut out.*, "sheet", u32.toU64(sheet))
+  run out.append(",\"bytes\":\"")
+  run writeBase64(&mut out.*, bytes)
+  run out.append("\"}")
 }

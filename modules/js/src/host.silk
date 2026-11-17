@@ -1,4 +1,5 @@
 //! The host: one engine, one realm, and the loop steps a window host calls.
+import ui_js_calls.stylesheets { Compiler }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -36,7 +37,7 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
@@ -92,7 +93,10 @@ pub effect fn secondString(event: &Event) -> Value ! OutOfMemoryError ? &mut All
     Event.KeyDown { key, .. } => run jsString(String.view(&key.code))
     Event.KeyUp { key } => run jsString(String.view(&key.code))
     Event.Input { change } => run jsString(change.inputType.name())
-    _ => Value.immediate(ValueBits.Undefined)
+    _ => match motionOf(event) {
+      Option<&Motion>.Some { value: motion } => run jsString(String.view(&motion.pseudoElement))
+      Option<&Motion>.None => Value.immediate(ValueBits.Undefined)
+    }
   }
 }
 
@@ -282,6 +286,9 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
 }
 
 impl<'m> JsHost<'m> {
+  pub fn setStylesheetCompiler(self: &mut Self, compiler: Compiler) -> () { self.engine.services.stylesheetCompiler = compiler }
+  pub fn stylesheetCompiler(self: &Self) -> Compiler { return self.engine.services.stylesheetCompiler }
+
   /// A realm with the standard intrinsics, the `__ui` native functions, and the web globals
   /// of `prelude.js`: timers, animation frames, a console, `queueMicrotask`,
   /// `performance.now` and `reportError`.
@@ -634,6 +641,49 @@ impl<'m> JsHost<'m> {
     }
     let arguments = [ValueBits.number(u32.toF64(call)), value.borrow().view()]
     let called = run Effect.result(callUi(&mut self.engine, realm, b"clipboard", &arguments))
+    realm.release(&mut self.engine, move value)
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
+  }
+
+  /// Takes the desktop calls JavaScript asked for since the last call, oldest first. The
+  /// host answers each with [`JsHost.answerShell`].
+  pub fn takeShell(self: &mut Self) -> List<ShellRequest> {
+    return Intrinsic.replace(self.engine.services.shell, List<ShellRequest>.make())
+  }
+
+  /// Answers desktop call `call` with `value` (`__ui.shellAnswer`).
+  pub effect fn answerShell(self: &mut Self, call: u32, value: f64) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let arguments = [ValueBits.number(u32.toF64(call)), ValueBits.number(value)]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"shellAnswer", &arguments))
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
+  }
+
+  /// Hands a desktop event to JavaScript (`__ui.shellEvent(kind, a, x, y, text)`): kinds 0
+  /// to 3 are a file drag entering, moving over, leaving and dropping on node `a` at `x`,
+  /// `y`, with the paths one per line in `text`; 4 is global shortcut `a`; 5 a click on the
+  /// tray with `MouseEvent.button` `a`; 6 tray menu item `a`; 7 a click on notification `a`.
+  pub effect fn shellEvent(self: &mut Self, kind: u32, a: f64, x: f64, y: f64, text: string) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let value = run jsString(text)
+    let arguments = [
+      ValueBits.number(u32.toF64(kind)),
+      ValueBits.number(a),
+      ValueBits.number(x),
+      ValueBits.number(y),
+      value.borrow().view(),
+    ]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"shellEvent", &arguments))
     realm.release(&mut self.engine, move value)
     match move called {
       Result<(), JsException>.Success { .. } => ()

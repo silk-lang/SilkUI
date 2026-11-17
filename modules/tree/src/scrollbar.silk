@@ -2,6 +2,9 @@
 //! scroll offset after a layout, and the overlay scrollbar thumbs.
 import mutation { Overflow, ScrollbarWidth }
 import style { Computed }
+import node { Node }
+import scrollbar_parts
+import silk.core.option { Option }
 import paint { paddingBox }
 import layout.lib { Fragment }
 import silk.core.ownership { Copy }
@@ -103,15 +106,58 @@ impl Copy for Thumb {}
 
 /// The vertical or horizontal thumb of a box with style `c`, fragment `f` and scroll offset
 /// `offset` on that axis. Only user-scrollable axes with something to scroll have one.
+pub struct Geometry { pub thumb: Thumb, pub track: Rect<f32> }
+impl Copy for Geometry {}
+
+fn emptyGeometry() -> Geometry {
+  let rect = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  return Geometry { thumb: Thumb { visible: false, rect: rect, ratio: 0.0 }, track: rect }
+}
+
+fn defaultThickness(c: &Computed) -> f32 { return if c.layout.scrollbarWidth == ScrollbarWidth.Thin { 3.0 } else { THUMB_THICKNESS } }
+
+/// The native geometry when no pseudo-part dimensions are supplied.
 pub fn thumbOf(c: &Computed, f: &Fragment, offset: f32, vertical: bool) -> Thumb {
-  let none = Thumb { visible: false, rect: Rect<f32>.new(0.0, 0.0, 0.0, 0.0), ratio: 0.0 }
-  if c.layout.scrollbarWidth == ScrollbarWidth.None || !userScrolls(usedOverflow(c, !vertical)) {
-    return none
+  let thickness = defaultThickness(c)
+  return geometry(c, f, offset, vertical, thickness, THUMB_INSET, thickness).thumb
+}
+
+/// Painting and interaction use the same part-aware rectangles and scroll ratio.
+pub fn geometryOf(node: &Node, f: &Fragment, offset: f32, vertical: bool) -> Geometry {
+  let c = node.computed
+  let mut thickness = defaultThickness(&c)
+  let mut inset = THUMB_INSET
+  let mut reserve = thickness
+  if let Option.Some { value } = scrollbar_parts.of(node) {
+    if value.bar.hidden { return emptyGeometry() }
+    if c.layout.scrollbarWidth != ScrollbarWidth.Thin {
+      let own = if vertical { value.width } else { value.height }
+      let other = if vertical { value.height } else { value.width }
+      if let Option.Some { value: size } = own { thickness = size inset = 0.0 }
+      if own.isSome() || other.isSome() {
+        let range = rangeOf(&c, f)
+        let otherSpan = if vertical { range.maxX - range.minX } else { range.maxY - range.minY }
+        reserve = 0.0
+        if userScrolls(usedOverflow(&c, vertical)) && otherSpan >= 0.5 {
+          reserve = match other { Option.Some { value: size } => size _ => defaultThickness(&c) + THUMB_INSET }
+        }
+      }
+    }
   }
-  let thickness: f32 = if c.layout.scrollbarWidth == ScrollbarWidth.Thin {
-    3.0
-  } else {
-    THUMB_THICKNESS
+  return geometry(&c, f, offset, vertical, thickness, inset, reserve)
+}
+
+pub fn thumbOfNode(node: &Node, f: &Fragment, offset: f32, vertical: bool) -> Thumb {
+  if let Option.Some { value } = scrollbar_parts.of(node) {
+    if value.thumb.hidden { return emptyGeometry().thumb }
+  }
+  return geometryOf(node, f, offset, vertical).thumb
+}
+
+fn geometry(c: &Computed, f: &Fragment, offset: f32, vertical: bool, thickness: f32, inset: f32, reserve: f32) -> Geometry {
+  let none = emptyGeometry()
+  if thickness <= 0.0 || c.layout.scrollbarWidth == ScrollbarWidth.None || !userScrolls(usedOverflow(c, !vertical)) {
+    return none
   }
   let range = rangeOf(c, f)
   let min = if vertical {
@@ -133,7 +179,7 @@ pub fn thumbOf(c: &Computed, f: &Fragment, offset: f32, vertical: bool) -> Thumb
   } else {
     port.width()
   }
-  let track = portLength - 2.0 * THUMB_INSET - thickness
+  let track = portLength - 2.0 * inset - reserve
   if track < THUMB_MIN_LENGTH {
     return none
   }
@@ -151,18 +197,23 @@ pub fn thumbOf(c: &Computed, f: &Fragment, offset: f32, vertical: bool) -> Thumb
   }
   let rect = if vertical {
     Rect<f32>.new(
-      port.xMax - THUMB_INSET - thickness,
-      port.yMin + THUMB_INSET + along,
-      port.xMax - THUMB_INSET,
-      port.yMin + THUMB_INSET + along + length,
+      port.xMax - inset - thickness,
+      port.yMin + inset + along,
+      port.xMax - inset,
+      port.yMin + inset + along + length,
     )
   } else {
     Rect<f32>.new(
-      port.xMin + THUMB_INSET + along,
-      port.yMax - THUMB_INSET - thickness,
-      port.xMin + THUMB_INSET + along + length,
-      port.yMax - THUMB_INSET,
+      port.xMin + inset + along,
+      port.yMax - inset - thickness,
+      port.xMin + inset + along + length,
+      port.yMax - inset,
     )
   }
-  return Thumb { visible: true, rect: rect, ratio: ratio }
+  let trackRect = if vertical {
+    Rect<f32>.new(port.xMax - inset - thickness, port.yMin + inset, port.xMax - inset, port.yMin + inset + track)
+  } else {
+    Rect<f32>.new(port.xMin + inset, port.yMax - inset - thickness, port.xMin + inset + track, port.yMax - inset)
+  }
+  return Geometry { thumb: Thumb { visible: true, rect: rect, ratio: ratio }, track: trackRect }
 }

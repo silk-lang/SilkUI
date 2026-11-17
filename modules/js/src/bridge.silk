@@ -5,6 +5,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -28,8 +29,10 @@ import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
+import ui_js_calls.stylesheets as stylesheets
+import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
-import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, unpackMarks, unpackAtoms, same }
+import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
 /// renumbering the others. The ids start above the runtime callbacks' (`REJECTION`). Each
@@ -61,6 +64,8 @@ pub const LISTEN: u32 = 668019 // nativeId(b"listen")
 /// `__ui.style(id, css, state)`: sets the declarations of `css` (`"width: 10px; color: red"`)
 /// in a look of the node. State 0 is the base look, 1 hover, 2 active, 3 focus, 4
 /// focus-visible. Declarations that do not parse are dropped, as in CSS.
+pub const COMPILE_STYLE_SHEET: u32 = 436067
+pub const STYLE_SHEET: u32 = 203804
 pub const STYLE: u32 = 794345 // nativeId(b"style")
 /// `__ui.clearStyle(id, state)`: forgets every declaration of that look.
 pub const CLEAR_STYLE: u32 = 724429 // nativeId(b"clearStyle")
@@ -93,6 +98,10 @@ pub const CLIPBOARD_READ: u32 = 868924 // nativeId(b"clipboardRead")
 /// `__ui.clipboardWrite(call, text)`: asks the host to put `text` on the system clipboard,
 /// answered with `__ui.clipboard(call)`.
 pub const CLIPBOARD_WRITE: u32 = 623693 // nativeId(b"clipboardWrite")
+/// `__ui.shell(call, op, text)`: asks the host for a desktop feature, answered with
+/// `__ui.shellAnswer(call, value)`. The ops and how `text` packs their arguments are
+/// [`ShellRequest`]'s.
+pub const SHELL: u32 = 417640 // nativeId(b"shell")
 /// `__ui.cancelTimer(id)`.
 pub const CANCEL_TIMER: u32 = 88792 // nativeId(b"cancelTimer")
 /// `__ui.requestFrame()`: asks for `__ui.frame(time)` before the next frame.
@@ -166,6 +175,7 @@ pub struct LogEntry {
 /// The engine's services for a UI host: the batch JavaScript appends to, the modules it can
 /// import, and what its timers, frame requests and console calls left for the host.
 pub struct Bridge {
+  pub stylesheetCompiler: Compiler,
   pub batch: Batch,
   pub modules: List<ModuleSource>,
   /// The host clock in milliseconds, as of the host's last `advance`.
@@ -187,6 +197,24 @@ pub struct Bridge {
   pub frames: List<Keyframe>,
   /// Clipboard reads and writes JavaScript asked for (`navigator.clipboard`), oldest first.
   pub clipboard: List<ClipboardRequest>,
+  /// Desktop calls JavaScript asked for (notifications, the tray, global shortcuts).
+  pub shell: List<ShellRequest>,
+}
+
+/// A `__ui.shell` call waiting for the host. `text` holds the op's fields, separated by U+001F:
+/// - 0, notify: title, body; answered with the notification's id, 0 when none was shown.
+/// - 1, set the tray: tooltip, width, height, template (0 or 1), RGBA pixels as hex, then the
+///   menu, one entry per line: `B<title>` opens a submenu, `E` closes it, `S` is a separator
+///   and `A<action>,<enabled>,<checked>,<title>` an item. Answered with 1 when it shows.
+/// - 2, remove the tray.
+/// - 3, register a global shortcut: id, UI Events `code`, modifier bits (shift 1, control 2,
+///   alt 4, meta 8, 16 for Command on macOS and Control elsewhere); answered with 1 when
+///   the system took it.
+/// - 4, unregister a global shortcut: id.
+pub struct ShellRequest {
+  pub call: u32,
+  pub op: u32,
+  pub text: String,
 }
 
 /// A `navigator.clipboard` call waiting for the host: `call` names it in the answer.
@@ -204,7 +232,7 @@ pub struct Rejected {
 impl Bridge {
   pub fn make() -> Bridge {
     return Bridge {
-      batch: Batch.make(),
+      stylesheetCompiler: Compiler.off(),      batch: Batch.make(),
       modules: List<ModuleSource>.make(),
       now: 0.0,
       timers: List<Timer>.make(),
@@ -216,6 +244,7 @@ impl Bridge {
       opened: List<String>.make(),
       frames: List<Keyframe>.make(),
       clipboard: List<ClipboardRequest>.make(),
+      shell: List<ShellRequest>.make(),
     }
   }
 
@@ -290,8 +319,11 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"scrollTo", arity: 3 },
     Native { name: b"select", arity: 3 },
     Native { name: b"setText", arity: 2 },
+    Native { name: b"shell", arity: 3 },
     Native { name: b"source", arity: 2 },
     Native { name: b"style", arity: 3 },
+    Native { name: b"styleSheet", arity: 3 },
+    Native { name: b"compileStyleSheet", arity: 1 },
     Native { name: b"timer", arity: 2 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
@@ -368,10 +400,30 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.setText(first, String.view(&value))
   } else if function == LISTEN {
     run bridge.batch.listen(first, id(argv.get(1).view()))
+  } else if function == COMPILE_STYLE_SHEET {
+    let source = run text(argv.get(0))
+    let compiled = bridge.stylesheetCompiler.call(String.utf8Bytes(String.view(&source)))
+    if let Option<Bytes>.Some { value } = move compiled {
+      let encoded = run stylesheets.encoded(value.asSlice())
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&encoded))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    let mut message = List<u8>.make()
+    run message.appendSlice(b"runtime CSS compilation is disabled or the stylesheet could not be compiled")
+    return Outcome.TypeError { message: move message }
+  } else if function == STYLE_SHEET {
+    let encoded = run text(argv.get(2))
+    if !(run stylesheets.apply(&mut bridge.batch, first, id(argv.get(1).view()), String.view(&encoded))) {
+      let mut message = List<u8>.make()
+      run message.appendSlice(b"invalid compiled stylesheet or stylesheet operation")
+      return Outcome.TypeError { message: move message }
+    }
   } else if function == STYLE {
     let css = run text(argv.get(1))
-    let declarations = run declarationsOf(&css)
-    run bridge.batch.push(Mutation.SetStyle { id: first, state: styleState(id(argv.get(2).view())), declarations: move declarations })
+    run applyStyle(&mut bridge.batch, first, styleState(id(argv.get(2).view())), &css)
   } else if function == CLEAR_STYLE {
     run bridge.batch.push(Mutation.ClearStyle { id: first, state: styleState(id(argv.get(1).view())) })
   } else if function == ATTRIBUTE {
@@ -427,6 +479,9 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == CLIPBOARD_WRITE {
     let value = run text(argv.get(1))
     run bridge.clipboard.append(ClipboardRequest.Write { call: first, text: move value })
+  } else if function == SHELL {
+    let packed = run text(argv.get(2))
+    run bridge.shell.append(ShellRequest { call: first, op: id(argv.get(1).view()), text: move packed })
   } else if function == DEV_RELOAD {
     bridge.reload = true
   } else if function == FONT_FAMILY {

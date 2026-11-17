@@ -115,9 +115,39 @@ through the tree.
 | `layout` | `bounds`: where layout put the node, in window pixels |
 | `transitionrun`, `transitionstart`, `transitionend`, `transitioncancel` | `propertyName`, `elapsedTime` |
 | `animationstart`, `animationiteration`, `animationend`, `animationcancel` | `animationName`, `elapsedTime` |
+| `dragenter`, `dragover`, `dragleave`, `drop` | `clientX`, `clientY`, `dataTransfer` (files dragged in from other apps) |
 
 A listener that throws does not stop the dispatch. `setErrorHandler(handler)` receives the
 exception; without one the host reports it.
+
+### The desktop
+
+Files dragged in from other apps fire `dragenter`, `dragover`, `dragleave` and `drop` on the
+node under them, and bubble, as on the web. `event.dataTransfer.types` is `["Files"]` while
+they are over the window, and `drop` lists them in `dataTransfer.files`, each with its `name`
+and its `path` on disk.
+
+```ts
+zone.addEventListener("drop", (event) => open(event.dataTransfer.files[0].path));
+```
+
+`Notification` is the web's: `new Notification("Built", { body: "In 2 s" })`, with `onclick`.
+Permission is always granted. Two things the web has no API for come from the package:
+
+```ts
+import { setTray, registerShortcut } from "@silkui/core";
+
+setTray({
+  icon: { width: 32, height: 32, data: pixels }, // RGBA, as an ImageData
+  tooltip: "Builds",
+  menu: [{ label: "Build now", click: build }, { type: "separator" }, { label: "Quit", click: quit }],
+});
+registerShortcut("Mod+Shift+B", build); // Mod is Command on macOS, Control elsewhere
+```
+
+`setTray` and `registerShortcut` resolve to whether the system took them. A shortcut works
+whichever app has focus; another app may hold it, and Wayland has none. `removeTray()` and
+`unregisterShortcut(accelerator)` undo them.
 
 ### Attributes and accessibility
 
@@ -178,3 +208,38 @@ The package ships its types. Every node class, event and style property is typed
 - [Templates](https://github.com/silk-lang/examples) and
   [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/).
 - [Source](https://github.com/silk-lang/SilkUI/tree/main/modules/js/packages/core). MIT license.
+
+
+## Stylesheets
+
+CSS imports built with `@silkui/vite` are adopted before the first frame and replaced in
+place during development. For application-managed themes, adopt constructed sheets on the
+node passed to `mount`:
+
+```js
+import { CSSStyleSheet, createBox, mount } from "@silkui/core";
+
+const theme = new CSSStyleSheet();
+theme.replaceSync(".card { padding: 12px; color: rebeccapurple }");
+const app = createBox();
+app.className = "card";
+app.adoptedStyleSheets = [theme];
+mount(app);
+await theme.replace(".card { padding: 18px; color: teal }");
+```
+
+JavaScript development hosts include the text compiler. Release hosts require
+`App.runtimeStylesheets()` in their Silk task pipeline. Without that option they accept
+compiled sheets and reject text compilation. The compiler is linked only when enabled.
+
+`adoptedStyleSheets` is an ordered mutable array. Assignment, `push`, `splice`, reordering,
+and shrinking `length` update the active root. Entries must be constructed `CSSStyleSheet`
+objects; deleting an indexed property or creating holes is invalid. The same sheet can
+appear multiple times, and replacing it updates each adoption. Invalid compiled bytes leave
+the current sheet intact. Replacing the mounted root switches to that node's adopted list.
+
+`CSSStyleSheet.fromCompiled(bytes)` creates a sheet from `Uint8Array`, `ArrayBuffer`, or
+Base64-encoded compiled bytes; `sheet.replaceCompiled(bytes)` updates it. The format is
+versioned and must match the host. Build-time sheets come first, followed by imported CSS
+and the root's constructed sheets. There is no `document`, `<style>`, or `<link>` node;
+`cssRules`, `insertRule`, and `deleteRule` are not part of this API.

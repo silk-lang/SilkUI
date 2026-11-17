@@ -26,7 +26,9 @@ const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
-const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup"]);
+const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop"]);
+// Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
+const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
 // Properties whose numbers are not lengths. Every other number is CSS pixels.
 const UNITLESS = new Set([
@@ -43,6 +45,7 @@ let nextId = 0;
 const CSS_NAMES = new Map();
 
 function cssName(name) {
+  if (name.startsWith("--")) return name;
   let css = CSS_NAMES.get(name);
   if (css === undefined) {
     css = name.replace(/[A-Z]/g, (letter) => "-" + letter.toLowerCase());
@@ -68,20 +71,11 @@ function familyOf(names) {
 }
 
 function cssValue(name, value) {
+  if (name.startsWith("--")) return String(value);
   if (name === "fontFamily") return familyOf(String(value));
   return typeof value === "number" && !UNITLESS.has(name) ? value + "px" : String(value);
 }
 
-// ARIA states with a tree attribute of their own, by the name after `aria-`. The host takes
-// the other ARIA names as they are; one it does not know is ignored, with one warning.
-const ARIA_STATES = { checked: "checked", selected: "selected", expanded: "expanded" };
-const ARIA_RANGE = { valuemin: 0, valuemax: 1, valuenow: 2 };
-// ARIA attributes that name other elements by their ids. The tree takes node numbers, so a
-// relation is sent again whenever an id it names comes, goes or moves to another node.
-const ARIA_RELATIONS = new Set(["labelledby", "describedby", "controls", "activedescendant"]);
-// Nodes by their `id`, and the nodes whose relations name each id.
-const byId = new Map();
-const naming = new Map();
 const warned = new Set();
 
 function warnOnce(message) {
@@ -135,15 +129,15 @@ class Look {
     if (removed) {
       // The tree sets declarations over earlier ones, so taking one out means starting the
       // look again.
-      native.clearStyle(this.#node.id, this.#state);
+      native.clearStyle(this.#node.nodeId, this.#state);
       css = this.cssText;
     }
-    if (css) native.style(this.#node.id, css, this.#state);
+    if (css) native.style(this.#node.nodeId, css, this.#state);
   }
 
   /** Replaces the whole look. */
   replace(properties) {
-    native.clearStyle(this.#node.id, this.#state);
+    native.clearStyle(this.#node.nodeId, this.#state);
     this.#values = Object.create(null);
     this.set(properties);
   }
@@ -159,6 +153,220 @@ class Look {
   }
 }
 
+const CLASS_SPACE = /[\t\n\f\r ]/;
+function classToken(value) {
+  const token = String(value);
+  if (!token || CLASS_SPACE.test(token)) {
+    const error = new Error(!token ? "A class token cannot be empty" : "A class token cannot contain whitespace");
+    error.name = !token ? "SyntaxError" : "InvalidCharacterError";
+    throw error;
+  }
+  return token;
+}
+
+/** A live token list backed by the node's class attribute. */
+export class ClassList {
+  #node;
+  constructor(node) { this.#node = node; }
+  #tokens() { return [...new Set(this.value.split(/[\t\n\f\r ]+/).filter(Boolean))]; }
+  #write(tokens) { this.#node.className = tokens.join(" "); }
+  get value() { return this.#node.className; }
+  set value(value) { this.#node.className = value; }
+  get length() { return this.#tokens().length; }
+  item(index) { return this.#tokens()[Number(index) >>> 0] ?? null; }
+  contains(token) { return this.#tokens().includes(classToken(token)); }
+  add(...values) {
+    const tokens = values.map(classToken);
+    this.#write([...new Set([...this.#tokens(), ...tokens])]);
+  }
+  remove(...values) {
+    const tokens = values.map(classToken);
+    this.#write(this.#tokens().filter((token) => !tokens.includes(token)));
+  }
+  toggle(value, force) {
+    const token = classToken(value);
+    const present = this.contains(token);
+    const wanted = force === undefined ? !present : !!force;
+    if (wanted && !present) this.add(token);
+    else if (!wanted && present) this.remove(token);
+    return wanted;
+  }
+  replace(oldValue, newValue) {
+    const oldToken = classToken(oldValue), newToken = classToken(newValue);
+    const tokens = this.#tokens(), index = tokens.indexOf(oldToken);
+    if (index === -1) return false;
+    if (oldToken !== newToken) {
+      if (tokens.includes(newToken)) tokens.splice(index, 1);
+      else tokens[index] = newToken;
+    }
+    this.#write(tokens);
+    return true;
+  }
+  values() { return this.#tokens().values(); }
+  keys() { return this.#tokens().keys(); }
+  entries() { return this.#tokens().entries(); }
+  forEach(callback, thisArg) { this.#tokens().forEach((value, index) => callback.call(thisArg, value, index, this)); }
+  [Symbol.iterator]() { return this.values(); }
+  toString() { return this.value; }
+}
+
+const sheetData = new WeakMap();
+const adoptedLists = new WeakMap();
+const importedSheets = new Map();
+let installedSheets = [];
+let nextSheet = 1;
+
+function sheetError(message) {
+  const error = new Error(message);
+  error.name = "NotAllowedError";
+  return error;
+}
+
+function base64Bytes(value) {
+  if (typeof value === "string") return value;
+  const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : value;
+  if (!(bytes instanceof Uint8Array)) throw new TypeError("Expected compiled stylesheet bytes");
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let encoded = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const bits = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+    encoded += alphabet[bits >>> 18] + alphabet[(bits >>> 12) & 63]
+      + (i + 1 < bytes.length ? alphabet[(bits >>> 6) & 63] : "=")
+      + (i + 2 < bytes.length ? alphabet[bits & 63] : "=");
+  }
+  return encoded;
+}
+
+function replaceSheet(sheet, bytes) {
+  native.styleSheet(0, 0, bytes);
+  const state = sheetData.get(sheet);
+  state.bytes = bytes;
+  for (const entry of installedSheets) {
+    if (entry.sheet !== sheet) continue;
+    native.styleSheet(entry.live ? 2 : 1, entry.id, bytes);
+    entry.live = true;
+  }
+}
+
+/** A constructed stylesheet, adopted on an application's root. */
+export class CSSStyleSheet {
+  constructor() { sheetData.set(this, { bytes: null, replacing: false }); }
+
+  static fromCompiled(bytes) {
+    const sheet = new CSSStyleSheet();
+    replaceSheet(sheet, base64Bytes(bytes));
+    return sheet;
+  }
+
+  replaceCompiled(bytes) {
+    if (sheetData.get(this).replacing) throw sheetError("A stylesheet replacement is already pending");
+    replaceSheet(this, base64Bytes(bytes));
+  }
+
+  replaceSync(text) {
+    if (sheetData.get(this).replacing) throw sheetError("A stylesheet replacement is already pending");
+    if (!native.compileStyleSheet) throw sheetError("Runtime CSS compilation is disabled in this host");
+    replaceSheet(this, native.compileStyleSheet(String(text)));
+  }
+
+  replace(text) {
+    const state = sheetData.get(this);
+    if (state.replacing) return Promise.reject(sheetError("A stylesheet replacement is already pending"));
+    const source = String(text);
+    state.replacing = true;
+    return Promise.resolve().then(() => {
+      if (!native.compileStyleSheet) throw sheetError("Runtime CSS compilation is disabled in this host");
+      replaceSheet(this, native.compileStyleSheet(source));
+      return this;
+    }).finally(() => { state.replacing = false; });
+  }
+}
+
+function clearAdoptedSheets() {
+  for (const entry of installedSheets) if (entry.live) native.styleSheet(3, entry.id, "");
+  installedSheets = [];
+}
+
+function syncAdoptedSheets() {
+  if (!rootNode) return;
+  clearAdoptedSheets();
+  const sheets = [...importedSheets.values(), ...(adoptedLists.get(rootNode)?.values ?? [])];
+  for (const sheet of sheets) {
+    if (nextSheet >= 0x80000000) throw new RangeError("Too many stylesheet adoptions");
+    const entry = { sheet, id: nextSheet++, live: false };
+    installedSheets.push(entry);
+    const bytes = sheetData.get(sheet).bytes;
+    if (bytes !== null) { native.styleSheet(1, entry.id, bytes); entry.live = true; }
+  }
+}
+
+function validateSheets(values) {
+  for (const sheet of values) if (!sheetData.has(sheet)) throw new TypeError("adoptedStyleSheets accepts constructed CSSStyleSheet objects");
+  return values;
+}
+
+const sheetMutators = new Set(["copyWithin", "fill", "pop", "push", "reverse", "shift", "sort", "splice", "unshift"]);
+function adoptedList(node) {
+  let list = adoptedLists.get(node);
+  if (list) return list;
+  const values = [];
+  const assign = next => {
+    validateSheets(next);
+    values.splice(0, values.length, ...next);
+    if (rootNode === node) syncAdoptedSheets();
+  };
+  const numeric = key => typeof key === "string" && /^(0|[1-9][0-9]*)$/.test(key);
+  const proxy = new Proxy(values, {
+    get(target, key, receiver) {
+      if (!sheetMutators.has(key)) return Reflect.get(target, key, receiver);
+      return (...args) => {
+        const next = values.slice();
+        const result = Array.prototype[key].apply(next, args);
+        assign(next);
+        return result === next ? proxy : result;
+      };
+    },
+    set(target, key, value) {
+      if (key !== "length" && !numeric(key)) return Reflect.set(target, key, value);
+      const next = values.slice();
+      Reflect.set(next, key, value);
+      assign(next);
+      return true;
+    },
+    defineProperty(target, key, descriptor) {
+      if (key !== "length" && !numeric(key)) return Reflect.defineProperty(target, key, descriptor);
+      if (!Object.hasOwn(descriptor, "value") || descriptor.get || descriptor.set || descriptor.configurable === false || descriptor.writable === false) {
+        throw new TypeError("adoptedStyleSheets entries must remain mutable values");
+      }
+      const next = values.slice();
+      Reflect.set(next, key, descriptor.value);
+      assign(next);
+      return true;
+    },
+    deleteProperty(target, key) {
+      if (!numeric(key)) return Reflect.deleteProperty(target, key);
+      return Number(key) >= values.length;
+    },
+  });
+  list = { values, proxy, assign };
+  adoptedLists.set(node, list);
+  return list;
+}
+
+/** Installs or replaces a CSS import compiled by the development build tool. */
+export function updateStyleSheet(id, compiled) {
+  const key = String(id);
+  const previous = importedSheets.get(key);
+  if (compiled === null) {
+    if (importedSheets.delete(key)) syncAdoptedSheets();
+  } else if (previous) {
+    previous.replaceCompiled(compiled);
+  } else {
+    importedSheets.set(key, CSSStyleSheet.fromCompiled(compiled));
+    syncAdoptedSheets();
+  }
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   #listeners = null;
@@ -166,18 +374,21 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
-  // aria-valuemin, aria-valuemax and aria-valuenow, which the tree takes as one range.
-  #range = null;
+  #attributes = null;
+  #classList = null;
 
   constructor(kind) {
-    this.id = ++nextId;
+    Object.defineProperty(this, "nodeId", { value: ++nextId, enumerable: true });
     this.kind = kind;
     this.parentNode = null;
     // A text leaf has no children: they all share one empty list.
     this.childNodes = kind === "text" ? NO_CHILDREN : [];
-    nodes.set(this.id, this);
-    native.create(this.id, KINDS[kind]);
+    nodes.set(this.nodeId, this);
+    native.create(this.nodeId, KINDS[kind]);
   }
+
+  get adoptedStyleSheets() { return adoptedList(this).proxy; }
+  set adoptedStyleSheets(value) { adoptedList(this).assign(Array.from(value)); }
 
   get firstChild() {
     return this.childNodes[0] ?? null;
@@ -213,10 +424,10 @@ export class Node {
     child.parentNode = this;
     if (before) {
       this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
-      native.insertBefore(this.id, child.id, before.id);
+      native.insertBefore(this.nodeId, child.nodeId, before.nodeId);
     } else {
       this.childNodes.push(child);
-      native.append(this.id, child.id);
+      native.append(this.nodeId, child.nodeId);
     }
     return child;
   }
@@ -235,7 +446,7 @@ export class Node {
     if (child.parentNode !== this) throw new Error("the node to remove is not a child of this node");
     this.childNodes.splice(this.childNodes.indexOf(child), 1);
     child.parentNode = null;
-    native.remove(child.id);
+    native.remove(child.nodeId);
     return child;
   }
 
@@ -245,12 +456,13 @@ export class Node {
 
   /** Detaches and frees this node and its subtree. They cannot be used again. */
   destroy() {
+    if (rootNode && this.contains(rootNode)) { clearAdoptedSheets(); rootNode = null; }
     const parent = this.parentNode;
     if (parent) {
       parent.childNodes.splice(parent.childNodes.indexOf(this), 1);
       this.parentNode = null;
     }
-    native.destroy(this.id);
+    native.destroy(this.nodeId);
     forget(this);
   }
 
@@ -281,88 +493,54 @@ export class Node {
    * the address with `open`, as a click on an `<a>` follows it.
    *
    * `role` and `aria-*` work as in the DOM, spelled `aria-checked` or `ariaChecked`. A role
-   * or ARIA name the tree does not know is ignored with a warning.
+   * the tree does not know is ignored with a warning. Literal ARIA and data attributes
+   * remain available to selectors even when they have no native accessibility mapping.
    */
-  setAttribute(name, value) {
-    if (name === "role") {
-      const words = value == null ? "" : String(value);
-      if (!native.attribute(this.id, "role", words)) warnOnce("the tree has no role '" + words + "': it is ignored");
-      return;
-    }
-    if (name === "id") {
-      this.#identify(value == null ? "" : String(value));
-      return;
-    }
+  get id() { return this._elementId ?? ""; }
+  set id(value) { this.setAttribute("id", String(value)); }
+  get className() { return this.getAttribute("class") ?? ""; }
+  set className(value) { this.setAttribute("class", String(value)); }
+  get classList() { return this.#classList ??= new ClassList(this); }
+
+  getAttribute(name) {
+    name = String(name);
     const aria = ariaName(name);
-    if (aria !== null) {
-      this.#aria(aria, value);
-      return;
-    }
-    if (name === "href") {
-      this._href = value ? String(value) : null;
-      this.#want(KIND_OF.get("click"));
-    }
-    native.attribute(this.id, name, value);
+    name = aria === null ? name === "className" ? "class" : name : "aria-" + aria;
+    return this.#attributes?.get(name) ?? null;
   }
 
-  #aria(name, value) {
-    if (name === "label") {
-      native.attribute(this.id, "label", value == null ? "" : String(value));
-    } else if (name in ARIA_STATES) {
-      // ARIA states are the words "true" and "false"; anything else is false.
-      if (name === "checked") native.attribute(this.id, "indeterminate", value === "mixed");
-      native.attribute(this.id, ARIA_STATES[name], value === true || value === "true");
-    } else if (ARIA_RELATIONS.has(name)) {
-      this.#relate(name, value == null ? [] : String(value).split(/\s+/).filter(Boolean));
-    } else if (name in ARIA_RANGE) {
-      const range = (this.#range ??= [undefined, undefined, undefined]);
-      range[ARIA_RANGE[name]] = value == null || value === "" ? undefined : Number(value);
-      const [min = 0, max = 100, now] = range;
-      if (now === undefined || Number.isNaN(now)) native.attribute(this.id, "valueRange");
-      else native.attribute(this.id, "valueRange", min, max, now);
-    } else if (!native.attribute(this.id, "aria-" + name, value == null ? "" : String(value))) {
-      warnOnce("the tree has no 'aria-" + name + "' yet: it is ignored");
+  hasAttribute(name) { return this.getAttribute(name) !== null; }
+  removeAttribute(name) { this.setAttribute(name, null); }
+
+  setAttribute(name, value) {
+    name = String(name);
+    const aria = ariaName(name);
+    name = aria === null ? name === "className" ? "class" : name : "aria-" + aria;
+    const text = value == null ? null : String(value);
+    if (name === "role") {
+      if (!native.attribute(this.nodeId, "role", text ?? "")) warnOnce("the tree has no role '" + text + "': it is ignored");
+    } else if (name === "id") {
+      this.#identify(text);
+    } else if (aria !== null) {
+      native.attribute(this.nodeId, name, text);
+    } else {
+      if (name === "href") {
+        this._href = text || null;
+        this.#want(KIND_OF.get("click"));
+      }
+      native.attribute(this.nodeId, name,
+        name === "class" || name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
     }
+    if (text === null) this.#attributes?.delete(name);
+    else (this.#attributes ??= new Map()).set(name, text);
   }
 
   // The `id` other nodes' relations name this node by.
   #identify(id) {
     const old = this._elementId ?? "";
-    if (old === id) return;
-    if (old && byId.get(old) === this) {
-      byId.delete(old);
-      resolveNaming(old);
-    }
+    if (old === (id ?? "") && this.getAttribute("id") === id) return;
     this._elementId = id || undefined;
-    native.attribute(this.id, "id", id);
-    if (id) {
-      byId.set(id, this);
-      resolveNaming(id);
-    }
-  }
-
-  // Sets relation `name` (`labelledby`) to the nodes with ids `refs`, as they are now and
-  // as they change.
-  #relate(name, refs) {
-    const relations = (this._relations ??= new Map());
-    for (const ref of relations.get(name) ?? []) naming.get(ref)?.delete(this);
-    if (refs.length) relations.set(name, refs);
-    else relations.delete(name);
-    for (const ref of refs) {
-      let sources = naming.get(ref);
-      if (!sources) naming.set(ref, (sources = new Set()));
-      sources.add(this);
-    }
-    this._sendRelation(name);
-  }
-
-  _sendRelation(name) {
-    const numbers = [];
-    for (const ref of this._relations?.get(name) ?? []) {
-      const target = byId.get(ref);
-      if (target) numbers.push(target.id);
-    }
-    native.attribute(this.id, "aria-" + name, numbers.join(" "));
+    native.attribute(this.nodeId, "id", id);
   }
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
@@ -370,23 +548,23 @@ export class Node {
     const list = this.#listeners?.get(TYPES[kind]);
     const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
     const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
-    if (flags !== this.#flags) native.listen(this.id, (this.#flags = flags));
+    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
   }
 
   set tabIndex(value) {
-    native.attribute(this.id, "tabIndex", value);
+    native.attribute(this.nodeId, "tabIndex", value);
   }
 
   set disabled(value) {
-    native.attribute(this.id, "disabled", value);
+    native.attribute(this.nodeId, "disabled", value);
   }
 
   focus() {
-    native.focus(this.id);
+    native.focus(this.nodeId);
   }
 
   scrollTo(x, y) {
-    native.scrollTo(this.id, x, y);
+    native.scrollTo(this.nodeId, x, y);
   }
 
   /**
@@ -395,14 +573,14 @@ export class Node {
    */
   addEventListener(type, listener, options) {
     const kind = KIND_OF.get(type);
-    if (kind === undefined) throw new TypeError("the tree has no event '" + type + "'");
+    if (kind === undefined && !DRAG_TYPES.has(type)) throw new TypeError("the tree has no event '" + type + "'");
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
     if (!list) this.#listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
-    this.#want(kind);
+    if (kind !== undefined) this.#want(kind);
   }
 
   removeEventListener(type, listener, options) {
@@ -412,7 +590,8 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    this.#want(KIND_OF.get(type));
+    const kind = KIND_OF.get(type);
+    if (kind !== undefined) this.#want(kind);
   }
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
@@ -450,7 +629,7 @@ export class Text extends Node {
     value = String(value);
     if (value === this.#data && value !== "") return;
     this.#data = value;
-    native.setText(this.id, value);
+    native.setText(this.nodeId, value);
   }
 
   get textContent() {
@@ -478,12 +657,12 @@ export class Input extends Node {
 
   set value(value) {
     this.#value = String(value);
-    native.setText(this.id, this.#value);
+    native.setText(this.nodeId, this.#value);
   }
 
   /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
   setSelectionRange(anchor, focus) {
-    native.select(this.id, anchor, focus);
+    native.select(this.nodeId, anchor, focus);
   }
 
   _changed(value, anchor, focus) {
@@ -545,7 +724,7 @@ export class Icon extends Node {
     if (markup === this.#svg) return;
     if (this.#svg) dropIcon(this.#svg);
     this.#svg = markup;
-    native.source(this.id, markup ? holdIcon(markup) : 0);
+    native.source(this.nodeId, markup ? holdIcon(markup) : 0);
   }
 
   _forget() {
@@ -653,12 +832,12 @@ export class RichInput extends Input {
 
   /** What text with mark `name` looks like: properties as `style.set` takes them. */
   defineMark(name, style) {
-    native.mark(this.id, this.#bit(name), cssTextOf(style));
+    native.mark(this.nodeId, this.#bit(name), cssTextOf(style));
   }
 
   /** What atoms of `kind` look like: the inline block holding the label. */
   defineAtom(kind, style) {
-    native.atomStyle(this.id, this.#kind(kind), cssTextOf(style));
+    native.atomStyle(this.nodeId, this.#kind(kind), cssTextOf(style));
   }
 
   get document() {
@@ -679,7 +858,7 @@ export class RichInput extends Input {
     }
     let packedAtoms = "";
     for (const atom of atoms) packedAtoms += this.#packAtom(atom);
-    native.richText(this.id, text, packedMarks, packedAtoms);
+    native.richText(this.nodeId, text, packedMarks, packedAtoms);
     super._changed(text, text.length, text.length);
   }
 
@@ -689,7 +868,7 @@ export class RichInput extends Input {
 
   /** Turns mark `name` on or off over the selection, or for the text typed next. */
   format(name, on = true) {
-    native.format(this.id, this.#bit(name), !!on);
+    native.format(this.nodeId, this.#bit(name), !!on);
   }
 
   /** Turns mark `name` off where the caret's text has it, on where it does not. */
@@ -700,12 +879,12 @@ export class RichInput extends Input {
   /** Replaces the text from `start` to `end` with `atom` (`{ kind, label, data }`). */
   insertAtom(start, end, atom) {
     const text = this.#document.text;
-    native.insertAtom(this.id, byteOf(text, start), byteOf(text, end), this.#packAtom(atom));
+    native.insertAtom(this.nodeId, byteOf(text, start), byteOf(text, end), this.#packAtom(atom));
   }
 
   setSelectionRange(anchor, focus) {
     const text = this.#document.text;
-    native.select(this.id, byteOf(text, anchor), byteOf(text, focus));
+    native.select(this.nodeId, byteOf(text, anchor), byteOf(text, focus));
   }
 
   _changed(value, anchor, focus, marks, atoms, active) {
@@ -740,22 +919,8 @@ export function createRichInput(style) {
   return input;
 }
 
-// Sends again the relations that name `ref`, after the node with that id changed.
-function resolveNaming(ref) {
-  for (const source of naming.get(ref) ?? []) {
-    for (const [name, refs] of source._relations) if (refs.includes(ref)) source._sendRelation(name);
-  }
-}
-
 function forget(node) {
-  nodes.delete(node.id);
-  if (node._relations) {
-    for (const refs of node._relations.values()) for (const ref of refs) naming.get(ref)?.delete(node);
-  }
-  if (node._elementId && byId.get(node._elementId) === node) {
-    byId.delete(node._elementId);
-    resolveNaming(node._elementId);
-  }
+  nodes.delete(node.nodeId);
   node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
@@ -826,8 +991,10 @@ export function defineKeyframes(name, frames) {
 }
 
 export function mount(node) {
+  if (rootNode) clearAdoptedSheets();
   rootNode = node;
-  native.root(node.id);
+  native.root(node.nodeId);
+  syncAdoptedSheets();
   return node;
 }
 
@@ -989,7 +1156,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind >= 19 && kind <= 22) {
     event.propertyName = first;
     event.elapsedTime = a;
-    event.pseudoElement = "";
+    event.pseudoElement = second ?? "";
   } else if (kind === 27) {
     event.target._selected?.(a, b, d);
     event.selectionStart = event.target.selectionStart;
@@ -997,7 +1164,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind >= 23) {
     event.animationName = first;
     event.elapsedTime = a;
-    event.pseudoElement = "";
+    event.pseudoElement = second ?? "";
   }
 }
 
@@ -1059,7 +1226,8 @@ function follow(target) {
 // The host calls this before it replaces the realm, on a reload: every node goes, so the
 // next realm starts on an empty tree.
 native.unload = function () {
-  for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.id)) node.destroy();
+  importedSheets.clear();
+  for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
   rootNode = null;
 };
 
@@ -1070,3 +1238,273 @@ native.takeError = function () {
   pendingError = null;
   throw error;
 };
+
+// The desktop around the window: files dragged in from other apps, notifications, the tray
+// and global shortcuts. The host serves `__ui.shell` calls after the code that made them has
+// run and answers through `__ui.shellAnswer`; desktop events arrive through `__ui.shellEvent`.
+
+const shellCalls = new Map();
+let nextShellCall = 0;
+
+function shellCall(op, fields) {
+  const call = ++nextShellCall;
+  return new Promise((resolve) => {
+    shellCalls.set(call, resolve);
+    native.shell(call, op, fields.join("\x1f"));
+  });
+}
+
+native.shellAnswer = function (call, value) {
+  const resolve = shellCalls.get(call);
+  if (!resolve) return;
+  shellCalls.delete(call);
+  resolve(value);
+};
+
+/** A file dragged in from the desktop, as the web's `File`, with its `path` on disk. */
+export class DroppedFile {
+  constructor(path) {
+    this.path = path;
+    this.name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+    this.type = "";
+  }
+}
+
+/**
+ * What a file drag carries, as the web's `DataTransfer`: `types` is `["Files"]` while files
+ * are over the window, and `files` lists them in `drop`, as on the web.
+ */
+export class DataTransfer {
+  constructor(paths) {
+    this.files = paths.map((path) => new DroppedFile(path));
+    this.items = this.files.map((file) => ({ kind: "file", type: "", getAsFile: () => file }));
+    this.types = ["Files"];
+    this.dropEffect = "copy";
+    this.effectAllowed = "copy";
+  }
+
+  getData() {
+    return "";
+  }
+}
+
+let dragTarget = null;
+
+function dragEvent(type, target, x, y, paths) {
+  const event = new Event(type, target);
+  event.clientX = event.x = x;
+  event.clientY = event.y = y;
+  event.dataTransfer = new DataTransfer(paths);
+  dispatchEvent(event);
+}
+
+// As the web: `dragenter` on the node now under the files, `dragleave` on the one before,
+// then `dragover` on the current one.
+function dragTo(target, x, y) {
+  if (target !== dragTarget) {
+    const before = dragTarget;
+    dragTarget = target;
+    if (target) dragEvent("dragenter", target, x, y, []);
+    if (before) dragEvent("dragleave", before, x, y, []);
+  }
+  if (target) dragEvent("dragover", target, x, y, []);
+}
+
+let trayMenu = new Map();
+let trayClick = null;
+const shortcuts = new Map();
+const shortcutIds = new Map();
+let nextShortcut = 0;
+const notifications = new Map();
+
+native.shellEvent = function (kind, a, x, y, text) {
+  if (kind <= 3) {
+    const target = nodes.get(a) ?? rootNode;
+    if (kind === 2) {
+      const before = dragTarget;
+      dragTarget = null;
+      if (before) dragEvent("dragleave", before, x, y, []);
+    } else if (kind === 3) {
+      if (target !== dragTarget) dragTo(target, x, y);
+      dragTarget = null;
+      if (target) dragEvent("drop", target, x, y, text ? text.split("\n") : []);
+    } else {
+      dragTo(target, x, y);
+    }
+  } else if (kind === 4) {
+    shortcuts.get(a)?.();
+  } else if (kind === 5) {
+    trayClick?.({ button: a });
+  } else if (kind === 6) {
+    trayMenu.get(a)?.();
+  } else if (kind === 7) {
+    const notification = notifications.get(a);
+    if (!notification) return;
+    notifications.delete(a);
+    notification._fire("click");
+  }
+};
+
+// Notifications nobody clicked are forgotten after this many newer ones.
+const NOTIFICATIONS_KEPT = 64;
+
+/**
+ * A desktop notification, as the web's: `new Notification(title, { body })`, with `onclick`
+ * or a `click` listener. Permission is always granted.
+ */
+export class Notification {
+  static permission = "granted";
+
+  static requestPermission(callback) {
+    callback?.("granted");
+    return Promise.resolve("granted");
+  }
+
+  #listeners = new Map();
+
+  constructor(title, options = {}) {
+    this.title = String(title);
+    this.body = String(options.body ?? "");
+    this.tag = String(options.tag ?? "");
+    this.data = options.data ?? null;
+    this.onclick = this.onshow = this.onerror = this.onclose = null;
+    shellCall(0, [this.title, this.body]).then((id) => {
+      if (!id) return this._fire("error");
+      notifications.set(id, this);
+      if (notifications.size > NOTIFICATIONS_KEPT) notifications.delete(notifications.keys().next().value);
+      this._fire("show");
+    });
+  }
+
+  /** The system keeps the notification until the user dismisses it. */
+  close() {}
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (!list.includes(listener)) list.push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(type);
+    const index = list ? list.indexOf(listener) : -1;
+    if (index >= 0) list.splice(index, 1);
+  }
+
+  _fire(type) {
+    const event = { type, target: this, currentTarget: this };
+    const handler = this["on" + type];
+    try {
+      if (typeof handler === "function") handler.call(this, event);
+      for (const listener of (this.#listeners.get(type) ?? []).slice()) listener.call(this, event);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+}
+
+globalThis.Notification ??= Notification;
+
+function hex(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i++) text += (bytes[i] < 16 ? "0" : "") + bytes[i].toString(16);
+  return text;
+}
+
+function packMenu(items, lines) {
+  for (const item of items) {
+    if (item.type === "separator") lines.push("S");
+    else if (item.submenu) {
+      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
+      packMenu(item.submenu, lines);
+      lines.push("E");
+    } else {
+      const action = trayMenu.size + 1;
+      trayMenu.set(action, typeof item.click === "function" ? item.click : () => {});
+      const label = String(item.label ?? "").replace(/\n/g, " ");
+      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + label);
+    }
+  }
+}
+
+/**
+ * Shows an icon in the system tray (the macOS menu bar, the Windows notification area, a
+ * StatusNotifierItem on Linux). `icon` is RGBA pixels, as an `ImageData`: `{ width, height,
+ * data }`; macOS draws a `template` icon from its alpha in the menu bar's colours. `menu`
+ * items are `{ label, click, enabled, checked }`, `{ type: "separator" }` or `{ label,
+ * submenu }`. With no menu, `onClick({ button })` runs when the icon is clicked. Calling it
+ * again replaces the tray. Resolves to whether the system shows it.
+ */
+export function setTray({ icon, tooltip = "", template = false, menu = [], onClick = null }) {
+  if (!icon || !(icon.width > 0) || !(icon.height > 0) || icon.data?.length !== icon.width * icon.height * 4) {
+    throw new TypeError("setTray needs an icon of RGBA pixels: { width, height, data }");
+  }
+  trayMenu = new Map();
+  trayClick = typeof onClick === "function" ? onClick : null;
+  const lines = [];
+  packMenu(menu, lines);
+  const fields = [String(tooltip), icon.width, icon.height, template ? 1 : 0, hex(icon.data), lines.join("\n")];
+  return shellCall(1, fields).then((shown) => shown === 1);
+}
+
+/** Takes the tray icon away. */
+export function removeTray() {
+  trayMenu = new Map();
+  trayClick = null;
+  shellCall(2, []);
+}
+
+const MODIFIERS = { shift: 1, ctrl: 2, control: 2, alt: 4, option: 4, meta: 8, cmd: 8, command: 8, super: 8, mod: 16, cmdorctrl: 16, commandorcontrol: 16 };
+const KEY_NAMES = {
+  up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", esc: "Escape", return: "Enter",
+  space: " ", plus: "Equal", "=": "Equal", "-": "Minus", ",": "Comma", ".": "Period", "/": "Slash",
+  ";": "Semicolon", "'": "Quote", "[": "BracketLeft", "]": "BracketRight", "\\": "Backslash", "`": "Backquote",
+};
+
+// "Mod+Shift+K" as the UI Events `code` of the key and the modifier bits; `Mod` (also
+// `CmdOrCtrl`) is Command on macOS and Control elsewhere.
+function parseShortcut(accelerator) {
+  const parts = String(accelerator).split("+").map((part) => part.trim()).filter(Boolean);
+  let bits = 0;
+  let code = "";
+  for (const part of parts) {
+    const modifier = MODIFIERS[part.toLowerCase()];
+    if (modifier !== undefined) {
+      bits |= modifier;
+      continue;
+    }
+    const named = KEY_NAMES[part.toLowerCase()] ?? part;
+    if (named === " ") code = "Space";
+    else if (/^[a-z]$/i.test(named)) code = "Key" + named.toUpperCase();
+    else if (/^[0-9]$/.test(named)) code = "Digit" + named;
+    else code = named[0].toUpperCase() + named.slice(1);
+  }
+  if (!code) throw new TypeError("'" + accelerator + "' names no key");
+  return { code, bits };
+}
+
+/**
+ * Runs `callback` when the keys of `accelerator` are pressed, whichever app has focus:
+ * `"Mod+Shift+K"`, where `Mod` is Command on macOS and Control elsewhere, and the key is a
+ * letter, a digit, a UI Events `code` (`"F5"`, `"ArrowUp"`, `"Slash"`) or a name such as
+ * `Space` or `Esc`. Registering it again replaces the callback. Resolves to whether the
+ * system took it: another app may hold it, and Wayland has no global shortcuts.
+ */
+export function registerShortcut(accelerator, callback) {
+  const { code, bits } = parseShortcut(accelerator);
+  const key = code + "+" + bits;
+  let id = shortcutIds.get(key);
+  if (id === undefined) shortcutIds.set(key, (id = ++nextShortcut));
+  shortcuts.set(id, callback);
+  return shellCall(3, [id, code, bits]).then((held) => held === 1);
+}
+
+/** Stops the shortcut of `accelerator`. */
+export function unregisterShortcut(accelerator) {
+  const { code, bits } = parseShortcut(accelerator);
+  const id = shortcutIds.get(code + "+" + bits);
+  if (id === undefined) return;
+  shortcutIds.delete(code + "+" + bits);
+  shortcuts.delete(id);
+  shellCall(4, [id]);
+}

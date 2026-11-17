@@ -19,6 +19,9 @@ import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
 import lib { toInput, windowCursor, HostState, serve, coalesce }
 import adapter { fastScrollOf, reportWindow, reportWindowOf }
+import browser { stylePreferences }
+import ui_tree.style_media { Preferences }
+import window.types { Appearance }
 import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
 import render_thread { FastScroll, FastScrolled, RenderSettings }
@@ -47,7 +50,19 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   /// A window's GPU started before [`runWindow`], with [`startGpu`]. In the browser it holds
   /// only the settings, since there the device is made with the canvas.
   pub struct StartedGpu {
-    early: EarlyRenderer,
+    early: Option<EarlyRenderer>,
+  }
+
+  impl StartedGpu {
+    effect fn started(check: bool) -> StartedGpu
+      ! GpuError | OutOfMemoryError
+      ? &mut Allocator {
+      return StartedGpu { early: Option<EarlyRenderer>.some(run prepareGpu(check)) }
+    }
+
+    fn none() -> StartedGpu {
+      return StartedGpu { early: Option<EarlyRenderer>.None }
+    }
   }
 
   effect fn prepareGpu(check: bool) -> EarlyRenderer
@@ -74,7 +89,19 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   /// A window's GPU started before [`runWindow`], with [`startGpu`]: its render thread, making
   /// the device and pipelines.
   pub struct StartedGpu {
-    early: RenderThread,
+    early: Option<RenderThread>,
+  }
+
+  impl StartedGpu {
+    effect fn started(check: bool) -> StartedGpu
+      ! GpuError | OutOfMemoryError
+      ? &mut Allocator {
+      return StartedGpu { early: Option<RenderThread>.some(run prepareGpu(check)) }
+    }
+
+    fn none() -> StartedGpu {
+      return StartedGpu { early: Option<RenderThread>.None }
+    }
   }
 
   effect fn prepareGpu(check: bool) -> RenderThread
@@ -96,7 +123,22 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
 pub effect fn startGpu(check: bool) -> StartedGpu
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
-  return StartedGpu { early: run prepareGpu(check) }
+  // A headless run draws on the CPU: no GPU starts.
+  if !check && run headlessRequested() {
+    return StartedGpu.none()
+  }
+  return run StartedGpu.started(check)
+}
+
+/// Whether this process was asked for a headless run (see `headless.silk`).
+pub effect fn headlessRequested() -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return false
+  } else {
+    return (run headless.requested()).isSome()
+  }
 }
 
 
@@ -109,7 +151,7 @@ import font_collection.lib { FontCollection }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
 import ui_scene.color as color
-import window.event { Event }
+import window.event { Event, MouseButton }
 import window.native { NativePlatform }
 // Interface methods resolve through this import; silk#2819 reports it as unused.
 import window.platform { Platform as _Platform }
@@ -125,6 +167,7 @@ import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
 import silk.text.string { String, InvalidUtf8 }
+import silk.geometry.point { Point2 }
 import silk.collections.bytes { Bytes }
 import silk.num.f32
 import silk.num.f64
@@ -898,6 +941,21 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 ) -> i32
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    if !options.check {
+      if let Option<String>.Some { value: script } = move run headless.requested() {
+        return run runHeadless<H, S, E, R>(
+          &mut state,
+          collection,
+          move resources,
+          move options,
+          move inspector,
+          &mut content,
+          String.view(&script),
+        )
+      }
+    }
+  }
   let check = options.check
   let serves = content.servesInspector()
   let mut inspector = if check || !serves {
@@ -919,9 +977,13 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // than everything up to the first frame on this one.
   let mut options = move options
   let given = Intrinsic.replace(options.gpu, Option<StartedGpu>.None)
-  let early = match move given {
-    Option<StartedGpu>.Some { value } => move value.early
-    Option<StartedGpu>.None => run prepareGpu(check)
+  let gpu = match move given {
+    Option<StartedGpu>.Some { value } => move value
+    Option<StartedGpu>.None => StartedGpu.none()
+  }
+  let early = match move gpu.early {
+    Option.Some { value } => move value
+    Option.None => run prepareGpu(check)
   }
   let mut tree = run UiTree.make(collection)
 
@@ -1012,6 +1074,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let first = clientSize(width, height, &dock)
   run content.resize(&mut state, &mut tree, f64.toF32(first.width), f64.toF32(first.height))
   platform.requestFrame(owner)
+  let mut mediaPreferences = if check { Preferences.desktop(false) } else { stylePreferences(platform.appearance() == Appearance.Dark) }
   while true {
     // The first root is current but while a window of another root is served.
     drop run tree.useRoot(FIRST_ROOT)
@@ -1090,6 +1153,26 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           run coalesce(&mut platform, move value, &mut backlog),
         )
         Option<Event>.None => Option<Event>.None
+      }
+    }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      if !check { mediaPreferences = stylePreferences(false) }
+    } else {
+      if !check {
+        if let Option<Event>.Some { value } = &next {
+          if let Event.AppearanceChanged { appearance } = &value {
+            mediaPreferences = Preferences.desktop(appearance == Appearance.Dark)
+          }
+        }
+      }
+    }
+    if tree.setStylePreferences(mediaPreferences) {
+      platform.requestFrame(owner)
+      let windows = others.asSlice()
+      let mut at: usize = 0
+      while at < windows.length {
+        platform.requestFrame(windows[at].window)
+        at = at + 1
       }
     }
     if compositing {
@@ -1528,6 +1611,196 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   platform.closeWindow(owner)
   return status
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import headless
+  import headless { Script, Turn, FRAME, Desktop }
+
+  /// Runs `content` with no display, no GPU and no window, as the script at `path` says (see
+  /// `headless.silk`): every turn of the loop serves the script's requests, lets one frame of
+  /// time pass and draws the frame on the CPU. Only the first root is shown. Returns the
+  /// script's status, or 2 when it cannot run. `runWindow` calls it when `SILK_UI_HEADLESS` is
+  /// set; tests call it directly.
+  pub effect fn runHeadless<H: WindowClient<S, E, R>, S, E, ? R>(
+    state: &mut S,
+    collection: &FontCollection,
+    resources: List<Mutation>,
+    options: RunOptions,
+    inspector: Inspector,
+    content: &mut H,
+    path: string,
+  ) -> i32
+    ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+    ? R | &mut Allocator {
+    if !content.servesInspector() {
+      // Scripts are inspector requests, and a release build leaves the inspector out.
+      drop inspector
+      StderrWriter.print("headless: a headless run needs a debug build\n", &())
+      return 2
+    }
+    let mut options = move options
+    drop Intrinsic.replace(options.gpu, Option<StartedGpu>.None)
+    drop Intrinsic.replace(options.platform, Option<Launched>.None)
+    let mut inspector = move inspector
+    inspector.deferInput()
+    let mut tree = run UiTree.make(collection)
+    tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
+    run content.setup(&mut state, &mut tree)
+    run tree.apply(move resources)
+    let mut script = match move run Script.load(path, &mut inspector) {
+      Option<Script>.Some { value } => move value
+      Option<Script>.None => {
+        return 2
+      }
+    }
+    run content.report(&mut state, &mut inspector)
+    run content.start(&mut state, &mut tree)
+
+    let mut platform = HostPlatform.headless()
+    let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
+    content.configure(&state.*, &mut windowOptions)
+    let owner = run platform.openWindow(&windowOptions)
+    run content.opened(&mut state, &mut platform, owner)
+    drop run content.update(&mut state, &mut tree, &mut platform, owner)
+    let mut host = HostState.of(&platform)
+    let opened = platform.contentSize(owner)
+    let mut width = opened.width
+    let mut height = opened.height
+    let mut scale: f64 = 1.0
+    run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
+    drop tree.setStylePreferences(Preferences.desktop(false))
+    let mut snapshot = CpuSnapshot.make()
+    let mut time: f64 = 0.0
+    let mut status: i32 = 0
+    while true {
+      // The app's own work and timers, at the run's time.
+      drop run content.poll(&mut state, &mut tree, time)
+      if content.waitsItself(&state.*) {
+        drop run content.wait(&mut state, &mut tree, 0.0)
+      }
+      run content.tick(&mut state, &mut tree, time, false)
+      if content.wantsFrames(&state.*) {
+        run content.tick(&mut state, &mut tree, time, true)
+      }
+      run content.report(&mut state, &mut inspector)
+
+      // The script's requests, and the input they dispatch, as from a socket client.
+      let local = run inspector.serveLocal(&mut tree)
+      let remote = run inspector.poll(&mut tree)
+      if local || remote || inspector.hasInput() {
+        while true {
+          if run inspector.beginNext(&mut tree) {
+            run inspector.observe(&tree)
+            let prevented = run content.decide(&mut state, &mut tree)
+            run inspector.finishNext(&mut tree, prevented)
+          }
+          run serve(&mut platform, owner, &mut tree, &mut host)
+          run inspector.observe(&tree)
+          run content.pump(&mut state, &mut tree)
+          if !inspector.hasInput() {
+            break
+          }
+        }
+      }
+      if run content.update(&mut state, &mut tree, &mut platform, owner) {}
+      if content.quitting(&state.*) {
+        break
+      }
+
+      // The frame, on the CPU.
+      let viewport = FrameInput {
+        width: f64.toF32(width),
+        height: f64.toF32(height),
+        scale: f64.toF32(scale),
+        time: time,
+      }
+      run content.prepare(&mut state, &mut tree)
+      run content.layout(&mut state, &mut tree, viewport)
+      run content.frame(&mut state, &mut tree, viewport, &inspector)
+      run serve(&mut platform, owner, &mut tree, &mut host)
+      run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
+      run snapshot.copyUploads(&tree)
+      if script.isRecording() {
+        let pixels = run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+        run script.frame(&pixels)
+      }
+      tree.clearUploads()
+      run content.pump(&mut state, &mut tree)
+
+      match run script.turn() {
+        Turn.Next => {}
+        Turn.Resize { width: w, height: h, scale: s } => {
+          width = w
+          height = h
+          scale = s
+          run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
+        }
+        Turn.Desktop { input } => {
+          let mut events = List<Event>.make()
+          run desktopEvents(move input, owner, width, height, &mut events)
+          let items = events.asSlice()
+          let mut e: usize = 0
+          while e < items.length {
+            drop run content.event(&mut state, &mut tree, &items[e])
+            e = e + 1
+          }
+          drop run content.update(&mut state, &mut tree, &mut platform, owner)
+          run content.pump(&mut state, &mut tree)
+        }
+        Turn.Done { status: code } => {
+          status = code
+          break
+        }
+      }
+      time = time + FRAME
+    }
+    run inspector.close()
+    platform.closeWindow(owner)
+    return status
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  /// The platform events a headless script's desktop line stands for, for `window` of `width`
+  /// by `height`.
+  effect fn desktopEvents(input: Desktop, window: WindowId, width: f64, height: f64, out: &mut List<Event>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match move input {
+      Desktop.Drop { paths, x, y } => {
+        let at = if x < 0.0 {
+          Point2<f64> { x: width / 2.0, y: height / 2.0 }
+        } else {
+          Point2<f64> { x: x, y: y }
+        }
+        let mut entered = List<String>.make()
+        let list = paths.asSlice()
+        let mut i: usize = 0
+        while i < list.length {
+          run entered.append(run String.copy(String.view(&list[i])))
+          i = i + 1
+        }
+        run out.append(Event.FileDragEntered { window: window, position: at, paths: move entered })
+        run out.append(Event.FileDragMoved { window: window, position: at })
+        run out.append(Event.FileDropped { window: window, position: at, paths: move paths })
+      }
+      Desktop.Shortcut { id } => run out.append(Event.GlobalShortcut { id: id })
+      Desktop.Tray { button } => run out.append(
+        Event.TrayClicked {
+          button: if button == 1 {
+            MouseButton.Middle
+          } else if button == 2 {
+            MouseButton.Right
+          } else {
+            MouseButton.Left
+          },
+        },
+      )
+      Desktop.TrayItem { action } => run out.append(Event.MenuAction { action: action })
+      Desktop.NotificationClick { id } => run out.append(Event.NotificationClicked { id: id })
+    }
+  }
 }
 
 static if Intrinsic.targetOperatingSystem() == "windows" {

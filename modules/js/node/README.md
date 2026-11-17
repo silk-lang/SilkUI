@@ -34,7 +34,8 @@ them. The first link of a program needs memory: allow about 9 GB for silkc.
 ## Checking
 
 `tests` is a program that runs `fixtures/net.js` in the runtime-backed realm against a local
-HTTP and WebSocket server (`fixtures/server.mjs`, run by Node):
+HTTP and WebSocket server (`fixtures/server.mjs`, run by Node). CI's `node` job runs it on Linux,
+building the runtime and its pinned native dependencies with Silk:
 
 ```sh
 silk build --manifest-path modules/js/node/tests/silk.toml

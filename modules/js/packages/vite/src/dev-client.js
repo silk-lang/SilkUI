@@ -38,6 +38,6 @@ native.devStart = async (modules) => {
   try {
     for (const module of modules) await runner.import(module);
   } catch (error) {
-    console.error(`Uncaught ${error?.stack ?? error}`);
+    console.error(`Uncaught ${error?.name ?? "Error"}: ${error?.message ?? error}\n${error?.stack ?? ""}`);
   }
 };
