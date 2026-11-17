@@ -68,6 +68,10 @@ background, and a theme switch changes every row's background and text color. Th
 idle cases also run with 5,000 rows. Each case checks the first and last row's resulting styles.
 Frames include style resolution, layout and painting.
 
+`[Rows=1000,Cells=3,Distinct]` gives every other row another padding class, so no row equals
+the one before it and no row or cell can take its style from a neighbor: every element matches
+selectors itself, and a cell reuses a finished cascade only through the pass cache, across parents.
+
 `RegisteredTailwind` runs the same seven Tailwind scenarios with a second compiled sheet,
 `fixtures/registered.css`. It adds a non-inheriting registered length, declares it on each row,
 and reads it for the unchanged 8 px gap. This exercises both registration-default isolation and

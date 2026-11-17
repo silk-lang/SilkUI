@@ -1,6 +1,6 @@
 import selection
 import style_load { Status }
-import sheet_cache { Cache, Pending }
+import sheet_cache { Cache, Pending, Inherited, Substituted }
 import silk.mem.frozen { Frozen }
 import svg_css.adopted { Candidate }
 import style_invalidation { States }
@@ -134,10 +134,21 @@ pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
   }
-  let frames = run keyframes(&sheets.*, system, tree, tree.node(slot).parent, &resolved.style, &mut stops)
+  let frames = run keyframes(&sheets.*, &mut cache, system, tree, tree.node(slot).parent, &resolved.style, &mut stops)
+  // Inherited animation names come from the parent's values, which the shared record does not key.
+  if inheritsAnimation(resolved.style.declarations.asSlice()) { resolved.pending = Option<Pending>.None }
   let style = &mut resolved.style
   style.keyframes = move frames
   return move resolved
+}
+
+fn inheritsAnimation(declarations: &[Declaration]) -> bool {
+  let mut i: usize = 0
+  while i < declarations.length {
+    if declarations[i].property == Property.AnimationName && convert.isKeyword(&declarations[i].value, Keyword.Inherit) { return true }
+    i = i + 1
+  }
+  return false
 }
 
 pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool,
@@ -152,7 +163,7 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
     style.starting = Option<List<Declaration>>.some(move before.style.declarations)
     resolved.containers = move before.containers
   }
-  let frames = run keyframes(&sheets.*, system, tree, origin, &resolved.style, &mut stops)
+  let frames = run keyframes(&sheets.*, &mut cache, system, tree, origin, &resolved.style, &mut stops)
   let style = &mut resolved.style
   style.keyframes = move frames
   return move resolved
@@ -218,8 +229,9 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   }
   let scope = run sheets.variableScopeWith(parent, custom.asSlice(), &Limits.make())
   let share = shareable && tree.styleOverrides().length == 0 && context.containers.length() == 0
+  let inherited = Inherited { rooted: parentSlot == NONE, color: parentColor(tree, parentSlot) }
   if share {
-    if let Option<Frozen<Resolved>>.Some { value } = move cache.find(scope, parentSlot, sheets.stateDependencies(), sheets.candidates(), sheets.matches(), inline.asSlice()) {
+    if let Option<Frozen<Resolved>>.Some { value } = move cache.find(scope, inherited, sheets.stateDependencies(), sheets.candidates(), sheets.matches(), inline.asSlice()) {
       return Resolution { highlightBackground: Option<ColorProgram>.None, containers: List<ContainerDependency>.make(), hit: Option<Frozen<Resolved>>.some(move value), pending: Option<Pending>.None,
         style: Resolved { plain: false, states: 0, keyframes: List<Rule>.make(), overrides: List<Declaration>.make(), declarations: List<Declaration>.make(),
           matches: List<MatchedRule>.make(), scope: scope, starting: Option<List<Declaration>>.None } }
@@ -243,7 +255,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
         } else { run declarations.append(run values.cloneDeclaration(item)) }
       }
       Source.Sheet { sheet, declaration } => {
-        run appendSheet(&mut declarations, &mut expressions, &sheets.*, scope, sheet, declaration, candidates[i].priority.important)
+        run appendSheet(&mut declarations, &mut expressions, &sheets.*, &mut cache, scope, sheet, declaration, candidates[i].priority.important)
       }
     }
     while ranks.length() < declarations.length() { run ranks.append(candidates[i].priority) }
@@ -269,7 +281,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   if share {
     let mut inputs = List<Candidate>.make()
     run inputs.appendSlice(sheets.candidates())
-    pending = Option<Pending>.some(Pending { scope: scope, parent: parentSlot, candidates: move inputs, inline: move inline })
+    pending = Option<Pending>.some(Pending { scope: scope, parent: inherited, candidates: move inputs, inline: move inline })
   }
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
@@ -277,12 +289,21 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     style: Resolved { plain: share, states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
 }
 
-effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets,
+effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets, memo: &mut Cache,
   scope: ScopeId, sheet: usize, declaration: usize, important: bool) -> ()
   ! CssError | OutOfMemoryError ? &mut Allocator {
   match &sheets.sheets()[sheet].sheet.declarations.asSlice()[declaration] {
     SheetDeclaration.Typed { property, value, .. } => run declarations.append(Declaration { property: property, important: important, value: run values.clone(&value) })
     SheetDeclaration.Pending { property, .. } => {
+      // Substitution serializes and parses the value again; a scope gives one result per declaration.
+      if let Option<&Substituted>.Some { value: kept } = memo.substitution(scope, sheet, declaration) {
+        if let Option<ColorProgram>.Some { value: program } = &kept.program {
+          run expressions.append(Expression { index: declarations.length(), program: run program.copy() })
+        }
+        run declarations.append(Declaration { property: kept.value.property, important: important, value: run values.clone(&kept.value.value) })
+        return ()
+      }
+      let before = expressions.length()
       let substituted = run sheets.variableInputs()[0].substitute(scope, sheet, declaration, &Limits.make())
       match move substituted {
         Option<Bytes>.Some { value } => run appendText(&mut declarations.*, &mut expressions.*, property, important, value.asSlice())
@@ -290,6 +311,9 @@ effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut Li
           run declarations.append(Declaration { property: property, important: important, value: values.keyword(Keyword.Unset) })
         }
       }
+      let program = if expressions.length() > before { Option<ColorProgram>.some(run expressions.asSlice()[before].program.copy()) } else { Option<ColorProgram>.None }
+      let made = run values.cloneDeclaration(&declarations.asSlice()[declarations.length() - 1])
+      run memo.keepSubstitution(scope, sheet, declaration, move made, move program)
     }
     SheetDeclaration.ColorExpression { property, program, .. } => {
       run expressions.append(Expression { index: declarations.length(), program: run program.copy() })
@@ -299,7 +323,7 @@ effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut Li
   }
 }
 
-effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, parent: u32, resolved: &Resolved, stops: &mut EasingStops) -> List<Rule>
+effect fn keyframes(sheets: &StyleSheets, memo: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, parent: u32, resolved: &Resolved, stops: &mut EasingStops) -> List<Rule>
   ! CssError | OutOfMemoryError ? &mut Allocator {
   let mut names = AnimationLists.initial()
   let mut foreground = parentComputed(tree, parent).text.color
@@ -340,7 +364,7 @@ effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>
               Result<string, InvalidUtf8>.Success { value: text } => run String.copy(text)
               _ => String.make()
             }
-            let frames = run keyframeValues(sheets, system, tree, parent, resolved.scope, value, color)
+            let frames = run keyframeValues(sheets, &mut memo, system, tree, parent, resolved.scope, value, color)
             run out.append(run animation.make(move name, move frames, &mut stops))
           }
           found = true
@@ -354,7 +378,7 @@ effect fn keyframes(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>
   return move out
 }
 
-effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTree<'_>, parent: u32,
+effect fn keyframeValues(sheets: &StyleSheets, memo: &mut Cache, system: [Color; 19], tree: &UiTree<'_>, parent: u32,
   scope: ScopeId, reference: KeyframesRef, color: Color) -> List<Keyframe>
   ! CssError | OutOfMemoryError ? &mut Allocator {
   let sheet = &sheets.sheets()[reference.sheet].sheet
@@ -368,7 +392,7 @@ effect fn keyframeValues(sheets: &StyleSheets, system: [Color; 19], tree: &UiTre
     let mut ranks = List<Priority>.make()
     let mut declaration = frame.declarations.start
     while declaration < frame.declarations.end {
-      run appendSheet(&mut declarations, &mut expressions, sheets, scope, reference.sheet, declaration, false)
+      run appendSheet(&mut declarations, &mut expressions, sheets, &mut memo, scope, reference.sheet, declaration, false)
       while ranks.length() < declarations.length() {
         let priority = Priority.make(Origin.Animation, ranks.length())
         run ranks.append(priority)
@@ -517,6 +541,11 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
 
 pub fn parentStyle(tree: &UiTree<'_>, slot: u32) -> Computed {
   return parentComputed(tree, tree.node(slot).parent)
+}
+
+fn parentColor(tree: &UiTree<'_>, parent: u32) -> Rgba<f32> {
+  if parent == NONE { return TextStyle.initial().color }
+  return tree.node(parent).computed.text.color
 }
 
 fn parentComputed(tree: &UiTree<'_>, parent: u32) -> Computed {

@@ -1,4 +1,6 @@
-//! Per-pass cache: scope ids and parent styles stay valid only until the next root restyle.
+//! Per-pass cache of finished cascades: scope ids stay valid only until the next root restyle.
+//! A result depends on its parent only through the variable scope, whether there is a parent
+//! to inherit from, and the parent's color, so equal elements under different parents share it.
 import mutation { Declaration }
 import properties.values
 import svg_css.adopted { Candidate, Source, MatchedRule }
@@ -6,6 +8,9 @@ import style_sheets { Resolved }
 import silk.mem.frozen { Frozen }
 import svg_css.cascade
 import svg_css.variables { ScopeId }
+import svg_css.colors { ColorProgram }
+import silk.color.rgba { Rgba }
+import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.collections.hash_map { HashMap }
 import silk.collections.hash { Hash }
@@ -14,11 +19,30 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.num.usize
 
-const LIMIT: usize = 128
+const LIMIT: usize = 512
+const SUBSTITUTION_LIMIT: usize = 4096
+
+/// What a cascade result takes from the element's parent besides the variable scope.
+pub struct Inherited { pub rooted: bool, pub color: Rgba<f32> }
+impl Copy for Inherited {}
+
+fn sameInherited(a: Inherited, b: Inherited) -> bool {
+  return a.rooted == b.rooted && a.color.r == b.color.r && a.color.g == b.color.g && a.color.b == b.color.b && a.color.a == b.color.a
+}
+
+/// A sheet declaration after `var()` substitution in one scope, parsed.
+pub struct Substituted {
+  scope: usize,
+  sheet: usize,
+  declaration: usize,
+  pub value: Declaration,
+  pub program: Option<ColorProgram>,
+  next: usize,
+}
 
 struct Entry {
   scope: usize,
-  parent: u32,
+  parent: Inherited,
   candidates: List<Candidate>,
   inline: List<Declaration>,
   style: Frozen<Resolved>,
@@ -28,12 +52,17 @@ struct Entry {
 /// The inputs of a result that is not in the cache yet. The node's finished style joins it.
 pub struct Pending {
   pub scope: ScopeId,
-  pub parent: u32,
+  pub parent: Inherited,
   pub candidates: List<Candidate>,
   pub inline: List<Declaration>,
 }
 
-pub struct Cache { entries: List<Entry>, heads: HashMap<u64, usize> }
+pub struct Cache {
+  entries: List<Entry>,
+  heads: HashMap<u64, usize>,
+  substituted: List<Substituted>,
+  substitutedHeads: HashMap<u64, usize>,
+}
 
 pub effect fn copy(source: &[Declaration]) -> List<Declaration> ! OutOfMemoryError ? &mut Allocator {
   let mut out = List<Declaration>.make()
@@ -45,9 +74,13 @@ pub effect fn copy(source: &[Declaration]) -> List<Declaration> ! OutOfMemoryErr
   return move out
 }
 
-fn hash(scope: ScopeId, parent: u32, candidates: &[Candidate]) -> u64 {
+fn substitutionKey(scope: ScopeId, sheet: usize, declaration: usize) -> u64 {
+  return Hash.combine(Hash.combine(Hash.mix(&Hash.seed(5381), usize.toU64(scope.index)), usize.toU64(sheet)), usize.toU64(declaration))
+}
+
+fn hash(scope: ScopeId, parent: Inherited, candidates: &[Candidate]) -> u64 {
   let mut result = Hash.mix(&Hash.seed(5347), usize.toU64(scope.index))
-  result = Hash.combine(result, u32.toU64(parent))
+  result = Hash.combine(result, if parent.rooted { 1 } else { 0 })
   let mut i: usize = 0
   while i < candidates.length {
     match candidates[i].source {
@@ -82,11 +115,11 @@ fn sameSource(a: Source, b: Source) -> bool {
   }
 }
 
-fn same(entry: &Entry, scope: ScopeId, parent: u32, states: u32, candidates: &[Candidate], matches: &[MatchedRule], inline: &[Declaration]) -> bool {
+fn same(entry: &Entry, scope: ScopeId, parent: Inherited, states: u32, candidates: &[Candidate], matches: &[MatchedRule], inline: &[Declaration]) -> bool {
   let style = entry.style.get()
   // Rules that matched without a declaration and state tests that failed still belong to the node.
   if style.states != states || style.matches.length() != matches.length { return false }
-  if entry.scope != scope.index || entry.parent != parent || entry.candidates.length() != candidates.length || entry.inline.length() != inline.length { return false }
+  if entry.scope != scope.index || !sameInherited(entry.parent, parent) || entry.candidates.length() != candidates.length || entry.inline.length() != inline.length { return false }
   let mut i: usize = 0
   while i < candidates.length {
     let previous = entry.candidates.asSlice()[i]
@@ -109,15 +142,39 @@ fn same(entry: &Entry, scope: ScopeId, parent: u32, states: u32, candidates: &[C
 
 impl Cache {
   pub fn make() -> Cache {
-    return Cache { entries: List<Entry>.make(), heads: HashMap<u64, usize>.make(Hash.seed(5351)) }
+    return Cache { entries: List<Entry>.make(), heads: HashMap<u64, usize>.make(Hash.seed(5351)),
+      substituted: List<Substituted>.make(), substitutedHeads: HashMap<u64, usize>.make(Hash.seed(5387)) }
   }
 
   pub fn reset(self: &mut Self) -> () {
     self.entries.truncate(0)
     self.heads.clear()
+    self.substituted.truncate(0)
+    self.substitutedHeads.clear()
   }
 
-  pub fn find(self: &Self, scope: ScopeId, parent: u32, states: u32, candidates: &[Candidate], matches: &[MatchedRule], inline: &[Declaration]) -> Option<Frozen<Resolved>> {
+  /// The parsed value sheet declaration `declaration` had in `scope` earlier in this pass.
+  pub fn substitution(self: &Self, scope: ScopeId, sheet: usize, declaration: usize) -> Option<&Substituted> {
+    let mut at = match self.substitutedHeads.get(substitutionKey(scope, sheet, declaration)) { Option.Some { value } => value _ => usize.MAX }
+    while at != usize.MAX {
+      let entry = &self.substituted.asSlice()[at]
+      if entry.scope == scope.index && entry.sheet == sheet && entry.declaration == declaration { return Option<&Substituted>.some(entry) }
+      at = entry.next
+    }
+    return Option<&Substituted>.None
+  }
+
+  pub effect fn keepSubstitution(self: &mut Self, scope: ScopeId, sheet: usize, declaration: usize, value: Declaration, program: Option<ColorProgram>) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if self.substituted.length() == SUBSTITUTION_LIMIT { return () }
+    let key = substitutionKey(scope, sheet, declaration)
+    let next = match self.substitutedHeads.get(key) { Option.Some { value: head } => head _ => usize.MAX }
+    let index = self.substituted.length()
+    run self.substituted.append(Substituted { scope: scope.index, sheet: sheet, declaration: declaration, value: move value, program: move program, next: next })
+    drop run self.substitutedHeads.insert(key, index)
+  }
+
+  pub fn find(self: &Self, scope: ScopeId, parent: Inherited, states: u32, candidates: &[Candidate], matches: &[MatchedRule], inline: &[Declaration]) -> Option<Frozen<Resolved>> {
     let mut at = match self.heads.get(hash(scope, parent, candidates)) { Option.Some { value } => value _ => usize.MAX }
     while at != usize.MAX {
       let entry = &self.entries.asSlice()[at]
