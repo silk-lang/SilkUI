@@ -116,41 +116,83 @@ pub struct Computed {
 
 impl Copy for Computed {}
 
-/// `container-type`, `contain` and `content-visibility`. css-layout reads the union of the two
-/// size containments, in `layout.sizeContainment`; container queries read only `query`.
-pub struct Containment {
-  pub query: SizeContainment,
-  pub size: SizeContainment,
-  pub paint: bool,
-  /// `content-visibility: hidden`: the contents are neither painted nor hit.
-  pub hidden: bool,
-  contain: Contained,
-}
+/// `container-type`, `contain` and `content-visibility`, in one byte (the record is copied for
+/// every restyled node). css-layout reads the union of the two size containments, in
+/// `layout.sizeContainment`; container queries read only `query`.
+pub struct Containment { bits: u8 }
 
 impl Copy for Containment {}
 
 struct Contained { size: SizeContainment, paint: bool }
 impl Copy for Contained {}
 
+const QUERY_SHIFT: u8 = 0
+const CONTAIN_SHIFT: u8 = 2
+const CONTAIN_PAINT: u8 = 16
+const HIDDEN: u8 = 32
+const PAINT: u8 = 64
+
+fn sizeCode(size: SizeContainment) -> u8 {
+  return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
+}
+
+fn sizeOfCode(code: u8) -> SizeContainment {
+  return if code == 2 { SizeContainment.Size } else if code == 1 { SizeContainment.InlineSize } else { SizeContainment.None }
+}
+
 impl Containment {
-  pub fn initial() -> Containment {
-    let none = Contained { size: SizeContainment.None, paint: false }
-    return Containment { query: SizeContainment.None, size: SizeContainment.None, paint: false, hidden: false, contain: none }
+  pub fn initial() -> Containment { return Containment { bits: 0 } }
+
+  /// The size containment `container-type` asks for.
+  pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
+
+  /// Paint containment, from `contain` or `content-visibility: hidden`.
+  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+
+  /// `content-visibility: hidden`: the contents are skipped like `display: none`.
+  pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
+
+  fn contained(self: &Self) -> Contained {
+    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
   }
 
-  pub fn inheritContain(self: &mut Self, parent: &Containment) -> () { self.contain = parent.contain }
-
-  pub fn used(self: &mut Self, layout: &mut CssStyle) -> () {
-    let size = if self.hidden { SizeContainment.Size } else { self.contain.size }
-    self.paint = self.hidden || self.contain.paint
-    self.size = size
-    layout.sizeContainment = if self.query == SizeContainment.Size || size == SizeContainment.Size {
+  fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
+    let size = if hidden { SizeContainment.Size } else { contain.size }
+    let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
+    if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if hidden { bits = u8.bitOr(bits, HIDDEN) }
+    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
+    self.bits = bits
+    layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
-    } else if self.query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
+    } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
       SizeContainment.InlineSize
     } else {
       SizeContainment.None
     }
+  }
+
+  pub fn setQuery(self: &mut Self, query: SizeContainment, layout: &mut CssStyle) -> () {
+    let contain = self.contained()
+    let hidden = self.hidden()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  fn setContain(self: &mut Self, contain: Contained, layout: &mut CssStyle) -> () {
+    let query = self.query()
+    let hidden = self.hidden()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  pub fn setHidden(self: &mut Self, hidden: bool, layout: &mut CssStyle) -> () {
+    let query = self.query()
+    let contain = self.contained()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  pub fn inheritContain(self: &mut Self, parent: &Containment, layout: &mut CssStyle) -> () {
+    let contain = parent.contained()
+    self.setContain(contain, &mut layout)
   }
 }
 
@@ -186,14 +228,15 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
 }
 
 /// What a node's style says about its paint effects, which `paint_css` reads into the node.
+// Widest fields first: in declaration order the flags between them padded this to 40 bytes.
 pub struct EffectState {
-  /// Whether the node's looks set a property `paint_css` reads.
-  pub declared: bool,
   /// `paint_css.Effects.hash` of the node's effects.
   pub hash: u64,
+  pub shadowHash: u64,
   /// The node whose `text-shadow` this one paints (it inherits), or `NO_SHADOW`.
   pub shadowFrom: u32,
-  pub shadowHash: u64,
+  /// Whether the node's looks set a property `paint_css` reads.
+  pub declared: bool,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
   pub layered: bool,
@@ -269,15 +312,16 @@ fn anyViewportUnit(items: &[Value]) -> bool {
 }
 
 /// `outline`: a ring `offset` outside the border box, drawn over the content.
+// Flags last, so they share one word of padding.
 pub struct Outline {
   pub width: f32,
+  pub offset: f32,
+  pub color: Rgba<f32>,
   pub style: BorderStyle,
   /// `outline-style: auto`, the platform focus ring.
   pub auto: bool,
-  pub color: Rgba<f32>,
   /// `outline-color: auto`: the focus ring color for an `auto` ring, the text color otherwise.
   pub colorAuto: bool,
-  pub offset: f32,
 }
 
 impl Copy for Outline {}
@@ -328,24 +372,48 @@ pub struct ScrollStyle {
   pub colors: ScrollbarColors,
 }
 
-/// `scrollbar-color`: `auto` is the native thumb over no track.
-pub struct ScrollbarColors { pub auto: bool, pub thumb: Rgba<f32>, pub track: Rgba<f32> }
+/// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
+/// 0 is `auto`, the native thumb over no track; a set value has the lowest bit of the track's
+/// alpha on, so `transparent transparent` stays apart from `auto`.
+pub struct ScrollbarColors { word: u64 }
 
 impl Copy for ScrollbarColors {}
 
 impl ScrollbarColors {
-  pub fn initial() -> ScrollbarColors {
-    return ScrollbarColors { auto: true, thumb: NATIVE_THUMB, track: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+  pub fn initial() -> ScrollbarColors { return ScrollbarColors { word: 0 } }
+
+  pub fn of(thumb: Rgba<f32>, track: Rgba<f32>) -> ScrollbarColors {
+    let both = u64.bitOr(u64.shiftLeft(u32.toU64(packColor(thumb)), 32), u32.toU64(packColor(track)))
+    return ScrollbarColors { word: u64.bitOr(both, 1) }
   }
+
+  pub fn auto(self: &Self) -> bool { return self.word == 0 }
+
+  pub fn thumb(self: &Self) -> Rgba<f32> { return if self.word == 0 { NATIVE_THUMB } else { unpackColor(u64.toU32(u64.shiftRight(self.word, 32))) } }
+
+  pub fn track(self: &Self) -> Rgba<f32> { return unpackColor(u64.toU32(u64.bitAnd(self.word, 0xFFFFFFFF))) }
+
+  pub fn words(self: &Self) -> u64 { return self.word }
 }
 
 impl Equal for ScrollbarColors {
-  fn equals(left: &ScrollbarColors, right: &ScrollbarColors) -> bool {
-    return left.auto == right.auto && &left.thumb == &right.thumb && &left.track == &right.track
-  }
+  fn equals(left: &ScrollbarColors, right: &ScrollbarColors) -> bool { return left.word == right.word }
 }
 
-/// The overlay thumb's color when `scrollbar-color` is `auto`.
+fn channel(value: f32) -> u32 { return f32.toU32(f32.floor(f32.max(0.0, f32.min(1.0, value)) * 255.0 + 0.5)) }
+
+fn packColor(c: Rgba<f32>) -> u32 {
+  return u32.bitOr(u32.bitOr(u32.shiftLeft(channel(c.r), 24), u32.shiftLeft(channel(c.g), 16)), u32.bitOr(u32.shiftLeft(channel(c.b), 8), channel(c.a)))
+}
+
+fn unpackColor(word: u32) -> Rgba<f32> {
+  let r = u32.bitAnd(u32.shiftRight(word, 24), 255)
+  let g = u32.bitAnd(u32.shiftRight(word, 16), 255)
+  let b = u32.bitAnd(u32.shiftRight(word, 8), 255)
+  let a = u32.bitAnd(word, 255)
+  return Rgba<f32> { r: u32.toF32(r) / 255.0, g: u32.toF32(g) / 255.0, b: u32.toF32(b) / 255.0, a: u32.toF32(a) / 255.0 }
+}
+
 pub const NATIVE_THUMB: Rgba<f32> = Rgba<f32> { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
 
 impl Copy for ScrollStyle {}
@@ -753,29 +821,23 @@ impl Computed {
     match property {
       CssProperty.ContainerType => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
-          if word == Keyword.Normal { self.contain.query = SizeContainment.None }
-          if word == Keyword.Size { self.contain.query = SizeContainment.Size }
-          if word == Keyword.InlineSize { self.contain.query = SizeContainment.InlineSize }
-          self.contain.used(&mut self.layout)
+          if word == Keyword.Normal { self.contain.setQuery(SizeContainment.None, &mut self.layout) }
+          if word == Keyword.Size { self.contain.setQuery(SizeContainment.Size, &mut self.layout) }
+          if word == Keyword.InlineSize { self.contain.setQuery(SizeContainment.InlineSize, &mut self.layout) }
         }
       }
       CssProperty.Contain => {
-        if let Option<Contained>.Some { value: found } = containOf(value) {
-          self.contain.contain = found
-          self.contain.used(&mut self.layout)
-        }
+        if let Option<Contained>.Some { value: found } = containOf(value) { self.contain.setContain(found, &mut self.layout) }
       }
       CssProperty.ContentVisibility => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
           if word == Keyword.Hidden || word == Keyword.Visible || word == Keyword.Auto {
-            self.contain.hidden = word == Keyword.Hidden
-            self.contain.used(&mut self.layout)
+            self.contain.setHidden(word == Keyword.Hidden, &mut self.layout)
           }
         }
       }
       CssProperty.Container => {
-        self.contain.query = SizeContainment.None
-        self.contain.used(&mut self.layout)
+        self.contain.setQuery(SizeContainment.None, &mut self.layout)
         if let Value.Sequence { separator: Separator.Slash, values } = &value.* {
           if values.length() == 2 { self.set(CssProperty.ContainerType, &values.asSlice()[1], &context) }
         }
@@ -1324,7 +1386,7 @@ impl Computed {
             let track = if convert.isKeyword(&items[1], Keyword.Currentcolor) { Option<Rgba<f32>>.some(current) } else { convert.color(&items[1]) }
             if let Option.Some { value: a } = thumb {
               if let Option.Some { value: b } = track {
-                self.scroll.colors = ScrollbarColors { auto: false, thumb: a, track: b }
+                self.scroll.colors = ScrollbarColors.of(a, b)
               }
             }
           }
@@ -1983,7 +2045,7 @@ impl Computed {
 
   /// Whether the node clips its children to its padding box.
   pub fn clips(self: &Self) -> bool {
-    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible || self.contain.paint
+    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible || self.contain.paint()
   }
 
   /// Whether the node draws anything of its own box: a background, border or shadow.
@@ -2069,9 +2131,8 @@ impl Computed {
     h = colorHash(h, self.text.caret())
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
-    let contained: u64 = if self.contain.hidden { 2 } else if self.contain.paint { 1 } else { 0 }
-    h = Hash.combine(h, contained)
-    if !self.scroll.colors.auto { h = colorHash(colorHash(Hash.combine(h, 3), self.scroll.colors.thumb), self.scroll.colors.track) }
+    if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
     h = Hash.combine(
       h,
       if self.paint.pointerEvents {
