@@ -67,6 +67,13 @@ cp "$root/build/llvm/wasm32-unknown-unknown/release-size/ui-docs-live" "$out/liv
 sed -e "s|'/native/platform/window/browser/window-host.js'|'./window/window-host.js'|" \
   -e "s|'/native/gpu/webgpu/browser/host.ts'|'./webgpu/host.js'|" \
   "$root/modules/tree/window/browser/app-host.js" > "$out/live/app-host.js"
+# The modules app-host.js imports from beside itself.
+for file in "$root"/modules/tree/window/browser/*.js "$root"/modules/tree/window/browser/*.mjs; do
+  case "$file" in
+    *.test.mjs | */app-host.js) ;;
+    *) cp "$file" "$out/live/" ;;
+  esac
+done
 for file in window-host imports keys; do
   cp "$windows/$file.js" "$out/live/window/$file.js"
 done
