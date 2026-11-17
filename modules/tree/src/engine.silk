@@ -95,7 +95,7 @@ import style_invalidation
 import style_invalidation { Reach, Extent }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
-import svg_css.element { PseudoTarget, StateBits }
+import svg_css.element { PseudoTarget, StateBits, ElementTree }
 import style_sheets { RootSheets, Resolved, Resolution }
 import style_share
 import selector_tree { SelectorTree }
@@ -1346,6 +1346,27 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// The first element child of `at`, or its next element sibling.
+  fn elementLink(self: &Self, at: usize, child: bool) -> usize {
+    let adapter = SelectorTree { tree: self }
+    return if child { ElementTree.firstChild(&adapter, at) } else { ElementTree.nextSibling(&adapter, at) }
+  }
+
+  fn restyleRadioGroup(self: &mut Self, slot: u32) -> () {
+    let parent = self.node(slot).parent
+    if parent == NONE { return }
+    let mut at = self.elementLink(u32.toUsize(parent), true)
+    while at != css_element.NO_ELEMENT {
+      let next = self.elementLink(at, false)
+      let sibling = usize.toU32(at)
+      if sibling != slot && self.node(sibling).accessRole == Role.Radio {
+        let extent = self.stateReach(sibling, css_element.INDETERMINATE)
+        self.restyleExtent(sibling, extent)
+      }
+      at = next
+    }
+  }
+
   fn selectorStates(self: &Self, slot: u32) -> u32 {
     let adapter = SelectorTree { tree: self }
     return adapter.state(u32.toUsize(slot)).bits
@@ -1361,8 +1382,9 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < names.length {
       if names[i].length != 0 { any = true }
-      // `:lang()` and `:link` are no invalidation key.
-      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")) {
+      // `:lang()`, `:dir()` and `:link` are no invalidation key.
+      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")
+        || css_tokens.insensitive(names[i], b"dir")) {
         return Extent { reach: Reach.Root, anchors: false }
       }
       i = i + 1
@@ -1798,6 +1820,10 @@ impl<'a> UiTree<'a> {
         let attached = self.rootHolding(slot) != NONE
         let tracked = attached && self.sheetReads().isSome()
         let statesBefore = if tracked { self.selectorStates(slot) } else { 0 }
+        let radioToggled = match &attribute {
+          Attribute.Checked { .. } => self.node(slot).accessRole == Role.Radio
+          _ => false
+        }
         let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
           Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
           Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
@@ -2031,9 +2057,11 @@ impl<'a> UiTree<'a> {
               if value.isSome() { semantics.literalRelations = semantics.literalRelations | relation }
             }
             let range = style_attributes.isRange(String.view(&name))
+            let span = style_attributes.isSpan(String.view(&name))
             let identity = run self.nodeMut(slot).identityMut()
             run identity.set(move name, move value)
             if range { style_attributes.syncRange(self.nodeMut(slot)) }
+            if span { self.restyle(slot) }
           }
           Attribute.ClassName { value } => {
             let identity = run node.identityMut()
@@ -2049,6 +2077,8 @@ impl<'a> UiTree<'a> {
         }
         if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
         self.restyleExtent(slot, change)
+        // A radio's group is `:indeterminate` while none of it is checked.
+        if tracked && radioToggled { self.restyleRadioGroup(slot) }
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
@@ -4834,6 +4864,8 @@ impl<'a> UiTree<'a> {
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
     let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
     let mut computed = self.valuesToStartFrom(lender, inherited)
+    // border-collapse, border-spacing and caption-side inherit.
+    if lender == NONE && parent != NONE { inheritTable(&mut computed.layout, &self.node(parent).computed.layout) }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
@@ -4878,6 +4910,7 @@ impl<'a> UiTree<'a> {
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
     }
+    if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
@@ -6208,4 +6241,28 @@ fn lastEffect<'a>(declarations: &'a [Declaration], property: CssProperty) -> Opt
     if declarations[i].property == property { return Option<&'a Declaration>.some(&declarations[i]) }
   }
   return Option<&'a Declaration>.None
+}
+
+fn inheritTable(target: &mut CssStyle, parent: &CssStyle) {
+  target.borderCollapse = parent.borderCollapse
+  target.borderSpacingX = parent.borderSpacingX
+  target.borderSpacingY = parent.borderSpacingY
+  target.captionSide = parent.captionSide
+}
+
+// HTML's `colspan` and `rowspan` on cells and `span` on columns, for the table layout.
+fn tableSpans(node: &Node, layout: &mut CssStyle) {
+  layout.columnSpan = 1
+  layout.rowSpan = 1
+  if let Option.Some { value: identity } = node.identity() {
+    let attributes = identity.attributes.asSlice()
+    let mut i: usize = 0
+    while i < attributes.length {
+      let name = String.view(&attributes[i].name)
+      let value = style_attributes.spanValue(String.view(&attributes[i].value))
+      if (name == "colspan" || name == "span") && value > 0 && value != usize.MAX { layout.columnSpan = if value > 1000 { 1000 } else { value } }
+      if name == "rowspan" && value != usize.MAX { layout.rowSpan = value }
+      i = i + 1
+    }
+  }
 }
