@@ -488,3 +488,16 @@ export function removeTray(): void;
  */
 export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
 export function unregisterShortcut(accelerator: string): void;
+
+/** The app's memory: `footprint` in bytes over `processes` processes. */
+export interface MemoryUsage {
+  footprint: number;
+  processes: number;
+}
+
+/**
+ * The app's memory as the system shows it to users (macOS `phys_footprint`, Linux `Pss`,
+ * Windows `PrivateUsage`). In the browser, the wasm tree's linear memory only. Cheap enough
+ * to call every second; `null` when the host cannot say.
+ */
+export function memoryUsage(): MemoryUsage | null;

@@ -261,6 +261,10 @@ check("mutationobserver", false, () => global("MutationObserver"));
 check("namevalue-storage", false, () => global("localStorage") || global("sessionStorage"));
 check("native-filesystem-api", false, () => typeof globalThis.showOpenFilePicker === "function");
 check("netinfo", false, () => typeof navigator.connection === "object");
+check("silkui-memory-usage", true, () => {
+  const usage = ui.memoryUsage();
+  return usage !== null && usage.footprint > 0 && usage.processes === 1;
+});
 check("notifications", true, () => Notification === ui.Notification && Notification.permission === "granted" &&
   typeof Notification.requestPermission === "function");
 check("objectrtc", false, () => global("RTCIceGatherer"));

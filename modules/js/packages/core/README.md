@@ -157,6 +157,22 @@ registerShortcut("Mod+Shift+B", build); // Mod is Command on macOS, Control else
 whichever app has focus; another app may hold it, and Wayland has none. `removeTray()` and
 `unregisterShortcut(accelerator)` undo them.
 
+`memoryUsage()` is the app's memory as the system shows it to users, to put next to an
+Electron app's in Activity Monitor or Task Manager. It is synchronous and allocates almost
+nothing, so it can run every second.
+
+```ts
+import { memoryUsage } from "@silkui/core";
+
+const { footprint, processes } = memoryUsage(); // bytes, and how many processes they cover
+```
+
+`footprint` is `phys_footprint` on macOS (Activity Monitor's "Memory", `/usr/bin/footprint`),
+`Pss` from `/proc/self/smaps_rollup` on Linux and `PrivateUsage` on Windows. `processes` is 1:
+the host runs the app, its tree and its JavaScript in one process. In a web-canvas build it
+is the wasm tree's memory only, without the page's JavaScript heap. It is `null` when the
+host cannot say.
+
 ### Attributes and accessibility
 
 `setAttribute(name, value)` sets the tree's attributes: `tabIndex`, `disabled`, `label`,

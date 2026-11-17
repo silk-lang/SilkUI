@@ -3,6 +3,7 @@
 The data behind the docs' [Can I use](../content/can-i-use.md) page.
 
 - `features.json` is caniuse's feature list, from <https://github.com/Fyrd/caniuse> (CC BY 4.0), cut down to the CSS, SVG and JavaScript features. `python3 docs/caniuse/sync.py --fetch` takes it again.
+- `silk.json` lists Silk UI's own APIs that caniuse has no feature for, in `features.json`'s shape plus a `link`; `--fetch` leaves it alone.
 - `areas.json` splits the features into areas, and `support/<area>.json` is what Silk UI does with the features of one area. Two people answering different areas never edit the same file, written or generated.
 - `sync.py` checks the answers and writes the Silk modules the page and the tests read (`docs/src/caniuse_*.silk`, `modules/tree/tests/src/caniuse_probes*.silk`). Run it after every edit and commit what it writes.
 

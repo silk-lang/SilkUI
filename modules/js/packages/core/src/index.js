@@ -1897,3 +1897,14 @@ export function unregisterShortcut(accelerator) {
   shortcuts.delete(id);
   shellCall(4, [id]);
 }
+
+/**
+ * The app's memory in bytes, as the system shows it to users: `phys_footprint` on macOS
+ * (Activity Monitor's "Memory"), `Pss` on Linux and `PrivateUsage` on Windows. `processes` is
+ * how many processes `footprint` counts: the host is one. In the browser it is the wasm
+ * tree's linear memory, without the page's JavaScript heap. `null` when there is no answer.
+ */
+export function memoryUsage() {
+  const footprint = native.memoryUsage?.() ?? 0;
+  return footprint > 0 ? { footprint, processes: 1 } : null;
+}
