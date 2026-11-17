@@ -7,10 +7,15 @@
 import mutation { Declaration, CssProperty }
 import properties.values
 import properties.convert { Context }
+import properties.convert
+import properties.values { Value, Separator }
+import mutation { DimensionKind }
+import silk.geometry.corners { Corners }
 import properties.catalog
 import svg_css.lexer
 import svg_css.tokens { Limits, CssError }
-import svg_css.input { Input }
+import svg_css.input { Input, TokenView }
+import svg_css.tokens { Kind }
 import svg_css.value_cursor { Cursor }
 import svg_css.dimensions
 import svg_css.dimensions { ExprId, Store, Context as LengthContext }
@@ -73,6 +78,21 @@ pub fn handles(property: CssProperty) -> bool {
     || property == CssProperty.TextShadow
     || isMask(property)
     || isBackgroundLayer(property)
+}
+
+/// Whether `apply` reads `property`: the ones it `handles`, `isolation` and `will-change`
+/// (which `Computed.set` routes here itself), and the corner radii, whose percentages it keeps
+/// (`Computed` keeps their lengths).
+pub fn reads(property: CssProperty) -> bool {
+  return handles(property) || isRadius(property) || property == CssProperty.Isolation
+    || property == CssProperty.WillChange
+}
+
+fn isRadius(property: CssProperty) -> bool {
+  return property == CssProperty.BorderRadius || property == CssProperty.BorderTopLeftRadius
+    || property == CssProperty.BorderTopRightRadius
+    || property == CssProperty.BorderBottomRightRadius
+    || property == CssProperty.BorderBottomLeftRadius
 }
 
 fn isMask(property: CssProperty) -> bool {
@@ -194,6 +214,25 @@ impl Layers {
     return if n == 0 { Clip.Border } else { self.clips.get(layer % n) }
   }
 
+  /// The `background-clip` of the background color: the bottom layer's.
+  pub fn colorClip(self: &Self) -> Clip {
+    let n = self.images.length()
+    return self.clip(if n == 0 { 0 } else { n - 1 })
+  }
+
+  /// Whether a layer or the color is clipped to the text.
+  pub fn textClipped(self: &Self) -> bool {
+    let n = if self.images.length() == 0 { 1 } else { self.images.length() }
+    let mut i: usize = 0
+    while i < n {
+      if self.clip(i) == Clip.Text {
+        return true
+      }
+      i = i + 1
+    }
+    return false
+  }
+
   pub fn composite(self: &Self, layer: usize) -> Composite {
     let n = self.composites.length()
     return if n == 0 { Composite.Add } else { self.composites.get(layer % n) }
@@ -215,6 +254,12 @@ pub struct Effects {
   pub hasShadows: bool,
   /// A `vector.layer` blend mode.
   pub blend: u8,
+  /// The percentage part of each corner radius, a fraction of the box.
+  pub radii: Corners<f32>,
+  /// `isolation: isolate`: blending inside stays inside.
+  pub isolate: bool,
+  /// `will-change` names a property that makes a stacking context.
+  pub stacks: bool,
   /// Same declarations at the same font size and color hash alike.
   pub hash: u64,
 }
@@ -230,6 +275,9 @@ impl Effects {
       shadows: List<TextShadow>.make(),
       hasShadows: false,
       blend: BLEND_NORMAL,
+      radii: Corners<f32>.zero(),
+      isolate: false,
+      stacks: false,
       hash: 0,
     }
   }
@@ -238,6 +286,7 @@ impl Effects {
   pub fn layered(self: &Self) -> bool {
     return self.filters.length() != 0 || self.clip.length() != 0 || self.masks.painted()
       || self.blend != BLEND_NORMAL
+      || self.isolate
   }
 
   /// `length` or `percentage` `id` in CSS pixels, percentages of `basis`.
@@ -270,7 +319,7 @@ pub effect fn applyAll(effects: &mut Effects, declarations: &[Declaration], basi
   ? &mut Allocator {
   let mut i: usize = 0
   while i < declarations.length {
-    if handles(declarations[i].property) {
+    if reads(declarations[i].property) {
       run apply(&mut effects.*, &declarations[i], basis)
     }
     i = i + 1
@@ -318,7 +367,83 @@ pub effect fn apply(effects: &mut Effects, declaration: &Declaration, basis: Bas
   }
   h = Hash.combine(h, if units.vertical { 1 } else { 0 })
   effects.hash = h
+  if isRadius(declaration.property) {
+    applyRadius(&mut effects.*, declaration, units)
+    return
+  }
   drop run Effect.catch<CssError>(applyText(&mut effects.*, declaration.property, bytes, basis), ignored)
+}
+
+/// The percentage part of a corner radius, or of each corner `border-radius` sets.
+fn applyRadius(effects: &mut Effects, declaration: &Declaration, units: &Context) -> () {
+  let property = declaration.property
+  if property != CssProperty.BorderRadius {
+    match share(&declaration.value, units) {
+      Option.Some { value } => {
+        if property == CssProperty.BorderTopLeftRadius {
+          effects.radii.topLeft = value
+        } else if property == CssProperty.BorderTopRightRadius {
+          effects.radii.topRight = value
+        } else if property == CssProperty.BorderBottomRightRadius {
+          effects.radii.bottomRight = value
+        } else {
+          effects.radii.bottomLeft = value
+        }
+      }
+      Option.None => {}
+    }
+    return
+  }
+  // One to four values: top-left, top-right, bottom-right, bottom-left, as `margin` repeats.
+  match &declaration.value {
+    Value.Sequence { separator: Separator.Space, values } => {
+      let items = values.asSlice()
+      if items.length < 2 || items.length > 4 {
+        return
+      }
+      let mut found: [f32; 4] = [0.0; 4]
+      let mut i: usize = 0
+      while i < items.length {
+        match share(&items[i], units) {
+          Option.Some { value } => {
+            found[i] = value
+          }
+          Option.None => {
+            return
+          }
+        }
+        i = i + 1
+      }
+      let topRight = found[1]
+      let bottomRight = if items.length >= 3 { found[2] } else { found[0] }
+      let bottomLeft = if items.length == 4 { found[3] } else { found[1] }
+      effects.radii = Corners<f32>.new(found[0], topRight, bottomRight, bottomLeft)
+    }
+    Value.Sequence { .. } => {}
+    _ => {
+      match share(&declaration.value, units) {
+        Option.Some { value } => {
+          effects.radii = Corners<f32>.uniform(value)
+        }
+        Option.None => {}
+      }
+    }
+  }
+}
+
+/// The percentage of a length-percentage radius, as a fraction; `None` when it is not one.
+fn share(value: &Value, units: &Context) -> Option<f32> {
+  return match convert.dimension(value, units) {
+    Option.Some { value: found } => {
+      if (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+        || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0 {
+        Option<f32>.some(found.percent)
+      } else {
+        Option<f32>.None
+      }
+    }
+    Option.None => Option<f32>.None
+  }
 }
 
 effect fn ignored(error: CssError) -> () {
@@ -345,6 +470,18 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     if mode != 255 && cursor.done(&source) {
       effects.blend = mode
     }
+    return
+  }
+  if property == CssProperty.Isolation {
+    if cursor.ident(&source, b"isolate") && cursor.done(&source) {
+      effects.isolate = true
+    } else if cursor.ident(&source, b"auto") && cursor.done(&source) {
+      effects.isolate = false
+    }
+    return
+  }
+  if property == CssProperty.WillChange {
+    applyWillChange(&mut effects.*, &source, &mut cursor)
     return
   }
   if property == CssProperty.TextShadow {
@@ -612,6 +749,76 @@ effect fn applyShadows(
   }
   effects.shadows = move shadows
   effects.hasShadows = true
+}
+
+/// Steps over one identifier.
+fn anyIdent(source: &Input<'_>, cursor: &mut Cursor) -> bool {
+  cursor.skip(source)
+  if cursor.position >= cursor.end {
+    return false
+  }
+  match source.at(cursor.position) {
+    Option<TokenView>.Some { value } => {
+      match &value.token.kind {
+        Kind.Ident { .. } => {
+          cursor.position = cursor.position + 1
+          return true
+        }
+        _ => {}
+      }
+    }
+    _ => {}
+  }
+  return false
+}
+
+/// `will-change`: `auto`, or a comma-separated list of property names. A property whose
+/// non-initial value makes a stacking context makes one now, as in browsers.
+fn applyWillChange(effects: &mut Effects, source: &Input<'_>, cursor: &mut Cursor) -> () {
+  if cursor.ident(source, b"auto") {
+    if cursor.done(source) {
+      effects.stacks = false
+    }
+    return
+  }
+  let names: [&[u8]; 14] = [
+    b"transform",
+    b"translate",
+    b"rotate",
+    b"scale",
+    b"perspective",
+    b"opacity",
+    b"filter",
+    b"backdrop-filter",
+    b"mix-blend-mode",
+    b"isolation",
+    b"clip-path",
+    b"mask",
+    b"mask-image",
+    b"z-index",
+  ]
+  let mut stacks = false
+  while true {
+    let mut matched = false
+    let mut i: usize = 0
+    while i < names.length {
+      if cursor.ident(source, names[i]) {
+        matched = true
+        stacks = true
+        break
+      }
+      i = i + 1
+    }
+    if !matched && !anyIdent(source, &mut cursor.*) {
+      return
+    }
+    if !cursor.comma(source) {
+      break
+    }
+  }
+  if cursor.done(source) {
+    effects.stacks = stacks
+  }
 }
 
 /// The `vector.layer` blend mode a `mix-blend-mode` keyword names, or 255.

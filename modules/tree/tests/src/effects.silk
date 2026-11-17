@@ -6,7 +6,7 @@
 import ui_tree.css
 import ui_tree.css { px, Declaration, Property }
 import ui_fixtures.fixtures as fixtures
-import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, Position }
 import font_collection.lib { FontCollection }
 import vector.pixmap { Pixmap }
 import vector.geometry_error { GeometryError }
@@ -434,4 +434,124 @@ test effect fn textShadowsInherit() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run textBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Draws box 2 with `outer` holding box 3 with `inner` (each 100 by 100 unless they say), or
+/// the text "Mm" when `inner` is empty, over the white root.
+effect fn nested(collection: &FontCollection, outer: &[Declaration], inner: &[Declaration]) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[css.width(px(100.0)), css.height(px(100.0)), css.backgroundColor(Rgba<f32>.new(1.0, 1.0, 1.0, 1.0))],
+  )
+  run batch.box(1, 2, &[css.width(px(100.0)), css.height(px(100.0))])
+  run batch.style(2, outer)
+  if inner.length == 0 {
+    run batch.text(2, 3, "Mm")
+  } else {
+    run batch.box(2, 3, &[css.width(px(100.0)), css.height(px(100.0))])
+    run batch.style(3, inner)
+  }
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn clipsBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+
+  // The color stops at the padding box, under a see-through border.
+  let full = run paint(&collection, &[css.backgroundColor(red()), css.borderWidth(px(10.0)), run declared(Property.BorderStyle, b"solid"), css.borderColor(Rgba<f32>.new(0.0, 0.0, 1.0, 0.5))])
+  let padded = run paint(
+    &collection,
+    &[
+      css.backgroundColor(red()),
+      css.borderWidth(px(10.0)), run declared(Property.BorderStyle, b"solid"), css.borderColor(Rgba<f32>.new(0.0, 0.0, 1.0, 0.5)),
+      run declared(Property.BackgroundClip, b"padding-box"),
+    ],
+  )
+  run Testing.expect(at(&full, 5, 50, 128, 0, 128), "border-box: red shows through the border")
+  run Testing.expect(at(&padded, 5, 50, 128, 128, 255), "padding-box: white shows through it")
+  run Testing.expect(at(&padded, 50, 50, 255, 0, 0), "the color still fills the padding box")
+  let content = run paint(
+    &collection,
+    &[css.backgroundColor(red()), css.padding(px(20.0)), run declared(Property.BackgroundClip, b"content-box")],
+  )
+  run Testing.expect(at(&content, 10, 50, 255, 255, 255), "content-box leaves the padding")
+  run Testing.expect(at(&content, 50, 50, 255, 0, 0), "and fills the content box")
+
+  // Clipped to the text: the background shows only inside transparent glyphs.
+  let style = [
+    css.fontSize(px(40.0)),
+    css.color(Rgba<f32>.new(0.0, 0.0, 0.0, 0.0)),
+    css.backgroundColor(red()),
+    run declared(Property.BackgroundClip, b"text"),
+  ]
+  let text = run nested(&collection, &style, &[])
+  run Testing.expect(reds(&text) > 30, "the glyphs fill with the background")
+  run Testing.expect(at(&text, 95, 95, 255, 255, 255), "the box around them stays clear")
+  let gradient = [
+    css.fontSize(px(40.0)),
+    css.color(Rgba<f32>.new(0.0, 0.0, 0.0, 0.0)),
+    run declared(Property.BackgroundImage, b"linear-gradient(red, red)"),
+    run declared(Property.BackgroundClip, b"text"),
+  ]
+  let painted = run nested(&collection, &gradient, &[])
+  run Testing.expect(reds(&painted) > 30, "a gradient fills the glyphs too")
+  run Testing.expect(at(&painted, 95, 95, 255, 255, 255), "and nothing else")
+
+  // Percentage radii: 50% of a square is a circle.
+  let round = run paint(&collection, &[css.backgroundColor(red()), css.borderRadius(css.percent(50.0))])
+  run Testing.expect(at(&round, 50, 50, 255, 0, 0), "the middle is filled")
+  run Testing.expect(at(&round, 8, 8, 255, 255, 255), "the corner is cut")
+  run Testing.expect(at(&round, 50, 2, 255, 0, 0), "the edge middle is filled")
+  let one = run paint(&collection, &[css.backgroundColor(red()), css.borderTopLeftRadius(css.percent(30.0))])
+  run Testing.expect(at(&one, 4, 4, 255, 255, 255), "a percentage on one corner")
+  run Testing.expect(at(&one, 96, 4, 255, 0, 0), "rounds only that corner")
+}
+
+test effect fn backgroundClipAndPercentRadii() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clipsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn contextsBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let blended = [css.backgroundColor(red()), run declared(Property.MixBlendMode, b"difference")]
+
+  // A blended child blends with the white root, unless its parent isolates it.
+  let open = run nested(&collection, &[], &blended)
+  run Testing.expect(at(&open, 50, 50, 0, 255, 255), "red differenced with white")
+  let isolated = run nested(&collection, &[run declared(Property.Isolation, b"isolate")], &blended)
+  run Testing.expect(at(&isolated, 50, 50, 255, 0, 0), "isolate: nothing under it to blend with")
+  let auto = run nested(&collection, &[run declared(Property.Isolation, b"auto")], &blended)
+  run Testing.expect(at(&auto, 50, 50, 0, 255, 255), "auto blends again")
+
+  // A negative z-index child paints under its parent's background, unless `will-change`
+  // makes the parent a stacking context.
+  let below = [css.backgroundColor(Rgba<f32>.new(0.0, 0.0, 1.0, 1.0)), css.position(Position.Relative), css.declare(Property.ZIndex, css.number(-1.0))]
+  let plain = run nested(&collection, &[css.backgroundColor(red())], &below)
+  run Testing.expect(at(&plain, 50, 50, 255, 0, 0), "the child sits under the red parent")
+  let changing = run nested(&collection, &[css.backgroundColor(red()), run declared(Property.WillChange, b"opacity, transform")], &below)
+  run Testing.expect(at(&changing, 50, 50, 0, 0, 255), "will-change: transform puts it in the parent's context")
+  let scrolling = run nested(&collection, &[css.backgroundColor(red()), run declared(Property.WillChange, b"scroll-position")], &below)
+  run Testing.expect(at(&scrolling, 50, 50, 255, 0, 0), "a property that makes no context does not")
+}
+
+test effect fn isolationAndWillChangeMakeContexts() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run contextsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

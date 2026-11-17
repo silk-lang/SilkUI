@@ -119,6 +119,11 @@ impl Copy for Computed {}
 pub struct EffectState {
   /// Whether the node's looks set a property `paint_css` reads.
   pub declared: bool,
+  /// Whether `will-change` makes the box a stacking context.
+  pub stacks: bool,
+  /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
+  /// `paint.radii` holds the length part.
+  pub radiusShare: bool,
   /// `paint_css.Effects.hash` of the node's effects.
   pub hash: u64,
   /// The node whose `text-shadow` this one paints (it inherits), or `NO_SHADOW`.
@@ -393,6 +398,33 @@ fn setPixels(target: &mut f32, value: &Value, context: &Context) -> () {
   }
 }
 
+/// Whether `value` is a percentage or a math function, which may hold one.
+fn hasPercent(value: &Value) -> bool {
+  return match &value.* {
+    Value.Unit { unit, .. } => unit == Unit.Percent
+    Value.Math { .. } => true
+    _ => false
+  }
+}
+
+/// A corner radius with a percentage: its length part in `length`, and a percentage part noted in `effects` for
+/// `paint_css` to read.
+fn setRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context: &Context) -> () {
+  match convert.dimension(value, context) {
+    Option.Some { value: found } => {
+      if (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+        || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0 {
+        length.* = found.value
+        if found.percent > 0.0 {
+          effects.radiusShare = true
+          effects.declared = true
+        }
+      }
+    }
+    Option.None => {}
+  }
+}
+
 /// A border width: a length, or `thin`, `medium`, `thick`.
 fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
@@ -539,7 +571,7 @@ impl Computed {
       layout: CssStyle.make(),
       paint: Paint.initial(),
       text: text,
-      effects: EffectState { declared: false, hash: 0, shadowFrom: NO_SHADOW, shadowHash: 0, layered: false },
+      effects: EffectState { declared: false, hash: 0, shadowFrom: NO_SHADOW, shadowHash: 0, layered: false, stacks: false, radiusShare: false },
       viewportWidth: width,
       viewportHeight: height,
       usesViewport: false,
@@ -1023,16 +1055,16 @@ impl Computed {
         setBorderWidth(&mut self.paint.border.left, value, &context)
       }
       CssProperty.BorderTopLeftRadius => {
-        setPixels(&mut self.paint.radii.topLeft, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topLeft, value, &context) }
       }
       CssProperty.BorderTopRightRadius => {
-        setPixels(&mut self.paint.radii.topRight, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topRight, value, &context) }
       }
       CssProperty.BorderBottomRightRadius => {
-        setPixels(&mut self.paint.radii.bottomRight, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomRight, value, &context) }
       }
       CssProperty.BorderBottomLeftRadius => {
-        setPixels(&mut self.paint.radii.bottomLeft, value, &context)
+        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomLeft, value, &context) }
       }
       // Keywords.
       CssProperty.Position => {
@@ -1835,6 +1867,10 @@ impl Computed {
         } else if setColor(&mut self.text.placeholderColor, value) {
           self.text.hasPlaceholderColor = true
         }
+      }
+      // Read with the paint effects (`paint_css.reads`), but not in its hot `handles` test.
+      CssProperty.Isolation | CssProperty.WillChange => {
+        self.effects.declared = true
       }
       // Properties the tree does not support are ignored.
       _ => {}
