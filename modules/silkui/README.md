@@ -50,8 +50,8 @@ An app goes through three stages, and each step is scoped under the stage it tak
 | `app.compilations(&options)` | Build | Describes the selected hosts as standard compilations, with generated entry modules and release bundles as prerequisites; runs no tools |
 | `App.build(&options)` | Built | Compiles the graph and assembles browser pages. Development builds also install the Vite packages needed to launch the dev server |
 | `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>`, and each page to `<dir>/<target>/` |
-| `Built.launch()` | Running | Starts the first target: Vite's dev server for an unoptimized JavaScript app, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
-| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, or reloads the page |
+| `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
+| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
 
 `App.tap(fn)`, `Built.tap(fn)` and `Running.tap(fn)` run a function on the value and pass it
 on; `App.map` and `Built.map` take an effect closure that makes a new value of the same

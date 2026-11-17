@@ -2,6 +2,7 @@ import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, Mutation
 import ui_tree.lib { RootOptions, StyleSource }
 import ui_fixtures.fixtures as fixtures
 import ui_assets.assets as assets
+import font_collection.lib { FontCollection, Generic }
 import svg_css.compile { CompileError, Options }
 import svg_css.compile
 import svg_css.written
@@ -212,4 +213,63 @@ effect fn localAndOrder() ! TreeError | CompileError | CssError | OutOfMemoryErr
 test effect fn stylesheetFontFacesHonorLocalSourcesLayersAndSheetOrder() ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run localAndOrder() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn familyWidth(fonts: &FontCollection, family: &[u8]) -> f32 ! TreeError | CssError | OutOfMemoryError ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  let mut batch = Batch.make()
+  run batch.create(1,NodeKind.Box)
+  run batch.create(2,NodeKind.Box)
+  run batch.append(1,2)
+  run batch.create(3,NodeKind.Text)
+  run batch.append(2,3)
+  run batch.setText(3,"iiiiiiiiii")
+  let mut css = run Bytes.copy(b"display:inline-block;font-size:16px;font-family:")
+  run Bytes.append(&mut css, family)
+  let style = run written.declarations(Bytes.asSlice(&css))
+  run batch.style(2,style.asSlice())
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(frame(400.0))
+  return run width(&tree,2)
+}
+
+effect fn uiGenerics() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut fonts = run fixtures.fonts()
+  run fonts.addGeneric(Generic.Monospace, b"Geist Mono")
+  run fonts.addGeneric(Generic.Serif, b"Geist")
+  run fonts.addGeneric(Generic.SystemUi, b"Noto Sans")
+  run fonts.addGeneric(Generic.UiRounded, b"Geist")
+  let mono = run familyWidth(&fonts, b"'Geist Mono'")
+  let geist = run familyWidth(&fonts, b"Geist")
+  let noto = run familyWidth(&fonts, b"'Noto Sans'")
+  run Testing.expect(!close(mono, noto) && !close(geist, noto), "the families draw at different widths")
+  run Testing.expect(close(run familyWidth(&fonts, b"ui-monospace, 'Noto Sans'"), mono), "ui-monospace is monospace")
+  run Testing.expect(close(run familyWidth(&fonts, b"UI-Serif, 'Noto Sans'"), geist), "ui-serif is serif, in any case")
+  run Testing.expect(close(run familyWidth(&fonts, b"ui-sans-serif, Geist"), noto), "ui-sans-serif is system-ui")
+  run Testing.expect(close(run familyWidth(&fonts, b"ui-rounded, 'Noto Sans'"), geist), "the host's own ui-rounded family comes first")
+  run Testing.expect(close(run familyWidth(&fonts, b"'ui-monospace', Geist"), geist), "a quoted ui-monospace is a family name")
+}
+
+test effect fn uiFontFamiliesAliasTheGenerics() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run uiGenerics() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn variations() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let plain = run familyWidth(&fonts, b"Geist")
+  let heavy = run familyWidth(&fonts, b"Geist;font-variation-settings:'wght' 800")
+  let bold = run familyWidth(&fonts, b"Geist;font-weight:800")
+  run Testing.expect(heavy > plain + 1.0, "a wght setting draws Geist heavier")
+  run Testing.expect(close(heavy, bold), "wght 800 draws as font-weight 800")
+  run Testing.expect(close(run familyWidth(&fonts, b"Geist;font-weight:800;font-variation-settings:\"wght\" 400"), plain), "the setting wins over font-weight")
+  run Testing.expect(close(run familyWidth(&fonts, b"Geist;font-variation-settings:'wght' 800, 'wght' 400"), plain), "a repeated axis takes its last value")
+  run Testing.expect(close(run familyWidth(&fonts, b"Geist;font-variation-settings:normal"), plain), "normal sets no axis")
+  run Testing.expect(close(run familyWidth(&fonts, b"Geist;font-variation-settings:'wght'"), plain), "an axis without a value is dropped")
+}
+
+test effect fn fontVariationSettingsSetAxes() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run variations() |> Effect.provideMut<Allocator>(&mut allocator)
 }

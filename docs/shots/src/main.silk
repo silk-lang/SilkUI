@@ -17,6 +17,9 @@ import examples.native.search {
 import examples.showcase.board { Board, Message as BoardMessage }
 import examples.native.swatches { Message as SwatchesMessage, Swatches }
 import examples.tree.card as card
+import examples.core.inbox_tailwind as inbox
+import examples.core.plans_css as plans_css
+import examples.core.plans_sheet as plans_sheet
 import examples.tree.clicker as clicker
 import examples.tree.field as field
 import examples.tree.picture { Camera }
@@ -33,6 +36,10 @@ import ui_tree.legacy { Batch, FrameInput, Mutation, TreeError as EngineError, U
 import ui_tree.lib { Input, NodeId, ProtocolError, Tree, TreeError, Viewport }
 import ui_tree.mutation { FIRST_ROOT }
 import ui_tree_window.host { WindowClient }
+import ui_tree.style_media { Preferences }
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.tokens { CssError }
 import codec.image { ImageError }
 import font_collection.lib { FontCollection }
 import vector.geometry_error { GeometryError }
@@ -205,6 +212,43 @@ effect fn board(out: &mut Out, fonts: &FontCollection) -> ()
   run shoot(&mut out, &mut snapshot, "native-board.png", &mut tree, size)
 }
 
+/// Compiles `css` as a build does and adopts it on the tree's root, in a desktop window's
+/// media environment (a pointer that can hover).
+effect fn adopt(tree: &mut UiTree<'_>, css: string) -> ()
+  ! EngineError | CompileError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  drop tree.setStylePreferences(Preferences.desktop(false))
+  let compiled = run compile.compile(String.utf8Bytes(css), &Options.make())
+  let bytes = run compiled.encode()
+  let mut batch = Batch.make()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  // A window names the system's fonts; here the only fonts are the fixtures', and a weight
+  // picks a face only within a family that is there.
+  let family = run compile.compile(b":root { font-family: \"Noto Sans\", sans-serif }", &Options.make())
+  let familyBytes = run family.encode()
+  run batch.adoptStyleSheet(0, 2, familyBytes.asSlice())
+  run tree.apply(run batch.take())
+}
+
+/// The plan picker and the inbox that take every style from a stylesheet.
+effect fn sheets(out: &mut Out, fonts: &FontCollection) -> ()
+  ! EngineError | CompileError | CssError | GeometryError | ImageError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut snapshot = CpuSnapshot.make()
+  let mut plans = run engine(fonts)
+  let mut picker = run program.make<plans_sheet.Plans, plans_sheet.Message, NoCommand>()
+  run picker.start(&mut plans, 0.0)
+  run drain(&mut picker, &mut plans)
+  run adopt(&mut plans, plans_css.PLAIN)
+  run shoot(&mut out, &mut snapshot, "native-plans-sheet.png", &mut plans, window(640.0, 150.0))
+  let mut mail = run engine(fonts)
+  let mut app = run program.make<inbox.Inbox, inbox.Message, NoCommand>()
+  run app.start(&mut mail, 0.0)
+  run drain(&mut app, &mut mail)
+  run adopt(&mut mail, plans_css.INBOX)
+  run shoot(&mut out, &mut snapshot, "native-inbox-tailwind.png", &mut mail, window(480.0, 230.0))
+}
+
 /// Answers the album's loads as `Window.file` would: its photos, icons and fonts by relative
 /// URL.
 effect fn serveAlbum(tree: &mut UiTree<'_>) -> ()
@@ -350,6 +394,8 @@ effect fn search(out: &mut Out, fonts: &FontCollection) -> ()
 
 effect fn draw() -> i32
   ! TreeError
+    | CompileError
+    | CssError
     | EngineError
     | ProtocolError
     | GeometryError
@@ -380,6 +426,7 @@ effect fn draw() -> i32
   run album(&mut out, &fonts)
   run treeWindow(&mut out, &fonts)
   run swatches(&mut out, &fonts)
+  run sheets(&mut out, &fonts)
   let mut shell = ShellLog.make()
   let mut disk = NoDisk {}
   run pad(&mut out, &fonts)

@@ -104,20 +104,6 @@ Follow its setup instructions, then run from the **silk-studio repository root**
 - Desktop: `node scripts/studio --release`
 - Browser: `node scripts/browser serve`, then open <http://127.0.0.1:8050/> in Chrome/Edge 137+.
 
-### Applications in nonstd
-
-The other full applications live in [silk-lang/nonstd](https://github.com/silk-lang/nonstd),
-not in this repository. Open or clone that repository, follow its
-[local setup](https://github.com/silk-lang/nonstd#run-an-application-locally), and run
-these commands from the **nonstd repository root**:
-
-| Application | Native launch command |
-| --- | --- |
-| [Notes](https://github.com/silk-lang/nonstd/tree/main/examples/notes) | `node examples/notes/scripts/notes` |
-| [Scroll Lab](https://github.com/silk-lang/nonstd/tree/main/examples/scroll-demo) | `node examples/scroll-demo/scripts/run` |
-| [Silk Loom showcase](https://github.com/silk-lang/nonstd/tree/main/examples/showcase) | `node examples/showcase/scripts/app` |
-| [Graphics Demo](https://github.com/silk-lang/nonstd/tree/main/examples/graphics-demo) | `node examples/graphics-demo/scripts/app` |
-
 ### Strict checks
 
 Keep compiler warnings enabled and fix them. Remove genuinely unused imports and bindings.
@@ -126,7 +112,7 @@ intentional module bindings, not warning suppression or removal of test/browser 
 
 ## Provenance and toolchains
 
-Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo live in the application repositories linked above; they are consumers, not dependencies of this repository.
+Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Studio lives in its own repository, linked above; it is a consumer, not a dependency of this repository.
 
 Use Silk **0.1.0-dev.74+205aea3f5b2e** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
 

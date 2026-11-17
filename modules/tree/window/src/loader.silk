@@ -38,6 +38,10 @@ import silk.encoding.base64 { Base64 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.url.percent { UrlPercent }
+import silk.num.f64
+import silk.num.u8
+import silk.num.usize
+import ui_inspect_server.server { debugBuild }
 
 /// A font stylesheet being read: where its relative `src` URLs resolve.
 struct StyleLoad { id: u32, ticket: StyleTicket }
@@ -48,6 +52,15 @@ struct SheetLoad {
   directory: String,
   /// The sheet's URL, for one fetched over HTTP(S).
   base: String,
+}
+
+/// An image or icon read from a file, which a debug build reads again when the file changes.
+struct Watched {
+  resource: u32,
+  icon: bool,
+  path: String,
+  /// The file's length and a hash of its bytes when it was last read, 0 before.
+  stamp: u64,
 }
 
 /// A file the program carries, served for the relative URL `path`.
@@ -85,6 +98,9 @@ pub struct Loader {
   styles: Remote,
   waitingStyles: List<StyleLoad>,
   nextStyle: u32,
+  watched: List<Watched>,
+  /// When `watch` next reads the watched files, in the host's seconds.
+  nextWatch: f64,
 }
 
 impl Loader {
@@ -103,7 +119,74 @@ impl Loader {
       styles: Remote.forSheets(),
       waitingStyles: List<StyleLoad>.make(),
       nextStyle: 1,
+      watched: List<Watched>.make(),
+      nextWatch: 0.0,
     }
+  }
+
+  /// In a debug build, reads the image and icon files it loaded again every half second and
+  /// installs the ones that changed, so an edited asset shows without a restart. `time` is in
+  /// seconds.
+  pub effect fn watch(self: &mut Self, time: f64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      if !debugBuild() || self.watched.length() == 0 || time < self.nextWatch {
+        return ()
+      }
+      self.nextWatch = time + WATCH_SECONDS
+      let mut files = run MachineFileSystem.make()
+      let mut i: usize = 0
+      while i < self.watched.length() {
+        let path = run String.copy(String.view(&self.watched.asSlice()[i].path))
+        let stamp = run Effect.catchAll(stampOf(String.view(&path)), unstamped)
+          |> Effect.provideMut<FileSystem>(&mut files)
+        let entry = &mut self.watched.asMutSlice()[i]
+        let before = entry.stamp
+        let resource = entry.resource
+        let icon = entry.icon
+        if stamp != 0 {
+          entry.stamp = stamp
+        }
+        if stamp != 0 && before != 0 && stamp != before {
+          if icon {
+            run self.remote.fileIcon(resource, String.view(&path))
+          } else {
+            run self.remote.file(resource, String.view(&path))
+          }
+          run self.wait(resource, icon)
+        }
+        i = i + 1
+      }
+    }
+  }
+
+  /// When the host should wake for `watch`, given when it wanted to.
+  pub fn watchAfter(self: &Self, wanted: Option<f64>) -> Option<f64> {
+    if !debugBuild() || self.watched.length() == 0 {
+      return wanted
+    }
+    return match wanted {
+      Option<f64>.Some { value } => Option<f64>.some(f64.min(value, WATCH_SECONDS))
+      Option<f64>.None => Option<f64>.some(WATCH_SECONDS)
+    }
+  }
+
+  effect fn remember(self: &mut Self, resource: u32, icon: bool, path: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !debugBuild() {
+      return ()
+    }
+    let list = self.watched.asSlice()
+    let mut i: usize = 0
+    while i < list.length {
+      if list[i].resource == resource && list[i].icon == icon {
+        return ()
+      }
+      i = i + 1
+    }
+    run self.watched.append(Watched { resource: resource, icon: icon, path: run String.copy(path), stamp: 0 })
   }
 
   /// Serves the relative URL `path` (`"photos/dusk.png"`) from `data`, bytes the program
@@ -482,6 +565,7 @@ impl Loader {
       } else {
         run self.remote.file(resource, local)
       }
+      run self.remember(resource, icon, local)
       run self.wait(resource, icon)
       return false
     }
@@ -501,6 +585,7 @@ impl Loader {
       } else {
         run self.remote.file(resource, String.view(&path))
       }
+      run self.remember(resource, icon, String.view(&path))
       run self.wait(resource, icon)
       return false
     }
@@ -539,6 +624,56 @@ impl Loader {
     let ok = run Effect.catch<TreeError>(applied(&mut tree, run batch.take()), notApplied)
     run self.settle(resource, icon, ok)
     return ok
+  }
+}
+
+/// How often a debug build reads the image and icon files it loaded again.
+const WATCH_SECONDS: f64 = 0.5
+
+/// Files past this many bytes are compared by their length and their first and last pages.
+const WHOLE_HASH_LIMIT: usize = 65536
+
+fn hashed(hash: u64, bytes: &[u8], from: usize, to: usize) -> u64 {
+  let mut value = hash
+  let mut at = from
+  while at < to {
+    value = ((value ^ u8.toU64(bytes[at])) * 16777619) & 4294967295
+    at = at + 1
+  }
+  return value
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.filesystem { FileSystem, FileError, Path }
+  import silk.system.filesystem_machine { MachineFileSystem }
+  import silk.system.host_input { HostInputError }
+  import images { resolveFile }
+
+  /// The length of the file at `path` and a hash of its bytes, never 0.
+  effect fn stampOf(path: string) -> u64
+    ! FileError | HostInputError | OutOfMemoryError
+    ? &mut Allocator | &mut FileSystem {
+    // The image loader's spelling: a Windows `C:/x` is `/C:/x` to the file system.
+    let resolved = run resolveFile(path)
+    let file = run Path.make(String.view(&resolved))
+    let data = run FileSystem.readFile(&file)
+    let bytes = data.asSlice()
+    let mut hash: u64 = (2166136261 ^ usize.toU64(bytes.length)) & 4294967295
+    if bytes.length <= WHOLE_HASH_LIMIT {
+      hash = hashed(hash, bytes, 0, bytes.length)
+    } else {
+      hash = hashed(hash, bytes, 0, 4096)
+      hash = hashed(hash, bytes, bytes.length - 4096, bytes.length)
+    }
+    if hash == 0 {
+      return 1
+    }
+    return hash
+  }
+
+  effect fn unstamped(error: FileError | HostInputError | OutOfMemoryError) -> u64 {
+    drop error
+    return 0
   }
 }
 

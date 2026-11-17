@@ -19,7 +19,7 @@ import stacking { Stacking, IN_FLOW }
 import edit
 import selection
 import placeholder
-import scrollbar_parts { Part, Scrollbars, THUMB_COLOR }
+import scrollbar_parts { Part, Scrollbars }
 import scrollbar_parts
 import caret
 import rich
@@ -45,7 +45,7 @@ import ui_scene.scene { Scene }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition }
 import ui_scene.effects { LayerEffects }
 import paint_effects
-import paint_css { Effects, TextShadow }
+import paint_css { Effects, TextShadow, Clip }
 import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
 import ui_scene.path_cache { PathCache }
@@ -213,8 +213,8 @@ pub fn paddingBox(f: &Fragment) -> Rect<f32> {
 /// A visible axis remains unbounded (not the other axis's padding extent).
 pub fn overflowClip(c: &Computed, f: &Fragment) -> Rect<f32> {
   let padding = paddingBox(f)
-  let clipX = usedOverflow(c, true) != Overflow.Visible
-  let clipY = usedOverflow(c, false) != Overflow.Visible
+  let clipX = usedOverflow(c, true) != Overflow.Visible || c.contain.paint()
+  let clipY = usedOverflow(c, false) != Overflow.Visible || c.contain.paint()
   return Rect<f32>.new(
     if clipX {
       padding.xMin
@@ -254,6 +254,36 @@ pub fn scaledCorners(radii: Corners<f32>, scale: f32) -> Corners<f32> {
   )
 }
 
+/// The corner radii of fragment `f`'s border box with style `c`, in CSS pixels.
+pub fn radiiOf(p: &Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment) -> Corners<f32> {
+  if !c.effects.radiusShare {
+    return c.paint.radii
+  }
+  return radiiIn(p, slot, c, f.size.width, f.size.height)
+}
+
+/// The corner radii of node `slot` with style `c` over a `width` by `height` border box. A
+/// percentage takes the shorter side, so the corners stay circular.
+fn radiiIn(p: &Painter<'_, '_>, slot: u32, c: &Computed, width: f32, height: f32) -> Corners<f32> {
+  let r = c.paint.radii
+  if !c.effects.radiusShare || slot == NONE {
+    return r
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => {
+      let share = value.radii
+      let basis = f32.max(0.0, f32.min(width, height))
+      Corners<f32>.new(
+        r.topLeft + share.topLeft * basis,
+        r.topRight + share.topRight * basis,
+        r.bottomRight + share.bottomRight * basis,
+        r.bottomLeft + share.bottomLeft * basis,
+      )
+    }
+    Option<&Effects>.None => r
+  }
+}
+
 fn backgroundOf(fill: Fill) -> Background {
   return match fill {
     Fill.None => Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })
@@ -280,6 +310,97 @@ fn hasBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
   }
 }
 
+/// The `background-clip` of node `slot`'s background color.
+fn colorClipOf(p: &Painter<'_, '_>, slot: u32) -> Clip {
+  if slot == NONE {
+    return Clip.Border
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => value.backgrounds.colorClip()
+    Option<&Effects>.None => Clip.Border
+  }
+}
+
+/// Whether node `slot` paints some of its background into its text (`background-clip: text`).
+fn textClipped(p: &Painter<'_, '_>, slot: u32) -> bool {
+  if slot == NONE {
+    return false
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => value.backgrounds.textClipped()
+    Option<&Effects>.None => false
+  }
+}
+
+/// Paints the `background-clip: text` part of box `index`'s background (node `slot`, style
+/// `c`): the color and layers over the border box, masked by the glyphs of the text inside.
+effect fn paintTextClip(
+  p: &mut Painter<'_, '_>,
+  index: usize,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  let bounds = snapped(device(borderBox(f), s))
+  drop run p.scene.pushEffectLayer(
+    mask.bounds,
+    mask,
+    Isolation { opacity: 1.0, blend: 0 },
+    LayerEffects.none(),
+  )
+  drop run p.scene.pushMaskLayer()
+  run paintGlyphMask(&mut p, index, mask)
+  run p.scene.popLayer()
+  let background = backgroundOf(c.paint.background)
+  let radii = scaledCorners(radiiOf(&p.*, slot, c, f), s)
+  if colorClipOf(&p.*, slot) == Clip.Text && !background.isTransparent() {
+    let mut quad = Quad.fill(bounds, mask, background)
+    quad.cornerRadii = radii
+    drop run p.scene.quad(quad)
+  }
+  let taken = paint_effects.takeEffects(&mut p, slot)
+  match &taken {
+    Option<Box<Effects>>.Some { value } => {
+      let effects = &value.get()[0]
+      run paint_effects.paintLayers(
+        &mut p,
+        effects,
+        &effects.backgrounds,
+        f,
+        radii,
+        mask,
+        GeometryBox.Padding,
+        true,
+      )
+    }
+    Option<Box<Effects>>.None => {}
+  }
+  paint_effects.putEffects(&mut p, slot, move taken)
+  run p.scene.popLayer()
+}
+
+/// The glyphs of the text inside fragment `index`, opaque, for a mask.
+effect fn paintGlyphMask(p: &mut Painter<'_, '_>, index: usize, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let opaque = Option<Rgba<f32>>.some(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0))
+  let mut child = p.output.fragments.values.asSlice()[index].firstChild
+  while child != NO_INDEX {
+    let f = p.output.fragments.values.asSlice()[child]
+    if f.kind == FragmentKind.Text {
+      let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
+      run paintTextAs(&mut p, child, slot, f, mask, opaque, Option<Rgba<f32>>.None)
+    } else {
+      run paintGlyphMask(&mut p, child, mask)
+    }
+    child = f.nextSibling
+  }
+}
+
 effect fn decorate(
   p: &mut Painter<'_, '_>,
   slot: u32,
@@ -292,7 +413,7 @@ effect fn decorate(
   ? &mut Allocator {
   let s = p.scale
   let bounds = snapped(device(borderBox(f), s))
-  let mut radii = scaledCorners(c.paint.radii, s)
+  let mut radii = scaledCorners(radiiOf(&p.*, slot, c, f), s)
   if !hasEdge(edges, 1) {
     radii.topLeft = 0.0
     radii.topRight = 0.0
@@ -343,12 +464,29 @@ effect fn decorate(
     || widths.left > 0.0)
     && c.paint.borderColor.a > 0.0
   let images = hasBackgrounds(&p.*, slot)
+  let colorClip = if c.effects.declared {
+    colorClipOf(&p.*, slot)
+  } else {
+    Clip.Border
+  }
+
+  // The color shares the border's quad only when it fills the border box under no image.
+  let joined = !images && colorClip == Clip.Border
+  if !joined && !background.isTransparent() && colorClip != Clip.Text {
+    let area = paint_effects.clipBox(f, colorClip)
+    let mut quad = Quad.fill(
+      if colorClip == Clip.Border {
+        bounds
+      } else {
+        snapped(device(area, s))
+      },
+      mask,
+      background,
+    )
+    quad.cornerRadii = paint_effects.insetCorners(radii, device(borderBox(f), s), device(area, s))
+    drop run p.scene.quad(quad)
+  }
   if images {
-    if !background.isTransparent() {
-      let mut quad = Quad.fill(bounds, mask, background)
-      quad.cornerRadii = radii
-      drop run p.scene.quad(quad)
-    }
     let taken = paint_effects.takeEffects(&mut p, slot)
     match &taken {
       Option<Box<Effects>>.Some { value } => {
@@ -361,17 +499,18 @@ effect fn decorate(
           radii,
           mask,
           GeometryBox.Padding,
+          false,
         )
       }
       Option<Box<Effects>>.None => {}
     }
     paint_effects.putEffects(&mut p, slot, move taken)
   }
-  if (!images && !background.isTransparent()) || bordered {
+  if (joined && !background.isTransparent()) || bordered {
     let mut quad = Quad.fill(
       bounds,
       mask,
-      if images {
+      if !joined {
         Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 0.0))
       } else {
         background
@@ -412,6 +551,7 @@ const FOCUS_RING: Rgba<f32> = Rgba<f32> { r: 0.0, g: 0.373, b: 0.8, a: 1.0 }
 /// pixels), over what the box painted. It follows the border radii, grown by its distance.
 effect fn paintOutline(
   p: &mut Painter<'_, '_>,
+  slot: u32,
   c: &Computed,
   rect: Rect<f32>,
   mask: ContentMask,
@@ -450,11 +590,16 @@ effect fn paintOutline(
     mask,
     Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
   )
+  let radii = if c.effects.radiusShare {
+    radiiIn(&p.*, slot, c, rect.xMax - rect.xMin, rect.yMax - rect.yMin)
+  } else {
+    c.paint.radii
+  }
   quad.cornerRadii = Corners<f32>.new(
-    radius(c.paint.radii.topLeft),
-    radius(c.paint.radii.topRight),
-    radius(c.paint.radii.bottomRight),
-    radius(c.paint.radii.bottomLeft),
+    radius(radii.topLeft),
+    radius(radii.topRight),
+    radius(radii.bottomRight),
+    radius(radii.bottomLeft),
   )
   let w = o.width * s
   quad.borderWidths = Insets<f32> { top: w, right: w, bottom: w, left: w }
@@ -465,6 +610,81 @@ effect fn paintOutline(
     BorderStyle.Solid
   }
   drop run p.scene.quad(quad)
+}
+
+/// Draws the column rules of a multi-column container (fragment `index`, style `c`): one in
+/// the middle of each gap between two columns with content, as tall as the columns, over the
+/// container's background and under its content (Multicol 1 §4).
+effect fn paintColumnRules(
+  p: &mut Painter<'_, '_>,
+  index: usize,
+  c: &Computed,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let rule = c.columnRule
+  let color = if rule.current {
+    c.text.color
+  } else {
+    rule.color
+  }
+  if color.a <= 0.0 {
+    return ()
+  }
+  let s = p.scale
+  let values = p.output.fragments.values.asSlice()
+  let boxes = p.output.boxNodes.asSlice()
+  let mut set = values[index].firstChild
+  while set != NO_INDEX {
+    let setBox = values[set].box
+    if values[set].kind == FragmentKind.Box && setBox != NO_INDEX && setBox < boxes.length
+      && boxes[setBox].columnSet {
+      let mut column = values[set].firstChild
+      let mut previous = NO_INDEX
+      while column != NO_INDEX {
+        if values[column].kind == FragmentKind.Box {
+          if previous != NO_INDEX {
+            let a = borderBox(&values[previous])
+            let b = borderBox(&values[column])
+            let left = if b.xMin >= a.xMax {
+              a.xMax
+            } else {
+              b.xMax
+            }
+            let right = if b.xMin >= a.xMax {
+              b.xMin
+            } else {
+              a.xMin
+            }
+            let middle = (left + right) * 0.5
+            let half = rule.width * 0.5
+            let top = f32.min(a.yMin, b.yMin)
+            let bottom = f32.max(a.yMax, b.yMax)
+            let line = snapped(device(Rect<f32>.new(middle - half, top, middle + half, bottom), s))
+            let w = f32.max(1.0, line.xMax - line.xMin)
+            let bounds = Rect<f32>.new(line.xMin, line.yMin, line.xMin + w, line.yMax)
+            if rule.style == StyleBorder.Dashed {
+              let mut quad = Quad.fill(
+                bounds,
+                mask,
+                Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+              )
+              quad.borderWidths = Insets<f32> { top: 0.0, right: 0.0, bottom: 0.0, left: w }
+              quad.borderColor = color
+              quad.borderStyle = BorderStyle.Dashed
+              drop run p.scene.quad(quad)
+            } else {
+              drop run p.scene.quad(Quad.fill(bounds, mask, Background.solid(color)))
+            }
+          }
+          previous = column
+        }
+        column = values[column].nextSibling
+      }
+    }
+    set = values[set].nextSibling
+  }
 }
 
 effect fn noGlyph<E>(error: E) -> Option<RasterGlyph> {
@@ -482,7 +702,8 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   ! OutOfMemoryError
   ? &mut Allocator {
   let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
-  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input && f.textData != NO_INDEX {
+  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input
+    && f.textData != NO_INDEX {
     let node = &p.nodes.asSlice()[u32.toUsize(slot)]
     let e = node.edit()
     if e.focused && !e.composing && !e.showsPlaceholder && e.anchor != e.focus {
@@ -504,10 +725,12 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
           if s.xMin < s.xMax && s.yMin < s.yMax {
             // Paint disjoint regions so alpha and partial ligatures replace the
             // selected ink rather than compositing another glyph on top of it.
-            let outside = [Rect<f32>.new(b.xMin, b.yMin, b.xMax, s.yMin),
+            let outside = [
+              Rect<f32>.new(b.xMin, b.yMin, b.xMax, s.yMin),
               Rect<f32>.new(b.xMin, s.yMax, b.xMax, b.yMax),
               Rect<f32>.new(b.xMin, s.yMin, s.xMin, s.yMax),
-              Rect<f32>.new(s.xMax, s.yMin, b.xMax, s.yMax)]
+              Rect<f32>.new(s.xMax, s.yMin, b.xMax, s.yMax),
+            ]
             let mut i: usize = 0
             while i < outside.length {
               let rect = outside[i]
@@ -526,8 +749,15 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
   run paintTextNormally(&mut p, index, slot, f, mask)
 }
 
-effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, mask: ContentMask) -> ()
-  ! OutOfMemoryError ? &mut Allocator {
+effect fn paintTextNormally(
+  p: &mut Painter<'_, '_>,
+  index: usize,
+  slot: u32,
+  f: Fragment,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   if slot != NONE {
     if p.nodes.asSlice()[u32.toUsize(slot)].computed.effects.shadowFrom != NONE {
       let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
@@ -554,7 +784,15 @@ effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f:
             effects,
           )
         }
-        run paintTextAs(&mut p, index, slot, shifted, mask, Option<Rgba<f32>>.some(shadow.color), Option<Rgba<f32>>.None)
+        run paintTextAs(
+          &mut p,
+          index,
+          slot,
+          shifted,
+          mask,
+          Option<Rgba<f32>>.some(shadow.color),
+          Option<Rgba<f32>>.None,
+        )
         if blurred {
           run p.scene.popLayer()
         }
@@ -598,7 +836,9 @@ effect fn paintTextAs(
       if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(slot)]) {
         c = value.computed
         color = c.text.color
-      } else { color = c.text.placeholder() }
+      } else {
+        color = c.text.placeholder()
+      }
     }
     let r = rich.runOf(&e.runs, f.source)
     if e.hasRuns() && r != NO_INDEX {
@@ -612,7 +852,10 @@ effect fn paintTextAs(
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
-  if let Option.Some { value } = foreground { color = value c.text.color = value }
+  if let Option.Some { value } = foreground {
+    color = value
+    c.text.color = value
+  }
   let mut shadowed = false
   if let Option<Rgba<f32>>.Some { value } = shadow {
     color = value
@@ -989,6 +1232,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
   let resource = node.resource
   let s = p.scale
   let content = device(contentBox(f), s)
+  let corners = scaledCorners(radiiOf(&p.*, slot, &c, f), s)
   if kind == NodeKind.Image {
     if let Option<Resource>.Some { value } = p.resources.get(resource) {
       if let Resource.Image { image, width, height } = value {
@@ -1011,7 +1255,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
               mask: mask,
               tile: placed,
               opacity: 1.0,
-              cornerRadii: scaledCorners(c.paint.radii, s),
+              cornerRadii: corners,
               grayscale: false,
             },
           )
@@ -1778,7 +2022,9 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
       if slot != NONE && !f.nonpainting {
         let c = p.nodes.asSlice()[u32.toUsize(slot)].computed
         if c.text.visible {
-          run paintOutline(&mut p, &c, borderBox(&f), mask)
+          if c.outline.drawn() {
+            run paintOutline(&mut p, slot, &c, borderBox(&f), mask)
+          }
         }
       }
     }
@@ -1891,7 +2137,9 @@ effect fn decorateRun(p: &mut Painter<'_, '_>, f: &Fragment, mask: ContentMask) 
   if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(owner)]) {
     if value.css == f.source {
       let c = value.computed
-      if c.text.visible && c.decorated() { run decorate(&mut p, NONE, &c, f, f.decorationEdges, mask) }
+      if c.text.visible && c.decorated() {
+        run decorate(&mut p, NONE, &c, f, f.decorationEdges, mask)
+      }
       return ()
     }
   }
@@ -1915,15 +2163,26 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let mut partOpacity: f32 = 1.0
     if owner != NONE {
       if let Option.Some { value } = placeholder.of(&p.nodes.asSlice()[u32.toUsize(owner)]) {
-        if value.css == f.source { partOpacity = value.computed.paint.opacity }
+        if value.css == f.source {
+          partOpacity = value.computed.paint.opacity
+        }
       }
     }
-    if partOpacity < 1.0 { drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: partOpacity, blend: 0 }, LayerEffects.none()) }
+    if partOpacity < 1.0 {
+      drop run p.scene.pushEffectLayer(
+        mask.bounds,
+        mask,
+        Isolation { opacity: partOpacity, blend: 0 },
+        LayerEffects.none(),
+      )
+    }
     if !f.nonpainting {
       run decorateRun(&mut p, &f, mask)
     }
     run paintStack(&mut p, index, mask)
-    if partOpacity < 1.0 { run p.scene.popLayer() }
+    if partOpacity < 1.0 {
+      run p.scene.popLayer()
+    }
     return ()
   }
   let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
@@ -1971,6 +2230,12 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       let rootPaints = p.only == NONE && p.stacking.rootElement(index)
       if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints {
         run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
+        if c.effects.declared && textClipped(&p.*, slot) {
+          run paintTextClip(&mut p, index, slot, &c, &f, mask)
+        }
+      }
+      if c.columnRule.drawn() {
+        run paintColumnRules(&mut p, index, &c, mask)
       }
       if kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas {
         run paintContent(&mut p, slot, &f, mask)
@@ -2004,7 +2269,9 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       run paintThumbs(&mut p, slot, &c, &f, mask)
     }
     if c.text.visible && !f.nonpainting {
-      run paintOutline(&mut p, &c, borderBox(&f), mask)
+      if c.outline.drawn() {
+        run paintOutline(&mut p, slot, &c, borderBox(&f), mask)
+      }
     }
     run paint_effects.popEffects(&mut p, opened)
   }
@@ -2037,11 +2304,42 @@ effect fn paintThumbs(
   let range = rangeOf(c, f)
   let node = &p.nodes.asSlice()[u32.toUsize(slot)]
   let generated = node.isGenerated()
-  let vertical = geometryOf(node, f, if generated { node.scrollY } else { range.minY }, true)
-  let horizontal = geometryOf(node, f, if generated { node.scrollX } else { range.minX }, false)
+  let vertical = geometryOf(
+    node,
+    f,
+    if generated {
+      node.scrollY
+    } else {
+      range.minY
+    },
+    true,
+  )
+  let horizontal = geometryOf(
+    node,
+    f,
+    if generated {
+      node.scrollX
+    } else {
+      range.minX
+    },
+    false,
+  )
   let id = node.id
-  let parts = match scrollbar_parts.of(node) { Option.Some { value } => Option<Scrollbars>.some(value.*) _ => Option<Scrollbars>.None }
+  let parts = match scrollbar_parts.of(node) {
+    Option.Some { value } => Option<Scrollbars>.some(value.*)
+    _ => Option<Scrollbars>.None
+  }
   let mut thumbStyle = Option<Part>.None
+  let thumbColor = c.scroll.colors.thumb()
+  let trackColor = c.scroll.colors.track()
+  if !c.scroll.colors.auto() && trackColor.a > 0.0 {
+    if vertical.thumb.visible {
+      run paintTrack(&mut p, vertical.track, trackColor, mask)
+    }
+    if horizontal.thumb.visible {
+      run paintTrack(&mut p, horizontal.track, trackColor, mask)
+    }
+  }
   if let Option.Some { value } = parts {
     thumbStyle = Option<Part>.some(value.thumb)
     if vertical.thumb.visible {
@@ -2054,13 +2352,37 @@ effect fn paintThumbs(
     }
   }
   if generated {
-    run paintThumb(&mut p, vertical.thumb, thumbStyle, mask)
-    run paintThumb(&mut p, horizontal.thumb, thumbStyle, mask)
+    run paintThumb(&mut p, vertical.thumb, thumbStyle, thumbColor, mask)
+    run paintThumb(&mut p, horizontal.thumb, thumbStyle, thumbColor, mask)
     return ()
   }
   let port = device(paddingBox(f), p.scale)
-  run paintThumbIn(&mut p, id, vertical.thumb, thumbStyle, range.minY, port, true, mask)
-  run paintThumbIn(&mut p, id, horizontal.thumb, thumbStyle, range.minX, port, false, mask)
+  run paintThumbIn(&mut p, id, vertical.thumb, thumbStyle, thumbColor, range.minY, port, true, mask)
+  run paintThumbIn(
+    &mut p,
+    id,
+    horizontal.thumb,
+    thumbStyle,
+    thumbColor,
+    range.minX,
+    port,
+    false,
+    mask,
+  )
+}
+
+/// The `scrollbar-color` track under a thumb, the full length of its scrollport edge.
+effect fn paintTrack(
+  p: &mut Painter<'_, '_>,
+  rect: Rect<f32>,
+  color: Rgba<f32>,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut quad = Quad.fill(device(rect, p.scale), mask, Background.solid(color))
+  quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
+  drop run p.scene.quad(quad)
 }
 
 /// Opens the scroll group of the content of scroll container `slot` (fragment `f`), cut to
@@ -2088,24 +2410,28 @@ effect fn openScroller(
     let mut y = ScrollAxis.fixed()
     x.base = -sx
     y.base = -sy
-    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, inner.bounds, inner.bounds)
+    drop run p.scene.pushScrollGroup(
+      ScrollLink { node: NONE, x: x, y: y },
+      inner.bounds,
+      inner.bounds,
+    )
   } else {
-  run p.scene.setScroll(
-    ScrollPosition {
-      node: id,
-      x: sx,
-      y: sy,
-      minX: range.minX * s,
-      maxX: range.maxX * s,
-      minY: range.minY * s,
-      maxY: range.maxY * s,
-    },
-  )
-  drop run p.scene.pushScrollGroup(
-    ScrollLink { node: id, x: ScrollAxis.content(), y: ScrollAxis.content() },
-    inner.bounds,
-    inner.bounds,
-  )
+    run p.scene.setScroll(
+      ScrollPosition {
+        node: id,
+        x: sx,
+        y: sy,
+        minX: range.minX * s,
+        maxX: range.maxX * s,
+        minY: range.minY * s,
+        maxY: range.maxY * s,
+      },
+    )
+    drop run p.scene.pushScrollGroup(
+      ScrollLink { node: id, x: ScrollAxis.content(), y: ScrollAxis.content() },
+      inner.bounds,
+      inner.bounds,
+    )
   }
   let seen = ContentMask.new(p.cull).intersect(inner).bounds
   let lead: f32 = p.lead
@@ -2143,6 +2469,7 @@ effect fn paintThumbIn(
   id: u32,
   thumb: Thumb,
   style: Option<Part>,
+  color: Rgba<f32>,
   start: f32,
   port: Rect<f32>,
   vertical: bool,
@@ -2170,11 +2497,17 @@ effect fn paintThumbIn(
     ScrollLink { node: id, x: axis, y: ScrollAxis.fixed() }
   }
   drop run p.scene.pushScrollGroup(link, mask.bounds, port)
-  run paintThumb(&mut p, thumb, style, mask)
+  run paintThumb(&mut p, thumb, style, color, mask)
   run p.scene.popScrollGroup()
 }
 
-effect fn paintThumb(p: &mut Painter<'_, '_>, thumb: Thumb, style: Option<Part>, mask: ContentMask) -> ()
+effect fn paintThumb(
+  p: &mut Painter<'_, '_>,
+  thumb: Thumb,
+  style: Option<Part>,
+  color: Rgba<f32>,
+  mask: ContentMask,
+) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !thumb.visible {
@@ -2184,27 +2517,45 @@ effect fn paintThumb(p: &mut Painter<'_, '_>, thumb: Thumb, style: Option<Part>,
     run paintScrollbarPart(&mut p, thumb.rect, value, mask)
     return ()
   }
-  let mut quad = Quad.fill(device(thumb.rect, p.scale), mask, Background.solid(THUMB_COLOR))
+  let mut quad = Quad.fill(device(thumb.rect, p.scale), mask, Background.solid(color))
   quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
   drop run p.scene.quad(quad)
 }
 
 /// Scrollbar parts use the same solid/gradient fill, border, and corner primitives as boxes.
-effect fn paintScrollbarPart(p: &mut Painter<'_, '_>, rect: Rect<f32>, part: Part, mask: ContentMask) -> ()
-  ! OutOfMemoryError ? &mut Allocator {
-  if part.hidden { return () }
+effect fn paintScrollbarPart(
+  p: &mut Painter<'_, '_>,
+  rect: Rect<f32>,
+  part: Part,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if part.hidden {
+    return ()
+  }
   let paint = part.paint
   let background = backgroundOf(paint.background)
   let bordered = paint.borderStyle != StyleBorder.None && paint.borderColor.a > 0.0
-  if background.isTransparent() && !bordered { return () }
+  if background.isTransparent() && !bordered {
+    return ()
+  }
   let scale = p.scale
   let mut quad = Quad.fill(device(rect, scale), mask, background)
   quad.cornerRadii = scaledCorners(paint.radii, scale)
   if bordered {
-    quad.borderWidths = Insets<f32> { top: borderWidth(paint.border.top * scale), right: borderWidth(paint.border.right * scale),
-      bottom: borderWidth(paint.border.bottom * scale), left: borderWidth(paint.border.left * scale) }
+    quad.borderWidths = Insets<f32> {
+      top: borderWidth(paint.border.top * scale),
+      right: borderWidth(paint.border.right * scale),
+      bottom: borderWidth(paint.border.bottom * scale),
+      left: borderWidth(paint.border.left * scale),
+    }
     quad.borderColor = paint.borderColor
-    quad.borderStyle = if paint.borderStyle == StyleBorder.Dashed { BorderStyle.Dashed } else { BorderStyle.Solid }
+    quad.borderStyle = if paint.borderStyle == StyleBorder.Dashed {
+      BorderStyle.Dashed
+    } else {
+      BorderStyle.Solid
+    }
   }
   drop run p.scene.quad(quad)
 }
@@ -2287,7 +2638,10 @@ fn ownHash(
   if slot != NONE {
     let node = &nodes.asSlice()[u32.toUsize(slot)]
     h = selection.hash(node, Hash.combine(h, node.paintHash))
-    if node.isGenerated() { h = floatHash(h, node.scrollX) h = floatHash(h, node.scrollY) }
+    if node.isGenerated() {
+      h = floatHash(h, node.scrollX)
+      h = floatHash(h, node.scrollY)
+    }
     if f.kind == FragmentKind.Box {
       h = transform.perspectiveHash(&node.computed.transform, h)
       h = Hash.combine(h, node.content)

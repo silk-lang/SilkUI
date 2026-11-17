@@ -1,0 +1,105 @@
+//! Pixel checks for properties the Can I use probes cannot see: `caret-color` (the probe
+//! fixture has no focused input) and `object-fit` (it has no image).
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot }
+import ui_fixtures.fixtures as fixtures
+import svg_css.compile { CompileError, Options }
+import svg_css.compile
+import svg_css.written
+import svg_css.tokens { CssError }
+import vector.geometry_error { GeometryError }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.num.f32
+import font_collection.lib { FontCollection }
+
+fn viewport() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
+
+effect fn caretColor() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run fixtures.editor(&mut batch)
+  run batch.select(fixtures.SEARCH, 0, 0)
+  let compiled = run compile.compile(b"*{caret-color:rgb(255,0,0)}", &Options.make())
+  let bytes = run compiled.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let caret = run tree.caretRect(fixtures.SEARCH)
+  run Testing.expect(caret.height() > 4.0, "the focused input shows a caret")
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let x = f32.toU32(f32.floor(f32.max(1.0, caret.xMin)))
+  let y = f32.toU32(f32.floor((caret.yMin + caret.yMax) / 2.0))
+  let mut red = false
+  let mut dx: u32 = 0
+  while dx <= 2 {
+    let pixel = painted.pixel(x + dx - 1, y)
+    if pixel.r > 200 && pixel.g < 80 && pixel.b < 80 { red = true }
+    dx = dx + 1
+  }
+  run Testing.expect(red, "the caret paints in caret-color")
+}
+
+test effect fn pixelCaretColorPaintsTheCaret() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run caretColor() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The fixture photo (160 by 120) in a 100 by 100 white box under `fit`.
+effect fn photo<'f>(fonts: &'f FontCollection, fit: &[u8]) -> UiTree<'f> ! TreeError | CssError | OutOfMemoryError ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  let mut batch = Batch.make()
+  run fixtures.resources(&mut batch)
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Image)
+  run batch.source(2, fixtures.PHOTO_IMAGE)
+  run batch.append(1, 2)
+  let own = run written.declarations(fit)
+  run batch.style(2, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  return move tree
+}
+
+fn white(r: u8, g: u8, b: u8) -> bool { return r == 255 && g == 255 && b == 255 }
+
+effect fn objectFit() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut fill = run photo(&fonts, b"display:block;width:100px;height:100px;object-fit:fill")
+  let mut contain = run photo(&fonts, b"display:block;width:100px;height:100px;object-fit:contain")
+  let mut cover = run photo(&fonts, b"display:block;width:100px;height:100px;object-fit:cover")
+  let mut a = CpuSnapshot.make()
+  run a.sync(&mut fill)
+  let filled = run a.render(&fill)
+  let mut b = CpuSnapshot.make()
+  run b.sync(&mut contain)
+  let contained = run b.render(&contain)
+  let mut c = CpuSnapshot.make()
+  run c.sync(&mut cover)
+  let covered = run c.render(&cover)
+  let top = contained.pixel(50, 5)
+  let inside = contained.pixel(50, 50)
+  let filledTop = filled.pixel(50, 5)
+  run Testing.expect(white(top.r, top.g, top.b) && !white(inside.r, inside.g, inside.b), "contain letterboxes the 4:3 photo above and below")
+  run Testing.expect(!white(filledTop.r, filledTop.g, filledTop.b), "fill stretches it to the top")
+  let mut differs = false
+  let mut y: u32 = 10
+  while y < 90 {
+    let p = covered.pixel(5, y)
+    let q = filled.pixel(5, y)
+    if p.r != q.r || p.g != q.g || p.b != q.b { differs = true }
+    y = y + 10
+  }
+  run Testing.expect(differs, "cover crops the sides that fill squeezes in")
+}
+
+test effect fn pixelObjectFitPlacesTheImage() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run objectFit() |> Effect.provideMut<Allocator>(&mut allocator)
+}
