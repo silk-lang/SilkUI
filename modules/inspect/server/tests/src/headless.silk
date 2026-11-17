@@ -21,8 +21,16 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.filesystem { FileSystem, FileError, Path }
 import silk.system.filesystem_machine { MachineFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String, InvalidUtf8 }
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+  import silk.platform.windows.path { WindowsPath }
+} else {
+  import silk.platform.native.host_input { NativeHostInput }
+}
 
 effect fn line(words: string) -> String
   ! OutOfMemoryError
@@ -125,24 +133,41 @@ impl WindowClient<Counter, never, never> for Client {
   }
 }
 
-const SCRIPT: string = "/tmp/ui-inspect-headless-test.txt"
+// Names under the working directory, where a headless run looks for relative files too:
+// `/tmp` is not a path on Windows.
+const SCRIPT: string = "ui-inspect-headless-test.txt"
 
-const TREE: string = "/tmp/ui-inspect-headless-test-tree.txt"
+const TREE: string = "ui-inspect-headless-test-tree.txt"
 
-const SHOT: string = "/tmp/ui-inspect-headless-test.png"
+const SHOT: string = "ui-inspect-headless-test.png"
+
+effect fn placed(name: string) -> Path
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut inputs = run WindowsHostInput.capture()
+    let native = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+    let parent = run WindowsPath.fromNativeBytes(native.asSlice())
+    return run Path.resolve(&parent, name)
+  } else {
+    let native = run NativeHostInput.workingDirectory()
+    let parent = run Path.fromBytes(native.asSlice())
+    return run Path.resolve(&parent, name)
+  }
+}
 
 effect fn writeText(path: string, text: string) -> ()
-  ! FileError | OutOfMemoryError
+  ! FileError | HostInputError | OutOfMemoryError
   ? &mut Allocator {
-  let place = run Path.make(path)
+  let place = run placed(path)
   let mut files = run MachineFileSystem.make()
   run FileSystem.writeFile(&place, String.utf8Bytes(text)) |> Effect.provideMut<FileSystem>(&mut files)
 }
 
 effect fn readText(path: string) -> String
-  ! FileError | OutOfMemoryError
+  ! FileError | HostInputError | OutOfMemoryError
   ? &mut Allocator {
-  let place = run Path.make(path)
+  let place = run placed(path)
   let mut files = run MachineFileSystem.make()
   let bytes = run FileSystem.readFile(&place) |> Effect.provideMut<FileSystem>(&mut files)
   return String.fromBytes(move bytes) |> Result<String, InvalidUtf8>.unwrapOr(String.make())
@@ -156,7 +181,7 @@ struct Ran {
 
 /// Runs the counter headless with `script`.
 effect fn runCounter(script: string) -> Ran
-  ! FileError | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ! FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
   run writeText(SCRIPT, script)
   let fonts = run fixtures.fonts()
@@ -186,7 +211,7 @@ effect fn runCounter(script: string) -> Ran
 }
 
 effect fn headlessBody() -> ()
-  ! AssertionError<'static> | FileError | WindowError | GpuError | TreeError | AtlasError
+  ! AssertionError<'static> | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
     | GeometryError
     | OutOfMemoryError
   ? &mut Allocator {
@@ -200,7 +225,7 @@ effect fn headlessBody() -> ()
   run Testing.expect(done.status == 0 && done.clicks == 2, "the script ran to its end, clicking twice")
   let tree = run readText(TREE)
   run Testing.expect(String.contains(String.view(&tree), "\"more\""), "the snapshot shows the second click")
-  let place = run Path.make(SHOT)
+  let place = run placed(SHOT)
   let mut files = run MachineFileSystem.make()
   let shot = run FileSystem.readFile(&place) |> Effect.provideMut<FileSystem>(&mut files)
   run Testing.expect(shot.length() > 8 && shot.asSlice()[1] == 80, "the screenshot is a PNG")
@@ -209,10 +234,13 @@ effect fn headlessBody() -> ()
   run Testing.expect(failed.status == 1 && failed.clicks == 1, "a failing line ends the run")
   let waited = run runCounter("wait --text never\nclick --test-id counter\n")
   run Testing.expect(waited.status == 1 && waited.clicks == 0, "a wait that never holds gives up")
+  run FileSystem.removeFile(&(run placed(SCRIPT))) |> Effect.provideMut<FileSystem>(&mut files)
+  run FileSystem.removeFile(&(run placed(TREE))) |> Effect.provideMut<FileSystem>(&mut files)
+  run FileSystem.removeFile(&place) |> Effect.provideMut<FileSystem>(&mut files)
 }
 
 test effect fn aHeadlessRunFollowsItsScript() -> ()
-  ! AssertionError<'static> | FileError | WindowError | GpuError | TreeError | AtlasError
+  ! AssertionError<'static> | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
     | GeometryError
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
