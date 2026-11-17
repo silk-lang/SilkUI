@@ -8,6 +8,7 @@ import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import ui_tree.style { Fill }
 
 fn frame() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
 fn width(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.width.value }
@@ -205,4 +206,42 @@ test effect fn stylesheetScopePressureFallsBackToFullRestyles() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pressureFallback() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn red(tree: &UiTree<'_>, id: u32) -> f32 {
+  return match tree.node(tree.slotOf(id)).computed.paint.background { Fill.Solid { color } => color.r _ => -1.0 }
+}
+
+effect fn cousins() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "row a")
+  run node(&mut batch, 3, 1, "row b")
+  run node(&mut batch, 6, 1, "row a")
+  run node(&mut batch, 4, 2, "leaf")
+  run node(&mut batch, 5, 3, "leaf")
+  run node(&mut batch, 7, 6, "leaf")
+  run node(&mut batch, 8, 3, "leaf")
+  run sheet(&mut batch, b"@layer base{.leaf{min-height:7px}}.host{display:block;width:400px;height:300px}.row{display:block;height:50px}.a{color:rgb(255 0 0);--w:10px;width:100px}.b{color:rgb(0 0 255);--w:20px;width:200px}.leaf{background-color:currentColor;height:var(--w);width:inherit;opacity:.5!important;min-height:9px}.leaf{opacity:.75;min-height:revert-layer;padding:4px;padding-left:6px}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(red(&tree, 4) == 1.0 && red(&tree, 5) == 0.0 && red(&tree, 7) == 1.0 && red(&tree, 8) == 0.0, "equal elements under parents of another color keep their own currentColor")
+  run Testing.expect(height(&tree, 4) == 10.0 && height(&tree, 5) == 20.0 && height(&tree, 7) == 10.0 && height(&tree, 8) == 20.0, "equal elements in another variable scope substitute their own values")
+  run Testing.expect(width(&tree, 4) == 100.0 && width(&tree, 5) == 200.0 && width(&tree, 7) == 100.0, "explicit inheritance reads each parent")
+  let leaf = &tree.node(tree.slotOf(7)).computed
+  run Testing.expect(leaf.paint.opacity == 0.5 && leaf.layout.minHeight.value == 7.0, "importance outranks order, and revert-layer falls back to the layer below")
+  run Testing.expect(leaf.layout.padding.left.value == 6.0 && leaf.layout.padding.top.value == 4.0, "a later longhand wins inside an earlier shorthand")
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("row a") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(red(&tree, 5) == 1.0 && height(&tree, 5) == 10.0 && width(&tree, 8) == 100.0, "a parent's class change reaches children that share a cascade")
+}
+
+test effect fn stylesheetEqualElementsUnderDifferentParentsKeepTheirOwnValues() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run cousins() |> Effect.provideMut<Allocator>(&mut allocator)
 }
