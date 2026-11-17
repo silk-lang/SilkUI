@@ -137,3 +137,25 @@ test("class, id, data and ARIA props update and disappear on the retained node",
   assert.equal(node.getAttribute("aria-expanded"), null);
   root.unmount();
 });
+
+test("inline svg markup renders as one icon, and an image takes a data: URL", () => {
+  const root = createRoot(createBox());
+  const Check = ({ color }) =>
+    h("svg", { width: 24, height: 24, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round", className: "size-4" },
+      h("path", { d: "M20 6 9 17l-5-5", stroke: color }),
+      h("text", null, "ok"));
+  mock.take();
+  root.render(h("box", null, h(Check, { color: undefined }), h("img", { src: "data:image/png;base64,AAAA", alt: "Dot" })));
+  let calls = mock.take();
+  assert.equal(find(calls, "create", (call) => call[2] === 4).length, 1, "the svg is one icon node, its children no nodes");
+  assert.deepEqual(find(calls, "defineIcon").map((call) => call[2]), [
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6 9 17l-5-5"/><text>ok</text></svg>',
+  ]);
+  assert.ok(find(calls, "attribute", (call) => call[2] === "class" && call[3] === "size-4").length === 1);
+  assert.deepEqual(find(calls, "load").map((call) => call.slice(2)), [["data:image/png;base64,AAAA", false]]);
+  root.render(h("box", null, h(Check, { color: "red" }), h("img", { src: "data:image/png;base64,AAAA", alt: "Dot" })));
+  calls = mock.take();
+  assert.equal(find(calls, "defineIcon").length, 1);
+  assert.ok(find(calls, "defineIcon")[0][2].includes('<path d="M20 6 9 17l-5-5" stroke="red"/>'));
+  assert.equal(find(calls, "create").length, 0, "an svg change creates no node");
+});
