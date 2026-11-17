@@ -1,5 +1,5 @@
-//! Painting what `paint_css` reads: background and mask image layers (linear gradients with any
-//! number of stops, sized, positioned and repeated), `text-shadow`, and the isolated layers for
+//! Painting what `paint_css` reads: background and mask image layers (linear, radial and conic
+//! gradients with any number of stops, sized, positioned and repeated), `text-shadow`, and the isolated layers for
 //! `filter`, `mix-blend-mode`, `clip-path` and `mask`. A run of filter functions that the scene
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
 import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
@@ -27,7 +27,17 @@ import svg_css.dimensions { ExprId }
 import svg_css.transform_values { Position, PositionAxis, Edge }
 import svg_css.colors
 import svg_core.vector_path
-import ui_scene.primitives { Background, ColorStop, LinearGradient, ContentMask, Isolation, Quad }
+import ui_scene.primitives {
+  Background,
+  ColorStop,
+  ContentMask,
+  GradientShape,
+  Isolation,
+  LinearGradient,
+  Quad,
+  StopRange,
+  StopsGradient,
+}
 import ui_scene.effects { LayerEffects, DropShadow }
 import ui_scene.effects as filters
 import vector.geometry { Affine }
@@ -50,9 +60,6 @@ import silk.num.usize
 
 /// The most tiles one image layer draws; past it the rest of the area stays unpainted.
 const MAX_TILES: usize = 4096
-
-/// The most stops a repeating gradient expands to.
-const MAX_STOPS: usize = 512
 
 fn rgbaOf(color: colors.Color) -> Rgba<f32> {
   let c = colors.toSrgb(color)
@@ -226,50 +233,60 @@ effect fn resolveStops(effects: &Effects, list: &List<GradientStop>, length: f32
   }
 }
 
-/// Repeats `stops` (a `repeating-linear-gradient`) to cover offsets 0 to 1.
-effect fn repeatStops(stops: &mut List<Stop>) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let n = stops.length()
-  if n < 2 {
-    return ()
-  }
-  let first = stops.get(0).offset
-  let period = stops.get(n - 1).offset - first
-  if period <= 0.0001 {
-    let last = stops.get(n - 1)
-    stops.clear()
-    run stops.append(Stop { color: last.color, offset: 0.0 })
-    return ()
-  }
-  let base = List<Stop>.make()
-  let mut source = move base
-  run source.appendSlice(stops.asSlice())
-  stops.clear()
-  let mut shift = f32.floor((0.0 - first) / period) * period
-  while first + shift < 1.0 && stops.length() < MAX_STOPS {
-    let items = source.asSlice()
-    let mut i: usize = 0
-    while i < items.length {
-      run stops.append(Stop { color: items[i].color, offset: items[i].offset + shift })
-      i = i + 1
-    }
-    shift = shift + period
-  }
-}
-
-fn twoStop(angle: f32, a: Stop, b: Stop, fromOffset: f32, toOffset: f32) -> Background {
+fn twoStop(angle: f32, a: Stop, b: Stop) -> Background {
   return Background.Linear {
     gradient: LinearGradient {
       angle: angle,
-      from: ColorStop { color: a.color, offset: fromOffset },
-      to: ColorStop { color: b.color, offset: toOffset },
+      from: ColorStop { color: a.color, offset: a.offset },
+      to: ColorStop { color: b.color, offset: b.offset },
       interpolation: Interpolation.new(ColorSpace.Srgb),
     },
   }
 }
 
-/// Paints linear gradient `image` stretched over `tile` (device pixels) and cut by `clip`.
+/// The gradient center `position` puts in a `w` by `h` box, from the box's top left corner.
+fn centerOf(effects: &Effects, position: Position, w: f32, h: f32) -> [f32; 2] {
+  return [axisOffset(effects, position.x, w), axisOffset(effects, position.y, h)]
+}
+
+/// The radii of a radial gradient centered at (`cx`, `cy`) in a `w` by `h` box (Images 3 §3.2.2).
+fn gradientRadii(effects: &Effects, size: RadialSize, circle: bool, cx: f32, cy: f32, w: f32, h: f32) -> [f32; 2] {
+  let left = f32.abs(cx)
+  let right = f32.abs(w - cx)
+  let top = f32.abs(cy)
+  let bottom = f32.abs(h - cy)
+  return match size {
+    RadialSize.Radii { x, y } => {
+      let rx = f32.max(0.0, effects.pixels(x, w))
+      match y {
+        Option<ExprId>.Some { value } => [rx, f32.max(0.0, effects.pixels(value, h))]
+        Option<ExprId>.None => [rx, rx]
+      }
+    }
+    RadialSize.Extent { extent } => {
+      let near = extent == Extent.ClosestSide || extent == Extent.ClosestCorner
+      let sx = if near { f32.min(left, right) } else { f32.max(left, right) }
+      let sy = if near { f32.min(top, bottom) } else { f32.max(top, bottom) }
+      let corner = extent == Extent.ClosestCorner || extent == Extent.FarthestCorner
+      if circle {
+        if corner {
+          let r = f32.sqrt(sx * sx + sy * sy)
+          [r, r]
+        } else {
+          let r = if near { f32.min(sx, sy) } else { f32.max(sx, sy) }
+          [r, r]
+        }
+      } else if corner {
+        // The ellipse through the corner with the aspect ratio of the side ellipse.
+        if sx <= 0.0 || sy <= 0.0 { [0.0, 0.0] } else { [sx * 1.4142135, sy * 1.4142135] }
+      } else {
+        [sx, sy]
+      }
+    }
+  }
+}
+
+/// Paints gradient `image` stretched over `tile` (device pixels) and cut by `clip`.
 /// `radii` rounds the tile when it is exactly the painting area.
 effect fn paintGradient(
   p: &mut Painter<'_, '_>,
@@ -282,261 +299,90 @@ effect fn paintGradient(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  if isEmpty(intersect(tile, clip.bounds)) {
+    return ()
+  }
   let s = p.scale
   let w = (tile.xMax - tile.xMin) / s
   let h = (tile.yMax - tile.yMin) / s
+  let mut gradient = StopsGradient {
+    shape: GradientShape.Linear,
+    angle: 0.0,
+    centerX: 0.0,
+    centerY: 0.0,
+    radiusX: 0.0,
+    radiusY: 0.0,
+    repeating: false,
+    stops: StopRange { start: 0, count: 0 },
+  }
   match &image.* {
     Image.Linear { repeating, direction, stops: list } => {
       let angle = angleOf(effects, direction, w, h)
       let radians = angle * 0.017453292
       let length = f32.abs(w * f32.sin(radians)) + f32.abs(h * f32.cos(radians))
       run resolveStops(effects, &list, length, &mut stops.*)
-      if repeating {
-        run repeatStops(&mut stops.*)
-      }
-      run paintStops(&mut p, angle, stops.asSlice(), tile, clip, radii)
+      gradient.angle = angle
+      gradient.repeating = repeating
     }
-    _ => {}
-  }
-}
-
-/// Paints resolved stops over `tile`: one quad for two stops, bands for more.
-effect fn paintStops(
-  p: &mut Painter<'_, '_>,
-  angle: f32,
-  stops: &[Stop],
-  tile: Rect<f32>,
-  clip: ContentMask,
-  radii: Corners<f32>,
-) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let n = stops.length
-  if n == 0 || isEmpty(intersect(tile, clip.bounds)) {
-    return ()
-  }
-  if n == 1 {
-    let mut quad = Quad.fill(tile, clip, Background.solid(stops[0].color))
-    quad.cornerRadii = radii
-    drop run p.scene.quad(quad)
-    return ()
-  }
-  if n == 2 {
-    let mut quad = Quad.fill(tile, clip, twoStop(angle, stops[0], stops[1], stops[0].offset, stops[1].offset))
-    quad.cornerRadii = radii
-    drop run p.scene.quad(quad)
-    return ()
-  }
-  if hasRadius(radii) {
-    // Bands cannot each be rounded: cut them with the rounded tile instead.
-    drop run p.scene.pushEffectLayer(
-      tile,
-      clip,
-      Isolation { opacity: 1.0, blend: 0 },
-      LayerEffects.none(),
-    )
-    drop run p.scene.pushMaskLayer()
-    let mut shape = Quad.fill(tile, clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
-    shape.cornerRadii = radii
-    drop run p.scene.quad(shape)
-    run p.scene.popLayer()
-    run paintBands(&mut p, angle, stops, tile, clip)
-    run p.scene.popLayer()
-    return ()
-  }
-  run paintBands(&mut p, angle, stops, tile, clip)
-}
-
-/// Normalizes `angle` to `0 .. 360`.
-fn turn(angle: f32) -> f32 {
-  let a = angle - f32.floor(angle / 360.0) * 360.0
-  return a
-}
-
-/// Paints each pair of neighbouring stops as a band of the tile, the ends padded with the end
-/// colors. Bands overlap their next neighbour by a pixel, in that neighbour's own end color,
-/// so no seam shows between them.
-effect fn paintBands(
-  p: &mut Painter<'_, '_>,
-  angle: f32,
-  stops: &[Stop],
-  tile: Rect<f32>,
-  clip: ContentMask,
-) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let a = turn(angle)
-  let w = tile.xMax - tile.xMin
-  let h = tile.yMax - tile.yMin
-  let radians = a * 0.017453292
-  let dx = f32.sin(radians)
-  let dy = -f32.cos(radians)
-  let length = f32.abs(w * dx) + f32.abs(h * dy)
-  if length <= 0.0 {
-    return ()
-  }
-  let cx = (tile.xMin + tile.xMax) * 0.5
-  let cy = (tile.yMin + tile.yMax) * 0.5
-  let axis = f32.abs(a) < 0.001 || f32.abs(a - 90.0) < 0.001 || f32.abs(a - 180.0) < 0.001
-    || f32.abs(a - 270.0) < 0.001
-    || f32.abs(a - 360.0) < 0.001
-  let overlap = 1.0 / length
-  let n = stops.length
-  let mut k: usize = 0
-  while k <= n {
-    // Band k runs from stop k - 1 to stop k; bands 0 and n pad out to the tile's ends.
-    let pad = k == 0 || k == n
-    let start: f32 = if k == 0 { -1.0 } else { stops[k - 1].offset }
-    let end: f32 = if k == n { 2.0 } else { stops[k].offset }
-    let from = if k == 0 { stops[0] } else { stops[k - 1] }
-    let to = if k == n { stops[n - 1] } else { stops[k] }
-    let t0 = f32.max(start, -1.0)
-    let t1 = f32.min(end + overlap, 2.0)
-    if t1 > t0 && t1 > 0.0 && t0 < 1.0 {
-      if axis {
-        // Offsets along the band itself, which the quad's gradient line spans.
-        let lo = f32.max(t0, 0.0)
-        let hi = f32.min(t1, 1.0)
-        let band = if f32.abs(a - 90.0) < 0.001 {
-          Rect<f32>.new(tile.xMin + lo * w, tile.yMin, tile.xMin + hi * w, tile.yMax)
-        } else if f32.abs(a - 270.0) < 0.001 {
-          Rect<f32>.new(tile.xMax - hi * w, tile.yMin, tile.xMax - lo * w, tile.yMax)
-        } else if f32.abs(a - 180.0) < 0.001 {
-          Rect<f32>.new(tile.xMin, tile.yMin + lo * h, tile.xMax, tile.yMin + hi * h)
-        } else {
-          Rect<f32>.new(tile.xMin, tile.yMax - hi * h, tile.xMax, tile.yMax - lo * h)
-        }
-        let span = hi - lo
-        let paint = if pad || to.offset - from.offset <= 0.00001 {
-          Background.solid(to.color)
-        } else {
-          twoStop(a, from, to, (from.offset - lo) / span, (to.offset - lo) / span)
-        }
-        drop run p.scene.quad(Quad.fill(band, clip, paint))
-      } else {
-        run pathBand(&mut p, a, tile, cx, cy, dx, dy, length, t0, t1, from, to, pad, clip)
+    Image.Radial { repeating, circle, size, position, stops: list } => {
+      let center = centerOf(effects, position, w, h)
+      let r = gradientRadii(effects, size, circle, center[0], center[1], w, h)
+      run resolveStops(effects, &list, r[0], &mut stops.*)
+      if (r[0] <= 0.0 || r[1] <= 0.0) && stops.length() > 0 {
+        // A degenerate ellipse: everything is past the last stop.
+        let last = stops.get(stops.length() - 1)
+        stops.clear()
+        run stops.append(last)
       }
+      gradient.shape = GradientShape.Radial
+      gradient.centerX = center[0] * s
+      gradient.centerY = center[1] * s
+      gradient.radiusX = r[0] * s
+      gradient.radiusY = r[1] * s
+      gradient.repeating = repeating
     }
-    k = k + 1
+    Image.Conic { repeating, angle, position, stops: list } => {
+      let center = centerOf(effects, position, w, h)
+      // Angles and percentages of a turn both resolve to degrees against a basis of 360.
+      run resolveStops(effects, &list, 360.0, &mut stops.*)
+      gradient.shape = GradientShape.Conic
+      gradient.angle = effects.number(angle)
+      gradient.centerX = center[0] * s
+      gradient.centerY = center[1] * s
+      gradient.repeating = repeating
+    }
+    _ => {
+      return ()
+    }
   }
-}
-
-/// One band of an angled gradient: the tile cut to offsets `t0 .. t1`, as a path whose
-/// gradient is set up on the path's own bounds.
-effect fn pathBand(
-  p: &mut Painter<'_, '_>,
-  angle: f32,
-  tile: Rect<f32>,
-  cx: f32,
-  cy: f32,
-  dx: f32,
-  dy: f32,
-  length: f32,
-  t0: f32,
-  t1: f32,
-  from: Stop,
-  to: Stop,
-  solid: bool,
-  clip: ContentMask,
-) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  // The tile's corners, clipped by the two lines across the gradient at t0 and t1.
-  let s0 = (t0 - 0.5) * length
-  let s1 = (t1 - 0.5) * length
-  let mut xs = List<f32>.make()
-  let mut ys = List<f32>.make()
-  run xs.appendSlice(&[tile.xMin, tile.xMax, tile.xMax, tile.xMin])
-  run ys.appendSlice(&[tile.yMin, tile.yMin, tile.yMax, tile.yMax])
-  run clipPolygon(&mut xs, &mut ys, cx, cy, dx, dy, s0, true)
-  run clipPolygon(&mut xs, &mut ys, cx, cy, dx, dy, s1, false)
-  if xs.length() < 3 {
+  let n = stops.length()
+  if n == 0 {
     return ()
   }
-  let mut path = VectorPath.make()
-  let px = xs.asSlice()
-  let py = ys.asSlice()
-  let mut bounds = Rect<f32>.new(px[0], py[0], px[0], py[0])
-  run path.moveTo(f32.toF64(px[0]), f32.toF64(py[0]))
-  let mut i: usize = 1
-  while i < px.length {
-    run path.lineTo(f32.toF64(px[i]), f32.toF64(py[i]))
-    bounds = Rect<f32>.new(
-      f32.min(bounds.xMin, px[i]),
-      f32.min(bounds.yMin, py[i]),
-      f32.max(bounds.xMax, px[i]),
-      f32.max(bounds.yMax, py[i]),
-    )
-    i = i + 1
-  }
-  run path.close()
-  let paint = if solid || to.offset - from.offset <= 0.00001 {
-    Background.solid(to.color)
+  let items = stops.asSlice()
+  let fill = if n == 1 {
+    Background.solid(items[0].color)
+  } else if n == 2 && !gradient.repeating && gradient.shape == GradientShape.Linear {
+    twoStop(gradient.angle, items[0], items[1])
   } else {
-    // The same gradient on the band's bounds: offsets move to where the stops fall there.
-    let bw = bounds.xMax - bounds.xMin
-    let bh = bounds.yMax - bounds.yMin
-    let bl = f32.abs(bw * dx) + f32.abs(bh * dy)
-    let bcx = (bounds.xMin + bounds.xMax) * 0.5
-    let bcy = (bounds.yMin + bounds.yMax) * 0.5
-    let shift = (cx - bcx) * dx + (cy - bcy) * dy
-    let a = ((from.offset - 0.5) * length + shift) / bl + 0.5
-    let b = ((to.offset - 0.5) * length + shift) / bl + 0.5
-    twoStop(angle, from, to, a, b)
+    let mut kept = List<ColorStop>.make()
+    run kept.reserve(n)
+    let mut i: usize = 0
+    while i < n {
+      run kept.append(ColorStop { color: items[i].color, offset: items[i].offset })
+      i = i + 1
+    }
+    gradient.stops = run p.scene.colorStops(kept.asSlice())
+    Background.Stops { gradient: gradient }
   }
-  drop run Effect.catchAll(
-    p.paths.fill(&mut p.scene, 0, &path, &Affine.identity(), NONZERO, paint, clip),
-    noPath,
-  )
+  let mut quad = Quad.fill(tile, clip, fill)
+  quad.cornerRadii = radii
+  drop run p.scene.quad(quad)
 }
 
 effect fn noPath<E>(error: E) -> u32 {
   drop error
   return 0
-}
-
-/// Keeps the part of polygon `xs`, `ys` on one side of the line where the projection on
-/// (`dx`, `dy`) from (`cx`, `cy`) is `at`: above it when `keepAbove`, below otherwise.
-effect fn clipPolygon(
-  xs: &mut List<f32>,
-  ys: &mut List<f32>,
-  cx: f32,
-  cy: f32,
-  dx: f32,
-  dy: f32,
-  at: f32,
-  keepAbove: bool,
-) -> ()
-  ! OutOfMemoryError
-  ? &mut Allocator {
-  let mut ox = List<f32>.make()
-  let mut oy = List<f32>.make()
-  let n = xs.length()
-  let mut i: usize = 0
-  while i < n {
-    let ax = xs.get(i)
-    let ay = ys.get(i)
-    let bx = xs.get((i + 1) % n)
-    let by = ys.get((i + 1) % n)
-    let da = (ax - cx) * dx + (ay - cy) * dy - at
-    let db = (bx - cx) * dx + (by - cy) * dy - at
-    let ina = if keepAbove { da >= 0.0 } else { da <= 0.0 }
-    let inb = if keepAbove { db >= 0.0 } else { db <= 0.0 }
-    if ina {
-      run ox.append(ax)
-      run oy.append(ay)
-    }
-    if ina != inb {
-      let t = da / (da - db)
-      run ox.append(ax + (bx - ax) * t)
-      run oy.append(ay + (by - ay) * t)
-    }
-    i = i + 1
-  }
-  xs.clear()
-  ys.clear()
-  run xs.appendSlice(ox.asSlice())
-  run ys.appendSlice(oy.asSlice())
 }
 
 // Image layers.
@@ -622,6 +468,8 @@ pub effect fn paintLayers(
     let image = &layers.images.asSlice()[layer]
     let drawable = match &image.* {
       Image.Linear { .. } => true
+      Image.Radial { .. } => true
+      Image.Conic { .. } => true
       _ => false
     }
     let clipKind = layers.clip(layer)
