@@ -213,8 +213,8 @@ app and its host share one Loom. That dependency's `path` must end in `modules/l
 - A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
 - The web targets read the page scripts from Silk's checkouts of silkui, Loom and lib-native, so
   Git dependencies on silkui and loom must be pinned with `rev`.
-- Under `silk task dev`, an edit to a Silk module a JavaScript app imports needs a restart of the
-  task: the host is built once.
+- Under `silk task dev`, an edit to the Silk modules a JavaScript app imports rebuilds the host
+  and starts it again, so the app's JavaScript state starts over, as after a page reload.
 - Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
   that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.
 - The examples install `@silkui/*` from this repository (`file:` dependencies with

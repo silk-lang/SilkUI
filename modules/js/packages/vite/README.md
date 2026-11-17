@@ -126,4 +126,4 @@ For editor types, the package is a TypeScript 7.1 content mapper:
 "contentMappers": [{ "package": "@silkui/vite", "extensions": [".silk"] }]
 ```
 
-Under the dev server, an edit to a `.silk` file needs a restart of `silk task dev`.
+Under the dev server, an edit to the project's Silk sources rebuilds the host silkui made and starts it again; JavaScript state starts over, as after a reload.

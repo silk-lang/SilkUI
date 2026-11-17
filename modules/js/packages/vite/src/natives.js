@@ -7,10 +7,10 @@
 // also what the content mapper in mapper.js answers). The code runs natively in the host: a call
 // is `__ui.native(id, ...args)`, which the bridge hands to the dispatcher.
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
@@ -102,7 +102,7 @@ export async function silkDoc(root, silk = process.env.SILK ?? "silk") {
       await run(silk, ["doc", "--manifest-path", join(root, "silk.toml"), "--output", output], { cwd: root });
     } catch (error) {
       if (error.code === "ENOENT") throw new Error(`cannot run \`${silk}\`: put silk on PATH or set SILK to its path`);
-      throw new Error(`silk doc failed in ${root}:\n${error.stderr || error.message}`);
+      throw new Error(`silk doc failed in ${root}:\n${error.stderr || error.stdout || error.message}`);
     }
     return JSON.parse(await readFile(output, "utf8"));
   } finally {
@@ -337,4 +337,34 @@ export function declarations(module) {
 export function readDescription(root) {
   const path = join(root, NATIVES_DIR, "natives.json");
   return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+}
+
+/**
+ * Describes the Silk functions the project at `root` exports and writes `NATIVES_DIR`:
+ * natives.json, natives.silk (the host's dispatcher) and types/<source>.d.silk.ts. Returns the
+ * description.
+ */
+export async function writeNatives(root) {
+  const description = await describeProject(root);
+  const out = join(root, NATIVES_DIR);
+  rmSync(out, { recursive: true, force: true });
+  mkdirSync(out, { recursive: true });
+  writeFileSync(join(out, "natives.json"), `${JSON.stringify(description, null, 2)}\n`);
+  if (hasFunctions(description)) {
+    if (!description.library) throw new Error("silk.toml exports modules to JavaScript, so the package must be a library: set `kind = \"library\"` and give the tasks their own profile (`[profiles.tasks] main = \"tasks.silk\"`)");
+    writeFileSync(join(out, "natives.silk"), silkGlue(description));
+  }
+  for (const module of description.modules) {
+    const types = join(out, "types", `${relative(root, module.file).replace(/\.silk$/, "")}.d.silk.ts`);
+    mkdirSync(dirname(types), { recursive: true });
+    writeFileSync(types, declarations(module));
+  }
+  return description;
+}
+
+/** Why each function of `description` that JavaScript cannot call is left out. */
+export function leftOut(description) {
+  return description.modules.flatMap((module) =>
+    module.functions.filter((fn) => fn.unsupported).map((fn) => `${module.module}.${fn.name} is not available to JavaScript: ${fn.unsupported}`),
+  );
 }

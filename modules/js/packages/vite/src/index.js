@@ -199,12 +199,9 @@ const silkImports = {
     this.addWatchFile(join(root, NATIVES_DIR, "natives.json"));
     return { code: jsModule(module), map: null };
   },
+  // The dev server rebuilds the host and starts it again (see dev.js): nothing to replace in place.
   hotUpdate({ file }) {
-    if (!file.endsWith(".silk")) return;
-    // Every environment sees the edit; the host's is the one to tell about.
-    if (this.environment.name !== "silk") return [];
-    this.environment.logger.warn(`[silk] ${file} changed: restart \`silk task dev\` to rebuild the host with it`, { timestamp: true });
-    return [];
+    if (file.endsWith(".silk") || file.includes(`${NATIVES_DIR}/`)) return [];
   },
 };
 

@@ -141,7 +141,7 @@ For types in the editor, add the TypeScript plugin to `tsconfig.json`. It needs 
 
 Hover shows the Silk doc comment, go to definition opens the `.silk` file, and Silk errors show in the editor. `tsc` needs `--runExternalCode`. With an older TypeScript, `.silk/natives/types/` has the same declarations as `.d.silk.ts` files, for `rootDirs` with `allowArbitraryExtensions`.
 
-Under `silk task dev`, an edit to a `.silk` file needs a restart of the task, which builds the window's program again.
+Under `silk task dev`, saving a `.silk` file rebuilds the window's program and starts it again, in a few seconds. The JavaScript state starts over, as after a page reload; if the build fails, the previous program keeps running until the next save.
 
 ## Draw the title bar
 

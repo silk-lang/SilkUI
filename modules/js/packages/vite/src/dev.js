@@ -1,9 +1,12 @@
 // The development side of @silkui/vite: a Vite environment whose modules run in a ui-js host,
 // reached over a local TCP connection the host opens (`--dev <port>`).
 import { spawn } from "node:child_process";
+import { copyFileSync, existsSync, readFileSync } from "node:fs";
 import net from "node:net";
+import { basename, dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build, DevEnvironment } from "vite";
+import { NATIVES_DIR, leftOut, packageFields, projectRoot, writeNatives } from "./natives.js";
 import { resolveOptions } from "./resolve.js";
 
 // The longest text on one line: the host reads lines of up to one mebibyte.
@@ -99,6 +102,28 @@ async function bootstrapScript(modules) {
 }
 
 /**
+ * The project and generated host of a host silkui built with Silk functions compiled in, or
+ * null: silkui builds it in `<project>/.silk/<target>/`, beside `.silk/natives/`.
+ */
+function nativesOf(command) {
+  const host = projectRoot(dirname(command));
+  if (!host || basename(dirname(host)) !== ".silk" || !existsSync(join(host, "src", "natives.silk"))) return null;
+  const root = projectRoot(dirname(dirname(host)));
+  if (!root) return null;
+  const { source } = packageFields(readFileSync(join(root, "silk.toml"), "utf8"));
+  return { root, host, source };
+}
+
+/** `silk build` of the host package in `dir`. */
+function silkBuild(dir) {
+  return new Promise((resolve, reject) => {
+    const build = spawn(process.env.SILK ?? "silk", ["build", "--progress", "never", "--manifest-path", join(dir, "silk.toml")], { stdio: "inherit" });
+    build.on("error", reject);
+    build.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("the host build failed"))));
+  });
+}
+
+/**
  * The plugins of `vite` (serve) for a ui-js application.
  * @param {{ entry: string, port: number, host?: { command: string, args?: readonly string[], cwd?: string } }} options
  */
@@ -157,11 +182,65 @@ export function devPlugins(options) {
         return;
       }
       const { command, args = [], cwd } = options.host;
-      child = spawn(command, [...args, "--dev", String(port)], { cwd, stdio: "inherit" });
-      child.on("error", (error) => server.config.logger.error(`[silk] could not start ${command}: ${error.message}`));
-      // Closing the window ends the dev session.
-      child.on("exit", (code) => process.exit(code ?? 0));
+      const logger = server.config.logger;
+      let restarting = false;
+      const start = () => {
+        child = spawn(command, [...args, "--dev", String(port)], { cwd, stdio: "inherit" });
+        child.on("error", (error) => logger.error(`[silk] could not start ${command}: ${error.message}`));
+        // Closing the window ends the dev session.
+        child.on("exit", (code) => {
+          if (!restarting) process.exit(code ?? 0);
+        });
+      };
+      start();
       process.on("exit", () => child.kill());
+      const natives = nativesOf(command);
+      if (!natives) return;
+      // The host has the project's exported Silk functions compiled in: an edit to its Silk
+      // sources rebuilds it and starts it again. JavaScript state starts over, as after a reload.
+      let building = null;
+      let again = false;
+      const rebuild = async () => {
+        do {
+          again = false;
+          logger.info(`[silk] ${natives.source}/ changed: rebuilding the host`, { timestamp: true });
+          restarting = true;
+          // The host is linked in place, so it stops first.
+          const exited = new Promise((resolve) => child.once("exit", resolve));
+          child.kill();
+          await exited;
+          try {
+            const description = await writeNatives(natives.root);
+            for (const line of leftOut(description)) logger.warn(`[silk] ${line}`);
+            const glue = join(natives.root, NATIVES_DIR, "natives.silk");
+            if (existsSync(glue)) copyFileSync(glue, join(natives.host, "src", "natives.silk"));
+            await silkBuild(natives.host);
+          } catch (error) {
+            logger.error(`[silk] ${error.message}: the previous build runs until the next change`, { timestamp: true });
+          }
+          for (const environment of Object.values(server.environments)) {
+            for (const module of environment.moduleGraph.idToModuleMap.values()) {
+              if (module.file?.endsWith(".silk")) environment.moduleGraph.invalidateModule(module);
+            }
+          }
+          start();
+          restarting = false;
+        } while (again);
+        building = null;
+      };
+      const sources = join(natives.root, natives.source) + sep;
+      server.watcher.add(sources);
+      const changed = (file) => {
+        if (!file.endsWith(".silk") || !file.startsWith(sources)) return;
+        if (building) {
+          again = true;
+          return;
+        }
+        building = rebuild();
+      };
+      server.watcher.on("change", changed);
+      server.watcher.on("add", changed);
+      server.watcher.on("unlink", changed);
     },
   };
 
