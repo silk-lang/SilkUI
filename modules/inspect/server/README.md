@@ -177,6 +177,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `tree` | target (optional, a subtree) | `nodes`: node objects in tree order, each with `parent` (left out at the top), `depth` and `children` (the count); `roots`: the open roots, `{"root", "node"}`, the current one first; `width`, `height`, `scale`, `frame` |
 | `events` | `since` (a `seq`, default 0), `limit` (the newest N) | `events`: the logged records after `since`, oldest first, each `{"seq", "frame", "kind", "target", "path"}` plus `x`, `y` (pointer, wheel and scroll records), `modifiers`, `key` and `value` (input records) where they apply; `next`: the `seq` the next record gets |
 | `frames` | `since` (a frame number), `limit` | `frames`: one per frame drawn, `{"frame", "layoutMs", "paintMs", "layoutSkipped", "layoutPasses", "repainted", "replayed", "fragments", "primitives", "glyphs", "nodes"}`; `count`, `timed` (whether the host times its frames; times are 0 when it does not), `slowestMs`, `averageMs` |
+| `performance` | `since` (a frame number), `limit` | `interactions`: each input that ran handlers, `{"frame", "input", "target", "totalMs", "handleMs", "layoutMs", "paintMs"}` (`input` is `press`, `click`, `key <key>`, `type`, `wheel` or `paste`; `target` names the node under the pointer or with focus, as `button "Save"` or `#12`); `slow` (over 100 ms) and `slowest`; `startup` `{"windowMs", "gpuMs", "firstFrameMs"}` from the host's start; `memoryBytes`, the process's footprint (0 where the system cannot say) |
 | `styles` | target | `node`; the declarations it shows per state (`base`, `hover`, `active`, `focus`, `focus-visible`): the client's with the style edits over them; for the states with edits, `overrides` (the edits' declarations), `client` (the client's own underneath) and `replacing` (states whose edit leaves the client's out) |
 | `setStyle` | target, `style` (`"width: 200px; color: red"`), `state` (default `base`), `replace` | `node`, `state`, `style` (what it shows now), `edited` (node and state pairs with edits), `edits` (the ids of the node's open edits in that state), `seq`; a declaration that does not parse is an error and changes nothing |
 | `resetStyles` | target (optional), `state`, `property` (with a target) | `restored` (pairs or properties showing the client's declarations again), `removed` (open edits taken out of the log), `seq` |
@@ -367,7 +368,7 @@ silk task native inspect      # the CLI drives the demo in a window
 - A connection costs two pump threads, besides the one accept thread. Closing the inspector
   waits for them, up to a read pause (0.2 s).
 - `type` sends `TextInput` records (Enter and Tab for newlines and tabs); IME preedit is not driven.
-- The timeline keeps the last 240 frames.
+- The timeline keeps the last 240 frames and 100 interactions. Interactions are timed by the window host in debug builds, from when it takes the input to when it hands the frame to the GPU, so display latency is not in them; inputs from the inspector itself are not timed.
 - An extension is served on the app's thread when the app's loop serves it: its replies and
   views come a turn of the loop after the request, never on the spot (a client in the app's
   process sends such requests without waiting, `Link.ask` in the devtools).
