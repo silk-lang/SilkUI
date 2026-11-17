@@ -79,6 +79,17 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
 
 `silk task dev --target web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
 
+## Draw the title bar
+
+On macOS the app can fill the whole window, with the window controls floating over its top:
+
+```silk
+    |> App.target(Target.window(Window { title: "My app", width: 1040.0, height: 720.0 })
+      .titleBar(TitleBar.transparent(56.0)))
+```
+
+The app draws its own bar in those top 56 pixels and leaves room on the left for the controls, which are centred in it. A press there moves the window and a double click zooms it, so the app gets no clicks in that strip. Import `TitleBar` from `silkui.app` beside `Window`. Windows and Linux keep the system's bar above the app.
+
 ## Next
 
 - Write a Loom app: [your first program](/core/first-program/), then the [tutorial](/core/tutorial/).

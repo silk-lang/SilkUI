@@ -11,6 +11,11 @@
 //!     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
 //! }
 //!
+//! // The app draws under the window's title bar on macOS, and a press in its top 56 pixels
+//! // moves the window.
+//! Target.window(Window { title: "My app", width: 900.0, height: 600.0 })
+//!   .titleBar(TitleBar.transparent(56.0))
+//!
 //! run app() |> App.only(target) |> App.build(Mode.Dev) |> Built.launch() |> Running.watch()
 //! run app() |> App.only(target) |> App.build(Mode.Release) |> Built.write("dist")
 //! ```
@@ -52,6 +57,24 @@ pub struct Window {
 
 impl Copy for Window {}
 
+/// How a desktop window's title bar is drawn.
+pub union TitleBar {
+  /// The system's bar, above the app.
+  Standard,
+  /// On macOS, the app fills the window and the window controls float over its top `height`
+  /// pixels: the app draws the bar there, a press in it moves the window (a double click zooms
+  /// or minimizes it, as the user's settings say), and the app gets no presses there. Other
+  /// systems keep their bar.
+  Transparent { pub height: f64 },
+}
+
+impl Copy for TitleBar {}
+
+impl TitleBar {
+  pub fn standard() -> TitleBar { return TitleBar.Standard }
+  pub fn transparent(height: f64) -> TitleBar { return TitleBar.Transparent { height: height } }
+}
+
 /// A browser page's options. The app fills the page.
 pub struct Page {
   pub title: string<'static>,
@@ -62,7 +85,7 @@ impl Copy for Page {}
 /// Where an app runs. Its id names it in `--target`, in `.silk/<id>/` and in `dist/<id>/`.
 pub union Target {
   /// A desktop window (`window`).
-  Window { pub window: Window },
+  Window { pub window: Window, pub bar: TitleBar },
   /// A browser page drawn with WebGPU (`web-canvas`): the tree, compiled to wasm.
   WebCanvas { pub page: Page },
   /// A browser page of real elements (`web-dom`): the browser's DOM in the tree's place.
@@ -72,9 +95,18 @@ pub union Target {
 impl Copy for Target {}
 
 impl Target {
-  pub fn window(window: Window) -> Target { return Target.Window { window: window } }
+  pub fn window(window: Window) -> Target { return Target.Window { window: window, bar: TitleBar.Standard } }
   pub fn webCanvas(page: Page) -> Target { return Target.WebCanvas { page: page } }
   pub fn webDom(page: Page) -> Target { return Target.WebDom { page: page } }
+
+  /// The window target with its title bar drawn as `bar`. A browser page has no title bar:
+  /// the web targets stay as they are.
+  pub fn titleBar(self: Target, bar: TitleBar) -> Target {
+    return match self {
+      Target.Window { window, .. } => Target.Window { window: window, bar: bar }
+      _ => self
+    }
+  }
 
   /// `window`, `web-canvas` or `web-dom`.
   pub fn id(self: &Target) -> string<'static> {
@@ -498,8 +530,12 @@ impl App {
         continue
       }
       let mut window = Window { title: "", width: 0.0, height: 0.0 }
+      let mut bar = TitleBar.Standard
       match target {
-        Target.Window { window: options } => { window = options }
+        Target.Window { window: options, bar: chosen } => {
+          window = options
+          bar = chosen
+        }
         Target.WebCanvas { page } => { window.title = page.title }
         Target.WebDom { page } => { window.title = page.title }
       }
@@ -527,6 +563,14 @@ impl App {
         title: window.title,
         width: window.width,
         height: window.height,
+        transparentTitleBar: match bar {
+          TitleBar.Standard => false
+          TitleBar.Transparent { .. } => true
+        },
+        titleBarHeight: match bar {
+          TitleBar.Standard => 0.0
+          TitleBar.Transparent { height } => height
+        },
         module: module,
         command: command,
         stylesheets: app.sheetCount(),
