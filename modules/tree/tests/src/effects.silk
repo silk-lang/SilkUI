@@ -6,7 +6,9 @@
 import ui_tree.css
 import ui_tree.css { px, Declaration, Property }
 import ui_fixtures.fixtures as fixtures
-import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, Position }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, Position, Mutation }
+import codec.image { Image, ImageError }
+import silk.text.string { String }
 import font_collection.lib { FontCollection }
 import vector.pixmap { Pixmap }
 import vector.geometry_error { GeometryError }
@@ -569,4 +571,123 @@ test effect fn isolationAndWillChangeMakeContexts() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run contextsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Draws box 2 with `styles`, then serves the one image the paint asks for, a 2 by 2 blue
+/// `pic.png`, and draws again.
+effect fn paintLoaded(collection: &FontCollection, styles: &[Declaration]) -> Pixmap
+  ! AssertionError<'static> | TreeError | GeometryError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[css.width(px(100.0)), css.height(px(100.0)), css.backgroundColor(Rgba<f32>.new(1.0, 1.0, 1.0, 1.0))],
+  )
+  run batch.box(1, 2, &[css.width(px(100.0)), css.height(px(100.0))])
+  run batch.style(2, styles)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let first = run snapshot.render(&tree)
+  run Testing.expect(at(&first, 50, 50, 255, 255, 255), "nothing shows before the image loads")
+  let loads = run tree.takeLoads()
+  run Testing.expect(loads.length() == 1, "each url is asked for once")
+  let resource = match &loads.asSlice()[0] {
+    Mutation.LoadImage { resource, url } => {
+      run Testing.expect(String.view(&url) == "pic.png", "the stylesheet url is asked for")
+      resource
+    }
+    _ => { run Testing.expect(false, "an image load") 0 }
+  }
+  let mut image = run Image.make(2, 2)
+  let pixels = image.dataMut()
+  let mut i: usize = 0
+  while i < pixels.length {
+    pixels[i] = if i % 4 == 2 || i % 4 == 3 { 255 } else { 0 }
+    i = i + 1
+  }
+  drop pixels
+  run batch.decodedImage(resource, move image)
+  run tree.apply(run batch.take())
+  run tree.settleSource(resource, true)
+  run tree.frame(viewport())
+  run Testing.expect((run tree.takeLoads()).length() == 0, "a loaded url is not asked for again")
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn urlImagesBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let tiled = run paintLoaded(&collection, &[run declared(Property.BackgroundImage, b"url(pic.png)")])
+  run Testing.expect(at(&tiled, 1, 1, 0, 0, 255), "the image draws from the corner")
+  run Testing.expect(at(&tiled, 77, 51, 0, 0, 255), "the image repeats at its own size")
+
+  let placed = run paintLoaded(
+    &collection,
+    &[
+      run declared(Property.BackgroundImage, b"url(pic.png)"),
+      run declared(Property.BackgroundSize, b"50px 50px"),
+      run declared(Property.BackgroundRepeat, b"no-repeat"),
+    ],
+  )
+  run Testing.expect(at(&placed, 25, 25, 0, 0, 255), "one tile scaled to its size")
+  run Testing.expect(at(&placed, 75, 75, 255, 255, 255), "nothing past the tile")
+
+  let covered = run paintLoaded(
+    &collection,
+    &[
+      run declared(Property.BackgroundImage, b"url(pic.png)"),
+      run declared(Property.BackgroundSize, b"cover"),
+      run declared(Property.BackgroundRepeat, b"no-repeat"),
+    ],
+  )
+  run Testing.expect(at(&covered, 95, 95, 0, 0, 255), "cover fills the box")
+
+  let masked = run paintLoaded(
+    &collection,
+    &[
+      css.backgroundColor(red()),
+      run declared(Property.MaskImage, b"url(pic.png)"),
+      run declared(Property.MaskSize, b"50px 100px"),
+      run declared(Property.MaskRepeat, b"no-repeat"),
+    ],
+  )
+  run Testing.expect(at(&masked, 25, 50, 255, 0, 0), "the opaque image keeps the box")
+  run Testing.expect(at(&masked, 75, 50, 255, 255, 255), "and the box is hidden past it")
+
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[css.width(px(100.0)), css.height(px(100.0))])
+  run batch.style(1, &[run declared(Property.BackgroundImage, b"url(\"data:image/svg+xml,<svg/>\")")])
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  drop run snapshot.render(&tree)
+  let loads = run tree.takeLoads()
+  let resource = match &loads.asSlice()[0] {
+    Mutation.LoadIcon { resource, .. } => resource
+    _ => { run Testing.expect(false, "an SVG url loads as an icon") 0 }
+  }
+  run batch.icon(resource, b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"><rect width=\"10\" height=\"10\" fill=\"red\"/></svg>")
+  run tree.apply(run batch.take())
+  run tree.settleSource(resource, true)
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  let icon = run snapshot.render(&tree)
+  run Testing.expect(at(&icon, 5, 5, 255, 0, 0) && at(&icon, 95, 95, 255, 0, 0), "an SVG image tiles at its own size")
+}
+
+test effect fn urlBackgroundsAndMasks() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | ImageError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run urlImagesBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

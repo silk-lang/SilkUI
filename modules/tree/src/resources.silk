@@ -23,6 +23,9 @@ import silk.color.rgba { Rgba }
 import silk.num.f32
 import silk.num.u32
 import silk.text.string { String }
+import silk.collections.bytes { Bytes }
+import silk.core.result { Result }
+import silk.num.usize
 
 /// The size an icon is rendered at to tell whether it paints only with `currentColor`.
 const CLASSIFY_SIZE: u32 = 32
@@ -354,9 +357,24 @@ effect fn imageTile(images: &mut ImageStore, atlas: &mut Atlas, id: ImageId) -> 
   return run images.tile(&mut atlas, id)
 }
 
+/// The first resource id the tree gives the images stylesheets name with `url()`. Clients
+/// number their own resources from 1, and host font faces start at 0x80000000.
+pub const CSS_IMAGE_BASE: u32 = 0x7F000000
+
+/// Where a stylesheet image is: not asked for yet, asked for, loaded, or failed.
+pub enum CssImageState { Wanted, Asked, Loaded, Failed }
+
+/// An image a stylesheet names, as resource `CSS_IMAGE_BASE` plus its index.
+pub struct CssImage {
+  pub url: String,
+  pub state: CssImageState,
+}
+
 /// Images and icons by client resource id.
 pub struct Resources {
   entries: List<Entry>,
+  /// Images stylesheets name, in the order paint first met them.
+  pub cssImages: List<CssImage>,
   pub images: ImageStore,
   pub icons: IconCache,
   host: IconHost,
@@ -370,11 +388,43 @@ impl Resources {
     let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/ui/icons/icon.svg"), badUrl)
     return Resources {
       entries: List<Entry>.make(),
+      cssImages: List<CssImage>.make(),
       images: ImageStore.make(),
       icons: IconCache.make(IconOptions.default()),
       host: IconHost { base: move base, fonts: FontDatabase.make() },
       resolver: DataOnly.make(ResourceLimits.defaults()),
     }
+  }
+
+  /// The resource id of stylesheet image `url`, asked for in the next `takeLoads` the first
+  /// time it is met.
+  pub effect fn cssImage(self: &mut Self, url: &[u8]) -> u32
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let images = self.cssImages.asSlice()
+    let mut i: usize = 0
+    while i < images.length {
+      if sameBytes(String.utf8Bytes(String.view(&images[i].url)), url) {
+        return CSS_IMAGE_BASE + usize.toU32(i)
+      }
+      i = i + 1
+    }
+    let text = match String.fromBytes(run Bytes.copy(url)) {
+      Result.Success { value } => move value
+      _ => String.make()
+    }
+    run self.cssImages.append(CssImage { url: move text, state: CssImageState.Wanted })
+    return CSS_IMAGE_BASE + usize.toU32(self.cssImages.length() - 1)
+  }
+
+  /// Records that stylesheet image `id` loaded or failed. False for other ids.
+  pub fn settleCssImage(self: &mut Self, id: u32, ok: bool) -> bool {
+    if id < CSS_IMAGE_BASE || u32.toUsize(id - CSS_IMAGE_BASE) >= self.cssImages.length() {
+      return false
+    }
+    let images = self.cssImages.asMutSlice()
+    images[u32.toUsize(id - CSS_IMAGE_BASE)].state = if ok { CssImageState.Loaded } else { CssImageState.Failed }
+    return true
   }
 
   /// The resource defined as `id`.
@@ -516,4 +566,18 @@ impl Resources {
     ? &mut Allocator {
     return run Effect.catch<AtlasError>(imageTile(&mut self.images, &mut atlas, image), noTile)
   }
+}
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length {
+    return false
+  }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  return true
 }
