@@ -24,6 +24,7 @@ import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f64
 import silk.num.u32
+import silk.num.u8
 import silk.num.u64
 import silk.num.usize
 
@@ -130,6 +131,9 @@ struct Source {
   tinted: bool,
   /// Width over height of the document's viewport (its size, else its viewBox).
   ratio: f64,
+  /// The root's `width` and `height` in pixels, 0 where the markup gives no absolute one.
+  width: f64,
+  height: f64,
 }
 
 pub struct IconCache {
@@ -158,6 +162,76 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
     i = i + 1
   }
   return false
+}
+
+/// Attribute `name` of the first `<svg` tag in `data` as pixels: a plain number or one in
+/// `px`. 0 when it is missing, relative (`%`, `em`) or not a number.
+pub fn rootLength(data: &[u8], name: &[u8]) -> f64 {
+  let mut i: usize = 0
+  while i + 4 <= data.length && !(data[i] == 60 && data[i + 1] == 115 && data[i + 2] == 118 && data[i + 3] == 103) {
+    i = i + 1
+  }
+  i = i + 4
+  while i < data.length && data[i] != 62 {
+    // An attribute name starts after white space.
+    let spaced = data[i - 1] == 32 || data[i - 1] == 9 || data[i - 1] == 10 || data[i - 1] == 13
+    if spaced && i + name.length + 1 < data.length {
+      let mut j: usize = 0
+      while j < name.length && data[i + j] == name[j] {
+        j = j + 1
+      }
+      if j == name.length && data[i + j] == 61 {
+        let quote = data[i + j + 1]
+        if quote == 34 || quote == 39 {
+          return pixels(data, i + j + 2, quote)
+        }
+      }
+    }
+    i = i + 1
+  }
+  return 0.0
+}
+
+/// The number at `from` up to `quote`, in pixels, or 0.
+fn pixels(data: &[u8], from: usize, quote: u8) -> f64 {
+  let mut value: f64 = 0.0
+  let mut scale: f64 = 0.0
+  let mut digits: usize = 0
+  let mut i = from
+  while i < data.length && data[i] == 32 {
+    i = i + 1
+  }
+  while i < data.length {
+    let c = data[i]
+    if c >= 48 && c <= 57 {
+      let digit = u32.toF64(u8.toU32(c - 48))
+      if scale == 0.0 {
+        value = value * 10.0 + digit
+      } else {
+        value = value + digit * scale
+        scale = scale / 10.0
+      }
+      digits = digits + 1
+    } else if c == 46 && scale == 0.0 {
+      scale = 0.1
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  if digits == 0 {
+    return 0.0
+  }
+  if i + 1 < data.length && data[i] == 112 && data[i + 1] == 120 {
+    i = i + 2
+  }
+  while i < data.length && data[i] == 32 {
+    i = i + 1
+  }
+  if i < data.length && data[i] == quote {
+    return value
+  }
+  return 0.0
 }
 
 fn near(a: u8, b: u8) -> bool {
@@ -215,7 +289,16 @@ impl IconCache {
     drop list
     let id = IconId { index: u64.toU32(usize.toU64(self.sources.length())) }
     run self.sources.append(
-      Option<Source>.some(Source { document: move document, moves: moves, tinted: true, ratio: ratio }),
+      Option<Source>.some(
+        Source {
+          document: move document,
+          moves: moves,
+          tinted: true,
+          ratio: ratio,
+          width: rootLength(data, b"width"),
+          height: rootLength(data, b"height"),
+        },
+      ),
     )
     return id
   }
@@ -281,6 +364,29 @@ impl IconCache {
     }
     return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
       Option<Source>.Some { value } => value.ratio
+      Option<Source>.None => 0.0
+    }
+  }
+
+  /// The `width` the root `<svg>` gives in pixels, as an inline `<svg>` sizes itself when
+  /// CSS does not; 0 for one it leaves out or gives in relative units.
+  pub fn width(self: &Self, icon: IconId) -> f64 {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return 0.0
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.width
+      Option<Source>.None => 0.0
+    }
+  }
+
+  /// The `height` the root `<svg>` gives in pixels, as [`IconCache.width`].
+  pub fn height(self: &Self, icon: IconId) -> f64 {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return 0.0
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.height
       Option<Source>.None => 0.0
     }
   }

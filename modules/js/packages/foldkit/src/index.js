@@ -8,7 +8,8 @@
 //   Runtime.run(Runtime.makeApplication({ ..., container: document.getElementById("root") }));
 //
 // Every tag is a box except <input> and <textarea> (the tree's input), <img> (image),
-// <icon> and <canvas>. Elements are styled with `h.Style`; the looks the tree lays over an
+// <icon>, <canvas> and <svg>, whose elements are the markup of one icon. Elements are
+// styled with `h.Style`; the looks the tree lays over an
 // element in a state come from the attributes below.
 import "./dom.js";
 

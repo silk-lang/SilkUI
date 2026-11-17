@@ -10,7 +10,7 @@ export const provided = [
 // `@silkui/foldkit` makes. In a window they are the globals already; in a page the browser's
 // own would win, so a bundle that runs on web-canvas too needs them renamed.
 export const pageGlobals = Object.fromEntries(
-  ["document", "Node", "Element", "HTMLElement", "HTMLInputElement", "HTMLTextAreaElement", "Text", "Comment",
+  ["document", "Node", "Element", "HTMLElement", "SVGElement", "HTMLInputElement", "HTMLTextAreaElement", "Text", "Comment",
     "MutationObserver", "getComputedStyle",
     "HTMLCanvasElement", "HTMLSelectElement", "HTMLDialogElement", "HTMLOutputElement", "DocumentFragment"]
     .map((name) => [name, `globalThis.__silkuiDom.${name}`]),

@@ -6,9 +6,10 @@
 // this file adds what the DOM has on top (attributes, reflected properties, text content,
 // selectors). It installs `document`, `window` and the classes Foldkit tests with
 // `instanceof`, where the realm does not have them.
-import { Event, createNode, createText, mount } from "@silkui/core";
+import { Event, SvgElement as SvgMarkup, createNode, createSvgElement, createText, mount } from "@silkui/core";
 
 const HTML = "http://www.w3.org/1999/xhtml";
+const SVG = "http://www.w3.org/2000/svg";
 
 // Tags that are not a box. Every other tag is one, as a <div> is.
 const KINDS = { input: "input", textarea: "input", img: "image", image: "image", icon: "icon", canvas: "canvas", richinput: "richinput" };
@@ -221,7 +222,7 @@ function attributeChanged(element, name, value) {
   } else if (name === "value" && element instanceof HTMLInputElement) {
     element.value = value ?? "";
   } else if (name === "src") {
-    warnOnce("an image has no src yet");
+    node.setAttribute("src", value ?? "");
   }
 }
 
@@ -582,6 +583,77 @@ class HTMLInputElement extends HTMLElement {
   }
 }
 
+/** The `style` attribute of an element inside an `<svg>`, as a look: it is markup too. */
+class SvgLook {
+  #element;
+  #values = {};
+
+  constructor(element) {
+    this.#element = element;
+  }
+
+  set(properties) {
+    for (const name of Object.keys(properties)) {
+      const value = properties[name];
+      if (value === null || value === undefined || value === "") delete this.#values[name];
+      else this.#values[name] = value;
+    }
+    this.#element.setAttribute("style", this.#values);
+  }
+
+  replace(properties) {
+    this.#values = {};
+    this.set(properties);
+  }
+
+  get(name) {
+    return this.#values[name];
+  }
+
+  get cssText() {
+    return this.#element.getAttribute("style") ?? "";
+  }
+}
+
+/**
+ * An element of the SVG namespace. The root `<svg>` is an icon node; the elements inside are
+ * markup it draws (`SvgElement` of @silkui/core). Attributes keep their case, as SVG's do.
+ */
+class SVGElement extends Element {
+  #style = null;
+
+  get namespaceURI() {
+    return SVG;
+  }
+
+  get tagName() {
+    return this.localName;
+  }
+
+  getAttribute(name) {
+    return this.node.getAttribute(String(name));
+  }
+
+  hasAttribute(name) {
+    return this.node.getAttribute(String(name)) !== null;
+  }
+
+  setAttribute(name, value) {
+    name = String(name);
+    if (name === "style" && !(this.node instanceof SvgMarkup)) this.style.cssText = value;
+    else this.node.setAttribute(name, String(value));
+  }
+
+  removeAttribute(name) {
+    this.node.removeAttribute(String(name));
+  }
+
+  get style() {
+    if (!(this.node instanceof SvgMarkup)) return super.style;
+    return (this.#style ??= new CSSStyleDeclaration(new SvgLook(this.node)));
+  }
+}
+
 class HTMLIconElement extends HTMLElement {
   get svg() {
     return this.node.svg;
@@ -684,6 +756,7 @@ export const document = {
 
   createElement(name) {
     const tag = String(name).toLowerCase();
+    if (tag === "svg") return this.createElementNS(SVG, "svg");
     const kind = KINDS[tag] ?? "box";
     const node = createNode(kind);
     node.setAttribute("element", tag);
@@ -696,8 +769,11 @@ export const document = {
     return kind === "icon" ? new HTMLIconElement(node, tag) : new HTMLElement(node, tag);
   },
 
-  createElementNS(_namespace, name) {
-    return this.createElement(name);
+  createElementNS(namespace, name) {
+    if (namespace !== SVG) return this.createElement(name);
+    const element = new SVGElement(createSvgElement(String(name)), String(name));
+    if (name === "svg") element.node.setAttribute("element", "svg");
+    return element;
   },
 
   createTextNode(data) {
@@ -859,7 +935,7 @@ provide("self", globalThis);
 provide("top", globalThis);
 provide("document", document);
 for (const name of Object.keys(windowMembers)) provide(name, windowMembers[name]);
-for (const [name, value] of Object.entries({ Node: DomNode, Element, HTMLElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, Text, Comment, CSSStyleDeclaration, Event })) {
+for (const [name, value] of Object.entries({ Node: DomNode, Element, HTMLElement, SVGElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, Text, Comment, CSSStyleDeclaration, Event })) {
   provide(name, value);
 }
 // Elements the tree does not have: nothing is an instance of them.
@@ -872,7 +948,7 @@ for (const name of ["HTMLCanvasElement", "HTMLSelectElement", "HTMLDialogElement
 // cannot replace them: a build for both targets renames Foldkit's references to these
 // (`pageGlobals` in apis.js), which are the same objects in a window.
 globalThis.__silkuiDom = {
-  document, Node: DomNode, Element, HTMLElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, Text, Comment,
+  document, Node: DomNode, Element, HTMLElement, SVGElement, HTMLInputElement, HTMLTextAreaElement: HTMLInputElement, Text, Comment,
   MutationObserver: windowMembers.MutationObserver, getComputedStyle: windowMembers.getComputedStyle, ...absent,
 };
 provide("navigator", { userAgent: "SilkUI" });
