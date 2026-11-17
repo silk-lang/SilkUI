@@ -329,3 +329,55 @@ test effect fn stylesheetEasingSurvivesTextChildren() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run easingWithText() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn ticksStyleOnlyWhatMoves() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  // 2 fades and holds a variable its child 4 reads; 3 is a bystander; 5 animates an inherited
+  // value its child 6 measures with; 7 transitions.
+  let classes: [string; 6] = ["fade", "reads", "still", "grow", "wide", "moves"]
+  let parents: [u32; 6] = [1, 2, 1, 1, 5, 1]
+  let ids: [u32; 6] = [2, 4, 3, 5, 6, 7]
+  let mut i: usize = 0
+  while i < 6 {
+    run batch.create(ids[i], NodeKind.Box)
+    run batch.append(parents[i], ids[i])
+    run batch.attribute(ids[i], Attribute.ClassName { value: run String.copy(classes[i]) })
+    i = i + 1
+  }
+  let bytes = run sheet(b".fade{--w:40px;animation:fade 1s linear both}.reads{width:var(--w)}.still{opacity:.7}.grow{font-size:10px;animation:grow 1s linear both}.wide{width:2em}.moves{opacity:1;transition:opacity 1s linear}.moves.on{opacity:.2}@keyframes fade{from{opacity:0}to{opacity:1}}@keyframes grow{to{font-size:20px}}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(tree.stats.styledNodes == 7, "the first frame styles every node")
+  run tree.frame(at(0.5))
+  run Testing.expect(near(opacity(&tree, 2), 0.5) && near(width(&tree, 6), 30.0), "the animations move on")
+  run Testing.expect(near(width(&tree, 4), 40.0) && near(opacity(&tree, 3), 0.7), "the nodes that did not move keep their styles")
+  // 2 and 5 animate; 6 follows 5's font size. 3, 4 and 7 match and compute nothing again.
+  run Testing.expect(tree.stats.styledNodes == 3, "a frame of an animation styles only the nodes it changes")
+
+  run batch.attribute(7, Attribute.ClassName { value: run String.copy("moves on") })
+  run tree.apply(run batch.take())
+  run tree.frame(at(1.5))
+  run tree.frame(at(2.0))
+  run Testing.expect(near(opacity(&tree, 7), 0.6), "a transition from a sheet moves on")
+  run Testing.expect(tree.stats.styledNodes == 1, "a frame of a transition styles only its node")
+  run tree.frame(at(2.6))
+  run Testing.expect(near(opacity(&tree, 7), 0.2), "the transition ends on the sheet's value")
+
+  // A change of rules during an animation still reaches every node.
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("any") })
+  run tree.apply(run batch.take())
+  run tree.frame(at(2.7))
+  run Testing.expect(near(width(&tree, 4), 40.0) && near(opacity(&tree, 2), 1.0) && near(width(&tree, 6), 40.0), "a restyle after ticks finds the same styles")
+}
+
+test effect fn stylesheetAnimationFramesStyleOnlyWhatMoves() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run ticksStyleOnlyWhatMoves() |> Effect.provideMut<Allocator>(&mut allocator)
+}

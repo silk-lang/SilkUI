@@ -151,13 +151,13 @@ test("data-testid remains available to both stylesheet selectors and the inspect
   assert.equal(element.node.getAttribute("testId"), "");
 });
 
-test("inline svg from the view draws as one icon whose markup follows the model", async () => {
+test("inline svg from the view draws as one node whose markup follows the model", async () => {
   const svg = document.getElementById("mark");
   assert.equal(svg.namespaceURI, "http://www.w3.org/2000/svg");
-  assert.equal(svg.node.kind, "icon");
+  assert.equal(svg.node.kind, "svg");
   assert.equal(svg.node.getAttribute("class"), "size-4");
-  assert.ok(svg.node.svg.includes('viewBox="0 0 24 24"'), svg.node.svg);
-  assert.ok(svg.node.svg.includes('<path d="M'), svg.node.svg);
+  assert.ok(svg.node.outerHTML.includes('viewBox="0 0 24 24"'), svg.node.outerHTML);
+  assert.ok(svg.node.outerHTML.includes('<path d="M'), svg.node.outerHTML);
   const element = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
   circle.setAttribute("r", "3");
@@ -165,7 +165,7 @@ test("inline svg from the view draws as one icon whose markup follows the model"
   element.appendChild(circle);
   element.setAttribute("viewBox", "0 0 8 8");
   await Promise.resolve();
-  assert.equal(element.node.svg, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><circle r="3" style="fill:red;"/></svg>');
+  assert.equal(element.node.outerHTML, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><circle r="3" style="fill:red;"/></svg>');
   assert.equal(circle.getAttribute("r"), "3");
   assert.equal(element.firstChild, circle);
 });

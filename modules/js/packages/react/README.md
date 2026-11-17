@@ -2,7 +2,7 @@
 
 A React renderer for the [Silk UI](https://github.com/silk-lang/SilkUI) tree, for apps that
 run on the SilkJS engine embedded in a Silk UI program. Components render to the tree's own
-nodes (`<box>`, `<input>`, `<richinput>`, `<img>`, `<icon>`, `<canvas>`, inline `<svg>`), not to a DOM, and
+nodes (`<box>`, `<input>`, `<richinput>`, `<img>`, `<canvas>`, inline `<svg>`), not to a DOM, and
 React itself runs unmodified. It is a reconciler only: React is your app's own dependency.
 
 ## Install
@@ -97,10 +97,10 @@ Host elements are the tree's node kinds, and strings in children become text nod
   for React DOM, such as `lucide-react`'s, render as they are.
 - **Images.** `<img src>` (or `<image src>`) takes a `data:` URL (base64 or percent-encoded),
   a file or an `http(s):` address, as a browser's does, with `alt`, `onLoad` and `onError`.
-  An SVG file draws as inline `<svg>` does.
-- **Icons.** `<icon svg={markup}>` draws SVG markup you hold as a string (a `?raw` import, an
-  icon set's string export) without building elements; `<icon src>` takes an SVG address.
-- **Refs** are the `@silkui/core` nodes (`Node`, `Input`, `RichInput`, `Image`, `Icon`, `Svg`), for code that
+  An SVG file draws as inline `<svg>` does, so markup you hold as a string (a `?raw` import,
+  an icon set's string export) goes in as `<img src={"data:image/svg+xml," + encodeURIComponent(markup)}>`.
+  To tint any other picture with the text color, use CSS `mask-image` over `background-color: currentColor`.
+- **Refs** are the `@silkui/core` nodes (`Node`, `Input`, `RichInput`, `Image`, `Svg`), for code that
   draws on the tree directly, such as animation on every frame.
 
 ### Timing

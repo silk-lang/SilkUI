@@ -1,5 +1,5 @@
 // JSX for the tree's node kinds. With `"jsxImportSource": "@silkui/react"`, TypeScript
-// checks <box>, <input>, <richinput>, <image>, <icon>, <canvas> and inline <svg> against
+// checks <box>, <input>, <richinput>, <image>, <canvas> and inline <svg> against
 // these props.
 import type { Key, Ref, ReactNode, JSX as ReactJSX } from "react";
 import type * as Silk from "@silkui/core";
@@ -101,13 +101,6 @@ export type ImageProps = SilkProps<Silk.Image> & {
   alt?: string | undefined;
 };
 
-export type IconProps = SilkProps<Silk.Icon> & {
-  /** SVG markup, drawn at the icon's CSS size with its `color` as `currentColor`. */
-  svg?: string | undefined;
-  /** The address of an SVG file instead, `data:image/svg+xml` URLs included. */
-  src?: string | undefined;
-};
-
 /** SVG attributes, in React DOM's spellings (`strokeWidth`, `fillRule`, `xlinkHref`). */
 type SvgAttributes = { [name: string]: string | number | boolean | undefined | null | object };
 
@@ -136,7 +129,6 @@ export namespace JSX {
     richinput: RichInputProps;
     image: ImageProps;
     img: ImageProps;
-    icon: IconProps;
     canvas: SilkProps;
     svg: SvgProps;
     path: SvgElementProps;
