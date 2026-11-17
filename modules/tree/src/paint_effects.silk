@@ -4,6 +4,9 @@
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
 import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
 import paint_css { Effects, Layers, Clip, TextShadow }
+import resources { Resource }
+import atlas.atlas { AtlasTile }
+import silk.collections.bytes { Bytes }
 import style { Computed }
 import node { NONE }
 import layout.lib { Fragment }
@@ -31,6 +34,8 @@ import ui_scene.primitives {
   Background,
   ColorStop,
   ContentMask,
+  GlyphSprite,
+  ImageSprite,
   GradientShape,
   Isolation,
   LinearGradient,
@@ -387,22 +392,66 @@ effect fn noPath<E>(error: E) -> u32 {
 
 // Image layers.
 
-/// The size of a tile of an image without intrinsic size (a gradient) in `area`.
-fn tileSize(effects: &Effects, size: Size, area: Rect<f32>) -> [f32; 2] {
+/// The size of a tile of an image in `area`. `natural` is the image's own size and `ratio` its
+/// width over height; either is 0 when it has none (a gradient has neither, an SVG without a
+/// size only a ratio).
+fn tileSize(effects: &Effects, size: Size, area: Rect<f32>, natural: [f32; 2], ratio: f32) -> [f32; 2] {
   let w = area.xMax - area.xMin
   let h = area.yMax - area.yMin
+  // The image's own size; without one, the largest of its ratio that fits, else the area.
+  let own: [f32; 2] = if natural[0] > 0.0 && natural[1] > 0.0 {
+    natural
+  } else if ratio > 0.0 {
+    if w > h * ratio { [h * ratio, h] } else { [w, w / ratio] }
+  } else {
+    [w, h]
+  }
   return match size {
-    Size.Explicit { x, y } => [
-      match x {
-        Option<ExprId>.Some { value } => f32.max(0.0, effects.pixels(value, w))
-        Option<ExprId>.None => w
-      },
-      match y {
-        Option<ExprId>.Some { value } => f32.max(0.0, effects.pixels(value, h))
-        Option<ExprId>.None => h
-      },
-    ]
-    _ => [w, h]
+    Size.Explicit { x, y } => {
+      let fx = match x {
+        Option<ExprId>.Some { value } => Option<f32>.some(f32.max(0.0, effects.pixels(value, w)))
+        Option<ExprId>.None => Option<f32>.None
+      }
+      let fy = match y {
+        Option<ExprId>.Some { value } => Option<f32>.some(f32.max(0.0, effects.pixels(value, h)))
+        Option<ExprId>.None => Option<f32>.None
+      }
+      let r: f32 = if ratio > 0.0 { ratio } else if own[1] > 0.0 { own[0] / own[1] } else { 0.0 }
+      // With one side auto, an image keeps its ratio; a gradient fills the area on that side.
+      let keeps = (natural[0] > 0.0 || ratio > 0.0) && r > 0.0
+      match fx {
+        Option<f32>.Some { value: ex } => match fy {
+          Option<f32>.Some { value: ey } => [ex, ey]
+          Option<f32>.None => {
+            let autoH = if keeps { ex / r } else { h }
+            [ex, autoH]
+          }
+        }
+        Option<f32>.None => match fy {
+          Option<f32>.Some { value: ey } => {
+            let autoW = if keeps { ey * r } else { w }
+            [autoW, ey]
+          }
+          Option<f32>.None => own
+        }
+      }
+    }
+    Size.Cover => {
+      if own[0] <= 0.0 || own[1] <= 0.0 || (natural[0] <= 0.0 && ratio <= 0.0) {
+        [w, h]
+      } else {
+        let k = f32.max(w / own[0], h / own[1])
+        [own[0] * k, own[1] * k]
+      }
+    }
+    Size.Contain => {
+      if own[0] <= 0.0 || own[1] <= 0.0 || (natural[0] <= 0.0 && ratio <= 0.0) {
+        [w, h]
+      } else {
+        let k = f32.min(w / own[0], h / own[1])
+        [own[0] * k, own[1] * k]
+      }
+    }
   }
 }
 
@@ -466,10 +515,33 @@ pub effect fn paintLayers(
   while layer > 0 {
     layer = layer - 1
     let image = &layers.images.asSlice()[layer]
+    // A `url()` image, once loaded: its resource, natural size and ratio.
+    let mut picture: Option<Resource> = Option<Resource>.None
+    let mut natural: [f32; 2] = [0.0, 0.0]
+    let mut ratio: f32 = 0.0
     let drawable = match &image.* {
       Image.Linear { .. } => true
       Image.Radial { .. } => true
       Image.Conic { .. } => true
+      Image.Url { url } => {
+        let id = run p.resources.cssImage(Bytes.asSlice(&url))
+        picture = p.resources.get(id)
+        match picture {
+          Option<Resource>.Some { value } => match value {
+            Resource.Image { width, height, .. } => {
+              natural = [u32.toF32(width), u32.toF32(height)]
+              ratio = if height > 0 { u32.toF32(width) / u32.toF32(height) } else { 0.0 }
+              width > 0 && height > 0
+            }
+            Resource.Icon { icon } => {
+              let r = f64.toF32(p.resources.iconRatio(icon))
+              ratio = if r > 0.0 && f32.isFinite(r) { r } else { 1.0 }
+              true
+            }
+          }
+          Option<Resource>.None => false
+        }
+      }
       _ => false
     }
     let clipKind = layers.clip(layer)
@@ -479,7 +551,7 @@ pub effect fn paintLayers(
     let area = boxOf(f, layers.origin(layer, initialOrigin))
     let painting = clipBox(f, clipKind)
     let paintingRadii = insetCorners(radii, device(border, s), device(painting, s))
-    let size = tileSize(effects, layers.size(layer), area)
+    let size = tileSize(effects, layers.size(layer), area, natural, ratio)
     let repeat = layers.repeat(layer)
     let mut tw = size[0]
     let mut th = size[1]
@@ -510,6 +582,13 @@ pub effect fn paintLayers(
     let ny = f32.toUsize(down[2])
     if nx == 0 || ny == 0 {
       continue
+    }
+    match picture {
+      Option<Resource>.Some { value } => {
+        run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip)
+        continue
+      }
+      Option<Resource>.None => {}
     }
     let single = nx == 1 && ny == 1
     let first = Rect<f32>.new(across[0], down[0], across[0] + tw, down[0] + th)
@@ -558,6 +637,106 @@ pub effect fn paintLayers(
     if rounded {
       run p.scene.popLayer()
     }
+  }
+}
+
+/// Paints the tiles of a loaded `url()` image (`across` and `down` from [`tiles`], `tw` by `th`
+/// CSS pixels each) clipped to `painting` with corner radii `radii` (device pixels).
+effect fn paintPictures(
+  p: &mut Painter<'_, '_>,
+  picture: Resource,
+  across: [f32; 3],
+  down: [f32; 3],
+  nx: usize,
+  ny: usize,
+  tw: f32,
+  th: f32,
+  painting: Rect<f32>,
+  radii: Corners<f32>,
+  mask: ContentMask,
+  clip: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  let area = device(painting, s)
+  // Images round with their own clip; icons draw as glyphs, which need a rounded mask layer.
+  let layered = match picture {
+    Resource.Icon { .. } => hasRadius(radii)
+    _ => false
+  }
+  if layered {
+    drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: 0 }, LayerEffects.none())
+    drop run p.scene.pushMaskLayer()
+    let mut shape = Quad.fill(area, clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
+    shape.cornerRadii = radii
+    drop run p.scene.quad(shape)
+    run p.scene.popLayer()
+  }
+  let mut drawn: usize = 0
+  let mut j: usize = 0
+  while j < ny && drawn < MAX_TILES {
+    let mut i: usize = 0
+    while i < nx && drawn < MAX_TILES {
+      let x = across[0] + usize.toF32(i) * across[1]
+      let y = down[0] + usize.toF32(j) * down[1]
+      let tile = Rect<f32>.new(x, y, x + tw, y + th)
+      if !isEmpty(intersect(tile, painting)) {
+        let bounds = Rect<f32>.new(f32.round(x * s), f32.round(y * s), f32.round((x + tw) * s), f32.round((y + th) * s))
+        match picture {
+          Resource.Image { image, .. } => {
+            let placed = run p.resources.imageTile(&mut p.atlas, image)
+            if let Option<AtlasTile>.Some { value } = placed {
+              drop run p.scene.image(
+                ImageSprite {
+                  quarterTurns: 0,
+                  clipBounds: area,
+                  bounds: bounds,
+                  mask: mask,
+                  tile: value,
+                  opacity: 1.0,
+                  cornerRadii: radii,
+                  grayscale: false,
+                },
+              )
+            }
+          }
+          Resource.Icon { icon } => {
+            let w = bounds.xMax - bounds.xMin
+            let h = bounds.yMax - bounds.yMin
+            if w >= 1.0 && h >= 1.0 {
+              // An SVG used as an image does not inherit a color: currentColor is black.
+              let black = Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)
+              let placed = run p.resources.iconTile(&mut p.atlas, icon, f32.toU32(w), f32.toU32(h), p.time, black)
+              if let Option<AtlasTile>.Some { value } = placed {
+                if p.resources.tinted(icon) {
+                  drop run p.scene.glyph(GlyphSprite { bounds: bounds, mask: clip, tile: value, color: black })
+                } else {
+                  drop run p.scene.image(
+                    ImageSprite {
+                      quarterTurns: 0,
+                      clipBounds: area,
+                      bounds: bounds,
+                      mask: clip,
+                      tile: value,
+                      opacity: 1.0,
+                      cornerRadii: Corners<f32>.zero(),
+                      grayscale: false,
+                    },
+                  )
+                }
+              }
+            }
+          }
+        }
+        drawn = drawn + 1
+      }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  if layered {
+    run p.scene.popLayer()
   }
 }
 

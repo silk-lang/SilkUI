@@ -129,7 +129,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -1068,6 +1068,10 @@ impl<'a> UiTree<'a> {
   pub effect fn settleSource(self: &mut Self, resource: u32, ok: bool) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if self.resources.settleCssImage(resource, ok) {
+      self.paintCachesStale = true
+      return ()
+    }
     let at = u32.toUsize(resource)
     let have = self.sourceStates.length()
     if at >= have {
@@ -1119,7 +1123,29 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.requestFontFaces()
+    run self.requestCssImages()
     return Intrinsic.replace(self.loads, List<Mutation>.make())
+  }
+
+  /// Asks for the images stylesheets named in the last paints, once each.
+  effect fn requestCssImages(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let images = self.resources.cssImages.asMutSlice()
+    let mut i: usize = 0
+    while i < images.length {
+      if images[i].state == CssImageState.Wanted {
+        images[i].state = CssImageState.Asked
+        let resource = CSS_IMAGE_BASE + usize.toU32(i)
+        let url = run String.copy(String.view(&images[i].url))
+        if isSvgUrl(String.utf8Bytes(String.view(&url))) {
+          run self.loads.append(Mutation.LoadIcon { resource: resource, url: move url })
+        } else {
+          run self.loads.append(Mutation.LoadImage { resource: resource, url: move url })
+        }
+      }
+      i = i + 1
+    }
   }
 
   /// The slot of node `id`, or NONE.
@@ -3864,6 +3890,23 @@ impl<'a> UiTree<'a> {
   effect fn refreshSources(self: &mut Self, resource: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if resource >= CSS_IMAGE_BASE {
+      // Stylesheet images are not node resources: repaint every node with a `url()` layer.
+      let mut at: usize = 0
+      while at < self.nodes.length() {
+        let uses = match self.nodes.asSlice()[at].paintEffects() {
+          Option<&Effects>.Some { value } => value.backgrounds.hasUrl() || value.masks.hasUrl()
+          Option<&Effects>.None => false
+        }
+        if uses && self.nodes.asSlice()[at].live {
+          let node = &mut self.nodes.asMutSlice()[at]
+          node.content = node.content + 1
+        }
+        at = at + 1
+      }
+      self.paintCachesStale = true
+      return ()
+    }
     let mut slot: u32 = 0
     while u32.toUsize(slot) < self.nodes.length() {
       let matches = self.node(slot).live && self.node(slot).resource == resource
@@ -6265,4 +6308,45 @@ fn tableSpans(node: &Node, layout: &mut CssStyle) {
       i = i + 1
     }
   }
+}
+
+/// Whether `url` names an SVG file, which loads as an icon.
+fn isSvgUrl(url: &[u8]) -> bool {
+  let svg = b".svg"
+  let data = b"data:image/svg"
+  let mut end = url.length
+  let mut q: usize = 0
+  while q < url.length {
+    if url[q] == 63 || url[q] == 35 {
+      end = q
+      break
+    }
+    q = q + 1
+  }
+  if end >= svg.length {
+    let mut same = true
+    let mut i: usize = 0
+    while i < svg.length {
+      let c = url[end - svg.length + i]
+      let lower = if c >= 65 && c <= 90 { c + 32 } else { c }
+      if lower != svg[i] {
+        same = false
+      }
+      i = i + 1
+    }
+    if same {
+      return true
+    }
+  }
+  if url.length >= data.length {
+    let mut i: usize = 0
+    while i < data.length {
+      if url[i] != data[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  return false
 }
