@@ -540,6 +540,59 @@ effect fn paintOutline(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, rect: R
   drop run p.scene.quad(quad)
 }
 
+/// Draws the column rules of a multi-column container (fragment `index`, style `c`): one in
+/// the middle of each gap between two columns with content, as tall as the columns, over the
+/// container's background and under its content (Multicol 1 §4).
+effect fn paintColumnRules(p: &mut Painter<'_, '_>, index: usize, c: &Computed, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let rule = c.columnRule
+  let color = if rule.current { c.text.color } else { rule.color }
+  if color.a <= 0.0 {
+    return ()
+  }
+  let s = p.scale
+  let values = p.output.fragments.values.asSlice()
+  let boxes = p.output.boxNodes.asSlice()
+  let mut set = values[index].firstChild
+  while set != NO_INDEX {
+    let setBox = values[set].box
+    if values[set].kind == FragmentKind.Box && setBox != NO_INDEX && setBox < boxes.length && boxes[setBox].columnSet {
+      let mut column = values[set].firstChild
+      let mut previous = NO_INDEX
+      while column != NO_INDEX {
+        if values[column].kind == FragmentKind.Box {
+          if previous != NO_INDEX {
+            let a = borderBox(&values[previous])
+            let b = borderBox(&values[column])
+            let left = if b.xMin >= a.xMax { a.xMax } else { b.xMax }
+            let right = if b.xMin >= a.xMax { b.xMin } else { a.xMin }
+            let middle = (left + right) * 0.5
+            let half = rule.width * 0.5
+            let top = f32.min(a.yMin, b.yMin)
+            let bottom = f32.max(a.yMax, b.yMax)
+            let line = snapped(device(Rect<f32>.new(middle - half, top, middle + half, bottom), s))
+            let w = f32.max(1.0, line.xMax - line.xMin)
+            let bounds = Rect<f32>.new(line.xMin, line.yMin, line.xMin + w, line.yMax)
+            if rule.style == StyleBorder.Dashed {
+              let mut quad = Quad.fill(bounds, mask, Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }))
+              quad.borderWidths = Insets<f32> { top: 0.0, right: 0.0, bottom: 0.0, left: w }
+              quad.borderColor = color
+              quad.borderStyle = BorderStyle.Dashed
+              drop run p.scene.quad(quad)
+            } else {
+              drop run p.scene.quad(Quad.fill(bounds, mask, Background.solid(color)))
+            }
+          }
+          previous = column
+        }
+        column = values[column].nextSibling
+      }
+    }
+    set = values[set].nextSibling
+  }
+}
+
 effect fn noGlyph<E>(error: E) -> Option<RasterGlyph> {
   drop error
   return Option<RasterGlyph>.None
@@ -2027,6 +2080,9 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
         if c.effects.declared && textClipped(&p.*, slot) {
           run paintTextClip(&mut p, index, slot, &c, &f, mask)
         }
+      }
+      if c.columnRule.drawn() {
+        run paintColumnRules(&mut p, index, &c, mask)
       }
       if kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas {
         run paintContent(&mut p, slot, &f, mask)
