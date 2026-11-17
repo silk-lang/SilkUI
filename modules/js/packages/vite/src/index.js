@@ -17,6 +17,7 @@ import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
 import { stylesheetDevPlugin } from "./stylesheets.js";
+import { reportDropped, standardize } from "./report.js";
 import { fontAssetResolver } from "./font-assets.js";
 
 /**
@@ -156,14 +157,12 @@ export default function silk(options = {}) {
         if (!sheets.length) return;
         const css = sheets.map(sheet => typeof sheet.source === "string" ? sheet.source : new TextDecoder().decode(sheet.source)).join("\n");
         let compiled;
-        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
+        try { compiled = compileStylesheet(standardize(css), { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
         catch (error) {
           const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
           this.error(error.message + (dropped ? `\n${dropped}` : ""));
         }
-        for (const diagnostic of compiled.diagnostics) {
-          this.warn(`dropped ${diagnostic.count} ${diagnostic.kind} occurrence(s): ${diagnostic.feature}`);
-        }
+        reportDropped(message => this.warn(message), compiled.diagnostics);
         for (const sheet of sheets) {
           delete output[sheet.fileName];
           delete output[sheet.fileName + ".map"];
