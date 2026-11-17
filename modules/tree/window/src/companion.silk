@@ -20,6 +20,10 @@
 //!   the client's on the one surface. Pointer input in the dock's area goes to the companion's
 //!   root, the rest to the client's.
 //!
+//! A companion may also draw over the first window without taking input (`Companion.overlay`):
+//! the host lays that root out at the size of the client's part of the window and draws its
+//! scene over the client's and the dock's. A development screen reader draws its focus ring and captions so.
+//!
 //! The companion applies its batches with its own root current (`UiTree.useRoot`), so the nodes
 //! it makes count as its root's and the client's root needs no frame for them.
 import ui_tree.legacy { UiTree, TreeError, FrameInput }
@@ -74,6 +78,12 @@ pub interface Companion {
   /// one. A docked root gets no window of its own.
   fn dock(self: &Self, width: f32, height: f32) -> Option<Dock> {
     return Option<Dock>.None
+  }
+
+  /// The companion root drawn over the client's part of the first window, or NONE. It takes no
+  /// input and gets no window of its own.
+  fn overlay(self: &Self) -> u32 {
+    return NONE
   }
 
   /// Takes the records and root events of its roots and answers them, and whatever else came
@@ -174,3 +184,104 @@ fn within(area: Rect<f32>, x: f32, y: f32) -> bool {
 pub struct NoCompanion {}
 
 impl Companion for NoCompanion {}
+
+/// Two companions as one: `first` (the caller's) and `second`. `second` attaches first, so what
+/// it adds to the inspector is there when `first` opens a client of it. Keys go to `first`
+/// first; the dock is `first`'s if it has one; the overlay is `second`'s if it has one.
+pub struct Paired<'c, A, B> {
+  pub first: &'c mut A,
+  pub second: &'c mut B,
+}
+
+impl<'c, A: Companion, B: Companion> Companion for Paired<'c, A, B> {
+  effect fn attach(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.second.attach(&mut tree, &mut inspector)
+    run self.first.attach(&mut tree, &mut inspector)
+  }
+
+  effect fn key(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    input: &Input,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if run self.first.key(&mut tree, &mut inspector, input) {
+      return true
+    }
+    return run self.second.key(&mut tree, &mut inspector, input)
+  }
+
+  fn owns(self: &Self, root: u32) -> bool {
+    return self.first.owns(root) || self.second.owns(root)
+  }
+
+  fn dock(self: &Self, width: f32, height: f32) -> Option<Dock> {
+    let docked = self.first.dock(width, height)
+    if docked.isSome() {
+      return docked
+    }
+    return self.second.dock(width, height)
+  }
+
+  fn overlay(self: &Self) -> u32 {
+    let drawn = self.second.overlay()
+    if drawn != NONE {
+      return drawn
+    }
+    return self.first.overlay()
+  }
+
+  effect fn pump(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    time: f64,
+  ) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let a = run self.first.pump(&mut tree, &mut inspector, time)
+    let b = run self.second.pump(&mut tree, &mut inspector, time)
+    return a || b
+  }
+
+  effect fn decide(self: &mut Self, tree: &mut UiTree<'_>, inspector: &mut Inspector) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.second.owns(tree.current) {
+      return run self.second.decide(&mut tree, &mut inspector)
+    }
+    return run self.first.decide(&mut tree, &mut inspector)
+  }
+
+  effect fn layout(
+    self: &mut Self,
+    tree: &mut UiTree<'_>,
+    inspector: &mut Inspector,
+    root: u32,
+    input: FrameInput,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.second.owns(root) {
+      run self.second.layout(&mut tree, &mut inspector, root, input)
+    } else {
+      run self.first.layout(&mut tree, &mut inspector, root, input)
+    }
+  }
+
+  fn nextDeadline(self: &Self) -> Option<f64> {
+    let a = self.first.nextDeadline()
+    let b = self.second.nextDeadline()
+    return match a {
+      Option<f64>.Some { value: x } => match b {
+        Option<f64>.Some { value: y } => Option<f64>.some(if x < y { x } else { y })
+        Option<f64>.None => a
+      }
+      Option<f64>.None => b
+    }
+  }
+}
