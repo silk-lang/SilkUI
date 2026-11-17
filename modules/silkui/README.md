@@ -83,7 +83,7 @@ information, as `silk build` makes without `--release`.
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
-| `Target.titleBar` | `TitleBar.standard()` (default), `TitleBar.transparent(height)` | On a window target. Transparent: on macOS the app fills the window under the controls and draws its own bar in the top `height` pixels, where a press moves the window and the app gets no clicks. Other systems keep their bar |
+| `Target.titleBar` | `TitleBar.standard()` (default), `TitleBar.transparent(height)`, `.buttons(left, top)` | On a window target. `buttons` moves the window buttons' top-left corner (0 keeps it centred). Transparent: on macOS the app fills the window under the controls and draws its own bar in the top `height` pixels, where a press moves the window and the app gets no clicks. Other systems keep their bar |
 | `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
 Fonts are the ones installed on the machine. A `web-canvas` page has no access to those, so it
