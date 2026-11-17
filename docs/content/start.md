@@ -12,7 +12,7 @@ cd my-app
 silk task dev
 ```
 
-The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `js/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
+`silk run` does the same in the JavaScript templates. The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `js/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
 
 On Linux the window system's headers have to be installed first:
 
