@@ -45,7 +45,7 @@ A JavaScript template has three parts:
 
 A Loom template has `src/app.silk` in place of `web/`, and depends on `loom` as well.
 
-In a Loom app, `dev` rebuilds and restarts the window when you save a file in `src/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. Each new `silk task dev` starts from `init`.
+In a Loom app, `dev` rebuilds and restarts the window when you save a file in `src/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. The window keeps its size, focus and scroll positions too. Each new `silk task dev` starts from `init`.
 
 The app definition is a few lines at the top of `src/tasks.silk`:
 
