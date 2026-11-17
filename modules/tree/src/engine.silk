@@ -38,6 +38,7 @@ import ui_protocol.backend { Backend, Measured }
 import grid_css
 import expand
 import font_features
+import font_features { VariationTable }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -759,6 +760,7 @@ pub struct UiTree<'a> {
   /// How many nodes are inert, so input skips looking for inert ancestors when none are.
   pub inerts: u32,
   families: Families,
+  variations: VariationTable,
   pub resources: Resources,
   /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
   /// the host's loaders (`takeLoads`). The tree does no I/O: a host reads, fetches or looks up
@@ -964,6 +966,7 @@ impl<'a> UiTree<'a> {
       returns: List<FocusReturn>.make(),
       inerts: 0,
       families: Families.make(),
+      variations: VariationTable.make(),
       resources: move resources,
       loads: List<Mutation>.make(),
       sourceStates: List<u8>.make(),
@@ -1159,7 +1162,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1182,6 +1185,16 @@ impl<'a> UiTree<'a> {
             })
           }
           Result.Failure { error: _ } => {}
+        }
+      } else if writtenVariations(&declared[i]) {
+        // Settings that do not parse are dropped, as CSS drops an invalid declaration.
+        let text = run values.cssText(&declared[i].value)
+        if let Option.Some { value: id } = run self.variations.intern(Bytes.asSlice(&text)) {
+          run out.append(Declaration {
+            property: CssProperty.FontVariationSettings,
+            value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
         }
       } else {
         run out.append(run values.cloneDeclaration(&declared[i]))
@@ -3961,6 +3974,7 @@ impl<'a> UiTree<'a> {
       },
     }
     request.treatment = treatment
+    request.variations = self.variations.axes(text.features.variations)
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -6150,6 +6164,19 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
     && &left.selectionColor == &right.selectionColor
     && &left.placeholderColor == &right.placeholderColor
     && left.hasPlaceholderColor == right.hasPlaceholderColor
+    && left.textWrapStyle == right.textWrapStyle
+    && left.width == right.width
+    && left.features.same(&right.features)
+}
+
+// `font-variation-settings` written as CSS text rather than as a VariationTable id.
+fn writtenVariations(declaration: &Declaration) -> bool {
+  return declaration.property == CssProperty.FontVariationSettings && convert.number(&declaration.value).isNone()
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
 // A `font-family` written as CSS text rather than as a family list id.
