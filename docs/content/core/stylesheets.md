@@ -2,6 +2,18 @@
 
 A stylesheet is another way to give a tree its CSS. Keep using `h.style` for values computed from your model, and use classes when you want shared rules, themes, or a CSS processor such as Tailwind. Both paths feed the same property resolver.
 
+## The plan picker, with a sheet
+
+::demo plans-sheet
+
+This is the plan picker of [Styling](/core/styling/), with every style moved into a CSS file. Click a plan, move the pointer over the others, press Tab. The program only names classes:
+
+::source examples/src/core/plans_sheet.silk
+
+The sheet holds the values. The colors are custom properties on the picker, the pointer and focus states are selectors, and the chosen card is one more class:
+
+::source styles/plans.css
+
 ## Load CSS at build time
 
 In `src/tasks.silk`, add files to the app definition in cascade order:
@@ -64,7 +76,17 @@ h.box(&[h.class("flex gap-3 p-4")], children)
 
 Class strings must be literal so Tailwind can find them. Classes assembled at runtime need an explicit source declaration in the Tailwind input.
 
-The `ui-loom-tailwind`, `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` templates show the complete setup. The original templates keep their style-object defaults. See the [Tailwind helper](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) for build and watch examples and platform support.
+Here is the same plan picker with Tailwind classes. The two class lists of a card are written out whole, so Tailwind finds every class by reading the file:
+
+::source examples/src/core/plans_tailwind.silk
+
+Its input file names the Silk source to scan:
+
+::source styles/plans.tailwind.input.css
+
+The tests of the docs examples compile both sheets, adopt them on a tree and check the computed styles of the cards.
+
+The `ui-loom-tailwind`, `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` templates show the complete setup, and the `ui-loom-css`, `ui-react-css`, `ui-foldkit-css` and `ui-js-css` templates do the same with one plain CSS file. The original templates keep their style-object defaults. See the [Tailwind helper](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) for build and watch examples and platform support.
 
 ## JavaScript apps
 

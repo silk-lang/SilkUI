@@ -1,0 +1,110 @@
+//! Tests for the examples that take their styles from a stylesheet. Each compiles the CSS file
+//! the docs show, adopts it on a real tree, and reads the styles the tree computed.
+import examples.core.plans_css as plans_css
+import examples.core.plans_sheet as by_sheet
+import examples.core.plans_tailwind as by_tailwind
+import loom_tree.harness { clickRole, locateRole }
+import loom.lib { drain, NoCommand, Role, TreeError }
+import loom.program as program
+import svg_css.compile { Options, CompileError }
+import svg_css.compile
+import svg_css.tokens { CssError }
+import ui_fixtures.fixtures as fixtures
+import ui_tree.legacy { Batch, FrameInput, UiTree }
+import ui_tree.style { Fill }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+type Failure = AssertionError<'static> | TreeError | CompileError | CssError | OutOfMemoryError
+
+const VIEWPORT: FrameInput = FrameInput { width: 640.0, height: 240.0, scale: 1.0, time: 0.0 }
+
+/// The same window a while later, when the cards' color transitions have ended.
+const LATER: FrameInput = FrameInput { width: 640.0, height: 240.0, scale: 1.0, time: 5000.0 }
+
+/// Compiles `css` as a build does and adopts it on the tree's root.
+effect fn adopt(tree: &mut UiTree<'_>, css: string) -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let sheet = run compile.compile(String.utf8Bytes(css), &Options.make())
+  let bytes = run sheet.encode()
+  let mut batch = Batch.make()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+}
+
+/// What the tree computed for a plan card.
+struct Card {
+  white: bool,
+  padding: f32,
+}
+
+/// The computed look of the plan card named `name`.
+effect fn card(tree: &mut UiTree<'_>, at: FrameInput, name: string) -> Card
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let found = run locateRole(&mut tree, at, Role.Radio, name)
+  run Testing.expect(found.isSome(), "the plan card is there")
+  let id = match found {
+    Option.Some { value } => value.id
+    Option.None => 0
+  }
+  let node = tree.node(tree.slotOf(id))
+  let white = match node.computed.paint.background {
+    Fill.Solid { color } => color.r == 1.0 && color.g == 1.0 && color.b == 1.0
+    _ => false
+  }
+  return Card { white: white, padding: node.computed.layout.padding.left.value }
+}
+
+effect fn sheetBody() -> () ! Failure ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = run program.make<by_sheet.Plans, by_sheet.Message, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  run adopt(&mut tree, plans_css.PLAIN)
+
+  let team = run card(&mut tree, VIEWPORT, "Team")
+  let solo = run card(&mut tree, VIEWPORT, "Solo")
+  run Testing.expect(team.padding == 14.0 && solo.padding == 14.0, "the sheet's padding reaches every card")
+  run Testing.expect(!team.white && solo.white, "the chosen card takes the color the sheet mixes")
+
+  run Testing.expect(run clickRole(&mut app, &mut tree, VIEWPORT, Role.Radio, "Solo"), "a card can be clicked")
+  let teamAfter = run card(&mut tree, LATER, "Team")
+  let soloAfter = run card(&mut tree, LATER, "Solo")
+  run Testing.expect(app.model.value.chosen == 0, "the click reaches the model")
+  run Testing.expect(teamAfter.white && !soloAfter.white, "and the chosen class moves with it")
+}
+
+test effect fn aStylesheetStylesThePlanPicker() -> () ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sheetBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn tailwindBody() -> () ! Failure ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut app = run program.make<by_tailwind.Plans, by_tailwind.Message, NoCommand>()
+  run app.start(&mut tree, 0.0)
+  run drain(&mut app, &mut tree)
+  run adopt(&mut tree, plans_css.TAILWIND)
+
+  let team = run card(&mut tree, VIEWPORT, "Team")
+  let solo = run card(&mut tree, VIEWPORT, "Solo")
+  run Testing.expect(team.padding == 14.0 && solo.padding == 14.0, "p-3.5 is 14px on every card")
+  run Testing.expect(!team.white && solo.white, "bg-teal-50 on the chosen card, bg-white on the others")
+
+  run Testing.expect(run clickRole(&mut app, &mut tree, VIEWPORT, Role.Radio, "Solo"), "a card can be clicked")
+  let teamAfter = run card(&mut tree, LATER, "Team")
+  let soloAfter = run card(&mut tree, LATER, "Solo")
+  run Testing.expect(teamAfter.white && !soloAfter.white, "the classes follow the model")
+}
+
+test effect fn tailwindClassesStyleThePlanPicker() -> () ! Failure {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tailwindBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

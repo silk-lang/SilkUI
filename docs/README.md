@@ -18,6 +18,7 @@ docs/build.sh serve   # builds into docs/dist and serves http://localhost:8017
 | `tests` | Tests of the examples. `silk task unit-tests` runs them |
 | `shots` | A tool that runs the examples with no window and writes the pictures the pages use |
 | `live` | The window examples as one wasm module for a WebGPU canvas. Where the browser can run it, `web/index.html` puts `live/?app=…` in a frame in place of the example's picture |
+| `styles` | The CSS files of the stylesheet examples. `sync.py` copies them into `examples/src/core/plans_css.silk` for the tests, and `build-tailwind.sh` writes the Tailwind one |
 | `src` | The site program: Markdown reader, code colors, page shell, live demos |
 | `web` | The HTML shell, fonts and favicon |
 | `wrangler.jsonc` | The Cloudflare deployment |

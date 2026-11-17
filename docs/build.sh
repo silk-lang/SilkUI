@@ -39,6 +39,9 @@ loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\
 cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$out/silk-ui-dom.js"
 cp "$here/web/favicon.svg" "$out/favicon.svg"
 cp -R "$here/web/fonts" "$out/fonts"
+# The sheet of the stylesheet demo, linked by the page as any site links its CSS.
+mkdir -p "$out/styles"
+cp "$here/styles/plans.css" "$out/styles/plans.css"
 # The album's photos, icons and fonts, at the root as its relative URLs name them.
 cp -R "$here/examples/apps/album/assets/photos" "$out/photos"
 cp -R "$here/examples/apps/album/assets/icons" "$out/icons"
