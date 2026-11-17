@@ -97,7 +97,7 @@ Use optimized builds and Callgrind instruction counts for comparisons:
 
 ```sh
 valgrind --tool=callgrind --callgrind-out-file=/dev/null \
-  build/llvm/x86_64-unknown-linux-gnu/release/ui-bench --smoke \
+  build/x86_64-unknown-linux-gnu/release/ui-bench --smoke \
   'stylesheets::Tailwind.change_class[Rows=1000]'
 ```
 
