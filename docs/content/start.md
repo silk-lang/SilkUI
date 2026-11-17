@@ -90,6 +90,8 @@ On macOS the app can fill the whole window, with the window controls floating ov
 
 The app draws its own bar in those top 56 pixels and leaves room on the left for the controls, which are centred in it. A press there moves the window and a double click zooms it, so the app gets no clicks in that strip. Import `TitleBar` from `silkui.app` beside `Window`. Windows and Linux keep the system's bar above the app.
 
+To put the three window buttons somewhere else in the bar, give their top-left corner in pixels from the window's left and top edges: `TitleBar.transparent(56.0).buttons(20.0, 18.0)`. A 0 keeps that one centred.
+
 ## Next
 
 - Write a Loom app: [your first program](/core/first-program/), then the [tutorial](/core/tutorial/).
