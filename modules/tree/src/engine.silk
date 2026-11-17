@@ -38,6 +38,7 @@ import ui_protocol.backend { Backend, Measured }
 import grid_css
 import expand
 import font_features
+import font_features { VariationTable }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -759,6 +760,7 @@ pub struct UiTree<'a> {
   /// How many nodes are inert, so input skips looking for inert ancestors when none are.
   pub inerts: u32,
   families: Families,
+  variations: VariationTable,
   pub resources: Resources,
   /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
   /// the host's loaders (`takeLoads`). The tree does no I/O: a host reads, fetches or looks up
@@ -964,6 +966,7 @@ impl<'a> UiTree<'a> {
       returns: List<FocusReturn>.make(),
       inerts: 0,
       families: Families.make(),
+      variations: VariationTable.make(),
       resources: move resources,
       loads: List<Mutation>.make(),
       sourceStates: List<u8>.make(),
@@ -1185,7 +1188,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1208,6 +1211,16 @@ impl<'a> UiTree<'a> {
             })
           }
           Result.Failure { error: _ } => {}
+        }
+      } else if writtenVariations(&declared[i]) {
+        // Settings that do not parse are dropped, as CSS drops an invalid declaration.
+        let text = run values.cssText(&declared[i].value)
+        if let Option.Some { value: id } = run self.variations.intern(Bytes.asSlice(&text)) {
+          run out.append(Declaration {
+            property: CssProperty.FontVariationSettings,
+            value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
         }
       } else {
         run out.append(run values.cloneDeclaration(&declared[i]))
@@ -4004,6 +4017,7 @@ impl<'a> UiTree<'a> {
       },
     }
     request.treatment = treatment
+    request.variations = self.variations.axes(text.features.variations)
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4763,9 +4777,11 @@ impl<'a> UiTree<'a> {
         let before = node.computed.text
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
+        let barColors = node.computed.scroll.colors
         let shadow = node.computed.effects
         let wasRendered = node.rendered
-        let containment = node.computed.layout.sizeContainment
+        let containment = node.computed.contain.query()
+        let skips = node.computed.contain.hidden()
         let namesChanged = run self.resolve(slot)
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
@@ -4774,7 +4790,8 @@ impl<'a> UiTree<'a> {
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || namesChanged || containment != after.layout.sizeContainment
+          || &barColors != &after.scroll.colors
+          || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
@@ -4921,6 +4938,7 @@ impl<'a> UiTree<'a> {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
+      computed.scroll.colors = self.node(parent).computed.scroll.colors
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -4964,7 +4982,8 @@ impl<'a> UiTree<'a> {
     }
     if animationUnits != 0 { computed.usesViewport = true }
     let kind = node.kind
-    if node.generatedSuppressed { computed.layout.display = CssDisplay.None }
+    // `content-visibility: hidden` skips its contents the way `display: none` does.
+    if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
@@ -6193,6 +6212,19 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
     && &left.selectionColor == &right.selectionColor
     && &left.placeholderColor == &right.placeholderColor
     && left.hasPlaceholderColor == right.hasPlaceholderColor
+    && left.textWrapStyle == right.textWrapStyle
+    && left.width == right.width
+    && left.features.same(&right.features)
+}
+
+// `font-variation-settings` written as CSS text rather than as a VariationTable id.
+fn writtenVariations(declaration: &Declaration) -> bool {
+  return declaration.property == CssProperty.FontVariationSettings && convert.number(&declaration.value).isNone()
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
 // A `font-family` written as CSS text rather than as a family list id.

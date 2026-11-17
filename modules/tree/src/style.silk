@@ -18,7 +18,7 @@ import layout.lib {
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
-import properties.computed { WritingMode, Direction, VerticalAlignKind }
+import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle }
 import properties.convert { Context }
 import timing { TransitionLists, AnimationLists }
 import transform { Transform }
@@ -114,12 +114,130 @@ pub struct Computed {
   /// The CSS `cursor`, when the node sets one other than `auto`. Hovering finds it on the
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
+  pub contain: Containment,
 }
 
 impl Copy for Computed {}
 
+/// `container-type`, `contain` and `content-visibility`, in one byte (the record is copied for
+/// every restyled node). css-layout reads the union of the two size containments, in
+/// `layout.sizeContainment`; container queries read only `query`.
+pub struct Containment { bits: u8 }
+
+impl Copy for Containment {}
+
+struct Contained { size: SizeContainment, paint: bool }
+impl Copy for Contained {}
+
+const QUERY_SHIFT: u8 = 0
+const CONTAIN_SHIFT: u8 = 2
+const CONTAIN_PAINT: u8 = 16
+const HIDDEN: u8 = 32
+const PAINT: u8 = 64
+
+fn sizeCode(size: SizeContainment) -> u8 {
+  return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
+}
+
+fn sizeOfCode(code: u8) -> SizeContainment {
+  return if code == 2 { SizeContainment.Size } else if code == 1 { SizeContainment.InlineSize } else { SizeContainment.None }
+}
+
+impl Containment {
+  pub fn initial() -> Containment { return Containment { bits: 0 } }
+
+  /// The size containment `container-type` asks for.
+  pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
+
+  /// Paint containment, from `contain` or `content-visibility: hidden`.
+  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+
+  /// `content-visibility: hidden`: the contents are skipped like `display: none`.
+  pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
+
+  fn contained(self: &Self) -> Contained {
+    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
+  }
+
+  fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
+    let size = if hidden { SizeContainment.Size } else { contain.size }
+    let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
+    if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if hidden { bits = u8.bitOr(bits, HIDDEN) }
+    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
+    self.bits = bits
+    layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
+      SizeContainment.Size
+    } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
+      SizeContainment.InlineSize
+    } else {
+      SizeContainment.None
+    }
+  }
+
+  pub fn setQuery(self: &mut Self, query: SizeContainment, layout: &mut CssStyle) -> () {
+    let contain = self.contained()
+    let hidden = self.hidden()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  fn setContain(self: &mut Self, contain: Contained, layout: &mut CssStyle) -> () {
+    let query = self.query()
+    let hidden = self.hidden()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  pub fn setHidden(self: &mut Self, hidden: bool, layout: &mut CssStyle) -> () {
+    let query = self.query()
+    let contain = self.contained()
+    self.write(query, contain, hidden, &mut layout)
+  }
+
+  pub fn inheritContain(self: &mut Self, parent: &Containment, layout: &mut CssStyle) -> () {
+    let contain = parent.contained()
+    self.setContain(contain, &mut layout)
+  }
+}
+
+/// `contain`'s keywords; `None` for a value that is not one.
+fn containOf(value: &Value) -> Option<Contained> {
+  let mut out = Contained { size: SizeContainment.None, paint: false }
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.None { return Option<Contained>.some(out) }
+    if !containWord(&mut out, word) { return Option<Contained>.None }
+    return Option<Contained>.some(out)
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      match convert.keywordOf(&items[i]) {
+        Option.Some { value: word } => { if word == Keyword.None || !containWord(&mut out, word) { return Option<Contained>.None } }
+        Option.None => { return Option<Contained>.None }
+      }
+      i = i + 1
+    }
+    return Option<Contained>.some(out)
+  }
+  return Option<Contained>.None
+}
+
+fn containWord(out: &mut Contained, word: Keyword) -> bool {
+  if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
+  if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
+  if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
+    || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
+}
+
+// Widest fields first: in declaration order the flags between them padded this to 40 bytes.
 /// What a node's style says about its paint effects, which `paint_css` reads into the node.
 pub struct EffectState {
+  /// `paint_css.Effects.hash` of the node's effects.
+  pub hash: u64,
+  pub shadowHash: u64,
+  /// The node whose `text-shadow` this one paints (it inherits), or `NO_SHADOW`.
+  pub shadowFrom: u32,
   /// Whether the node's looks set a property `paint_css` reads.
   pub declared: bool,
   /// Whether `will-change` makes the box a stacking context.
@@ -127,11 +245,6 @@ pub struct EffectState {
   /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
   /// `paint.radii` holds the length part.
   pub radiusShare: bool,
-  /// `paint_css.Effects.hash` of the node's effects.
-  pub hash: u64,
-  /// The node whose `text-shadow` this one paints (it inherits), or `NO_SHADOW`.
-  pub shadowFrom: u32,
-  pub shadowHash: u64,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
   pub layered: bool,
@@ -207,15 +320,16 @@ fn anyViewportUnit(items: &[Value]) -> bool {
 }
 
 /// `outline`: a ring `offset` outside the border box, drawn over the content.
+// Flags last, so they share one word of padding.
 pub struct Outline {
   pub width: f32,
+  pub offset: f32,
+  pub color: Rgba<f32>,
   pub style: BorderStyle,
   /// `outline-style: auto`, the platform focus ring.
   pub auto: bool,
-  pub color: Rgba<f32>,
   /// `outline-color: auto`: the focus ring color for an `auto` ring, the text color otherwise.
   pub colorAuto: bool,
-  pub offset: f32,
 }
 
 impl Copy for Outline {}
@@ -262,7 +376,53 @@ pub struct ScrollStyle {
   pub margin: Insets<f32>,
   /// `scroll-padding` of the scroll container; `auto` is zero.
   pub padding: Edges,
+  /// `scrollbar-color`, which inherits.
+  pub colors: ScrollbarColors,
 }
+
+/// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
+/// 0 is `auto`, the native thumb over no track; a set value has the lowest bit of the track's
+/// alpha on, so `transparent transparent` stays apart from `auto`.
+pub struct ScrollbarColors { word: u64 }
+
+impl Copy for ScrollbarColors {}
+
+impl ScrollbarColors {
+  pub fn initial() -> ScrollbarColors { return ScrollbarColors { word: 0 } }
+
+  pub fn of(thumb: Rgba<f32>, track: Rgba<f32>) -> ScrollbarColors {
+    let both = u64.bitOr(u64.shiftLeft(u32.toU64(packColor(thumb)), 32), u32.toU64(packColor(track)))
+    return ScrollbarColors { word: u64.bitOr(both, 1) }
+  }
+
+  pub fn auto(self: &Self) -> bool { return self.word == 0 }
+
+  pub fn thumb(self: &Self) -> Rgba<f32> { return if self.word == 0 { NATIVE_THUMB } else { unpackColor(u64.toU32(u64.shiftRight(self.word, 32))) } }
+
+  pub fn track(self: &Self) -> Rgba<f32> { return unpackColor(u64.toU32(u64.bitAnd(self.word, 0xFFFFFFFF))) }
+
+  pub fn words(self: &Self) -> u64 { return self.word }
+}
+
+impl Equal for ScrollbarColors {
+  fn equals(left: &ScrollbarColors, right: &ScrollbarColors) -> bool { return left.word == right.word }
+}
+
+fn channel(value: f32) -> u32 { return f32.toU32(f32.floor(f32.max(0.0, f32.min(1.0, value)) * 255.0 + 0.5)) }
+
+fn packColor(c: Rgba<f32>) -> u32 {
+  return u32.bitOr(u32.bitOr(u32.shiftLeft(channel(c.r), 24), u32.shiftLeft(channel(c.g), 16)), u32.bitOr(u32.shiftLeft(channel(c.b), 8), channel(c.a)))
+}
+
+fn unpackColor(word: u32) -> Rgba<f32> {
+  let r = u32.bitAnd(u32.shiftRight(word, 24), 255)
+  let g = u32.bitAnd(u32.shiftRight(word, 16), 255)
+  let b = u32.bitAnd(u32.shiftRight(word, 8), 255)
+  let a = u32.bitAnd(word, 255)
+  return Rgba<f32> { r: u32.toF32(r) / 255.0, g: u32.toF32(g) / 255.0, b: u32.toF32(b) / 255.0, a: u32.toF32(a) / 255.0 }
+}
+
+pub const NATIVE_THUMB: Rgba<f32> = Rgba<f32> { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
 
 impl Copy for ScrollStyle {}
 
@@ -274,6 +434,7 @@ impl ScrollStyle {
       smooth: false,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
+      colors: ScrollbarColors.initial(),
     }
   }
 }
@@ -505,7 +666,7 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
     match declaration.property {
       CssProperty.WritingMode | CssProperty.Direction | CssProperty.TextOrientation
         | CssProperty.ContainerName | CssProperty.Container
-        | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontWidth | CssProperty.FontStretch
+        | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontVariationSettings | CssProperty.FontWidth | CssProperty.FontStretch
         | CssProperty.FontVariantLigatures | CssProperty.FontVariantCaps | CssProperty.FontVariantNumeric
         | CssProperty.FontVariantPosition | CssProperty.FontKerning
         | CssProperty.Transform | CssProperty.Translate | CssProperty.Rotate | CssProperty.Scale
@@ -595,6 +756,7 @@ impl Computed {
       outline: Outline.initial(),
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
+      contain: Containment.initial(),
     }
   }
 
@@ -702,13 +864,23 @@ impl Computed {
     match property {
       CssProperty.ContainerType => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
-          if word == Keyword.Normal { self.layout.sizeContainment = SizeContainment.None }
-          if word == Keyword.Size { self.layout.sizeContainment = SizeContainment.Size }
-          if word == Keyword.InlineSize { self.layout.sizeContainment = SizeContainment.InlineSize }
+          if word == Keyword.Normal { self.contain.setQuery(SizeContainment.None, &mut self.layout) }
+          if word == Keyword.Size { self.contain.setQuery(SizeContainment.Size, &mut self.layout) }
+          if word == Keyword.InlineSize { self.contain.setQuery(SizeContainment.InlineSize, &mut self.layout) }
+        }
+      }
+      CssProperty.Contain => {
+        if let Option<Contained>.Some { value: found } = containOf(value) { self.contain.setContain(found, &mut self.layout) }
+      }
+      CssProperty.ContentVisibility => {
+        if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+          if word == Keyword.Hidden || word == Keyword.Visible || word == Keyword.Auto {
+            self.contain.setHidden(word == Keyword.Hidden, &mut self.layout)
+          }
         }
       }
       CssProperty.Container => {
-        self.layout.sizeContainment = SizeContainment.None
+        self.contain.setQuery(SizeContainment.None, &mut self.layout)
         if let Value.Sequence { separator: Separator.Slash, values } = &value.* {
           if values.length() == 2 { self.set(CssProperty.ContainerType, &values.asSlice()[1], &context) }
         }
@@ -1297,6 +1469,22 @@ impl Computed {
           Option.None => {}
         }
       }
+      CssProperty.ScrollbarColor => {
+        if convert.isKeyword(value, Keyword.Auto) { self.scroll.colors = ScrollbarColors.initial() }
+        if let Value.Sequence { separator: _, values } = &value.* {
+          let items = values.asSlice()
+          if items.length == 2 {
+            let current = self.text.color
+            let thumb = if convert.isKeyword(&items[0], Keyword.Currentcolor) { Option<Rgba<f32>>.some(current) } else { convert.color(&items[0]) }
+            let track = if convert.isKeyword(&items[1], Keyword.Currentcolor) { Option<Rgba<f32>>.some(current) } else { convert.color(&items[1]) }
+            if let Option.Some { value: a } = thumb {
+              if let Option.Some { value: b } = track {
+                self.scroll.colors = ScrollbarColors.of(a, b)
+              }
+            }
+          }
+        }
+      }
       CssProperty.ScrollbarWidth => {
         match convert.keywordOf(value) {
           Option.Some { value: word } => {
@@ -1383,6 +1571,20 @@ impl Computed {
                 self.text.textWrap = found
               }
               Option.None => {}
+            }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextWrapStyle => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Auto || word == Keyword.Stable || word == Keyword.AvoidOrphans {
+              self.text.textWrapStyle = TextWrapStyle.Auto
+            } else if word == Keyword.Balance {
+              self.text.textWrapStyle = TextWrapStyle.Balance
+            } else if word == Keyword.Pretty {
+              self.text.textWrapStyle = TextWrapStyle.Pretty
             }
           }
           Option.None => {}
@@ -1954,7 +2156,7 @@ impl Computed {
 
   /// Whether the node clips its children to its padding box.
   pub fn clips(self: &Self) -> bool {
-    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible
+    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible || self.contain.paint()
   }
 
   /// Whether the node draws anything of its own box: a background, border or shadow.
@@ -2040,6 +2242,8 @@ impl Computed {
     h = colorHash(h, self.text.caret())
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
+    if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
     h = Hash.combine(
       h,
       if self.paint.pointerEvents {
@@ -2069,6 +2273,7 @@ impl Computed {
     self.layout.textOrientation = text.textOrientation
     self.layout.textAlignLast = text.textAlignLast
     self.layout.textWrap = text.textWrap
+    self.layout.textWrapStyle = text.textWrapStyle
     self.layout.whiteSpaceCollapse = text.whiteSpaceCollapse
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
@@ -2094,15 +2299,27 @@ fn named(name: &[u8], word: &[u8]) -> bool {
 pub fn cursorOf(name: &[u8]) -> Option<Cursor> {
   if named(name, b"auto") { return Option<Cursor>.None }
   if named(name, b"pointer") { return Option<Cursor>.Some { value: Cursor.Pointer } }
-  if named(name, b"text") || named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.Text } }
+  if named(name, b"text") { return Option<Cursor>.Some { value: Cursor.Text } }
+  if named(name, b"none") { return Option<Cursor>.Some { value: Cursor.None } }
+  if named(name, b"wait") { return Option<Cursor>.Some { value: Cursor.Wait } }
+  if named(name, b"progress") { return Option<Cursor>.Some { value: Cursor.Progress } }
+  if named(name, b"help") { return Option<Cursor>.Some { value: Cursor.Help } }
+  if named(name, b"context-menu") { return Option<Cursor>.Some { value: Cursor.ContextMenu } }
+  if named(name, b"copy") { return Option<Cursor>.Some { value: Cursor.Copy } }
+  if named(name, b"alias") { return Option<Cursor>.Some { value: Cursor.Alias } }
+  if named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.VerticalText } }
+  if named(name, b"col-resize") { return Option<Cursor>.Some { value: Cursor.ColumnResize } }
+  if named(name, b"row-resize") { return Option<Cursor>.Some { value: Cursor.RowResize } }
+  if named(name, b"zoom-in") { return Option<Cursor>.Some { value: Cursor.ZoomIn } }
+  if named(name, b"zoom-out") { return Option<Cursor>.Some { value: Cursor.ZoomOut } }
   if named(name, b"move") || named(name, b"all-scroll") { return Option<Cursor>.Some { value: Cursor.Move } }
   if named(name, b"grab") { return Option<Cursor>.Some { value: Cursor.Grab } }
   if named(name, b"grabbing") { return Option<Cursor>.Some { value: Cursor.Grabbing } }
   if named(name, b"not-allowed") || named(name, b"no-drop") { return Option<Cursor>.Some { value: Cursor.NotAllowed } }
-  if named(name, b"ew-resize") || named(name, b"col-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
+  if named(name, b"ew-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
     return Option<Cursor>.Some { value: Cursor.ResizeHorizontal }
   }
-  if named(name, b"ns-resize") || named(name, b"row-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
+  if named(name, b"ns-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
     return Option<Cursor>.Some { value: Cursor.ResizeVertical }
   }
   if named(name, b"nwse-resize") || named(name, b"nw-resize") || named(name, b"se-resize") {
