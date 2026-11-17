@@ -1,10 +1,10 @@
 // Compiled by types.test.js: what an application writes against the packages' types.
 import { useRef, useState } from "react";
-import { createBox, createIcon, mount, parseMarkdown, OBJECT, type Input, type RichDocument, type Style } from "@silkui/core";
+import { createBox, createImage, mount, parseMarkdown, OBJECT, type Input, type RichDocument, type Style } from "@silkui/core";
 import { createRoot, flushSync } from "@silkui/react";
 
 const card: Style = { display: "flex", padding: 8, gridTemplateColumns: "1fr 2fr", opacity: 0.5, color: null };
-const box = createBox(card, "text", createIcon("<svg/>", { width: 16 }));
+const box = createBox(card, "text", createImage("data:image/svg+xml,%3Csvg/%3E", { width: 16 }));
 box.style.set({ width: 120 });
 box.style = { height: 40 };
 box.addEventListener("keydown", (event) => event.key.toUpperCase());
@@ -31,10 +31,11 @@ function App() {
       {/* @ts-expect-error: a plain input's event may have no document */}
       <input onInput={(event) => setDocument(event.document)} />
       <richinput document={document} marks={{ bold: { fontWeight: 700 } }} onInput={(event) => setDocument(event.document)} onSelectionChange={(event) => event.target.document.text} />
-      <icon svg="<svg/>" style={{ width: 16 }} />
+      {/* @ts-expect-error: there is no icon element, inline svg is the way */}
+      <icon />
       <image />
       <img src="data:image/png;base64,AAAA" alt="Dot" onLoad={(event) => event.type} />
-      <icon src="data:image/svg+xml,%3Csvg/%3E" />
+      <img src="data:image/svg+xml,%3Csvg/%3E" style={{ width: 16 }} />
       <svg viewBox="0 0 24 24" width={24} className="size-4" onClick={(event) => event.clientX}>
         <path d="M5 12h14" strokeWidth={2} strokeLinecap="round" />
         <g fill="currentColor"><circle cx={12} cy={12} r={3} /></g>

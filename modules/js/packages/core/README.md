@@ -2,7 +2,7 @@
 
 The node and event API of a [Silk UI](https://github.com/silk-lang/SilkUI) tree, for
 JavaScript apps that run on the SilkJS engine embedded in a Silk UI program. Its nodes are
-the tree's own (box, text, input, rich input, image, icon, canvas). Its methods and its
+the tree's own (box, text, input, rich input, image, canvas) and inline svg. Its methods and its
 event flow are the DOM's: `appendChild`, `addEventListener`, capture and bubble,
 `preventDefault`.
 
@@ -62,13 +62,12 @@ mount(createBox({ position: "absolute", inset: 0, display: "flex", alignItems: "
 | `createInput(style?)` | An editable text field. `value`, `selectionStart`, `selectionEnd` and `setSelectionRange` work as on an `<input>` |
 | `createRichInput(style?)` | A text field with marks and inline atoms (see below) |
 | `createImage(src, style?)` | An image, as an `<img>`: `src` is a `data:` URL, a file or an `http(s):` address. An SVG file draws as an inline `<svg>` |
-| `createIcon(svg, style?)` | SVG markup drawn at the node's size, with its `color` as `currentColor`. `icon.src` takes an SVG address instead |
 | `createSvgElement(tag)` | `document.createElementNS` for SVG: an `Svg` root for `"svg"`, else an `SvgElement` (`path`, `g`, ...) to append inside one |
-| `createNode(kind)` | A node of any kind: `"box"`, `"text"`, `"input"`, `"richinput"`, `"image"` (or `"img"`), `"icon"`, `"canvas"`, `"svg"` |
+| `createNode(kind)` | A node of any kind: `"box"`, `"text"`, `"input"`, `"richinput"`, `"image"` (or `"img"`), `"canvas"`, `"svg"` |
 | `mount(node)` / `root()` | Makes a node the root of the window's tree, or returns it |
 | `nodeById(id)` | The node with a tree id, for hosts and tools |
 
-An `Svg` is one icon node whose markup its `SvgElement` and text children make, as an inline
+An `Svg` is one node whose markup its `SvgElement` and text children make, as an inline
 `<svg>` is on a page. Class, look, events and ARIA attributes are the node's; `viewBox`,
 `fill`, `width` and every other attribute are markup, and React's spellings (`strokeWidth`)
 work too. Changes are drawn once, before the host applies the batch (`flushSvg()` draws them

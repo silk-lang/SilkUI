@@ -1,8 +1,8 @@
 // @silkui/react: a React renderer for the Silk UI tree.
 //
-// Host elements are the tree's node kinds: <box>, <input>, <image> (or <img>), <icon>,
-// <canvas>, and inline <svg> with its elements (<path>, <circle>, <g> and the rest), drawn
-// as one icon. Strings in children become text nodes. Props:
+// Host elements are the tree's node kinds: <box>, <input>, <image> (or <img>), <canvas>, and
+// inline <svg> with its elements (<path>, <circle>, <g> and the rest), drawn as one node.
+// Strings in children become text nodes. Props:
 //
 // - `style`, and `hoverStyle`, `activeStyle`, `focusStyle`, `focusVisibleStyle` for the
 //   looks the tree lays over it in those states. `startingStyle` is what transitions start
@@ -11,9 +11,9 @@
 //   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silkui/core
 //   event, which has the DOM members.
 // - `value` on <input>: a controlled value, as in React DOM.
-// - `src` on <image> and <icon>: an address, `data:` URLs included, as `<img src>`.
-// - `svg` on <icon>: SVG markup, drawn at the icon's CSS size with its `color` as
-//   `currentColor`. Inside <svg>, props are SVG attributes in React DOM's spellings.
+// - `src` on <image>: an address, `data:` URLs included, as `<img src>`. An SVG draws with
+//   the node's `color` as `currentColor`. Inside <svg>, props are SVG attributes in React
+//   DOM's spellings.
 // - Everything else is a tree attribute: `tabIndex`, `testId`, `label`, `disabled`,
 //   `placeholder` and so on, and `role` and `aria-*` as in React DOM.
 import Reconciler from "react-reconciler";
@@ -28,7 +28,7 @@ import { RichInput, SvgElement, SvgText, createNode, createSvgElement, createTex
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
-const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "svg", "document", "defaultDocument", "marks", "atoms"]);
+const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "document", "defaultDocument", "marks", "atoms"]);
 
 let updatePriority = 0;
 let eventPriority = 0;
@@ -162,7 +162,6 @@ function applyProps(node, previous, next) {
       else node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
     }
   }
-  if (node.kind === "icon" && next.svg !== previous.svg) node.svg = next.svg;
   if (node instanceof RichInput) {
     defineLooks(previous.marks, next.marks, (name, style) => node.defineMark(name, style));
     defineLooks(previous.atoms, next.atoms, (kind, style) => node.defineAtom(kind, style));

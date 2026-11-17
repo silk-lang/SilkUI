@@ -20,8 +20,6 @@ export declare const FocusStyle: (style: Style) => Attribute<never>;
 export declare const FocusVisibleStyle: (style: Style) => Attribute<never>;
 /** What its transitions start from when it first shows, as `@starting-style`. */
 export declare const StartingStyle: (style: Style) => Attribute<never>;
-/** The SVG markup an `icon` element draws, with the element's `color` as `currentColor`. */
-export declare const Svg: (markup: string) => Attribute<never>;
 
 declare global {
   interface Node {
