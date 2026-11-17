@@ -50,6 +50,7 @@ import silk.text.string { String }
 import silk.num.i32
 import silk.num.u8
 import process { Child, Variable, start, pause }
+import output { now, say as tell, done, artifact as listArtifact, built as finished }
 
 /// A desktop window's options.
 pub struct Window {
@@ -230,6 +231,8 @@ pub struct App {
   bundled: String,
   compiledSheet: String,
   hosts: List<Host>,
+  /// When it was made, on `output.now`'s clock: the start of a build.
+  begun: u64,
 }
 
 /// One built target.
@@ -244,6 +247,8 @@ pub struct Artifact {
 /// A built app: an artifact per target.
 pub struct Built {
   source: App,
+  /// The project directory, absolute.
+  root: String,
   madeIn: Mode,
   outputs: List<Artifact>,
 }
@@ -278,10 +283,16 @@ effect fn fromRoot(project: &Project, path: string) -> String ! OutOfMemoryError
   return run joined(String.view(&project.root), path)
 }
 
-effect fn say(text: string) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut line = run String.copy("silkui: ")
-  run String.append(&mut line, text)
-  StderrWriter.print("{}\n", &.(String.view(&line)))
+effect fn say(text: string) -> () ! OutOfMemoryError ? &mut Allocator { tell(text) }
+
+/// `path` from the project root when it is inside it, as the lines silkui writes show it.
+fn relative<'a>(root: string, path: string<'a>) -> string<'a> {
+  let rootLength = String.byteLength(root)
+  let length = String.byteLength(path)
+  if length > rootLength + 1 && String.startsWith(path, root) && String.utf8Bytes(path)[rootLength] == 47 {
+    return String.slice(path, rootLength + 1, length - rootLength - 1)
+  }
+  return path
 }
 
 effect fn writeText(path: string, text: string) -> ()
@@ -383,18 +394,19 @@ effect fn compileHost(dir: string, mode: Mode, web: bool) -> ()
     } else {
       "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"none\",\"debug\":true,\"stackSize\":\"8MiB\"}"
     }
-    run Task.silk(&["build", "--manifest-path", String.view(&manifest), "--profile-input", profile])
+    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest), "--profile-input", profile])
   } else if mode == Mode.Release {
-    run Task.silk(&["build", "--manifest-path", String.view(&manifest), "--release"])
+    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest), "--release"])
   } else {
-    run Task.silk(&["build", "--manifest-path", String.view(&manifest)])
+    run Task.silk(&["build", "--progress", "never", "--manifest-path", String.view(&manifest)])
   }
 }
 
 // --- App: the definition ---
 
 impl App {
-  /// A new app named `name`: the name of its program. No framework, no target yet.
+  /// A new app named `name`, the program a custom host ([`App.customHost`]) builds. A generated
+  /// host and `dist/` take the project's name. No framework, no target yet.
   pub effect fn make(name: string<'static>) -> App {
     return App {
       named: name,
@@ -407,6 +419,7 @@ impl App {
       bundled: String.make(),
       compiledSheet: String.make(),
       hosts: List<Host>.make(),
+      begun: now(),
     }
   }
 
@@ -512,7 +525,12 @@ impl App {
     app.bundled = run joined(String.view(&out), "app.js")
     app.compiledSheet = String.make()
     if mode == Mode.Dev && app.runsOn == Runtime.Engine { return move app }
-    run say("bundling with Vite")
+    if dir == "." { run say("bundling with Vite") } else {
+      let mut line = run String.copy("bundling ")
+      run String.append(&mut line, dir)
+      run String.append(&mut line, "/ with Vite")
+      run say(String.view(&line))
+    }
     let viteMode = if mode == Mode.Release { "production" } else { "development" }
     run npm(String.view(&web), &["exec", "--", "vite", "build", "--mode", viteMode, "--outDir", String.view(&out), "--emptyOutDir"])
     let sheet = run joined(String.view(&out), "app.sheet")
@@ -644,13 +662,19 @@ impl App {
     let mut at: usize = 0
     while at < hosts.length {
       let dir = String.view(&hosts[at].dir)
-      let mut line = run String.copy("building the ")
-      run String.append(&mut line, hosts[at].target.id())
-      if mode == Mode.Release { run String.append(&mut line, " host (release)") }
-      if mode == Mode.Debug { run String.append(&mut line, " host (debug)") }
-      if mode == Mode.Dev { run String.append(&mut line, " host (dev)") }
+      let mut what = run String.copy(hosts[at].target.id())
+      run String.append(&mut what, " host")
+      let mut line = run String.copy("compiling the ")
+      run String.append(&mut line, String.view(&what))
+      if mode == Mode.Release { run String.append(&mut line, " (release)") }
+      if mode == Mode.Debug { run String.append(&mut line, " (debug)") }
+      run String.append(&mut line, "...")
       run say(String.view(&line))
+      let started = now()
       run compileHost(dir, mode, hosts[at].target.web())
+      let mut compiled = run String.copy("compiled the ")
+      run String.append(&mut compiled, String.view(&what))
+      done(String.view(&compiled), started)
       // A generated host is named after the project and the target; a custom one after the app.
       let mut name = run String.copy(app.named)
       if hosts[at].generated {
@@ -667,7 +691,7 @@ impl App {
       }
       at = at + 1
     }
-    return Built { source: move app, madeIn: mode, outputs: move artifacts }
+    return Built { source: move app, root: run String.copy(String.view(&project.root)), madeIn: mode, outputs: move artifacts }
   }
 
   /// [`App.bundle`], [`App.host`] and [`App.compile`], in order. Most projects only use this.
@@ -698,12 +722,13 @@ impl Built {
   pub fn mode(self: &Built) -> Mode { return self.madeIn }
   pub fn artifacts(self: &Built) -> &[Artifact] { return self.outputs.asSlice() }
 
-  /// Writes each artifact's size to standard error.
+  /// Writes each artifact's path and size to standard error. [`Built.write`] lists what it
+  /// wrote the same way.
   pub fn sizes(self: &Built) -> () {
     let all = self.outputs.asSlice()
     let mut at: usize = 0
     while at < all.length {
-      StderrWriter.print("silkui: {} {} ({} KiB)\n", &.(all[at].target.id(), String.view(&all[at].path), all[at].bytes / 1024))
+      listArtifact(relative(String.view(&self.root), String.view(&all[at].path)), all[at].bytes)
       at = at + 1
     }
   }
@@ -720,8 +745,9 @@ impl Built {
     return move built
   }
 
-  /// Copies each artifact to `<dir>/<target>/<app name>` (relative to the project), and the
-  /// page of a web target to `<dir>/<target>/`. It ends a build pipeline.
+  /// Copies each artifact to `<dir>/<target>/<project name>` (relative to the project), and
+  /// the page of a web target to `<dir>/<target>/`, and lists them with the build's time. It
+  /// ends a build pipeline.
   pub effect fn write<'env, E, ?R>(self: once Effect<'env; Built ! E ? R>, dir: string) -> ()
     ! E | TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
     ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
@@ -739,15 +765,16 @@ impl Built {
         let from = run joined(String.view(&all[at].path), ".")
         run Task.exec("cp", &["-R", String.view(&from), String.view(&out)])
       } else {
-        // cp keeps the program's mode, so it stays executable. It takes the app's name.
-        out = run joined(String.view(&out), built.source.named)
+        // cp keeps the program's mode, so it stays executable. It takes the project's name,
+        // which `silk init` gives the package.
+        out = run joined(String.view(&out), String.view(&project.name))
         run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
       }
-      let mut line = run String.copy("wrote ")
-      run String.append(&mut line, String.view(&out))
-      run say(String.view(&line))
+      if at == 0 { StderrWriter.print("\n", &.()) }
+      listArtifact(relative(String.view(&project.root), String.view(&out)), all[at].bytes)
       at = at + 1
     }
+    finished(String.view(&project.name), built.source.begun)
     drop built
   }
 

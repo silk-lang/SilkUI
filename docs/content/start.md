@@ -66,7 +66,7 @@ Below it, `dev` and `build` are pipelines of steps, written out so you can read 
 silk task build --release
 ```
 
-`dist/window/my-app` is the release program, with the bundle inside and no development tools. Copy it anywhere and run it. Without `--release` the task writes the same program unoptimized, which builds faster.
+`dist/window/my-app`, named after the project, is the release program, with the bundle inside and no development tools. Copy it anywhere and run it. Without `--release` the task writes the same program unoptimized, which builds faster.
 
 ## Add a target
 
