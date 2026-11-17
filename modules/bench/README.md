@@ -69,15 +69,8 @@ idle cases also run with 5,000 rows. Each case checks the first and last row's r
 Frames include style resolution, layout and painting.
 
 `[Rows=1000,Cells=3,Distinct]` gives every other row another padding class, so no row equals
-the one before it and no row or cell can take its style from a neighbor: every element matches
-selectors itself, and a cell reuses a finished cascade only through the pass cache, across parents.
-
-`stylesheets::{SpaceY,Owl,Zebra}.{create,idle,theme,append_row}[Rows=1000,Cells=3]` adopt
-`fixtures/siblings.sheet`, a Tailwind sheet that also holds `peer-checked:`, `even:` and
-`has-[.flex]:` rules and `.owl > * + *`: a sibling combinator, an index test and `:has()`,
-whichever of them a case uses. `SpaceY` puts `space-y-2 divide-y divide-black` on the list,
-`Owl` the `owl` class, and `Zebra` gives every row `even:bg-black`. Each case checks the rows
-at both ends and their neighbours.
+the one before it. A row then takes its style from an equal row further back, and its cells
+from that row's cells (`UiTree.styleModels`); only the first row of each kind matches selectors.
 
 `RegisteredTailwind` runs the same seven Tailwind scenarios with a second compiled sheet,
 `fixtures/registered.css`. It adds a non-inheriting registered length, declares it on each row,
