@@ -1406,6 +1406,67 @@ effect fn paintHoisted(p: &mut Painter<'_, '_>, root: usize, entry: usize, mask:
   run paintThrough(&mut p, &path, path.length(), entry, mask)
 }
 
+/// The ink of the children of fragment `index`, in CSS pixels.
+fn childInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
+  let values = p.output.fragments.values.asSlice()
+  let mut total = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
+  let mut child = values[index].firstChild
+  while child != NO_INDEX {
+    total = unite(total, if child < p.ink.length() { p.ink.get(child) } else { unboundedInk() })
+    child = values[child].nextSibling
+  }
+  return total
+}
+
+/// Whether `ink` reaches outside the rounded corners `radii` of `clip`: the point of `ink`
+/// nearest each corner lies outside that corner's arc.
+fn reachesCorners(ink: Rect<f32>, clip: Rect<f32>, radii: Corners<f32>) -> bool {
+  if ink.xMax <= ink.xMin || ink.yMax <= ink.yMin {
+    return false
+  }
+  return outsideArc(ink.xMin - clip.xMin, ink.yMin - clip.yMin, radii.topLeft)
+    || outsideArc(clip.xMax - ink.xMax, ink.yMin - clip.yMin, radii.topRight)
+    || outsideArc(clip.xMax - ink.xMax, clip.yMax - ink.yMax, radii.bottomRight)
+    || outsideArc(ink.xMin - clip.xMin, clip.yMax - ink.yMax, radii.bottomLeft)
+}
+
+/// Whether a point `dx` and `dy` in from a corner (negative past it) lies outside the arc of
+/// radius `r` there.
+fn outsideArc(dx: f32, dy: f32, r: f32) -> bool {
+  if r <= 0.0 || dx >= r || dy >= r {
+    return false
+  }
+  let x = r - f32.max(dx, 0.0)
+  let y = r - f32.max(dy, 0.0)
+  return x * x + y * y > r * r
+}
+
+/// Opens a layer masked by the rounded padding box of node `slot` when its overflow clip has
+/// corner radii, as `overflow: hidden` follows `border-radius`. Returns whether it opened one;
+/// close it with `Scene.popLayer` after the clipped content.
+/// Opens nothing when `ink`, what the clipped content can paint (CSS pixels), stays out of the
+/// corners.
+effect fn openRoundedClip(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, ink: Rect<f32>, inner: ContentMask) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !c.clips() {
+    return false
+  }
+  let s = p.scale
+  let clip = device(overflowClip(c, f), s)
+  let corners = paint_effects.insetCorners(scaledCorners(radiiOf(&p.*, slot, c, f), s), device(borderBox(f), s), clip)
+  if !paint_effects.hasRadius(corners) || !reachesCorners(device(ink, s), clip, corners) {
+    return false
+  }
+  drop run p.scene.pushEffectLayer(inner.bounds, inner, Isolation { opacity: 1.0, blend: 0 }, LayerEffects.none())
+  drop run p.scene.pushMaskLayer()
+  let mut shape = Quad.fill(clip, inner, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
+  shape.cornerRadii = corners
+  drop run p.scene.quad(shape)
+  run p.scene.popLayer()
+  return true
+}
+
 /// Opens the clip and scroll group of `path[count - 1]` (the path runs bottom up), then the
 /// rest of the path, then paints `entry`.
 effect fn paintThrough(
@@ -1430,6 +1491,8 @@ effect fn paintThrough(
     return ()
   }
   let saved = p.cull
+  let reach = if entry < p.ink.length() { p.ink.get(entry) } else { unboundedInk() }
+  let rounded = run openRoundedClip(&mut p, slot, &c, &f, reach, inner)
   let scrolled = layers.scroller(&c)
   if scrolled {
     inner = run openScroller(&mut p, slot, &c, &f, inner)
@@ -1438,6 +1501,9 @@ effect fn paintThrough(
   if scrolled {
     p.cull = saved
     run p.scene.popScrollGroup()
+  }
+  if rounded {
+    run p.scene.popLayer()
   }
 }
 
@@ -1792,6 +1858,31 @@ fn localInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
   return total
 }
 
+/// How far to move a transformed layer whose content covers `bounds` (device pixels, before
+/// `matrix`) so the part of it that can land inside `mask` lies inside the `width` by `height`
+/// target, in whole pixels. Zero when it already does.
+fn layerShift(matrix: Matrix3<f32>, bounds: Rect<f32>, mask: Rect<f32>, width: f32, height: f32) -> [f32; 2] {
+  if bounds.xMin >= 0.0 && bounds.yMin >= 0.0 && bounds.xMax <= width && bounds.yMax <= height {
+    return [0.0, 0.0]
+  }
+  let target = Rect<f32>.new(f32.max(mask.xMin, 0.0), f32.max(mask.yMin, 0.0), f32.min(mask.xMax, width), f32.min(mask.yMax, height))
+  let mut visible = bounds
+  if let Option.Some { value } = matrix.inverse() {
+    let back = transform.mapRect(&value, target)
+    visible = Rect<f32>.new(
+      f32.max(bounds.xMin, back.xMin),
+      f32.max(bounds.yMin, back.yMin),
+      f32.min(bounds.xMax, back.xMax),
+      f32.min(bounds.yMax, back.yMax),
+    )
+  }
+  if visible.xMin >= 0.0 && visible.yMin >= 0.0 && visible.xMax <= width && visible.yMax <= height
+    || visible.xMax <= visible.xMin || visible.yMax <= visible.yMin {
+    return [0.0, 0.0]
+  }
+  return [-f32.floor(visible.xMin), -f32.floor(visible.yMin)]
+}
+
 /// Paints fragment `index` through its transform, if it has one: a plain move is a scroll group
 /// with a fixed offset, anything else a layer drawn through the matrix. Inside, the subtree
 /// paints in its own layout space with an unbounded mask, so its cached paint replays however
@@ -1834,15 +1925,44 @@ effect fn paintTransformed(p: &mut Painter<'_, '_>, index: usize, mask: ContentM
   let a = flat.values
   let onDevice = Matrix3<f32>.new([a[0], a[1], a[2] / s, a[3], a[4], a[5] / s, a[6] * s, a[7] * s, a[8]])
   let bounds = device(localInk(&p.*, index), s)
+  // The layer is drawn into a target-sized texture before the matrix maps it, so its visible
+  // part must lie inside the target: shift it there and fold the shift into the matrix.
+  let shift = layerShift(onDevice, bounds, mask.bounds, p.width * s, p.height * s)
+  let tx = shift[0]
+  let ty = shift[1]
+  let shifted = tx != 0.0 || ty != 0.0
+  let b = onDevice.values
+  let matrix = if shifted {
+    Matrix3<f32>.new([
+      b[0], b[1], b[2], b[3], b[4], b[5],
+      b[6] - b[0] * tx - b[3] * ty,
+      b[7] - b[1] * tx - b[4] * ty,
+      b[8] - b[2] * tx - b[5] * ty,
+    ])
+  } else {
+    onDevice
+  }
+  let placed = Rect<f32>.new(bounds.xMin + tx, bounds.yMin + ty, bounds.xMax + tx, bounds.yMax + ty)
   drop run p.scene.pushTransformLayer(
-    bounds,
+    placed,
     mask,
     Isolation { opacity: 1.0, blend: 0 },
-    onDevice,
+    matrix,
   )
+  if shifted {
+    let fixed = ScrollAxis { factor: 0.0, base: 0.0, low: -UNBOUNDED_INK, high: UNBOUNDED_INK }
+    let mut x = fixed
+    x.base = tx
+    let mut y = fixed
+    y.base = ty
+    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, everywhere(), placed)
+  }
   p.cull = everywhere()
   run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
   p.cull = saved
+  if shifted {
+    run p.scene.popScrollGroup()
+  }
   run p.scene.popLayer()
 }
 
@@ -2104,6 +2224,11 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let scrolled = layers.scroller(&c)
     let open = inner.bounds.xMax > inner.bounds.xMin && inner.bounds.yMax > inner.bounds.yMin
     let saved = p.cull
+    let mut rounded = false
+    if open {
+      let reach = childInk(&p.*, index)
+      rounded = run openRoundedClip(&mut p, slot, &c, &f, reach, inner)
+    }
     if scrolled && open {
       inner = run openScroller(&mut p, slot, &c, &f, inner)
     }
@@ -2119,6 +2244,9 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     if scrolled && open {
       p.cull = saved
       run p.scene.popScrollGroup()
+    }
+    if rounded {
+      run p.scene.popLayer()
     }
     if c.clips() && c.text.visible {
       run paintThumbs(&mut p, slot, &c, &f, mask)
