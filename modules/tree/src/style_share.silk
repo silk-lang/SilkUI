@@ -1,8 +1,11 @@
 //! A node takes the matched style of another whose selector inputs and ancestors equal its own:
 //! a sibling, or the matching child of its parent's twin, as the rows of a list are to each other.
-//! Rules that read only identity, state and ancestors give both the same result. Edge position
-//! and emptiness join the comparison when a sheet reads them (`READS_EDGE`, `READS_EMPTY`);
-//! the engine does not ask at all when a sheet reads sibling order, indexes or descendants.
+//! Rules that read only identity, state and ancestors give both the same result, and the other
+//! node's record says whether its match read more than that (`Resolved.reads`): matching the
+//! node would run the same tests in the same order, up to the first one the two can differ on.
+//! Edge position and emptiness join the comparison when a sheet reads them. A match that read
+//! siblings or an index holds for the node when the siblings it can reach and its index agree
+//! too, within the bounds the sheets give (`Sharing`); one that read descendants is not shared.
 import engine { UiTree }
 import node { Node, NONE }
 import mutation { Declaration, NodeKind }
@@ -11,6 +14,7 @@ import style_identity { NodeIdentity }
 import properties.values
 import svg_css.element { ElementTree, NO_ELEMENT }
 import svg_css.selectors
+import svg_css.selectors { Sharing }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.color.rgba { Rgba }
@@ -49,6 +53,34 @@ fn plainBox(node: &Node) -> bool {
   return node.kind == NodeKind.Box && node.live && !node.isGenerated() && node.starting.length() == 0
 }
 
+const STRONG: u32 = selectors.READS_INDEX | selectors.READS_SIBLINGS | selectors.READS_DESCENDANTS
+
+fn readsOf(node: &Node) -> u32 { return match node.sheetStyle() { Option.Some { value } => value.reads _ => 0 } }
+
+/// Whether a selector testing `two` in place of `one`, as a sibling of the element it matches,
+/// finds the same name, attributes, state and, where a sheet reads it, emptiness.
+fn sameKind(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, one: u32, two: u32, reads: u32) -> bool {
+  let a = tree.node(one)
+  let b = tree.node(two)
+  // Nodes that hold one class were alike when they took it, and are restyled when that changes.
+  if a.styleClass != 0 && a.styleClass == b.styleClass && !a.styleDirty && !b.styleDirty { return true }
+  if a.kind != NodeKind.Box || b.kind != NodeKind.Box || !sameIdentity(a.identity(), b.identity()) { return false }
+  if adapter.state(u32.toUsize(one)).bits != adapter.state(u32.toUsize(two)).bits { return false }
+  return u32.bitAnd(reads, selectors.READS_EMPTY) == 0 || adapter.isEmpty(u32.toUsize(one)) == adapter.isEmpty(u32.toUsize(two))
+}
+
+/// Whether the `count` element siblings after `slot` exist and are of its kind.
+fn followed(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, count: usize, reads: u32) -> bool {
+  let mut at = u32.toUsize(slot)
+  let mut i: usize = 0
+  while i < count {
+    at = adapter.nextSibling(at)
+    if at == NO_ELEMENT || !sameKind(tree, adapter, slot, usize.toU32(at), reads) { return false }
+    i = i + 1
+  }
+  return true
+}
+
 /// Whether `slot` and the clean, classed node `other` would match the same rules given equal ancestors.
 fn alike(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, other: u32, reads: u32) -> bool {
   let node = tree.node(slot)
@@ -78,9 +110,68 @@ fn twinOf(tree: &UiTree<'_>, slot: u32) -> u32 {
   return found
 }
 
+/// The longest run of earlier siblings `inStep` compares.
+const REACH: usize = 32
+
+/// Whether the siblings before `one` and before `two` are as many and pairwise of one kind.
+/// Twin links alone do not say so: a child can enter one parent without the other's restyling.
+fn inStep(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, one: u32, two: u32, reads: u32) -> bool {
+  let mut a = adapter.previousSibling(u32.toUsize(one))
+  let mut b = adapter.previousSibling(u32.toUsize(two))
+  let mut i: usize = 0
+  while a != NO_ELEMENT && b != NO_ELEMENT {
+    if i == REACH || !sameKind(tree, adapter, usize.toU32(a), usize.toU32(b), reads) { return false }
+    a = adapter.previousSibling(a)
+    b = adapter.previousSibling(b)
+    i = i + 1
+  }
+  return a == b
+}
+
+/// Whether the match of `cousin`, a child of the parent's twin, holds for `slot`. What comes
+/// before the two has to agree, and what comes after where an index counts from the end.
+/// A test on an ancestor's siblings, index or descendants is one the parents were never
+/// compared on.
+fn cousinHolds(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, cousin: u32, reads: u32, sharing: Sharing) -> bool {
+  let read = readsOf(tree.node(cousin))
+  if u32.bitAnd(read, u32.shiftLeft(STRONG, selectors.READS_ABOVE)) != 0 { return false }
+  if u32.bitAnd(read, STRONG) == 0 { return true }
+  if u32.bitAnd(read, selectors.READS_DESCENDANTS) != 0 || !inStep(tree, adapter, slot, cousin, reads) { return false }
+  if u32.bitAnd(reads, selectors.READS_INDEX) == 0 { return true }
+  if sharing.period == 0 || sharing.fromEnd { return false }
+  return followed(tree, adapter, slot, sharing.tail, reads) && followed(tree, adapter, cousin, sharing.tail, reads)
+}
+
+/// An earlier sibling whose match holds for `slot`, or NONE. `previous` is alike `slot`.
+/// Selectors tell elements one period apart from each other only by the siblings before them:
+/// `siblings` of them at most, each of which has to equal the one a period before it. That
+/// holds when `lead + (siblings + 1) * period` siblings of `slot`'s kind come before it.
+fn siblingHolds(tree: &UiTree<'_>, adapter: &SelectorTree<'_, '_>, slot: u32, previous: u32, reads: u32, sharing: Sharing) -> u32 {
+  if u32.bitAnd(readsOf(tree.node(previous)), STRONG) == 0 { return previous }
+  let indexed = u32.bitAnd(reads, selectors.READS_INDEX) != 0
+  let period = if indexed { sharing.period } else { 1 }
+  if period == 0 { return NONE }
+  let steps = if u32.bitAnd(reads, selectors.READS_SIBLINGS) != 0 { sharing.siblings } else { 0 }
+  let mut lead = if indexed { sharing.lead } else { 0 }
+  // `:first-child` sets the first sibling apart from the ones a step can reach.
+  if lead == 0 && steps != 0 && u32.bitAnd(reads, selectors.READS_EDGE) != 0 { lead = 1 }
+  if indexed && !followed(tree, adapter, slot, sharing.tail, reads) { return NONE }
+  let mut model = NONE
+  let mut at = u32.toUsize(slot)
+  let mut i: usize = 0
+  while i < lead + (steps + 1) * period {
+    at = adapter.previousSibling(at)
+    if at == NO_ELEMENT || !sameKind(tree, adapter, slot, usize.toU32(at), reads) { return NONE }
+    i = i + 1
+    if i == period { model = usize.toU32(at) }
+  }
+  if u32.bitAnd(readsOf(tree.node(model)), selectors.READS_DESCENDANTS) != 0 { return NONE }
+  return if model == previous || alike(tree, adapter, slot, model, reads) { model } else { NONE }
+}
+
 /// A node whose matched style `slot` can take, or NONE. Its selector inputs equal `slot`'s and
 /// its ancestors equal `slot`'s: it is a sibling, or a child of the parent's own twin.
-pub fn twin(tree: &UiTree<'_>, slot: u32, reads: u32) -> u32 {
+pub fn twin(tree: &UiTree<'_>, slot: u32, reads: u32, sharing: Sharing) -> u32 {
   let node = tree.node(slot)
   if !plainBox(node) || node.parent == NONE || tree.styleOverrides().length != 0 { return NONE }
   let adapter = SelectorTree { tree: tree }
@@ -95,9 +186,12 @@ pub fn twin(tree: &UiTree<'_>, slot: u32, reads: u32) -> u32 {
       let before = twinOf(tree, usize.toU32(previous))
       if before != NONE && tree.node(before).parent == uncle { cousin = adapter.nextSibling(u32.toUsize(before)) }
     }
-    if cousin != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(cousin), reads) { return usize.toU32(cousin) }
+    if cousin != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(cousin), reads)
+      && cousinHolds(tree, &adapter, slot, usize.toU32(cousin), reads, sharing) { return usize.toU32(cousin) }
   }
-  if previous != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(previous), reads) { return usize.toU32(previous) }
+  if previous != NO_ELEMENT && alike(tree, &adapter, slot, usize.toU32(previous), reads) {
+    return siblingHolds(tree, &adapter, slot, usize.toU32(previous), reads, sharing)
+  }
   return NONE
 }
 
