@@ -95,7 +95,7 @@ import style_invalidation
 import style_invalidation { Reach, Extent }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
-import svg_css.element { PseudoTarget, StateBits }
+import svg_css.element { PseudoTarget, StateBits, ElementTree }
 import style_sheets { RootSheets, Resolved, Resolution }
 import style_share
 import selector_tree { SelectorTree }
@@ -1346,6 +1346,27 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// The first element child of `at`, or its next element sibling.
+  fn elementLink(self: &Self, at: usize, child: bool) -> usize {
+    let adapter = SelectorTree { tree: self }
+    return if child { ElementTree.firstChild(&adapter, at) } else { ElementTree.nextSibling(&adapter, at) }
+  }
+
+  fn restyleRadioGroup(self: &mut Self, slot: u32) -> () {
+    let parent = self.node(slot).parent
+    if parent == NONE { return }
+    let mut at = self.elementLink(u32.toUsize(parent), true)
+    while at != css_element.NO_ELEMENT {
+      let next = self.elementLink(at, false)
+      let sibling = usize.toU32(at)
+      if sibling != slot && self.node(sibling).accessRole == Role.Radio {
+        let extent = self.stateReach(sibling, css_element.INDETERMINATE)
+        self.restyleExtent(sibling, extent)
+      }
+      at = next
+    }
+  }
+
   fn selectorStates(self: &Self, slot: u32) -> u32 {
     let adapter = SelectorTree { tree: self }
     return adapter.state(u32.toUsize(slot)).bits
@@ -1361,8 +1382,9 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < names.length {
       if names[i].length != 0 { any = true }
-      // `:lang()` and `:link` are no invalidation key.
-      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")) {
+      // `:lang()`, `:dir()` and `:link` are no invalidation key.
+      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")
+        || css_tokens.insensitive(names[i], b"dir")) {
         return Extent { reach: Reach.Root, anchors: false }
       }
       i = i + 1
@@ -1798,6 +1820,10 @@ impl<'a> UiTree<'a> {
         let attached = self.rootHolding(slot) != NONE
         let tracked = attached && self.sheetReads().isSome()
         let statesBefore = if tracked { self.selectorStates(slot) } else { 0 }
+        let radioToggled = match &attribute {
+          Attribute.Checked { .. } => self.node(slot).accessRole == Role.Radio
+          _ => false
+        }
         let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
           Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
           Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
@@ -2049,6 +2075,8 @@ impl<'a> UiTree<'a> {
         }
         if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
         self.restyleExtent(slot, change)
+        // A radio's group is `:indeterminate` while none of it is checked.
+        if tracked && radioToggled { self.restyleRadioGroup(slot) }
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
