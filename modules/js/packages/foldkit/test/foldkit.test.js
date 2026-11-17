@@ -47,6 +47,8 @@ const view = (model, h) => ({
       h.button([h.Id("reverse"), h.OnClick(Message.Reversed())], []),
       h.ul([], model.items.map((item) => h.keyed("li")(item, [h.DataAttribute("item", item)], [item]))),
       model.count === 1 ? h.span([h.Id("once")], ["once"]) : h.empty,
+      h.svg([h.Id("mark"), h.ViewBox("0 0 24 24"), h.Class("size-4"), h.StrokeWidth("2")], [h.path([h.D(model.count === 0 ? "M5 12h14" : "M12 5v14")], [])]),
+      h.img([h.Id("photo"), h.Src("data:image/png;base64,AAAA"), h.Alt("Photo")]),
     ],
   ),
 });
@@ -147,4 +149,30 @@ test("data-testid remains available to both stylesheet selectors and the inspect
   element.removeAttribute("data-testid");
   assert.equal(element.node.getAttribute("data-testid"), null);
   assert.equal(element.node.getAttribute("testId"), "");
+});
+
+test("inline svg from the view draws as one icon whose markup follows the model", async () => {
+  const svg = document.getElementById("mark");
+  assert.equal(svg.namespaceURI, "http://www.w3.org/2000/svg");
+  assert.equal(svg.node.kind, "icon");
+  assert.equal(svg.node.getAttribute("class"), "size-4");
+  assert.ok(svg.node.svg.includes('viewBox="0 0 24 24"'), svg.node.svg);
+  assert.ok(svg.node.svg.includes('<path d="M'), svg.node.svg);
+  const element = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  circle.setAttribute("r", "3");
+  circle.style.setProperty("fill", "red");
+  element.appendChild(circle);
+  element.setAttribute("viewBox", "0 0 8 8");
+  await Promise.resolve();
+  assert.equal(element.node.svg, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><circle r="3" style="fill:red;"/></svg>');
+  assert.equal(circle.getAttribute("r"), "3");
+  assert.equal(element.firstChild, circle);
+});
+
+test("an image's src and alt reach the tree", () => {
+  const image = document.getElementById("photo");
+  assert.equal(image.node.kind, "image");
+  assert.equal(image.node.src, "data:image/png;base64,AAAA");
+  assert.equal(image.alt, "Photo");
 });

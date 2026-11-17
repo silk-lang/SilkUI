@@ -173,10 +173,66 @@ export class RichInput extends Input {
   setSelectionRange(anchor: number, focus: number): void;
 }
 
-/** An icon: SVG markup drawn at the node's CSS size, with its `color` as `currentColor`. */
+/**
+ * An image, as an `<img>`: `src` is a `data:` URL, a file or `http(s):` address. An SVG
+ * file draws as an inline `<svg>` does. It hears `load` and `error`.
+ */
+export class Image extends Node {
+  constructor(src?: string);
+  src: string;
+}
+
+/**
+ * An icon: SVG drawn at the node's CSS size, with its `color` as `currentColor`. Without a
+ * CSS size it takes the `<svg>`'s `width` and `height`, else a square of the font size.
+ * `svg` is markup and `src` the address of an SVG file; setting one clears the other.
+ */
 export class Icon extends Node {
   constructor(svg?: string);
   svg: string;
+  src: string;
+}
+
+/** Text inside an `<svg>`. */
+export class SvgText {
+  constructor(data?: string);
+  data: string;
+  textContent: string;
+  readonly parentNode: SvgElement | Svg | null;
+  remove(): void;
+  destroy(): void;
+}
+
+/** An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node. */
+export class SvgElement {
+  constructor(tag: string);
+  readonly localName: string;
+  readonly tagName: string;
+  readonly namespaceURI: string;
+  readonly parentNode: SvgElement | Svg | null;
+  readonly childNodes: (SvgElement | SvgText | Text)[];
+  textContent: string;
+  getAttribute(name: string): string | null;
+  hasAttribute(name: string): boolean;
+  /** SVG's names, or React's spellings (`strokeWidth`, `xlinkHref`). */
+  setAttribute(name: string, value: unknown): void;
+  removeAttribute(name: string): void;
+  insertBefore<T extends SvgElement | SvgText | Text>(child: T, before?: SvgElement | SvgText | Text | null): T;
+  appendChild<T extends SvgElement | SvgText | Text>(child: T): T;
+  append(...children: (SvgElement | SvgText | Text | string)[]): void;
+  removeChild<T extends SvgElement | SvgText | Text>(child: T): T;
+  remove(): void;
+  destroy(): void;
+}
+
+/**
+ * An inline `<svg>`: an icon node whose markup its `SvgElement` children make. Class, look,
+ * events and ARIA are the node's; `viewBox`, `fill`, `width` and the rest are markup.
+ */
+export class Svg extends Icon {
+  constructor();
+  readonly outerHTML: string;
+  textContent: string;
 }
 
 /** An event of the tree, with the members of the DOM event it corresponds to. */
@@ -308,6 +364,8 @@ export function createNode(kind: "text"): Text;
 export function createNode(kind: "input"): Input;
 export function createNode(kind: "richinput"): RichInput;
 export function createNode(kind: "icon"): Icon;
+export function createNode(kind: "image" | "img"): Image;
+export function createNode(kind: "svg"): Svg;
 export function createNode(kind: NodeKind): Node;
 
 /** A box with `style` as its base look and `children` appended. */
@@ -317,6 +375,13 @@ export function createInput(style?: Style | null): Input;
 export function createRichInput(style?: Style | null): RichInput;
 /** An icon showing `svg` markup, with `style` as its base look. */
 export function createIcon(svg: string, style?: Style | null): Icon;
+/** An image showing `src`, with `style` as its base look. */
+export function createImage(src: string, style?: Style | null): Image;
+/** `document.createElementNS` in the SVG namespace: an `Svg` for `svg`, else an `SvgElement`. */
+export function createSvgElement(tag: "svg"): Svg;
+export function createSvgElement(tag: string): SvgElement;
+/** Draws the `<svg>`s that changed now, rather than before the host applies the batch. */
+export function flushSvg(): void;
 
 /**
  * Defines `@keyframes name`: `{ from: { opacity: 0 }, "50%": { ... }, to: { ... } }`.

@@ -321,7 +321,9 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 4 {
+  let ran = if scenario == 5 {
+    run Effect.result(svgMarkup(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 4 {
     run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 3 {
     run Effect.result(stylesheets(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -442,6 +444,7 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
   run Testing.expect(bridge.DEFINE_ICON == bridge.nativeId(b"defineIcon"), "DEFINE_ICON")
   run Testing.expect(bridge.DESTROY == bridge.nativeId(b"destroy"), "DESTROY")
+  run Testing.expect(bridge.LOAD == bridge.nativeId(b"load"), "LOAD")
   run Testing.expect(bridge.DEV_RELOAD == bridge.nativeId(b"devReload"), "DEV_RELOAD")
   run Testing.expect(bridge.DEV_SEND == bridge.nativeId(b"devSend"), "DEV_SEND")
   run Testing.expect(bridge.FOCUS == bridge.nativeId(b"focus"), "FOCUS")
@@ -565,4 +568,58 @@ test effect fn literalAriaIdsReachNativeSelectorsAndAccessibility() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(4) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+import ui_tree.inspect { info }
+import ui_tree.mutation { Mutation }
+import ui_tree.resources { Resource }
+
+effect fn widthOf(tree: &Tree<'_>, id: u32) -> f32 ! OutOfMemoryError ? &mut Allocator {
+  return match run info(tree.engine(), id) {
+    Option.Some { value } => value.bounds.width()
+    Option.None => -1.0
+  }
+}
+
+/// Inline `<svg>` markup built from elements draws as one icon of its own width, and an
+/// image's `data:` URL is asked of the host's loader.
+effect fn svgMarkup(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { createBox, createImage, createNode, createSvgElement, mount } from '@silkui/core'; const root = createBox({ display: 'flex', alignItems: 'flex-start' }); const svg = createNode('svg'); svg.setAttribute('width', '24'); svg.setAttribute('height', '12'); svg.setAttribute('viewBox', '0 0 2 1'); const rect = createSvgElement('rect'); rect.setAttribute('width', 2); rect.setAttribute('height', 1); rect.setAttribute('fill', 'currentColor'); svg.appendChild(rect); const sized = createNode('svg'); sized.style.set({ width: 40, height: 20 }); sized.setAttribute('width', '24'); root.append(svg, sized, createImage('data:image/png;base64,iVBORw0KGgo=')); mount(root);", b"svg.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  let engine = tree.engine()
+  let shown = engine.node(engine.slotOf(2)).resource
+  let isIcon = match engine.resources.get(shown) {
+    Option<Resource>.Some { value } => match value {
+      Resource.Icon { .. } => true
+      Resource.Image { .. } => false
+    }
+    Option<Resource>.None => false
+  }
+  run Testing.expect(isIcon, "the svg's markup is an icon resource")
+  let natural = run widthOf(&tree.*, 2)
+  let sized = run widthOf(&tree.*, 3)
+  run Testing.expect(natural == 24.0, "an svg without a CSS size takes its width attribute")
+  run Testing.expect(sized == 40.0, "CSS sizes win over the width attribute")
+  let loads = run tree.engineMut().takeLoads()
+  let mut asked = false
+  let list = loads.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if let Mutation.LoadImage { url, .. } = &list[i] {
+      asked = asked || String.view(&url) == "data:image/png;base64,iVBORw0KGgo="
+    }
+    i = i + 1
+  }
+  run Testing.expect(asked, "the image's data: URL is a load for the host")
+}
+
+test effect fn inlineSvgMarkupAndDataUrlsReachTheNativeTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(5) |> Effect.provideMut<Allocator>(&mut allocator)
 }

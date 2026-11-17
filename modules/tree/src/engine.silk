@@ -172,6 +172,7 @@ import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.num.f32
+import silk.num.f64
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
@@ -2254,9 +2255,10 @@ impl<'a> UiTree<'a> {
         }
         match self.resources.get(resource) {
           Option<Resource>.Some { value } => {
+            // An image shows an SVG file as an icon, as an `<img>` shows one.
             let matches = match value {
               Resource.Image { .. } => kind == NodeKind.Image
-              Resource.Icon { .. } => kind == NodeKind.Icon
+              Resource.Icon { .. } => true
             }
             if !matches {
               fail TreeError.WrongKind { index: index, id: id }
@@ -3957,20 +3959,35 @@ impl<'a> UiTree<'a> {
     let fontSize = self.node(slot).computed.text.size
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
-    if kind == NodeKind.Image {
-      if let Option<Resource>.Some { value } = self.resources.get(resource) {
-        if let Resource.Image { width, height, .. } = value {
+    if kind != NodeKind.Image && kind != NodeKind.Icon {
+      return ()
+    }
+    let shown = self.resources.get(resource)
+    if let Option<Resource>.Some { value } = shown {
+      match value {
+        Resource.Image { width, height, .. } => {
           natural.size = OptionalSize.definite(u32.toF32(width), u32.toF32(height))
           if height != 0 {
             natural.aspectRatio = u32.toF32(width) / u32.toF32(height)
+          }
+        }
+        // The root's own width and height, as an inline `<svg>` has; a square of the
+        // font size where it gives none.
+        Resource.Icon { icon } => {
+          let width = self.resources.iconWidth(icon)
+          let height = self.resources.iconHeight(icon)
+          if width > 0.0 && height > 0.0 {
+            natural.size = OptionalSize.definite(f64.toF32(width), f64.toF32(height))
+            natural.aspectRatio = f64.toF32(width / height)
+          } else {
+            natural.size = OptionalSize.definite(fontSize, fontSize)
+            natural.aspectRatio = 1.0
           }
         }
       }
     } else if kind == NodeKind.Icon {
       natural.size = OptionalSize.definite(fontSize, fontSize)
       natural.aspectRatio = 1.0
-    } else {
-      return ()
     }
     let key = u32.toUsize(slot)
     let changed = key >= self.provider.naturals.length()
@@ -6429,8 +6446,9 @@ fn tableSpans(node: &Node, layout: &mut CssStyle) {
   }
 }
 
-/// Whether `url` names an SVG file, which loads as an icon.
-fn isSvgUrl(url: &[u8]) -> bool {
+/// Whether `url` names an SVG file: a `.svg` path (before any query or fragment) or a
+/// `data:image/svg` URL.
+pub fn isSvgUrl(url: &[u8]) -> bool {
   let svg = b".svg"
   let data = b"data:image/svg"
   let mut end = url.length

@@ -33,7 +33,7 @@ The URL's scheme says how it loads:
 | `photos/dusk.png` | The app's own files: next to the page, or built into a native program |
 | `https://example.com/a.png` | The network, off the UI thread natively |
 | `file:///home/me/a.png` | A local file (native only) |
-| `data:image/png;base64,...` | The URL itself |
+| `data:image/png;base64,...` | The URL itself, base64 or percent-encoded (`data:image/svg+xml,%3Csvg...`) |
 
 Each URL loads once, however many nodes show it. Until it has loaded, the node shows nothing. `h.onLoad(message)` and `h.onError(message)` say when it is ready or could not be loaded, as the DOM's `load` and `error` events do.
 
@@ -58,7 +58,9 @@ Draw an icon's shapes with `fill="currentColor"` or `stroke="currentColor"`. In 
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 21 C5 15.5 2 12.5 2 8.5 A5 5 0 0 1 12 6 A5 5 0 0 1 22 8.5 C22 12.5 19 15.5 12 21 Z"/></svg>
 ```
 
-An icon scales without blurring, so size it with `css.width` and `css.height` and use the same file everywhere.
+An icon scales without blurring, so size it with `css.width` and `css.height` and use the same file everywhere. Without a size it takes the `width` and `height` of its `<svg>`, as an inline `<svg>` does, and a square of the font size when the file gives none.
+
+`h.image` takes an SVG file too, as an `<img>` does, and draws it the same way. A small icon can live in the view as a `data:` URL: `h.icon("data:image/svg+xml,<svg ...>...</svg>", attrs)`.
 
 ## Fonts
 

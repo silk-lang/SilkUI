@@ -33,6 +33,12 @@ function App() {
       <richinput document={document} marks={{ bold: { fontWeight: 700 } }} onInput={(event) => setDocument(event.document)} onSelectionChange={(event) => event.target.document.text} />
       <icon svg="<svg/>" style={{ width: 16 }} />
       <image />
+      <img src="data:image/png;base64,AAAA" alt="Dot" onLoad={(event) => event.type} />
+      <icon src="data:image/svg+xml,%3Csvg/%3E" />
+      <svg viewBox="0 0 24 24" width={24} className="size-4" onClick={(event) => event.clientX}>
+        <path d="M5 12h14" strokeWidth={2} strokeLinecap="round" />
+        <g fill="currentColor"><circle cx={12} cy={12} r={3} /></g>
+      </svg>
       {/* @ts-expect-error: the tree has no such style property */}
       <box style={{ notAProperty: 1 }} />
       {/* @ts-expect-error: a key event has no clientX */}

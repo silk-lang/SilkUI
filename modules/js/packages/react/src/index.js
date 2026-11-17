@@ -1,7 +1,8 @@
 // @silkui/react: a React renderer for the Silk UI tree.
 //
-// Host elements are the tree's node kinds: <box>, <input>, <image>, <icon>, <canvas>.
-// Strings in children become text nodes. Props:
+// Host elements are the tree's node kinds: <box>, <input>, <image> (or <img>), <icon>,
+// <canvas>, and inline <svg> with its elements (<path>, <circle>, <g> and the rest), drawn
+// as one icon. Strings in children become text nodes. Props:
 //
 // - `style`, and `hoverStyle`, `activeStyle`, `focusStyle`, `focusVisibleStyle` for the
 //   looks the tree lays over it in those states. `startingStyle` is what transitions start
@@ -10,8 +11,9 @@
 //   tree, with a `Capture` suffix for the capture phase. Listeners receive the @silkui/core
 //   event, which has the DOM members.
 // - `value` on <input>: a controlled value, as in React DOM.
+// - `src` on <image> and <icon>: an address, `data:` URLs included, as `<img src>`.
 // - `svg` on <icon>: SVG markup, drawn at the icon's CSS size with its `color` as
-//   `currentColor`.
+//   `currentColor`. Inside <svg>, props are SVG attributes in React DOM's spellings.
 // - Everything else is a tree attribute: `tabIndex`, `testId`, `label`, `disabled`,
 //   `placeholder` and so on, and `role` and `aria-*` as in React DOM.
 import Reconciler from "react-reconciler";
@@ -22,7 +24,7 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext } from "react";
-import { RichInput, createNode, createText, mount, root as mountedRoot } from "@silkui/core";
+import { RichInput, SvgElement, SvgText, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
@@ -186,6 +188,24 @@ function applyProps(node, previous, next) {
 }
 
 const EMPTY = {};
+// The host context inside an <svg>: its elements are markup, not nodes.
+const SVG = { svg: true };
+
+// Props of an element inside an <svg>: SVG attributes. Events reach the <svg> itself.
+function applySvgProps(element, previous, next) {
+  for (const name of Object.keys(next)) {
+    const value = next[name];
+    if (name === "children" || name === "key" || name === "ref" || previous[name] === value) continue;
+    if (eventOf(name)) {
+      if (typeof value === "function") element.addEventListener(eventOf(name).type);
+      continue;
+    }
+    element.setAttribute(name, value);
+  }
+  for (const name of Object.keys(previous)) {
+    if (!(name in next) && name !== "children" && name !== "key" && name !== "ref" && !eventOf(name)) element.removeAttribute(name);
+  }
+}
 
 const hostConfig = {
   rendererPackageName: "@silkui/react",
@@ -203,23 +223,30 @@ const hostConfig = {
   noTimeout: -1,
 
   getRootHostContext: () => EMPTY,
-  getChildHostContext: (context) => context,
+  getChildHostContext: (context, type) => (type === "svg" ? SVG : context === SVG && type === "foreignObject" ? EMPTY : context),
   getPublicInstance: (instance) => instance,
   prepareForCommit: () => null,
-  resetAfterCommit() {},
+  // The <svg>s this commit changed are drawn before the host applies it.
+  resetAfterCommit: () => flushSvg(),
   preparePortalMount() {},
   shouldSetTextContent: () => false,
-  createInstance(type, props) {
+  createInstance(type, props, _root, context) {
+    if (context === SVG && type !== "svg") {
+      const element = createSvgElement(type);
+      applySvgProps(element, EMPTY, props);
+      return element;
+    }
     const node = createNode(type);
     applyProps(node, EMPTY, props);
     return node;
   },
-  createTextInstance: (text) => createText(text),
+  createTextInstance: (text, _root, context) => (context === SVG ? new SvgText(text) : createText(text)),
   appendInitialChild: (parent, child) => parent.appendChild(child),
   finalizeInitialChildren: () => false,
   commitMount() {},
   commitUpdate(node, type, previous, next) {
-    applyProps(node, previous, next);
+    if (node instanceof SvgElement) applySvgProps(node, previous, next);
+    else applyProps(node, previous, next);
   },
   commitTextUpdate(node, previous, next) {
     node.data = next;
@@ -235,8 +262,8 @@ const hostConfig = {
   clearContainer(container) {
     for (const child of container.childNodes.slice()) child.destroy();
   },
-  hideInstance: (node) => node.style.set({ display: "none" }),
-  unhideInstance: (node, props) => node.style.set({ display: props.style?.display ?? null }),
+  hideInstance: (node) => (node instanceof SvgElement ? node.setAttribute("display", "none") : node.style.set({ display: "none" })),
+  unhideInstance: (node, props) => (node instanceof SvgElement ? node.setAttribute("display", props.display ?? null) : node.style.set({ display: props.style?.display ?? null })),
   hideTextInstance: (node) => (node.data = ""),
   unhideTextInstance: (node, text) => (node.data = text),
   detachDeletedInstance() {},

@@ -1,5 +1,6 @@
 // JSX for the tree's node kinds. With `"jsxImportSource": "@silkui/react"`, TypeScript
-// checks <box>, <input>, <richinput>, <image>, <icon> and <canvas> against these props.
+// checks <box>, <input>, <richinput>, <image>, <icon>, <canvas> and inline <svg> against
+// these props.
 import type { Key, Ref, ReactNode, JSX as ReactJSX } from "react";
 import type * as Silk from "@silkui/core";
 
@@ -93,9 +94,31 @@ export type RichInputProps = SilkProps<Silk.RichInput> & {
   readOnly?: boolean | undefined;
 };
 
+export type ImageProps = SilkProps<Silk.Image> & {
+  /** The address: a `data:` URL (base64 or percent-encoded), a file or `http(s):`. */
+  src?: string | undefined;
+  /** The text a screen reader reads for it. */
+  alt?: string | undefined;
+};
+
 export type IconProps = SilkProps<Silk.Icon> & {
   /** SVG markup, drawn at the icon's CSS size with its `color` as `currentColor`. */
   svg?: string | undefined;
+  /** The address of an SVG file instead, `data:image/svg+xml` URLs included. */
+  src?: string | undefined;
+};
+
+/** SVG attributes, in React DOM's spellings (`strokeWidth`, `fillRule`, `xlinkHref`). */
+type SvgAttributes = { [name: string]: string | number | boolean | undefined | null | object };
+
+/** The root `<svg>`: a node, with SVG attributes as its markup. */
+export type SvgProps = SilkProps<Silk.Svg> & SvgAttributes;
+
+/** An element inside an `<svg>`: markup alone, so it takes no handlers, look or ref. */
+export type SvgElementProps = SvgAttributes & {
+  key?: Key | null | undefined;
+  ref?: Ref<Silk.SvgElement> | undefined;
+  children?: ReactNode | undefined;
 };
 
 export namespace JSX {
@@ -111,8 +134,48 @@ export namespace JSX {
     box: SilkProps;
     input: InputProps;
     richinput: RichInputProps;
-    image: SilkProps;
+    image: ImageProps;
+    img: ImageProps;
     icon: IconProps;
     canvas: SilkProps;
+    svg: SvgProps;
+    path: SvgElementProps;
+    circle: SvgElementProps;
+    ellipse: SvgElementProps;
+    line: SvgElementProps;
+    polyline: SvgElementProps;
+    polygon: SvgElementProps;
+    rect: SvgElementProps;
+    g: SvgElementProps;
+    defs: SvgElementProps;
+    use: SvgElementProps;
+    symbol: SvgElementProps;
+    title: SvgElementProps;
+    desc: SvgElementProps;
+    text: SvgElementProps;
+    tspan: SvgElementProps;
+    textPath: SvgElementProps;
+    linearGradient: SvgElementProps;
+    radialGradient: SvgElementProps;
+    stop: SvgElementProps;
+    pattern: SvgElementProps;
+    clipPath: SvgElementProps;
+    mask: SvgElementProps;
+    marker: SvgElementProps;
+    filter: SvgElementProps;
+    feGaussianBlur: SvgElementProps;
+    feOffset: SvgElementProps;
+    feBlend: SvgElementProps;
+    feColorMatrix: SvgElementProps;
+    feComposite: SvgElementProps;
+    feFlood: SvgElementProps;
+    feMerge: SvgElementProps;
+    feMergeNode: SvgElementProps;
+    feDropShadow: SvgElementProps;
+    animate: SvgElementProps;
+    animateTransform: SvgElementProps;
+    animateMotion: SvgElementProps;
+    set: SvgElementProps;
+    foreignObject: SvgElementProps;
   }
 }
