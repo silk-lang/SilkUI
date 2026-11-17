@@ -111,9 +111,79 @@ pub struct Computed {
   /// The CSS `cursor`, when the node sets one other than `auto`. Hovering finds it on the
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
+  pub contain: Containment,
 }
 
 impl Copy for Computed {}
+
+/// `container-type`, `contain` and `content-visibility`. css-layout reads the union of the two
+/// size containments, in `layout.sizeContainment`; container queries read only `query`.
+pub struct Containment {
+  pub query: SizeContainment,
+  pub size: SizeContainment,
+  pub paint: bool,
+  /// `content-visibility: hidden`: the contents are neither painted nor hit.
+  pub hidden: bool,
+  contain: Contained,
+}
+
+impl Copy for Containment {}
+
+struct Contained { size: SizeContainment, paint: bool }
+impl Copy for Contained {}
+
+impl Containment {
+  pub fn initial() -> Containment {
+    let none = Contained { size: SizeContainment.None, paint: false }
+    return Containment { query: SizeContainment.None, size: SizeContainment.None, paint: false, hidden: false, contain: none }
+  }
+
+  pub fn inheritContain(self: &mut Self, parent: &Containment) -> () { self.contain = parent.contain }
+
+  pub fn used(self: &mut Self, layout: &mut CssStyle) -> () {
+    let size = if self.hidden { SizeContainment.Size } else { self.contain.size }
+    self.paint = self.hidden || self.contain.paint
+    self.size = size
+    layout.sizeContainment = if self.query == SizeContainment.Size || size == SizeContainment.Size {
+      SizeContainment.Size
+    } else if self.query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
+      SizeContainment.InlineSize
+    } else {
+      SizeContainment.None
+    }
+  }
+}
+
+/// `contain`'s keywords; `None` for a value that is not one.
+fn containOf(value: &Value) -> Option<Contained> {
+  let mut out = Contained { size: SizeContainment.None, paint: false }
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.None { return Option<Contained>.some(out) }
+    if !containWord(&mut out, word) { return Option<Contained>.None }
+    return Option<Contained>.some(out)
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      match convert.keywordOf(&items[i]) {
+        Option.Some { value: word } => { if word == Keyword.None || !containWord(&mut out, word) { return Option<Contained>.None } }
+        Option.None => { return Option<Contained>.None }
+      }
+      i = i + 1
+    }
+    return Option<Contained>.some(out)
+  }
+  return Option<Contained>.None
+}
+
+fn containWord(out: &mut Contained, word: Keyword) -> bool {
+  if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
+  if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
+  if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
+    || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
+}
 
 /// What a node's style says about its paint effects, which `paint_css` reads into the node.
 pub struct EffectState {
@@ -254,7 +324,29 @@ pub struct ScrollStyle {
   pub margin: Insets<f32>,
   /// `scroll-padding` of the scroll container; `auto` is zero.
   pub padding: Edges,
+  /// `scrollbar-color`, which inherits.
+  pub colors: ScrollbarColors,
 }
+
+/// `scrollbar-color`: `auto` is the native thumb over no track.
+pub struct ScrollbarColors { pub auto: bool, pub thumb: Rgba<f32>, pub track: Rgba<f32> }
+
+impl Copy for ScrollbarColors {}
+
+impl ScrollbarColors {
+  pub fn initial() -> ScrollbarColors {
+    return ScrollbarColors { auto: true, thumb: NATIVE_THUMB, track: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }
+  }
+}
+
+impl Equal for ScrollbarColors {
+  fn equals(left: &ScrollbarColors, right: &ScrollbarColors) -> bool {
+    return left.auto == right.auto && &left.thumb == &right.thumb && &left.track == &right.track
+  }
+}
+
+/// The overlay thumb's color when `scrollbar-color` is `auto`.
+pub const NATIVE_THUMB: Rgba<f32> = Rgba<f32> { r: 0.5, g: 0.5, b: 0.5, a: 0.6 }
 
 impl Copy for ScrollStyle {}
 
@@ -266,6 +358,7 @@ impl ScrollStyle {
       smooth: false,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
+      colors: ScrollbarColors.initial(),
     }
   }
 }
@@ -552,6 +645,7 @@ impl Computed {
       outline: Outline.initial(),
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
+      contain: Containment.initial(),
     }
   }
 
@@ -659,13 +753,29 @@ impl Computed {
     match property {
       CssProperty.ContainerType => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
-          if word == Keyword.Normal { self.layout.sizeContainment = SizeContainment.None }
-          if word == Keyword.Size { self.layout.sizeContainment = SizeContainment.Size }
-          if word == Keyword.InlineSize { self.layout.sizeContainment = SizeContainment.InlineSize }
+          if word == Keyword.Normal { self.contain.query = SizeContainment.None }
+          if word == Keyword.Size { self.contain.query = SizeContainment.Size }
+          if word == Keyword.InlineSize { self.contain.query = SizeContainment.InlineSize }
+          self.contain.used(&mut self.layout)
+        }
+      }
+      CssProperty.Contain => {
+        if let Option<Contained>.Some { value: found } = containOf(value) {
+          self.contain.contain = found
+          self.contain.used(&mut self.layout)
+        }
+      }
+      CssProperty.ContentVisibility => {
+        if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+          if word == Keyword.Hidden || word == Keyword.Visible || word == Keyword.Auto {
+            self.contain.hidden = word == Keyword.Hidden
+            self.contain.used(&mut self.layout)
+          }
         }
       }
       CssProperty.Container => {
-        self.layout.sizeContainment = SizeContainment.None
+        self.contain.query = SizeContainment.None
+        self.contain.used(&mut self.layout)
         if let Value.Sequence { separator: Separator.Slash, values } = &value.* {
           if values.length() == 2 { self.set(CssProperty.ContainerType, &values.asSlice()[1], &context) }
         }
@@ -1202,6 +1312,22 @@ impl Computed {
             }
           }
           Option.None => {}
+        }
+      }
+      CssProperty.ScrollbarColor => {
+        if convert.isKeyword(value, Keyword.Auto) { self.scroll.colors = ScrollbarColors.initial() }
+        if let Value.Sequence { separator: _, values } = &value.* {
+          let items = values.asSlice()
+          if items.length == 2 {
+            let current = self.text.color
+            let thumb = if convert.isKeyword(&items[0], Keyword.Currentcolor) { Option<Rgba<f32>>.some(current) } else { convert.color(&items[0]) }
+            let track = if convert.isKeyword(&items[1], Keyword.Currentcolor) { Option<Rgba<f32>>.some(current) } else { convert.color(&items[1]) }
+            if let Option.Some { value: a } = thumb {
+              if let Option.Some { value: b } = track {
+                self.scroll.colors = ScrollbarColors { auto: false, thumb: a, track: b }
+              }
+            }
+          }
         }
       }
       CssProperty.ScrollbarWidth => {
@@ -1857,7 +1983,7 @@ impl Computed {
 
   /// Whether the node clips its children to its padding box.
   pub fn clips(self: &Self) -> bool {
-    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible
+    return self.layout.overflowX != Overflow.Visible || self.layout.overflowY != Overflow.Visible || self.contain.paint
   }
 
   /// Whether the node draws anything of its own box: a background, border or shadow.
@@ -1943,6 +2069,9 @@ impl Computed {
     h = colorHash(h, self.text.caret())
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
+    let contained: u64 = if self.contain.hidden { 2 } else if self.contain.paint { 1 } else { 0 }
+    h = Hash.combine(h, contained)
+    if !self.scroll.colors.auto { h = colorHash(colorHash(Hash.combine(h, 3), self.scroll.colors.thumb), self.scroll.colors.track) }
     h = Hash.combine(
       h,
       if self.paint.pointerEvents {
@@ -1997,15 +2126,27 @@ fn named(name: &[u8], word: &[u8]) -> bool {
 pub fn cursorOf(name: &[u8]) -> Option<Cursor> {
   if named(name, b"auto") { return Option<Cursor>.None }
   if named(name, b"pointer") { return Option<Cursor>.Some { value: Cursor.Pointer } }
-  if named(name, b"text") || named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.Text } }
+  if named(name, b"text") { return Option<Cursor>.Some { value: Cursor.Text } }
+  if named(name, b"none") { return Option<Cursor>.Some { value: Cursor.None } }
+  if named(name, b"wait") { return Option<Cursor>.Some { value: Cursor.Wait } }
+  if named(name, b"progress") { return Option<Cursor>.Some { value: Cursor.Progress } }
+  if named(name, b"help") { return Option<Cursor>.Some { value: Cursor.Help } }
+  if named(name, b"context-menu") { return Option<Cursor>.Some { value: Cursor.ContextMenu } }
+  if named(name, b"copy") { return Option<Cursor>.Some { value: Cursor.Copy } }
+  if named(name, b"alias") { return Option<Cursor>.Some { value: Cursor.Alias } }
+  if named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.VerticalText } }
+  if named(name, b"col-resize") { return Option<Cursor>.Some { value: Cursor.ColumnResize } }
+  if named(name, b"row-resize") { return Option<Cursor>.Some { value: Cursor.RowResize } }
+  if named(name, b"zoom-in") { return Option<Cursor>.Some { value: Cursor.ZoomIn } }
+  if named(name, b"zoom-out") { return Option<Cursor>.Some { value: Cursor.ZoomOut } }
   if named(name, b"move") || named(name, b"all-scroll") { return Option<Cursor>.Some { value: Cursor.Move } }
   if named(name, b"grab") { return Option<Cursor>.Some { value: Cursor.Grab } }
   if named(name, b"grabbing") { return Option<Cursor>.Some { value: Cursor.Grabbing } }
   if named(name, b"not-allowed") || named(name, b"no-drop") { return Option<Cursor>.Some { value: Cursor.NotAllowed } }
-  if named(name, b"ew-resize") || named(name, b"col-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
+  if named(name, b"ew-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
     return Option<Cursor>.Some { value: Cursor.ResizeHorizontal }
   }
-  if named(name, b"ns-resize") || named(name, b"row-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
+  if named(name, b"ns-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
     return Option<Cursor>.Some { value: Cursor.ResizeVertical }
   }
   if named(name, b"nwse-resize") || named(name, b"nw-resize") || named(name, b"se-resize") {
