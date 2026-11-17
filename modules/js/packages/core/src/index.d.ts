@@ -11,7 +11,7 @@ export function updateStyleSheet(id: string, compiled: Uint8Array | ArrayBuffer 
 import type * as CSS from "csstype";
 
 /** The node kinds of the tree. `richinput` is an `input` with marks and atoms. */
-export type NodeKind = "box" | "text" | "input" | "richinput" | "image" | "icon" | "canvas";
+export type NodeKind = "box" | "text" | "input" | "richinput" | "image" | "canvas" | "svg";
 
 /** The looks a state lays over the base look: `:hover`, `:active`, `:focus`, `:focus-visible`, `@starting-style`. */
 export type LookState = "base" | "hover" | "active" | "focus" | "focusVisible" | "starting";
@@ -182,17 +182,6 @@ export class Image extends Node {
   src: string;
 }
 
-/**
- * An icon: SVG drawn at the node's CSS size, with its `color` as `currentColor`. Without a
- * CSS size it takes the `<svg>`'s `width` and `height`, else a square of the font size.
- * `svg` is markup and `src` the address of an SVG file; setting one clears the other.
- */
-export class Icon extends Node {
-  constructor(svg?: string);
-  svg: string;
-  src: string;
-}
-
 /** Text inside an `<svg>`. */
 export class SvgText {
   constructor(data?: string);
@@ -226,10 +215,12 @@ export class SvgElement {
 }
 
 /**
- * An inline `<svg>`: an icon node whose markup its `SvgElement` children make. Class, look,
- * events and ARIA are the node's; `viewBox`, `fill`, `width` and the rest are markup.
+ * An inline `<svg>`: one node drawing the markup its `SvgElement` children make, at its CSS
+ * size (else its `width` and `height`, else a square of the font size), with its `color` as
+ * `currentColor`. Class, look, events and ARIA are the node's; `viewBox`, `fill`, `width`
+ * and the rest are markup.
  */
-export class Svg extends Icon {
+export class Svg extends Node {
   constructor();
   readonly outerHTML: string;
   textContent: string;
@@ -363,7 +354,6 @@ export interface EventMap {
 export function createNode(kind: "text"): Text;
 export function createNode(kind: "input"): Input;
 export function createNode(kind: "richinput"): RichInput;
-export function createNode(kind: "icon"): Icon;
 export function createNode(kind: "image" | "img"): Image;
 export function createNode(kind: "svg"): Svg;
 export function createNode(kind: NodeKind): Node;
@@ -373,8 +363,6 @@ export function createBox(style?: Style | null, ...children: (Node | string)[]):
 export function createText(data?: string): Text;
 export function createInput(style?: Style | null): Input;
 export function createRichInput(style?: Style | null): RichInput;
-/** An icon showing `svg` markup, with `style` as its base look. */
-export function createIcon(svg: string, style?: Style | null): Icon;
 /** An image showing `src`, with `style` as its base look. */
 export function createImage(src: string, style?: Style | null): Image;
 /** `document.createElementNS` in the SVG namespace: an `Svg` for `svg`, else an `SvgElement`. */
@@ -500,3 +488,16 @@ export function removeTray(): void;
  */
 export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
 export function unregisterShortcut(accelerator: string): void;
+
+/** The app's memory: `footprint` in bytes over `processes` processes. */
+export interface MemoryUsage {
+  footprint: number;
+  processes: number;
+}
+
+/**
+ * The app's memory as the system shows it to users (macOS `phys_footprint`, Linux `Pss`,
+ * Windows `PrivateUsage`). In the browser, the wasm tree's linear memory only. Cheap enough
+ * to call every second; `null` when the host cannot say.
+ */
+export function memoryUsage(): MemoryUsage | null;

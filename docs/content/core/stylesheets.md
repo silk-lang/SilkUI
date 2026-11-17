@@ -20,7 +20,7 @@ The frame above runs on the browser's DOM, so the browser applies the sheet. In 
 
 ## Load CSS at build time
 
-In `src/tasks.silk`, add files to the app definition in cascade order:
+In `silk/tasks.silk`, add files to the app definition in cascade order:
 
 ```silk
 App.make("my-app")
@@ -105,10 +105,10 @@ silk task dev
 
    ```css
    @import "tailwindcss" source(none);
-   @source "../src/**/*.silk";
+   @source "../silk/**/*.silk";
    ```
 
-4. In `src/tasks.silk`, load the file Tailwind writes, and run Tailwind around the build:
+4. In `silk/tasks.silk`, load the file Tailwind writes, and run Tailwind around the build:
 
    ```silk
    import tailwind.tailwind { Tailwind }
@@ -125,13 +125,13 @@ silk task dev
    let processor = Tailwind.make("styles/input.css", "styles/app.css")
    match move self {
      // Builds the CSS, then keeps Tailwind watching while the app runs.
-     Tasks.Dev { target } => run processor.watching(app()
-       |> App.build(Mode.Dev)
+     Tasks.Dev { platform: _, options } => run processor.watching(app()
+       |> App.dev(&options)
        |> Built.launch()
        |> Running.watch())
-     Tasks.Build { target } => {
+     Tasks.Build { platform: _, options } => {
        drop run processor.build()
-       run app() |> App.build(Mode.Release) |> Built.write("dist")
+       run app() |> App.build(&options) |> Built.write("dist")
      }
    }
    ```

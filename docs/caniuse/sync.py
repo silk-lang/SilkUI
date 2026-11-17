@@ -100,6 +100,8 @@ def main():
         at = sys.argv.index("--fetch") + 1
         fetch(sys.argv[at] if at < len(sys.argv) else "")
     catalog = json.loads((here / "features.json").read_text())
+    # Silk UI's own APIs that caniuse has no feature for, in features.json's shape plus a `link`.
+    catalog["features"] += json.loads((here / "silk.json").read_text())
     areas = json.loads((here / "areas.json").read_text())
     where = {}
     for area, ids in areas.items():
@@ -135,7 +137,7 @@ def main():
         rows.append(
             "    Feature { "
             f"id: {literal(feature['id'])}, title: {literal(feature['title'])}, "
-            f"about: {literal(feature['description'])}, link: {literal('https://caniuse.com/' + feature['id'])}, "
+            f"about: {literal(feature['description'])}, link: {literal(feature.get('link', 'https://caniuse.com/' + feature['id']))}, "
             f"group: {literal(feature['group'])}, area: {literal(where[feature['id']])}, "
             f"chrome: {literal(feature['browsers']['chrome'])}, "
             f"firefox: {literal(feature['browsers']['firefox'])}, "

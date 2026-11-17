@@ -167,6 +167,8 @@ export class JsHost {
       markdown: (text, flags) => this.markdown(text, flags),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
+      // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
+      memoryUsage: () => this.instance?.exports.memory.buffer.byteLength ?? 0,
     };
     globalThis.__ui = this.ui;
     this.imports = {

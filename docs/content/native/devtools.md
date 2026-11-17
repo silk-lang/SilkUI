@@ -77,6 +77,26 @@ claude mcp add silk-ui -- "$PWD/build/x86_64-unknown-linux-gnu/dev/ui-inspect-mc
 
 Other MCP clients take the same command in their configuration.
 
+## Try it with a screen reader
+
+Debug builds have a screen reader of their own, so you can hear your app the way a blind user does without turning on VoiceOver, NVDA or Narrator for your whole computer. It plays NVDA, VoiceOver, JAWS, Narrator or Orca on any system, with that screen reader's keys and words: arrows read by line, word and character, H jumps to the next heading, K to the next link, NVDA+F7 lists them, and Enter activates. A ring shows what it is reading, and captions at the bottom of the window show what it says. Speech uses `say` on macOS and `espeak-ng` or `spd-say` on Linux. Elsewhere you get captions only.
+
+Ctrl+Alt+Shift+S turns it on and off at any time. Ctrl+Alt+Shift+F plays the next screen reader, M mutes speech, and C hides the captions. To start with it on, set `SILK_UI_SCREEN_READER`:
+
+```sh
+SILK_UI_SCREEN_READER=voiceover,muted silk task native demo docs/examples/apps/pad -- --debug
+```
+
+The value is `1` or a screen reader's name (`nvda`, `voiceover`, `jaws`, `narrator`, `orca`), with `muted` for captions only.
+
+With the inspector on, the devtools have a Screen reader tab: a switch, the five screen readers, and a button for every command, each showing the keys the chosen screen reader uses for it, so you can learn them as you go. Scripts and agents use the same commands:
+
+```sh
+ui-inspect-cli screen-reader.set --on true --flavor nvda
+ui-inspect-cli screen-reader.do --command nextHeading     # prints what it said
+ui-inspect-cli screen-reader.transcript
+```
+
 ## Turning it off for good
 
 An app that must never serve the inspector, even in a debug build, says so on its window:

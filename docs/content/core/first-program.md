@@ -78,7 +78,7 @@ The user clicks, a message goes to `update`, `update` returns a model, `view` sh
 
 ## Run it yourself
 
-The program above knows nothing about where it runs. The quickest way to run one is the Loom template, whose `src/app.silk` is this counter:
+The program above knows nothing about where it runs. The quickest way to run one is the Loom template, whose `silk/app.silk` is this counter:
 
 ```sh
 silk init my-app -t ui-loom
@@ -86,7 +86,7 @@ cd my-app
 silk task dev
 ```
 
-The window restarts when you change `src/app.silk`. [Get started](/start/) has the rest: building, and running the same app in a browser page.
+The window restarts when you change `silk/app.silk`. [Get started](/start/) has the rest: building, and running the same app in a browser page.
 
 The template's tasks write the host for you: the few lines that open a window or mount the program in a page. To see what is in one, [your first window](/native/) writes it by hand, and [in the browser](/core/browser/) does the same for a web page.
 

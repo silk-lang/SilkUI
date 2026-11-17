@@ -1,14 +1,17 @@
 # silkui
 
-The front door of Silk UI. A project defines its app once, in `src/tasks.silk`, and builds and
+The front door of Silk UI. A project defines its app once, in `silk/tasks.silk`, and builds and
 runs it with pipelines of steps: `silk task dev` opens it with the development tools, and
 `silk task build --release` writes the release program. silkui generates the Silk host for each target,
 so the project never assembles hosts, fonts, GPU start-up or bundles by hand.
 
 | Written in | Files the project owns | What silkui generates |
 | --- | --- | --- |
-| React, Foldkit, plain JS | `silk.toml`, `src/tasks.silk`, a Vite project in `web/` | A generated window entry module, with the bundle embedded in release builds |
-| Loom | `silk.toml`, `src/tasks.silk`, `src/app.silk` with the model, view and update | An entry module per target that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
+| React, Foldkit, plain JS | `silk.toml`, `silk/tasks.silk`, the JavaScript in `js/`, and `package.json` and `vite.config.js` beside `silk.toml` | A generated window entry module, with the bundle embedded in release builds |
+| Loom | `silk.toml`, `silk/tasks.silk`, `silk/app.silk` with the model, view and update | An entry module per target that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
+
+One root holds both projects, so `silk` and `npm` commands both run there. The manifest's
+`source = "silk"` points Silk at `silk/` (without it, Silk reads `src/`).
 
 Generated modules and bundles are cached build steps. Each compilation uses the application's
 manifest and explicit dependencies; its entry module calls into [silkui-window](window) or
@@ -22,20 +25,19 @@ import silkui.app { App, Framework, Target, Window, Built, Running }
 
 effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
   return run App.make("my-app")
-    |> App.framework(Framework.react("web"))
+    |> App.framework(Framework.react("."))
     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
 }
 
 // in TaskSet.perform:
 Tasks.Dev { platform, options } => run app()
   |> App.only(String.view(&platform))
-  |> App.build(&options)
+  |> App.dev(&options)
   |> Built.launch()
   |> Running.watch()
 Tasks.Build { platform, options } => run app()
   |> App.only(String.view(&platform))
   |> App.build(&options)
-  |> Built.tap(Built.sizes)
   |> Built.write("dist")
 ```
 
@@ -48,10 +50,11 @@ An app goes through three stages, and each step is scoped under the stage it tak
 | --- | --- | --- |
 | `App.only(id)` | App | Keeps only platform `id` (the `--platform` flag); empty keeps them all |
 | `app.compilations(&options)` | Build | Describes the selected hosts as standard compilations, with generated entry modules and release bundles as prerequisites; runs no tools |
-| `App.build(&options)` | Built | Compiles the graph and assembles browser pages. Development builds also install the Vite packages needed to launch the dev server |
-| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<app name>`, and each page to `<dir>/<target>/` |
+| `App.build(&options)` | Built | Compiles the graph without the development tools and assembles browser pages |
+| `App.dev(&options)` | Built | The same with the development tools, and it installs the Vite packages the dev server needs |
+| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<project name>`, and each page to `<dir>/<target>/`, and lists them with their sizes and the build time |
 | `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
-| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
+| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change in the Silk sources of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
 
 `App.tap(fn)`, `Built.tap(fn)` and `Running.tap(fn)` run a function on the value and pass it
 on; `App.map` and `Built.map` take an effect closure that makes a new value of the same
@@ -68,20 +71,22 @@ effect fn sign<'env, E, ?R>(built: once Effect<'env; Built ! E ? R>) -> Built ! 
 
 Tasks flatten the standard `silk.build.graph.Options` flags: `--release` selects speed
 optimization, `--optimize` selects an optimization mode, `--debug` controls debug information,
-and `--target` selects a native target triple. `--platform` selects the UI host. Unoptimized
-builds include development tools; optimized builds exclude reload, the development server
-and the inspector. Development builds optimize the renderer, inspector server and runtime
+and `--target` selects a native target triple. `--platform` selects the UI host. Only
+`App.dev` builds include the development tools (reload, the development server, the
+inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptimized, as
+`silk build` makes it. Development builds optimize the renderer, inspector server and runtime
 packages while keeping the application unoptimized.
 
 ## The definition
 
 | Setting | Choices | Notes |
 | --- | --- | --- |
-| `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react("web")`, `Framework.foldkit("web")`, `Framework.js("web")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project, whose config has `@silkui/vite` and bundles to `dist/app.js` |
+| `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react(".")`, `Framework.foldkit(".")`, `Framework.js(".")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project's directory (`.` for the project root), whose config has `@silkui/vite`; silkui has it bundle into `.silk/bundle/` |
 | `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
+| `Target.titleBar` | `TitleBar.standard()` (default), `TitleBar.transparent(height)`, `.buttons(left, top)` | On a window target. `buttons` moves the window buttons' top-left corner (0 keeps it centred). Transparent: on macOS the app fills the window under the controls and draws its own bar in the top `height` pixels, where a press moves the window and the app gets no clicks. Other systems keep their bar |
 | `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
 Fonts are the ones installed on the machine. A `web-canvas` page has no access to those, so it

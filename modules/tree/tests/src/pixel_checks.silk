@@ -1,6 +1,8 @@
 //! Pixel checks for properties the Can I use probes cannot see: `caret-color` (the probe
 //! fixture has no focused input) and `object-fit` (it has no image).
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Attribute }
+import silk.core.option { Option }
+import silk.text.string { String }
 import ui_fixtures.fixtures as fixtures
 import svg_css.compile { CompileError, Options }
 import svg_css.compile
@@ -102,4 +104,186 @@ effect fn objectFit() ! TreeError | CssError | GeometryError | OutOfMemoryError 
 test effect fn pixelObjectFitPlacesTheImage() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run objectFit() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A 100 by 100 box at the origin with `overflow: hidden` and 40px corners over a red child
+/// styled `child`, rendered on white.
+effect fn roundedClip(child: &[u8]) -> bool ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let clip = run written.declarations(b"display:block;position:relative;width:100px;height:100px;overflow:hidden;border-radius:40px")
+  run batch.style(2, clip.asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  let own = run written.declarations(child)
+  run batch.style(3, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let corner = painted.pixel(3, 3)
+  let middle = painted.pixel(50, 50)
+  let edge = painted.pixel(50, 1)
+  run Testing.expect(middle.r > 200 && middle.g < 60, "the child paints inside the box")
+  run Testing.expect(edge.r > 200 && edge.g < 60, "the clip keeps the straight edges")
+  return white(corner.r, corner.g, corner.b)
+}
+
+effect fn roundedClips() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let flow = run roundedClip(b"display:block;width:100px;height:100px;background-color:red")
+  run Testing.expect(flow, "overflow: hidden rounds an in-flow child to the border radius")
+  let gradient = run roundedClip(b"display:block;width:100px;height:100px;background-image:radial-gradient(red, red)")
+  run Testing.expect(gradient, "overflow: hidden rounds a gradient child")
+  let placed = run roundedClip(b"position:absolute;left:0;top:0;width:100px;height:100px;background-color:red")
+  run Testing.expect(placed, "overflow: hidden rounds a positioned child painted by the stacking context")
+  let moved = run roundedClip(b"display:block;width:100px;height:100px;background-color:red;transform:scale(1.5)")
+  run Testing.expect(moved, "overflow: hidden rounds a transformed child")
+}
+
+test effect fn pixelOverflowClipFollowsBorderRadius() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run roundedClips() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn offscreenLayer() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  // Half of it lies left of the viewport until the turn brings that half into view.
+  let own = run written.declarations(b"position:absolute;left:-100px;top:0;width:200px;height:100px;background-color:red;transform:rotate(180deg)")
+  run batch.style(2, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let near = painted.pixel(5, 50)
+  let far = painted.pixel(95, 50)
+  run Testing.expect(near.r > 200 && near.g < 60 && far.r > 200 && far.g < 60, "a transform shows the part of a box that lay outside the viewport")
+}
+
+test effect fn pixelTransformShowsContentFromOutsideTheViewport() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run offscreenLayer() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The center pixel of a 100 by 100 box on white whose inline style is `own`, under `sheet`.
+effect fn backgroundCenter(own: &[u8], sheet: &[u8]) -> [u8; 3] ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let style = run written.declarations(own)
+  run batch.style(2, style.asSlice())
+  let compiled = run compile.compile(sheet, &Options.make())
+  let bytes = run compiled.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let pixel = painted.pixel(50, 50)
+  return [pixel.r, pixel.g, pixel.b]
+}
+
+effect fn backgroundShorthandGradients() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let size = b"display:block;width:100px;height:100px;"
+  let inline = run backgroundCenter(b"display:block;width:100px;height:100px;background:radial-gradient(closest-side, #f00, transparent)", b"")
+  run Testing.expect(inline[0] > 200 && inline[1] < 60, "an inline background shorthand paints a radial gradient")
+  let sheet = run backgroundCenter(size, b"div, * > * {background:radial-gradient(closest-side, #f00, transparent)}")
+  run Testing.expect(sheet[0] > 200 && sheet[1] < 60, "a stylesheet background shorthand paints a radial gradient")
+  let linear = run backgroundCenter(size, b"* > * {background:linear-gradient(#f00, #f00)}")
+  run Testing.expect(linear[0] > 200 && linear[1] < 60, "a stylesheet background shorthand paints a linear gradient")
+}
+
+test effect fn pixelBackgroundShorthandPaintsGradients() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backgroundShorthandGradients() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The center pixel of a 100 by 100 box on white with `classes`, under `sheet`.
+effect fn classCenter(classes: string, sheet: &[u8]) -> [u8; 3]
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(
+    b"display:block;width:400px;height:300px;background-color:white",
+  )
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let style = run written.declarations(b"display:block;width:100px;height:100px")
+  run batch.style(2, style.asSlice())
+  run batch.attribute(
+    2,
+    Attribute.Named {
+      name: run String.copy("class"),
+      value: Option<String>.some(run String.copy(classes)),
+    },
+  )
+  let compiled = run compile.compile(sheet, &Options.make())
+  let bytes = run compiled.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let pixel = painted.pixel(50, 50)
+  return [pixel.r, pixel.g, pixel.b]
+}
+
+/// Tailwind 4 `bg-linear-to-br from-* to-*`: the position is `to bottom right in oklab` once
+/// `@supports (linear-gradient(in lab, ...))` holds, so the method must parse.
+effect fn tailwindGradients()
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let literal = run classCenter(
+    "g",
+    b".g{background-image:linear-gradient(to bottom right in oklab, oklch(72% 0.21 305) 0%, oklch(78% 0.16 215) 100%)}",
+  )
+  run Testing.expect(
+    literal[0] < 235 || literal[1] < 235,
+    "a literal oklab-interpolated linear gradient paints",
+  )
+  let tailwind = run classCenter(
+    "bg-linear-to-br from-accent to-accent-2",
+    b"@layer properties;@layer theme,base,components,utilities;@layer theme{:root,:host{--color-accent:oklch(72% 0.21 305);--color-accent-2:oklch(78% 0.16 215)}}@layer utilities{.bg-linear-to-br{--tw-gradient-position:to bottom right;@supports (background-image:linear-gradient(in lab, red, red)){--tw-gradient-position:to bottom right in oklab}background-image:linear-gradient(var(--tw-gradient-stops))}.from-accent{--tw-gradient-from:var(--color-accent);--tw-gradient-stops:var(--tw-gradient-via-stops,var(--tw-gradient-position),var(--tw-gradient-from) var(--tw-gradient-from-position),var(--tw-gradient-to) var(--tw-gradient-to-position))}.to-accent-2{--tw-gradient-to:var(--color-accent-2);--tw-gradient-stops:var(--tw-gradient-via-stops,var(--tw-gradient-position),var(--tw-gradient-from) var(--tw-gradient-from-position),var(--tw-gradient-to) var(--tw-gradient-to-position))}}@property --tw-gradient-position{syntax:'*';inherits:false}@property --tw-gradient-from{syntax:'<color>';inherits:false;initial-value:#0000}@property --tw-gradient-via{syntax:'<color>';inherits:false;initial-value:#0000}@property --tw-gradient-to{syntax:'<color>';inherits:false;initial-value:#0000}@property --tw-gradient-stops{syntax:'*';inherits:false}@property --tw-gradient-via-stops{syntax:'*';inherits:false}@property --tw-gradient-from-position{syntax:'<length-percentage>';inherits:false;initial-value:0%}@property --tw-gradient-via-position{syntax:'<length-percentage>';inherits:false;initial-value:50%}@property --tw-gradient-to-position{syntax:'<length-percentage>';inherits:false;initial-value:100%}@layer properties{@supports ((-webkit-hyphens: none) and (not (margin-trim: block))) or ((-moz-orient: inline) and (not (color:rgb(from red r g b)))){*,::before,::after,::backdrop{--tw-gradient-position:initial;--tw-gradient-from:#0000;--tw-gradient-via:#0000;--tw-gradient-to:#0000;--tw-gradient-stops:initial;--tw-gradient-via-stops:initial;--tw-gradient-from-position:0%;--tw-gradient-via-position:50%;--tw-gradient-to-position:100%}}}",
+  )
+  run Testing.expect(tailwind[0] < 235 || tailwind[1] < 235, "bg-linear-to-br from-* to-* paints")
+}
+
+test effect fn pixelTailwindGradientUtilitiesPaint()
+  ! TreeError
+    | CompileError
+    | CssError
+    | GeometryError
+    | OutOfMemoryError
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run tailwindGradients() |> Effect.provideMut<Allocator>(&mut allocator)
 }

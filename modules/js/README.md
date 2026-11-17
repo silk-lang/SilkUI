@@ -14,7 +14,7 @@ page is the reference for the packages and the host underneath.
 ## @silkui/core
 
 [packages/core](packages/core) is the node and event API. Its primitives are the tree's own (box,
-text, input, image, icon, canvas). Its methods and its event flow are the DOM's.
+text, input, image, canvas) and inline svg. Its methods and its event flow are the DOM's.
 
 ```js
 import { createBox, createText, mount } from "@silkui/core";
@@ -188,7 +188,7 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
   program boots in `document.getElementById('root')` as it does from a browser's
   `index.html`. Foldkit puts the view's root element in its place.
 - **Elements.** Every tag is a box, except `input` and `textarea` (the tree's input), `img`
-  (image), `icon` and `canvas`. A tag brings what it means, not how a browser draws it:
+  (image), `canvas` and `svg` (one node drawing its elements as markup). A tag brings what it means, not how a browser draws it:
   `button` and `a` take the focus and have their roles, `h1` to `h6`, `p`, `ul`, `ol` and
   `li` have theirs, and nothing has a default style.
 - **Style.** `h.Style` with CSS values (`fontSize: '13px'`) and `h.Class` for adopted

@@ -1,0 +1,163 @@
+//! `shape-outside` and `shape-margin` as css-layout's `FloatShape`: what a float's lines wrap
+//! around (CSS Shapes 1 §3).
+import paint_css { Effects }
+import layout.lib { FloatShape, ShapeKind, ShapeBox, ShapeRadius }
+import properties.computed { Dimension }
+import svg_css.dimensions { ExprId }
+import svg_css.effect_values { ClipSource, GeometryBox, Shape, RadialSize, Extent, RectangleKind, Corners as ShapeCorners }
+import svg_css.transform_values { PositionAxis, Edge }
+import silk.geometry.corners { Corners }
+import silk.collections.list { List }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+
+/// The float shape `effects` declares over a border box with corner radius lengths `radii`;
+/// none when it declares no shape or one css-layout cannot wrap around (a path).
+pub effect fn of(effects: &Effects, radii: Corners<f32>) -> FloatShape ! OutOfMemoryError ? &mut Allocator {
+  let mut shape = FloatShape.make()
+  if effects.shape.length() == 0 { return move shape }
+  shape.margin = match effects.shapeMargin {
+    Option.Some { value } => dimension(effects, value)
+    Option.None => Dimension.px(0.0)
+  }
+  match &effects.shape.asSlice()[0] {
+    ClipSource.Box { reference } => {
+      shape.kind = ShapeKind.Box
+      shape.reference = referenceOf(effects, reference)
+      let share = effects.radii
+      let lengths = [radii.topLeft, radii.topRight, radii.bottomRight, radii.bottomLeft]
+      let shares = [share.topLeft, share.topRight, share.bottomRight, share.bottomLeft]
+      let mut axis: usize = 0
+      while axis < 2 {
+        let mut i: usize = 0
+        while i < 4 {
+          run shape.values.append(Dimension.calc(lengths[i], shares[i]))
+          i = i + 1
+        }
+        axis = axis + 1
+      }
+    }
+    ClipSource.Shape { shape: found, reference } => {
+      shape.reference = referenceOf(effects, reference)
+      match &found {
+        Shape.Ellipse { circle, size, position } => {
+          shape.kind = if circle { ShapeKind.Circle } else { ShapeKind.Ellipse }
+          match size {
+            RadialSize.Extent { extent } => {
+              let side = if extent == Extent.ClosestSide || extent == Extent.ClosestCorner { ShapeRadius.ClosestSide } else { ShapeRadius.FarthestSide }
+              shape.radiusX = side
+              shape.radiusY = side
+              run shape.values.append(Dimension.px(0.0))
+              if !circle { run shape.values.append(Dimension.px(0.0)) }
+            }
+            RadialSize.Radii { x, y } => {
+              run shape.values.append(dimension(effects, x))
+              if !circle {
+                run shape.values.append(match y {
+                  Option.Some { value } => dimension(effects, value)
+                  Option.None => dimension(effects, x)
+                })
+              }
+            }
+          }
+          run shape.values.append(axisOf(effects, position.x))
+          run shape.values.append(axisOf(effects, position.y))
+        }
+        Shape.Rectangle { kind, edges, corners } => {
+          shape.kind = ShapeKind.Inset
+          run appendInsets(&mut shape.values, effects, kind, edges)
+          run appendCorners(&mut shape.values, effects, corners)
+        }
+        Shape.Polygon { points, .. } => {
+          shape.kind = ShapeKind.Polygon
+          let list = points.asSlice()
+          let mut i: usize = 0
+          while i < list.length {
+            run shape.values.append(dimension(effects, list[i].x))
+            run shape.values.append(dimension(effects, list[i].y))
+            i = i + 1
+          }
+        }
+        _ => {
+          return FloatShape.make()
+        }
+      }
+    }
+    ClipSource.Url { .. } => {}
+  }
+  return move shape
+}
+
+/// The margin box unless the value names its box (CSS Shapes 1 §3.1).
+fn referenceOf(effects: &Effects, reference: GeometryBox) -> ShapeBox {
+  if !effects.shapeBox { return ShapeBox.MarginBox }
+  return match reference {
+    GeometryBox.Content => ShapeBox.ContentBox
+    GeometryBox.Padding => ShapeBox.PaddingBox
+    GeometryBox.Margin => ShapeBox.MarginBox
+    _ => ShapeBox.BorderBox
+  }
+}
+
+/// A computed length or percentage as a length plus a fraction of its basis.
+fn dimension(effects: &Effects, id: ExprId) -> Dimension {
+  let length = effects.pixels(id, 0.0)
+  return Dimension.calc(length, (effects.pixels(id, 1000.0) - length) / 1000.0)
+}
+
+/// A position axis as an offset from the reference box's left or top edge.
+fn axisOf(effects: &Effects, axis: PositionAxis) -> Dimension {
+  let d = dimension(effects, axis.offset)
+  return match axis.edge {
+    Edge.Start => d
+    Edge.Center => Dimension.calc(d.value, 0.5 + d.percent)
+    Edge.End => Dimension.calc(-d.value, 1.0 - d.percent)
+  }
+}
+
+/// `inset()`, `rect()` and `xywh()` as top, right, bottom and left insets.
+effect fn appendInsets(values: &mut List<Dimension>, effects: &Effects, kind: RectangleKind, edges: [Option<ExprId>; 4]) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut e = [Dimension.px(0.0); 4]
+  let mut set = [false; 4]
+  let mut i: usize = 0
+  while i < 4 {
+    match edges[i] {
+      Option.Some { value } => {
+        e[i] = dimension(effects, value)
+        set[i] = true
+      }
+      Option.None => {}
+    }
+    i = i + 1
+  }
+  if kind == RectangleKind.Inset {
+    run values.appendSlice(&e)
+    return
+  }
+  if kind == RectangleKind.Rect {
+    // rect(top right bottom left), edges from the top and left; `auto` is the box's own edge.
+    let right = if set[1] { Dimension.calc(-e[1].value, 1.0 - e[1].percent) } else { Dimension.px(0.0) }
+    let bottom = if set[2] { Dimension.calc(-e[2].value, 1.0 - e[2].percent) } else { Dimension.px(0.0) }
+    run values.appendSlice(&[e[0], right, bottom, e[3]])
+    return
+  }
+  // xywh(x y width height).
+  let right = Dimension.calc(-e[0].value - e[2].value, 1.0 - e[0].percent - e[2].percent)
+  let bottom = Dimension.calc(-e[1].value - e[3].value, 1.0 - e[1].percent - e[3].percent)
+  run values.appendSlice(&[e[1], right, bottom, e[0]])
+}
+
+effect fn appendCorners(values: &mut List<Dimension>, effects: &Effects, corners: ShapeCorners) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut i: usize = 0
+  while i < 4 {
+    run values.append(dimension(effects, corners.x[i]))
+    i = i + 1
+  }
+  i = 0
+  while i < 4 {
+    run values.append(dimension(effects, corners.y[i]))
+    i = i + 1
+  }
+}

@@ -36,6 +36,7 @@ pick-mode [on|off]             let the app's own pointer pick a node; without on
 audit                          accessibility issues in the tree (or under a target)
 raw JSON                       send a request as written
 ID.COMMAND                     an extension's command, the options as its request members
+                               (its own too: --flavor nvda is "flavor": "nvda")
 
 Targets: --node ID --role ROLE --name TEXT --label TEXT --text TEXT --test-id ID
          --within ID --exact --hidden

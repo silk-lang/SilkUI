@@ -36,6 +36,7 @@ import ui_protocol.grid { Grid }
 pub import ui_protocol.error { TreeError }
 import ui_protocol.backend { Backend, Measured }
 import grid_css
+import float_shapes
 import expand
 import font_features
 import font_features { VariationTable }
@@ -155,7 +156,8 @@ import layout.lib {
   InvalidNode,
   NaturalDimensions,
   Style as CssStyle,
-  SizeValue
+  SizeValue,
+  FloatShape
 }
 import layout.lib as Engine
 import silk.collections.bytes { Bytes }
@@ -1290,11 +1292,23 @@ impl<'a> UiTree<'a> {
     self.restyleLocal(slot)
   }
 
+  /// The node at `slot` shows another moment of an animation or transition: it applies its
+  /// declarations again, with the match and the variables it has.
+  pub fn restyleTick(self: &mut Self, slot: u32) -> () {
+    let clean = !self.node(slot).styleDirty
+    self.restyleLocal(slot)
+    if clean {
+      let nodes = self.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].styleTick = true
+    }
+  }
+
   // Callers must rule out selector changes outside this subtree and changed variable inputs.
   pub fn restyleLocal(self: &mut Self, slot: u32) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
     nodes[u32.toUsize(slot)].styleDirty = true
+    nodes[u32.toUsize(slot)].styleTick = false
     let mut up = nodes[u32.toUsize(slot)].parent
     while up != NONE {
       let at = u32.toUsize(up)
@@ -2233,9 +2247,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.ScrollIntoView { id } => {
         let slot = run self.require(index, id)
-        self.viewScrollState.interruptAll()
-        self.viewScrollAnimations.clear()
-        run self.reveal.append(interact.pair(slot, id))
+        run self.revealSlot(slot, id)
       }
       Mutation.SetGrid { id, value } => {
         let slot = run self.require(index, id)
@@ -2525,6 +2537,7 @@ impl<'a> UiTree<'a> {
       hovered: false,
       pressed: false,
       styleDirty: true,
+      styleTick: false,
       gridDeclared: false,
       gridStyled: false,
       styleNeedsContext: false,
@@ -3173,6 +3186,16 @@ impl<'a> UiTree<'a> {
     } else {
       run Effect.catchAll(self.layout.remove(css), ignoreInvalid)
     }
+  }
+
+  /// At the next frame, scrolls the containers around node `id` at `slot` the least that
+  /// brings it into view, as `scrollIntoView({ block: "nearest" })`.
+  pub effect fn revealSlot(self: &mut Self, slot: u32, id: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.viewScrollState.interruptAll()
+    self.viewScrollAnimations.clear()
+    run self.reveal.append(interact.pair(slot, id))
   }
 
   /// Makes open root `root` the current one: the one `frame`, `scene`, hit testing, the
@@ -4867,6 +4890,7 @@ impl<'a> UiTree<'a> {
       let forced = full || rootFontChanged || u64.shiftRight(entry, 32) != 0
       let node = self.node(slot)
       let own = forced || node.styleDirty
+      let tick = !forced && node.styleTick
       let below = node.subtreeDirty
       let mut changed = full
       if own {
@@ -4879,7 +4903,8 @@ impl<'a> UiTree<'a> {
         let wasRendered = node.rendered
         let containment = node.computed.contain.query()
         let skips = node.computed.contain.hidden()
-        let namesChanged = run self.resolve(slot)
+        let namesChanged = run self.resolve(slot, tick)
+        self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
@@ -4887,7 +4912,8 @@ impl<'a> UiTree<'a> {
         if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
-        changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        // A tick leaves the variables below as they were: only inherited values can pass on.
+        changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || &barColors != &after.scroll.colors || &listStyle != &after.list
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
@@ -4896,6 +4922,7 @@ impl<'a> UiTree<'a> {
       }
       let cleared = self.nodeMut(slot)
       cleared.styleDirty = false
+      cleared.styleTick = false
       cleared.subtreeDirty = false
       if changed || below {
         let flag: u64 = if changed { 0x100000000 } else { 0 }
@@ -5009,10 +5036,10 @@ impl<'a> UiTree<'a> {
     }
   }
 
-  effect fn resolve(self: &mut Self, slot: u32) -> bool
+  effect fn resolve(self: &mut Self, slot: u32, tick: bool) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
+    if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -5201,6 +5228,11 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
       run self.resolveGrid(slot, &computed)
+      let shape = match self.node(slot).paintEffects() {
+        Option<&Effects>.Some { value } => run float_shapes.of(value, computed.paint.radii)
+        Option<&Effects>.None => FloatShape.make()
+      }
+      run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {

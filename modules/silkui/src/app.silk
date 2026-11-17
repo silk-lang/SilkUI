@@ -7,11 +7,19 @@
 //! ```silk,ignore
 //! effect fn app() -> App {
 //!   return run App.make("my-app")
-//!     |> App.framework(Framework.react("web"))
+//!     |> App.framework(Framework.react("."))
 //!     |> App.target(Target.window(Window { title: "My app", width: 900.0, height: 600.0 }))
 //! }
 //!
-//! run app() |> App.only(target) |> App.build(&options) |> Built.launch() |> Running.watch()
+//! // The app draws under the window's title bar on macOS, and a press in its top 56 pixels
+//! // moves the window.
+//! Target.window(Window { title: "My app", width: 900.0, height: 600.0 })
+//!   .titleBar(TitleBar.transparent(56.0))
+//!
+//! // The same, with the window buttons 20 pixels from the left and 18 from the top.
+//!   .titleBar(TitleBar.transparent(56.0).buttons(20.0, 18.0))
+//!
+//! run app() |> App.only(target) |> App.dev(&options) |> Built.launch() |> Running.watch()
 //! run app() |> App.only(target) |> App.build(&options) |> Built.write("dist")
 //! ```
 //!
@@ -64,6 +72,7 @@ import silk.text.string { String }
 import silk.num.i32
 import silk.num.u8
 import process { Child, Variable, start, pause }
+import output { now, say as tell, done, artifact as listArtifact, built as finished }
 
 /// A desktop window's options.
 pub struct Window {
@@ -73,6 +82,39 @@ pub struct Window {
 }
 
 impl Copy for Window {}
+
+/// How a desktop window's title bar is drawn.
+pub union TitleBar {
+  /// The system's bar, above the app.
+  Standard,
+  /// On macOS, the app fills the window and the window controls float over its top `height`
+  /// pixels: the app draws the bar there, a press in it moves the window (a double click zooms
+  /// or minimizes it, as the user's settings say), and the app gets no presses there. Other
+  /// systems keep their bar. The window buttons (close, minimize, zoom) are centred in it,
+  /// as far from the left edge as from the top, unless `buttons` placed them.
+  Transparent { pub height: f64, pub left: f64, pub top: f64 },
+}
+
+impl Copy for TitleBar {}
+
+impl TitleBar {
+  pub fn standard() -> TitleBar {
+    return TitleBar.Standard
+  }
+
+  pub fn transparent(height: f64) -> TitleBar {
+    return TitleBar.Transparent { height: height, left: 0.0, top: 0.0 }
+  }
+
+  /// A transparent bar with the window buttons' top-left corner `left` and `top` pixels from
+  /// the window's edges; 0 keeps that one centred. The standard bar stays as it is.
+  pub fn buttons(self: TitleBar, left: f64, top: f64) -> TitleBar {
+    return match self {
+      TitleBar.Transparent { height, .. } => TitleBar.Transparent { height: height, left: left, top: top }
+      _ => self
+    }
+  }
+}
 
 /// A browser page's options. The app fills the page.
 pub struct Page {
@@ -84,7 +126,7 @@ impl Copy for Page {}
 /// Where an app runs. Its id names it in `--platform`, in `build/pages/<id>/` and in `dist/<id>/`.
 pub union Target {
   /// A desktop window (`window`).
-  Window { pub window: Window },
+  Window { pub window: Window, pub bar: TitleBar },
   /// A browser page drawn with WebGPU (`web-canvas`): the tree, compiled to wasm.
   WebCanvas { pub page: Page },
   /// A browser page of real elements (`web-dom`): the browser's DOM in the tree's place.
@@ -95,7 +137,7 @@ impl Copy for Target {}
 
 impl Target {
   pub fn window(window: Window) -> Target {
-    return Target.Window { window: window }
+    return Target.Window { window: window, bar: TitleBar.Standard }
   }
 
   pub fn webCanvas(page: Page) -> Target {
@@ -104,6 +146,15 @@ impl Target {
 
   pub fn webDom(page: Page) -> Target {
     return Target.WebDom { page: page }
+  }
+
+  /// The window target with its title bar drawn as `bar`. A browser page has no title bar:
+  /// the web targets stay as they are.
+  pub fn titleBar(self: Target, bar: TitleBar) -> Target {
+    return match self {
+      Target.Window { window, .. } => Target.Window { window: window, bar: bar }
+      _ => self
+    }
   }
 
   /// `window`, `web-canvas` or `web-dom`.
@@ -125,7 +176,7 @@ impl Target {
 }
 
 /// What the app is written in. The JavaScript ones name the directory of a Vite project with
-/// `@silkui/vite` in its config, which bundles to `dist/app.js`.
+/// `@silkui/vite` in its config, `.` when `package.json` sits beside `silk.toml`.
 pub union Framework {
   /// Loom: `module` in the project's sources has a `Model` (a `Program<Message, C>`) and its
   /// `Message`; `command` names its command type, or is empty for none.
@@ -139,7 +190,7 @@ impl Copy for Framework {}
 
 impl Framework {
   /// A Loom app whose `Model` and `Message` are in the project module `module`, such as `app`
-  /// for `src/app.silk`. The project's manifest exports it.
+  /// for `silk/app.silk` when the manifest sets `source = "silk"`. The project's manifest exports it.
   pub fn loom(module: string<'static>) -> Framework {
     return Framework.Loom { module: module, command: "" }
   }
@@ -200,10 +251,12 @@ impl Runtime {
   }
 }
 
-/// How a build is made. `Dev` adds the development tools (hot reload, the inspector) and
-/// keeps debug information; `Release` is optimized and has none of them.
+/// How a build was made. `Dev` ([`App.dev`]) adds the development tools (hot reload, the
+/// inspector) and keeps debug information; `Debug` is the program without them, unoptimized,
+/// as `silk build` makes; `Release` is optimized.
 pub enum Mode {
   Dev,
+  Debug,
   Release,
 }
 
@@ -228,6 +281,8 @@ pub struct App {
   bundled: String,
   compiledSheet: String,
   hosts: List<Host>,
+  /// When it was made, on `output.now`'s clock: the start of a build.
+  begun: u64,
 }
 
 /// One built target.
@@ -242,6 +297,8 @@ pub struct Artifact {
 /// A built app: an artifact per target.
 pub struct Built {
   source: App,
+  /// The project directory, absolute.
+  root: String,
   madeIn: Mode,
   options: Options,
   outputs: List<Artifact>,
@@ -282,15 +339,28 @@ effect fn fromRoot(project: &Project, path: string) -> String
   if String.startsWith(path, "/") {
     return run String.copy(path)
   }
+  // `.` is the root itself: paths with a `.` segment are not valid.
+  if path == "." {
+    return run String.copy(String.view(&project.root))
+  }
   return run joined(String.view(&project.root), path)
 }
 
 effect fn say(text: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut line = run String.copy("silkui: ")
-  run String.append(&mut line, text)
-  StderrWriter.print("{}\n", &.(String.view(&line)))
+  tell(text)
+}
+
+/// `path` from the project root when it is inside it, as the lines silkui writes show it.
+fn relative<'a>(root: string, path: string<'a>) -> string<'a> {
+  let rootLength = String.byteLength(root)
+  let length = String.byteLength(path)
+  if length > rootLength + 1 && String.startsWith(path, root)
+    && String.utf8Bytes(path)[rootLength] == 47 {
+    return String.slice(path, rootLength + 1, length - rootLength - 1)
+  }
+  return path
 }
 
 effect fn writeText(path: string, text: string) -> ()
@@ -403,9 +473,11 @@ effect fn hostPlan(app: &App, target: Target, dev: bool) -> Plan
     run Task.abort("silkui: a custom host supports the window target only")
   }
   let mut window = Window { title: "", width: 0.0, height: 0.0 }
+  let mut bar = TitleBar.Standard
   match target {
-    Target.Window { window: settings } => {
+    Target.Window { window: settings, bar: chosen } => {
       window = settings
+      bar = chosen
     }
     Target.WebCanvas { page } => {
       window.title = page.title
@@ -438,6 +510,22 @@ effect fn hostPlan(app: &App, target: Target, dev: bool) -> Plan
     title: window.title,
     width: window.width,
     height: window.height,
+    transparentTitleBar: match bar {
+      TitleBar.Standard => false
+      TitleBar.Transparent { .. } => true
+    },
+    titleBarHeight: match bar {
+      TitleBar.Standard => 0.0
+      TitleBar.Transparent { height, .. } => height
+    },
+    controlsLeft: match bar {
+      TitleBar.Standard => 0.0
+      TitleBar.Transparent { left, .. } => left
+    },
+    controlsTop: match bar {
+      TitleBar.Standard => 0.0
+      TitleBar.Transparent { top, .. } => top
+    },
     module: module,
     command: command,
     stylesheets: app.sheetCount(),
@@ -493,11 +581,12 @@ effect fn bundle(app: &App, project: &Project) -> StepHandle
 // --- App: the definition ---
 
 impl App {
-  /// A new app named `name`: the name of its program. No framework, no target yet.
+  /// A new app named `name`, the program a custom host ([`App.customHost`]) builds. A generated
+  /// host and `dist/` take the project's name. No framework, no target yet.
   pub effect fn make(name: string<'static>) -> App {
     return App {
       named: name,
-      writtenIn: Framework.Js { dir: "web" },
+      writtenIn: Framework.Js { dir: "." },
       runsOn: Runtime.Engine,
       runtimeCss: false,
       places: List<Target>.make(),
@@ -506,10 +595,12 @@ impl App {
       bundled: String.make(),
       compiledSheet: String.make(),
       hosts: List<Host>.make(),
+      begun: now(),
     }
   }
 
-  /// What the app is written in. Plain JS in `web/` until this says otherwise.
+  /// What the app is written in. Plain JS, its Vite project at the root, until this says
+  /// otherwise.
   pub effect fn framework<'env, E, ? R>(
     self: once Effect<'env; App ! E ? R>,
     framework: Framework,
@@ -635,10 +726,18 @@ impl App {
     return move app
   }
 
-  /// Describes every selected host as a standard compilation. Creating the graph runs no tools.
-  /// Generated entry modules and release bundles are deferred prerequisites of compilation.
-  /// Host packages must be listed in the application's dependencies.
+  /// Describes every selected host as a standard compilation, with the development tools when
+  /// `options` leave the program unoptimized (what an editor builds). Creating the graph runs
+  /// no tools. Host packages must be listed in the application's dependencies.
   pub effect fn compilations(self: &Self, options: &Options) -> Build
+    ! BuildError | TaskError
+    ? &mut HostInput | &mut Allocator | &mut FileSystem {
+    return run self.graph(options, options.optimize == Optimize.None)
+  }
+
+  /// The compilations, with the development tools when `dev`. Generated entry modules and
+  /// release bundles are deferred prerequisites of compilation.
+  effect fn graph(self: &Self, options: &Options, dev: bool) -> Build
     ! BuildError | TaskError
     ? &mut HostInput | &mut Allocator | &mut FileSystem {
     let mut graph = run Build.make()
@@ -650,7 +749,7 @@ impl App {
     let mut at: usize = 0
     while at < targets.length {
       let target = targets[at]
-      let plan = run hostPlan(self, target, options.optimize == Optimize.None)
+      let plan = run hostPlan(self, target, dev)
       let mut name = run String.copy(self.named)
       // A generated host is not named like the runtime packages it depends on.
       run name.append(if self.custom == "" { "-host-" } else { "-" })
@@ -743,8 +842,7 @@ impl App {
       }
 
       // The app retains its requested mode; the engine, renderer, and inspector stay responsive.
-      let compilation = if self.custom == "" && target.id() == "window"
-        && options.optimize == Optimize.None {
+      let compilation = if self.custom == "" && target.id() == "window" && dev {
         let alias = if plan.kind == Kind.Loom {
           "silkui_window_loom"
         } else if plan.kind == Kind.Node {
@@ -775,8 +873,8 @@ impl App {
     return move graph
   }
 
-  /// Compiles the app through the standard graph and assembles each browser page.
-  /// Development mode installs the Vite packages before launching its development server.
+  /// Compiles the app through the standard graph, without the development tools, and
+  /// assembles each browser page: `Mode.Release` when `options` optimize, else `Mode.Debug`.
   pub effect fn build<'env, E, ? R>(
     self: once Effect<'env; App ! E ? R>,
     options: &Options,
@@ -790,73 +888,27 @@ impl App {
       | OutOfMemoryError
       | WriterError
     ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
-    let mut app = run move self
-    let project = run readProject()
-    let mode = if options.optimize == Optimize.None {
-      Mode.Dev
-    } else {
-      Mode.Release
-    }
-    if mode == Mode.Dev && app.runsOn != Runtime.Node && app.writtenIn.dir() != "" {
-      let web = run fromRoot(&project, app.writtenIn.dir())
-      run installed(web.view())
-    }
-    app.compiledSheet = String.make()
-    let bundles = app.writtenIn.dir() != "" && app.custom == ""
-      && (mode == Mode.Release || app.runsOn == Runtime.Node)
-    if bundles {
-      // The bundle is cached, so the compilations below reuse this build of it. Vite's
-      // compiled stylesheet, when the app's Vite configuration makes one, is embedded too.
-      let producer = run bundle(&app, &project)
-      let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
-      let built = run graph.compile()
-      app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
-      let length = String.byteLength(app.bundled.view())
-      let mut sheet = run String.copy(String.slice(app.bundled.view(), 0, length - 6))
-      run sheet.append("app.sheet")
-      if run exists(sheet.view()) {
-        app.compiledSheet = move sheet
-      }
-    }
-    let graph = run app.compilations(options)
-    let built = run graph.compile()
-    let mut artifacts = List<Artifact>.make()
-    let outputs = built.artifacts.asSlice()
-    let targets = app.places.asSlice()
-    let mut at: usize = 0
-    while at < outputs.length {
-      let path = run Context.text(&outputs[at].path)
-      let bytes = run sizeOf(path.view())
-      let target = targets[at]
-      if target.web() {
-        let mut directory = run fromRoot(&project, "build/pages")
-        directory = run joined(directory.view(), target.id())
-        let plan = run hostPlan(&app, target, mode == Mode.Dev)
-        let page = run hostPage(&plan)
-        run refresh((run joined(directory.view(), "index.html")).view(), page.view())
-        let folder = run joined(directory.view(), "site")
-        run site(
-          &project,
-          target.id(),
-          directory.view(),
-          path.view(),
-          folder.view(),
-          app.sheetCount(),
-          mode == Mode.Dev,
-        )
-        run artifacts.append(Artifact { target: target, path: move folder, bytes: bytes })
-        run app.hosts.append(Host { target: target, dir: move directory, generated: true })
-      } else {
-        run artifacts.append(Artifact { target: target, path: move path, bytes: bytes })
-      }
-      at = at + 1
-    }
-    return Built {
-      source: move app,
-      madeIn: mode,
-      options: run copyOptions(options),
-      outputs: move artifacts,
-    }
+    let app = run move self
+    return run compiled(move app, options, false)
+  }
+
+  /// [`App.build`] with the development tools (hot reload, the inspector): `Mode.Dev`. It
+  /// installs the Vite packages, for the development server [`Built.launch`] starts.
+  pub effect fn dev<'env, E, ? R>(
+    self: once Effect<'env; App ! E ? R>,
+    options: &Options,
+  ) -> Built
+    ! E
+      | BuildError
+      | TaskError
+      | ProcessError
+      | FileError
+      | HostInputError
+      | OutOfMemoryError
+      | WriterError
+    ? R | &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    let app = run move self
+    return run compiled(move app, options, true)
   }
 
   /// Runs `f` on the app and passes it on unchanged.
@@ -883,6 +935,115 @@ impl App {
   }
 }
 
+/// The app, compiled: see [`App.build`] and [`App.dev`].
+effect fn compiled(app: App, options: &Options, dev: bool) -> Built
+  ! BuildError
+    | TaskError
+    | ProcessError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | WriterError
+  ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+  let mut app = move app
+  let project = run readProject()
+  let mode = if dev {
+    Mode.Dev
+  } else if options.optimize == Optimize.None {
+    Mode.Debug
+  } else {
+    Mode.Release
+  }
+  if mode == Mode.Dev && app.runsOn != Runtime.Node && app.writtenIn.dir() != "" {
+    let web = run fromRoot(&project, app.writtenIn.dir())
+    run installed(web.view())
+  }
+  app.compiledSheet = String.make()
+  let bundles = app.writtenIn.dir() != "" && app.custom == ""
+    && (mode != Mode.Dev || app.runsOn == Runtime.Node)
+  if bundles {
+    // The bundle is cached, so the compilations below reuse this build of it. Vite's
+    // compiled stylesheet, when the app's Vite configuration makes one, is embedded too.
+    let producer = run bundle(&app, &project)
+    let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
+    let built = run graph.compile()
+    app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
+    let length = String.byteLength(app.bundled.view())
+    let mut sheet = run String.copy(String.slice(app.bundled.view(), 0, length - 6))
+    run sheet.append("app.sheet")
+    if run exists(sheet.view()) {
+      app.compiledSheet = move sheet
+    }
+  }
+  let graph = run app.graph(options, dev)
+  let mut what = String.make()
+  let listed = app.places.asSlice()
+  let mut named: usize = 0
+  while named < listed.length {
+    if named > 0 {
+      run String.append(&mut what, ", ")
+    }
+    run String.append(&mut what, listed[named].id())
+    named = named + 1
+  }
+  run String.append(&mut what, if listed.length == 1 { " host" } else { " hosts" })
+  let mut line = run String.copy("compiling the ")
+  run String.append(&mut line, String.view(&what))
+  if mode == Mode.Release {
+    run String.append(&mut line, " (release)")
+  }
+  if mode == Mode.Debug {
+    run String.append(&mut line, " (debug)")
+  }
+  run String.append(&mut line, "...")
+  run say(String.view(&line))
+  let started = now()
+  let built = run graph.compile()
+  let mut artifacts = List<Artifact>.make()
+  let outputs = built.artifacts.asSlice()
+  let targets = app.places.asSlice()
+  let mut at: usize = 0
+  while at < outputs.length {
+    let path = run Context.text(&outputs[at].path)
+    let bytes = run sizeOf(path.view())
+    let target = targets[at]
+    if target.web() {
+      let mut directory = run fromRoot(&project, "build/pages")
+      directory = run joined(directory.view(), target.id())
+      let plan = run hostPlan(&app, target, mode == Mode.Dev)
+      let page = run hostPage(&plan)
+      run refresh((run joined(directory.view(), "index.html")).view(), page.view())
+      let folder = run joined(directory.view(), "site")
+      run site(
+        &project,
+        target.id(),
+        directory.view(),
+        path.view(),
+        folder.view(),
+        app.sheetCount(),
+        mode == Mode.Dev,
+      )
+      run artifacts.append(Artifact { target: target, path: move folder, bytes: bytes })
+      run app.hosts.append(Host { target: target, dir: move directory, generated: true })
+    } else {
+      run artifacts.append(Artifact { target: target, path: move path, bytes: bytes })
+    }
+    at = at + 1
+  }
+  if outputs.length != 0 {
+    let mut compiled = run String.copy("compiled the ")
+    run String.append(&mut compiled, String.view(&what))
+    done(String.view(&compiled), started)
+  }
+  return Built {
+    source: move app,
+    root: run String.copy(String.view(&project.root)),
+    madeIn: mode,
+    options: run copyOptions(options),
+    outputs: move artifacts,
+  }
+}
+
 // --- Built ---
 
 impl Built {
@@ -898,15 +1059,13 @@ impl Built {
     return self.outputs.asSlice()
   }
 
-  /// Writes each artifact's size to standard error.
+  /// Writes each artifact's path and size to standard error. [`Built.write`] lists what it
+  /// wrote the same way.
   pub fn sizes(self: &Built) -> () {
     let all = self.outputs.asSlice()
     let mut at: usize = 0
     while at < all.length {
-      StderrWriter.print(
-        "silkui: {} {} ({} KiB)\n",
-        &.(all[at].target.id(), String.view(&all[at].path), all[at].bytes / 1024),
-      )
+      listArtifact(relative(String.view(&self.root), String.view(&all[at].path)), all[at].bytes)
       at = at + 1
     }
   }
@@ -927,8 +1086,9 @@ impl Built {
     return move built
   }
 
-  /// Copies each artifact to `<dir>/<target>/<app name>` (relative to the project), and the
-  /// page of a web target to `<dir>/<target>/`. It ends a build pipeline.
+  /// Copies each artifact to `<dir>/<target>/<project name>` (relative to the project), and
+  /// the page of a web target to `<dir>/<target>/`, and lists them with the build's time. It
+  /// ends a build pipeline.
   pub effect fn write<'env, E, ? R>(self: once Effect<'env; Built ! E ? R>, dir: string) -> ()
     ! E
       | BuildError
@@ -953,15 +1113,18 @@ impl Built {
         let from = run joined(String.view(&all[at].path), ".")
         run Task.exec("cp", &["-R", String.view(&from), String.view(&out)])
       } else {
-        // cp keeps the program's mode, so it stays executable. It takes the app's name.
-        out = run joined(String.view(&out), built.source.named)
+        // cp keeps the program's mode, so it stays executable. It takes the project's name,
+        // which `silk init` gives the package.
+        out = run joined(String.view(&out), String.view(&project.name))
         run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
       }
-      let mut line = run String.copy("wrote ")
-      run String.append(&mut line, String.view(&out))
-      run say(String.view(&line))
+      if at == 0 {
+        StderrWriter.print("\n", &.())
+      }
+      listArtifact(relative(String.view(&project.root), String.view(&out)), all[at].bytes)
       at = at + 1
     }
+    finished(String.view(&project.name), built.source.begun)
     drop built
   }
 
@@ -1126,12 +1289,24 @@ static if Intrinsic.targetOperatingSystem() == "darwin"
       run excluded.append(run stylesheets.sourcePath(String.view(&project.root), css[at]))
       at = at + 1
     }
-    let src = run Path.make(String.view(&run joined(String.view(&project.root), "src")))
+    let src = run Path.make(
+      String.view(&run joined(String.view(&project.root), String.view(&project.source))),
+    )
     if run FileSystem.exists(&src) {
       run fingerprint(&src, &mut hash, excluded.asSlice())
     }
     return hash
   }
+}
+
+/// `before`, the Silk source directory, then `after`.
+effect fn sourceNote(project: &Project, before: string, after: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut note = run String.copy(before)
+  run String.append(&mut note, String.view(&project.source))
+  run String.append(&mut note, after)
+  return move note
 }
 
 effect fn ended(code: i32) -> ()
@@ -1181,7 +1356,7 @@ effect fn rebuildPage(
 ) -> ()
   ! BuildError | TaskError
   ? &mut HostInput | &mut Allocator | &mut FileSystem {
-  let graph = run app.compilations(options)
+  let graph = run app.graph(options, true)
   let built = run graph.compile()
   let wasm = run Context.text(&built.artifacts.asSlice()[0].path)
   run site(
@@ -1203,7 +1378,8 @@ impl Running {
   /// Keeps the app running until its window closes, or for a web target serves its page
   /// until the task is stopped. Fails when the program ends with a nonzero status.
   /// For a JavaScript app in `Mode.Dev`, Vite replaces edited modules in place. For a Loom
-  /// app in `Mode.Dev`, a change under `src/` rebuilds the host and restarts the app (a page
+  /// app in `Mode.Dev`, a change in the Silk sources (`src/`, or the manifest's `source`)
+  /// rebuilds the host and restarts the app (a page
   /// reloads itself); after a build that fails, the previous build runs.
   pub effect fn watch<'env, E, ? R>(self: once Effect<'env; Running ! E ? R>) -> ()
     ! E
@@ -1231,7 +1407,7 @@ impl Running {
         let watchesStyles = rebuilds && css.length != 0
         let mut styled = Option<u64>.None
         if rebuilds {
-          run say("watching src/ for changes")
+          run say(String.view(&run sourceNote(&project, "watching ", "/ for changes")))
         }
         if watchesStyles {
           run say("watching stylesheets: CSS edits preserve application state")
@@ -1277,7 +1453,7 @@ impl Running {
             continue
           }
           seen = now
-          run say("src/ changed: rebuilding")
+          run say(String.view(&run sourceNote(&project, "", "/ changed: rebuilding")))
           let artifact = &running.launched.outputs.asSlice()[0]
           let host = &running.launched.source.hosts.asSlice()[0]
           let rebuilt = run Effect.result(
@@ -1310,7 +1486,7 @@ impl Running {
         return run ended(child.wait())
       }
       if rebuilds {
-        run say("watching src/ for changes")
+        run say(String.view(&run sourceNote(&project, "watching ", "/ for changes")))
       }
       if watchesStyles {
         run say("watching stylesheets: CSS edits preserve application state")
@@ -1353,7 +1529,7 @@ impl Running {
           continue
         }
         seen = now
-        run say("src/ changed: rebuilding")
+        run say(String.view(&run sourceNote(&project, "", "/ changed: rebuilding")))
         let artifact = &running.launched.outputs.asSlice()[0]
 
         // The program is linked in place, so it stops before the build. A failed build
@@ -1397,6 +1573,6 @@ impl Running {
 effect fn recompile(app: &App, options: &Options) -> ()
   ! BuildError | TaskError
   ? &mut Allocator | &mut FileSystem | &mut HostInput {
-  let graph = run app.compilations(options)
+  let graph = run app.graph(options, true)
   drop run graph.compile()
 }

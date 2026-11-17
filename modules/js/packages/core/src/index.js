@@ -1,6 +1,6 @@
 // @silkui/core: the nodes of a Silk UI tree and their events, for JavaScript that runs on the
-// embedded SilkJS engine. The primitives are the tree's own (box, text, input, image, icon,
-// canvas); the methods and the event flow are the DOM's, so code written for the web reads
+// embedded SilkJS engine. The primitives are the tree's own (box, text, input, image, canvas)
+// and inline svg; the methods and the event flow are the DOM's, so code written for the web reads
 // the same here.
 //
 // Every call queues a mutation through the native `__ui` functions. The host applies the
@@ -524,9 +524,9 @@ export class Node {
     } else if (aria !== null) {
       native.attribute(this.nodeId, name, text);
     } else if (name === "src") {
-      // An image's or icon's address, as `<img src>`.
+      // An image's address, as `<img src>`.
       if ("src" in this) this.src = text ?? "";
-      else warnOnce("only an image or an icon has a src: it is ignored");
+      else warnOnce("only an image has a src: it is ignored");
     } else if (name === "alt") {
       native.attribute(this.nodeId, "label", text ?? "");
     } else {
@@ -684,8 +684,8 @@ export class Input extends Node {
   }
 }
 
-// Inline SVG markup as icon resources: identical markup shares one, freed when no icon shows
-// it. The ids start high, clear of resources a host or a URL table numbers from 1.
+// Inline SVG markup as icon resources: identical markup shares one, freed when no `<svg>`
+// shows it. The ids start high, clear of resources a host or a URL table numbers from 1.
 const ICONS = new Map();
 let nextIcon = 0x40000000;
 
@@ -708,28 +708,26 @@ function dropIcon(markup) {
   }
 }
 
-// Addresses as image and icon resources, shared and freed as markup is. The tree keeps a load
-// state per number, so these count from 1.
+// Addresses as image resources, shared and freed as markup is. The tree keeps a load state per
+// number, so these count from 1. The loader tells an SVG file from a bitmap by itself.
 const ADDRESSES = new Map();
 let nextAddress = 1;
 
-function holdAddress(url, icon) {
-  const key = (icon ? "icon " : "image ") + url;
-  let entry = ADDRESSES.get(key);
+function holdAddress(url) {
+  let entry = ADDRESSES.get(url);
   if (!entry) {
     entry = { id: nextAddress++, count: 0 };
-    ADDRESSES.set(key, entry);
-    native.load(entry.id, url, icon);
+    ADDRESSES.set(url, entry);
+    native.load(entry.id, url, false);
   }
   entry.count++;
   return entry.id;
 }
 
-function dropAddress(url, icon) {
-  const key = (icon ? "icon " : "image ") + url;
-  const entry = ADDRESSES.get(key);
+function dropAddress(url) {
+  const entry = ADDRESSES.get(url);
   if (entry && --entry.count === 0) {
-    ADDRESSES.delete(key);
+    ADDRESSES.delete(url);
     native.release(entry.id);
   }
 }
@@ -754,69 +752,14 @@ export class Image extends Node {
   set src(url) {
     url = url == null ? "" : String(url);
     if (url === this.#src) return;
-    if (this.#src) dropAddress(this.#src, false);
+    if (this.#src) dropAddress(this.#src);
     this.#src = url;
-    native.source(this.nodeId, url ? holdAddress(url, false) : 0);
+    native.source(this.nodeId, url ? holdAddress(url) : 0);
   }
 
   _forget() {
-    if (this.#src) dropAddress(this.#src, false);
+    if (this.#src) dropAddress(this.#src);
     this.#src = "";
-  }
-}
-
-/**
- * An icon: SVG drawn at the node's CSS size, as an inline `<svg>` is. Its `currentColor` is
- * the node's `color`, so an icon that paints only with it (Lucide's, for example) takes the
- * text color, and any other keeps its own colors. Without a CSS size it takes the `width`
- * and `height` of its `<svg>`, else a square of the font size.
- *
- * `svg` is its markup; `src` is the address of an SVG file instead (a `data:image/svg+xml`
- * URL too). Setting one clears the other.
- */
-export class Icon extends Node {
-  #svg = "";
-  #src = "";
-
-  constructor(svg = "", kind = "icon") {
-    super(kind);
-    this.svg = svg;
-  }
-
-  /** The SVG markup, as `outerHTML` of an `<svg>` element would give it. */
-  get svg() {
-    return this.#svg;
-  }
-
-  set svg(markup) {
-    markup = markup == null ? "" : String(markup);
-    if (markup === this.#svg) return;
-    this.#release();
-    this.#svg = markup;
-    native.source(this.nodeId, markup ? holdIcon(markup) : 0);
-  }
-
-  get src() {
-    return this.#src;
-  }
-
-  set src(url) {
-    url = url == null ? "" : String(url);
-    if (url === this.#src) return;
-    this.#release();
-    this.#src = url;
-    native.source(this.nodeId, url ? holdAddress(url, true) : 0);
-  }
-
-  #release() {
-    if (this.#svg) dropIcon(this.#svg);
-    if (this.#src) dropAddress(this.#src, true);
-    this.#svg = "";
-    this.#src = "";
-  }
-
-  _forget() {
-    this.#release();
   }
 }
 
@@ -1092,11 +1035,14 @@ function treeAttribute(name) {
  * are the node's; `viewBox`, `fill`, `width` and the other SVG attributes are markup.
  * Changes are drawn once, before the host applies the batch.
  */
-export class Svg extends Icon {
+export class Svg extends Node {
   #attributes = new Map();
+  #markup = "";
 
   constructor() {
-    super("", "icon");
+    // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
+    super("icon");
+    this.kind = "svg";
     this.localName = "svg";
     this.tagName = "svg";
     this.namespaceURI = SVG_NAMESPACE;
@@ -1144,7 +1090,17 @@ export class Svg extends Icon {
   }
 
   _draw() {
-    if (nodes.has(this.nodeId)) this.svg = this.outerHTML;
+    if (!nodes.has(this.nodeId)) return;
+    const markup = this.outerHTML;
+    if (markup === this.#markup) return;
+    this._forget();
+    this.#markup = markup;
+    native.source(this.nodeId, holdIcon(markup));
+  }
+
+  _forget() {
+    if (this.#markup) dropIcon(this.#markup);
+    this.#markup = "";
   }
 }
 
@@ -1364,10 +1320,9 @@ export function createNode(kind) {
   if (kind === "richinput") return new RichInput();
   if (kind === "svg") return new Svg();
   if (kind === "img") kind = "image";
-  if (!(kind in KINDS)) throw new TypeError("the tree has no node kind '" + kind + "'");
+  if (!(kind in KINDS) || kind === "icon") throw new TypeError("the tree has no node kind '" + kind + "'");
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
-  if (kind === "icon") return new Icon();
   if (kind === "image") return new Image();
   return new Node(kind);
 }
@@ -1382,13 +1337,6 @@ export function createBox(style, ...children) {
 
 export function createText(data = "") {
   return new Text(data);
-}
-
-/** An icon showing `svg` markup, with `style` as its base look. */
-export function createIcon(svg, style) {
-  const icon = new Icon(svg);
-  if (style) icon.style.set(style);
-  return icon;
 }
 
 /** An image showing `src` (see `Image`), with `style` as its base look. */
@@ -1948,4 +1896,15 @@ export function unregisterShortcut(accelerator) {
   shortcutIds.delete(code + "+" + bits);
   shortcuts.delete(id);
   shellCall(4, [id]);
+}
+
+/**
+ * The app's memory in bytes, as the system shows it to users: `phys_footprint` on macOS
+ * (Activity Monitor's "Memory"), `Pss` on Linux and `PrivateUsage` on Windows. `processes` is
+ * how many processes `footprint` counts: the host is one. In the browser it is the wasm
+ * tree's linear memory, without the page's JavaScript heap. `null` when there is no answer.
+ */
+export function memoryUsage() {
+  const footprint = native.memoryUsage?.() ?? 0;
+  return footprint > 0 ? { footprint, processes: 1 } : null;
 }

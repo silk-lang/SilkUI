@@ -12,7 +12,7 @@ cd my-app
 silk task dev
 ```
 
-The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `web/src/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
+`silk run` does the same in the JavaScript templates. The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `js/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
 
 On Linux the window system's headers have to be installed first:
 
@@ -26,33 +26,34 @@ The template decides what you write the app in. Each one is a hello-world you ca
 
 | Template | You write the app in | Runs on |
 | --- | --- | --- |
-| `ui-react` | React and TypeScript, in `web/` | `window` |
-| `ui-foldkit` | Foldkit, in `web/` | `window` |
-| `ui-js` | Plain TypeScript with `@silkui/core`, in `web/` | `window` |
-| `ui-loom` | [Loom](/core/), Silk's own framework, in `src/app.silk` | `window`, `web-dom`, `web-canvas` |
+| `ui-react` | React and TypeScript, in `js/` | `window` |
+| `ui-foldkit` | Foldkit, in `js/` | `window` |
+| `ui-js` | Plain TypeScript with `@silkui/core`, in `js/` | `window` |
+| `ui-loom` | [Loom](/core/), Silk's own framework, in `silk/app.silk` | `window`, `web-dom`, `web-canvas` |
 
 JavaScript apps run in the window on the SilkJS Engine, embedded in the program: there is no browser inside. The [Products](/products/) page says what each name means.
 
 ## What is in the project
 
-A JavaScript template has three parts:
+The project root holds both the Silk and the npm side, so `silk task dev` and `npm install` both run there:
 
 | Path | What it is |
 | --- | --- |
-| `silk.toml` | The manifest. Its explicit dependencies include the tasks, hosts and runtime packages |
-| `src/tasks.silk` | The app definition, and the `dev`, `build` and `plan` tasks |
-| `web/` | A Vite project with `@silkui/vite` in its config. This is the app |
+| `silk.toml` | The manifest. `source = "silk"` points Silk at `silk/`. Its explicit dependencies include the tasks, hosts and runtime packages |
+| `silk/tasks.silk` | The app definition, and the `dev`, `build` and `plan` tasks |
+| `js/` | The app |
+| `package.json`, `vite.config.js` | The npm packages, and Vite with `@silkui/vite` in its config |
 
-A Loom template has `src/app.silk` in place of `web/`, and depends on `loom` as well.
+A Loom template has `silk/app.silk` in place of `js/` and the npm files, and depends on `loom` as well.
 
-In a Loom app, `dev` rebuilds and restarts the window when you save a file in `src/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. The window keeps its size, focus and scroll positions too. Each new `silk task dev` starts from `init`.
+In a Loom app, `dev` rebuilds and restarts the window when you save a file in `silk/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. The window keeps its size, focus and scroll positions too. Each new `silk task dev` starts from `init`.
 
-The app definition is a few lines at the top of `src/tasks.silk`:
+The app definition is a few lines at the top of `silk/tasks.silk`:
 
-```silk title="src/tasks.silk"
+```silk title="silk/tasks.silk"
 effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
   return run App.make("my-app")
-    |> App.framework(Framework.react("web"))
+    |> App.framework(Framework.react("."))
     |> App.target(Target.window(Window { title: "My app", width: 1040.0, height: 720.0 }))
 }
 ```
@@ -65,7 +66,7 @@ Below it, `dev` and `build` are pipelines of steps, written out so you can read 
 silk task build --release
 ```
 
-`dist/window/my-app` is the release program, with the bundle inside and no development tools. Copy it anywhere and run it.
+`dist/window/my-app`, named after the project, is the release program, with the bundle inside and no development tools. Copy it anywhere and run it. Without `--release` the task writes the same program unoptimized, which builds faster.
 
 ## Add a target
 
@@ -76,7 +77,20 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
     |> App.target(Target.webCanvas(Page { title: "My app" }))
 ```
 
-`silk task dev --platform web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `src/` changes. `silk task build --release` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
+`silk task dev --platform web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build --release` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
+
+## Draw the title bar
+
+On macOS the app can fill the whole window, with the window controls floating over its top:
+
+```silk
+    |> App.target(Target.window(Window { title: "My app", width: 1040.0, height: 720.0 })
+      .titleBar(TitleBar.transparent(56.0)))
+```
+
+The app draws its own bar in those top 56 pixels and leaves room on the left for the controls, which are centred in it. A press there moves the window and a double click zooms it, so the app gets no clicks in that strip. Import `TitleBar` from `silkui.app` beside `Window`. Windows and Linux keep the system's bar above the app.
+
+To put the three window buttons somewhere else in the bar, give their top-left corner in pixels from the window's left and top edges: `TitleBar.transparent(56.0).buttons(20.0, 18.0)`. A 0 keeps that one centred.
 
 ## Next
 
