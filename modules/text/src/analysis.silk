@@ -24,6 +24,7 @@ import silk.text.bidi { BidiAnalysis, BidiRun, BidiParagraph, ParagraphDirection
 import silk.text.line_break
 import silk.text.line_break { BreakKind, BreakOpportunity, LineOptions, WordBreakMode, LineBreakMode, Hyphens }
 import silk.text.segmentation
+import silk.text.word_dictionary { IcuDictionary }
 import fonts { FontState, Treatment }
 import properties.computed { WordBreak, OverflowWrap, LineBreak, Hyphens as CssHyphens }
 import silk.text.string { String }
@@ -391,7 +392,7 @@ effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontSta
   while pass < rules.length {
     let options = rules[pass]
     state.tailored.clear()
-    run line_break.breaks(state.lineText.view(), options, &mut state.tailored)
+    run lineBreaks(state.lineText.view(), options, &mut state.tailored)
     // Merge the ones of these rules into `merged`, in offset order.
     state.opportunities.clear()
     let mut left: usize = 0
@@ -421,6 +422,38 @@ effect fn tailor(state: &mut Analyzer, tokens: &[TextToken<'_>], fonts: &FontSta
   }
   state.opportunities.clear()
   run state.opportunities.appendSlice(state.merged.asSlice())
+}
+
+// Thai, Lao, Khmer and Myanmar words have no spaces between them, so their breaks come from the
+// ICU dictionaries. A byte scan for those blocks keeps other text off the dictionary path.
+effect fn lineBreaks(text: string, options: LineOptions, output: &mut List<BreakOpportunity>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if mayNeedDictionary(String.utf8Bytes(text)) {
+    let dictionary = IcuDictionary.make()
+    run line_break.breaksWithDictionary(text, options, &dictionary, &mut output)
+    return
+  }
+  run line_break.breaks(text, options, &mut output)
+}
+
+// True when `bytes` holds a lead pair of Thai or Lao (U+0E00-0EFF), Myanmar (U+1000-10BF),
+// Khmer (U+1780-17FF) or Myanmar Extended-A/B (U+A9C0-A9FF, U+AA40-AA7F).
+fn mayNeedDictionary(bytes: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i + 1 < bytes.length {
+    let lead = bytes[i]
+    if lead >= 0xe0 {
+      let next = bytes[i + 1]
+      if (lead == 0xe0 && next >= 0xb8 && next <= 0xbb)
+        || (lead == 0xe1 && (next <= 0x82 || next == 0x9e || next == 0x9f))
+        || (lead == 0xea && (next == 0xa7 || next == 0xa9)) {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
 }
 
 // Appends the overflow-wrap breaks at grapheme boundaries inside text tokens, from token
@@ -464,7 +497,7 @@ effect fn breaks(
   ? &mut Allocator {
   let tokens = context.tokens
   state.opportunities.clear()
-  run line_break.breaks(state.lineText.view(), LineOptions.make(), &mut state.opportunities)
+  run lineBreaks(state.lineText.view(), LineOptions.make(), &mut state.opportunities)
   let mut rules = List<LineOptions>.make()
   let mut wraps = false
   let mut scan: usize = 0

@@ -1,7 +1,8 @@
 # ui-text
 
 Text for the retained UI: css-layout's `TextMeasure` over real fonts. It breaks lines with
-UAX #14, orders bidirectional text with UAX #9, picks fonts per character from a
+UAX #14 (Thai, Lao, Khmer and Myanmar words come from std's ICU dictionaries in
+`silk.text.word_dictionary`, about 2.9 MB of data in every program), orders bidirectional text with UAX #9, picks fonts per character from a
 [font-collection](https://github.com/silk-lang/lib-fonts/tree/main/modules/collection), shapes with [font-shape](https://github.com/silk-lang/lib-fonts/tree/main/modules/shape) and keeps
 the shaped glyphs of every fragment for [font-raster](https://github.com/silk-lang/lib-fonts/tree/main/modules/raster) to draw.
 
