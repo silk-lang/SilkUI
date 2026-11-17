@@ -109,3 +109,21 @@ The package ships its types: `silk(options?: SilkOptions): Plugin[]`.
   including how the dev server talks to the host.
 - [Templates](https://github.com/silk-lang/examples).
 - [Source](https://github.com/silk-lang/SilkUI/tree/main/modules/js/packages/vite). MIT license.
+
+## Silk functions
+
+`import { add } from "../silk/math.silk"` imports the public functions of a module the
+project's `silk.toml` exports (`kind = "library"`, `exports = ["math"]`). silkui compiles the
+module into the app's host program, and the import becomes calls into it: `add(1, 2)` runs
+now, natively, and `add.async(1, 2)` runs on a thread and returns a promise. Numbers, `bool`,
+`string` and `String` cross; `i64` and `u64` are `bigint`. Before it runs Vite, silkui runs
+`silkui-natives` (this package's bin), which asks `silk doc` for the signatures and writes
+`.silk/natives/`: the description the import reads, the host's dispatcher, and declarations.
+
+For editor types, the package is a TypeScript 7.1 content mapper:
+
+```json
+"contentMappers": [{ "package": "@silkui/vite", "extensions": [".silk"] }]
+```
+
+Under the dev server, an edit to a `.silk` file needs a restart of `silk task dev`.

@@ -34,6 +34,7 @@ import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
+import ui_js_calls.natives { Natives, NativeCall, Reply }
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
@@ -92,6 +93,12 @@ pub const LOG: u32 = 172868 // nativeId(b"log")
 /// `__ui.memoryUsage()`: the process's memory in bytes as the system shows it to users, 0 when
 /// it cannot say (see `process_memory`).
 pub const MEMORY_USAGE: u32 = 838122 // nativeId(b"memoryUsage")
+/// `__ui.native(id, ...args)`: calls the app's exported Silk function `id` (see
+/// `ui_js_calls.natives`). A failure throws an `InternalError` the importing module rethrows.
+pub const NATIVE: u32 = 226387 // nativeId(b"native")
+/// `__ui.nativeStart(call, id, ...args)`: the same on a background thread; the host answers
+/// with `__ui.nativeDone(call, kind, value)` once it ends (the prelude makes the promise).
+pub const NATIVE_START: u32 = 665098 // nativeId(b"nativeStart")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
 pub const NOW: u32 = 174806 // nativeId(b"now")
 /// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
@@ -208,6 +215,16 @@ pub struct Bridge {
   pub clipboard: List<ClipboardRequest>,
   /// Desktop calls JavaScript asked for (notifications, the tray, global shortcuts).
   pub shell: List<ShellRequest>,
+  /// The app's exported Silk functions, for `__ui.native`.
+  pub natives: Natives,
+  /// `__ui.nativeStart` calls waiting for the host to start them, oldest first.
+  pub started: List<StartedNative>,
+}
+
+/// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
+pub struct StartedNative {
+  pub token: u32,
+  pub call: NativeCall,
 }
 
 /// A `__ui.shell` call waiting for the host. `text` holds the op's fields, separated by U+001F:
@@ -254,6 +271,8 @@ impl Bridge {
       frames: List<Keyframe>.make(),
       clipboard: List<ClipboardRequest>.make(),
       shell: List<ShellRequest>.make(),
+      natives: Natives.off(),
+      started: List<StartedNative>.make(),
     }
   }
 
@@ -320,6 +339,8 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"mark", arity: 3 },
     Native { name: b"markdown", arity: 2 },
     Native { name: b"memoryUsage", arity: 0 },
+    Native { name: b"native", arity: 1 },
+    Native { name: b"nativeStart", arity: 2 },
     Native { name: b"now", arity: 0 },
     Native { name: b"open", arity: 1 },
     Native { name: b"release", arity: 1 },
@@ -392,6 +413,35 @@ effect fn argOf<'v>(value: ValueRef<'v>) -> Arg ! OutOfMemoryError ? &mut Alloca
 pub union Outcome {
   Returned { pub value: ValueBits },
   TypeError { pub message: List<u8> },
+  /// An `InternalError` with `message`: an exported Silk function failed.
+  Failed { pub message: List<u8> },
+}
+
+/// What `__ui.native` answers for `reply`.
+effect fn replied(reply: Reply) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  return match move reply {
+    Reply.Nothing => Outcome.Returned { value: ValueBits.Undefined }
+    Reply.Number { value } => Outcome.Returned { value: ValueBits.number(value) }
+    Reply.Flag { value } => Outcome.Returned { value: ValueBits.Bool { value: value } }
+    Reply.Text { value } => {
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&value))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    Reply.TypeError { message } => {
+      let mut bytes = List<u8>.make()
+      run bytes.appendSlice(String.utf8Bytes(String.view(&message)))
+      Outcome.TypeError { message: move bytes }
+    }
+    Reply.Failed { message } => {
+      let mut bytes = List<u8>.make()
+      run bytes.appendSlice(String.utf8Bytes(String.view(&message)))
+      Outcome.Failed { message: move bytes }
+    }
+    Reply.OutOfMemory => { fail OutOfMemoryError {} }
+  }
 }
 
 /// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
@@ -469,6 +519,23 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == LOG {
     let line = run text(argv.get(1))
     run bridge.logs.append(LogEntry { level: first, text: move line })
+  } else if function == NATIVE {
+    let mut call = NativeCall { id: first, args: List<Arg>.make(), reply: Reply.Nothing }
+    let mut at: usize = 1
+    while at < argv.length() {
+      run call.args.append(run argOf(argv.get(at)))
+      at = at + 1
+    }
+    run bridge.natives.call(&mut call)
+    return run replied(move call.reply)
+  } else if function == NATIVE_START {
+    let mut call = NativeCall { id: id(argv.get(1).view()), args: List<Arg>.make(), reply: Reply.Nothing }
+    let mut at: usize = 2
+    while at < argv.length() {
+      run call.args.append(run argOf(argv.get(at)))
+      at = at + 1
+    }
+    run bridge.started.append(StartedNative { token: first, call: move call })
   } else if function == NOW {
     return Outcome.Returned { value: ValueBits.number(bridge.now) }
   } else if function == MEMORY_USAGE {
@@ -589,6 +656,7 @@ impl EngineServices for Bridge {
     return match move outcome {
       Outcome.Returned { value } => value
       Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
+      Outcome.Failed { message } => run engine.throwError(realm, NativeErrorKind.Internal, message.asSlice())
     }
   }
 

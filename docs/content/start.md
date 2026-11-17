@@ -79,6 +79,70 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
 
 `silk task dev --target web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
 
+## Call Silk from JavaScript
+
+A JavaScript app can import Silk functions. They are compiled into the app's program and run natively, with no WebAssembly:
+
+```silk title="silk/math.silk"
+/// Whether `n` is prime.
+pub fn isPrime(n: u32) -> bool {
+  if n < 2 { return false }
+  let mut d: u32 = 2
+  while d * d <= n {
+    if n % d == 0 { return false }
+    d = d + 1
+  }
+  return true
+}
+
+/// How many primes are below `limit`.
+pub fn countPrimes(limit: u32) -> u32 {
+  let mut found: u32 = 0
+  let mut n: u32 = 0
+  while n < limit {
+    if isPrime(n) { found = found + 1 }
+    n = n + 1
+  }
+  return found
+}
+```
+
+```js title="js/main.js"
+import { countPrimes } from "../silk/math.silk";
+
+const count = countPrimes(1000);                 // runs now, on the app's thread
+const later = await countPrimes.async(2_000_000); // runs on a thread of its own
+```
+
+The manifest says which modules JavaScript can import. The package becomes a library, and the tasks get a profile of their own:
+
+```toml title="silk.toml"
+[package]
+# name, version, silk-version as before
+source = "silk"
+kind = "library"
+main = "math.silk"
+exports = ["math"]
+
+[profiles.tasks]
+main = "tasks.silk"
+
+[profiles.tasks.dependencies]
+silkui = { … }
+```
+
+Public functions cross when their parameters and result are numbers (`i64` and `u64` become `bigint`), `bool`, `string` or `String`. An `effect fn` can fail (it throws an `Error` naming the failure) and can allocate. Other functions are left out, and the build says why. Arguments that do not fit, such as a string for a `u32` or a number out of its range, throw a `TypeError`.
+
+For types in the editor, add the TypeScript plugin to `tsconfig.json`. It needs TypeScript 7.1 or newer, and `silk` on `PATH`:
+
+```json title="tsconfig.json"
+"contentMappers": [{ "package": "@silkui/vite", "extensions": [".silk"] }]
+```
+
+Hover shows the Silk doc comment, go to definition opens the `.silk` file, and Silk errors show in the editor. `tsc` needs `--runExternalCode`. With an older TypeScript, `.silk/natives/types/` has the same declarations as `.d.silk.ts` files, for `rootDirs` with `allowArbitraryExtensions`.
+
+Under `silk task dev`, an edit to a `.silk` file needs a restart of the task, which builds the window's program again.
+
 ## Draw the title bar
 
 On macOS the app can fill the whole window, with the window controls floating over its top:

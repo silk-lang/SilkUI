@@ -41,7 +41,7 @@ Tasks.Build { target } => run app()
 ```
 
 The examples have the whole `tasks.silk`, command line included: [loom](examples/loom),
-[react](examples/react), [foldkit](examples/foldkit) and [js](examples/js).
+[react](examples/react), [foldkit](examples/foldkit), [js](examples/js) and [native](examples/native) (JavaScript calling Silk functions).
 
 An app goes through three stages, and each step is scoped under the stage it takes:
 
@@ -196,6 +196,11 @@ main = "tasks.silk"
 silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "…", path = "modules/silkui", package = "silkui" }
 ```
 
+A JavaScript project that imports Silk functions (`import { add } from "../silk/math.silk"`)
+is a library in the same way: its `exports` are the modules JavaScript can import. silkui
+describes them into `.silk/natives/` before it runs Vite, and the host depends on the project
+and hands the bridge their dispatcher. [examples/native](examples/native) is one.
+
 The generated hosts depend on `silkui-window` from the same place as the `silkui` dependency,
 so they always match it. A Loom app's hosts run Loom's targets (`silkui-window-loom`,
 `silkui-web-canvas`, `silkui-web-dom`), which live in [the Loom repository](https://github.com/silk-lang/loom)
@@ -208,6 +213,8 @@ app and its host share one Loom. That dependency's `path` must end in `modules/l
 - A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
 - The web targets read the page scripts from Silk's checkouts of silkui, Loom and lib-native, so
   Git dependencies on silkui and loom must be pinned with `rev`.
+- Under `silk task dev`, an edit to a Silk module a JavaScript app imports needs a restart of the
+  task: the host is built once.
 - Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
   that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.
 - The examples install `@silkui/*` from this repository (`file:` dependencies with
