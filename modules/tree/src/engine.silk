@@ -38,6 +38,7 @@ import ui_protocol.backend { Backend, Measured }
 import grid_css
 import expand
 import font_features
+import font_features { VariationTable }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -95,7 +96,7 @@ import style_invalidation
 import style_invalidation { Reach, Extent }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
-import svg_css.element { PseudoTarget, StateBits }
+import svg_css.element { PseudoTarget, StateBits, ElementTree }
 import style_sheets { RootSheets, Resolved, Resolution }
 import style_share
 import selector_tree { SelectorTree }
@@ -129,7 +130,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -759,6 +760,7 @@ pub struct UiTree<'a> {
   /// How many nodes are inert, so input skips looking for inert ancestors when none are.
   pub inerts: u32,
   families: Families,
+  variations: VariationTable,
   pub resources: Resources,
   /// `LoadImage`, `LoadIcon`, `LoadFontFace` and `LoadFontStylesheet` mutations waiting for
   /// the host's loaders (`takeLoads`). The tree does no I/O: a host reads, fetches or looks up
@@ -964,6 +966,7 @@ impl<'a> UiTree<'a> {
       returns: List<FocusReturn>.make(),
       inerts: 0,
       families: Families.make(),
+      variations: VariationTable.make(),
       resources: move resources,
       loads: List<Mutation>.make(),
       sourceStates: List<u8>.make(),
@@ -1068,6 +1071,10 @@ impl<'a> UiTree<'a> {
   pub effect fn settleSource(self: &mut Self, resource: u32, ok: bool) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if self.resources.settleCssImage(resource, ok) {
+      self.paintCachesStale = true
+      return ()
+    }
     let at = u32.toUsize(resource)
     let have = self.sourceStates.length()
     if at >= have {
@@ -1119,7 +1126,29 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.requestFontFaces()
+    run self.requestCssImages()
     return Intrinsic.replace(self.loads, List<Mutation>.make())
+  }
+
+  /// Asks for the images stylesheets named in the last paints, once each.
+  effect fn requestCssImages(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let images = self.resources.cssImages.asMutSlice()
+    let mut i: usize = 0
+    while i < images.length {
+      if images[i].state == CssImageState.Wanted {
+        images[i].state = CssImageState.Asked
+        let resource = CSS_IMAGE_BASE + usize.toU32(i)
+        let url = run String.copy(String.view(&images[i].url))
+        if isSvgUrl(String.utf8Bytes(String.view(&url))) {
+          run self.loads.append(Mutation.LoadIcon { resource: resource, url: move url })
+        } else {
+          run self.loads.append(Mutation.LoadImage { resource: resource, url: move url })
+        }
+      }
+      i = i + 1
+    }
   }
 
   /// The slot of node `id`, or NONE.
@@ -1159,7 +1188,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1182,6 +1211,16 @@ impl<'a> UiTree<'a> {
             })
           }
           Result.Failure { error: _ } => {}
+        }
+      } else if writtenVariations(&declared[i]) {
+        // Settings that do not parse are dropped, as CSS drops an invalid declaration.
+        let text = run values.cssText(&declared[i].value)
+        if let Option.Some { value: id } = run self.variations.intern(Bytes.asSlice(&text)) {
+          run out.append(Declaration {
+            property: CssProperty.FontVariationSettings,
+            value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
         }
       } else {
         run out.append(run values.cloneDeclaration(&declared[i]))
@@ -1346,6 +1385,27 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// The first element child of `at`, or its next element sibling.
+  fn elementLink(self: &Self, at: usize, child: bool) -> usize {
+    let adapter = SelectorTree { tree: self }
+    return if child { ElementTree.firstChild(&adapter, at) } else { ElementTree.nextSibling(&adapter, at) }
+  }
+
+  fn restyleRadioGroup(self: &mut Self, slot: u32) -> () {
+    let parent = self.node(slot).parent
+    if parent == NONE { return }
+    let mut at = self.elementLink(u32.toUsize(parent), true)
+    while at != css_element.NO_ELEMENT {
+      let next = self.elementLink(at, false)
+      let sibling = usize.toU32(at)
+      if sibling != slot && self.node(sibling).accessRole == Role.Radio {
+        let extent = self.stateReach(sibling, css_element.INDETERMINATE)
+        self.restyleExtent(sibling, extent)
+      }
+      at = next
+    }
+  }
+
   fn selectorStates(self: &Self, slot: u32) -> u32 {
     let adapter = SelectorTree { tree: self }
     return adapter.state(u32.toUsize(slot)).bits
@@ -1361,8 +1421,9 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < names.length {
       if names[i].length != 0 { any = true }
-      // `:lang()` and `:link` are no invalidation key.
-      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")) {
+      // `:lang()`, `:dir()` and `:link` are no invalidation key.
+      if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")
+        || css_tokens.insensitive(names[i], b"dir")) {
         return Extent { reach: Reach.Root, anchors: false }
       }
       i = i + 1
@@ -1798,6 +1859,10 @@ impl<'a> UiTree<'a> {
         let attached = self.rootHolding(slot) != NONE
         let tracked = attached && self.sheetReads().isSome()
         let statesBefore = if tracked { self.selectorStates(slot) } else { 0 }
+        let radioToggled = match &attribute {
+          Attribute.Checked { .. } => self.node(slot).accessRole == Role.Radio
+          _ => false
+        }
         let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
           Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
           Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
@@ -2031,9 +2096,11 @@ impl<'a> UiTree<'a> {
               if value.isSome() { semantics.literalRelations = semantics.literalRelations | relation }
             }
             let range = style_attributes.isRange(String.view(&name))
+            let span = style_attributes.isSpan(String.view(&name))
             let identity = run self.nodeMut(slot).identityMut()
             run identity.set(move name, move value)
             if range { style_attributes.syncRange(self.nodeMut(slot)) }
+            if span { self.restyle(slot) }
           }
           Attribute.ClassName { value } => {
             let identity = run node.identityMut()
@@ -2049,6 +2116,8 @@ impl<'a> UiTree<'a> {
         }
         if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
         self.restyleExtent(slot, change)
+        // A radio's group is `:indeterminate` while none of it is checked.
+        if tracked && radioToggled { self.restyleRadioGroup(slot) }
       }
       Mutation.SetSelection { id, anchor, focus } => {
         let slot = run self.require(index, id)
@@ -3834,6 +3903,23 @@ impl<'a> UiTree<'a> {
   effect fn refreshSources(self: &mut Self, resource: u32) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    if resource >= CSS_IMAGE_BASE {
+      // Stylesheet images are not node resources: repaint every node with a `url()` layer.
+      let mut at: usize = 0
+      while at < self.nodes.length() {
+        let uses = match self.nodes.asSlice()[at].paintEffects() {
+          Option<&Effects>.Some { value } => value.backgrounds.hasUrl() || value.masks.hasUrl()
+          Option<&Effects>.None => false
+        }
+        if uses && self.nodes.asSlice()[at].live {
+          let node = &mut self.nodes.asMutSlice()[at]
+          node.content = node.content + 1
+        }
+        at = at + 1
+      }
+      self.paintCachesStale = true
+      return ()
+    }
     let mut slot: u32 = 0
     while u32.toUsize(slot) < self.nodes.length() {
       let matches = self.node(slot).live && self.node(slot).resource == resource
@@ -3931,6 +4017,7 @@ impl<'a> UiTree<'a> {
       },
     }
     request.treatment = treatment
+    request.variations = self.variations.axes(text.features.variations)
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4690,9 +4777,11 @@ impl<'a> UiTree<'a> {
         let before = node.computed.text
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
+        let barColors = node.computed.scroll.colors
         let shadow = node.computed.effects
         let wasRendered = node.rendered
-        let containment = node.computed.layout.sizeContainment
+        let containment = node.computed.contain.query()
+        let skips = node.computed.contain.hidden()
         let namesChanged = run self.resolve(slot)
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
@@ -4701,7 +4790,8 @@ impl<'a> UiTree<'a> {
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         changed = full || rootFontChanged || self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || namesChanged || containment != after.layout.sizeContainment
+          || &barColors != &after.scroll.colors
+          || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
@@ -4834,6 +4924,8 @@ impl<'a> UiTree<'a> {
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
     let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
     let mut computed = self.valuesToStartFrom(lender, inherited)
+    // border-collapse, border-spacing and caption-side inherit.
+    if lender == NONE && parent != NONE { inheritTable(&mut computed.layout, &self.node(parent).computed.layout) }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
       computed.containerHeight = containers.physicalUnit(&self, slot, false)
@@ -4846,6 +4938,7 @@ impl<'a> UiTree<'a> {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
+      computed.scroll.colors = self.node(parent).computed.scroll.colors
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -4878,6 +4971,7 @@ impl<'a> UiTree<'a> {
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
     }
+    if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
@@ -4888,7 +4982,8 @@ impl<'a> UiTree<'a> {
     }
     if animationUnits != 0 { computed.usesViewport = true }
     let kind = node.kind
-    if node.generatedSuppressed { computed.layout.display = CssDisplay.None }
+    // `content-visibility: hidden` skips its contents the way `display: none` does.
+    if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
@@ -6117,6 +6212,19 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
     && &left.selectionColor == &right.selectionColor
     && &left.placeholderColor == &right.placeholderColor
     && left.hasPlaceholderColor == right.hasPlaceholderColor
+    && left.textWrapStyle == right.textWrapStyle
+    && left.width == right.width
+    && left.features.same(&right.features)
+}
+
+// `font-variation-settings` written as CSS text rather than as a VariationTable id.
+fn writtenVariations(declaration: &Declaration) -> bool {
+  return declaration.property == CssProperty.FontVariationSettings && convert.number(&declaration.value).isNone()
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
 // A `font-family` written as CSS text rather than as a family list id.
@@ -6208,4 +6316,69 @@ fn lastEffect<'a>(declarations: &'a [Declaration], property: CssProperty) -> Opt
     if declarations[i].property == property { return Option<&'a Declaration>.some(&declarations[i]) }
   }
   return Option<&'a Declaration>.None
+}
+
+fn inheritTable(target: &mut CssStyle, parent: &CssStyle) {
+  target.borderCollapse = parent.borderCollapse
+  target.borderSpacingX = parent.borderSpacingX
+  target.borderSpacingY = parent.borderSpacingY
+  target.captionSide = parent.captionSide
+}
+
+// HTML's `colspan` and `rowspan` on cells and `span` on columns, for the table layout.
+fn tableSpans(node: &Node, layout: &mut CssStyle) {
+  layout.columnSpan = 1
+  layout.rowSpan = 1
+  if let Option.Some { value: identity } = node.identity() {
+    let attributes = identity.attributes.asSlice()
+    let mut i: usize = 0
+    while i < attributes.length {
+      let name = String.view(&attributes[i].name)
+      let value = style_attributes.spanValue(String.view(&attributes[i].value))
+      if (name == "colspan" || name == "span") && value > 0 && value != usize.MAX { layout.columnSpan = if value > 1000 { 1000 } else { value } }
+      if name == "rowspan" && value != usize.MAX { layout.rowSpan = value }
+      i = i + 1
+    }
+  }
+}
+
+/// Whether `url` names an SVG file, which loads as an icon.
+fn isSvgUrl(url: &[u8]) -> bool {
+  let svg = b".svg"
+  let data = b"data:image/svg"
+  let mut end = url.length
+  let mut q: usize = 0
+  while q < url.length {
+    if url[q] == 63 || url[q] == 35 {
+      end = q
+      break
+    }
+    q = q + 1
+  }
+  if end >= svg.length {
+    let mut same = true
+    let mut i: usize = 0
+    while i < svg.length {
+      let c = url[end - svg.length + i]
+      let lower = if c >= 65 && c <= 90 { c + 32 } else { c }
+      if lower != svg[i] {
+        same = false
+      }
+      i = i + 1
+    }
+    if same {
+      return true
+    }
+  }
+  if url.length >= data.length {
+    let mut i: usize = 0
+    while i < data.length {
+      if url[i] != data[i] {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  return false
 }
