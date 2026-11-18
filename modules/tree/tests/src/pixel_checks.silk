@@ -640,3 +640,91 @@ test effect fn pixelBackdropFilterListsBlur()
   let mut allocator = Allocator.systemAllocatorProvider()
   run backdropFilterLists() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+/// The pixels at `points` of a table with one row of cells `a` and `b` on white; `b` holds a
+/// 10px tall block when `filled`.
+effect fn tablePixels(table: &[u8], a: &[u8], b: &[u8], filled: bool, points: [[u32; 2]; 4]) -> [[u8; 3]; 4]
+  ! TreeError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.style(2, (run written.declarations(table)).asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.style(3, (run written.declarations(b"display:table-row")).asSlice())
+  run batch.create(4, NodeKind.Box)
+  run batch.append(3, 4)
+  run batch.style(4, (run written.declarations(a)).asSlice())
+  run batch.create(5, NodeKind.Box)
+  run batch.append(3, 5)
+  run batch.style(5, (run written.declarations(b)).asSlice())
+  if filled {
+    run batch.create(6, NodeKind.Box)
+    run batch.append(5, 6)
+    run batch.style(6, (run written.declarations(b"display:block;height:10px")).asSlice())
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let mut result: [[u8; 3]; 4] = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]
+  let mut at: usize = 0
+  while at < 4 {
+    let pixel = painted.pixel(points[at][0], points[at][1])
+    result[at] = [pixel.r, pixel.g, pixel.b]
+    at = at + 1
+  }
+  return result
+}
+
+fn rgb(pixel: [u8; 3], r: u8, g: u8, b: u8) -> bool { return pixel[0] == r && pixel[1] == g && pixel[2] == b }
+
+// https://www.w3.org/TR/CSS2/tables.html#border-conflict-resolution
+effect fn collapsedTableBorders() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // The table is 124px wide: its 4px red border, a's 2px blue and b's 10px green meet.
+  let wins = run tablePixels(
+    b"display:table;border-collapse:collapse;border:4px solid rgb(255, 0, 0)",
+    b"display:table-cell;width:50px;height:20px;border:2px solid rgb(0, 0, 255)",
+    b"display:table-cell;width:50px;height:20px;border:10px solid rgb(0, 128, 0)",
+    false, [[30, 5], [100, 2], [56, 20], [30, 20]])
+  run Testing.expect(rgb(wins[0], 255, 0, 0), "the table's wider border wins over a cell's on the table's edge")
+  run Testing.expect(rgb(wins[1], 0, 128, 0), "a cell's wider border wins over the table's")
+  run Testing.expect(rgb(wins[2], 0, 128, 0), "and over its neighbour's, centred on the line between them")
+  run Testing.expect(rgb(wins[3], 255, 255, 255), "a cell's content area has no border")
+  let hidden = run tablePixels(
+    b"display:table;border-collapse:collapse",
+    b"display:table-cell;width:50px;height:20px;border:3px solid rgb(0, 0, 255)",
+    b"display:table-cell;width:50px;height:20px;border:3px solid rgb(0, 0, 255);border-left-style:hidden",
+    false, [[1, 10], [51, 10], [52, 10], [103, 10]])
+  run Testing.expect(rgb(hidden[0], 0, 0, 255), "an outer cell border paints")
+  run Testing.expect(rgb(hidden[1], 255, 255, 255) && rgb(hidden[2], 255, 255, 255), "a hidden side suppresses its neighbour's border")
+  run Testing.expect(rgb(hidden[3], 0, 0, 255), "the other sides still paint")
+}
+
+test effect fn pixelCollapsedTableBordersResolveConflicts() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run collapsedTableBorders() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// https://www.w3.org/TR/CSS2/tables.html#empty-and-nonempty-cells
+effect fn emptyCells() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let cell = b"display:table-cell;width:50px;height:20px;background-color:rgb(0, 0, 255)"
+  let hide = run tablePixels(b"display:table;border-spacing:0;empty-cells:hide", cell, cell, true, [[25, 10], [75, 15], [75, 5], [150, 10]])
+  run Testing.expect(rgb(hide[0], 255, 255, 255), "empty-cells: hide paints no background on an empty cell")
+  run Testing.expect(rgb(hide[1], 0, 0, 255) && rgb(hide[2], 0, 0, 255), "a cell with content still paints")
+  let show = run tablePixels(b"display:table;border-spacing:0", cell, cell, true, [[25, 10], [75, 15], [75, 5], [150, 10]])
+  run Testing.expect(rgb(show[0], 0, 0, 255), "empty cells paint by default")
+}
+
+test effect fn pixelEmptyCellsHide() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run emptyCells() |> Effect.provideMut<Allocator>(&mut allocator)
+}
