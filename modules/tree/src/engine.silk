@@ -931,6 +931,18 @@ pub struct UiTree<'a> {
   pub keyframes: List<Rule>,
   /// The CSS animations every root plays.
   pub animations: List<Playing>,
+  /// The style under the animations of each node that plays some, as its last full restyle
+  /// left it: a frame of the clock starts from it instead of applying the node's declarations
+  /// again (see `resolve`). `tickPlaces[slot]` is the node's index here + 1, or 0.
+  pub tickBases: List<TickBase>,
+  pub tickPlaces: List<u32>,
+}
+
+/// The style of a node before its animations (see `UiTree.tickBases`).
+pub struct TickBase {
+  /// The node it is of, [`NONE`] once it no longer holds.
+  pub id: u32,
+  pub computed: Computed,
 }
 
 impl<'a> UiTree<'a> {
@@ -1069,6 +1081,8 @@ impl<'a> UiTree<'a> {
       easingStops: EasingStops.make(),
       keyframes: List<Rule>.make(),
       animations: List<Playing>.make(),
+      tickBases: List<TickBase>.make(),
+      tickPlaces: List<u32>.make(),
     }
   }
 
@@ -4667,6 +4681,46 @@ impl<'a> UiTree<'a> {
   }
 
   /// The lender's finished values, or the initial ones to apply this node's declarations to.
+  /// The index in `tickBases` of the style under the animations of the node at `slot`, or
+  /// `usize.MAX` when none holds.
+  fn tickBaseOf(self: &Self, slot: u32) -> usize {
+    let at = u32.toUsize(slot)
+    if at >= self.tickPlaces.length() { return usize.MAX }
+    let place = self.tickPlaces.get(at)
+    if place == 0 { return usize.MAX }
+    let index = u32.toUsize(place) - 1
+    if self.tickBases.asSlice()[index].id != self.node(slot).id { return usize.MAX }
+    return index
+  }
+
+  /// Keeps `computed` as the style under the animations of the node at `slot` when it `plays`
+  /// some, and forgets the one it had when it does not.
+  effect fn keepTickBase(self: &mut Self, slot: u32, computed: &Computed, plays: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(slot)
+    let place = if at < self.tickPlaces.length() { self.tickPlaces.get(at) } else { 0 }
+    if !plays {
+      if place != 0 {
+        let bases = self.tickBases.asMutSlice()
+        bases[u32.toUsize(place) - 1].id = NONE
+      }
+      return ()
+    }
+    let id = self.node(slot).id
+    if place != 0 {
+      let bases = self.tickBases.asMutSlice()
+      bases[u32.toUsize(place) - 1] = TickBase { id: id, computed: computed.* }
+      return ()
+    }
+    let held = self.tickPlaces.length()
+    if at >= held {
+      run self.tickPlaces.appendRepeated(0, at + 1 - held)
+    }
+    run self.tickBases.append(TickBase { id: id, computed: computed.* })
+    self.tickPlaces.set(at, usize.toU32(self.tickBases.length()))
+  }
+
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
     if lender != NONE { return self.node(lender).computed }
     return Computed.inViewport(inherited, self.input.width, self.input.height)
@@ -5048,8 +5102,12 @@ impl<'a> UiTree<'a> {
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
-    let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
-    let mut computed = self.valuesToStartFrom(lender, inherited)
+    // A frame of the clock changes nothing under the node's animations: the style its last
+    // full restyle built there is the one this would build. Anchors move without a restyle.
+    let based = if tick && self.anchors.length() == 0 { self.tickBaseOf(slot) } else { usize.MAX }
+    let lender = if based != usize.MAX || simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
+    let mut computed = if based != usize.MAX { self.tickBases.asSlice()[based].computed } else { self.valuesToStartFrom(lender, inherited) }
+    if based == usize.MAX {
     // border-collapse, border-spacing and caption-side inherit.
     if lender == NONE && parent != NONE {
       inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
@@ -5112,6 +5170,9 @@ impl<'a> UiTree<'a> {
       computed.usesContainer = true
     }
     if animationUnits != 0 { computed.usesViewport = true }
+    run self.keepTickBase(slot, &computed, !simpleStyles && computed.animation.names.start != usize.MAX)
+    }
+    let node = self.node(slot)
     let kind = node.kind
     // `content-visibility: hidden` skips its contents the way `display: none` does.
     if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
