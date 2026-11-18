@@ -74,7 +74,32 @@ test("listen flags follow the listeners", () => {
   box.addEventListener("keydown", listener, { once: true });
   box.removeEventListener("click", listener);
   assert.deepEqual(mock.take(), [["listen", box.nodeId, 4], ["listen", box.nodeId, 4 | 128], ["listen", box.nodeId, 128]]);
-  assert.throws(() => box.addEventListener("nope", listener), /no event/);
+  box.addEventListener("ping", listener);
+  assert.deepEqual(mock.take(), []);
+});
+
+test("the app's own events go through the tree as on the web", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.append(inner);
+  const log = [];
+  outer.addEventListener("ping", (event) => log.push("outer capture " + event.eventPhase + " " + (event.target === inner)), true);
+  inner.addEventListener("ping", (event) => log.push("inner " + event.detail));
+  outer.addEventListener("ping", (event) => {
+    log.push("outer " + event.eventPhase + " " + (event.currentTarget === outer));
+    event.preventDefault();
+  });
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 3, bubbles: true, cancelable: true })), false);
+  assert.deepEqual(log, ["outer capture 1 true", "inner 3", "outer 3 true"]);
+
+  log.length = 0;
+  inner.addEventListener("ping", (event) => event.stopImmediatePropagation(), true);
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 4, bubbles: true })), true);
+  assert.deepEqual(log, ["outer capture 1 true"]);
+
+  log.length = 0;
+  outer.dispatchEvent(new Event("ping"));
+  assert.deepEqual(log, ["outer capture 2 false", "outer 2 true"]);
 });
 
 test("preventDefault reaches the host for cancelable events only", () => {
@@ -83,6 +108,51 @@ test("preventDefault reaches the host for cancelable events only", () => {
   box.addEventListener("focus", (event) => event.preventDefault());
   assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, 0, 0, 1), true);
   assert.equal(mock.native.dispatch(9, box.nodeId, 0, 0, 0, 0, 0), false);
+});
+
+test("pointer events carry the pointer, its buttons and the spec defaults", () => {
+  const box = createBox();
+  const seen = [];
+  for (const type of ["pointerdown", "pointermove", "pointerup", "pointerover", "pointerout"]) {
+    box.addEventListener(type, (event) => seen.push([event.type, event.pointerId, event.pointerType, event.isPrimary, event.buttons, event.button, event.pressure, event.width, event.getCoalescedEvents().length]));
+  }
+  // A touch: pointer 2, type touch (2 << 4), primary (64).
+  const touch = 2 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(28, box.nodeId, 5, 5, touch, 0, 0);
+  mock.native.dispatch(0, box.nodeId, 5, 5, touch, 0, 1);
+  mock.native.dispatch(3, box.nodeId, 6, 5, touch, 0, 0);
+  mock.native.dispatch(1, box.nodeId, 6, 5, touch, 0, 0);
+  // The mouse, with shift held: pointer 1, primary.
+  mock.native.dispatch(29, box.nodeId, 6, 5, 256 + 64 + 1, 0, 0);
+  assert.deepEqual(seen, [
+    ["pointerover", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerdown", 2, "touch", true, 1, 0, 0.5, 1, 0],
+    ["pointermove", 2, "touch", true, 1, -1, 0.5, 1, 1],
+    ["pointerup", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerout", 1, "mouse", true, 0, 0, 0, 1, 0],
+  ]);
+});
+
+test("pointer capture follows the pointer that is down", () => {
+  const box = createBox();
+  box.addEventListener("pointerdown", (event) => box.setPointerCapture(event.pointerId));
+  mock.take();
+  assert.throws(() => box.setPointerCapture(9), { name: "NotFoundError" });
+  const mouse = 256 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", box.nodeId]]);
+  assert.equal(box.hasPointerCapture(1), true);
+  box.releasePointerCapture(1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", 0]]);
+  assert.equal(box.hasPointerCapture(1), false);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  // A finger that is not primary keeps its records where it went down; the tree is not asked.
+  const second = 3 * 256 + 2 * 16;
+  mock.native.dispatch(0, box.nodeId, 0, 0, second, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), []);
+  assert.equal(box.hasPointerCapture(3), true);
+  mock.native.dispatch(14, box.nodeId, 0, 0, second, 0, 0);
+  assert.equal(box.hasPointerCapture(3), false);
 });
 
 test("transition events bubble with their property and elapsed time", () => {
@@ -400,7 +470,7 @@ test("selectionchange moves the caret of an input and names a rich input's typin
   mock.take();
   let seen = null;
   input.addEventListener("selectionchange", (event) => (seen = event));
-  assert.equal(mock.take()[0][0], "listen");
+  assert.deepEqual(mock.take(), [], "an input hears selection changes from the start");
   // Bytes 5 and 6 are the end of the object character and of "x".
   globalThis.__ui.dispatch(27, input.nodeId, 5, 6, 0, 1, 0);
   assert.equal(seen.type, "selectionchange");
@@ -569,4 +639,71 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   assert.equal(await held, false);
   mock.native.shellEvent(4, 1, 0, 0, "");
   assert.equal(pressed, 1);
+});
+
+test("input selection offsets are UTF-16 indices, as in Chrome", () => {
+  const input = createInput();
+  const listened = mock.take().find((call) => call[0] === "listen" && call[1] === input.nodeId);
+  assert.ok(listened && (listened[2] & (1 << 11)) && (listened[2] & (1 << 27)), "it keeps value and selection current");
+
+  // a, 4-byte emoji (2 units), é (2 bytes), 漢字 (3 bytes each), b.
+  const value = "a\u{1F600}\u00e9\u6f22\u5b57b";
+  input.value = value;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [7, 7], "a new value puts the caret at its end");
+  mock.take();
+
+  input.setSelectionRange(1, 4, "backward");
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 4, "backward"]);
+  assert.deepEqual(mock.take(), [["select", input.nodeId, 7, 1]], "anchor at the end, in bytes");
+
+  // The rest of these follow what Chrome answered for the same calls.
+  input.setSelectionRange(5, 2);
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [2, 2, "forward"]);
+  input.setSelectionRange(0, 99);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 7]);
+  input.selectionStart = 3;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 7]);
+  input.selectionEnd = 1;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [1, 1]);
+
+  input.setSelectionRange(1, 3);
+  input.setRangeText("XY");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["aXY\u00e9\u6f22\u5b57b", 1, 3]);
+  input.value = "hello world";
+  input.setSelectionRange(2, 4);
+  input.setRangeText("ZZZ", 6, 11, "select");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["hello ZZZ", 6, 9]);
+  input.setRangeText("Q", 0, 1, "start");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Qello ZZZ", 0, 0]);
+  input.setRangeText("W", 0, 1, "end");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Wello ZZZ", 1, 1]);
+  input.setSelectionRange(3, 8);
+  input.setRangeText("", 0, 5);
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], [" ZZZ", 0, 3]);
+  input.select();
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 4]);
+  assert.throws(() => input.setRangeText("x", 3, 1), (error) => error.name === "IndexSizeError");
+
+  // The tree reports bytes: the caret after the emoji and the combining mark.
+  input.value = "a\u{1F600}e\u0301\u6f22";
+  globalThis.__ui.dispatch(27, input.nodeId, 5, 8, 0, 0, 0);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 5]);
+  globalThis.__ui.dispatch(11, input.nodeId, 14, 14, 0, 0, 0, input.value + "\u5b57", "insertText");
+  assert.deepEqual([input.value.length, input.selectionStart], [7, 7]);
+});
+
+test("setRangeText on a rich input keeps marks and atoms outside the range", () => {
+  const input = createRichInput();
+  input.defineMark("bold", { fontWeight: 700 });
+  input.document = { text: "hi " + OBJECT + " there", marks: [{ start: 4, end: 10, marks: ["bold"] }], atoms: [{ kind: "mention", label: "@a", data: "" }] };
+  input.setRangeText("hello", 0, 2, "end");
+  assert.deepEqual(input.document, {
+    text: "hello " + OBJECT + " there",
+    marks: [{ start: 7, end: 13, marks: ["bold"] }],
+    atoms: [{ kind: "mention", label: "@a", data: "" }],
+  });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 5]);
+  input.setRangeText("x" + OBJECT, 5, 8, "select");
+  assert.deepEqual(input.document, { text: "hellox\ufffdthere", marks: [{ start: 7, end: 12, marks: ["bold"] }], atoms: [] });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 7]);
 });

@@ -17,7 +17,7 @@
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
-import lib { toInput, windowCursor, HostState, serve, coalesce }
+import lib { toInputAt, windowCursor, HostState, serve, coalesce }
 import adapter { fastScrollOf, reportWindow, reportWindowOf }
 import browser { stylePreferences }
 import ui_tree.style_media { Preferences }
@@ -145,7 +145,8 @@ pub effect fn headlessRequested() -> bool
 
 import platform_thread { HostPlatform, Launched }
 import vector.pixmap { Pixmap }
-import ui_inspect_server.lib { Inspector, InspectorOptions }
+import ui_inspect_server.lib { Inspector, InspectorOptions, Interaction, Startup, SLOW_INTERACTION_MS, interactionName, interactionTarget, slowLine }
+import ui_inspect_server.server { debugBuild }
 import silk.core.result { Result }
 import silk.system.host_input { HostInput, HostInputError }
 import font_collection.lib { FontCollection }
@@ -167,6 +168,7 @@ import silk.num.usize
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
+import metal_hud
 import silk.text.string { String, InvalidUtf8 }
 import silk.geometry.point { Point2 }
 import silk.collections.bytes { Bytes }
@@ -177,6 +179,15 @@ import ui_tree.input { Input, BUTTON_PRIMARY }
 import ui_tree.inspect { info, NodeInfo }
 import ui_tree.node { NONE }
 import silk.geometry.rect { Rect }
+
+/// Shows the Metal Performance HUD over the windows opened from now on (macOS 13 and later):
+/// the frames per second, frame times and GPU time Metal measures for what each window
+/// presents. Elsewhere it does nothing. `SILK_UI_METAL_HUD=1` in the environment does the same.
+/// Metal shows the HUD only when it was asked for before it started (`MTL_HUD_ENABLED`), so
+/// call it at the top of `main`, before the GPU starts; it cannot be hidden again while running.
+pub fn showMetalHud(on: bool) -> () {
+  metal_hud.showByDefault(on)
+}
 
 /// Client lifecycle hooks for the native tree host. Default hooks draw an ordinary tree.
 pub interface WindowClient<S, E, ? R> {
@@ -368,6 +379,13 @@ pub interface WindowClient<S, E, ? R> {
     return false
   }
 
+  /// Hears the frames the window presented since the last call: the milliseconds between
+  /// presents, oldest first, and how many painted frames a newer one replaced before the GPU
+  /// drew them.
+  effect fn presented(self: &mut Self, state: &mut S, intervals: &[f64], dropped: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
   /// Whether this window can serve the inspector. A client whose answer is a constant
   /// false (a production build) leaves the inspector's code out of the program: the host
   /// checks this before every use of it, and passes an inspector that is off.
@@ -421,6 +439,23 @@ pub interface WindowClient<S, E, ? R> {
   }
 }
 
+/// The scale the first window most likely opens at, before there is one to ask.
+fn expectedScale() -> f64 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return 2.0
+  } else {
+    return 1.0
+  }
+}
+
+fn revealsWhenDrawn() -> bool {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return true
+  } else {
+    return false
+  }
+}
+
 /// How to open the window.
 pub struct RunOptions {
   /// Native window title.
@@ -454,6 +489,73 @@ fn deviceSize(logical: f64, scale: f64) -> u32 {
 }
 
 /// Seconds on the monotonic clock.
+/// What `SILK_UI_FRAME_STATS` adds up between its lines: seconds on the UI thread, milliseconds
+/// on the render thread.
+struct FrameTimes {
+  frames: u64,
+  since: f64,
+  tick: f64,
+  layout: f64,
+  paint: f64,
+  submit: f64,
+  acquire: f64,
+  draw: f64,
+  present: f64,
+}
+
+impl FrameTimes {
+  fn none() -> FrameTimes {
+    return FrameTimes {
+      frames: 0,
+      since: 0.0,
+      tick: 0.0,
+      layout: 0.0,
+      paint: 0.0,
+      submit: 0.0,
+      acquire: 0.0,
+      draw: 0.0,
+      present: 0.0,
+    }
+  }
+}
+
+/// The interaction a debug build is timing: the first input since the last frame that ran
+/// handlers, and how long the handlers of every such input took.
+struct Waiting {
+  /// When that input was taken, in seconds on the host's clock; negative while none waits.
+  since: f64,
+  handled: f64,
+  input: String,
+  target: String,
+}
+
+impl Waiting {
+  fn none() -> Waiting {
+    return Waiting { since: -1.0, handled: 0.0, input: String.make(), target: String.make() }
+  }
+
+  /// Notes `input` before its handlers run; returns when they start, or -1 for an input that
+  /// starts no interaction (a pointer move, a key release).
+  effect fn begin(self: &mut Self, tree: &UiTree<'_>, input: &Input, clock: &mut Clock) -> f64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let name = run interactionName(input)
+    if String.byteLength(String.view(&name)) == 0 {
+      return -1.0
+    }
+    let now = run seconds(&mut clock)
+    if self.since < 0.0 {
+      self.since = now
+      self.input = move name
+      self.target = run interactionTarget(tree, input)
+    } else if String.view(&self.input) == "press" && String.view(&name) == "click" {
+      // A press and its release before the frame: one click.
+      self.input = move name
+    }
+    return now
+  }
+}
+
 effect fn seconds(clock: &mut Clock) -> f64 {
   return run clock.seconds()
 }
@@ -782,7 +884,7 @@ effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       )
     }
     _ => {
-      if let Option<Input>.Some { value: input } = run toInput(event) {
+      if let Option<Input>.Some { value: input } = run toInputAt(event, time) {
         if keyInput(&input) && run companion.key(&mut tree, &mut inspector, &input) {
           return ()
         }
@@ -1008,9 +1110,23 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   inspector.deferInput()
   let mut clock = Clock.make()
   let started = run seconds(&mut clock)
+  // Debug builds time each interaction from its input to the frame that shows it, and say on
+  // standard error when one is slow (see `performance` in modules/inspect/server).
+  let watching = debugBuild() && !check
+  let mut waiting = Waiting.none()
+  let mut windowOpenAt: f64 = 0.0
+  let mut gpuAt: f64 = 0.0
   // SILK_UI_TRACE_FRAMES prints a line on standard error as each frame is presented, for
   // benchmarks that time startup and input to pixels from outside the process.
   let tracing = !check && (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
+  // SILK_UI_FRAME_STATS prints a line on standard error each second: the frames painted and the
+  // average milliseconds of each step of one, on this thread and on the render thread.
+  let timing = !check && (run environmentVariable("SILK_UI_FRAME_STATS")).isSome()
+  // SILK_UI_UNCAPPED draws frames one after another instead of one per display refresh, and
+  // presents them without waiting for the display: how many frames a second the app could
+  // draw, for benchmarks. Frames may tear, and the app takes a whole processor core.
+  let uncapped = !check && (run environmentVariable("SILK_UI_UNCAPPED")).isSome()
+  let mut timed = FrameTimes.none()
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
@@ -1041,8 +1157,25 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     run content.report(&mut state, &mut inspector)
   }
   run content.start(&mut state, &mut tree)
+  if tracing {
+    StderrWriter.print("silk-ui: client started\n", &())
+  }
   if !check {
     run companion.attach(&mut tree, &mut inspector)
+    // The first frame's styles, layout and paint, while the window system starts (about
+    // 100 ms on macOS): at the size asked for, the first real frame finds them done.
+    let early = FrameInput {
+      width: f64.toF32(options.width),
+      height: f64.toF32(options.height),
+      scale: f64.toF32(expectedScale()),
+      time: (run seconds(&mut clock)) - started,
+    }
+    run content.prepare(&mut state, &mut tree)
+    run content.layout(&mut state, &mut tree, early)
+    run content.frame(&mut state, &mut tree, early, &inspector)
+    if tracing {
+      StderrWriter.print("silk-ui: first frame laid out\n", &())
+    }
   }
   let mut snapshot = CpuSnapshot.make()
 
@@ -1054,8 +1187,16 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
   windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(240.0, 200.0))
   content.configure(&state.*, &mut windowOptions)
+  // On macOS the window shows once its first frame is presented, so it never shows blank
+  // (Electron's ready-to-show). AppKit sends no frames to a hidden window: this loop draws
+  // that first frame without waiting for one.
+  let mut reveal = !check && windowOptions.visible && revealsWhenDrawn()
+  if reveal {
+    windowOptions.visible = false
+  }
   let window = run platform.openWindow(&windowOptions)
   let owner = window
+  windowOpenAt = (run seconds(&mut clock)) - started
   if tracing {
     StderrWriter.print("silk-ui: window open\n", &())
   }
@@ -1073,8 +1214,20 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
   let mut renderer = run attachRenderer(move early, raw, owner)
+  gpuAt = (run seconds(&mut clock)) - started
   if tracing {
     StderrWriter.print("silk-ui: gpu ready\n", &())
+  }
+  // The Metal Performance HUD, when the app (`showMetalHud`) or SILK_UI_METAL_HUD asked.
+  let hudAsked = match move run environmentVariable("SILK_UI_METAL_HUD") {
+    Option<String>.Some { value } => String.view(&value) != "0" && String.view(&value) != ""
+    Option<String>.None => false
+  }
+  if !check && (hudAsked || metal_hud.defaultOn()) {
+    renderer.setMetalHud(true)
+  }
+  if uncapped {
+    renderer.setUncapped(true)
   }
 
   // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
@@ -1087,6 +1240,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
+  let mut intervals = List<f64>.make()
 
   let initial = platform.contentSize(window)
   let mut width = initial.width
@@ -1131,6 +1285,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
     let wait = if check {
       Wait.Seconds { seconds: 0.016 }
+    } else if reveal || uncapped {
+      Wait.Poll
     } else {
       let mut deadline = match content.nextDeadline(&state.*) {
         Option<f64>.Some { value } => if value > now {
@@ -1235,13 +1391,22 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
     }
     let time = (run seconds(&mut clock)) - started
-    if check && next.isNone() {
+    if (check || reveal || uncapped) && next.isNone() {
+      if uncapped {
+        // No frame is replaced undrawn: this one starts as soon as the last is taken.
+        renderer.waitTaken()
+      }
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
     }
     let mut redraw = backgroundChanged
     if !check {
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree)
+      let dropped = run renderer.takePresented(&mut intervals)
+      if intervals.length() != 0 || dropped != 0 {
+        run content.presented(&mut state, intervals.asSlice(), dropped)
+        intervals.clear()
+      }
     }
     if serves && inspector.enabled() {
       run content.report(&mut state, &mut inspector)
@@ -1318,7 +1483,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       } else {
         match &value {
           Event.RequestFrame { targetTime, .. } => {
-            if deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
+            // The GPU has not taken the last frame yet: a new one would replace it undrawn,
+            // and requestAnimationFrame would run for frames nobody sees. As a browser does,
+            // this refresh is skipped and the next one tries again.
+            let behind = !check && !reveal && renderer.pending()
+            if !behind && deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
               let area = clientSize(width, height, &dock)
               let viewport = FrameInput {
                 width: f64.toF32(area.width),
@@ -1329,6 +1498,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if check && drawn == 1 {
                 run content.checkInput(&mut state, &mut tree, viewport, options.checkClick)
               }
+              let tickStart = run seconds(&mut clock)
               if !check && content.wantsFrames(&state.*) {
                 run content.tick(&mut state, &mut tree, time, true)
               }
@@ -1443,6 +1613,34 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               tree.clearUploads()
               drawn = drawn + 1
               let submitted = run seconds(&mut clock)
+              if watching {
+                if drawn == 1 {
+                  inspector.started(
+                    Startup {
+                      windowMs: f64.toF32(windowOpenAt * 1000.0),
+                      gpuMs: f64.toF32(gpuAt * 1000.0),
+                      firstFrameMs: f64.toF32((submitted - started) * 1000.0),
+                    },
+                  )
+                }
+                if waiting.since >= 0.0 {
+                  let shown = Interaction {
+                    frame: tree.stats.frame,
+                    input: Intrinsic.replace(waiting.input, String.make()),
+                    target: Intrinsic.replace(waiting.target, String.make()),
+                    handleMs: f64.toF32(waiting.handled * 1000.0),
+                    layoutMs: f64.toF32((layoutEnd - frameStart) * 1000.0),
+                    paintMs: f64.toF32((canvasEnd - layoutEnd) * 1000.0),
+                    totalMs: f64.toF32((submitted - waiting.since) * 1000.0),
+                  }
+                  waiting = Waiting.none()
+                  if shown.totalMs > SLOW_INTERACTION_MS {
+                    let line = run slowLine(&shown)
+                    StderrWriter.print("{}", &.(String.view(&line)))
+                  }
+                  run inspector.interaction(move shown)
+                }
+              }
               if tracing {
                 StderrWriter.print("silk-ui: frame {} submitted\n", &.(drawn))
               }
@@ -1456,6 +1654,45 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               }
               if tracing {
                 StderrWriter.print("silk-ui: frame {} presented\n", &.(drawn))
+              }
+              if reveal {
+                reveal = false
+                if !tracing && !options.lowestLatency {
+                  drop run renderer.waitFrames(drawn)
+                }
+                platform.focus(owner)
+                if tracing {
+                  StderrWriter.print("silk-ui: window shown\n", &())
+                }
+              }
+              if timing {
+                let report = renderer.report()
+                timed.frames = timed.frames + 1
+                timed.tick = timed.tick + (frameStart - tickStart)
+                timed.layout = timed.layout + (layoutEnd - frameStart)
+                timed.paint = timed.paint + (canvasEnd - layoutEnd)
+                timed.submit = timed.submit + (submitted - canvasEnd)
+                timed.acquire = timed.acquire + report.acquire
+                timed.draw = timed.draw + report.draw
+                timed.present = timed.present + report.present
+                if submitted - timed.since >= 1.0 {
+                  let n = u64.toF64(timed.frames)
+                  StderrWriter.print(
+                    "frame-stats: frames={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={}\n",
+                    &(
+                      timed.frames,
+                      timed.tick * 1000.0 / n,
+                      timed.layout * 1000.0 / n,
+                      timed.paint * 1000.0 / n,
+                      timed.submit * 1000.0 / n,
+                      timed.acquire / n,
+                      timed.draw / n,
+                      timed.present / n
+                    ),
+                  )
+                  timed = FrameTimes.none()
+                  timed.since = submitted
+                }
               }
               if content.profile(&state.*) {
                 let report = renderer.report()
@@ -1511,7 +1748,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
             let fed = if check {
               Option<Input>.None
             } else {
-              run toInput(&value)
+              run toInputAt(&value, time)
             }
             if let Option<Input>.Some { value: input } = move fed {
               // The root the input is for: with a dock, the pointer's side, or the side a
@@ -1575,11 +1812,15 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   redraw = tree.needsFrameOf(into) || (serves && inspector.wantsFrame())
                   drop run tree.useRoot(FIRST_ROOT)
                 } else {
+                  let handling = if watching { run waiting.begin(&tree, &input, &mut clock) } else { -1.0 }
                   let prevented = run content.decide(&mut state, &mut tree)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
                   if serves { run inspector.observe(&tree) }
                   run content.pump(&mut state, &mut tree)
+                  if handling >= 0.0 {
+                    waiting.handled = waiting.handled + (run seconds(&mut clock)) - handling
+                  }
                   platform.setCursor(owner, windowCursor(tree.cursor()))
                   redraw = content.needsFrame(&state.*, &tree)
                 }

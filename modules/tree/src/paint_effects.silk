@@ -4,6 +4,7 @@
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
 import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
 import paint_css { Effects, Layers, Clip, TextShadow }
+import vector.layer { BLEND_NORMAL }
 import resources { Resource }
 import atlas.atlas { AtlasTile }
 import silk.collections.bytes { Bytes }
@@ -29,6 +30,7 @@ import svg_css.effect_values {
 import svg_css.dimensions { ExprId }
 import svg_css.transform_values { Position, PositionAxis, Edge }
 import svg_css.colors
+import svg_css.colors { Space as CssSpace, HueMethod, Interpolation as CssInterpolation }
 import svg_core.vector_path
 import ui_scene.primitives {
   Background,
@@ -45,11 +47,12 @@ import ui_scene.primitives {
 }
 import ui_scene.effects { LayerEffects, DropShadow }
 import ui_scene.effects as filters
+import ui_scene.color as scene_colors
 import vector.geometry { Affine }
 import vector.path { Path as VectorPath }
 import vector.strips { NONZERO, EVENODD }
 import silk.collections.list { List }
-import silk.color.color { ColorSpace, Interpolation }
+import silk.color.color { ColorSpace, HueInterpolation, Interpolation }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -69,6 +72,77 @@ const MAX_TILES: usize = 4096
 fn rgbaOf(color: colors.Color) -> Rgba<f32> {
   let c = colors.toSrgb(color)
   return Rgba<f32> { r: f64.toF32(c.r), g: f64.toF32(c.g), b: f64.toF32(c.b), a: f64.toF32(c.a) }
+}
+
+/// `color` as extended sRGB: outside the gamut a channel leaves 0 to 1 instead of being mapped
+/// in, so a gradient mixed in another space starts from the color as written (as Chromium does).
+fn extendedOf(color: colors.Color) -> Rgba<f32> {
+  if color.space == CssSpace.Srgb || color.space == CssSpace.Hsl
+    || color.space == CssSpace.Hwb {
+    return rgbaOf(color)
+  }
+  return match colors.convert(color, CssSpace.Srgb) {
+    Option<colors.Color>.Some { value } => Rgba<f32> {
+      r: f64.toF32(value.channels[0]),
+      g: f64.toF32(value.channels[1]),
+      b: f64.toF32(value.channels[2]),
+      a: rgbaOf(color).a,
+    }
+    _ => rgbaOf(color)
+  }
+}
+
+/// Whether a stop color is a legacy one (hex, named, `rgb()`, `hsl()`, `hwb()`, `currentcolor`),
+/// which gradients without `in <space>` mix in sRGB.
+fn isLegacy(color: colors.Color) -> bool {
+  return color.space == CssSpace.Srgb || color.space == CssSpace.Hsl
+    || color.space == CssSpace.Hwb
+}
+
+/// How `list` mixes: as written, else sRGB when every stop is a legacy color and Oklab otherwise
+/// (Images 4 §3.5, as Chromium does).
+fn interpolationOf(method: CssInterpolation, list: &List<GradientStop>) -> Interpolation {
+  if !method.given {
+    let items = list.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      match items[i] {
+        GradientStop.ColorStop { color, .. } => {
+          if !isLegacy(color) {
+            return Interpolation.new(ColorSpace.Oklab)
+          }
+        }
+        GradientStop.Hint { .. } => {}
+      }
+      i = i + 1
+    }
+    return Interpolation.new(ColorSpace.Srgb)
+  }
+  let space = match method.space {
+    CssSpace.Srgb => ColorSpace.Srgb
+    CssSpace.SrgbLinear => ColorSpace.SrgbLinear
+    CssSpace.DisplayP3 => ColorSpace.DisplayP3
+    // Linear spaces mix alike (a linear map of a straight line is a straight line).
+    CssSpace.DisplayP3Linear => ColorSpace.SrgbLinear
+    CssSpace.A98Rgb => ColorSpace.A98Rgb
+    CssSpace.ProphotoRgb => ColorSpace.ProphotoRgb
+    CssSpace.Rec2020 => ColorSpace.Rec2020
+    CssSpace.XyzD50 => ColorSpace.XyzD50
+    CssSpace.XyzD65 => ColorSpace.XyzD65
+    CssSpace.Hsl => ColorSpace.Hsl
+    CssSpace.Hwb => ColorSpace.Hwb
+    CssSpace.Lab => ColorSpace.Lab
+    CssSpace.Lch => ColorSpace.Lch
+    CssSpace.Oklab => ColorSpace.Oklab
+    CssSpace.Oklch => ColorSpace.Oklch
+  }
+  let hue = match method.hue {
+    HueMethod.Shorter => HueInterpolation.Shorter
+    HueMethod.Longer => HueInterpolation.Longer
+    HueMethod.Increasing => HueInterpolation.Increasing
+    HueMethod.Decreasing => HueInterpolation.Decreasing
+  }
+  return Interpolation.withHue(space, hue)
 }
 
 fn isEmpty(r: Rect<f32>) -> bool {
@@ -163,10 +237,20 @@ fn angleOf(effects: &Effects, direction: Direction, w: f32, h: f32) -> f32 {
   }
 }
 
+fn stopColor(color: colors.Color, extended: bool) -> Rgba<f32> {
+  return if extended { extendedOf(color) } else { rgbaOf(color) }
+}
+
 /// The stops of `list` resolved on a gradient line `length` CSS pixels long, with the fix-ups
 /// of Images 3 §3.5.1 (missing ends at 0 and 1, positions never decreasing, missing ones spread
 /// evenly). Hints are dropped.
-effect fn resolveStops(effects: &Effects, list: &List<GradientStop>, length: f32, out: &mut List<Stop>) -> ()
+effect fn resolveStops(
+  effects: &Effects,
+  list: &List<GradientStop>,
+  length: f32,
+  extended: bool,
+  out: &mut List<Stop>,
+) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   out.clear()
@@ -179,11 +263,11 @@ effect fn resolveStops(effects: &Effects, list: &List<GradientStop>, length: f32
         match position {
           Option<ExprId>.Some { value } => {
             let px = effects.pixels(value, length)
-            run out.append(Stop { color: rgbaOf(color), offset: if length > 0.0 { px / length } else { 0.0 } })
+            run out.append(Stop { color: stopColor(color, extended), offset: if length > 0.0 { px / length } else { 0.0 } })
             run known.append(true)
           }
           Option<ExprId>.None => {
-            run out.append(Stop { color: rgbaOf(color), offset: 0.0 })
+            run out.append(Stop { color: stopColor(color, extended), offset: 0.0 })
             run known.append(false)
           }
         }
@@ -238,13 +322,13 @@ effect fn resolveStops(effects: &Effects, list: &List<GradientStop>, length: f32
   }
 }
 
-fn twoStop(angle: f32, a: Stop, b: Stop) -> Background {
+fn twoStop(angle: f32, a: Stop, b: Stop, interpolation: Interpolation) -> Background {
   return Background.Linear {
     gradient: LinearGradient {
       angle: angle,
       from: ColorStop { color: a.color, offset: a.offset },
       to: ColorStop { color: b.color, offset: b.offset },
-      interpolation: Interpolation.new(ColorSpace.Srgb),
+      interpolation: interpolation,
     },
   }
 }
@@ -319,20 +403,23 @@ effect fn paintGradient(
     radiusY: 0.0,
     repeating: false,
     stops: StopRange { start: 0, count: 0 },
+    interpolation: Interpolation.new(ColorSpace.Srgb),
   }
   match &image.* {
-    Image.Linear { repeating, direction, stops: list } => {
+    Image.Linear { repeating, direction, stops: list, interpolation } => {
+      gradient.interpolation = interpolationOf(interpolation, &list)
       let angle = angleOf(effects, direction, w, h)
       let radians = angle * 0.017453292
       let length = f32.abs(w * f32.sin(radians)) + f32.abs(h * f32.cos(radians))
-      run resolveStops(effects, &list, length, &mut stops.*)
+      run resolveStops(effects, &list, length, !scene_colors.isSrgb(gradient.interpolation), &mut stops.*)
       gradient.angle = angle
       gradient.repeating = repeating
     }
-    Image.Radial { repeating, circle, size, position, stops: list } => {
+    Image.Radial { repeating, circle, size, position, stops: list, interpolation } => {
+      gradient.interpolation = interpolationOf(interpolation, &list)
       let center = centerOf(effects, position, w, h)
       let r = gradientRadii(effects, size, circle, center[0], center[1], w, h)
-      run resolveStops(effects, &list, r[0], &mut stops.*)
+      run resolveStops(effects, &list, r[0], !scene_colors.isSrgb(gradient.interpolation), &mut stops.*)
       if (r[0] <= 0.0 || r[1] <= 0.0) && stops.length() > 0 {
         // A degenerate ellipse: everything is past the last stop.
         let last = stops.get(stops.length() - 1)
@@ -346,10 +433,11 @@ effect fn paintGradient(
       gradient.radiusY = r[1] * s
       gradient.repeating = repeating
     }
-    Image.Conic { repeating, angle, position, stops: list } => {
+    Image.Conic { repeating, angle, position, stops: list, interpolation } => {
+      gradient.interpolation = interpolationOf(interpolation, &list)
       let center = centerOf(effects, position, w, h)
       // Angles and percentages of a turn both resolve to degrees against a basis of 360.
-      run resolveStops(effects, &list, 360.0, &mut stops.*)
+      run resolveStops(effects, &list, 360.0, !scene_colors.isSrgb(gradient.interpolation), &mut stops.*)
       gradient.shape = GradientShape.Conic
       gradient.angle = effects.number(angle)
       gradient.centerX = center[0] * s
@@ -368,7 +456,7 @@ effect fn paintGradient(
   let fill = if n == 1 {
     Background.solid(items[0].color)
   } else if n == 2 && !gradient.repeating && gradient.shape == GradientShape.Linear {
-    twoStop(gradient.angle, items[0], items[1])
+    twoStop(gradient.angle, items[0], items[1], gradient.interpolation)
   } else {
     let mut kept = List<ColorStop>.make()
     run kept.reserve(n)
@@ -586,9 +674,16 @@ pub effect fn paintLayers(
     if nx == 0 || ny == 0 {
       continue
     }
+    // background-blend-mode: the layer blends with the layers and color under it, in the
+    // isolated group the caller opened.
+    let mode = layers.blend(layer)
+    if mode != BLEND_NORMAL {
+      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: mode }, LayerEffects.none())
+    }
     match picture {
       Option<Resource>.Some { value } => {
         run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip)
+        if mode != BLEND_NORMAL { run p.scene.popLayer() }
         continue
       }
       Option<Resource>.None => {}
@@ -598,6 +693,7 @@ pub effect fn paintLayers(
     if single && sameRect(first, painting) {
       // Snapped like the background color under it, so their edges agree.
       run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops)
+      if mode != BLEND_NORMAL { run p.scene.popLayer() }
       continue
     }
     let rounded = hasRadius(paintingRadii)
@@ -638,6 +734,9 @@ pub effect fn paintLayers(
       j = j + 1
     }
     if rounded {
+      run p.scene.popLayer()
+    }
+    if mode != BLEND_NORMAL {
       run p.scene.popLayer()
     }
   }
@@ -920,6 +1019,10 @@ pub effect fn pushEffects(
   }
   outer.backdropBlur = c.paint.backdropBlur * s
   outer.clip = device(borderBox(f), s)
+  if backdrop {
+    // The backdrop takes one radius: the top-left corner's, as in `rounded-*` cards.
+    outer.radius = scaledCorners(radiiOf(&p.*, slot, c, f), s).topLeft
+  }
   drop run p.scene.pushEffectLayer(
     if backdrop { mask.bounds } else { bounds },
     mask,

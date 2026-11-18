@@ -42,7 +42,7 @@ Tasks.Build { platform, options } => run app()
 ```
 
 The examples have the whole `tasks.silk`, command line included: [loom](examples/loom),
-[react](examples/react), [foldkit](examples/foldkit) and [js](examples/js).
+[react](examples/react), [foldkit](examples/foldkit), [js](examples/js) and [native](examples/native) (JavaScript calling Silk functions).
 
 An app goes through three stages, and each step is scoped under the stage it takes:
 
@@ -87,6 +87,7 @@ packages while keeping the application unoptimized.
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
 | `Target.titleBar` | `TitleBar.standard()` (default), `TitleBar.transparent(height)`, `.buttons(left, top)` | On a window target. `buttons` moves the window buttons' top-left corner (0 keeps it centred). Transparent: on macOS the app fills the window under the controls and draws its own bar in the top `height` pixels, where a press moves the window and the app gets no clicks. Other systems keep their bar |
+| `Target.metalHud` | `true` or `false` (default) | On a window target. Shows the Metal Performance HUD over the window on macOS 13 and later: frames presented per second, frame times and GPU time. Other systems show nothing. `SILK_UI_METAL_HUD=1` does the same for one run |
 | `App.customHost(dir)` | a package directory | The escape hatch: the project's own host package is built instead of a generated one (window only) |
 
 Fonts are the ones installed on the machine. A `web-canvas` page has no access to those, so it
@@ -177,12 +178,19 @@ with `main = "app.silk"` and `exports = ["app"]`; it also lists the Loom window 
 and their platform dependencies. The examples pin compatible Git revisions so each package
 has one identity throughout the graph.
 
+A JavaScript project that imports Silk functions (`import { add } from "../silk/math.silk"`)
+is a library in the same way: its `exports` are the modules JavaScript can import. silkui
+describes them into `.silk/natives/` before it runs Vite, and the host depends on the project
+and hands the bridge their dispatcher. [examples/native](examples/native) is one.
+
 ## Limits
 
 - JavaScript apps run in a window only: on `web-canvas` they come next, `web-dom` later.
 - A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
 - The web targets read the page scripts from Silk's checkouts of silkui, Loom and lib-native, so
   Git dependencies on silkui and loom must be pinned with `rev`.
+- Under `silk task dev`, an edit to the Silk modules a JavaScript app imports rebuilds the host
+  and starts it again, so the app's JavaScript state starts over, as after a page reload.
 - Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
   that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.
 - The examples install `@silkui/*` from this repository (`file:` dependencies with

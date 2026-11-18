@@ -1,4 +1,4 @@
-// What a ui-js realm on the SilkJS runtime adds to Node's globals: animation frames,
+// What a ui-js realm on the SilkJS runtime adds to Node's globals: animation and idle frames,
 // `window.open`, `navigator.clipboard`, the `@silkui/core` modules the host defines, and
 // uncaught exceptions printed as a browser console prints them, with the window left running.
 (() => {
@@ -29,6 +29,35 @@
       }
     }
     if (failure) throw failure.error;
+  };
+
+  // Idle callbacks run from a timer, with a 50 ms budget as the web gives at most.
+  globalThis.requestIdleCallback ??= (callback) => {
+    if (typeof callback !== "function") throw new TypeError("requestIdleCallback needs a function");
+    return setTimeout(() => {
+      const start = performance.now();
+      callback({ didTimeout: false, timeRemaining: () => Math.max(0, 50 - (performance.now() - start)) });
+    }, 1);
+  };
+  globalThis.cancelIdleCallback ??= (id) => clearTimeout(id);
+
+  // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
+  // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a
+  // TypeError and 2 an Error.
+  const nativeCalls = new Map();
+  let nextNativeCall = 0;
+  const startNative = native.nativeStart;
+  native.nativeStart = (id, ...args) => new Promise((resolve, reject) => {
+    const call = ++nextNativeCall;
+    nativeCalls.set(call, { resolve, reject });
+    startNative(call, id, ...args);
+  });
+  native.nativeDone = function (call, kind, value) {
+    const pending = nativeCalls.get(call);
+    if (!pending) return;
+    nativeCalls.delete(call);
+    if (kind === 0) pending.resolve(value);
+    else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
   };
 
   // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
@@ -72,7 +101,30 @@
   const uncaught = (error) => console.error("Uncaught", error);
   native.report = uncaught;
   process.on("uncaughtException", uncaught);
-  process.on("unhandledRejection", (reason) => console.error("Uncaught (in promise)", reason));
+  // As on the web: `unhandledrejection` on the global object first, and a listener that
+  // prevents its default keeps the rejection off the console.
+  class PromiseRejectionEvent extends Event {
+    #promise;
+    #reason;
+    constructor(type, options) {
+      super(type, options);
+      this.#promise = options?.promise;
+      this.#reason = options?.reason;
+    }
+    get promise() { return this.#promise; }
+    get reason() { return this.#reason; }
+  }
+  globalThis.PromiseRejectionEvent ??= PromiseRejectionEvent;
+  if (typeof globalThis.addEventListener !== "function") {
+    const target = new EventTarget();
+    globalThis.addEventListener = target.addEventListener.bind(target);
+    globalThis.removeEventListener = target.removeEventListener.bind(target);
+    globalThis.dispatchEvent = target.dispatchEvent.bind(target);
+  }
+  process.on("unhandledRejection", (reason, promise) => {
+    const event = new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true });
+    if (globalThis.dispatchEvent(event)) console.error("Uncaught (in promise)", reason);
+  });
   globalThis.reportError ??= uncaught;
 
   // Modules the host defines (`@silkui/core`), importable by name from any module.

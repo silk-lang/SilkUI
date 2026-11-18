@@ -77,6 +77,16 @@ claude mcp add silk-ui -- "$PWD/build/x86_64-unknown-linux-gnu/dev/ui-inspect-mc
 
 Other MCP clients take the same command in their configuration.
 
+## What people wait for
+
+A debug build times every click, key, scroll and paste from the moment the window gets it to the frame that shows the result. When that takes more than 100 ms, it says so on standard error, naming the control and where the time went:
+
+```text
+silk-ui: slow click on button "Save": 183 ms to the next frame (handlers 150 ms, layout 20 ms, paint 13 ms)
+```
+
+With the inspector on, `ui-inspect-cli performance` lists the recent interactions with the same split. It also shows how long the app took to open its window, start the GPU and draw its first frame, and how much memory the process uses, as Activity Monitor, the Task Manager or `smem` count it. Agents get the same data from the `ui_performance` tool.
+
 ## Try it with a screen reader
 
 Debug builds have a screen reader of their own, so you can hear your app the way a blind user does without turning on VoiceOver, NVDA or Narrator for your whole computer. It plays NVDA, VoiceOver, JAWS, Narrator or Orca on any system, with that screen reader's keys and words: arrows read by line, word and character, H jumps to the next heading, K to the next link, NVDA+F7 lists them, and Enter activates. A ring shows what it is reading, and captions at the bottom of the window show what it says. Speech uses `say` on macOS and `espeak-ng` or `spd-say` on Linux. Elsewhere you get captions only.
@@ -96,6 +106,13 @@ ui-inspect-cli screen-reader.set --on true --flavor nvda
 ui-inspect-cli screen-reader.do --command nextHeading     # prints what it said
 ui-inspect-cli screen-reader.transcript
 ```
+
+## See the frames that reach the screen
+
+An fps counter built on `requestAnimationFrame` counts the frames the app paints. When the GPU falls behind, that is more than the screen shows. Two things count what is presented:
+
+- On macOS 13 and later, the Metal Performance HUD draws the presented frames per second, the frame times and the GPU time over the window. Start any build with `SILK_UI_METAL_HUD=1` (`SILK_UI_METAL_HUD=1 silk task dev`) or give the window target `.metalHud(true)`. Metal decides at startup, so the HUD cannot be switched while the app runs. Other systems show nothing.
+- In JavaScript, `frameStats()` from `@silkui/core` returns what was presented since its last call: `{ frames, fps, dropped, p50, p95, p99, max }`, with frame times in milliseconds. `dropped` counts painted frames the GPU never drew.
 
 ## Turning it off for good
 

@@ -1,7 +1,8 @@
 // The web globals a ui-js realm starts with, on top of the engine's ECMAScript: timers,
 // animation frames, a console, queueMicrotask, performance.now, reportError and
-// navigator.clipboard. The host evaluates this once, before any application code. Edit it,
-// then run `silk task embed-assets` to regenerate generated_prelude.silk.
+// navigator.clipboard, and stand-ins that load the rest (web_apis.js) when first used.
+// The host evaluates this once, before any application code. Edit it, then run
+// `silk task embed-assets` to regenerate generated_prelude.silk.
 (function () {
   const native = globalThis.__ui;
   const timers = new Map();
@@ -65,7 +66,10 @@
     Promise.resolve().then(callback);
   };
 
-  globalThis.performance = { now: () => native.now() };
+  // `timeOrigin` is wall-clock time when `now()` read 0, as on the web.
+  globalThis.performance = { timeOrigin: Date.now() - native.now(), now: () => native.now() };
+
+
 
   function show(value, depth) {
     if (typeof value === "string") return depth === 0 ? value : JSON.stringify(value);
@@ -78,7 +82,9 @@
     return parts.length ? "{ " + parts.join(", ") + " }" : "{}";
   }
 
-  const log = (level) => (...values) => native.log(level, values.map((value) => show(value, 0)).join(" "));
+  // Lines inside `console.group` are indented two spaces a level.
+  const shared = { groups: 0, show, log: null };
+  const log = (shared.log = (level) => (...values) => native.log(level, "  ".repeat(shared.groups) + values.map((value) => show(value, 0)).join(" ")));
   globalThis.console = {
     debug: log(0),
     log: log(1),
@@ -91,7 +97,65 @@
     },
   };
 
+  // The rest of the web APIs (web_apis.js) are evaluated on their first use: parsing them
+  // in every realm would make every app start slower.
+  let web = null;
+  const api = () => (web ??= (0, eval)(native.webApis())(native, shared));
+  const forward = (object, part, names) => {
+    for (const name of names) object[name] = (...args) => api()[part][name](...args);
+  };
+  forward(globalThis.console, "console", ["dir", "table", "group", "groupCollapsed", "groupEnd", "time", "timeLog", "timeEnd", "count", "countReset"]);
+  forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
+  globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
+  const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
+  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = api()[name];
+        own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // `devicePixelRatio` and `matchMedia` answer for the window's last frame; the host calls
+  // `native.media` when that changes, for the lists' `change` events.
+  Object.defineProperty(globalThis, "devicePixelRatio", { get: () => native.scale(), set: (value) => own("devicePixelRatio", value), configurable: true });
+  globalThis.matchMedia = (query) => api().matchMedia(query);
+  native.media = () => web?.mediaChanged();
+
+  // The global object as an event target, for `unhandledrejection`, the one event a realm
+  // sends it. The host asks `native.rejected` before it reports a rejection nothing handled.
+  let windowTarget = null;
+  const target = () => (windowTarget ??= new globalThis.EventTarget());
+  globalThis.addEventListener = (...args) => target().addEventListener(...args);
+  globalThis.removeEventListener = (...args) => windowTarget?.removeEventListener(...args);
+  globalThis.dispatchEvent = (event) => target().dispatchEvent(event);
+  native.rejected = (promise, reason) =>
+    windowTarget !== null && !windowTarget.dispatchEvent(new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true }));
+
+  // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
+  // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a
+  // TypeError and 2 an Error.
+  const nativeCalls = new Map();
+  let nextNativeCall = 0;
+  const startNative = native.nativeStart;
+  native.nativeStart = (id, ...args) => new Promise((resolve, reject) => {
+    const call = ++nextNativeCall;
+    nativeCalls.set(call, { resolve, reject });
+    startNative(call, id, ...args);
+  });
+  native.nativeDone = function (call, kind, value) {
+    const pending = nativeCalls.get(call);
+    if (!pending) return;
+    nativeCalls.delete(call);
+    if (kind === 0) pending.resolve(value);
+    else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
+  };
 
   // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
   // clipboard after the code that asked has run, then settles the promise.
@@ -120,6 +184,7 @@
   };
   if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
   Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
+  Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
 
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.

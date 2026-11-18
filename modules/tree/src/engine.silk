@@ -15,7 +15,7 @@ import container_watch
 import style_change
 import style_change { Change }
 import container_watch { Watch }
-import style_media { Preferences }
+import style_media { Preferences, MediaState }
 import properties.convert as properties_convert
 import properties.convert { Context }
 import properties.catalog
@@ -30,6 +30,11 @@ import anchoring { Anchored }
 import inspect
 import cssom_view
 import cssom_view { ScrollAnimation }
+import scroll_snap
+import css_anchor
+import scroll_snap { SnapWait }
+import scroll_anchor
+import scroll_anchor { ScrollAnchor }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
@@ -73,6 +78,8 @@ import properties.values
 import properties.convert
 import input { Input }
 import interact
+import touch
+import touch { TouchState }
 import layers
 import edit
 import rich
@@ -87,7 +94,7 @@ import font_units { Source as FontSource }
 import motion
 import motion { Running }
 import animation
-import animation { Rule, Playing }
+import animation { Rule, Playing, KeptSamples }
 import timing
 import timing { EasingStops }
 import transform
@@ -467,7 +474,7 @@ pub effect fn applyInitial(computed: &mut Computed, property: CssProperty) -> ()
   // medium, then let the catalog override native user-agent defaults.
   let value = run Effect.catch<CssError>(css_written.value(catalog.initial(property)), invalidInitial)
   let mut declaration = Declaration { property: property, important: false, value: move value }
-  if properties_convert.isKeyword(&declaration.value, Keyword.Currentcolor) { declaration.value = values.color(computed.text.color) }
+  if properties_convert.isKeyword(&declaration.value, Keyword.Currentcolor) && property != CssProperty.WebkitTextFillColor { declaration.value = values.color(computed.text.color) }
   if !run applyWritten(&mut initial, &declaration) { initial.apply(&declaration) }
   drop style_inherit.apply(&mut computed.*, &initial, property)
 }
@@ -799,6 +806,15 @@ pub struct UiTree<'a> {
   /// Some node is a list item or changes counters, or generated content names one: each
   /// style pass ends with the counters pass (`lists.update`).
   pub listsUsed: bool,
+  /// Whether any node is a scroll snap container (see `scroll_snap`).
+  pub snapUsed: bool,
+  /// A style used anchor positioning (`anchor-name` or an anchored box).
+  pub cssAnchorUsed: bool,
+  pub cssPlacements: List<css_anchor.Placement>,
+  /// User scrolls of snap containers that snap once they stop.
+  pub snapWaits: List<SnapWait>,
+  /// Scroll containers away from their block start and their anchors (see `scroll_anchor`).
+  pub scrollAnchors: List<ScrollAnchor>,
   /// The last `Node.styleClass` handed out.
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
@@ -882,6 +898,17 @@ pub struct UiTree<'a> {
   pub thumbVertical: bool,
   pub thumbStart: f32,
   pub thumbOffset: f32,
+  /// Fingers on the screen, the gesture they make, and a flick (see `touch`).
+  pub touch: TouchState,
+  /// What a touch input's `begin` left for its `finish` (`touch.TOUCH_*`), and the finger it
+  /// saw come off.
+  pub touchPending: u8,
+  pub touchEnded: usize,
+  /// The pointer the pointer records being made speak for: DOM `pointerId`, `POINTER_*` type
+  /// and `isPrimary`.
+  pub pointerId: u32,
+  pub pointerType: u32,
+  pub pointerPrimary: bool,
   /// Where the pointer is, and whether it is in the window.
   pub pointerX: f32,
   pub pointerY: f32,
@@ -931,6 +958,23 @@ pub struct UiTree<'a> {
   pub keyframes: List<Rule>,
   /// The CSS animations every root plays.
   pub animations: List<Playing>,
+  /// The style under the animations of each node that plays some, as its last full restyle
+  /// left it: a frame of the clock starts from it instead of applying the node's declarations
+  /// again (see `resolve`). `tickPlaces[slot]` is the node's index here + 1, or 0.
+  pub tickBases: List<TickBase>,
+  pub tickPlaces: List<u32>,
+  /// The viewport `tickBases` were built in: its size is in every one of them.
+  tickWidth: f32,
+  tickHeight: f32,
+}
+
+/// The style of a node before its animations (see `UiTree.tickBases`).
+pub struct TickBase {
+  /// The node it is of, [`NONE`] once it no longer holds.
+  pub id: u32,
+  pub computed: Computed,
+  /// The keyframe values of its first animation over `computed`.
+  pub samples: KeptSamples,
 }
 
 impl<'a> UiTree<'a> {
@@ -996,6 +1040,11 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       listsUsed: false,
+      snapUsed: false,
+      cssAnchorUsed: false,
+      cssPlacements: List<css_anchor.Placement>.make(),
+      snapWaits: List<SnapWait>.make(),
+      scrollAnchors: List<ScrollAnchor>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
       computedStamps: 0,
@@ -1043,6 +1092,12 @@ impl<'a> UiTree<'a> {
       thumbVertical: true,
       thumbStart: 0.0,
       thumbOffset: 0.0,
+      touch: TouchState.make(),
+      touchPending: 0,
+      touchEnded: usize.MAX,
+      pointerId: 1,
+      pointerType: 0,
+      pointerPrimary: true,
       pointerX: 0.0,
       pointerY: 0.0,
       pointerInside: false,
@@ -1069,6 +1124,10 @@ impl<'a> UiTree<'a> {
       easingStops: EasingStops.make(),
       keyframes: List<Rule>.make(),
       animations: List<Playing>.make(),
+      tickBases: List<TickBase>.make(),
+      tickPlaces: List<u32>.make(),
+      tickWidth: 0.0,
+      tickHeight: 0.0,
     }
   }
 
@@ -1638,6 +1697,9 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let before = self.current
+    if self.laidOutCurrent() && !self.stylesDirty && !self.stylesPending {
+      run scroll_anchor.select(&mut self)
+    }
     run self.applyAll(move batch)
     run edit.reportSelection(&mut self)
     if self.current != before && self.rootOpen(before) {
@@ -3686,8 +3748,9 @@ impl<'a> UiTree<'a> {
       drop run self.useRoot(keyed)
     }
     let interruptsScroll = match &input {
-      Input.Wheel { .. } => true
+      Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
+      Input.TouchStart { .. } => true
       Input.KeyDown { .. } => true
       _ => false
     }
@@ -3712,8 +3775,9 @@ impl<'a> UiTree<'a> {
     }
     self.pendingRoot = self.current
     let interruptsScroll = match &input.* {
-      Input.Wheel { .. } => true
+      Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
+      Input.TouchStart { .. } => true
       Input.KeyDown { .. } => true
       _ => false
     }
@@ -3765,7 +3829,10 @@ impl<'a> UiTree<'a> {
     self.viewScrollState.interruptTarget(
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
+    let fromX = self.node(slot).scrollX
+    let fromY = self.node(slot).scrollY
     run interact.scrolledElsewhere(&mut self, slot, x, y)
+    run scroll_snap.userScrolled(&mut self, slot, fromX, fromY, false)
   }
 
   pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
@@ -4290,6 +4357,22 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// The media `input` gives the current root's stylesheets: what a script's `matchMedia`
+  /// evaluates its queries against.
+  pub fn mediaState(self: &Self, input: FrameInput) -> MediaState {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let mut environment = Environment.headless(0.0, 0.0)
+    if at != usize.MAX {
+      environment = self.styleSheets.asSlice()[at].environment
+    } else if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      value.apply(&mut environment)
+    }
+    environment.initial.viewportWidth = f32.toF64(input.width)
+    environment.initial.viewportHeight = f32.toF64(input.height)
+    environment.resolutionDppx = f32.toF64(input.scale)
+    return MediaState.of(environment)
+  }
+
   /// Updates host media inputs without restyling until a condition changes truth.
   pub fn setStylePreferences(self: &mut Self, preferences: Preferences) -> bool {
     if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
@@ -4667,6 +4750,46 @@ impl<'a> UiTree<'a> {
   }
 
   /// The lender's finished values, or the initial ones to apply this node's declarations to.
+  /// The index in `tickBases` of the style under the animations of the node at `slot`, or
+  /// `usize.MAX` when none holds.
+  fn tickBaseOf(self: &Self, slot: u32) -> usize {
+    let at = u32.toUsize(slot)
+    if at >= self.tickPlaces.length() { return usize.MAX }
+    let place = self.tickPlaces.get(at)
+    if place == 0 { return usize.MAX }
+    let index = u32.toUsize(place) - 1
+    if self.tickBases.asSlice()[index].id != self.node(slot).id { return usize.MAX }
+    return index
+  }
+
+  /// Keeps `computed` as the style under the animations of the node at `slot` when it `plays`
+  /// some, and forgets the one it had when it does not.
+  effect fn keepTickBase(self: &mut Self, slot: u32, computed: &Computed, plays: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = u32.toUsize(slot)
+    let place = if at < self.tickPlaces.length() { self.tickPlaces.get(at) } else { 0 }
+    if !plays {
+      if place != 0 {
+        let bases = self.tickBases.asMutSlice()
+        bases[u32.toUsize(place) - 1].id = NONE
+      }
+      return ()
+    }
+    let id = self.node(slot).id
+    if place != 0 {
+      let bases = self.tickBases.asMutSlice()
+      bases[u32.toUsize(place) - 1] = TickBase { id: id, computed: computed.*, samples: KeptSamples.none() }
+      return ()
+    }
+    let held = self.tickPlaces.length()
+    if at >= held {
+      run self.tickPlaces.appendRepeated(0, at + 1 - held)
+    }
+    run self.tickBases.append(TickBase { id: id, computed: computed.*, samples: KeptSamples.none() })
+    self.tickPlaces.set(at, usize.toU32(self.tickBases.length()))
+  }
+
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
     if lender != NONE { return self.node(lender).computed }
     return Computed.inViewport(inherited, self.input.width, self.input.height)
@@ -5040,6 +5163,12 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
+    if self.tickWidth != self.input.width || self.tickHeight != self.input.height {
+      self.tickBases.clear()
+      self.tickPlaces.clear()
+      self.tickWidth = self.input.width
+      self.tickHeight = self.input.height
+    }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -5048,8 +5177,12 @@ impl<'a> UiTree<'a> {
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
-    let lender = if simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
-    let mut computed = self.valuesToStartFrom(lender, inherited)
+    // A frame of the clock changes nothing under the node's animations: the style its last
+    // full restyle built there is the one this would build. Anchors move without a restyle.
+    let based = if tick && self.anchors.length() == 0 { self.tickBaseOf(slot) } else { usize.MAX }
+    let lender = if based != usize.MAX || simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
+    let mut computed = if based != usize.MAX { self.tickBases.asSlice()[based].computed } else { self.valuesToStartFrom(lender, inherited) }
+    if based == usize.MAX {
     // border-collapse, border-spacing and caption-side inherit.
     if lender == NONE && parent != NONE {
       inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
@@ -5103,8 +5236,13 @@ impl<'a> UiTree<'a> {
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
+    if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
+    if computed.anchor.name != 0 || computed.anchor.anchored() {
+      self.cssAnchorUsed = true
+      css_anchor.apply(&self, slot, self.node(slot).id, &mut computed)
+    }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
     if animationUnits & 2 != 0 && !computed.usesContainer {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
@@ -5112,6 +5250,9 @@ impl<'a> UiTree<'a> {
       computed.usesContainer = true
     }
     if animationUnits != 0 { computed.usesViewport = true }
+    run self.keepTickBase(slot, &computed, !simpleStyles && computed.animation.names.start != usize.MAX)
+    }
+    let node = self.node(slot)
     let kind = node.kind
     // `content-visibility: hidden` skips its contents the way `display: none` does.
     if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
@@ -5147,7 +5288,8 @@ impl<'a> UiTree<'a> {
       else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
       if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
         let fontUnits = run font_units.inherited(&mut self, slot, &computed)
-        run animation.apply(&self, slot, &mut computed, &fontUnits, true)
+        let mut unkept = KeptSamples.none()
+        run animation.apply(&self, slot, &mut computed, &fontUnits, true, &mut unkept)
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
@@ -5169,7 +5311,17 @@ impl<'a> UiTree<'a> {
       if animated != 0 {
         let key = run self.fontKeyOf(computed.text)
         let currentUnits = font_units.context(&self, slot, &computed, key)
-        run animation.apply(&self, slot, &mut computed, &currentUnits, false)
+        // The keyframes' values hold while the style under the animations and the font their
+        // units read do: the font moves when an animation sets its size.
+        let held = self.tickBaseOf(slot)
+        let steady = held != usize.MAX && u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) == 0
+          && computed.text.size == underlyingFontSize
+        let mut kept = if steady { self.tickBases.asSlice()[held].samples } else { KeptSamples.none() }
+        run animation.apply(&self, slot, &mut computed, &currentUnits, false, &mut kept)
+        if steady {
+          let bases = self.tickBases.asMutSlice()
+          bases[held].samples = kept
+        }
       }
     } else {
       self.easingStops = move stops
@@ -5562,12 +5714,25 @@ impl<'a> UiTree<'a> {
 
   // Frames.
 
+  /// Whether the last layout still describes css-layout's tree: no change since.
+  pub fn laidOutCurrent(self: &Self) -> bool {
+    return self.layout.revision() == self.laidOutRevision
+  }
+
+  /// Whether the last layout has a fragment for every node it could: no node was created or
+  /// moved since, though styles may have changed.
+  pub fn laidOutNodes(self: &Self) -> bool {
+    return self.laidOutRevision != usize.MAX && self.layout.structureRevision() <= self.laidOutRevision
+  }
+
   /// Whether a frame would draw something new: styles, layout or scroll offsets changed, or a
   /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
+      || scroll_snap.waiting(self)
+      || touch.animating(self)
       || motion.animating(self)
       || animation.animating(self)
       || self.layout.revision() != self.laidOutRevision
@@ -5600,9 +5765,17 @@ impl<'a> UiTree<'a> {
     run animation.tick(&mut self)
     style_change.begin(&mut self)
     run self.resolveStyles()
+    if self.laidOutNodes() {
+      run scroll_anchor.select(&mut self)
+    }
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    run touch.advance(&mut self)
+    run scroll_snap.settle(&mut self)
+    if run scroll_snap.resnap(&mut self) {
+      run self.layoutFrame()
+    }
     if run interact.settleScrolls(&mut self) {
       run self.layoutFrame()
       drop run interact.settleScrolls(&mut self)
@@ -5622,6 +5795,9 @@ impl<'a> UiTree<'a> {
     run self.settleAnchors()
     run self.finishStyleChange()
     run self.notifyLayout()
+    if self.laidOutCurrent() {
+      run scroll_anchor.select(&mut self)
+    }
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
     run self.paintFrame()
@@ -5635,8 +5811,9 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut pass: usize = 0
-    while pass <= self.anchors.length() {
-      if !(run anchoring.settle(&mut self)) {
+    while pass <= self.anchors.length() + 3 {
+      // A box placed against an anchor can move or size the next one: a few passes.
+      if !(run css_anchor.settle(&mut self)) {
         break
       }
       run self.resolveStyles()
@@ -5761,6 +5938,9 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     style_change.begin(&mut self)
     run self.resolveStyles()
+    if self.laidOutNodes() {
+      run scroll_anchor.select(&mut self)
+    }
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     if run interact.settleScrolls(&mut self) {
@@ -5769,6 +5949,9 @@ impl<'a> UiTree<'a> {
     run self.settleVirtual()
     run self.settleAnchors()
     run self.finishStyleChange()
+    if self.laidOutCurrent() {
+      run scroll_anchor.select(&mut self)
+    }
   }
 
   effect fn refineContainers(self: &mut Self) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -5864,6 +6047,7 @@ impl<'a> UiTree<'a> {
     self.stats.layoutSkipped = false
     if !moved {
       run self.indexFragments()
+      if self.scrollAnchors.length() != 0 { run scroll_anchor.adjust(&mut self) }
     }
     self.layoutObserversDirty = true
     return !moved
@@ -6348,6 +6532,7 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
     && &left.selectionColor == &right.selectionColor
     && &left.placeholderColor == &right.placeholderColor
     && left.hasPlaceholderColor == right.hasPlaceholderColor
+    && left.fillColor == right.fillColor
     && left.textWrapStyle == right.textWrapStyle
     && left.width == right.width
     && left.features.same(&right.features)

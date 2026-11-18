@@ -29,6 +29,7 @@ import properties.values { Unit, Separator, MathOperator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
+import anchor_style { AnchorStyle }
 import properties.keywords
 import silk.collections.hash { Hash, HashSeed }
 import silk.color.rgba { Rgba }
@@ -120,6 +121,8 @@ pub struct Computed {
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
   pub contain: Containment,
+  /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
+  pub anchor: AnchorStyle,
 }
 
 impl Copy for Computed {}
@@ -180,14 +183,15 @@ pub struct Containment { bits: u8 }
 
 impl Copy for Containment {}
 
-struct Contained { size: SizeContainment, paint: bool }
+struct Contained { size: SizeContainment, paint: bool, layout: bool, style: bool }
 impl Copy for Contained {}
 
 const QUERY_SHIFT: u8 = 0
 const CONTAIN_SHIFT: u8 = 2
 const CONTAIN_PAINT: u8 = 16
 const HIDDEN: u8 = 32
-const PAINT: u8 = 64
+const CONTAIN_LAYOUT: u8 = 64
+const CONTAIN_STYLE: u8 = 128
 
 fn sizeCode(size: SizeContainment) -> u8 {
   return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
@@ -204,22 +208,33 @@ impl Containment {
   pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
 
   /// Paint containment, from `contain` or `content-visibility: hidden`.
-  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
+
+  /// Layout containment, from `contain` or `content-visibility: hidden`.
+  pub fn layout(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
+
+  /// Style containment: counters changed inside stay inside.
+  pub fn style(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
 
   /// `content-visibility: hidden`: the contents are skipped like `display: none`.
   pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
 
   fn contained(self: &Self) -> Contained {
-    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
+    return Contained {
+      size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0,
+      layout: u8.bitAnd(self.bits, CONTAIN_LAYOUT) != 0, style: u8.bitAnd(self.bits, CONTAIN_STYLE) != 0,
+    }
   }
 
   fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
     let size = if hidden { SizeContainment.Size } else { contain.size }
     let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
     if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if contain.layout { bits = u8.bitOr(bits, CONTAIN_LAYOUT) }
+    if contain.style { bits = u8.bitOr(bits, CONTAIN_STYLE) }
     if hidden { bits = u8.bitOr(bits, HIDDEN) }
-    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
     self.bits = bits
+    layout.layoutContainment = hidden || contain.paint || contain.layout
     layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
     } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
@@ -253,9 +268,86 @@ impl Containment {
   }
 }
 
+/// The blur of a `backdrop-filter` list such as Tailwind's `blur(40px) saturate(150%)`: its
+/// `blur()` (the other functions are not drawn on the backdrop yet), 0 for a list without one.
+/// Names the shared keywords lack (`saturate`) leave the list as text.
+fn backdropBlurOf(value: &Value, context: &Context) -> Option<f32> {
+  match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => {
+      let items = values.asSlice()
+      let mut i: usize = 0
+      while i < items.length {
+        if let Option<f32>.Some { value: found } = convert.blur(&items[i], context) {
+          return Option<f32>.some(found)
+        }
+        i = i + 1
+      }
+      return Option<f32>.some(0.0)
+    }
+    Value.Text { css } => { return blurInText(Bytes.asSlice(&css), context) }
+    _ => { return convert.blur(value, context) }
+  }
+}
+
+/// The `blur(<number>px|em|rem)` in filter list text, 0 when the list has none.
+fn blurInText(css: &[u8], context: &Context) -> Option<f32> {
+  let name = b"blur("
+  let mut at: usize = 0
+  while at + name.length <= css.length {
+    let mut matched = at == 0 || !(lower(css[at - 1]) >= 97 && lower(css[at - 1]) <= 122 || css[at - 1] == 45)
+    let mut k: usize = 0
+    while matched && k < name.length {
+      matched = lower(css[at + k]) == name[k]
+      k = k + 1
+    }
+    if matched {
+      let mut i = at + name.length
+      while i < css.length && css[i] == 32 { i = i + 1 }
+      let mut amount: f32 = 0.0
+      let mut digits: usize = 0
+      while i < css.length && css[i] >= 48 && css[i] <= 57 {
+        amount = amount * 10.0 + u8.toF32(css[i] - 48)
+        i = i + 1
+        digits = digits + 1
+      }
+      if i < css.length && css[i] == 46 {
+        i = i + 1
+        let mut place: f32 = 0.1
+        while i < css.length && css[i] >= 48 && css[i] <= 57 {
+          amount = amount + place * u8.toF32(css[i] - 48)
+          place = place / 10.0
+          i = i + 1
+          digits = digits + 1
+        }
+      }
+      if digits == 0 { return Option<f32>.None }
+      let rest = css.length - i
+      if rest >= 3 && lower(css[i]) == 114 && lower(css[i + 1]) == 101 && lower(css[i + 2]) == 109 {
+        return Option<f32>.some(amount * context.rootFontSize)
+      }
+      if rest >= 2 && lower(css[i]) == 101 && lower(css[i + 1]) == 109 {
+        return Option<f32>.some(amount * context.fontSize)
+      }
+      if rest >= 2 && lower(css[i]) == 112 && lower(css[i + 1]) == 120 {
+        return Option<f32>.some(amount)
+      }
+      if rest >= 1 && css[i] == 41 && amount == 0.0 {
+        return Option<f32>.some(0.0)
+      }
+      return Option<f32>.None
+    }
+    at = at + 1
+  }
+  return Option<f32>.some(0.0)
+}
+
+fn lower(byte: u8) -> u8 {
+  return if byte >= 65 && byte <= 90 { byte + 32 } else { byte }
+}
+
 /// `contain`'s keywords; `None` for a value that is not one.
 fn containOf(value: &Value) -> Option<Contained> {
-  let mut out = Contained { size: SizeContainment.None, paint: false }
+  let mut out = Contained { size: SizeContainment.None, paint: false, layout: false, style: false }
   if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
     if word == Keyword.None { return Option<Contained>.some(out) }
     if !containWord(&mut out, word) { return Option<Contained>.None }
@@ -280,6 +372,8 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
   if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
   if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
   if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  if word == Keyword.Layout || word == Keyword.Strict || word == Keyword.Content { out.layout = true }
+  if word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content { out.style = true }
   return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
     || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
 }
@@ -447,12 +541,18 @@ pub struct ScrollStyle {
   pub overscrollY: Overscroll,
   /// `scroll-behavior: smooth`.
   pub smooth: bool,
+  /// `overflow-anchor: none` (see `scroll_anchor`).
+  pub anchorNone: bool,
+  /// `scroll-snap-type` (container) and `scroll-snap-align`/`-stop` (item), packed: see `SNAP_*`.
+  pub snap: u8,
   /// `scroll-margin` of the box, in pixels.
   pub margin: Insets<f32>,
   /// `scroll-padding` of the scroll container; `auto` is zero.
   pub padding: Edges,
   /// `scrollbar-color`, which inherits.
   pub colors: ScrollbarColors,
+  /// `touch-action` as `TOUCH_*` bits: the gestures the tree may take for itself.
+  pub touch: u8,
 }
 
 /// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
@@ -507,11 +607,164 @@ impl ScrollStyle {
       overscrollX: Overscroll.Auto,
       overscrollY: Overscroll.Auto,
       smooth: false,
+      anchorNone: false,
+      snap: 0,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
+      touch: TOUCH_AUTO,
     }
   }
+}
+
+/// `ScrollStyle.snap` bits: the container's snapping axes and strictness, then the item's
+/// alignment per axis (`SNAP_NONE` to `SNAP_END`) and `scroll-snap-stop: always`.
+pub const SNAP_X: u8 = 1
+pub const SNAP_Y: u8 = 2
+pub const SNAP_MANDATORY: u8 = 4
+pub const SNAP_STOP: u8 = 128
+pub const SNAP_NONE: u8 = 0
+pub const SNAP_START: u8 = 1
+pub const SNAP_CENTER: u8 = 2
+pub const SNAP_END: u8 = 3
+
+impl ScrollStyle {
+  /// Whether the box is a snap container on that axis.
+  pub fn snapsX(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_X) != 0 }
+  pub fn snapsY(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_Y) != 0 }
+  pub fn snapMandatory(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_MANDATORY) != 0 }
+  /// The item's `scroll-snap-align` on that axis.
+  pub fn alignX(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 3), 3) }
+  pub fn alignY(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 5), 3) }
+  /// The item's `scroll-snap-stop: always`.
+  pub fn snapStop(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_STOP) != 0 }
+
+  fn setSnapType(self: &mut Self, bits: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 248), bits)
+  }
+
+  fn setSnapAlign(self: &mut Self, x: u8, y: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 135), u8.bitOr(u8.shiftLeft(x, 3), u8.shiftLeft(y, 5)))
+  }
+
+  fn setSnapStop(self: &mut Self, always: bool) -> () {
+    self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
+  }
+}
+
+/// `ScrollStyle.touch` bits: the directions a touch may start panning in (`pan-left` is the
+/// finger moving right, the content scrolling left) and `pinch-zoom`.
+pub const TOUCH_PAN_LEFT: u8 = 1
+pub const TOUCH_PAN_RIGHT: u8 = 2
+pub const TOUCH_PAN_UP: u8 = 4
+pub const TOUCH_PAN_DOWN: u8 = 8
+pub const TOUCH_PINCH: u8 = 16
+pub const TOUCH_PAN_X: u8 = 3
+pub const TOUCH_PAN_Y: u8 = 12
+/// `auto` and `manipulation`: every gesture (the tree has no double-tap zoom to leave out).
+pub const TOUCH_AUTO: u8 = 31
+
+fn touchWord(word: Keyword) -> u8 {
+  return if word == Keyword.PanX { TOUCH_PAN_X }
+    else if word == Keyword.PanLeft { TOUCH_PAN_LEFT }
+    else if word == Keyword.PanRight { TOUCH_PAN_RIGHT }
+    else if word == Keyword.PanY { TOUCH_PAN_Y }
+    else if word == Keyword.PanUp { TOUCH_PAN_UP }
+    else if word == Keyword.PanDown { TOUCH_PAN_DOWN }
+    else if word == Keyword.PinchZoom { TOUCH_PINCH }
+    else { 0 }
+}
+
+/// `touch-action`: `auto`, `none`, `manipulation`, or up to one horizontal pan word, one
+/// vertical pan word and `pinch-zoom`, in any order.
+fn touchActionOf(value: &Value) -> Option<u8> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.Auto || word == Keyword.Manipulation { return Option<u8>.some(TOUCH_AUTO) }
+    if word == Keyword.None { return Option<u8>.some(0) }
+    let bits = touchWord(word)
+    return if bits == 0 { Option<u8>.None } else { Option<u8>.some(bits) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length > 3 { return Option<u8>.None }
+    let mut bits: u8 = 0
+    let mut i: usize = 0
+    while i < items.length {
+      let word = match convert.keywordOf(&items[i]) {
+        Option.Some { value: found } => found
+        Option.None => { return Option<u8>.None }
+      }
+      let one = touchWord(word)
+      // Each group (horizontal, vertical, pinch) may be named once.
+      let group: u8 = if u8.bitAnd(one, TOUCH_PAN_X) != 0 { TOUCH_PAN_X }
+        else if u8.bitAnd(one, TOUCH_PAN_Y) != 0 { TOUCH_PAN_Y }
+        else { one }
+      if one == 0 || u8.bitAnd(bits, group) != 0 { return Option<u8>.None }
+      bits = u8.bitOr(bits, one)
+      i = i + 1
+    }
+    return Option<u8>.some(bits)
+  }
+  return Option<u8>.None
+}
+
+/// `scroll-snap-type`: `none`, or an axis and an optional strictness.
+fn snapTypeOf(value: &Value) -> Option<u8> {
+  let mut axis: u8 = 0
+  let mut strict: u8 = 0
+  let mut words: [Keyword; 2] = [Keyword.None; 2]
+  let mut count: usize = 0
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    words[0] = word
+    count = 1
+  } else if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<u8>.None }
+    let mut i: usize = 0
+    while i < 2 {
+      match convert.keywordOf(&items[i]) {
+        Option.Some { value: word } => { words[i] = word }
+        Option.None => { return Option<u8>.None }
+      }
+      i = i + 1
+    }
+    count = 2
+  } else {
+    return Option<u8>.None
+  }
+  let first = words[0]
+  if first == Keyword.None { return if count == 1 { Option<u8>.some(0) } else { Option<u8>.None } }
+  // Block and inline are y and x in horizontal writing modes.
+  axis = if first == Keyword.X || first == Keyword.Inline { SNAP_X }
+    else if first == Keyword.Y || first == Keyword.Block { SNAP_Y }
+    else if first == Keyword.Both { u8.bitOr(SNAP_X, SNAP_Y) } else { 0 }
+  if axis == 0 { return Option<u8>.None }
+  if count == 2 {
+    if words[1] == Keyword.Mandatory { strict = SNAP_MANDATORY } else if words[1] != Keyword.Proximity { return Option<u8>.None }
+  }
+  return Option<u8>.some(u8.bitOr(axis, strict))
+}
+
+fn snapAlignWord(word: Keyword) -> u8 {
+  return if word == Keyword.None { SNAP_NONE } else if word == Keyword.Start { SNAP_START }
+    else if word == Keyword.Center { SNAP_CENTER } else if word == Keyword.End { SNAP_END } else { 255 }
+}
+
+/// `scroll-snap-align`: one value for both axes, or the block (y) then the inline (x) one.
+fn snapAlignOf(value: &Value) -> Option<[u8; 2]> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    let a = snapAlignWord(word)
+    return if a == 255 { Option<[u8; 2]>.None } else { Option<[u8; 2]>.some([a, a]) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<[u8; 2]>.None }
+    let block = match convert.keywordOf(&items[0]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    let inline = match convert.keywordOf(&items[1]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    if block == 255 || inline == 255 { return Option<[u8; 2]>.None }
+    return Option<[u8; 2]>.some([inline, block])
+  }
+  return Option<[u8; 2]>.None
 }
 
 impl ScrollStyle {
@@ -844,6 +1097,7 @@ impl Computed {
       cursor: Option<Cursor>.None,
       contain: Containment.initial(),
       list: ListStyle.initial(),
+      anchor: AnchorStyle.none(),
     }
   }
 
@@ -1240,6 +1494,30 @@ impl Computed {
       CssProperty.OverscrollBehaviorY => {
         setOverscroll(&mut self.scroll.overscrollY, value)
       }
+      CssProperty.AnchorName => { self.anchor.setName(value) }
+      CssProperty.PositionAnchor => { self.anchor.setTarget(value) }
+      CssProperty.PositionArea => { self.anchor.setArea(value) }
+      CssProperty.PositionTryFallbacks => { self.anchor.setTries(value) }
+      CssProperty.ScrollSnapType => {
+        if let Option<u8>.Some { value: bits } = snapTypeOf(value) { self.scroll.setSnapType(bits) }
+      }
+      CssProperty.ScrollSnapAlign => {
+        if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
+      }
+      CssProperty.TouchAction => {
+        if let Option<u8>.Some { value: bits } = touchActionOf(value) { self.scroll.touch = bits }
+      }
+      CssProperty.ScrollSnapStop => {
+        if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
+        else if convert.isKeyword(value, Keyword.Normal) { self.scroll.setSnapStop(false) }
+      }
+      CssProperty.OverflowAnchor => {
+        if convert.isKeyword(value, Keyword.None) {
+          self.scroll.anchorNone = true
+        } else if convert.isKeyword(value, Keyword.Auto) {
+          self.scroll.anchorNone = false
+        }
+      }
       CssProperty.ScrollBehavior => {
         if convert.isKeyword(value, Keyword.Smooth) {
           self.scroll.smooth = true
@@ -1272,10 +1550,10 @@ impl Computed {
         setScrollPadding(&mut self.scroll.padding.left, value, &context)
       }
       CssProperty.Width => {
-        setSize(&mut self.layout.width, value, &context)
+        if !self.anchor.setSize(true, value) { setSize(&mut self.layout.width, value, &context) }
       }
       CssProperty.Height => {
-        setSize(&mut self.layout.height, value, &context)
+        if !self.anchor.setSize(false, value) { setSize(&mut self.layout.height, value, &context) }
       }
       CssProperty.MinWidth => {
         setSize(&mut self.layout.minWidth, value, &context)
@@ -1305,7 +1583,7 @@ impl Computed {
         setDimension(&mut self.layout.padding.top, value, &context)
       }
       CssProperty.Top => {
-        setDimension(&mut self.layout.inset.top, value, &context)
+        if self.anchor.setEdge(0, value) { self.layout.inset.top = Dimension.auto() } else { setDimension(&mut self.layout.inset.top, value, &context) }
       }
       CssProperty.BorderTopWidth => {
         setBorderWidth(&mut self.paint.border.top, value, &context)
@@ -1317,7 +1595,7 @@ impl Computed {
         setDimension(&mut self.layout.padding.right, value, &context)
       }
       CssProperty.Right => {
-        setDimension(&mut self.layout.inset.right, value, &context)
+        if self.anchor.setEdge(1, value) { self.layout.inset.right = Dimension.auto() } else { setDimension(&mut self.layout.inset.right, value, &context) }
       }
       CssProperty.BorderRightWidth => {
         setBorderWidth(&mut self.paint.border.right, value, &context)
@@ -1329,7 +1607,7 @@ impl Computed {
         setDimension(&mut self.layout.padding.bottom, value, &context)
       }
       CssProperty.Bottom => {
-        setDimension(&mut self.layout.inset.bottom, value, &context)
+        if self.anchor.setEdge(2, value) { self.layout.inset.bottom = Dimension.auto() } else { setDimension(&mut self.layout.inset.bottom, value, &context) }
       }
       CssProperty.BorderBottomWidth => {
         setBorderWidth(&mut self.paint.border.bottom, value, &context)
@@ -1341,7 +1619,7 @@ impl Computed {
         setDimension(&mut self.layout.padding.left, value, &context)
       }
       CssProperty.Left => {
-        setDimension(&mut self.layout.inset.left, value, &context)
+        if self.anchor.setEdge(3, value) { self.layout.inset.left = Dimension.auto() } else { setDimension(&mut self.layout.inset.left, value, &context) }
       }
       CssProperty.BorderLeftWidth => {
         setBorderWidth(&mut self.paint.border.left, value, &context)
@@ -2124,7 +2402,7 @@ impl Computed {
         }
       }
       CssProperty.BackdropFilter => {
-        match convert.blur(value, &context) {
+        match backdropBlurOf(value, &context) {
           Option.Some { value: found } => {
             self.paint.backdropBlur = f32.max(0.0, found)
           }
@@ -2283,6 +2561,11 @@ impl Computed {
       CssProperty.SilkSelectionColor => {
         drop setColor(&mut self.text.selectionColor, value)
       }
+      CssProperty.WebkitTextFillColor => {
+        let mut fill = self.text.color
+        let given = !convert.isKeyword(value, Keyword.Currentcolor) && setColor(&mut fill, value)
+        self.text.fillColor = if given { TextStyle.packFill(fill) } else { 0 }
+      }
       CssProperty.SilkPlaceholderColor => {
         if convert.isKeyword(value, Keyword.Auto) {
           self.text.hasPlaceholderColor = false
@@ -2406,7 +2689,9 @@ impl Computed {
     h = colorHash(h, self.text.caret())
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
+    if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
     if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if self.contain.layout() { h = Hash.combine(h, 6) }
     if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
     h = Hash.combine(
       h,

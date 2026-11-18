@@ -13,6 +13,7 @@ import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.num.f32
+import silk.num.u8
 import font_collection.lib { FontCollection }
 
 fn viewport() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
@@ -205,7 +206,6 @@ effect fn backgroundCenter(own: &[u8], sheet: &[u8]) -> [u8; 3] ! TreeError | Co
   let pixel = painted.pixel(50, 50)
   return [pixel.r, pixel.g, pixel.b]
 }
-
 effect fn backgroundShorthandGradients() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let size = b"display:block;width:100px;height:100px;"
   let inline = run backgroundCenter(b"display:block;width:100px;height:100px;background:radial-gradient(closest-side, #f00, transparent)", b"")
@@ -221,8 +221,32 @@ test effect fn pixelBackgroundShorthandPaintsGradients() ! TreeError | CompileEr
   run backgroundShorthandGradients() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+// https://drafts.fxtf.org/compositing-1/#background-blend-mode
+effect fn backgroundBlending() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let own = b"display:block;width:100px;height:100px;background-color:rgb(255, 255, 0);background-image:linear-gradient(rgb(0, 128, 255), rgb(0, 128, 255))"
+  let plain = run backgroundCenter(own, b"")
+  run Testing.expect(plain[0] == 0 && plain[1] == 128 && plain[2] == 255, "without a blend mode the image covers the color")
+  let multiplied = run backgroundCenter(own, b"* > * {background-blend-mode:multiply}")
+  run Testing.expect(multiplied[0] == 0 && multiplied[1] >= 127 && multiplied[1] <= 129 && multiplied[2] == 0, "multiply takes the product with the color")
+  let screened = run backgroundCenter(own, b"* > * {background-blend-mode:screen}")
+  run Testing.expect(screened[0] == 255 && screened[1] == 255 && screened[2] == 255, "screen lightens to white")
+}
+
+test effect fn pixelBackgroundLayersBlendWithTheColor() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backgroundBlending() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 /// The center pixel of a 100 by 100 box on white with `classes`, under `sheet`.
 effect fn classCenter(classes: string, sheet: &[u8]) -> [u8; 3]
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let points = run classPoints(classes, sheet)
+  return points[0]
+}
+
+/// The pixels at (50, 50), (25, 50) and (75, 30) of a 100px box with `classes` under `sheet`.
+effect fn classPoints(classes: string, sheet: &[u8]) -> [[u8; 3]; 3]
   ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -253,8 +277,76 @@ effect fn classCenter(classes: string, sheet: &[u8]) -> [u8; 3]
   let mut snapshot = CpuSnapshot.make()
   run snapshot.sync(&mut tree)
   let painted = run snapshot.render(&tree)
-  let pixel = painted.pixel(50, 50)
-  return [pixel.r, pixel.g, pixel.b]
+  let a = painted.pixel(50, 50)
+  let b = painted.pixel(25, 50)
+  let c = painted.pixel(75, 30)
+  return [[a.r, a.g, a.b], [b.r, b.g, b.b], [c.r, c.g, c.b]]
+}
+
+fn within(points: [[u8; 3]; 3], expected: [[u32; 3]; 3], tolerance: u32) -> bool {
+  let mut i: usize = 0
+  while i < 3 {
+    let mut j: usize = 0
+    while j < 3 {
+      let got = u8.toU32(points[i][j])
+      let want = expected[i][j]
+      if got > want + tolerance || want > got + tolerance { return false }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return true
+}
+
+/// Gradients mix in their `<color-interpolation-method>`, else in sRGB for legacy stops and Oklab
+/// for others. Expected pixels are Chromium's (`--force-color-profile=srgb`) for the same box.
+effect fn interpolatedGradients()
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let cases: [&'static [u8]; 7] = [
+    b".g{background-image:linear-gradient(to bottom right in oklab, oklch(72% 0.21 305) 0%, oklch(78% 0.16 215) 100%)}",
+    b".g{background-image:linear-gradient(90deg, oklch(72% 0.21 305), oklch(78% 0.16 215))}",
+    b".g{background-image:linear-gradient(in oklch longer hue 90deg, red, blue)}",
+    b".g{background-image:radial-gradient(in oklab, red, blue)}",
+    b".g{background-image:conic-gradient(in hsl, red, blue, red)}",
+    b".g{background-image:linear-gradient(90deg, red, blue)}",
+    b".g{background-image:linear-gradient(90deg in oklch, oklch(70% 0.35 30), oklch(70% 0.3 250))}",
+  ]
+  let expected: [[[u32; 3]; 3]; 7] = [
+    [[136, 170, 255], [155, 160, 255], [133, 173, 255]],
+    [[136, 170, 255], [170, 149, 255], [85, 190, 253]],
+    [[0, 147, 0], [186, 101, 0], [0, 130, 181]],
+    [[252, 11, 16], [176, 80, 131], [151, 83, 154]],
+    [[127, 0, 255], [252, 0, 255], [255, 0, 149]],
+    [[126, 0, 128], [190, 0, 65], [63, 0, 193]],
+    [[238, 32, 255], [255, 0, 172], [150, 102, 255]],
+  ]
+  let names: [string<'static>; 7] = [
+    "in oklab, oklch stops",
+    "oklch stops without a method mix in oklab",
+    "in oklch longer hue",
+    "radial in oklab",
+    "conic in hsl",
+    "legacy stops without a method mix in sRGB",
+    "wide gamut stops keep their chroma until the mix",
+  ]
+  let mut i: usize = 0
+  while i < 7 {
+    let points = run classPoints("g", cases[i])
+    run Testing.expect(within(points, expected[i], 3), names[i])
+    i = i + 1
+  }
+}
+
+test effect fn pixelGradientsMixInTheirInterpolationSpace()
+  ! TreeError
+    | CompileError
+    | CssError
+    | GeometryError
+    | OutOfMemoryError
+    | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run interpolatedGradients() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// Tailwind 4 `bg-linear-to-br from-* to-*`: the position is `to bottom right in oklab` once
@@ -286,4 +378,64 @@ test effect fn pixelTailwindGradientUtilitiesPaint()
     | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run tailwindGradients() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The red channel at (16, 50) of a 100px card with `card` styles over a black half and a
+/// white half that meet at x = 20.
+effect fn backdropOverEdge(card: &[u8], sheet: &[u8]) -> u8
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;position:relative;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let black = run written.declarations(b"position:absolute;left:0;top:0;width:20px;height:100px;background-color:black")
+  run batch.style(2, black.asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(1, 3)
+  let style = run written.declarations(card)
+  run batch.style(3, style.asSlice())
+  if sheet.length != 0 {
+    run batch.attribute(3, Attribute.Named { name: run String.copy("class"), value: Option<String>.some(run String.copy("g")) })
+    let compiled = run compile.compile(sheet, &Options.make())
+    let bytes = run compiled.encode()
+    run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  return painted.pixel(16, 50).r
+}
+
+/// `backdrop-filter` lists, as Tailwind writes `backdrop-blur-* backdrop-saturate-*`, still blur.
+effect fn backdropFilterLists()
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let plain = run backdropOverEdge(b"position:absolute;left:0;top:0;width:100px;height:100px", b"")
+  run Testing.expect(plain < 8, "without a backdrop filter the black half shows")
+  let single = run backdropOverEdge(b"position:absolute;left:0;top:0;width:100px;height:100px;backdrop-filter:blur(8px)", b"")
+  run Testing.expect(single > 30, "blur() alone blurs the backdrop")
+  let list = run backdropOverEdge(
+    b"position:absolute;left:0;top:0;width:100px;height:100px;backdrop-filter:blur(8px) saturate(150%)",
+    b"",
+  )
+  run Testing.expect(list > 30, "blur() in a list with saturate() blurs the backdrop")
+  let vars = run backdropOverEdge(
+    b"position:absolute;left:0;top:0;width:100px;height:100px",
+    b".g{--tw-backdrop-blur:blur(8px);--tw-backdrop-saturate:saturate(150%);backdrop-filter:var(--tw-backdrop-blur,) var(--tw-backdrop-brightness,) var(--tw-backdrop-saturate,) var(--tw-backdrop-sepia,)}",
+  )
+  run Testing.expect(vars > 30, "Tailwind's var() list blurs the backdrop")
+}
+
+test effect fn pixelBackdropFilterListsBlur()
+  ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backdropFilterLists() |> Effect.provideMut<Allocator>(&mut allocator)
 }

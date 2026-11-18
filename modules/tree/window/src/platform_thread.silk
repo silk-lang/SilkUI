@@ -58,6 +58,8 @@ import silk.geometry.vector { Vector2 }
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
 import silk.text.string { String }
 import silk.num.f64
 import ui_inspect_server.channel { Wake }
@@ -395,18 +397,10 @@ pub effect fn launch<
     if (run headless.requested()).isSome() {
       return app(Option<Launched>.None)
     }
+    // The UI thread starts before the window system, which takes about 100 ms on macOS: the
+    // app loads its fonts, script and GPU meanwhile. Its first command waits for the platform.
     let mut heap = Allocator.systemAllocatorProvider()
-    let started = run Effect.result(NativePlatform.start())
-    let mut platform = match move started {
-      Result.Success { value } => move value
-      Result.Failure { error } => {
-        drop error
-
-        // No window system: the app still runs (it reports the failure itself).
-        return app(Option<Launched>.None)
-      }
-    }
-    let shared = run makeLink(platform.appearance()) |> Effect.provideMut<Allocator>(&mut heap)
+    let shared = run makeLink(Appearance.Light) |> Effect.provideMut<Allocator>(&mut heap)
     let uiParker = run Parker.make() |> Effect.provideMut<Allocator>(&mut heap)
     let wakeUi = uiParker.unparker()
     let launched = Launched { link: shared.clone(), waker: Waker.make(), parker: move uiParker }
@@ -438,6 +432,16 @@ pub effect fn launch<
         }
       }
     }
+    let started = run Effect.result(NativePlatform.start())
+    let mut platform = match move started {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        // No window system: the app's calls fail, and it reports that itself.
+        run refuse(&shared, &wakeUi, move error)
+        return thread.join()
+      }
+    }
+    setAppearance(&shared, platform.appearance())
     run servePlatform(&mut platform, &shared, &wakeUi) |> Effect.provideMut<Allocator>(&mut heap)
     return thread.join()
   }
@@ -465,6 +469,26 @@ effect fn makeLink(appearance: Appearance) -> Arc<Mutex<Link>>
     also: Option<AlsoWake>.None,
   }
   return run Arc<Mutex<Link>>.make(run Mutex<Link>.make(move link))
+}
+
+fn setAppearance(link: &Arc<Mutex<Link>>, appearance: Appearance) -> () {
+  let mut guard = link.get().lock()
+  let state = guard.getMut()
+  state.appearance = appearance
+}
+
+/// Answers each call of the UI thread with `error` until it is done, when there is no window
+/// system to serve it.
+effect fn refuse(link: &Arc<Mutex<Link>>, wakeUi: &Unparker, error: WindowError) -> () {
+  let mut clock = OsMonotonicClock.make()
+  while !isDone(link) {
+    let commands = takeCommands(link)
+    if commands.length() != 0 {
+      answer(link, wakeUi, Reply.Failed { error: error })
+    }
+    drop commands
+    run Effect.sleep(1000000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
 }
 
 fn markDone(link: &Arc<Mutex<Link>>) -> () {

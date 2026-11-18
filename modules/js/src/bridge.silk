@@ -15,7 +15,14 @@ import silk.num.f64
 import silk.num.u8
 import silk.num.usize
 import silk.num.u64
-import process_memory
+import silk.num.u32
+import silk.system.random { Random }
+import silk.system.random_native { OsRandom }
+import silk.system.system_info { SystemInfo, SystemInfoError }
+import silk.system.system_info_native { OsSystemInfo }
+import ui_tree.process_memory
+import ui_tree.style_media { MediaState }
+import generated_web_apis { webApis }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
@@ -34,12 +41,16 @@ import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
+import ui_js_calls.natives { Natives, NativeCall, Reply }
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
 /// renumbering the others. The ids start above the runtime callbacks' (`REJECTION`). Each
 /// constant below spells its hash out (a constant cannot call a function); a test checks
 /// them, and that no two names share an id.
+/// How many present intervals a [`Bridge`] keeps for `__ui.frameStats` at most.
+const MAX_PRESENTS: usize = 4096
+
 pub fn nativeId(name: &[u8]) -> u32 {
   let mut hash: u32 = 0
   let mut i: usize = 0
@@ -77,6 +88,9 @@ pub const CLEAR_STYLE: u32 = 724429 // nativeId(b"clearStyle")
 /// the value range, and without numbers clears it. An `aria-` name takes ARIA value text
 /// (`"aria-level", "2"`) and returns whether the tree has that attribute.
 pub const ATTRIBUTE: u32 = 281985 // nativeId(b"attribute")
+/// `__ui.capture(id)`: node `id` takes the pointer capture of the press under way, as DOM
+/// `setPointerCapture`; 0 releases it.
+pub const CAPTURE: u32 = 310643 // nativeId(b"capture")
 /// `__ui.focus(id)`.
 pub const FOCUS: u32 = 153071 // nativeId(b"focus")
 /// `__ui.remove(id)`: detaches the node and its subtree; it can be inserted again.
@@ -92,6 +106,28 @@ pub const LOG: u32 = 172868 // nativeId(b"log")
 /// `__ui.memoryUsage()`: the process's memory in bytes as the system shows it to users, 0 when
 /// it cannot say (see `process_memory`).
 pub const MEMORY_USAGE: u32 = 838122 // nativeId(b"memoryUsage")
+/// `__ui.native(id, ...args)`: calls the app's exported Silk function `id` (see
+/// `ui_js_calls.natives`). A failure throws an `InternalError` the importing module rethrows.
+pub const NATIVE: u32 = 226387 // nativeId(b"native")
+/// `__ui.nativeStart(call, id, ...args)`: the same on a background thread; the host answers
+/// with `__ui.nativeDone(call, kind, value)` once it ends (the prelude makes the promise).
+pub const NATIVE_START: u32 = 665098 // nativeId(b"nativeStart")
+/// `__ui.frameStats(field)`: the frames the window presented. Field 0 takes the frames since the
+/// last take and returns how many; 1 is how many painted frames were replaced undrawn among
+/// them, 2 to 5 the 50th, 95th and 99th percentile and the longest of their milliseconds
+/// between presents (0 without frames).
+pub const FRAME_STATS: u32 = 687480 // nativeId(b"frameStats")
+/// `__ui.random()`: 32 secure random bits from the operating system, for `crypto`.
+pub const RANDOM: u32 = 264774 // nativeId(b"random")
+/// `__ui.cpus()`: how many threads can run at once, for `navigator.hardwareConcurrency`.
+pub const CPUS: u32 = 1029073 // nativeId(b"cpus")
+/// `__ui.scale()`: device pixels per CSS pixel in the window's last frame, for
+/// `devicePixelRatio`.
+pub const SCALE: u32 = 264834 // nativeId(b"scale")
+/// `__ui.matchMedia(query)`: whether the media query list matches the last frame's media.
+pub const MATCH_MEDIA: u32 = 629931 // nativeId(b"matchMedia")
+/// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
+pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
 pub const NOW: u32 = 174806 // nativeId(b"now")
 /// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
@@ -208,6 +244,25 @@ pub struct Bridge {
   pub clipboard: List<ClipboardRequest>,
   /// Desktop calls JavaScript asked for (notifications, the tray, global shortcuts).
   pub shell: List<ShellRequest>,
+  /// The app's exported Silk functions, for `__ui.native`.
+  pub natives: Natives,
+  /// `__ui.nativeStart` calls waiting for the host to start them, oldest first.
+  pub started: List<StartedNative>,
+  /// Milliseconds between the window's presents since `__ui.frameStats(0)` last took them, and
+  /// the painted frames replaced undrawn since then (see [`Bridge.presented`]).
+  pub presents: List<f64>,
+  pub dropped: u64,
+  /// What `__ui.frameStats(0)` took, sorted, and its replaced frames.
+  pub taken: List<f64>,
+  pub takenDropped: u64,
+  /// The media of the window's last frame, for `__ui.scale` and `__ui.matchMedia`.
+  pub media: MediaState,
+}
+
+/// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
+pub struct StartedNative {
+  pub token: u32,
+  pub call: NativeCall,
 }
 
 /// A `__ui.shell` call waiting for the host. `text` holds the op's fields, separated by U+001F:
@@ -254,7 +309,54 @@ impl Bridge {
       frames: List<Keyframe>.make(),
       clipboard: List<ClipboardRequest>.make(),
       shell: List<ShellRequest>.make(),
+      natives: Natives.off(),
+      started: List<StartedNative>.make(),
+      presents: List<f64>.make(),
+      dropped: 0,
+      taken: List<f64>.make(),
+      takenDropped: 0,
+      media: MediaState.initial(expectedScale()),
     }
+  }
+
+  /// Adds frames the window presented: the milliseconds between presents, and how many
+  /// painted frames were replaced before the GPU drew them. An app that never reads them
+  /// keeps the newest few thousand.
+  pub effect fn presented(self: &mut Self, intervals: &[f64], dropped: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.presents.length() + intervals.length > MAX_PRESENTS { self.presents.clear() }
+    run self.presents.appendSlice(intervals)
+    self.dropped = self.dropped + dropped
+  }
+
+  /// Takes the presents that wait into `taken`, sorted, for `__ui.frameStats`.
+  fn takePresents(self: &mut Self) -> () {
+    // The two lists swap, so neither allocates again once they have grown.
+    let used = Intrinsic.replace(self.taken, List<f64>.make())
+    self.taken = Intrinsic.replace(self.presents, move used)
+    self.presents.clear()
+    self.takenDropped = self.dropped
+    self.dropped = 0
+    let items = self.taken.asMutSlice()
+    let mut i: usize = 1
+    while i < items.length {
+      let value = items[i]
+      let mut at = i
+      while at > 0 && items[at - 1] > value {
+        items[at] = items[at - 1]
+        at = at - 1
+      }
+      items[at] = value
+      i = i + 1
+    }
+  }
+
+  /// The `fraction` percentile of what `takePresents` took, nearest rank; 0 when it took none.
+  fn takenPercentile(self: &Self, fraction: f64) -> f64 {
+    let items = self.taken.asSlice()
+    if items.length == 0 { return 0.0 }
+    let rank = f64.toUsize(f64.ceil(fraction * usize.toF64(items.length)))
+    let at = if rank == 0 { 0 } else { rank - 1 }
+    return items[if at >= items.length { items.length - 1 } else { at }]
   }
 
   /// Takes timer `id` out. Says whether it was there.
@@ -282,6 +384,15 @@ impl Bridge {
   }
 }
 
+/// The scale a window most likely opens at, until its first frame says.
+fn expectedScale() -> f64 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return 2.0
+  } else {
+    return 1.0
+  }
+}
+
 /// A native function of `__ui`: its JavaScript name and declared argument count.
 pub struct Native {
   pub name: &'static [u8],
@@ -299,6 +410,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"atomStyle", arity: 3 },
     Native { name: b"attribute", arity: 3 },
     Native { name: b"cancelTimer", arity: 1 },
+    Native { name: b"capture", arity: 1 },
     Native { name: b"clearStyle", arity: 2 },
     Native { name: b"clipboardRead", arity: 1 },
     Native { name: b"clipboardWrite", arity: 2 },
@@ -310,6 +422,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"focus", arity: 1 },
     Native { name: b"fontFamily", arity: 2 },
     Native { name: b"format", arity: 3 },
+    Native { name: b"frameStats", arity: 1 },
     Native { name: b"insertAtom", arity: 4 },
     Native { name: b"insertBefore", arity: 3 },
     Native { name: b"keyframe", arity: 2 },
@@ -319,14 +432,19 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"log", arity: 2 },
     Native { name: b"mark", arity: 3 },
     Native { name: b"markdown", arity: 2 },
+    Native { name: b"matchMedia", arity: 1 },
     Native { name: b"memoryUsage", arity: 0 },
+    Native { name: b"native", arity: 1 },
+    Native { name: b"nativeStart", arity: 2 },
     Native { name: b"now", arity: 0 },
     Native { name: b"open", arity: 1 },
+    Native { name: b"random", arity: 0 },
     Native { name: b"release", arity: 1 },
     Native { name: b"remove", arity: 1 },
     Native { name: b"requestFrame", arity: 0 },
     Native { name: b"richText", arity: 4 },
     Native { name: b"root", arity: 1 },
+    Native { name: b"scale", arity: 0 },
     Native { name: b"scrollTo", arity: 3 },
     Native { name: b"select", arity: 3 },
     Native { name: b"setText", arity: 2 },
@@ -335,7 +453,9 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"style", arity: 3 },
     Native { name: b"styleSheet", arity: 3 },
     Native { name: b"compileStyleSheet", arity: 1 },
+    Native { name: b"cpus", arity: 0 },
     Native { name: b"timer", arity: 2 },
+    Native { name: b"webApis", arity: 0 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
   return Option<Native>.none()
@@ -392,6 +512,35 @@ effect fn argOf<'v>(value: ValueRef<'v>) -> Arg ! OutOfMemoryError ? &mut Alloca
 pub union Outcome {
   Returned { pub value: ValueBits },
   TypeError { pub message: List<u8> },
+  /// An `InternalError` with `message`: an exported Silk function failed.
+  Failed { pub message: List<u8> },
+}
+
+/// What `__ui.native` answers for `reply`.
+effect fn replied(reply: Reply) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  return match move reply {
+    Reply.Nothing => Outcome.Returned { value: ValueBits.Undefined }
+    Reply.Number { value } => Outcome.Returned { value: ValueBits.number(value) }
+    Reply.Flag { value } => Outcome.Returned { value: ValueBits.Bool { value: value } }
+    Reply.Text { value } => {
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&value))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    Reply.TypeError { message } => {
+      let mut bytes = List<u8>.make()
+      run bytes.appendSlice(String.utf8Bytes(String.view(&message)))
+      Outcome.TypeError { message: move bytes }
+    }
+    Reply.Failed { message } => {
+      let mut bytes = List<u8>.make()
+      run bytes.appendSlice(String.utf8Bytes(String.view(&message)))
+      Outcome.Failed { message: move bytes }
+    }
+    Reply.OutOfMemory => { fail OutOfMemoryError {} }
+  }
 }
 
 /// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
@@ -460,6 +609,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     }
   } else if function == FOCUS {
     run bridge.batch.focus(first)
+  } else if function == CAPTURE {
+    run bridge.batch.push(if first == 0 { Mutation.ReleasePointerCapture } else { Mutation.SetPointerCapture { id: first } })
   } else if function == REMOVE {
     run bridge.batch.push(Mutation.Remove { id: first })
   } else if function == DESTROY {
@@ -469,8 +620,68 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == LOG {
     let line = run text(argv.get(1))
     run bridge.logs.append(LogEntry { level: first, text: move line })
+  } else if function == NATIVE {
+    let mut call = NativeCall { id: first, args: List<Arg>.make(), reply: Reply.Nothing }
+    let mut at: usize = 1
+    while at < argv.length() {
+      run call.args.append(run argOf(argv.get(at)))
+      at = at + 1
+    }
+    run bridge.natives.call(&mut call)
+    return run replied(move call.reply)
+  } else if function == NATIVE_START {
+    let mut call = NativeCall { id: id(argv.get(1).view()), args: List<Arg>.make(), reply: Reply.Nothing }
+    let mut at: usize = 2
+    while at < argv.length() {
+      run call.args.append(run argOf(argv.get(at)))
+      at = at + 1
+    }
+    run bridge.started.append(StartedNative { token: first, call: move call })
   } else if function == NOW {
     return Outcome.Returned { value: ValueBits.number(bridge.now) }
+  } else if function == FRAME_STATS {
+    if first == 0 {
+      bridge.takePresents()
+      return Outcome.Returned { value: ValueBits.number(usize.toF64(bridge.taken.length())) }
+    }
+    let value = if first == 1 {
+      u64.toF64(bridge.takenDropped)
+    } else if first == 2 {
+      bridge.takenPercentile(0.5)
+    } else if first == 3 {
+      bridge.takenPercentile(0.95)
+    } else if first == 4 {
+      bridge.takenPercentile(0.99)
+    } else {
+      bridge.takenPercentile(1.0)
+    }
+    return Outcome.Returned { value: ValueBits.number(value) }
+  } else if function == RANDOM {
+    let mut source = OsRandom.make()
+    let mut bytes: [u8; 4] = [0; 4]
+    run Random.fillBytes(&mut bytes) |> Effect.provideMut<Random>(&mut source)
+    let bits = u8.toU32(bytes[0]) + u8.toU32(bytes[1]) * 256 + u8.toU32(bytes[2]) * 65536 + u8.toU32(bytes[3]) * 16777216
+    return Outcome.Returned { value: ValueBits.number(u32.toF64(bits)) }
+  } else if function == SCALE {
+    return Outcome.Returned { value: ValueBits.number(bridge.media.scale()) }
+  } else if function == MATCH_MEDIA {
+    let query = run text(argv.get(0))
+    let media = bridge.media
+    return Outcome.Returned { value: ValueBits.Bool { value: run media.matches(String.utf8Bytes(String.view(&query))) } }
+  } else if function == WEB_APIS {
+    let made = run Effect.result(Strings.fromUtf8(webApis()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
+  } else if function == CPUS {
+    let mut info = OsSystemInfo.make()
+    let counted = run Effect.result(SystemInfo.availableParallelism()) |> Effect.provideMut<SystemInfo>(&mut info)
+    let cpus = match move counted {
+      Result<usize, SystemInfoError>.Success { value } => if value > 0 { value } else { 1 }
+      Result<usize, SystemInfoError>.Failure { .. } => 1
+    }
+    return Outcome.Returned { value: ValueBits.number(usize.toF64(cpus)) }
   } else if function == MEMORY_USAGE {
     return Outcome.Returned { value: ValueBits.number(u64.toF64(process_memory.footprint())) }
   } else if function == TIMER {
@@ -589,6 +800,7 @@ impl EngineServices for Bridge {
     return match move outcome {
       Outcome.Returned { value } => value
       Outcome.TypeError { message } => run engine.throwError(realm, NativeErrorKind.Type, message.asSlice())
+      Outcome.Failed { message } => run engine.throwError(realm, NativeErrorKind.Internal, message.asSlice())
     }
   }
 

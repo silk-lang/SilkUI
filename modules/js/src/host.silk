@@ -1,5 +1,6 @@
 //! The host: one engine, one realm, and the loop steps a window host calls.
 import ui_js_calls.stylesheets { Compiler }
+import ui_js_calls.natives { Natives, Reply }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -11,6 +12,7 @@ import ui_tree.node { Event as RawEvent }
 import silkjs.js_engine { Engine }
 import silkjs.js_heap { HeapHeader }
 import silkjs.js_value { ValueBits }
+import ui_tree.style_media { MediaState }
 import silkjs.js_realm { Realm, lendRealm }
 import silkjs.js_owned_value { Value, ValueRef }
 import silkjs.js_core_types { NativeFunctionId, NativeCallProtocol }
@@ -37,7 +39,7 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest, StartedNative }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
@@ -195,7 +197,12 @@ effect fn reportRejections<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm
   let mut rest = move rejections
   while rest.length() > 0 {
     let Rejected { promise: rejected, reason } = rest.remove(0)
+    let handled = run rejectionHandled(&mut engine, realm, rejected.borrow(), reason.borrow())
     realm.release(&mut engine, move rejected)
+    if handled {
+      realm.release(&mut engine, move reason)
+      continue
+    }
     let JsError { message } = run describe(&mut engine, realm, move reason)
     let mut line = run String.copy("Uncaught (in promise) ")
     run line.append(String.view(&message))
@@ -256,6 +263,49 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   return prevented
 }
 
+/// Asks `__ui.rejected(promise, reason)`, the prelude's `unhandledrejection` event, whether a
+/// listener prevented the default; then the host does not report the rejection. A listener
+/// that throws counts as not preventing it.
+effect fn rejectionHandled<'a, 'v, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, rejected: ValueRef<'v>, reason: ValueRef<'v>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let arguments = [rejected.view(), reason.view()]
+  let called = run Effect.result(callUiValue(&mut engine, realm, b"rejected", &arguments))
+  return match move called {
+    Result<bool, JsException>.Success { value } => value
+    Result<bool, JsException>.Failure { .. } => {
+      let thrown = realm.takeException()
+      realm.release(&mut engine, move thrown)
+      false
+    }
+  }
+}
+
+/// Calls `__ui.<name>(...arguments)` when that is a function, and says whether it returned true.
+effect fn callUiValue<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, name: &[u8], arguments: &[ValueBits]) -> bool ! JsException ? &mut Allocator {
+  let ui = run common.get(&mut engine, realm, realm.globalObject(), b"__ui")
+  let function = run common.get(&mut engine, realm, ui.borrow(), name)
+  let mut answer = false
+  if function.borrow().view().isObject() {
+    let called = run Effect.result(promise.call(&mut engine, realm, function.borrow(), ui.borrow(), arguments))
+    match move called {
+      Result<Value, JsException>.Success { value } => {
+        answer = match value.borrow().view() {
+          ValueBits.Bool { value: flag } => flag
+          _ => false
+        }
+        realm.release(&mut engine, move value)
+      }
+      Result<Value, JsException>.Failure { error } => {
+        realm.release(&mut engine, move function)
+        realm.release(&mut engine, move ui)
+        fail move error
+      }
+    }
+  }
+  realm.release(&mut engine, move function)
+  realm.release(&mut engine, move ui)
+  return answer
+}
+
 /// Calls `__ui.<name>(...arguments)` when that is a function, and drops what it returns.
 effect fn callUi<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, name: &[u8], arguments: &[ValueBits]) -> () ! JsException ? &mut Allocator {
   let ui = run common.get(&mut engine, realm, realm.globalObject(), b"__ui")
@@ -288,6 +338,8 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
 impl<'m> JsHost<'m> {
   pub fn setStylesheetCompiler(self: &mut Self, compiler: Compiler) -> () { self.engine.services.stylesheetCompiler = compiler }
   pub fn stylesheetCompiler(self: &Self) -> Compiler { return self.engine.services.stylesheetCompiler }
+  /// The app's exported Silk functions, which `__ui.native` calls.
+  pub fn setNatives(self: &mut Self, natives: Natives) -> () { self.engine.services.natives = natives }
 
   /// A realm with the standard intrinsics, the `__ui` native functions, and the web globals
   /// of `prelude.js`: timers, animation frames, a console, `queueMicrotask`,
@@ -521,6 +573,12 @@ impl<'m> JsHost<'m> {
     }
   }
 
+  /// Hands JavaScript the frames the window presented, for `frameStats()` (see
+  /// [`Bridge.presented`]).
+  pub effect fn presented(self: &mut Self, intervals: &[f64], dropped: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.engine.services.presented(intervals, dropped)
+  }
+
   /// Sets the clock JavaScript reads, in seconds since the host started.
   pub fn advance(self: &mut Self, seconds: f64) -> () {
     self.engine.services.now = seconds * 1000.0
@@ -542,6 +600,25 @@ impl<'m> JsHost<'m> {
   /// Whether JavaScript waits for an animation frame callback.
   pub fn wantsFrame(self: &Self) -> bool {
     return self.engine.services.frame
+  }
+
+  /// Whether `media` differs from the media scripts see now, so [`JsHost.setMedia`] would
+  /// run them.
+  pub fn mediaChanges(self: &Self, media: &MediaState) -> bool { return self.engine.services.media.differs(media) }
+
+  /// Takes the media of the frame about to be drawn. When a query could answer differently,
+  /// `__ui.media()` runs, which sends the `change` events of `matchMedia` lists.
+  pub effect fn setMedia(self: &mut Self, media: MediaState) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    if !self.engine.services.media.differs(&media) { return () }
+    self.engine.services.media = media
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let ran = run Effect.result(callUi(&mut self.engine, realm, b"media", &[]))
+    match move ran {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
   }
 
   /// Moves the clock to `seconds` and runs the timers that are due, earliest first, with
@@ -641,6 +718,48 @@ impl<'m> JsHost<'m> {
     }
     let arguments = [ValueBits.number(u32.toF64(call)), value.borrow().view()]
     let called = run Effect.result(callUi(&mut self.engine, realm, b"clipboard", &arguments))
+    realm.release(&mut self.engine, move value)
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
+  }
+
+  /// The app's exported Silk functions.
+  pub fn natives(self: &Self) -> Natives { return self.engine.services.natives }
+
+  /// Takes the `__ui.nativeStart` calls JavaScript made since the last call, oldest first. The
+  /// host runs each and answers it with [`JsHost.answerNative`].
+  pub fn takeStartedNatives(self: &mut Self) -> List<StartedNative> {
+    return Intrinsic.replace(self.engine.services.started, List<StartedNative>.make())
+  }
+
+  /// Settles the promise of `__ui.nativeStart` call `token` with what the function replied.
+  pub effect fn answerNative(self: &mut Self, token: u32, reply: Reply) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let mut kind: f64 = 0.0
+    let value = match move reply {
+      Reply.Nothing => Value.immediate(ValueBits.Undefined)
+      Reply.Number { value: number } => Value.immediate(ValueBits.number(number))
+      Reply.Flag { value: flag } => Value.immediate(ValueBits.Bool { value: flag })
+      Reply.Text { value: text } => run jsString(String.view(&text))
+      Reply.TypeError { message } => {
+        kind = 1.0
+        run jsString(String.view(&message))
+      }
+      Reply.Failed { message } => {
+        kind = 2.0
+        run jsString(String.view(&message))
+      }
+      Reply.OutOfMemory => {
+        kind = 2.0
+        run jsString("out of memory")
+      }
+    }
+    let arguments = [ValueBits.number(u32.toF64(token)), ValueBits.number(kind), value.borrow().view()]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"nativeDone", &arguments))
     realm.release(&mut self.engine, move value)
     match move called {
       Result<(), JsException>.Success { .. } => ()

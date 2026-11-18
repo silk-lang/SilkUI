@@ -12,11 +12,13 @@
 //! run app.entry(b"/app/app.js", source)
 //! let status = run app.start(b"my-app")
 //! ```
-import ui_js.lib { StylesheetCompiler, Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
+import ui_js.lib { StylesheetCompiler, Natives, Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
 import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
 import ui_js_window.shell { serveShell, shellEventOf, ShellAnswer, ShellEvent }
+import ui_js_window.natives { NativeJobs, Finished }
+import ui_js.lib { Reply }
 import ui_tree.lib { EventRecord }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
@@ -93,6 +95,14 @@ export "C" fn uiNative(state: ?*mut u8, raw: ?*mut u8) -> u32 as "ui_js_node_nat
         let context = request.context
         let memory = engine.memory
         drop run Effect.result(errors.throwError(&mut engine.*, memory, unsafe lendRealm(&context, context), NativeErrorKind.Type, message.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator)
+        embedder.STATUS_THREW
+      }
+      Outcome.Failed { message } => {
+        let mut engineAnchor: u8 = 0
+        let engine = unsafe Pointer.borrowMut<u8, Engine<'static, Services>>(&mut engineAnchor, unsafe embedder.typed<Engine<'static, Services>>(request.engine))
+        let context = request.context
+        let memory = engine.memory
+        drop run Effect.result(errors.throwError(&mut engine.*, memory, unsafe lendRealm(&context, context), NativeErrorKind.Internal, message.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator)
         embedder.STATUS_THREW
       }
     }
@@ -280,6 +290,43 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     return true
   }
 
+  /// Starts JavaScript's `fn.async(...)` calls of exported Silk functions on threads, and
+  /// settles the ones that ended, then applies what their promise jobs built. Says whether a
+  /// call ended.
+  pub effect fn natives(self: &mut Self, jobs: &mut NativeJobs, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let started = Intrinsic.replace(self.bridge.started, List<bridge.StartedNative>.make())
+    if started.length() != 0 { run jobs.start(move started, self.bridge.natives) }
+    let mut done = run jobs.finished()
+    if done.length() == 0 { return false }
+    while done.length() > 0 {
+      let Finished { token, reply } = done.remove(0)
+      let mut kind: f64 = 0.0
+      let value = match move reply {
+        Reply.Nothing => Value.immediate(ValueBits.Undefined)
+        Reply.Number { value: number } => Value.immediate(ValueBits.number(number))
+        Reply.Flag { value: flag } => Value.immediate(ValueBits.Bool { value: flag })
+        Reply.Text { value: words } => run text(String.utf8Bytes(String.view(&words)))
+        Reply.TypeError { message } => {
+          kind = 1.0
+          run text(String.utf8Bytes(String.view(&message)))
+        }
+        Reply.Failed { message } => {
+          kind = 2.0
+          run text(String.utf8Bytes(String.view(&message)))
+        }
+        Reply.OutOfMemory => {
+          kind = 2.0
+          run text(b"out of memory")
+        }
+      }
+      let returned = run self.callReporting(b"nativeDone", &[ValueBits.number(u32.toF64(token)), ValueBits.number(kind), value.borrow().view()])
+      self.release(move returned)
+      self.release(move value)
+    }
+    drop run self.flush(&mut tree)
+    return true
+  }
+
   /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
   /// `platform`, and the calls their promise jobs made, then applies what it built. Says
   /// whether there were calls.
@@ -427,6 +474,8 @@ effect fn text(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
 /// The window client of a [`NodeApp`].
 pub struct NodeClient {
   pub stylesheetCompiler: StylesheetCompiler,
+  /// The app's exported Silk functions, which `__ui.native` calls.
+  pub natives: Natives,
   /// Compiled application stylesheets, installed before each root first paints.
   pub stylesheets: StyleAssets,
   pub stylesheetUpdates: SheetWatch,
@@ -441,11 +490,13 @@ pub struct NodeClient {
   /// Loads the image, icon and `url()` addresses the application names (see
   /// `ui_js_window.lib.JsClient.loader`).
   pub loader: Loader,
+  /// The `fn.async(...)` calls of exported Silk functions running on threads.
+  jobs: NativeJobs,
 }
 
 impl NodeClient {
   pub fn make() -> NodeClient {
-    return NodeClient { stylesheetCompiler: StylesheetCompiler.off(), titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make() }
+    return NodeClient { stylesheetCompiler: StylesheetCompiler.off(), natives: Natives.off(), titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make(), jobs: NativeJobs.make() }
   }
 
   /// Starts the loads the last batch asked for; what ended is told to the application's
@@ -509,7 +560,8 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*)
-    return clipboard || shell
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    return clipboard || shell || natives
   }
 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
@@ -531,13 +583,14 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
     run self.loader.watch(time)
     let loaded = run self.load(&mut state, &mut tree)
-    return styled || loaded
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    return styled || loaded || natives
   }
 
   fn wakeAfter(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> Option<f64> {
     let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(Option<f64>.None))
-    if !self.loader.pending() { return wanted }
-    // Collect running loads about once a frame.
+    if !self.loader.pending() && !self.jobs.pending() { return wanted }
+    // Collect running loads and Silk calls about once a frame.
     return match wanted {
       Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
       Option<f64>.None => Option<f64>.some(0.016)
@@ -591,6 +644,12 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
 
   fn wantsFrames(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
     return state.wantsFrame()
+  }
+
+  effect fn presented(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, intervals: &[f64], dropped: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.bridge.presented(intervals, dropped)
   }
 }
 
@@ -663,6 +722,7 @@ impl<'f> Host for NodeWindow<'f> {
   effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     let mut app = run NodeApp.make(&mut runtime.*)
     app.bridge.stylesheetCompiler = self.client.stylesheetCompiler
+    app.bridge.natives = self.client.natives
     let items = self.modules.asSlice()
     let mut i: usize = 0
     while i < items.length {
