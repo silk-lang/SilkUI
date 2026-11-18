@@ -218,7 +218,7 @@ impl Origin {
       && self.z == other.z
   }
 
-  fn at(self: &Self, box: Rect<f32>) -> Vector3<f32> {
+  pub fn at(self: &Self, box: Rect<f32>) -> Vector3<f32> {
     return Vector3<f32> {
       x: box.xMin + self.x + self.xp * (box.xMax - box.xMin),
       y: box.yMin + self.y + self.yp * (box.yMax - box.yMin),
@@ -240,6 +240,8 @@ pub struct Transform {
   pub perspectiveOrigin: Origin,
   /// `backface-visibility: hidden`.
   pub hideBackface: bool,
+  /// The `offset-*` properties (Motion Path 1).
+  pub offset: Offset,
 }
 
 impl Copy for Transform {}
@@ -255,6 +257,7 @@ impl Transform {
       perspective: 0.0,
       perspectiveOrigin: Origin.center(),
       hideBackface: false,
+      offset: Offset.initial(),
     }
   }
 
@@ -262,7 +265,7 @@ impl Transform {
   /// other than `none` (an identity function still makes one, as in CSS).
   pub fn any(self: &Self) -> bool {
     return self.list.count != 0 || self.translate.kind != NO_OP || self.rotate.kind != NO_OP
-      || self.scale.kind != NO_OP
+      || self.scale.kind != NO_OP || self.offset.path != PATH_NONE
   }
 
   /// Whether the node's children see its `perspective`.
@@ -353,6 +356,12 @@ fn listMatrix(list: &TransformList, from: u32, to: u32, width: f32, height: f32)
 /// and then `transform` apply about the origin (CSS Transforms 2 §"The current transformation
 /// matrix").
 pub fn matrix(t: &Transform, box: Rect<f32>) -> Matrix4<f32> {
+  return matrixAlong(t, box, Option<Placement>.None)
+}
+
+/// `matrix` with the offset transform of `placed` between `scale` and `transform` (Motion Path 1
+/// §"Calculating the path transform"): the anchor moves to the point on the path and turns there.
+pub fn matrixAlong(t: &Transform, box: Rect<f32>, placed: Option<Placement>) -> Matrix4<f32> {
   let width = box.xMax - box.xMin
   let height = box.yMax - box.yMin
   let origin = t.origin.at(box)
@@ -365,6 +374,14 @@ pub fn matrix(t: &Transform, box: Rect<f32>) -> Matrix4<f32> {
   }
   if t.scale.kind != NO_OP {
     m = m * op4(t.scale, &t.list.matrix, width, height)
+  }
+  if let Option<Placement>.Some { value: at } = placed {
+    let anchor = if t.offset.anchorAuto { origin } else { t.offset.anchor.at(box) }
+    m = m * Matrix4<f32>.translation(Vector3<f32> { x: at.x - origin.x, y: at.y - origin.y, z: 0.0 })
+    if at.angle != 0.0 {
+      m = m * rotation(0.0, 0.0, 1.0, at.angle)
+    }
+    m = m * Matrix4<f32>.translation(Vector3<f32> { x: origin.x - anchor.x, y: origin.y - anchor.y, z: 0.0 })
   }
   m = m * listMatrix(&t.list, 0, t.list.count, width, height)
   return m * Matrix4<f32>.translation(Vector3<f32> { x: -origin.x, y: -origin.y, z: -origin.z })
@@ -1827,6 +1844,11 @@ pub const ORIGIN_PROPERTY: u32 = 4
 pub const PERSPECTIVE_PROPERTY: u32 = 5
 pub const PERSPECTIVE_ORIGIN_PROPERTY: u32 = 6
 pub const BACKFACE_PROPERTY: u32 = 7
+pub const OFFSET_PATH_PROPERTY: u32 = 8
+pub const OFFSET_DISTANCE_PROPERTY: u32 = 9
+pub const OFFSET_ROTATE_PROPERTY: u32 = 10
+pub const OFFSET_ANCHOR_PROPERTY: u32 = 11
+pub const OFFSET_POSITION_PROPERTY: u32 = 12
 
 /// Sets the property `which` (`TRANSFORM_LIST`, ...) declares as CSS `text`. An invalid value
 /// leaves it as it was, as an invalid declaration does.
@@ -1882,6 +1904,8 @@ pub fn declare(t: &mut Transform, which: u32, text: &[u8], units: &Units) -> () 
       }
       Option.None => {}
     }
+  } else if which >= OFFSET_PATH_PROPERTY {
+    declareOffset(&mut t.offset, which, spelled, units)
   } else if named(spelled, b"hidden") {
     t.hideBackface = true
   } else if named(spelled, b"visible") {
@@ -1940,6 +1964,9 @@ pub fn placementHash(t: &Transform, h: u64) -> u64 {
   if t.hideBackface {
     out = Hash.combine(out, 1)
   }
+  if t.offset.path != PATH_NONE {
+    out = offsetHash(out, &t.offset)
+  }
   return out
 }
 
@@ -1967,3 +1994,293 @@ pub fn mixOrigin(a: Origin, b: Origin, p: f32) -> Origin {
     z: lerp(a.z, b.z, p),
   }
 }
+
+// Motion Path 1: the `offset-*` properties.
+
+/// `offset-path: none`.
+pub const PATH_NONE: u8 = 0
+/// A `ray()`.
+pub const PATH_RAY: u8 = 1
+/// A basic shape or `path()`, which the node's `paint_css.Effects.offset` holds.
+pub const PATH_SHAPE: u8 = 2
+/// A `<coord-box>` alone: the containing block's box.
+pub const PATH_BOX: u8 = 3
+
+/// `<coord-box>` keywords, of the containing block (and for `path()`, unused).
+pub const BOX_BORDER: u8 = 0
+pub const BOX_PADDING: u8 = 1
+pub const BOX_CONTENT: u8 = 2
+pub const BOX_MARGIN: u8 = 3
+
+/// `ray()` sizes.
+pub const RAY_CLOSEST_SIDE: u8 = 0
+pub const RAY_CLOSEST_CORNER: u8 = 1
+pub const RAY_FARTHEST_SIDE: u8 = 2
+pub const RAY_FARTHEST_CORNER: u8 = 3
+pub const RAY_SIDES: u8 = 4
+
+/// `offset-position` kinds; a set one is `position`.
+pub const PLACE_NORMAL: u8 = 0
+pub const PLACE_AUTO: u8 = 1
+pub const PLACE_SET: u8 = 2
+
+/// The `offset-*` properties of a computed style. None of them inherit.
+pub struct Offset {
+  pub path: u8,
+  /// The reference box of a shape or a box path.
+  pub box: u8,
+  pub raySize: u8,
+  pub contain: bool,
+  /// The ray has `at <position>`: `rayAt`.
+  pub rayAtSet: bool,
+  /// `offset-rotate: auto` (or `reverse`, which is auto plus 180deg in `rotate`).
+  pub autoRotate: bool,
+  pub anchorAuto: bool,
+  pub positionKind: u8,
+  /// The ray's angle in radians, clockwise from up.
+  pub rayAngle: f32,
+  pub rayAt: Origin,
+  /// `offset-distance`: pixels plus a fraction of the path's length.
+  pub distance: f32,
+  pub distanceFraction: f32,
+  /// `offset-rotate`'s angle in radians.
+  pub rotate: f32,
+  pub anchor: Origin,
+  pub position: Origin,
+  /// A hash of the `offset-path` text, so a changed shape repaints.
+  pub pathHash: u64,
+}
+
+impl Copy for Offset {}
+
+impl Offset {
+  pub fn initial() -> Offset {
+    return Offset {
+      path: PATH_NONE,
+      box: BOX_BORDER,
+      raySize: RAY_CLOSEST_SIDE,
+      contain: false,
+      rayAtSet: false,
+      autoRotate: true,
+      anchorAuto: true,
+      positionKind: PLACE_NORMAL,
+      rayAngle: 0.0,
+      rayAt: Origin.center(),
+      distance: 0.0,
+      distanceFraction: 0.0,
+      rotate: 0.0,
+      anchor: Origin.center(),
+      position: Origin.center(),
+      pathHash: 0,
+    }
+  }
+}
+
+/// Where the path puts a box, in its layout space: the point its anchor goes to and how far it
+/// turns there (radians, clockwise), `offset-rotate` included.
+pub struct Placement {
+  pub x: f32,
+  pub y: f32,
+  pub angle: f32,
+}
+
+impl Copy for Placement {}
+
+fn boxWord(word: &[u8]) -> u8 {
+  if named(word, b"border-box") || named(word, b"stroke-box") || named(word, b"view-box") { return BOX_BORDER }
+  if named(word, b"padding-box") { return BOX_PADDING }
+  if named(word, b"content-box") || named(word, b"fill-box") { return BOX_CONTENT }
+  if named(word, b"margin-box") { return BOX_MARGIN }
+  return 255
+}
+
+fn shapeWord(word: &[u8]) -> bool {
+  return startsWith(word, 0, b"path(") || startsWith(word, 0, b"circle(") || startsWith(word, 0, b"ellipse(")
+    || startsWith(word, 0, b"inset(") || startsWith(word, 0, b"polygon(") || startsWith(word, 0, b"rect(")
+    || startsWith(word, 0, b"xywh(")
+}
+
+fn textHash(text: &[u8]) -> u64 {
+  let mut h: u64 = 1469598103934665603
+  let mut i: usize = 0
+  while i < text.length {
+    h = Hash.combine(h, u8.toU64(text[i]))
+    i = i + 1
+  }
+  return h
+}
+
+// The inside of `ray(...)`: an angle, a size, `contain` and `at <position>`, in any order but
+// the position last.
+fn parseRay(inner: &[u8], units: &Units, offset: &mut Offset) -> bool {
+  let words = split(inner, false)
+  let mut hasAngle = false
+  let mut hasSize = false
+  let mut i: usize = 0
+  while i < words.count {
+    let word = item(inner, &words, i)
+    if named(word, b"at") {
+      if i + 1 >= words.count { return false }
+      let rest = part(inner, words.starts[i + 1], words.ends[words.count - 1])
+      match parseOrigin(rest, units, false) {
+        Option.Some { value } => {
+          offset.rayAt = value
+          offset.rayAtSet = true
+        }
+        Option.None => { return false }
+      }
+      break
+    }
+    if named(word, b"contain") {
+      if offset.contain { return false }
+      offset.contain = true
+    } else if named(word, b"closest-side") || named(word, b"closest-corner") || named(word, b"farthest-side")
+      || named(word, b"farthest-corner") || named(word, b"sides") {
+      if hasSize { return false }
+      hasSize = true
+      offset.raySize = if named(word, b"closest-side") { RAY_CLOSEST_SIDE }
+        else if named(word, b"closest-corner") { RAY_CLOSEST_CORNER }
+        else if named(word, b"farthest-side") { RAY_FARTHEST_SIDE }
+        else if named(word, b"farthest-corner") { RAY_FARTHEST_CORNER }
+        else { RAY_SIDES }
+    } else {
+      match angle(word) {
+        Option.Some { value } => {
+          if hasAngle { return false }
+          hasAngle = true
+          offset.rayAngle = value
+        }
+        Option.None => { return false }
+      }
+    }
+    i = i + 1
+  }
+  return hasAngle
+}
+
+/// An `offset-path`: `none`, `ray()`, a basic shape or `path()` (read again by `paint_css`),
+/// a `<coord-box>`, or a shape and a box. `url()` and `shape()` are not followed: none.
+fn parseOffsetPath(text: &[u8], units: &Units) -> Option<Offset> {
+  let mut next = Offset.initial()
+  let words = split(text, false)
+  if words.count == 1 && named(item(text, &words, 0), b"none") {
+    return Option<Offset>.some(next)
+  }
+  if words.count == 0 || words.count > 2 {
+    return Option<Offset>.None
+  }
+  let mut boxed = false
+  let mut shaped = false
+  let mut i: usize = 0
+  while i < words.count {
+    let word = item(text, &words, i)
+    let b = boxWord(word)
+    if b != 255 {
+      if boxed { return Option<Offset>.None }
+      boxed = true
+      next.box = b
+    } else if startsWith(word, 0, b"ray(") && word.length > 5 && word[word.length - 1] == 41 {
+      if shaped { return Option<Offset>.None }
+      shaped = true
+      if !parseRay(part(word, 4, word.length - 1), units, &mut next) { return Option<Offset>.None }
+      next.path = PATH_RAY
+    } else if shapeWord(word) {
+      if shaped { return Option<Offset>.None }
+      shaped = true
+      next.path = PATH_SHAPE
+    } else if startsWith(word, 0, b"url(") || startsWith(word, 0, b"shape(") {
+      if shaped { return Option<Offset>.None }
+      shaped = true
+      next.path = PATH_NONE
+    } else {
+      return Option<Offset>.None
+    }
+    i = i + 1
+  }
+  if !shaped {
+    next.path = PATH_BOX
+  }
+  if next.path != PATH_NONE {
+    next.pathHash = textHash(text)
+  }
+  return Option<Offset>.some(next)
+}
+
+/// Sets the `offset-*` property `which` from CSS `text`; an invalid value changes nothing.
+fn declareOffset(offset: &mut Offset, which: u32, text: &[u8], units: &Units) -> () {
+  if which == OFFSET_PATH_PROPERTY {
+    if let Option<Offset>.Some { value } = parseOffsetPath(text, units) {
+      offset.path = value.path
+      offset.box = value.box
+      offset.raySize = value.raySize
+      offset.contain = value.contain
+      offset.rayAtSet = value.rayAtSet
+      offset.rayAngle = value.rayAngle
+      offset.rayAt = value.rayAt
+      offset.pathHash = value.pathHash
+    }
+  } else if which == OFFSET_DISTANCE_PROPERTY {
+    if let Option<Length>.Some { value } = length(text, units, true) {
+      offset.distance = value.pixels
+      offset.distanceFraction = value.fraction
+    }
+  } else if which == OFFSET_ROTATE_PROPERTY {
+    let words = split(text, false)
+    if words.count == 0 || words.count > 2 { return () }
+    let mut auto = false
+    let mut keyword = false
+    let mut turn: f32 = 0.0
+    let mut hasAngle = false
+    let mut i: usize = 0
+    while i < words.count {
+      let word = item(text, &words, i)
+      if named(word, b"auto") || named(word, b"reverse") {
+        if keyword { return () }
+        keyword = true
+        auto = true
+        if named(word, b"reverse") { turn = turn + PI }
+      } else {
+        match angle(word) {
+          Option.Some { value } => {
+            if hasAngle { return () }
+            hasAngle = true
+            turn = turn + value
+          }
+          Option.None => { return () }
+        }
+      }
+      i = i + 1
+    }
+    offset.autoRotate = auto
+    offset.rotate = turn
+  } else if which == OFFSET_ANCHOR_PROPERTY {
+    if named(text, b"auto") {
+      offset.anchorAuto = true
+      offset.anchor = Origin.center()
+    } else if let Option<Origin>.Some { value } = parseOrigin(text, units, false) {
+      offset.anchorAuto = false
+      offset.anchor = value
+    }
+  } else {
+    if named(text, b"normal") {
+      offset.positionKind = PLACE_NORMAL
+      offset.position = Origin.center()
+    } else if named(text, b"auto") {
+      offset.positionKind = PLACE_AUTO
+      offset.position = Origin.center()
+    } else if let Option<Origin>.Some { value } = parseOrigin(text, units, false) {
+      offset.positionKind = PLACE_SET
+      offset.position = value
+    }
+  }
+}
+
+fn offsetHash(h: u64, o: &Offset) -> u64 {
+  let mut out = Hash.combine(h, o.pathHash)
+  out = Hash.combine(out, u8.toU64(o.box) + u8.toU64(o.positionKind) * 8)
+  out = floatHash(floatHash(floatHash(out, o.distance), o.distanceFraction), o.rotate)
+  if o.autoRotate { out = Hash.combine(out, 2) }
+  if !o.anchorAuto { out = originHash(out, o.anchor) }
+  return originHash(out, o.position)
+}
+
