@@ -29,6 +29,7 @@ import properties.values { Unit, Separator, MathOperator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
+import css_cursor { cursorOf, textCursor, textHasUrl }
 import anchor_style { AnchorStyle }
 import properties.keywords
 import silk.collections.hash { Hash, HashSeed }
@@ -124,6 +125,9 @@ pub struct Computed {
   /// The CSS `cursor`, when the node sets one other than `auto`. Hovering finds it on the
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
+  /// `cursor` lists images before its keyword, read back from the declaration on hover
+  /// (`css_cursor`).
+  pub cursorUrl: bool,
   pub contain: Containment,
   /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
   pub anchor: AnchorStyle,
@@ -414,8 +418,8 @@ pub struct EffectState {
   pub declared: bool,
   /// Whether `will-change` makes the box a stacking context.
   pub stacks: bool,
-  /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
-  /// `paint.radii` holds the length part.
+  /// Whether a corner radius has a percentage or a vertical radius of its own, which
+  /// `paint_css.Effects` holds; `paint.radii` holds the horizontal length parts.
   pub radiusShare: bool,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
@@ -987,6 +991,76 @@ fn setRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context
   }
 }
 
+/// Whether `value` is a valid corner radius: a length-percentage, not negative.
+fn validRadius(value: &Value, context: &Context) -> bool {
+  return match convert.dimension(value, context) {
+    Option.Some { value: found } => (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+      || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0
+    Option.None => false
+  }
+}
+
+/// A corner radius longhand: one radius for both axes, or a horizontal and a vertical one
+/// (`8px 4px`). `length` keeps the horizontal length part; a vertical radius is noted in
+/// `effects` for `paint_css` to read, as a percentage is.
+fn setCornerRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context: &Context) -> () {
+  match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => {
+      let items = values.asSlice()
+      if items.length == 2 {
+        setCornerPair(&mut length.*, &mut effects.*, &items[0], &items[1], true, context)
+      }
+    }
+    _ => setCornerPair(&mut length.*, &mut effects.*, value, value, false, context)
+  }
+}
+
+/// A corner's radii: `horizontal`, and `vertical` when `paired` (else the same).
+fn setCornerPair(length: &mut f32, effects: &mut EffectState, horizontal: &Value, vertical: &Value, paired: bool, context: &Context) -> () {
+  if !validRadius(horizontal, context) {
+    return
+  }
+  if paired {
+    if !validRadius(vertical, context) {
+      return
+    }
+    effects.radiusShare = true
+    effects.declared = true
+  }
+  if hasPercent(horizontal) { setRadius(&mut length.*, &mut effects.*, horizontal, context) } else { setPixels(&mut length.*, horizontal, context) }
+}
+
+/// How many space-separated values `value` lists (one for a single value).
+fn spacedCount(value: &Value) -> usize {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => values.length()
+    _ => 1
+  }
+}
+
+/// Value `index` of a list of `spacedCount(value)` values.
+fn spacedItem(value: &Value, index: usize) -> &Value {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => &values.asSlice()[index]
+    _ => value
+  }
+}
+
+/// Which of `count` values (one to four) corner `corner` takes, top-left first, as `margin`
+/// repeats them.
+fn cornerPick(count: usize, corner: usize) -> usize {
+  if count == 1 {
+    return 0
+  }
+  if count == 2 {
+    return corner % 2
+  }
+  if count == 3 {
+    return if corner == 3 { 1 } else { corner }
+  }
+  return corner
+}
+
 /// A border width: a length, or `thin`, `medium`, `thick`.
 fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
@@ -1057,6 +1131,7 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
       CssProperty.WritingMode | CssProperty.Direction | CssProperty.TextOrientation
         | CssProperty.ContainerName | CssProperty.Container
         | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontVariationSettings | CssProperty.FontWidth | CssProperty.FontStretch
+        | CssProperty.FontPalette | CssProperty.FontVariantAlternates | CssProperty.FontSizeAdjust | CssProperty.FontSmooth
         | CssProperty.FontVariantLigatures | CssProperty.FontVariantCaps | CssProperty.FontVariantNumeric
         | CssProperty.FontVariantPosition | CssProperty.FontKerning
         | CssProperty.Transform | CssProperty.Translate | CssProperty.Rotate | CssProperty.Scale
@@ -1198,6 +1273,7 @@ impl Computed {
       columnRule: ColumnRule.initial(),
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
+      cursorUrl: false,
       contain: Containment.initial(),
       list: ListStyle.initial(),
       anchor: AnchorStyle.none(),
@@ -1247,6 +1323,45 @@ impl Computed {
         self.set(c, value, context)
         self.set(d, value, context)
       }
+    }
+  }
+
+  /// `border-radius`: one to four radii, then optionally a slash and one to four vertical radii.
+  fn radiusShorthand(self: &mut Self, value: &Value, context: &Context) -> () {
+    let mut horizontal = value
+    let mut vertical = value
+    let mut paired = false
+    match &value.* {
+      Value.Sequence { separator: Separator.Slash, values } => {
+        let items = values.asSlice()
+        if items.length != 2 {
+          return ()
+        }
+        horizontal = &items[0]
+        vertical = &items[1]
+        paired = true
+      }
+      _ => {}
+    }
+    let across = spacedCount(horizontal)
+    let down = spacedCount(vertical)
+    if across == 0 || across > 4 || down == 0 || down > 4 {
+      return ()
+    }
+    let mut corner: usize = 0
+    while corner < 4 {
+      let h = spacedItem(horizontal, cornerPick(across, corner))
+      let v = spacedItem(vertical, cornerPick(down, corner))
+      if corner == 0 {
+        setCornerPair(&mut self.paint.radii.topLeft, &mut self.effects, h, v, paired, context)
+      } else if corner == 1 {
+        setCornerPair(&mut self.paint.radii.topRight, &mut self.effects, h, v, paired, context)
+      } else if corner == 2 {
+        setCornerPair(&mut self.paint.radii.bottomRight, &mut self.effects, h, v, paired, context)
+      } else {
+        setCornerPair(&mut self.paint.radii.bottomLeft, &mut self.effects, h, v, paired, context)
+      }
+      corner = corner + 1
     }
   }
 
@@ -1344,7 +1459,7 @@ impl Computed {
         self.four(value, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth, &context)
       }
       CssProperty.BorderRadius => {
-        self.four(value, CssProperty.BorderTopLeftRadius, CssProperty.BorderTopRightRadius, CssProperty.BorderBottomRightRadius, CssProperty.BorderBottomLeftRadius, &context)
+        self.radiusShorthand(value, &context)
       }
       // The tree paints one border color and style, so every side sets the same one.
       CssProperty.BorderColor => {
@@ -1386,12 +1501,29 @@ impl Computed {
       }
       // Sizes and edges.
       CssProperty.Cursor => {
+        self.cursorUrl = false
         match &value.* {
           Value.Keyword { value: word } => {
             self.cursor = cursorOf(keywords.name(word))
           }
           Value.Text { css } => {
-            self.cursor = cursorOf(Bytes.asSlice(&css))
+            self.cursor = textCursor(Bytes.asSlice(&css))
+            self.cursorUrl = textHasUrl(Bytes.asSlice(&css))
+          }
+          Value.Sequence { values, .. } => {
+            // `url(...) x y, ..., keyword`: the images are read back on hover.
+            self.cursorUrl = true
+            let list = values.asSlice()
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
+            if list.length > 0 {
+              if let Value.Keyword { value: word } = &list[list.length - 1] {
+                self.cursor = cursorOf(keywords.name(word))
+              }
+            }
+          }
+          Value.Function { .. } => {
+            self.cursorUrl = true
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
           }
           _ => {}
         }
@@ -1729,16 +1861,16 @@ impl Computed {
         setBorderWidth(&mut self.paint.border.left, value, &context)
       }
       CssProperty.BorderTopLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context)
       }
       CssProperty.BorderTopRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context)
       }
       // Keywords.
       CssProperty.Position => {
@@ -2870,6 +3002,8 @@ impl Computed {
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
     if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
+    // font-palette and font-smooth only change paint; the other extras change layout too.
+    if self.text.features.extras != 0 { h = Hash.combine(h, u32.toU64(self.text.features.extras)) }
     if self.text.emphasis.mark != 0 {
       h = Hash.combine(Hash.combine(h, u32.toU64(self.text.emphasis.mark)), u32.toU64(self.text.emphasis.color))
       let side: u64 = if self.text.emphasis.under { 1 } else { 0 }
@@ -2929,55 +3063,6 @@ impl Computed {
     self.layout.orphans = u32.toUsize(text.orphans)
     self.layout.widows = u32.toUsize(text.widows)
   }
-}
-
-fn named(name: &[u8], word: &[u8]) -> bool {
-  if name.length != word.length { return false }
-  let mut i: usize = 0
-  while i < name.length {
-    let byte = if name[i] >= 65 && name[i] <= 90 { name[i] + 32 } else { name[i] }
-    if byte != word[i] { return false }
-    i = i + 1
-  }
-  return true
-}
-
-/// The tree's cursor for a CSS `cursor` keyword; None for `auto`. Keywords without a cursor
-/// of their own take the nearest one.
-pub fn cursorOf(name: &[u8]) -> Option<Cursor> {
-  if named(name, b"auto") { return Option<Cursor>.None }
-  if named(name, b"pointer") { return Option<Cursor>.Some { value: Cursor.Pointer } }
-  if named(name, b"text") { return Option<Cursor>.Some { value: Cursor.Text } }
-  if named(name, b"none") { return Option<Cursor>.Some { value: Cursor.None } }
-  if named(name, b"wait") { return Option<Cursor>.Some { value: Cursor.Wait } }
-  if named(name, b"progress") { return Option<Cursor>.Some { value: Cursor.Progress } }
-  if named(name, b"help") { return Option<Cursor>.Some { value: Cursor.Help } }
-  if named(name, b"context-menu") { return Option<Cursor>.Some { value: Cursor.ContextMenu } }
-  if named(name, b"copy") { return Option<Cursor>.Some { value: Cursor.Copy } }
-  if named(name, b"alias") { return Option<Cursor>.Some { value: Cursor.Alias } }
-  if named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.VerticalText } }
-  if named(name, b"col-resize") { return Option<Cursor>.Some { value: Cursor.ColumnResize } }
-  if named(name, b"row-resize") { return Option<Cursor>.Some { value: Cursor.RowResize } }
-  if named(name, b"zoom-in") { return Option<Cursor>.Some { value: Cursor.ZoomIn } }
-  if named(name, b"zoom-out") { return Option<Cursor>.Some { value: Cursor.ZoomOut } }
-  if named(name, b"move") || named(name, b"all-scroll") { return Option<Cursor>.Some { value: Cursor.Move } }
-  if named(name, b"grab") { return Option<Cursor>.Some { value: Cursor.Grab } }
-  if named(name, b"grabbing") { return Option<Cursor>.Some { value: Cursor.Grabbing } }
-  if named(name, b"not-allowed") || named(name, b"no-drop") { return Option<Cursor>.Some { value: Cursor.NotAllowed } }
-  if named(name, b"ew-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeHorizontal }
-  }
-  if named(name, b"ns-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeVertical }
-  }
-  if named(name, b"nwse-resize") || named(name, b"nw-resize") || named(name, b"se-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthWestSouthEast }
-  }
-  if named(name, b"nesw-resize") || named(name, b"ne-resize") || named(name, b"sw-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthEastSouthWest }
-  }
-  if named(name, b"crosshair") || named(name, b"cell") { return Option<Cursor>.Some { value: Cursor.Crosshair } }
-  return Option<Cursor>.Some { value: Cursor.Default }
 }
 
 fn borderEdges(border: Insets<f32>) -> Edges {

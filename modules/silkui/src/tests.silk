@@ -1,6 +1,7 @@
 import host { Kind, Plan }
 import host
 import stylesheets
+import process
 import css_style.sheet { Sheet }
 import css_style.sheet_fonts { FaceSource }
 import css_style.tokens { equal }
@@ -177,4 +178,41 @@ effect fn hostNatives() ! OutOfMemoryError | AssertionError<'static> ? &mut Allo
 test effect fn generatedHostsPassExportedFunctions() ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run hostNatives() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn stopsTheWholeGroup() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut FileSystem {
+  let temporary = run FileSystem.temporaryDirectory(&run Path.root(), "silkui-stop-")
+  let ready = run Path.resolve(&temporary.path, "ready")
+  let stopped = run Path.resolve(&temporary.path, "stopped")
+  // The leader waits for a process of its own, as npm waits for Vite: stopping only the leader
+  // would leave that one running.
+  // It gives up after ten seconds, so a failing run leaves nothing behind.
+  let script = "(trap 'echo > stopped; exit 0' TERM; echo > ready; i=0; while [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done) </dev/null >/dev/null 2>&1 & wait"
+  // The file system is rooted at /tmp, so its paths are relative to that.
+  let name = temporary.path.view().unwrapOr("")
+  let mut directory = run String.copy("/tmp")
+  if !String.startsWith(name, "/") { run String.append(&mut directory, "/") }
+  run String.append(&mut directory, name)
+  let mut child = run process.start("sh", &["-c", script], String.view(&directory), &[])
+  let mut waited: u32 = 0
+  while waited < 200 {
+    if run FileSystem.exists(&ready) { break }
+    process.pause(25)
+    waited = waited + 1
+  }
+  let started = run FileSystem.exists(&ready)
+  child.stop()
+  run Testing.expect(started, "the program started its own process")
+  run Testing.expect(child.ended(), "stop waits for the program")
+  run Testing.expect(run FileSystem.exists(&stopped), "stop reaches what the program started")
+}
+
+effect fn stopsInTmp() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/tmp")
+  run stopsTheWholeGroup() |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn stoppingAProgramStopsWhatItStarted() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stopsInTmp() |> Effect.provideMut<Allocator>(&mut allocator)
 }

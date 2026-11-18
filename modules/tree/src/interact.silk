@@ -3,6 +3,7 @@
 //! client hears about comes out as `Event` records; nothing calls back into it.
 import engine { UiTree }
 import input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, POINTER_TOUCH }
+import mutation { Overflow }
 import mutation {
   NodeKind,
   StyleState,
@@ -36,10 +37,10 @@ import text_selection
 import scroll_snap
 import touch
 import scroll_anchor
-import paint { styleSlot, borderBox, paddingBox, overflowClip }
+import paint { styleSlot, borderBox, paddingBox, overflowClip, nodeRadii, insideRounded, rounds }
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
-import layout.lib { FragmentKind, InvalidNode }
+import layout.lib { Fragment, FragmentKind, InvalidNode }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -194,16 +195,40 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) 
     return hitInside(tree, index, x, y, pruned)
   }
   let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
-  if !clips || inside(overflowClip(&tree.node(slot).computed, &f), x, y) {
+  if !clips || insideClip(tree, slot, &f, x, y) {
     let below = hitInside(tree, index, x, y, pruned)
     if below != NONE {
       return below
     }
   }
-  if inside(borderBox(&f), x, y) && targetable(tree, slot) {
+  if insideBorder(tree, slot, &f, x, y) && targetable(tree, slot) {
     return slot
   }
   return NONE
+}
+
+/// Whether (`x`, `y`) is inside box fragment `f` of node `slot`, whose rounded corners cut
+/// what is hit as they cut what is painted.
+fn insideBorder(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let border = borderBox(f)
+  let c = &tree.node(slot).computed
+  if !rounds(c) {
+    return inside(border, x, y)
+  }
+  return insideRounded(border, nodeRadii(tree.node(slot), c, f.size.width, f.size.height), x, y)
+}
+
+/// Whether (`x`, `y`) is inside the overflow clip of box fragment `f` of node `slot`: its
+/// padding box's rounded corners clip when both axes clip, as paint's `clipMask` does.
+fn insideClip(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let c = &tree.node(slot).computed
+  let clip = overflowClip(c, f)
+  let both = usedOverflow(c, true) != Overflow.Visible && usedOverflow(c, false) != Overflow.Visible
+  if !rounds(c) || !(both || c.contain.paint()) {
+    return inside(clip, x, y)
+  }
+  let radii = nodeRadii(tree.node(slot), c, f.size.width, f.size.height).insetTo(borderBox(f), clip)
+  return insideRounded(clip, radii, x, y)
 }
 
 /// Whether the stacking flags describe the last layout.
@@ -289,8 +314,7 @@ fn insideBetween(
     if clipsAt(tree, at) {
       let f = values[at]
       let slot = slotIn(&tree.slotOfCss, f.source)
-      let clip = overflowClip(&tree.node(slot).computed, &f)
-      if !inside(clip, x - (total.x - below.x), y - (total.y - below.y)) {
+      if !insideClip(tree, slot, &f, x - (total.x - below.x), y - (total.y - below.y)) {
         return false
       }
     }
@@ -506,6 +530,19 @@ effect fn hitsChildren(
 
 /// The cursor of the hovered node.
 pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
+  return cursorFrom(tree).cursor
+}
+
+/// What decides the hovered node's cursor: the cursor, and the slot whose CSS `cursor` lists
+/// images first (NONE when none does).
+pub struct CursorFrom {
+  pub cursor: Cursor,
+  pub images: u32,
+}
+
+impl Copy for CursorFrom {}
+
+pub fn cursorFrom(tree: &UiTree<'_>) -> CursorFrom {
   let chain = tree.hoverChain.asSlice()
   let mut i: usize = 0
   while i < chain.length {
@@ -513,21 +550,21 @@ pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
     if alive(tree, slot, pairId(chain[i])) {
       let node = tree.node(slot)
       if node.cursor != Cursor.Default {
-        return node.cursor
+        return CursorFrom { cursor: node.cursor, images: NONE }
       }
       match node.computed.cursor {
         Option.Some { value } => {
-          return value
+          return CursorFrom { cursor: value, images: if node.computed.cursorUrl { slot } else { NONE } }
         }
         Option.None => {}
       }
       if node.kind == NodeKind.Input {
-        return Cursor.Text
+        return CursorFrom { cursor: Cursor.Text, images: NONE }
       }
     }
     i = i + 1
   }
-  return Cursor.Default
+  return CursorFrom { cursor: Cursor.Default, images: NONE }
 }
 
 // Records.

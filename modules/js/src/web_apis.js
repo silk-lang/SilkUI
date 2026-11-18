@@ -335,7 +335,7 @@
   class EventTarget {
     #listeners = new Map();
     addEventListener(type, listener, options) {
-      if (listener == null) return;
+      if (listener == null || options?.signal?.aborted) return;
       const capture = options === true || !!options?.capture;
       let list = this.#listeners.get(type);
       if (!list) this.#listeners.set(type, (list = []));
@@ -369,6 +369,119 @@
       return !event.defaultPrevented;
     }
   }
+
+  // AbortController and AbortSignal, which Node and the SilkJS runtime already have: drop
+  // these when apps move to that runtime.
+  class AbortSignal extends EventTarget {
+    #aborted = false;
+    #reason = undefined;
+    #onabort = null;
+    constructor(key) {
+      if (key !== made) throw new TypeError("Illegal constructor");
+      super();
+    }
+    get aborted() { return this.#aborted; }
+    get reason() { return this.#reason; }
+    get onabort() { return this.#onabort; }
+    set onabort(handler) {
+      if (this.#onabort) this.removeEventListener("abort", this.#onabort);
+      this.#onabort = typeof handler === "function" ? handler : null;
+      if (this.#onabort) this.addEventListener("abort", this.#onabort);
+    }
+    throwIfAborted() { if (this.#aborted) throw this.#reason; }
+    _abort(reason) {
+      if (this.#aborted) return;
+      this.#aborted = true;
+      this.#reason = reason === undefined ? new DOMError("This operation was aborted", "AbortError") : reason;
+      this.dispatchEvent(new Event("abort"));
+    }
+    static abort(reason) {
+      const signal = new AbortSignal(made);
+      signal._abort(reason);
+      return signal;
+    }
+    static timeout(milliseconds) {
+      const signal = new AbortSignal(made);
+      setTimeout(() => signal._abort(new DOMError("The operation timed out.", "TimeoutError")), Number(milliseconds));
+      return signal;
+    }
+    static any(signals) {
+      const signal = new AbortSignal(made);
+      for (const source of signals) {
+        if (!(source instanceof AbortSignal)) throw new TypeError("AbortSignal.any takes AbortSignals");
+        if (source.aborted) { signal._abort(source.reason); return signal; }
+      }
+      for (const source of signals) source.addEventListener("abort", () => signal._abort(source.reason), { once: true });
+      return signal;
+    }
+  }
+  const made = Symbol("AbortSignal");
+  class AbortController {
+    #signal = new AbortSignal(made);
+    get signal() { return this.#signal; }
+    abort(reason) { this.#signal._abort(reason); }
+  }
+  // `DOMException` where the runtime has one, else an Error with the same name.
+  function DOMError(message, name) {
+    if (typeof globalThis.DOMException === "function") return new globalThis.DOMException(message, name);
+    const error = new Error(message);
+    error.name = name;
+    return error;
+  }
+
+  // navigator.getBattery(): one BatteryManager, read from the host. With no battery to read it
+  // reports a full battery on external power, as the spec allows. Change events come from
+  // re-reading every 30 seconds while something listens.
+  const BATTERY_EVENTS = ["chargingchange", "levelchange", "chargingtimechange", "dischargingtimechange"];
+  class BatteryManager extends EventTarget {
+    #state = { charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity };
+    #listening = 0;
+    #poll = 0;
+    constructor(key) {
+      if (key !== made) throw new TypeError("Illegal constructor");
+      super();
+      this._read();
+    }
+    get charging() { return this.#state.charging; }
+    get level() { return this.#state.level; }
+    get chargingTime() { return this.#state.chargingTime; }
+    get dischargingTime() { return this.#state.dischargingTime; }
+    addEventListener(type, listener, options) {
+      super.addEventListener(type, listener, options);
+      if (listener != null && BATTERY_EVENTS.includes(type) && this.#listening++ === 0) this.#poll = setInterval(() => this._read(), 30000);
+    }
+    removeEventListener(type, listener, options) {
+      super.removeEventListener(type, listener, options);
+      if (listener != null && BATTERY_EVENTS.includes(type) && this.#listening > 0 && --this.#listening === 0) clearInterval(this.#poll);
+    }
+    _read() {
+      const next = native.battery(0) === 1
+        ? { charging: native.battery(1) === 1, level: native.battery(2), chargingTime: native.battery(3), dischargingTime: native.battery(4) }
+        : { charging: true, level: 1, chargingTime: 0, dischargingTime: Infinity };
+      const last = this.#state;
+      this.#state = next;
+      if (next.charging !== last.charging) this.dispatchEvent(new Event("chargingchange"));
+      if (next.level !== last.level) this.dispatchEvent(new Event("levelchange"));
+      if (next.chargingTime !== last.chargingTime) this.dispatchEvent(new Event("chargingtimechange"));
+      if (next.dischargingTime !== last.dischargingTime) this.dispatchEvent(new Event("dischargingtimechange"));
+    }
+  }
+  for (const type of BATTERY_EVENTS) {
+    Object.defineProperty(BatteryManager.prototype, "on" + type, {
+      get() { return this._handler?.(type) ?? null; },
+      set(handler) {
+        this._handlers ??= new Map();
+        const old = this._handlers.get(type);
+        if (old) this.removeEventListener(type, old);
+        if (typeof handler === "function") { this._handlers.set(type, handler); this.addEventListener(type, handler); }
+        else this._handlers.delete(type);
+      },
+      configurable: true,
+    });
+  }
+  BatteryManager.prototype._handler = function (type) { return this._handlers?.get(type); };
+  let battery;
+  const getBattery = () => Promise.resolve((battery ??= new BatteryManager(made)));
 
   // matchMedia lists with change listeners: `mediaChanged` runs after the window's media
   // changed (a resize, a move to a display of another scale, a new appearance).
@@ -424,5 +537,5 @@
     for (const list of watched) list._check();
   };
 
-  return { matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
+  return { AbortController, AbortSignal, BatteryManager, getBattery, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })

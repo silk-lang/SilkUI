@@ -6,6 +6,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -22,6 +23,8 @@ import silk.system.system_info { SystemInfo, SystemInfoError }
 import silk.system.system_info_native { OsSystemInfo }
 import ui_tree.process_memory
 import ui_tree.style_media { MediaState }
+import ui_tree.battery
+import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
 import ui_tree.computed_style
@@ -34,6 +37,7 @@ import svg_css.cssom_view { ScrollToOptions, ScrollIntoViewOptions, ScrollLogica
 import svg_css.cssom_view_window { ScrollRequest }
 import svg_css.cssom_geometry { DOMRect }
 import svg_css.cssom_error { CssomError }
+import ui_tree.query { Query }
 import silk.mem.pointer { Pointer }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
@@ -142,6 +146,9 @@ pub const COMPUTED: u32 = 383089 // nativeId(b"computed")
 pub const SCALE: u32 = 264834 // nativeId(b"scale")
 /// `__ui.matchMedia(query)`: whether the media query list matches the last frame's media.
 pub const MATCH_MEDIA: u32 = 629931 // nativeId(b"matchMedia")
+/// `__ui.battery(field)`: 0 reads the battery and answers 1, or 0 when there is none to read;
+/// 1 to 4 answer the reading's charging (0 or 1), level, seconds to full and seconds to empty.
+pub const BATTERY: u32 = 432729 // nativeId(b"battery")
 /// `__ui.supports(conditionText)` and `__ui.supports(property, value)`: `CSS.supports`, as the
 /// tree's `@supports` evaluates it.
 pub const SUPPORTS: u32 = 870406 // nativeId(b"supports")
@@ -192,6 +199,11 @@ pub const THRESHOLD: u32 = 226919 // nativeId(b"threshold")
 /// for all. Changes reach JavaScript after each layout as `__ui.observed(count)`.
 pub const OBSERVE: u32 = 540327 // nativeId(b"observe")
 pub const UNOBSERVE: u32 = 571481 // nativeId(b"unobserve")
+/// `__ui.query(mode, id, selector)`: the selector matcher of stylesheets on the attached tree,
+/// after the pending batch. Mode 0 answers whether node `id` matches (1 or 0), 1 its closest
+/// match (an id, 0 when none), 2 its first matching descendant (an id or 0) and 3 all of
+/// them (ids joined by commas). -1 is an invalid selector; undefined means no tree.
+pub const QUERY: u32 = 1055226 // nativeId(b"query")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
@@ -326,6 +338,8 @@ pub struct Bridge {
   pub tree: ?*mut u8,
   /// The media of the window's last frame, for `__ui.scale` and `__ui.matchMedia`.
   pub media: MediaState,
+  /// The last `__ui.battery(0)` reading.
+  pub battery: BatteryState,
   /// The numbers of the last layout read, for `__ui.geometry`.
   pub geometry: List<f64>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
@@ -390,6 +404,7 @@ impl Bridge {
       takenDropped: 0,
       tree: Pointer.null<u8>(),
       media: MediaState.initial(expectedScale()),
+      battery: BatteryState.full(),
       geometry: List<f64>.make(),
       observers: Observers.make(),
     }
@@ -492,6 +507,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"append", arity: 2 },
     Native { name: b"atomStyle", arity: 3 },
     Native { name: b"attribute", arity: 3 },
+    Native { name: b"battery", arity: 1 },
     Native { name: b"cancelTimer", arity: 1 },
     Native { name: b"computed", arity: 2 },
     Native { name: b"capture", arity: 1 },
@@ -522,6 +538,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"nativeStart", arity: 2 },
     Native { name: b"now", arity: 0 },
     Native { name: b"open", arity: 1 },
+    Native { name: b"query", arity: 3 },
     Native { name: b"random", arity: 0 },
     Native { name: b"release", arity: 1 },
     Native { name: b"remove", arity: 1 },
@@ -764,6 +781,19 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run Random.fillBytes(&mut bytes) |> Effect.provideMut<Random>(&mut source)
     let bits = u8.toU32(bytes[0]) + u8.toU32(bytes[1]) * 256 + u8.toU32(bytes[2]) * 65536 + u8.toU32(bytes[3]) * 16777216
     return Outcome.Returned { value: ValueBits.number(u32.toF64(bits)) }
+  } else if function == BATTERY {
+    if first == 0 {
+      return match battery.read() {
+        Option<BatteryState>.Some { value } => {
+          bridge.battery = value
+          Outcome.Returned { value: ValueBits.number(1.0) }
+        }
+        Option<BatteryState>.None => Outcome.Returned { value: ValueBits.number(0.0) }
+      }
+    }
+    let reading = bridge.battery
+    let value = if first == 1 { if reading.charging { 1.0 } else { 0.0 } } else if first == 2 { reading.level } else if first == 3 { reading.chargingTime } else { reading.dischargingTime }
+    return Outcome.Returned { value: ValueBits.number(value) }
   } else if function == COMPUTED {
     return run computed(&mut bridge.*, first, argv.get(1))
   } else if function == SCALE {
@@ -813,6 +843,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
       run supports.condition(String.utf8Bytes(String.view(&condition)))
     }
     return Outcome.Returned { value: ValueBits.Bool { value: answer } }
+  } else if function == QUERY {
+    return run query(&mut bridge.*, first, id(argv.get(1).view()), argv.get(2))
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {
@@ -1170,6 +1202,72 @@ effect fn selectedText(batch: &mut Batch, tree: &mut UiTree<'_>) -> String
   if tree.layoutPending() { run tree.layoutNow() }
   run text_selection.refresh(&mut tree.*)
   return run text_selection.text(&tree.*)
+}
+
+/// `__ui.query`: applies the pending batch to the attached tree, then runs the query.
+effect fn query<'v>(bridge: &mut Bridge, mode: u32, id: u32, selector: ValueRef<'v>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.Undefined } }
+  let text = run Strings.toUtf8(selector.view(), false)
+  let parsed = run Query.parse(text.asSlice())
+  let compiled = match move parsed {
+    Option<Query>.Some { value } => move value
+    Option<Query>.None => { return Outcome.Returned { value: ValueBits.number(-1.0) } }
+  }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  if bridge.batch.length() != 0 {
+    let applied = run Effect.result(tree.apply(run bridge.batch.take()))
+    match move applied {
+      Result<(), TreeError | OutOfMemoryError>.Success { .. } => ()
+      Result<(), TreeError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        TreeError invalid => {
+          drop invalid
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the tree refused a mutation before a selector query")
+          return Outcome.TypeError { message: move message }
+        }
+      }
+    }
+  }
+  if mode == 0 { return Outcome.Returned { value: ValueBits.number(if run compiled.matches(&tree.*, id) { 1.0 } else { 0.0 }) } }
+  if mode == 1 { return Outcome.Returned { value: ValueBits.number(u32.toF64(run compiled.closest(&tree.*, id))) } }
+  let mut found = List<u32>.make()
+  run compiled.select(&tree.*, id, mode == 3, &mut found)
+  if mode == 2 {
+    return Outcome.Returned { value: ValueBits.number(if found.length() == 0 { 0.0 } else { u32.toF64(found.asSlice()[0]) }) }
+  }
+  let mut out = Bytes.make()
+  let mut at: usize = 0
+  while at < found.length() {
+    if at > 0 { run out.append(b",") }
+    run writeDecimal(&mut out, found.asSlice()[at])
+    at = at + 1
+  }
+  let made = run Effect.result(Strings.fromUtf8(out.asSlice()))
+  return match move made {
+    Result.Success { value: ids } => Outcome.Returned { value: ids }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+effect fn writeDecimal(out: &mut Bytes, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = u32.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  while count > 0 {
+    count = count - 1
+    run out.append(Slice.view<u8>(&digits, count, 1))
+  }
 }
 
 effect fn applyAndRead(batch: &mut Batch, tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool
