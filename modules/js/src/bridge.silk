@@ -21,6 +21,7 @@ import silk.system.random_native { OsRandom }
 import silk.system.system_info { SystemInfo, SystemInfoError }
 import silk.system.system_info_native { OsSystemInfo }
 import ui_tree.process_memory
+import ui_tree.style_media { MediaState }
 import generated_web_apis { webApis }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom }
 import silkjs.js_engine { Engine }
@@ -87,6 +88,9 @@ pub const CLEAR_STYLE: u32 = 724429 // nativeId(b"clearStyle")
 /// the value range, and without numbers clears it. An `aria-` name takes ARIA value text
 /// (`"aria-level", "2"`) and returns whether the tree has that attribute.
 pub const ATTRIBUTE: u32 = 281985 // nativeId(b"attribute")
+/// `__ui.capture(id)`: node `id` takes the pointer capture of the press under way, as DOM
+/// `setPointerCapture`; 0 releases it.
+pub const CAPTURE: u32 = 310643 // nativeId(b"capture")
 /// `__ui.focus(id)`.
 pub const FOCUS: u32 = 153071 // nativeId(b"focus")
 /// `__ui.remove(id)`: detaches the node and its subtree; it can be inserted again.
@@ -117,6 +121,11 @@ pub const FRAME_STATS: u32 = 687480 // nativeId(b"frameStats")
 pub const RANDOM: u32 = 264774 // nativeId(b"random")
 /// `__ui.cpus()`: how many threads can run at once, for `navigator.hardwareConcurrency`.
 pub const CPUS: u32 = 1029073 // nativeId(b"cpus")
+/// `__ui.scale()`: device pixels per CSS pixel in the window's last frame, for
+/// `devicePixelRatio`.
+pub const SCALE: u32 = 264834 // nativeId(b"scale")
+/// `__ui.matchMedia(query)`: whether the media query list matches the last frame's media.
+pub const MATCH_MEDIA: u32 = 629931 // nativeId(b"matchMedia")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
@@ -246,6 +255,8 @@ pub struct Bridge {
   /// What `__ui.frameStats(0)` took, sorted, and its replaced frames.
   pub taken: List<f64>,
   pub takenDropped: u64,
+  /// The media of the window's last frame, for `__ui.scale` and `__ui.matchMedia`.
+  pub media: MediaState,
 }
 
 /// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
@@ -304,6 +315,7 @@ impl Bridge {
       dropped: 0,
       taken: List<f64>.make(),
       takenDropped: 0,
+      media: MediaState.initial(expectedScale()),
     }
   }
 
@@ -372,6 +384,15 @@ impl Bridge {
   }
 }
 
+/// The scale a window most likely opens at, until its first frame says.
+fn expectedScale() -> f64 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return 2.0
+  } else {
+    return 1.0
+  }
+}
+
 /// A native function of `__ui`: its JavaScript name and declared argument count.
 pub struct Native {
   pub name: &'static [u8],
@@ -389,6 +410,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"atomStyle", arity: 3 },
     Native { name: b"attribute", arity: 3 },
     Native { name: b"cancelTimer", arity: 1 },
+    Native { name: b"capture", arity: 1 },
     Native { name: b"clearStyle", arity: 2 },
     Native { name: b"clipboardRead", arity: 1 },
     Native { name: b"clipboardWrite", arity: 2 },
@@ -410,6 +432,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"log", arity: 2 },
     Native { name: b"mark", arity: 3 },
     Native { name: b"markdown", arity: 2 },
+    Native { name: b"matchMedia", arity: 1 },
     Native { name: b"memoryUsage", arity: 0 },
     Native { name: b"native", arity: 1 },
     Native { name: b"nativeStart", arity: 2 },
@@ -421,6 +444,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"requestFrame", arity: 0 },
     Native { name: b"richText", arity: 4 },
     Native { name: b"root", arity: 1 },
+    Native { name: b"scale", arity: 0 },
     Native { name: b"scrollTo", arity: 3 },
     Native { name: b"select", arity: 3 },
     Native { name: b"setText", arity: 2 },
@@ -585,6 +609,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     }
   } else if function == FOCUS {
     run bridge.batch.focus(first)
+  } else if function == CAPTURE {
+    run bridge.batch.push(if first == 0 { Mutation.ReleasePointerCapture } else { Mutation.SetPointerCapture { id: first } })
   } else if function == REMOVE {
     run bridge.batch.push(Mutation.Remove { id: first })
   } else if function == DESTROY {
@@ -636,6 +662,12 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run Random.fillBytes(&mut bytes) |> Effect.provideMut<Random>(&mut source)
     let bits = u8.toU32(bytes[0]) + u8.toU32(bytes[1]) * 256 + u8.toU32(bytes[2]) * 65536 + u8.toU32(bytes[3]) * 16777216
     return Outcome.Returned { value: ValueBits.number(u32.toF64(bits)) }
+  } else if function == SCALE {
+    return Outcome.Returned { value: ValueBits.number(bridge.media.scale()) }
+  } else if function == MATCH_MEDIA {
+    let query = run text(argv.get(0))
+    let media = bridge.media
+    return Outcome.Returned { value: ValueBits.Bool { value: run media.matches(String.utf8Bytes(String.view(&query))) } }
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {

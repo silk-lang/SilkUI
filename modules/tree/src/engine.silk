@@ -15,7 +15,7 @@ import container_watch
 import style_change
 import style_change { Change }
 import container_watch { Watch }
-import style_media { Preferences }
+import style_media { Preferences, MediaState }
 import properties.convert as properties_convert
 import properties.convert { Context }
 import properties.catalog
@@ -78,6 +78,8 @@ import properties.values
 import properties.convert
 import input { Input }
 import interact
+import touch
+import touch { TouchState }
 import layers
 import edit
 import rich
@@ -896,6 +898,17 @@ pub struct UiTree<'a> {
   pub thumbVertical: bool,
   pub thumbStart: f32,
   pub thumbOffset: f32,
+  /// Fingers on the screen, the gesture they make, and a flick (see `touch`).
+  pub touch: TouchState,
+  /// What a touch input's `begin` left for its `finish` (`touch.TOUCH_*`), and the finger it
+  /// saw come off.
+  pub touchPending: u8,
+  pub touchEnded: usize,
+  /// The pointer the pointer records being made speak for: DOM `pointerId`, `POINTER_*` type
+  /// and `isPrimary`.
+  pub pointerId: u32,
+  pub pointerType: u32,
+  pub pointerPrimary: bool,
   /// Where the pointer is, and whether it is in the window.
   pub pointerX: f32,
   pub pointerY: f32,
@@ -1079,6 +1092,12 @@ impl<'a> UiTree<'a> {
       thumbVertical: true,
       thumbStart: 0.0,
       thumbOffset: 0.0,
+      touch: TouchState.make(),
+      touchPending: 0,
+      touchEnded: usize.MAX,
+      pointerId: 1,
+      pointerType: 0,
+      pointerPrimary: true,
       pointerX: 0.0,
       pointerY: 0.0,
       pointerInside: false,
@@ -3731,6 +3750,7 @@ impl<'a> UiTree<'a> {
     let interruptsScroll = match &input {
       Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
+      Input.TouchStart { .. } => true
       Input.KeyDown { .. } => true
       _ => false
     }
@@ -3757,6 +3777,7 @@ impl<'a> UiTree<'a> {
     let interruptsScroll = match &input.* {
       Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
+      Input.TouchStart { .. } => true
       Input.KeyDown { .. } => true
       _ => false
     }
@@ -4334,6 +4355,22 @@ impl<'a> UiTree<'a> {
       }
       slot = slot + 1
     }
+  }
+
+  /// The media `input` gives the current root's stylesheets: what a script's `matchMedia`
+  /// evaluates its queries against.
+  pub fn mediaState(self: &Self, input: FrameInput) -> MediaState {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let mut environment = Environment.headless(0.0, 0.0)
+    if at != usize.MAX {
+      environment = self.styleSheets.asSlice()[at].environment
+    } else if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      value.apply(&mut environment)
+    }
+    environment.initial.viewportWidth = f32.toF64(input.width)
+    environment.initial.viewportHeight = f32.toF64(input.height)
+    environment.resolutionDppx = f32.toF64(input.scale)
+    return MediaState.of(environment)
   }
 
   /// Updates host media inputs without restyling until a condition changes truth.
@@ -5696,6 +5733,7 @@ impl<'a> UiTree<'a> {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
       || scroll_snap.waiting(self)
+      || touch.animating(self)
       || motion.animating(self)
       || animation.animating(self)
       || self.layout.revision() != self.laidOutRevision
@@ -5734,6 +5772,7 @@ impl<'a> UiTree<'a> {
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    run touch.advance(&mut self)
     run scroll_snap.settle(&mut self)
     if run scroll_snap.resnap(&mut self) {
       run self.layoutFrame()
