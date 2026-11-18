@@ -74,7 +74,32 @@ test("listen flags follow the listeners", () => {
   box.addEventListener("keydown", listener, { once: true });
   box.removeEventListener("click", listener);
   assert.deepEqual(mock.take(), [["listen", box.nodeId, 4], ["listen", box.nodeId, 4 | 128], ["listen", box.nodeId, 128]]);
-  assert.throws(() => box.addEventListener("nope", listener), /no event/);
+  box.addEventListener("ping", listener);
+  assert.deepEqual(mock.take(), []);
+});
+
+test("the app's own events go through the tree as on the web", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.append(inner);
+  const log = [];
+  outer.addEventListener("ping", (event) => log.push("outer capture " + event.eventPhase + " " + (event.target === inner)), true);
+  inner.addEventListener("ping", (event) => log.push("inner " + event.detail));
+  outer.addEventListener("ping", (event) => {
+    log.push("outer " + event.eventPhase + " " + (event.currentTarget === outer));
+    event.preventDefault();
+  });
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 3, bubbles: true, cancelable: true })), false);
+  assert.deepEqual(log, ["outer capture 1 true", "inner 3", "outer 3 true"]);
+
+  log.length = 0;
+  inner.addEventListener("ping", (event) => event.stopImmediatePropagation(), true);
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 4, bubbles: true })), true);
+  assert.deepEqual(log, ["outer capture 1 true"]);
+
+  log.length = 0;
+  outer.dispatchEvent(new Event("ping"));
+  assert.deepEqual(log, ["outer capture 2 false", "outer 2 true"]);
 });
 
 test("preventDefault reaches the host for cancelable events only", () => {

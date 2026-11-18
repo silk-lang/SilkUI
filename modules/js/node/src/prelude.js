@@ -1,4 +1,4 @@
-// What a ui-js realm on the SilkJS runtime adds to Node's globals: animation frames,
+// What a ui-js realm on the SilkJS runtime adds to Node's globals: animation and idle frames,
 // `window.open`, `navigator.clipboard`, the `@silkui/core` modules the host defines, and
 // uncaught exceptions printed as a browser console prints them, with the window left running.
 (() => {
@@ -30,6 +30,16 @@
     }
     if (failure) throw failure.error;
   };
+
+  // Idle callbacks run from a timer, with a 50 ms budget as the web gives at most.
+  globalThis.requestIdleCallback ??= (callback) => {
+    if (typeof callback !== "function") throw new TypeError("requestIdleCallback needs a function");
+    return setTimeout(() => {
+      const start = performance.now();
+      callback({ didTimeout: false, timeRemaining: () => Math.max(0, 50 - (performance.now() - start)) });
+    }, 1);
+  };
+  globalThis.cancelIdleCallback ??= (id) => clearTimeout(id);
 
   // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
   // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a

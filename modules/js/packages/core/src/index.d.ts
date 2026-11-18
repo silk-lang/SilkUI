@@ -105,8 +105,14 @@ export class Node {
   set disabled(value: boolean);
   focus(): void;
   scrollTo(x: number, y: number): void;
+  scroll(x: number, y: number): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  /** The app's own event types, sent with `dispatchEvent`. */
+  addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
   removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  /** Sends `event` through the tree from this node, as on the web. False when a listener prevented the default. */
+  dispatchEvent(event: globalThis.Event): boolean;
 }
 
 /** A text leaf. It takes its look from its parent. */
