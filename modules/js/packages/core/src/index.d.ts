@@ -395,6 +395,48 @@ export interface PointerButtonEvent extends PointerEvent {
   readonly detail: number;
 }
 
+/** A compatibility mouse event, after the pointer event of a mouse, or before a tap's click. */
+export interface MouseEvent extends ModifierEvent {
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly x: number;
+  readonly y: number;
+  readonly button: number;
+  readonly buttons: number;
+  readonly detail: number;
+}
+
+/** One finger, as DOM `Touch`. No host reports contact size or force yet. */
+export interface Touch {
+  readonly identifier: number;
+  /** The node the finger went down on, for as long as it stays down. */
+  readonly target: Node;
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly pageX: number;
+  readonly pageY: number;
+  readonly screenX: number;
+  readonly screenY: number;
+  readonly radiusX: number;
+  readonly radiusY: number;
+  readonly rotationAngle: number;
+  readonly force: number;
+}
+
+export interface TouchList extends ReadonlyArray<Touch> {
+  item(index: number): Touch | null;
+}
+
+/**
+ * As DOM `TouchEvent`, after the finger's pointer event. Preventing `touchstart` or a
+ * `touchmove` before the tree pans keeps the gesture: no pan and no click.
+ */
+export interface TouchEvent extends ModifierEvent {
+  readonly touches: TouchList;
+  readonly targetTouches: TouchList;
+  readonly changedTouches: TouchList;
+}
+
 export interface WheelEvent extends PointerEvent {
   readonly deltaX: number;
   readonly deltaY: number;
@@ -456,6 +498,17 @@ export interface EventMap {
   pointercancel: PointerEvent;
   pointerover: PointerEvent;
   pointerout: PointerEvent;
+  touchstart: TouchEvent;
+  touchmove: TouchEvent;
+  touchend: TouchEvent;
+  touchcancel: TouchEvent;
+  mousedown: MouseEvent;
+  mouseup: MouseEvent;
+  mousemove: MouseEvent;
+  mouseover: MouseEvent;
+  mouseout: MouseEvent;
+  mouseenter: MouseEvent;
+  mouseleave: MouseEvent;
   wheel: WheelEvent;
   keydown: KeyboardEvent;
   keyup: KeyboardEvent;
