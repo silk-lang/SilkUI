@@ -32,6 +32,7 @@ import mutation {
 import node { NONE, NO_INDEX, Event, EventKind }
 import edit
 import clipboard
+import text_selection
 import scroll_snap
 import touch
 import scroll_anchor
@@ -1795,7 +1796,7 @@ pub effect fn beginInput(tree: &mut UiTree<'_>, input: &Input) -> ()
     Input.TextInput { .. } => {}
     Input.ImePreedit { .. } => {}
     Input.Command { command } => {
-      let target = keyTarget(&tree.*)
+      let target = run clipboard.target(&mut tree, keyTarget(&tree.*))
       remember(&mut tree, target)
       run clipboard.beginCommand(&mut tree, target, command)
     }
@@ -1852,6 +1853,8 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       let origin = captured(&tree.*)
       if origin != NONE && origin == tree.focused && tree.node(origin).kind == NodeKind.Input {
         run edit.pointerDrag(&mut tree, origin, x, y)
+      } else if tree.textSelection.unit != text_selection.UNIT_NONE {
+        run text_selection.pointerDrag(&mut tree, x, y)
       }
     }
     Input.PointerDown { x, y, button, modifiers, clickCount } => {
@@ -1876,6 +1879,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
         // The press landed on nothing.
         if !prevented {
           run tree.focusSlot(NONE)
+          run text_selection.clear(&mut tree)
         }
         return ()
       }
@@ -1902,6 +1906,14 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
           run edit.pointerDown(&mut tree, hit, x, y, clickCount, modifiers)
         }
       }
+      if !prevented {
+        // A press in an input selects there; anywhere else it selects document text.
+        if tree.node(hit).kind == NodeKind.Input {
+          run text_selection.clear(&mut tree)
+        } else {
+          run text_selection.pointerDown(&mut tree, hit, x, y, clickCount, u32.bitAnd(modifiers, MOD_SHIFT) != 0)
+        }
+      }
     }
     Input.PointerUp { x, y, button, modifiers } => {
       if button != BUTTON_PRIMARY {
@@ -1915,6 +1927,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       if origin != NONE && tree.node(origin).kind == NodeKind.Input {
         edit.pointerUp(&mut tree, origin)
       }
+      text_selection.pointerUp(&mut tree)
       let hit = hitSlot(&tree.*, x, y)
       let mut clicked = NONE
       if tree.captureMode == CAPTURE_EXPLICIT {
@@ -1945,6 +1958,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       if origin != NONE && tree.node(origin).kind == NodeKind.Input {
         edit.pointerUp(&mut tree, origin)
       }
+      text_selection.pointerUp(&mut tree)
       let holder = explicitHolder(&tree.*)
       run captureRecord(
         &mut tree,
@@ -1984,7 +1998,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
         if let Option<EditCommand>.Some { value: command } = clipboard.shortcut(tree.keymap, String.view(&key), modifiers) {
           if command == EditCommand.Paste {
             run clipboard.requestPaste(&mut tree, target)
-          } else if clipboard.matters(&tree.*, target) {
+          } else if run clipboard.matters(&mut tree, target) {
             run tree.queueFollowUp(Input.Command { command: command })
           }
           return ()

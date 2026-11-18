@@ -1,0 +1,357 @@
+//! Document text selection: presses, drags, double and triple clicks and Shift on paragraphs of
+//! text, `user-select`, copying (Chromium's plain text), keeping up with mutations, and the
+//! highlight. Expected selections and texts are what Chromium gave for the same gestures
+//! (`tests/chrome/selection.js` replays them there; `selection.jsonl` keeps its answers).
+import ui_tree.legacy {
+  UiTree,
+  TreeError,
+  Batch,
+  FrameInput,
+  NodeKind,
+  Attribute,
+  Role,
+  Input,
+  Mutation,
+  HostRequest,
+  Keymap,
+  MOD_SHIFT,
+  MOD_CONTROL,
+  BUTTON_PRIMARY,
+  CpuSnapshot
+}
+import ui_tree.cssom_view as view
+import ui_tree.text_selection
+import ui_fixtures.fixtures as fixtures
+import svg_css.written
+import svg_css.tokens { CssError }
+import svg_css.cssom_geometry { DOMRect }
+import svg_css.cssom_error { CssomError }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Rgba8 }
+import font_collection.lib { FontCollection }
+import silk.collections.list { List }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+import silk.text.string { String }
+
+fn same(a: Rgba8, b: Rgba8) -> bool { return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a }
+
+fn frame() -> FrameInput { return FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 } }
+
+effect fn styled(batch: &mut Batch, id: u32, css: &[u8]) -> () ! CssError | OutOfMemoryError ? &mut Allocator {
+  let declarations = run written.declarations(css)
+  run batch.style(id, declarations.asSlice())
+}
+
+/// A body (id 1) as the probe pages had it: 16px text on 24px lines, 20px margins.
+effect fn body(batch: &mut Batch) -> () ! CssError | OutOfMemoryError ? &mut Allocator {
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run styled(&mut batch, 1, b"font-family:'Geist';font-size:16px;line-height:24px;padding:20px;width:360px;height:300px;box-sizing:border-box")
+}
+
+/// A paragraph `id` with text node `id + 100`.
+effect fn paragraph(batch: &mut Batch, parent: u32, id: u32, text: string) -> () ! CssError | OutOfMemoryError ? &mut Allocator {
+  run batch.create(id, NodeKind.Box)
+  run batch.append(parent, id)
+  run batch.attribute(id, Attribute.Role { value: Role.Paragraph })
+  run styled(&mut batch, id, b"margin:0 0 12px")
+  run batch.text(id, id + 100, text)
+}
+
+/// The middle of the left half of character `index` of text node `id`, as the probe pressed.
+effect fn spot(tree: &UiTree<'_>, id: u32, index: usize, x: &mut f32, y: &mut f32) -> () ! CssomError | OutOfMemoryError ? &mut Allocator {
+  let mut rects = List<DOMRect>.make()
+  run view.rangeClientRects(
+    tree,
+    view.Range { start: view.BoundaryPoint { node: id, offset: index }, end: view.BoundaryPoint { node: id, offset: index + 1 } },
+    &mut rects,
+  )
+  let rect = rects.get(rects.length() - 1)
+  let quarter = rect.width / 4.0
+  x.* = f64.toF32(rect.x + (if quarter < 2.0 { quarter } else { 2.0 }))
+  y.* = f64.toF32(rect.y + rect.height / 2.0)
+}
+
+effect fn down(tree: &mut UiTree<'_>, x: f32, y: f32, clicks: u32, modifiers: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run tree.dispatch(Input.PointerMove { x: x, y: y, modifiers: 0 })
+  run tree.dispatch(Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: modifiers, clickCount: clicks })
+}
+
+effect fn moveTo(tree: &mut UiTree<'_>, x: f32, y: f32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run tree.dispatch(Input.PointerMove { x: x, y: y, modifiers: 0 })
+}
+
+effect fn up(tree: &mut UiTree<'_>, x: f32, y: f32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run tree.dispatch(Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+}
+
+/// Presses on character `from` of text `a`, drags to character `to` of text `b` and lets go.
+effect fn drag(tree: &mut UiTree<'_>, a: u32, from: usize, b: u32, to: usize) -> () ! CssomError | OutOfMemoryError ? &mut Allocator {
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree.*, a, from, &mut x, &mut y)
+  run down(&mut tree, x, y, 1, 0)
+  run spot(&tree.*, b, to, &mut x, &mut y)
+  run moveTo(&mut tree, x, y)
+  run up(&mut tree, x, y)
+}
+
+effect fn click(tree: &mut UiTree<'_>, id: u32, index: usize, clicks: u32, modifiers: u32) -> () ! CssomError | OutOfMemoryError ? &mut Allocator {
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree.*, id, index, &mut x, &mut y)
+  run down(&mut tree, x, y, clicks, modifiers)
+  run up(&mut tree, x, y)
+}
+
+effect fn number(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+  if value >= 10 { run number(&mut out, value / 10) }
+  run out.append(digits[value % 10])
+}
+
+/// The selection as `anchor@offset focus@offset` with node ids.
+effect fn ends(tree: &mut UiTree<'_>) -> String ! OutOfMemoryError ? &mut Allocator {
+  run text_selection.refresh(&mut tree)
+  let s = &tree.textSelection
+  let mut out = String.make()
+  if !s.anchor.exists() {
+    run out.append("none")
+    return move out
+  }
+  run number(&mut out, u32.toUsize(s.anchor.id))
+  run out.append("@")
+  run number(&mut out, s.anchor.offset)
+  run out.append(" ")
+  run number(&mut out, u32.toUsize(s.focus.id))
+  run out.append("@")
+  run number(&mut out, s.focus.offset)
+  return move out
+}
+
+effect fn copied(tree: &mut UiTree<'_>) -> String ! OutOfMemoryError ? &mut Allocator {
+  run text_selection.refresh(&mut tree)
+  return run text_selection.text(&tree.*)
+}
+
+effect fn expectSelection(tree: &mut UiTree<'_>, expected: string, text: string, what: string<'static>) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let found = run ends(&mut tree)
+  run Testing.expect(String.view(&found) == expected, what)
+  let got = run copied(&mut tree)
+  run Testing.expect(String.view(&got) == text, what)
+}
+
+effect fn twoParagraphs(fonts: &FontCollection) -> UiTree<'_> ! TreeError | CssError | OutOfMemoryError ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run paragraph(&mut batch, 1, 2, "First paragraph here")
+  run paragraph(&mut batch, 1, 3, "Second paragraph here")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  return move tree
+}
+
+effect fn drags() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run twoParagraphs(&fonts)
+  run drag(&mut tree, 102, 1, 102, 13)
+  run expectSelection(&mut tree, "102@1 102@13", "irst paragra", "a drag in one text node selects from the press to the pointer")
+  run drag(&mut tree, 102, 6, 103, 6)
+  run expectSelection(&mut tree, "102@6 103@6", "paragraph here\n\nSecond", "a drag across paragraphs copies two line breaks after a paragraph")
+  run drag(&mut tree, 103, 6, 102, 2)
+  run expectSelection(&mut tree, "103@6 102@2", "rst paragraph here\n\nSecond", "a backward drag keeps its anchor where it started")
+
+  // Past the end of the content, the focus goes to the end of the last line.
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree, 102, 2, &mut x, &mut y)
+  run down(&mut tree, x, y, 1, 0)
+  run moveTo(&mut tree, x, 280.0)
+  run up(&mut tree, x, 280.0)
+  run expectSelection(&mut tree, "102@2 103@21", "rst paragraph here\n\nSecond paragraph here", "below everything selects to the end")
+  // Left of a line, in the padding, the focus is the line's start.
+  run spot(&tree, 103, 6, &mut x, &mut y)
+  run down(&mut tree, x, y, 1, 0)
+  run spot(&tree, 102, 0, &mut x, &mut y)
+  run moveTo(&mut tree, 5.0, y)
+  run up(&mut tree, 5.0, y)
+  run expectSelection(&mut tree, "103@6 102@0", "First paragraph here\n\nSecond", "left of a line selects from its start")
+
+  // A plain click collapses the selection, and a press on nothing clears it.
+  run click(&mut tree, 102, 4, 1, 0)
+  run expectSelection(&mut tree, "102@4 102@4", "", "a click leaves a caret, which copies nothing")
+}
+
+test effect fn dragsSelectInTreeOrderBetweenPointsFoundOnScreen() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run drags() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn units() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run paragraph(&mut batch, 1, 2, "Hello brave new world and more words")
+  run paragraph(&mut batch, 1, 3, "Next one")
+  run paragraph(&mut batch, 1, 4, "foo.bar_baz-qux, 3.14 e-mail@x.com")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+
+  run click(&mut tree, 102, 8, 2, 0)
+  run expectSelection(&mut tree, "102@6 102@11", "brave", "a double click selects the word")
+  run click(&mut tree, 104, 5, 2, 0)
+  run expectSelection(&mut tree, "104@4 104@11", "bar_baz", "words break at dots and dashes but not underscores")
+  run click(&mut tree, 104, 18, 2, 0)
+  run expectSelection(&mut tree, "104@17 104@21", "3.14", "a number with a decimal point is one word")
+  run click(&mut tree, 102, 8, 3, 0)
+  run expectSelection(&mut tree, "102@0 1@1", "Hello brave new world and more words\n\n", "a triple click selects the paragraph and its line break")
+
+  // A drag after a double click grows by whole words, both ways.
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree, 102, 8, &mut x, &mut y)
+  run down(&mut tree, x, y, 2, 0)
+  run spot(&tree, 102, 17, &mut x, &mut y)
+  run moveTo(&mut tree, x, y)
+  run up(&mut tree, x, y)
+  run expectSelection(&mut tree, "102@6 102@21", "brave new world", "a word drag ends on a word end")
+  run spot(&tree, 102, 17, &mut x, &mut y)
+  run down(&mut tree, x, y, 2, 0)
+  run spot(&tree, 102, 2, &mut x, &mut y)
+  run moveTo(&mut tree, x, y)
+  run up(&mut tree, x, y)
+  run expectSelection(&mut tree, "102@21 102@0", "Hello brave new world", "a backward word drag keeps the first word")
+
+  // Shift extends from the anchor; on a Mac the end farther from the press stays.
+  run drag(&mut tree, 102, 10, 102, 15)
+  run click(&mut tree, 102, 3, 1, MOD_SHIFT)
+  run expectSelection(&mut tree, "102@10 102@3", "lo brav", "Shift with a press moves the focus")
+  run click(&mut tree, 102, 10, 1, 0)
+  run click(&mut tree, 102, 20, 1, MOD_SHIFT)
+  run expectSelection(&mut tree, "102@10 102@20", "e new worl", "Shift extends a caret")
+  tree.keymap = Keymap.Mac
+  run drag(&mut tree, 102, 6, 102, 21)
+  run click(&mut tree, 102, 8, 1, MOD_SHIFT)
+  run expectSelection(&mut tree, "102@21 102@8", "ave new world", "on a Mac Shift moves the nearer end")
+}
+
+test effect fn doubleAndTripleClicksAndShiftSelectByUnit() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run units() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn userSelect() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  // <p id=2>Start <span id=5 style="user-select:none">SKIP</span> end text</p>
+  run paragraph(&mut batch, 1, 2, "Start ")
+  run batch.create(5, NodeKind.Box)
+  run batch.append(2, 5)
+  run styled(&mut batch, 5, b"display:inline;user-select:none")
+  run batch.text(5, 105, "SKIP")
+  run batch.text(2, 6, " end text")
+  // <p id=3>Code <span id=7 style="user-select:all">npm install silk</span> done</p>
+  run paragraph(&mut batch, 1, 3, "Code ")
+  run batch.create(7, NodeKind.Box)
+  run batch.append(3, 7)
+  run styled(&mut batch, 7, b"display:inline;user-select:all")
+  run batch.text(7, 107, "npm install silk")
+  run batch.text(3, 8, " done")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+
+  run drag(&mut tree, 102, 1, 6, 8)
+  run expectSelection(&mut tree, "102@1 6@8", "tart  end tex", "user-select: none text is left out of what is copied")
+  run drag(&mut tree, 105, 2, 6, 8)
+  run expectSelection(&mut tree, "none", "", "a press on user-select: none starts no selection")
+  run click(&mut tree, 107, 5, 1, 0)
+  run expectSelection(&mut tree, "3@1 3@2", "npm install silk", "a click in user-select: all selects the element")
+  run drag(&mut tree, 103, 1, 107, 5)
+  run expectSelection(&mut tree, "103@1 3@2", "ode npm install silk", "a drag into user-select: all takes it whole")
+}
+
+test effect fn userSelectDecidesWhatCanBeSelected() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run userSelect() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn copyAndMutations() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run twoParagraphs(&fonts)
+  run drag(&mut tree, 102, 6, 103, 6)
+  run tree.dispatch(Input.KeyDown { key: run String.copy("c"), code: run String.copy("KeyC"), modifiers: MOD_CONTROL, repeat: false })
+  let mut requests = List<HostRequest>.make()
+  run tree.takeRequests(&mut requests)
+  let mut written = false
+  let mut i: usize = 0
+  while i < requests.length() {
+    let found = match &requests.asSlice()[i] {
+      HostRequest.WriteClipboard { text: copiedText } => String.view(&copiedText) == "paragraph here\n\nSecond"
+      _ => false
+    }
+    if found { written = true }
+    i = i + 1
+  }
+  run Testing.expect(written, "Ctrl+C writes the selected text to the clipboard")
+
+  // Shorter text pulls the end in; a removed end clears the selection.
+  let mut batch = Batch.make()
+  run batch.setText(103, "Sec")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run expectSelection(&mut tree, "102@6 103@3", "paragraph here\n\nSec", "an end past shorter text moves to its end")
+  run batch.push(Mutation.Remove { id: 3 })
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run expectSelection(&mut tree, "none", "", "removing an end's node clears the selection")
+}
+
+test effect fn copyWritesTextAndMutationsKeepTheSelectionValid() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run copyAndMutations() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn highlight() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run twoParagraphs(&fonts)
+  let mut snapshot = CpuSnapshot.make()
+  run tree.frame(frame())
+  let plain = run snapshot.render(&tree)
+  run drag(&mut tree, 102, 0, 102, 5)
+  run tree.frame(frame())
+  let selected = run snapshot.render(&tree)
+  // Between the glyphs of "First" the highlight shows; past the selection nothing changed.
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree, 102, 0, &mut x, &mut y)
+  let top = f32.toU32(y) - 10
+  let changed = !same(selected.pixel(f32.toU32(x) - 2, top), plain.pixel(f32.toU32(x) - 2, top))
+  run Testing.expect(changed, "the selected text gets the highlight, at line height")
+  run spot(&tree, 102, 12, &mut x, &mut y)
+  run Testing.expect(same(selected.pixel(f32.toU32(x), top), plain.pixel(f32.toU32(x), top)), "text past the selection keeps its look")
+  // Collapsing the selection repaints the node rather than replaying the highlighted one.
+  run click(&mut tree, 102, 12, 1, 0)
+  run tree.frame(frame())
+  let cleared = run snapshot.render(&tree)
+  run spot(&tree, 102, 0, &mut x, &mut y)
+  run Testing.expect(same(cleared.pixel(f32.toU32(x) - 2, top), plain.pixel(f32.toU32(x) - 2, top)), "a cleared selection paints again without the highlight")
+}
+
+test effect fn selectedTextIsHighlightedAndRepaintsWhenTheSelectionMoves() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run highlight() |> Effect.provideMut<Allocator>(&mut allocator)
+}

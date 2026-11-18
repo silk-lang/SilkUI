@@ -74,8 +74,17 @@ export class Node {
   readonly lastChild: Node | null;
   readonly nextSibling: Node | null;
   readonly previousSibling: Node | null;
+  /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
+  readonly nodeType: 1 | 3 | 11;
+  hasChildNodes(): boolean;
+  /** A copy with the same looks and attributes, and with `deep` copies of the children. */
+  cloneNode(deep?: boolean): this;
+  /** Joins adjacent text children and drops empty ones, in the whole subtree. */
+  normalize(): void;
   /** Whether `other` is this node or inside it. */
   contains(other: Node | null): boolean;
+  /** Puts `node` where `child` is and detaches `child`. */
+  replaceChild<T extends Node>(node: Node, child: T): T;
   /** Inserts `child` before `before`, or last without it. A child already in the tree moves. */
   insertBefore<T extends Node>(child: T, before?: Node | null): T;
   appendChild<T extends Node>(child: T): T;
@@ -123,17 +132,110 @@ export class Node {
 export class Text extends Node {
   constructor(data?: string);
   data: string;
+  nodeValue: string;
   textContent: string;
+  /** In UTF-16 code units. */
+  readonly length: number;
+  substringData(offset: number, count: number): string;
+  appendData(data: string): void;
+  insertData(offset: number, data: string): void;
+  deleteData(offset: number, count: number): void;
+  replaceData(offset: number, count: number, data: string): void;
+  /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
+  splitText(offset: number): Text;
 }
 
-/** An editable text field. `value` follows what the user types. */
+/** Nodes held together outside the tree. Inserting it inserts its children and empties it. */
+export class DocumentFragment extends Node {
+  constructor();
+}
+
+export function createDocumentFragment(): DocumentFragment;
+
+/** Two boundary points: a node and an offset (a child index, or UTF-16 units in text). */
+export abstract class AbstractRange {
+  readonly startContainer: Node;
+  readonly startOffset: number;
+  readonly endContainer: Node;
+  readonly endOffset: number;
+  readonly collapsed: boolean;
+}
+
+export interface StaticRangeInit {
+  startContainer: Node;
+  startOffset: number;
+  endContainer: Node;
+  endOffset: number;
+}
+
+/** A range that does not follow changes to the tree. */
+export class StaticRange extends AbstractRange {
+  constructor(init: StaticRangeInit);
+}
+
+/** A live range over the app's nodes, as the DOM Standard defines it. */
+export class Range extends AbstractRange {
+  static readonly START_TO_START: 0;
+  static readonly START_TO_END: 1;
+  static readonly END_TO_END: 2;
+  static readonly END_TO_START: 3;
+  readonly START_TO_START: 0;
+  readonly START_TO_END: 1;
+  readonly END_TO_END: 2;
+  readonly END_TO_START: 3;
+  /** Collapsed at the start of the mounted root. */
+  constructor();
+  readonly commonAncestorContainer: Node;
+  setStart(node: Node, offset: number): void;
+  setEnd(node: Node, offset: number): void;
+  setStartBefore(node: Node): void;
+  setStartAfter(node: Node): void;
+  setEndBefore(node: Node): void;
+  setEndAfter(node: Node): void;
+  collapse(toStart?: boolean): void;
+  selectNode(node: Node): void;
+  selectNodeContents(node: Node): void;
+  compareBoundaryPoints(how: 0 | 1 | 2 | 3, sourceRange: Range): -1 | 0 | 1;
+  comparePoint(node: Node, offset: number): -1 | 0 | 1;
+  isPointInRange(node: Node, offset: number): boolean;
+  intersectsNode(node: Node): boolean;
+  cloneRange(): Range;
+  detach(): void;
+  deleteContents(): void;
+  extractContents(): DocumentFragment;
+  cloneContents(): DocumentFragment;
+  insertNode(node: Node): void;
+  surroundContents(newParent: Node): void;
+  toString(): string;
+}
+
+/** A new live range, collapsed at the start of the root. */
+export function createRange(): Range;
+
+/**
+ * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
+ * string indices, as on the web.
+ */
 export class Input extends Node {
   constructor();
+  /** Setting a different value puts the caret at its end. */
   value: string;
-  readonly selectionStart: number;
-  readonly selectionEnd: number;
-  /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
-  setSelectionRange(anchor: number, focus: number): void;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: "forward" | "backward" | "none";
+  /** Selects `start` to `end`; with `direction` "backward" the caret sits at `start`. */
+  setSelectionRange(start: number, end: number, direction?: "forward" | "backward" | "none"): void;
+  /** Selects the whole value. */
+  select(): void;
+  /** Replaces the selection with `replacement`. */
+  setRangeText(replacement: string): void;
+  /** Replaces `start` to `end` with `replacement` and places the selection by `selectionMode`. */
+  setRangeText(
+    replacement: string,
+    start: number,
+    end: number,
+    selectionMode?: "select" | "start" | "end" | "preserve",
+  ): void;
 }
 
 /** An inline atom of a rich input: a mention or a chip. */
@@ -179,8 +281,6 @@ export class RichInput extends Input {
   toggleMark(name: string): void;
   /** Replaces the text from `start` to `end` with `atom`. */
   insertAtom(start: number, end: number, atom: RichAtom): void;
-  /** Selects from `anchor` to `focus`, as string indices. */
-  setSelectionRange(anchor: number, focus: number): void;
 }
 
 /**

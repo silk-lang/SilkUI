@@ -9,8 +9,9 @@ import engine { UiTree }
 import edit
 import edit { HostRequest, Keymap }
 import input { Input, EditCommand, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
-import mutation { LISTEN_CLIPBOARD, LISTEN_BEFORE_INPUT }
+import mutation { LISTEN_CLIPBOARD, LISTEN_BEFORE_INPUT, NodeKind }
 import node { NONE, Event, EventKind }
+import text_selection
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -67,10 +68,33 @@ fn pathListens(tree: &UiTree<'_>, slot: u32, flag: u32) -> bool {
   return false
 }
 
-/// Whether a clipboard command at `slot` would do anything: an input has focus, or a listener
-/// on the way hears the event.
-pub fn matters(tree: &UiTree<'_>, slot: u32) -> bool {
-  return slot != NONE && (edit.focusedInput(tree) != NONE || pathListens(tree, slot, LISTEN_CLIPBOARD))
+/// Where a clipboard command goes: `keyTarget` (the focused node, or the root) while something
+/// has focus, else the element holding the selection's focus, as the spec has it.
+pub effect fn target(tree: &mut UiTree<'_>, keyTarget: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.focused != NONE && keyTarget == tree.focused {
+    return keyTarget
+  }
+  run text_selection.refresh(&mut tree)
+  if !tree.textSelection.ranged() {
+    return keyTarget
+  }
+  let slot = tree.textSelection.focus.slot
+  if tree.node(slot).kind == NodeKind.Text && tree.node(slot).parent != NONE {
+    return tree.node(slot).parent
+  }
+  return slot
+}
+
+/// Whether a clipboard command from `keyTarget` would do anything: an input has focus, text is
+/// selected, or a listener on the way hears the event.
+pub effect fn matters(tree: &mut UiTree<'_>, keyTarget: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let slot = run target(&mut tree, keyTarget)
+  return slot != NONE && (edit.focusedInput(&tree.*) != NONE || tree.textSelection.ranged()
+    || pathListens(&tree.*, slot, LISTEN_CLIPBOARD))
 }
 
 effect fn record(tree: &UiTree<'_>, kind: EventKind, slot: u32) -> Event
@@ -111,6 +135,8 @@ pub effect fn finishCommand(tree: &mut UiTree<'_>, slot: u32, command: EditComma
     EditCommand.Copy => {
       if input != NONE {
         drop run edit.copySelection(&mut tree, input)
+      } else {
+        drop run text_selection.copy(&mut tree)
       }
     }
     EditCommand.Cut => {
