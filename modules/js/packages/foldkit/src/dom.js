@@ -6,7 +6,10 @@
 // this file adds what the DOM has on top (attributes, reflected properties, text content,
 // selectors). It installs `document`, `window` and the classes Foldkit tests with
 // `instanceof`, where the realm does not have them.
-import { Event, SvgElement as SvgMarkup, createNode, createSvgElement, createText, getComputedStyle, mount } from "@silkui/core";
+import {
+  Event, SvgElement as SvgMarkup, caretPositionFromPoint, createNode, createSvgElement, createText, elementFromPoint, elementsFromPoint,
+  getComputedStyle, mount,
+} from "@silkui/core";
 
 const HTML = "http://www.w3.org/1999/xhtml";
 const SVG = "http://www.w3.org/2000/svg";
@@ -500,10 +503,28 @@ class Element extends DomNode {
 
   blur() {}
 
-  scrollTo(x, y) {
-    if (typeof x === "object") this.node.scrollTo(x?.left ?? 0, x?.top ?? 0);
-    else this.node.scrollTo(x, y);
-  }
+  scrollTo(x, y) { this.node.scrollTo(x, y); }
+  scroll(x, y) { this.node.scroll(x, y); }
+  scrollBy(x, y) { this.node.scrollBy(x, y); }
+  scrollIntoView(options) { this.node.scrollIntoView(options); }
+  scrollIntoViewIfNeeded(center) { this.node.scrollIntoViewIfNeeded(center); }
+  getBoundingClientRect() { return this.node.getBoundingClientRect(); }
+  getClientRects() { return this.node.getClientRects(); }
+  get clientLeft() { return this.node.clientLeft; }
+  get clientTop() { return this.node.clientTop; }
+  get clientWidth() { return this.node.clientWidth; }
+  get clientHeight() { return this.node.clientHeight; }
+  get scrollWidth() { return this.node.scrollWidth; }
+  get scrollHeight() { return this.node.scrollHeight; }
+  get scrollLeft() { return this.node.scrollLeft; }
+  set scrollLeft(value) { this.node.scrollLeft = value; }
+  get scrollTop() { return this.node.scrollTop; }
+  set scrollTop(value) { this.node.scrollTop = value; }
+  get offsetParent() { return dom(this.node.offsetParent); }
+  get offsetLeft() { return this.node.offsetLeft; }
+  get offsetTop() { return this.node.offsetTop; }
+  get offsetWidth() { return this.node.offsetWidth; }
+  get offsetHeight() { return this.node.offsetHeight; }
 
   /** The style the tree lays over the element in `state`, set from an object as `Style` takes. */
   _look(state, next) {
@@ -742,6 +763,19 @@ export const document = {
 
   set title(value) {
     title = String(value);
+  },
+
+  elementFromPoint(x, y) {
+    return dom(elementFromPoint(x, y));
+  },
+
+  elementsFromPoint(x, y) {
+    return elementsFromPoint(x, y).map(dom).filter(Boolean);
+  },
+
+  caretPositionFromPoint(x, y) {
+    const position = caretPositionFromPoint(x, y);
+    return position && { ...position, offsetNode: dom(position.offsetNode) };
   },
 
   createElement(name) {

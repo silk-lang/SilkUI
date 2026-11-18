@@ -30,10 +30,10 @@ effect fn now() -> f64 {
   return i64.toF64(SystemClock.seconds(&at)) * 1000.0 + i64.toF64(SystemClock.nanoseconds(&at)) / 1000000.0
 }
 
-const SETUP: &[u8] = b"import { CSSStyleSheet, createBox, createText, mount } from '@silkui/core'; const root = createBox({ fontSize: '10px', color: 'rgb(0, 0, 255)' }); const sheet = new CSSStyleSheet(); sheet.replaceSync('.row { padding: 4px 1em; margin: 2px; border: 1px solid red; display: flex; cursor: pointer } .row:nth-child(odd) { opacity: 0.5 }'); root.adoptedStyleSheets.push(sheet); globalThis.rows = []; for (let i = 0; i < 1000; i++) { const row = createBox({ height: '12px' }); row.className = 'row'; row.appendChild(createText('row ' + i)); root.appendChild(row); rows.push(row); } mount(root); globalThis.first = getComputedStyle(rows[0]); globalThis.sink = 0;"
+const SETUP: &[u8] = b"import { CSSStyleSheet, IntersectionObserver, createBox, createText, elementFromPoint, mount } from '@silkui/core'; globalThis.elementFromPoint = elementFromPoint; globalThis.IntersectionObserver = IntersectionObserver; const root = createBox({ fontSize: '10px', color: 'rgb(0, 0, 255)' }); const sheet = new CSSStyleSheet(); sheet.replaceSync('.row { padding: 4px 1em; margin: 2px; border: 1px solid red; display: flex; cursor: pointer } .row:nth-child(odd) { opacity: 0.5 }'); root.adoptedStyleSheets.push(sheet); globalThis.rows = []; for (let i = 0; i < 1000; i++) { const row = createBox({ height: '12px' }); row.className = 'row'; row.appendChild(createText('row ' + i)); root.appendChild(row); rows.push(row); } const list = createBox({ height: '600px', overflow: 'auto' }); globalThis.items = []; for (let i = 0; i < 1000; i++) { const item = createBox({ height: '20px', flexShrink: 0 }); items.push(item); list.appendChild(item); } globalThis.list = list; const page = createBox({ flexDirection: 'row' }); page.appendChild(root); page.appendChild(list); mount(page); globalThis.first = getComputedStyle(rows[0]); globalThis.sink = 0;"
 
 /// The loops: a name and the JavaScript that does 1,000 reads.
-fn loops() -> [[&'static [u8]; 2]; 10] {
+fn loops() -> [[&'static [u8]; 2]; 16] {
   return [
     [b"empty loop (subtracted from the rest)", b"for (let i = 0; i < 1000; i++) sink += i;"],
     [b"__ui.now(), a native call that does nothing", b"for (let i = 0; i < 1000; i++) sink += __ui.now();"],
@@ -45,6 +45,12 @@ fn loops() -> [[&'static [u8]; 2]; 10] {
     [b"getComputedStyle(row).paddingLeft, 1,000 nodes", b"for (let i = 0; i < 1000; i++) sink += getComputedStyle(rows[i]).paddingLeft.length;"],
     [b"getComputedStyle(row).color, 1,000 nodes (inherited)", b"for (let i = 0; i < 1000; i++) sink += getComputedStyle(rows[i]).color.length;"],
     [b"write height then read it, 1,000 times (a layout per read)", b"for (let i = 0; i < 1000; i++) { rows[i].style.set({ height: (10 + i % 7) + 'px' }); sink += first.height.length; }"],
+    [b"getBoundingClientRect(), one node, nothing pending", b"for (let i = 0; i < 1000; i++) sink += rows[5].getBoundingClientRect().width;"],
+    [b"getBoundingClientRect(), 1,000 nodes", b"for (let i = 0; i < 1000; i++) sink += rows[i].getBoundingClientRect().top;"],
+    [b"offsetWidth, one node", b"for (let i = 0; i < 1000; i++) sink += rows[5].offsetWidth;"],
+    [b"write height then getBoundingClientRect(), 1,000 times (a layout per read)", b"for (let i = 0; i < 1000; i++) { rows[i].style.set({ height: (10 + i % 7) + 'px' }); sink += rows[0].getBoundingClientRect().height; }"],
+    [b"elementFromPoint(x, y)", b"for (let i = 0; i < 1000; i++) sink += elementFromPoint(20, i % 500) ? 1 : 0;"],
+    [b"scrollIntoView() in a 1,000-item list", b"for (let i = 0; i < 1000; i++) items[(i * 37) % 1000].scrollIntoView({ block: 'nearest' });"],
   ]
 }
 
@@ -91,6 +97,36 @@ effect fn measure(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> () ! TreeError 
     // Milliseconds for 1,000 reads are microseconds per read.
     StderrWriter.print("{}: {} us per read ({} ms for the loop)\n", &(unsafe String.fromUtf8Unchecked(table[i][0]), f64.round(perRead * 100.0) / 100.0, f64.round(median * 100.0) / 100.0))
     i = i + 1
+  }
+  run scrolling(&mut host.*, &mut tree.*, false)
+  run scrolling(&mut host.*, &mut tree.*, true)
+}
+
+/// 300 frames that scroll the 1,000-item list by 7 px, without and then with one
+/// IntersectionObserver on every item: the frame's layout and the observers, per frame.
+effect fn scrolling(host: &mut JsHost<'_>, tree: &mut Tree<'_>, observed: bool) -> () ! TreeError | ProtocolError | OutOfMemoryError | JsError ? &mut Allocator {
+  if observed {
+    run host.evaluate(b"globalThis.entries = 0; const io = new IntersectionObserver((list) => { entries += list.length; }, { threshold: [0, 0.5, 1] }); for (const item of items) io.observe(item);", b"observe.js")
+  }
+  let mut framing = 0.0
+  let mut observing = 0.0
+  let mut i: usize = 0
+  while i < 300 {
+    host.attach(tree.engineMut())
+    run host.evaluate(b"list.scrollTop = (list.scrollTop + 7) % 19000;", b"scroll.js")
+    run host.flush(&mut tree)
+    let start = run now()
+    drop run tree.frame(viewport(), 0.0)
+    let framed = run now()
+    run host.observe(tree.engineMut())
+    let end = run now()
+    framing = framing + (framed - start)
+    observing = observing + (end - framed)
+    i = i + 1
+  }
+  StderrWriter.print("scrolling 1,000 items, {}: frame {} ms, observers {} ms per frame\n", &(if observed { "observed" } else { "not observed" }, f64.round(framing / 300.0 * 1000.0) / 1000.0, f64.round(observing / 300.0 * 1000.0) / 1000.0))
+  if observed {
+    run host.evaluate(b"console.log('entries delivered over 300 frames: ' + entries)", b"log.js")
   }
 }
 
