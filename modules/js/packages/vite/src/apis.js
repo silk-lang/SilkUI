@@ -16,8 +16,7 @@ export const MISSING = {
   workers: ["Worker"],
   storage: ["localStorage", "sessionStorage", "indexedDB"],
   dom: [
-    "document", "window", "navigator", "location", "history", "MutationObserver", "ResizeObserver",
-    "IntersectionObserver", "matchMedia", "getComputedStyle", "Image", "HTMLElement",
+    "document", "window", "navigator", "location", "history", "MutationObserver", "matchMedia", "Image", "HTMLElement",
   ],
   node: ["process", "Buffer", "require", "setImmediate", "__dirname", "__filename"],
 };
