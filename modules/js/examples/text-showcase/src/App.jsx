@@ -1,4 +1,5 @@
 import { useState } from "react";
+import "./showcase.css";
 import { accent, arabic, display, hairline, hebrew, ink, jp, mono, muted, paper, sans, serif } from "./theme.js";
 
 const row = { display: "flex", flexDirection: "row" };
@@ -176,7 +177,7 @@ function Vertical() {
 }
 
 const article =
-  "ext does not have to sit in a rectangle. A float pulls a figure to one side and the lines beside it grow shorter to make room, then return to the full measure once they pass beneath it. Editors have used the effect for centuries: an initial letter cut deep into the first lines, a portrait set into a column, a seal stamped in the margin with the paragraph wrapping around its edge. The browser learned these tricks one property at a time, and a layout engine that wants to look at home on the web has to learn them too.";
+  "Text does not have to sit in a rectangle. A float pulls a figure to one side and the lines beside it grow shorter to make room, then return to the full measure once they pass beneath it. Editors have used the effect for centuries: an initial letter cut deep into the first lines, a portrait set into a column, a seal stamped in the margin with the paragraph wrapping around its edge. The browser learned these tricks one property at a time, and a layout engine that wants to look at home on the web has to learn them too.";
 
 const columns =
   "Columns let a long passage be read in short lines without leaving the page. The text fills the first column, breaks, and continues at the top of the next, with a rule between them. Magazines lean on it for sidebars and briefs like this one, where a single measure across the whole page would make the eye travel too far. The same text, set in one column, would simply run on.";
@@ -189,8 +190,7 @@ function Shapes() {
       </Headline>
       <box style={{ ...row, gap: 32, flexGrow: 1 }}>
         <box style={{ ...column, gap: 12, flexGrow: 3, flexBasis: 0 }}>
-          <box style={{ ...body, textAlign: "justify" }}>
-            <box style={{ float: "left", fontFamily: display, fontWeight: 700, fontSize: 92, lineHeight: 0.8, color: accent, marginTop: 6, marginRight: 10 }}>T</box>
+          <box className="drop-cap" style={{ ...body, textAlign: "justify" }}>
             <box
               style={{
                 float: "right",
@@ -211,7 +211,7 @@ function Shapes() {
             {article}
           </box>
           <box style={{ ...row, gap: 8 }}>
-            <Tag>float: left · drop cap</Tag>
+            <Tag>::first-letter · initial-letter: 3</Tag>
             <Tag>float: right · shape-outside: circle()</Tag>
             <Tag>text-align: justify</Tag>
           </box>
