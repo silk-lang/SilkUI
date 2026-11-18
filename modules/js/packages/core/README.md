@@ -74,6 +74,14 @@ work too. Changes are drawn once, before the host applies the batch (`flushSvg()
 now). Without a CSS size it takes the `<svg>`'s `width` and `height`, else a square of the
 font size. Elements inside it hear no events: listen on the `Svg`.
 
+Once an `Svg` has drawn, later changes go to the tree element by element, and only the shapes
+whose geometry changed rasterize again: a script can animate it every frame. The tree draws
+`g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `clipPath` and linear
+and radial gradients this way; anything else (text, masks, filters, `use`...) puts the `Svg`
+back to drawing its markup whole, which is right but slower. Browser libraries that build SVG
+with `document`, such as lottie-web, run after `import "@silkui/core/globals"`, which adds a
+minimal `window` and `document` where the realm has none.
+
 A node has `append`, `appendChild`, `insertBefore`, `removeChild`, `remove`, `contains`,
 `parentNode`, `childNodes`, `firstChild`, `lastChild` and the sibling getters, as in the DOM.
 A removed node keeps its state and can be inserted again. `destroy()` frees a node and its

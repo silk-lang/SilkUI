@@ -25,6 +25,7 @@ const OP = {
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
+  svgInsert: 29, svgRemove: 30, svgAttribute: 31,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -155,6 +156,9 @@ export class JsHost {
       fontFamily(id, names) { write(OP.fontFamily, id); calls.text(names); },
       defineIcon(resource, markup) { write(OP.defineIcon, resource); calls.text(markup); },
       source(id, resource) { write(OP.source, id); calls.u32(resource); },
+      svgInsert(id, element, tag, parent, before) { write(OP.svgInsert, id); calls.u32(element); calls.text(tag); calls.u32(parent); calls.u32(before < 0 ? 0xffffffff : before); },
+      svgRemove(id, element) { write(OP.svgRemove, id); calls.u32(element); },
+      svgAttribute(id, element, name, value) { write(OP.svgAttribute, id); calls.u32(element); calls.text(name); calls.byte(typeof value === 'string' ? 1 : 0); calls.text(typeof value === 'string' ? value : ''); },
       load(resource, url, icon) { write(OP.load, resource); calls.text(url); calls.byte(icon ? 1 : 0); },
       release(resource) { write(OP.release, resource); },
       keyframe(offset, css) { calls.byte(OP.keyframe); calls.f64(offset); calls.text(css); host.queueWake(); },

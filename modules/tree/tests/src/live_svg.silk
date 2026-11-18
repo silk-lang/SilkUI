@@ -1,0 +1,193 @@
+//! Live svg: an icon node whose svg elements the client writes one attribute at a time draws
+//! them as paths, and a frame rasterizes only the shapes whose geometry changed.
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot }
+import ui_fixtures.fixtures as fixtures
+import svg_css.written
+import svg_css.tokens { CssError }
+import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.testing.testing { Testing, AssertionError }
+
+const SVG: u32 = 2
+
+fn viewport() -> FrameInput { return FrameInput { width: 200.0, height: 200.0, scale: 1.0, time: 0.0 } }
+
+effect fn set(batch: &mut Batch, element: u32, name: string, value: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  run batch.svgAttribute(SVG, element, name, Option<string>.some(value))
+}
+
+/// A 100 by 100 live svg at the origin on white: a red rect in a translated group (element 2
+/// in group 1), a blue square path (3) at half opacity, and a green path (5) clipped by
+/// clipPath 4 to its left half.
+effect fn scene(batch: &mut Batch) -> () ! CssError | OutOfMemoryError ? &mut Allocator {
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(SVG, NodeKind.Icon)
+  run batch.append(1, SVG)
+  let own = run written.declarations(b"display:block;width:100px;height:100px")
+  run batch.style(SVG, own.asSlice())
+  run set(&mut batch.*, 0, "viewBox", "0 0 100 100")
+  run batch.svgInsert(SVG, 1, "g", 0, Option<u32>.None)
+  run set(&mut batch.*, 1, "transform", "translate(10,10)")
+  run batch.svgInsert(SVG, 2, "rect", 1, Option<u32>.None)
+  run set(&mut batch.*, 2, "width", "30")
+  run set(&mut batch.*, 2, "height", "30")
+  run set(&mut batch.*, 2, "fill", "rgb(255,0,0)")
+  run batch.svgInsert(SVG, 3, "path", 0, Option<u32>.None)
+  run set(&mut batch.*, 3, "d", "M60 60h30v30h-30z")
+  run set(&mut batch.*, 3, "fill", "#0000ff")
+  run set(&mut batch.*, 3, "opacity", "0.5")
+  run batch.svgInsert(SVG, 4, "clipPath", 0, Option<u32>.None)
+  run set(&mut batch.*, 4, "id", "left")
+  run batch.svgInsert(SVG, 6, "rect", 4, Option<u32>.None)
+  run set(&mut batch.*, 6, "x", "60")
+  run set(&mut batch.*, 6, "width", "15")
+  run set(&mut batch.*, 6, "height", "40")
+  run batch.svgInsert(SVG, 5, "path", 0, Option<u32>.None)
+  run set(&mut batch.*, 5, "d", "M60 10h30v30h-30z")
+  run set(&mut batch.*, 5, "style", "fill: #00ff00; display: block")
+  run set(&mut batch.*, 5, "clip-path", "url(#left)")
+}
+
+effect fn rendered(tree: &mut UiTree<'_>) -> Pixmap ! GeometryError | OutOfMemoryError ? &mut Allocator {
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree.*)
+  return run snapshot.render(&tree.*)
+}
+
+fn near(value: u8, expected: u8) -> bool {
+  return (value >= expected && value - expected <= 8) || (value < expected && expected - value <= 8)
+}
+
+fn color(image: &Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8) -> bool {
+  let p = image.pixel(x, y)
+  return near(p.r, r) && near(p.g, g) && near(p.b, b)
+}
+
+effect fn draws() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run scene(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 25, 25, 255, 0, 0), "the rect paints red inside its translated group")
+  run Testing.expect(color(&image, 5, 5, 255, 255, 255), "nothing paints outside the shapes")
+  run Testing.expect(color(&image, 75, 75, 128, 128, 255), "opacity 0.5 on the path blends its blue with white")
+  run Testing.expect(color(&image, 65, 25, 0, 255, 0), "the style attribute fills the clipped path green")
+  run Testing.expect(color(&image, 85, 25, 255, 255, 255), "the rect clip path keeps only the left half")
+
+  // display none hides an element; removing it shows it again.
+  run set(&mut batch, 1, "display", "none")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let hidden = run rendered(&mut tree)
+  run Testing.expect(color(&hidden, 25, 25, 255, 255, 255), "display none hides the group")
+  run batch.svgAttribute(SVG, 1, "display", Option<string<'static>>.None)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let shown = run rendered(&mut tree)
+  run Testing.expect(color(&shown, 25, 25, 255, 0, 0), "removing display shows it again")
+
+  // Removing element 0 ends the live svg.
+  run batch.svgRemove(SVG, 0)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let ended = run rendered(&mut tree)
+  run Testing.expect(color(&ended, 25, 25, 255, 255, 255), "without its live svg the icon node draws its (absent) icon")
+}
+
+test effect fn liveSvgDrawsShapesGroupsOpacityAndClips() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run draws() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn onlyChangedShapesRasterize() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run scene(&mut batch)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let before = tree.paths.misses()
+
+  // A new `d` on one path rasterizes that path alone.
+  run set(&mut batch, 3, "d", "M55 60h35v30h-35z")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let reshaped = tree.paths.misses() - before
+  run Testing.expect(reshaped == 1, "a new d rasterizes only its path")
+
+  // A colour or a whole-pixel move rasterizes nothing.
+  let moved = tree.paths.misses()
+  run set(&mut batch, 2, "fill", "rgb(0,0,0)")
+  run set(&mut batch, 1, "transform", "translate(12,10)")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run Testing.expect(tree.paths.misses() == moved, "colour changes and whole-pixel moves reuse coverage")
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 11, 25, 255, 255, 255) && color(&image, 41, 25, 0, 0, 0), "the moved rect paints black at its new place")
+}
+
+test effect fn liveSvgRasterizesOnlyChangedShapes() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run onlyChangedShapesRasterize() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn gradients() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(SVG, NodeKind.Icon)
+  run batch.append(1, SVG)
+  let own = run written.declarations(b"display:block;width:100px;height:100px")
+  run batch.style(SVG, own.asSlice())
+  run set(&mut batch, 0, "viewBox", "0 0 100 100")
+  run batch.svgInsert(SVG, 1, "defs", 0, Option<u32>.None)
+  // A user-space gradient from red at x = 20 to blue at x = 80, over a square from 0 to 100.
+  run batch.svgInsert(SVG, 2, "linearGradient", 1, Option<u32>.None)
+  run set(&mut batch, 2, "id", "g")
+  run set(&mut batch, 2, "gradientUnits", "userSpaceOnUse")
+  run set(&mut batch, 2, "x1", "20")
+  run set(&mut batch, 2, "x2", "80")
+  run batch.svgInsert(SVG, 3, "stop", 2, Option<u32>.None)
+  run set(&mut batch, 3, "stop-color", "#ff0000")
+  run batch.svgInsert(SVG, 4, "stop", 2, Option<u32>.None)
+  run set(&mut batch, 4, "offset", "1")
+  run set(&mut batch, 4, "stop-color", "#0000ff")
+  run batch.svgInsert(SVG, 5, "rect", 0, Option<u32>.None)
+  run set(&mut batch, 5, "width", "100")
+  run set(&mut batch, 5, "height", "100")
+  run set(&mut batch, 5, "fill", "url(#g)")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 10, 50, 255, 0, 0), "before x1 the gradient pads with its first stop")
+  run Testing.expect(color(&image, 90, 50, 0, 0, 255), "after x2 it pads with its last stop")
+  let middle = image.pixel(50, 50)
+  run Testing.expect(near(middle.r, 128) && near(middle.b, 128), "halfway it mixes both")
+
+  // SVG mixes stops with straight alpha: halfway from opaque red to transparent blue is half
+  // purple over white, where a premultiplied mix would give half red.
+  run set(&mut batch, 4, "stop-opacity", "0")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let faded = run rendered(&mut tree)
+  let half = faded.pixel(50, 50)
+  run Testing.expect(near(half.r, 191) && near(half.g, 128) && near(half.b, 191), "straight alpha mixes the transparent stop's colour too")
+}
+
+test effect fn liveSvgPaintsGradients() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run gradients() |> Effect.provideMut<Allocator>(&mut allocator)
+}

@@ -829,6 +829,38 @@ function svgChanged(node) {
   changedSvgs.add(svg);
 }
 
+// A live svg: after its first drawing, an `<svg>` whose elements change sends each change to
+// the tree as it happens (`svgInsert`, `svgAttribute`, `svgRemove`), and the tree draws its
+// shapes as paths, so a frame of an animation costs what it changes. This needs content the
+// tree's live svg draws; anything else keeps the svg drawn as markup.
+const LIVE_TAGS = new Set([
+  "g", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "defs", "clipPath",
+  "linearGradient", "radialGradient", "stop", "title", "desc", "metadata",
+]);
+const QUIET_TAGS = new Set(["title", "desc", "metadata"]);
+const UNLIVE_ATTRIBUTES = new Set(["mask", "filter", "marker", "marker-start", "marker-mid", "marker-end"]);
+const UNLIVE_STYLE = /(^|;)\s*(mask|filter|marker)[\w-]*\s*:/;
+
+function liveAttribute(name, text) {
+  return !UNLIVE_ATTRIBUTES.has(name) && !(name === "style" && UNLIVE_STYLE.test(text));
+}
+
+/** Whether the tree's live svg can draw `child` and what is in it. */
+function liveable(child, quiet = false) {
+  if (!(child instanceof SvgElement)) return quiet;
+  if (!LIVE_TAGS.has(child.localName)) return false;
+  for (const [name, value] of child._attributes()) if (!liveAttribute(name, value)) return false;
+  const inner = quiet || QUIET_TAGS.has(child.localName);
+  for (const grandchild of child.childNodes) if (!liveable(grandchild, inner)) return false;
+  return true;
+}
+
+/** The live svg `node` is in, or null. */
+function liveOwner(node) {
+  const svg = svgOwner(node);
+  return svg?._live ? svg : null;
+}
+
 function svgStyle(value) {
   if (typeof value !== "object" || value === null) return String(value);
   let css = "";
@@ -848,6 +880,7 @@ const svgChildren = {
     for (let at = this; at; at = at.parentNode) if (at === child) throw new Error("a node cannot be inserted into itself or its own subtree");
     const old = child.parentNode;
     if (old) {
+      liveOwner(old)?._removed(child);
       svgChanged(old);
       old.childNodes.splice(old.childNodes.indexOf(child), 1);
     }
@@ -855,6 +888,7 @@ const svgChildren = {
     if (before) this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
     else this.childNodes.push(child);
     if (child instanceof Text) child._svgText = true;
+    liveOwner(this)?._inserted(child, this, before);
     svgChanged(this);
     return child;
   },
@@ -866,6 +900,7 @@ const svgChildren = {
   },
   removeChild(child) {
     if (child.parentNode !== this) throw new Error("the node to remove is not a child of this node");
+    liveOwner(this)?._removed(child);
     svgChanged(this);
     this.childNodes.splice(this.childNodes.indexOf(child), 1);
     child.parentNode = null;
@@ -890,6 +925,57 @@ const svgChildren = {
   },
 };
 
+function quietAncestor(element) {
+  for (let at = element; at && at instanceof SvgElement; at = at.parentNode) if (QUIET_TAGS.has(at.localName)) return true;
+  return false;
+}
+
+/** The declarations of `element`'s `style` attribute, read and written as properties. */
+function svgDeclarations(element) {
+  const read = () => {
+    const map = new Map();
+    for (const part of (element.getAttribute("style") ?? "").split(";")) {
+      const colon = part.indexOf(":");
+      if (colon > 0) map.set(part.slice(0, colon).trim(), part.slice(colon + 1).trim());
+    }
+    return map;
+  };
+  const write = (map) => {
+    let css = "";
+    for (const [name, value] of map) css += name + ": " + value + ";";
+    if (css) element.setAttribute("style", css);
+    else element.removeAttribute("style");
+  };
+  const set = (name, value) => {
+    const map = read();
+    if (value === null || value === undefined || value === "") map.delete(name);
+    else map.set(name, String(value));
+    write(map);
+  };
+  const methods = {
+    setProperty: (name, value) => set(String(name), value),
+    removeProperty: (name) => {
+      const old = read().get(String(name)) ?? "";
+      set(String(name), null);
+      return old;
+    },
+    getPropertyValue: (name) => read().get(String(name)) ?? "",
+  };
+  return new Proxy(methods, {
+    get(target, key) {
+      if (typeof key !== "string") return undefined;
+      if (key in target) return target[key];
+      if (key === "cssText") return element.getAttribute("style") ?? "";
+      return read().get(cssName(key)) ?? "";
+    },
+    set(target, key, value) {
+      if (key === "cssText") element.setAttribute("style", String(value));
+      else if (typeof key === "string") set(cssName(key), value);
+      return true;
+    },
+  });
+}
+
 /** Text in an `<svg>`: its `<text>` and `<title>` contents. */
 export class SvgText {
   #data;
@@ -908,6 +994,8 @@ export class SvgText {
     value = String(value);
     if (value === this.#data) return;
     this.#data = value;
+    const live = liveOwner(this);
+    if (live && !QUIET_TAGS.has(this.parentNode?.localName)) live._leave();
     svgChanged(this);
   }
 
@@ -976,11 +1064,40 @@ export class SvgElement {
     const text = name === "style" ? svgStyle(value) : String(value);
     if (this.#attributes.get(name) === text) return;
     this.#attributes.set(name, text);
-    svgChanged(this);
+    this._written(name, text);
   }
 
   removeAttribute(name) {
-    if (this.#attributes.delete(svgName(name))) svgChanged(this);
+    name = svgName(name);
+    if (this.#attributes.delete(name)) this._written(name, null);
+  }
+
+  setAttributeNS(namespace, name, value) {
+    this.setAttribute(name, value);
+  }
+
+  getAttributeNS(namespace, name) {
+    return this.getAttribute(name);
+  }
+
+  removeAttributeNS(namespace, name) {
+    this.removeAttribute(name);
+  }
+
+  /** The element's `style` attribute as a declaration object: `style.display = "none"`. */
+  get style() {
+    return this._style ??= svgDeclarations(this);
+  }
+
+  _attributes() {
+    return this.#attributes;
+  }
+
+  _written(name, text) {
+    const live = liveOwner(this);
+    if (!live) svgChanged(this);
+    else if (text !== null && !liveAttribute(name, text)) live._leave();
+    else native.svgAttribute(live.nodeId, this._n, name, text);
   }
 
   get firstChild() {
@@ -1049,6 +1166,10 @@ function treeAttribute(name) {
 export class Svg extends Node {
   #attributes = new Map();
   #markup = "";
+  // Live: element numbers in use, and freed ones to use again.
+  _live = false;
+  _count = 0;
+  _free = [];
 
   constructor() {
     // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
@@ -1079,13 +1200,75 @@ export class Svg extends Node {
     const text = name === "style" ? svgStyle(value) : String(value);
     if (this.#attributes.get(name) === text) return;
     this.#attributes.set(name, text);
-    svgChanged(this);
+    this._written(name, text);
   }
 
   removeAttribute(name) {
     name = String(name);
     if (treeAttribute(name)) super.removeAttribute(name);
-    else if (this.#attributes.delete(svgName(name))) svgChanged(this);
+    else if (this.#attributes.delete(svgName(name))) this._written(svgName(name), null);
+  }
+
+  setAttributeNS(namespace, name, value) {
+    this.setAttribute(name, value);
+  }
+
+  getAttributeNS(namespace, name) {
+    return this.getAttribute(name);
+  }
+
+  _written(name, text) {
+    if (!this._live) svgChanged(this);
+    else if (text !== null && !liveAttribute(name, text)) this._leave();
+    else native.svgAttribute(this.nodeId, 0, name, text);
+  }
+
+  /** Sends the elements to the tree as a live svg, once its markup was drawn and changed. */
+  _goLive() {
+    this._forget();
+    this._live = true;
+    for (const [name, value] of this.#attributes) native.svgAttribute(this.nodeId, 0, name, value);
+    for (const child of this.childNodes) this._inserted(child, this, null);
+  }
+
+  /** Back to markup: content the live svg does not draw came in. */
+  _leave() {
+    if (!this._live) return;
+    this._live = false;
+    this._count = 0;
+    this._free = [];
+    native.svgRemove(this.nodeId, 0);
+    svgChanged(this);
+  }
+
+  _inserted(child, parent, before) {
+    if (!(child instanceof SvgElement)) {
+      if (!QUIET_TAGS.has(parent.localName) && !(parent !== this && svgOwner(parent) && quietAncestor(parent))) this._leave();
+      return;
+    }
+    if (!liveable(child, quietAncestor(parent))) {
+      this._leave();
+      return;
+    }
+    this._send(child, parent === this ? 0 : parent._n, before instanceof SvgElement ? before._n : -1);
+  }
+
+  _send(element, parent, before) {
+    element._n = this._free.pop() ?? ++this._count;
+    native.svgInsert(this.nodeId, element._n, element.localName, parent, before);
+    for (const [name, value] of element._attributes()) native.svgAttribute(this.nodeId, element._n, name, value);
+    for (const child of element.childNodes) if (child instanceof SvgElement) this._send(child, element._n, -1);
+  }
+
+  _removed(child) {
+    if (!(child instanceof SvgElement) || !child._n) return;
+    native.svgRemove(this.nodeId, child._n);
+    const free = (element) => {
+      if (element._n) this._free.push(element._n);
+      element._n = 0;
+      for (const grandchild of element.childNodes) if (grandchild instanceof SvgElement) free(grandchild);
+    };
+    free(child);
   }
 
   /** The markup the tree draws, as `outerHTML` gives it. */
@@ -1101,9 +1284,13 @@ export class Svg extends Node {
   }
 
   _draw() {
-    if (!nodes.has(this.nodeId)) return;
+    if (!nodes.has(this.nodeId) || this._live) return;
     const markup = this.outerHTML;
     if (markup === this.#markup) return;
+    if (this.#markup && this.childNodes.every((child) => liveable(child))) {
+      this._goLive();
+      return;
+    }
     this._forget();
     this.#markup = markup;
     native.source(this.nodeId, holdIcon(markup));

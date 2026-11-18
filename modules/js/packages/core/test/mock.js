@@ -16,6 +16,7 @@ export function installMock() {
     "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",
     "shell",
+    "svgInsert", "svgRemove", "svgAttribute",
   ]) {
     native[name] = record(name);
   }

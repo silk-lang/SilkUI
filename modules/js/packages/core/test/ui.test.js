@@ -212,7 +212,7 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   b.destroy();
   a.destroy();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "release").length, 2, "both released");
+  assert.equal(calls.filter((call) => call[0] === "release").length, 1, "a went live when it changed, so only b held the markup");
   assert.throws(() => createNode("icon"), /no node kind 'icon'/);
 });
 
@@ -234,7 +234,7 @@ test("an image src loads its address once while some node shows it", () => {
   assert.equal(mock.take().filter((call) => call[0] === "release").length, 1);
 });
 
-test("svg markup built from elements draws once as one node, and again when it changes", async () => {
+test("svg markup built from elements draws once as one node, then changes go live per element", async () => {
   mock.take();
   const svg = createNode("svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -253,14 +253,35 @@ test("svg markup built from elements draws once as one node, and again when it c
   assert.ok(calls.some((call) => call[0] === "attribute" && call[2] === "class" && call[3] === "size-4"), "class is the node's");
   assert.equal(svg.outerHTML, markup);
   path.setAttribute("fill", "currentColor");
-  path.setAttribute("fill", "red");
   flushSvg();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 1, "two changes, one new markup");
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "a change after the first draw goes live");
+  const id = svg.nodeId;
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [
+    ["svgAttribute", id, 0, "viewBox", "0 0 24 24"],
+    ["svgAttribute", id, 0, "stroke-width", "2"],
+    ["svgInsert", id, 1, "path", 0, -1],
+    ["svgAttribute", id, 1, "d", 'M5 12h14"'],
+    ["svgAttribute", id, 1, "fill", "currentColor"],
+    ["svgInsert", id, 2, "title", 0, -1],
+  ]);
+  path.setAttribute("fill", "red");
+  title.firstChild.data = "B";
+  assert.deepEqual(mock.take(), [["svgAttribute", id, 1, "fill", "red"]], "one write, and title text stays quiet");
   path.destroy();
   title.remove();
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 1], ["svgRemove", id, 2]]);
+  const circle = createSvgElement("circle");
+  circle.setAttribute("r", 4);
+  svg.appendChild(circle);
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgInsert", id, 2, "circle", 0, -1], ["svgAttribute", id, 2, "r", "4"]], "numbers are reused");
+  const text = createSvgElement("text");
+  svg.appendChild(text);
+  calls = mock.take();
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 0]], "content the live svg cannot draw goes back to markup");
   flushSvg();
-  assert.ok(svg.outerHTML.endsWith('stroke-width="2"></svg>'));
+  assert.equal(mock.take().filter((call) => call[0] === "defineIcon").length, 1);
+  assert.ok(svg.outerHTML.endsWith('stroke-width="2"><circle r="4"/><text/></svg>'), svg.outerHTML);
   svg.destroy();
 });
 

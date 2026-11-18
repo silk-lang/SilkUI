@@ -198,7 +198,10 @@ export class SvgText {
   destroy(): void;
 }
 
-/** An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node. */
+/**
+ * An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node.
+ * Once the root has drawn, a change to its elements updates them one at a time.
+ */
 export class SvgElement {
   constructor(tag: string);
   readonly localName: string;
@@ -212,6 +215,11 @@ export class SvgElement {
   /** SVG's names, or React's spellings (`strokeWidth`, `xlinkHref`). */
   setAttribute(name: string, value: unknown): void;
   removeAttribute(name: string): void;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
+  removeAttributeNS(namespace: string | null, name: string): void;
+  /** The `style` attribute as declarations: `element.style.display = "none"`. */
+  readonly style: Record<string, string>;
   insertBefore<T extends SvgElement | SvgText | Text>(child: T, before?: SvgElement | SvgText | Text | null): T;
   appendChild<T extends SvgElement | SvgText | Text>(child: T): T;
   append(...children: (SvgElement | SvgText | Text | string)[]): void;
@@ -224,11 +232,14 @@ export class SvgElement {
  * An inline `<svg>`: one node drawing the markup its `SvgElement` children make, at its CSS
  * size (else its `width` and `height`, else a square of the font size), with its `color` as
  * `currentColor`. Class, look, events and ARIA are the node's; `viewBox`, `fill`, `width`
- * and the rest are markup.
+ * and the rest are markup. After its first draw, changes go to the tree element by element
+ * and only the shapes that changed redraw, so scripts can animate it (lottie-web and the like).
  */
 export class Svg extends Node {
   constructor();
   readonly outerHTML: string;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
   textContent: string;
 }
 
