@@ -4,8 +4,12 @@
 //! tree order) and containing block, and works out the insets `anchor()` and `position-area`
 //! ask for, the sizes `anchor-size()` asks for, and the first `position-try-fallbacks` flip
 //! that keeps the box inside its containing block. When that changes, styles resolve again,
-//! and `apply` writes it into the box's computed style, as `anchoring` does for popups.
+//! and `apply` writes it into the box's computed style. `Tree.anchor` popups come through
+//! here too: their anchor is the node `anchoring` names, with the extras of `AnchorOptions`.
 import engine { UiTree }
+import anchoring
+import mutation { Position }
+import layout.lib { Display as CssDisplay }
 import node { NONE, NO_INDEX }
 import paint { borderBox, paddingBox }
 import anchor_style {
@@ -13,7 +17,6 @@ import anchor_style {
   SIDE_END, SIDE_INSIDE, SIDE_OUTSIDE, SIDE_PERCENT, TRACK_START, TRACK_CENTER, TRACK_END,
   TRACKS_ALL, SIZE_WIDTH, SIZE_HEIGHT, TRY_FLIP_BLOCK, TRY_FLIP_INLINE,
 }
-import mutation { Position }
 import style { Computed }
 import layout.lib { Dimension, SizeValue, DimensionKind }
 import silk.collections.list { List }
@@ -42,6 +45,9 @@ pub struct Placement {
   pub maxHeight: f32,
   /// The `position-try-fallbacks` flips in use (`TRY_*`).
   pub flip: u8,
+  /// A `Tree.anchor` popup, and the anchor width it matches (or -1).
+  pub popup: bool,
+  pub minWidth: f32,
 }
 
 impl Copy for Placement {}
@@ -52,6 +58,7 @@ fn same(a: &Placement, b: &Placement) -> bool {
     && close(a.insets[2], b.insets[2]) && close(a.insets[3], b.insets[3])
     && close(a.width, b.width) && close(a.height, b.height)
     && close(a.maxWidth, b.maxWidth) && close(a.maxHeight, b.maxHeight) && a.flip == b.flip
+    && a.popup == b.popup && close(a.minWidth, b.minWidth)
 }
 
 fn close(a: f32, b: f32) -> bool {
@@ -106,6 +113,15 @@ pub effect fn settle(tree: &mut UiTree<'_>) -> bool
     run next.append(place(&tree.*, boxes.get(i), &names))
     i = i + 1
   }
+  // A box in another root keeps its placement until that root is laid out.
+  let mut k: usize = 0
+  while k < tree.cssPlacements.length() {
+    let old = tree.cssPlacements.asSlice()[k]
+    if tree.node(old.slot).live && tree.node(old.slot).id == old.id && tree.inParkedRoot(old.slot) {
+      run next.append(old)
+    }
+    k = k + 1
+  }
   let mut changed = next.length() != tree.cssPlacements.length()
   if !changed {
     let mut k: usize = 0
@@ -139,10 +155,18 @@ fn place(tree: &UiTree<'_>, slot: u32, names: &List<Named>) -> Placement {
   let style = node.computed.anchor
   let mut out = Placement {
     slot: slot, id: node.id, found: false, set: 0, cleared: 0, insets: [0.0; 4],
-    width: -1.0, height: -1.0, maxWidth: -1.0, maxHeight: -1.0, flip: 0,
+    width: -1.0, height: -1.0, maxWidth: -1.0, maxHeight: -1.0, flip: 0, popup: false, minWidth: -1.0,
   }
   let wanted = style.anchor()
   let mut anchor = NONE
+  let popup = if node.isGenerated() { NO_INDEX } else { anchoring.find(tree, node.id) }
+  if popup != NO_INDEX {
+    out.popup = true
+    let target = tree.slotOf(tree.anchors.asSlice()[popup].target)
+    if target != NONE && fragmentOf(tree, target) != NO_INDEX {
+      anchor = target
+    }
+  }
   let mut i = names.length()
   while i > 0 && wanted != 0 {
     i = i - 1
@@ -153,7 +177,7 @@ fn place(tree: &UiTree<'_>, slot: u32, names: &List<Named>) -> Placement {
     }
   }
   let own = fragmentOf(tree, slot)
-  if anchor == NONE || own == NO_INDEX {
+  if anchor == NONE || (own == NO_INDEX && !out.popup) {
     return out
   }
   out.found = true
@@ -180,6 +204,9 @@ fn place(tree: &UiTree<'_>, slot: u32, names: &List<Named>) -> Placement {
   let a = Rect<f32>.new(ab.xMin - cb.xMin + shiftX, ab.yMin - cb.yMin + shiftY, ab.xMax - cb.xMin + shiftX, ab.yMax - cb.yMin + shiftY)
   let w = cb.width()
   let h = cb.height()
+  if out.popup {
+    return placePopup(&style, tree.anchors.asSlice()[popup].options, a, w, h, &out)
+  }
   let ownBox = borderBox(&tree.visualFragment(own))
   let bw = ownBox.width()
   let bh = ownBox.height()
@@ -202,6 +229,34 @@ fn place(tree: &UiTree<'_>, slot: u32, names: &List<Named>) -> Placement {
     index = index + 1
   }
   return first
+}
+
+/// A `Tree.anchor` popup: below the anchor unless it would get less than the preferred
+/// height there and more above, against its left edge (its right edge with `alignEnd`, or
+/// when it starts past the middle), `gap` away and 4px inside the viewport.
+fn placePopup(style: &AnchorStyle, options: anchoring.AnchorOptions, a: Rect<f32>, w: f32, h: f32, base: &Placement) -> Placement {
+  let above = f32.max(0.0, a.yMin - options.gap - 4.0)
+  let below = f32.max(0.0, h - a.yMax - options.gap - 4.0)
+  let up = below < options.preferredHeight && above > below
+  let left = f32.max(4.0, f32.min(w - 4.0, a.xMin))
+  let right = f32.max(4.0, f32.min(w - 4.0, w - a.xMax))
+  let end = options.alignEnd || left > w * 0.5
+  let mut flip: u8 = if up { TRY_FLIP_BLOCK } else { 0 }
+  // The columns `anchoring` set are span-right; past the middle they flip to span-left.
+  if end && !options.alignEnd { flip = u8.bitOr(flip, TRY_FLIP_INLINE) }
+  let mut out = resolve(style, flip, a, w, h, 0.0, 0.0, base)
+  if up {
+    out.insets[2] = f32.max(4.0, h - a.yMin + options.gap)
+    out.maxHeight = above
+  } else {
+    out.insets[0] = f32.max(4.0, a.yMax + options.gap)
+    out.maxHeight = below
+  }
+  let x = if end { right } else { left }
+  if end { out.insets[1] = x } else { out.insets[3] = x }
+  out.maxWidth = f32.max(0.0, w - x - 4.0)
+  if options.matchWidth { out.minWidth = f32.min(out.maxWidth, a.width()) }
+  return out
 }
 
 /// The placement for `style` flipped by `flip`.
@@ -342,6 +397,8 @@ pub fn apply(tree: &UiTree<'_>, slot: u32, id: u32, computed: &mut Computed) -> 
   let at = find(tree, slot, id)
   let mut written = [computed.layout.inset.top, computed.layout.inset.right, computed.layout.inset.bottom, computed.layout.inset.left]
   if at == NO_INDEX || !tree.cssPlacements.asSlice()[at].found {
+    // A popup waits, hidden, for an anchor that is laid out.
+    if !tree.node(slot).isGenerated() && anchoring.find(tree, id) != NO_INDEX { computed.layout.display = CssDisplay.None }
     return ()
   }
   let p = tree.cssPlacements.asSlice()[at]
@@ -364,8 +421,9 @@ pub fn apply(tree: &UiTree<'_>, slot: u32, id: u32, computed: &mut Computed) -> 
   if p.width >= 0.0 { computed.layout.width = SizeValue.px(p.width) }
   if p.height >= 0.0 { computed.layout.height = SizeValue.px(p.height) }
   // The `position-area` cell bounds an auto size.
-  if p.maxWidth >= 0.0 && computed.layout.width.kind == DimensionKind.Auto { computed.layout.maxWidth = SizeValue.px(f32.max(p.maxWidth, 0.0)) }
-  if p.maxHeight >= 0.0 && computed.layout.height.kind == DimensionKind.Auto { computed.layout.maxHeight = SizeValue.px(f32.max(p.maxHeight, 0.0)) }
+  if p.maxWidth >= 0.0 && (p.popup || computed.layout.width.kind == DimensionKind.Auto) { computed.layout.maxWidth = SizeValue.px(f32.max(p.maxWidth, 0.0)) }
+  if p.maxHeight >= 0.0 && (p.popup || computed.layout.height.kind == DimensionKind.Auto) { computed.layout.maxHeight = SizeValue.px(f32.max(p.maxHeight, 0.0)) }
+  if p.minWidth >= 0.0 { computed.layout.minWidth = SizeValue.px(p.minWidth) }
   computed.layout.inset.top = written[0]
   computed.layout.inset.right = written[1]
   computed.layout.inset.bottom = written[2]

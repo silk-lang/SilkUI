@@ -107,6 +107,19 @@ run tree.finish(pending, prevented)
 
 A press captures the pointer: the moves and the release that follow go to the pressed node even when the pointer leaves it. `tree.setPointerCapture(node)`, called from a pointer down, hands that capture to another node, as the DOM call of the same name does.
 
+## Touch
+
+A host with a touchscreen sends each finger as `Input.TouchStart`, `TouchMove` and `TouchEnd` (or `TouchCancel` when the system takes it), with the finger's number. Clients hear fingers as pointer records: `pointer.kind` is `PointerKind.Touch`, `pointer.id` tells the fingers apart, and the first finger down is the primary one, which presses, focuses and clicks like a mouse button.
+
+What a finger does on its own follows `touch-action`, as in a browser. Once the first finger moves past a few pixels in a direction the touch action allows, the tree takes the gesture: every finger's pointer is cancelled, the fingers pan the scroll containers under them, and a flick keeps scrolling after the release. With `touch-action: none`, or a drag across the axes `pan-x` or `pan-y` allow, the pointer records go on to the client, which handles the gesture itself. A second finger where `pinch-zoom` is allowed is a pinch, which the tree takes too; there is no page zoom, so it only pans.
+
+```css
+.canvas { touch-action: none; }      /* drawing: every finger is the app's */
+.carousel { touch-action: pan-y; }   /* the page scrolls, horizontal swipes are the app's */
+```
+
+A trackpad pinch arrives as `Input.Pinch` and reaches clients as browsers report it: a wheel record with control held, `deltaY` negative when zooming in.
+
 ## Answering
 
 The client answers an event by changing the tree: `tree.setText(label, "Clicked 3 times")`. The next frame lays out and paints what that changed, and nothing else.
