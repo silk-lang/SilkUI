@@ -128,12 +128,9 @@ pub struct Node {
   /// The parent slot, or NONE.
   pub parent: u32,
   pub base: List<Declaration>,
-  pub hover: List<Declaration>,
-  pub active: List<Declaration>,
-  pub focus: List<Declaration>,
-  pub focusVisible: List<Declaration>,
-  /// The `@starting-style` look (see `StyleState.Starting`).
-  pub starting: List<Declaration>,
+  /// The other looks, the transition text, the test id and the canvas commands: what most
+  /// nodes leave empty, on the heap (see `NodeExtras`).
+  pub extras: Option<Box<NodeExtras>>,
   /// The computed style, shared with every node whose values are the same (see `style_pool`).
   /// Read it with [`Node.computed`]; `UiTree.setComputed` replaces it.
   pub styled: Frozen<Computed>,
@@ -146,7 +143,6 @@ pub struct Node {
   pub valueMax: f32,
   pub valueNow: f32,
   pub label: String,
-  pub testId: String,
   pub tabIndex: i32,
   pub cursor: Cursor,
   pub disabled: bool,
@@ -180,13 +176,10 @@ pub struct Node {
   /// The node and its ancestors were displayed at its last style resolve: it has a
   /// before-change style for transitions.
   pub rendered: bool,
-  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
-  pub transition: String,
   /// The scroll offset of a scroll container, clamped to its range at the last frame.
   pub scrollX: f32,
   pub scrollY: f32,
   pub resource: u32,
-  pub canvas: List<CanvasCommand>,
   /// An icon node's live svg (`Mutation.SvgInsert`), on the heap: drawn instead of its resource.
   pub svg: Option<Box<LiveSvg>>,
   /// Bumped when the text, source or canvas changes, and for inputs when the caret, the
@@ -218,6 +211,38 @@ pub struct Node {
   pub computedStamp: u32,
   pub selectorIdentity: Option<Box<NodeIdentity>>,
   pub cache: PaintCache,
+}
+
+/// What a node may hold and most do not: a node gets one with the first of these it is given.
+/// Each is a list or a text, whose header alone is 64 bytes, and a long document has tens of
+/// thousands of nodes; in the node they were half of it. Read them through the node
+/// (`Node.hover`, `Node.transition`, ...), which gives the empty value for a node without them.
+pub struct NodeExtras {
+  pub hover: List<Declaration>,
+  pub active: List<Declaration>,
+  pub focus: List<Declaration>,
+  pub focusVisible: List<Declaration>,
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub starting: List<Declaration>,
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub transition: String,
+  pub testId: String,
+  pub canvas: List<CanvasCommand>,
+}
+
+impl NodeExtras {
+  pub fn make() -> NodeExtras {
+    return NodeExtras {
+      hover: List<Declaration>.make(),
+      active: List<Declaration>.make(),
+      focus: List<Declaration>.make(),
+      focusVisible: List<Declaration>.make(),
+      starting: List<Declaration>.make(),
+      transition: String.make(),
+      testId: String.make(),
+      canvas: List<CanvasCommand>.make(),
+    }
+  }
 }
 
 /// A node's rarer accessibility attributes, named and valued as their `Attribute`s.
@@ -280,6 +305,80 @@ impl Node {
   /// The node's computed style.
   @inlineAlways
   pub fn computed(self: &Self) -> &Computed { return self.styled.get() }
+
+  /// The node's rarer parts, when it was given any (see `NodeExtras`).
+  pub fn extrasOf(self: &Self) -> Option<&NodeExtras> {
+    return match &self.extras {
+      Option<Box<NodeExtras>>.Some { value } => Option<&NodeExtras>.Some { value: &value.get()[0] }
+      Option<Box<NodeExtras>>.None => Option<&NodeExtras>.None
+    }
+  }
+
+  /// The node's rarer parts to change, made on first use.
+  pub effect fn extrasMut(self: &mut Self) -> &mut NodeExtras ! OutOfMemoryError ? &mut Allocator {
+    if self.extras.isNone() {
+      self.extras = Option<Box<NodeExtras>>.Some { value: run Box<NodeExtras>.make(NodeExtras.make()) }
+    }
+    match &mut self.extras {
+      Option<Box<NodeExtras>>.Some { value } => {
+        return &mut value.getMut()[0]
+      }
+      Option<Box<NodeExtras>>.None => {
+        return Intrinsic.trap("ui-tree: the node's extras were just made")
+      }
+    }
+  }
+
+  /// The node's rarer parts to change, when it has them.
+  pub fn extrasHeld(self: &mut Self) -> Option<&mut NodeExtras> {
+    return match &mut self.extras {
+      Option<Box<NodeExtras>>.Some { value } => Option<&mut NodeExtras>.Some { value: &mut value.getMut()[0] }
+      Option<Box<NodeExtras>>.None => Option<&mut NodeExtras>.None
+    }
+  }
+
+  /// The `:hover` look.
+  pub fn hover(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.hover.asSlice() _ => &[] }
+  }
+
+  /// The `:active` look.
+  pub fn active(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.active.asSlice() _ => &[] }
+  }
+
+  /// The `:focus` look.
+  pub fn focus(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focus.asSlice() _ => &[] }
+  }
+
+  /// The `:focus-visible` look.
+  pub fn focusVisible(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focusVisible.asSlice() _ => &[] }
+  }
+
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub fn starting(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.starting.asSlice() _ => &[] }
+  }
+
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub fn transition(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.transition) _ => "" }
+  }
+
+  pub fn hasTransition(self: &Self) -> bool {
+    return match self.extrasOf() { Option.Some { value } => value.transition.ownedByteLength() != 0 _ => false }
+  }
+
+  pub fn testId(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.testId) _ => "" }
+  }
+
+  /// The drawing commands of a canvas node.
+  pub fn canvas(self: &Self) -> &[CanvasCommand] {
+    return match self.extrasOf() { Option.Some { value } => value.canvas.asSlice() _ => &[] }
+  }
 
   pub fn generatedOrigin(self: &Self) -> u32 {
     return match self.identity() { Option.Some { value } => value.generatedOrigin _ => NONE }
