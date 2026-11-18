@@ -46,6 +46,7 @@ import event {
 }
 import input { Input as RawInput }
 import interact
+import text_selection
 import ui_protocol.options { RootOptions }
 import mutation {
   Mutation,
@@ -491,6 +492,16 @@ impl<'t, 'a> NodeView<'t, 'a> {
 }
 
 /// The retained UI tree.
+/// A document text selection, by node id: see [`Tree.textSelection`].
+pub struct TextRange {
+  pub anchor: NodeId,
+  pub anchorOffset: usize,
+  pub focus: NodeId,
+  pub focusOffset: usize,
+}
+
+impl Copy for TextRange {}
+
 pub struct Tree<'a> {
   core: UiTree<'a>,
   nextId: u32,
@@ -878,6 +889,57 @@ impl<'a> Tree<'a> {
       return Option<NodeId>.None
     }
     return Option<NodeId>.Some { value: NodeId.of(self.core.node(self.core.focused).id) }
+  }
+
+  /// The document's text selection: where it was started (the anchor) and where it ends
+  /// now (the focus), as nodes with offsets (UTF-8 bytes in a text node, child indices in
+  /// an element). None when nothing is selected.
+  pub effect fn textSelection(self: &mut Self) -> Option<TextRange>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.refresh(&mut self.core)
+    let s = &self.core.textSelection
+    if !s.anchor.exists() {
+      return Option<TextRange>.None
+    }
+    return Option<TextRange>.Some {
+      value: TextRange {
+        anchor: NodeId.of(s.anchor.id),
+        anchorOffset: s.anchor.offset,
+        focus: NodeId.of(s.focus.id),
+        focusOffset: s.focus.offset,
+      }
+    }
+  }
+
+  /// Selects document text from `anchor` to `focus`. Offsets are clamped to the nodes.
+  pub effect fn selectText(self: &mut Self, range: TextRange) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let a = self.core.slotOf(range.anchor.raw())
+    let f = self.core.slotOf(range.focus.raw())
+    if a == NONE || f == NONE {
+      fail TreeError.StaleNode { node: if a == NONE { range.anchor } else { range.focus } }
+    }
+    let anchor = text_selection.Point { slot: a, id: range.anchor.raw(), offset: range.anchorOffset }
+    let focus = text_selection.Point { slot: f, id: range.focus.raw(), offset: range.focusOffset }
+    run text_selection.select(&mut self.core, anchor, focus)
+  }
+
+  /// Clears the document's text selection.
+  pub effect fn clearTextSelection(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.clear(&mut self.core)
+  }
+
+  /// The selected document text as copying gives it: rendered white space, line breaks
+  /// between blocks, tabs between table cells, nothing from `user-select: none` text.
+  pub effect fn selectedText(self: &mut Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.refresh(&mut self.core)
+    return run text_selection.text(&self.core)
   }
 
   /// Selects `selection` in the value of `input`. Offsets are clamped to the value and moved
