@@ -1,5 +1,5 @@
-//! Pixel checks for properties the Can I use probes cannot see: `caret-color` (the probe
-//! fixture has no focused input) and `object-fit` (it has no image).
+//! Pixel checks for what the Can I use probes cannot see: `caret-color` (the probe
+//! fixture has no focused input), `object-fit` (it has no image) and corner shapes.
 import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Attribute }
 import silk.core.option { Option }
 import silk.text.string { String }
@@ -438,4 +438,143 @@ test effect fn pixelBackdropFilterListsBlur()
   ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run backdropFilterLists() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The pixels at `points` of a table with one row of cells `a` and `b` on white; `b` holds a
+/// 10px tall block when `filled`.
+effect fn tablePixels(table: &[u8], a: &[u8], b: &[u8], filled: bool, points: [[u32; 2]; 4]) -> [[u8; 3]; 4]
+  ! TreeError | CssError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.style(2, (run written.declarations(table)).asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.style(3, (run written.declarations(b"display:table-row")).asSlice())
+  run batch.create(4, NodeKind.Box)
+  run batch.append(3, 4)
+  run batch.style(4, (run written.declarations(a)).asSlice())
+  run batch.create(5, NodeKind.Box)
+  run batch.append(3, 5)
+  run batch.style(5, (run written.declarations(b)).asSlice())
+  if filled {
+    run batch.create(6, NodeKind.Box)
+    run batch.append(5, 6)
+    run batch.style(6, (run written.declarations(b"display:block;height:10px")).asSlice())
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let mut result: [[u8; 3]; 4] = [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]]
+  let mut at: usize = 0
+  while at < 4 {
+    let pixel = painted.pixel(points[at][0], points[at][1])
+    result[at] = [pixel.r, pixel.g, pixel.b]
+    at = at + 1
+  }
+  return result
+}
+
+fn rgb(pixel: [u8; 3], r: u8, g: u8, b: u8) -> bool { return pixel[0] == r && pixel[1] == g && pixel[2] == b }
+
+// https://www.w3.org/TR/CSS2/tables.html#border-conflict-resolution
+effect fn collapsedTableBorders() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // The table is 124px wide: its 4px red border, a's 2px blue and b's 10px green meet.
+  let wins = run tablePixels(
+    b"display:table;border-collapse:collapse;border:4px solid rgb(255, 0, 0)",
+    b"display:table-cell;width:50px;height:20px;border:2px solid rgb(0, 0, 255)",
+    b"display:table-cell;width:50px;height:20px;border:10px solid rgb(0, 128, 0)",
+    false, [[30, 5], [100, 2], [56, 20], [30, 20]])
+  run Testing.expect(rgb(wins[0], 255, 0, 0), "the table's wider border wins over a cell's on the table's edge")
+  run Testing.expect(rgb(wins[1], 0, 128, 0), "a cell's wider border wins over the table's")
+  run Testing.expect(rgb(wins[2], 0, 128, 0), "and over its neighbour's, centred on the line between them")
+  run Testing.expect(rgb(wins[3], 255, 255, 255), "a cell's content area has no border")
+  let hidden = run tablePixels(
+    b"display:table;border-collapse:collapse",
+    b"display:table-cell;width:50px;height:20px;border:3px solid rgb(0, 0, 255)",
+    b"display:table-cell;width:50px;height:20px;border:3px solid rgb(0, 0, 255);border-left-style:hidden",
+    false, [[1, 10], [51, 10], [52, 10], [103, 10]])
+  run Testing.expect(rgb(hidden[0], 0, 0, 255), "an outer cell border paints")
+  run Testing.expect(rgb(hidden[1], 255, 255, 255) && rgb(hidden[2], 255, 255, 255), "a hidden side suppresses its neighbour's border")
+  run Testing.expect(rgb(hidden[3], 0, 0, 255), "the other sides still paint")
+}
+
+test effect fn pixelCollapsedTableBordersResolveConflicts() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run collapsedTableBorders() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// https://www.w3.org/TR/CSS2/tables.html#empty-and-nonempty-cells
+effect fn emptyCells() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let cell = b"display:table-cell;width:50px;height:20px;background-color:rgb(0, 0, 255)"
+  let hide = run tablePixels(b"display:table;border-spacing:0;empty-cells:hide", cell, cell, true, [[25, 10], [75, 15], [75, 5], [150, 10]])
+  run Testing.expect(rgb(hide[0], 255, 255, 255), "empty-cells: hide paints no background on an empty cell")
+  run Testing.expect(rgb(hide[1], 0, 0, 255) && rgb(hide[2], 0, 0, 255), "a cell with content still paints")
+  let show = run tablePixels(b"display:table;border-spacing:0", cell, cell, true, [[25, 10], [75, 15], [75, 5], [150, 10]])
+  run Testing.expect(rgb(show[0], 0, 0, 255), "empty cells paint by default")
+}
+
+test effect fn pixelEmptyCellsHide() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run emptyCells() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The pixel at (x, y) of a 200x100 box with `style` on white, as 0 white, 1 red, 2 black, 3 other.
+effect fn radiusPixel(style: &[u8], x: u32, y: u32) -> u8 ! TreeError | CssError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let own = run written.declarations(style)
+  run batch.style(2, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let p = painted.pixel(x, y)
+  if white(p.r, p.g, p.b) { return 0 }
+  if p.r > 240 && p.g < 15 && p.b < 15 { return 1 }
+  if p.r < 15 && p.g < 15 && p.b < 15 { return 2 }
+  return 3
+}
+
+/// Expected values are Chromium's pixels for the same styles.
+effect fn ellipticalRadii() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let slash = b"display:block;width:200px;height:100px;background-color:red;border-radius:100px / 50px"
+  run Testing.expect(u8.toU32(run radiusPixel(slash, 15, 15)) == 0, "the slash form makes an elliptical corner")
+  run Testing.expect(u8.toU32(run radiusPixel(slash, 30, 30)) == 1, "inside the elliptical corner paints")
+  let percent = b"display:block;width:200px;height:100px;background-color:red;border-radius:50%"
+  run Testing.expect(u8.toU32(run radiusPixel(percent, 15, 15)) == 0, "50% of a wide box is an ellipse")
+  run Testing.expect(u8.toU32(run radiusPixel(percent, 30, 30)) == 1, "50% keeps the inside")
+  let overlap = b"display:block;width:200px;height:100px;background-color:red;border-top-left-radius:160px 80px;border-top-right-radius:160px 80px"
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 15, 15)) == 0, "overlapping radii shrink by one factor")
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 30, 30)) == 1, "the shrunk corner keeps the inside")
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 185, 15)) == 0, "both top corners shrink alike")
+  let longhand = b"display:block;width:200px;height:100px;background-color:red;border-top-left-radius:100px 50px"
+  run Testing.expect(u8.toU32(run radiusPixel(longhand, 15, 15)) == 0, "a longhand takes a horizontal and vertical radius")
+  run Testing.expect(u8.toU32(run radiusPixel(longhand, 195, 3)) == 1, "other corners stay square")
+  let ring = b"display:block;box-sizing:border-box;width:200px;height:100px;background-color:red;border:10px solid black;border-radius:40px / 20px"
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 3, 3)) == 0, "outside the outer ellipse is clear")
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 12, 12)) == 2, "the inner corner is the outer ellipse less the borders")
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 25, 15)) == 1, "the padding box starts at the inner ellipse")
+}
+
+test effect fn pixelBorderRadiusMatchesChromium() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run ellipticalRadii() |> Effect.provideMut<Allocator>(&mut allocator)
 }
