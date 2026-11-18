@@ -155,6 +155,76 @@ test("pointer capture follows the pointer that is down", () => {
   assert.equal(box.hasPointerCapture(3), false);
 });
 
+test("touch events carry their touch lists and report their own prevention", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.appendChild(inner);
+  const seen = [];
+  for (const type of ["touchstart", "touchmove", "touchend"]) {
+    outer.addEventListener(type, (event) => {
+      seen.push([event.type, event.cancelable, event.changedTouches[0].identifier, event.touches.length, event.targetTouches.length, event.changedTouches.item(0).target === inner]);
+      if (event.type === "touchstart") event.preventDefault();
+    });
+  }
+  const flags = mock.take().filter((call) => call[0] === "listen" && call[1] === outer.nodeId);
+  assert.deepEqual(flags.at(-1), ["listen", outer.nodeId, 1 << 30]);
+  const first = 2 * 256 + 2 * 16 + 64;
+  const second = 3 * 256 + 2 * 16;
+  // A prevented pointerdown of a finger does not reach the tree; its touchstart does.
+  outer.addEventListener("pointerdown", (event) => event.preventDefault());
+  assert.equal(mock.native.dispatch(0, inner.nodeId, 5, 5, first, 0, 1), false);
+  assert.equal(mock.native.dispatch(30, inner.nodeId, 5, 5, first, 1, 0), true);
+  assert.equal(mock.native.dispatch(30, outer.nodeId, 9, 5, second, 1, 0), true);
+  // Once the tree pans, touchmove cannot be prevented; it still goes to the first node.
+  mock.native.dispatch(31, inner.nodeId, 5, 30, first, 0, 0);
+  mock.native.dispatch(32, outer.nodeId, 9, 5, second, 1, 0);
+  mock.native.dispatch(32, inner.nodeId, 5, 30, first, 0, 0);
+  assert.deepEqual(seen, [
+    ["touchstart", true, 2, 1, 1, true],
+    ["touchstart", true, 3, 2, 1, false],
+    ["touchmove", false, 2, 2, 1, true],
+    ["touchend", true, 3, 1, 0, false],
+    ["touchend", false, 2, 0, 0, true],
+  ]);
+});
+
+test("mouse events follow pointer events, and a tap's come before its click", () => {
+  const box = createBox();
+  const log = [];
+  for (const type of ["pointerdown", "mousedown", "mousemove", "mouseup", "mouseover", "click"]) {
+    box.addEventListener(type, (event) => log.push(type));
+  }
+  const mouse = 256 + 64;
+  mock.native.dispatch(28, box.nodeId, 0, 0, mouse, 0, 0);
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, mouse, 0, 1);
+  assert.deepEqual(log, ["mouseover", "pointerdown", "mousedown", "mouseup", "click"]);
+  log.length = 0;
+  // A prevented pointerdown mutes the mouse events up to the release.
+  const prevent = (event) => event.preventDefault();
+  box.addEventListener("pointerdown", prevent);
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  mock.native.dispatch(3, box.nodeId, 1, 0, mouse, 0, 0);
+  mock.native.dispatch(1, box.nodeId, 1, 0, mouse, 0, 0);
+  mock.native.dispatch(3, box.nodeId, 2, 0, mouse, 0, 0);
+  assert.deepEqual(log, ["pointerdown", "mousemove"]);
+  box.removeEventListener("pointerdown", prevent);
+  log.length = 0;
+  const finger = 2 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, finger, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, finger, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, finger, 0, 1);
+  assert.deepEqual(log, ["pointerdown", "mousemove", "mousedown", "mouseup", "click"]);
+  log.length = 0;
+  box.addEventListener("pointerdown", prevent);
+  const next = 3 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, next, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, next, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, next, 0, 1);
+  assert.deepEqual(log, ["pointerdown", "click"]);
+});
+
 test("transition events bubble with their property and elapsed time", () => {
   const outer = createBox();
   const inner = createBox();

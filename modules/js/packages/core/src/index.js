@@ -19,14 +19,32 @@ const TYPES = [
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
-  "animationcancel", "selectionchange", "pointerover", "pointerout",
+  "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
+  "touchend", "touchcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
+const TOUCH_START = KIND_OF.get("touchstart");
+// The tree has one listener flag for the four touch kinds.
+const TOUCH_FLAG = 1 << 30;
+// Compatibility mouse events, as the web fires them after pointer events: each listens
+// through the pointer kind it follows.
+const MOUSE_OF = new Map([
+  ["pointerdown", "mousedown"], ["pointerup", "mouseup"], ["pointermove", "mousemove"],
+  ["pointerover", "mouseover"], ["pointerout", "mouseout"], ["pointerenter", "mouseenter"],
+  ["pointerleave", "mouseleave"],
+]);
+const POINTER_OF = new Map([...MOUSE_OF].map(([pointer, mouse]) => [mouse, pointer]));
 // As on the web: these reach the target alone.
-const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
-// The tree has a default action to skip for these.
-const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop"]);
+const NO_BUBBLE = new Set([
+  "pointerenter", "pointerleave", "mouseenter", "mouseleave", "focus", "blur", "scroll", "layout", "load",
+  "error",
+]);
+// The tree has a default action to skip for these. Touch records say for themselves.
+const CANCELABLE = new Set([
+  "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
+  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout",
+]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
@@ -551,9 +569,18 @@ export class Node {
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
   #want(kind) {
-    const list = this.#listeners?.get(TYPES[kind]);
-    const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
-    const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    const has = (type) => (this.#listeners?.get(type)?.length ?? 0) > 0;
+    let wanted;
+    let bit;
+    if (kind >= TOUCH_START) {
+      wanted = TYPES.slice(TOUCH_START).some(has);
+      bit = TOUCH_FLAG;
+    } else {
+      const type = TYPES[kind];
+      wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href);
+      bit = 1 << kind;
+    }
+    const flags = wanted ? this.#flags | bit : this.#flags & ~bit;
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
   }
 
@@ -609,7 +636,7 @@ export class Node {
    */
   addEventListener(type, listener, options) {
     if (listener == null) return;
-    const kind = KIND_OF.get(type);
+    const kind = KIND_OF.get(POINTER_OF.get(type) ?? type);
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
@@ -626,7 +653,7 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    const kind = KIND_OF.get(type);
+    const kind = KIND_OF.get(POINTER_OF.get(type) ?? type);
     if (kind !== undefined) this.#want(kind);
   }
 
@@ -1567,6 +1594,43 @@ function isPointerKind(kind) {
   return kind <= 5 || kind === 14 || kind === 28 || kind === 29;
 }
 
+// The fingers down, by `identifier`: the `Touch` each last reported.
+const touches = new Map();
+
+function touchList(list) {
+  list.item = (index) => list[index] ?? null;
+  return list;
+}
+
+// A touch record as DOM `TouchEvent`: the finger it is about is `changedTouches[0]`, and it
+// goes to the node the finger went down on. No host reports contact size or force: a touch is
+// 1 by 1 pixel, as its pointer is, with force 0.
+function fillTouch(event, kind, a, b, bits, d) {
+  const identifier = Math.floor(bits / 256);
+  const touch = {
+    identifier,
+    target: event.target,
+    clientX: a,
+    clientY: b,
+    pageX: a,
+    pageY: b,
+    screenX: a,
+    screenY: b,
+    radiusX: 0.5,
+    radiusY: 0.5,
+    rotationAngle: 0,
+    force: 0,
+  };
+  const start = touches.get(identifier);
+  if (start) touch.target = start.target;
+  if (kind === TOUCH_START || kind === TOUCH_START + 1) touches.set(identifier, touch);
+  else touches.delete(identifier);
+  event.cancelable = d === 1;
+  event.changedTouches = touchList([touch]);
+  event.touches = touchList([...touches.values()]);
+  event.targetTouches = touchList([...touches.values()].filter((t) => t.target === event.target));
+}
+
 // The members of DOM `PointerEvent` the record carries (see ui-js-calls `pointerBits`), and the
 // spec defaults for what no host reports: pressure 0.5 while a button is down, 0 otherwise, and
 // a contact of 1 by 1 pixel with no tilt.
@@ -1576,8 +1640,9 @@ function fillPointer(event, kind, bits, d) {
   const isPrimary = Math.floor(bits / 64) % 2 === 1;
   let pointer = pointers.get(pointerId);
   if (!pointer) {
-    pointer = { buttons: 0, capture: null, primary: isPrimary };
-    pointers.set(pointerId, pointer);
+    pointer = { buttons: 0, capture: null, primary: isPrimary, mute: false };
+    // A click comes after its pointer lifted: it leaves no pointer behind.
+    if (kind !== 2) pointers.set(pointerId, pointer);
   }
   if (kind === 0) pointer.buttons |= BUTTON_BITS[d] ?? 0;
   else if (kind === 1) pointer.buttons &= ~(BUTTON_BITS[d] ?? 0);
@@ -1606,6 +1671,14 @@ function fillPointer(event, kind, bits, d) {
 }
 
 function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
+  if (kind >= TOUCH_START) {
+    fillTouch(event, kind, a, b, modifiers, d);
+    event.shiftKey = (modifiers & 1) !== 0;
+    event.ctrlKey = (modifiers & 2) !== 0;
+    event.altKey = (modifiers & 4) !== 0;
+    event.metaKey = (modifiers & 8) !== 0;
+    return;
+  }
   if (kind <= 6 || kind === 14 || kind === 28 || kind === 29) {
     event.clientX = event.x = a;
     event.clientY = event.y = b;
@@ -1706,14 +1779,59 @@ function adopt(event, target) {
   return event;
 }
 
+// The compatibility mouse event of `type` that follows pointer event `from`.
+function mouseEvent(type, from, target) {
+  const event = new Event(type, target);
+  for (const name of ["clientX", "clientY", "x", "y", "button", "buttons", "detail", "shiftKey", "ctrlKey", "altKey", "metaKey"]) {
+    event[name] = from[name];
+  }
+  if (type === "mousemove") event.button = 0;
+  return event;
+}
+
+// Mouse events after a pointer event of a mouse or pen, as the web sends them: a prevented
+// `pointerdown` mutes `mousedown`, `mousemove` and `mouseup` until the pointer lifts.
+function compatMouse(kind, event, target) {
+  const type = MOUSE_OF.get(event.type);
+  if (!type) return;
+  const pointer = pointers.get(event.pointerId);
+  if (kind === 0 && event.defaultPrevented && pointer) pointer.mute = true;
+  const muted = pointer?.mute && (kind === 0 || kind === 1 || kind === 3);
+  if (kind === 1 && pointer) pointer.mute = false;
+  if (!muted && event.isPrimary) dispatchEvent(mouseEvent(type, event, target));
+}
+
+// The finger whose prevented `pointerdown` mutes its tap's mouse events.
+let mutedTap = null;
+
+// A tap's mouse events come just before its click, as on the web.
+function compatTap(click, target) {
+  if (mutedTap === click.pointerId) return;
+  for (const type of ["mousemove", "mousedown", "mouseup"]) {
+    const event = mouseEvent(type, click, target);
+    event.buttons = type === "mousedown" ? 1 : 0;
+    dispatchEvent(event);
+  }
+}
+
 // The host calls this for every event record, before the tree runs the default action.
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
+  if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
   dispatchEvent(event);
   if (kind === CLICK && !event.defaultPrevented) follow(target);
+  if (kind !== CLICK && isPointerKind(kind)) {
+    if (event.pointerType !== "touch") compatMouse(kind, event, target);
+    // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
+    // pointer events, as on the web.
+    else {
+      if (kind === 0 && event.isPrimary) mutedTap = event.defaultPrevented ? event.pointerId : null;
+      return false;
+    }
+  }
   return event.defaultPrevented;
 };
 
