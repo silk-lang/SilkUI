@@ -37,7 +37,12 @@ export interface Look {
 }
 
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
+/** What `signal` needs from an `AbortSignal`. */
+export interface ListenerSignal {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+}
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: ListenerSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {
@@ -142,6 +147,15 @@ export class Node {
   readonly offsetTop: number;
   readonly offsetWidth: number;
   readonly offsetHeight: number;
+  /** Whether this node matches CSS `selector`, by the stylesheet matcher. Throws a SyntaxError for an invalid selector. */
+  matches(selector: string): boolean;
+  webkitMatchesSelector(selector: string): boolean;
+  /** This node or its nearest ancestor that matches `selector`. */
+  closest(selector: string): Node | null;
+  /** The first descendant, in tree order, that matches `selector`. */
+  querySelector(selector: string): Node | null;
+  /** Every descendant that matches `selector`, in tree order (a static list). */
+  querySelectorAll(selector: string): Node[];
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   /** The app's own event types, sent with `dispatchEvent`. */
   addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
