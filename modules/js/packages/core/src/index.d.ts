@@ -37,7 +37,7 @@ export interface Look {
 }
 
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: AbortSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {
