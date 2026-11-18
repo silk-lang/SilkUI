@@ -19,7 +19,7 @@ const TYPES = [
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
-  "animationcancel", "selectionchange",
+  "animationcancel", "selectionchange", "pointerover", "pointerout",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -374,6 +374,8 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
+  // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
+  #kept = 0;
   #attributes = null;
   #classList = null;
 
@@ -553,8 +555,13 @@ export class Node {
   #want(kind) {
     const list = this.#listeners?.get(TYPES[kind]);
     const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
-    const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    const flags = (wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind)) | this.#kept;
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+  }
+
+  _keep(...types) {
+    for (const type of types) this.#kept |= 1 << KIND_OF.get(type);
+    this.#want(KIND_OF.get(types[0]));
   }
 
   set tabIndex(value) {
@@ -567,6 +574,31 @@ export class Node {
 
   focus() {
     native.focus(this.nodeId);
+  }
+
+  /**
+   * Sends the pointer's records here until it lifts, as DOM `setPointerCapture`. Throws
+   * `NotFoundError` for a pointer that is not down. The tree moves the capture of the
+   * primary pointer; another finger keeps sending to the node it went down on.
+   */
+  setPointerCapture(pointerId) {
+    const pointer = pointers.get(pointerId);
+    if (!pointer) throw domError("NotFoundError", `no active pointer with id ${pointerId}`);
+    if (!pointer.buttons) return;
+    pointer.capture = this;
+    if (pointer.primary) native.capture(this.nodeId);
+  }
+
+  releasePointerCapture(pointerId) {
+    const pointer = pointers.get(pointerId);
+    if (!pointer) throw domError("NotFoundError", `no active pointer with id ${pointerId}`);
+    if (pointer.capture !== this) return;
+    pointer.capture = null;
+    if (pointer.primary) native.capture(0);
+  }
+
+  hasPointerCapture(pointerId) {
+    return pointers.get(pointerId)?.capture === this;
   }
 
   scrollTo(x, y) {
@@ -659,14 +691,24 @@ export class Text extends Node {
   }
 }
 
-/** An editable text field. `value` follows what the user types. */
+/**
+ * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
+ * string indices, as on the web; the tree counts UTF-8 bytes, converted here.
+ */
 export class Input extends Node {
   #value = "";
+  #start = 0;
+  #end = 0;
+  #direction = "forward";
 
   constructor() {
     super("input");
-    this.selectionStart = 0;
-    this.selectionEnd = 0;
+    this._keep("input", "selectionchange");
+  }
+
+  /** The text the selection offsets index into. */
+  _text() {
+    return this.#value;
   }
 
   get value() {
@@ -674,25 +716,133 @@ export class Input extends Node {
   }
 
   set value(value) {
-    this.#value = String(value);
-    native.setText(this.nodeId, this.#value);
+    value = String(value);
+    if (value === this.#value) return;
+    this.#value = value;
+    native.setText(this.nodeId, value);
+    this.#start = this.#end = value.length;
+    this.#direction = "forward";
   }
 
-  /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
-  setSelectionRange(anchor, focus) {
+  get selectionStart() {
+    return this.#start;
+  }
+
+  set selectionStart(value) {
+    const start = clampIndex(value, this._text().length);
+    this.setSelectionRange(start, Math.max(start, this.#end), this.#direction);
+  }
+
+  get selectionEnd() {
+    return this.#end;
+  }
+
+  set selectionEnd(value) {
+    this.setSelectionRange(this.#start, clampIndex(value, this._text().length), this.#direction);
+  }
+
+  get selectionDirection() {
+    return this.#direction;
+  }
+
+  set selectionDirection(value) {
+    this.setSelectionRange(this.#start, this.#end, value);
+  }
+
+  /** Selects `start` to `end`; with `direction` "backward" the caret sits at `start`. */
+  setSelectionRange(start, end, direction = "none") {
+    const text = this._text();
+    end = clampIndex(end, text.length);
+    start = Math.min(clampIndex(start, text.length), end);
+    const backward = direction === "backward";
+    this.#start = start;
+    this.#end = end;
+    this.#direction = backward ? "backward" : "forward";
+    const anchor = byteOf(text, backward ? end : start);
+    const focus = byteOf(text, backward ? start : end);
     native.select(this.nodeId, anchor, focus);
   }
 
+  /** Selects the whole value. */
+  select() {
+    this.setSelectionRange(0, this._text().length);
+  }
+
+  /**
+   * Replaces `start` to `end` (the selection by default) with `replacement`. `selectionMode`
+   * is "select", "start", "end" or "preserve", as on the web.
+   */
+  setRangeText(replacement, start, end, selectionMode = "preserve") {
+    replacement = String(replacement);
+    const text = this._text();
+    if (start === undefined) {
+      start = this.#start;
+      end = this.#end;
+    } else if (end === undefined) {
+      throw new TypeError("setRangeText needs both start and end");
+    } else if (Number(start) > Number(end)) {
+      throw domError("IndexSizeError", "setRangeText: start is after end");
+    }
+    start = clampIndex(start, text.length);
+    end = clampIndex(end, text.length);
+    let selectionStart = this.#start;
+    let selectionEnd = this.#end;
+    const delta = replacement.length - (end - start);
+    const newEnd = start + replacement.length;
+    if (selectionMode === "select") {
+      selectionStart = start;
+      selectionEnd = newEnd;
+    } else if (selectionMode === "start") {
+      selectionStart = selectionEnd = start;
+    } else if (selectionMode === "end") {
+      selectionStart = selectionEnd = newEnd;
+    } else {
+      if (selectionStart > end) selectionStart += delta;
+      else if (selectionStart > start) selectionStart = start;
+      if (selectionEnd > end) selectionEnd += delta;
+      else if (selectionEnd > start) selectionEnd = newEnd;
+    }
+    const direction = this.#direction;
+    this._replace(start, end, replacement);
+    this.setSelectionRange(selectionStart, selectionEnd, direction);
+  }
+
+  _replace(start, end, replacement) {
+    const text = this.#value;
+    this.value = text.slice(0, start) + replacement + text.slice(end);
+  }
+
+  // From the tree: the value and selection in UTF-8 bytes.
   _changed(value, anchor, focus) {
     this.#value = value;
-    this.selectionStart = Math.min(anchor, focus);
-    this.selectionEnd = Math.max(anchor, focus);
+    this.#take(byteIndex(value, anchor), byteIndex(value, focus));
   }
 
   _selected(start, end) {
-    this.selectionStart = start;
-    this.selectionEnd = end;
+    const text = this._text();
+    this.#take(byteIndex(text, start), byteIndex(text, end));
   }
+
+  // The tree reports the low and high offsets only, so a selection it changed reads forward
+  // unless it is the one set here.
+  #take(a, b) {
+    const start = Math.min(a, b);
+    const end = Math.max(a, b);
+    if (start === this.#start && end === this.#end) return;
+    this.#start = start;
+    this.#end = end;
+    this.#direction = "forward";
+  }
+}
+
+function clampIndex(value, length) {
+  const number = Math.trunc(Number(value)) || 0;
+  return Math.min(Math.max(number, 0), length);
+}
+
+// A UTF-8 offset from the tree as a string index; NaN and missing read as 0.
+function byteIndex(text, byte) {
+  return indexOf(text, Number(byte) || 0);
 }
 
 // Inline SVG markup as icon resources: identical markup shares one, freed when no `<svg>`
@@ -1444,7 +1594,8 @@ export class RichInput extends Input {
     let packedAtoms = "";
     for (const atom of atoms) packedAtoms += this.#packAtom(atom);
     native.richText(this.nodeId, text, packedMarks, packedAtoms);
-    super._changed(text, text.length, text.length);
+    const end = byteOf(text, text.length);
+    super._changed(text, end, end);
   }
 
   #packAtom(atom) {
@@ -1467,13 +1618,32 @@ export class RichInput extends Input {
     native.insertAtom(this.nodeId, byteOf(text, start), byteOf(text, end), this.#packAtom(atom));
   }
 
-  setSelectionRange(anchor, focus) {
-    const text = this.#document.text;
-    native.select(this.nodeId, byteOf(text, anchor), byteOf(text, focus));
+  // Marks around the range stay, shifted; the replacement takes none. Atoms in the range go,
+  // and OBJECT characters in the replacement become U+FFFD, since they would name no atom.
+  _replace(start, end, replacement) {
+    const { text, marks, atoms } = this.#document;
+    replacement = replacement.replaceAll(OBJECT, "\ufffd");
+    const delta = replacement.length - (end - start);
+    const shift = (index, inside) => (index <= start ? index : index >= end ? index + delta : inside);
+    const spans = [];
+    for (const span of marks) {
+      const from = shift(span.start, start + replacement.length);
+      const to = shift(span.end, start);
+      if (to > from) spans.push({ start: from, end: to, marks: span.marks });
+    }
+    let before = 0;
+    let inside = 0;
+    for (let i = 0; i < end; i++) {
+      if (text[i] !== OBJECT) continue;
+      if (i < start) before++;
+      else inside++;
+    }
+    const kept = atoms.slice(0, before).concat(atoms.slice(before + inside));
+    this.document = { text: text.slice(0, start) + replacement + text.slice(end), marks: spans, atoms: kept };
   }
 
   _changed(value, anchor, focus, marks, atoms, active) {
-    super._changed(value, indexOf(value, anchor), indexOf(value, focus));
+    super._changed(value, anchor, focus);
     if (marks === undefined) return;
     const spans = [];
     for (const part of String(marks).split(";")) {
@@ -1491,8 +1661,7 @@ export class RichInput extends Input {
   }
 
   _selected(start, end, active) {
-    const text = this.#document.text;
-    super._selected(indexOf(text, start), indexOf(text, end));
+    super._selected(start, end);
     this.activeMarks = this.#names(active ?? 0);
   }
 }
@@ -1709,12 +1878,72 @@ export class Event {
   }
 }
 
+// The pointers down or hovering, by `pointerId`: their buttons and the node holding their
+// capture.
+const pointers = new Map();
+
+function domError(name, message) {
+  const DOMExceptionClass = globalThis.DOMException;
+  if (DOMExceptionClass) return new DOMExceptionClass(message, name);
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+const POINTER_TYPES = ["mouse", "pen", "touch"];
+// DOM `buttons` bits by `button`: primary 1, secondary 2, auxiliary 4, back 8, forward 16.
+const BUTTON_BITS = [1, 4, 2, 8, 16];
+
+function isPointerKind(kind) {
+  return kind <= 5 || kind === 14 || kind === 28 || kind === 29;
+}
+
+// The members of DOM `PointerEvent` the record carries (see ui-js-calls `pointerBits`), and the
+// spec defaults for what no host reports: pressure 0.5 while a button is down, 0 otherwise, and
+// a contact of 1 by 1 pixel with no tilt.
+function fillPointer(event, kind, bits, d) {
+  const pointerId = Math.floor(bits / 256);
+  const pointerType = POINTER_TYPES[Math.floor(bits / 16) % 4] ?? "mouse";
+  const isPrimary = Math.floor(bits / 64) % 2 === 1;
+  let pointer = pointers.get(pointerId);
+  if (!pointer) {
+    pointer = { buttons: 0, capture: null, primary: isPrimary };
+    pointers.set(pointerId, pointer);
+  }
+  if (kind === 0) pointer.buttons |= BUTTON_BITS[d] ?? 0;
+  else if (kind === 1) pointer.buttons &= ~(BUTTON_BITS[d] ?? 0);
+  event.pointerId = pointerId;
+  event.pointerType = pointerType;
+  event.isPrimary = isPrimary;
+  event.buttons = pointer.buttons;
+  event.pressure = pointer.buttons ? 0.5 : 0;
+  event.tangentialPressure = 0;
+  event.tiltX = 0;
+  event.tiltY = 0;
+  event.twist = 0;
+  event.altitudeAngle = Math.PI / 2;
+  event.azimuthAngle = 0;
+  event.width = 1;
+  event.height = 1;
+  if (kind !== 0 && kind !== 1 && kind !== 2) event.button = kind === 3 ? -1 : 0;
+  const coalesced = kind === 3 ? [event] : [];
+  event.getCoalescedEvents = () => coalesced;
+  event.getPredictedEvents = () => [];
+  // A pointer that lifted, or a touch that left, is gone; the mouse stays.
+  if ((kind === 1 && !pointer.buttons) || kind === 14) {
+    pointer.capture = null;
+    if (pointerType !== "mouse") pointers.delete(pointerId);
+  }
+}
+
 function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
-  if (kind <= 6 || kind === 14) {
+  if (kind <= 6 || kind === 14 || kind === 28 || kind === 29) {
     event.clientX = event.x = a;
     event.clientY = event.y = b;
   }
-  if (kind <= 8 || kind === 14) {
+  if (isPointerKind(kind)) fillPointer(event, kind, modifiers, d);
+  if (kind === 16) for (const pointer of pointers.values()) if (pointer.capture === event.target) pointer.capture = null;
+  if (kind <= 8 || kind === 14 || kind === 28 || kind === 29) {
     event.shiftKey = (modifiers & 1) !== 0;
     event.ctrlKey = (modifiers & 2) !== 0;
     event.altKey = (modifiers & 4) !== 0;

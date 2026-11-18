@@ -11,7 +11,7 @@ export function installMock() {
   const native = {};
   for (const name of [
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
-    "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
+    "attribute", "focus", "capture", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release", "load",
     "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",

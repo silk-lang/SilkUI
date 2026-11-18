@@ -104,6 +104,10 @@ export class Node {
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;
+  /** As DOM `setPointerCapture`: throws `NotFoundError` for a pointer that is not down. */
+  setPointerCapture(pointerId: number): void;
+  releasePointerCapture(pointerId: number): void;
+  hasPointerCapture(pointerId: number): boolean;
   scrollTo(x: number, y: number): void;
   scroll(x: number, y: number): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
@@ -122,14 +126,30 @@ export class Text extends Node {
   textContent: string;
 }
 
-/** An editable text field. `value` follows what the user types. */
+/**
+ * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
+ * string indices, as on the web.
+ */
 export class Input extends Node {
   constructor();
+  /** Setting a different value puts the caret at its end. */
   value: string;
-  readonly selectionStart: number;
-  readonly selectionEnd: number;
-  /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
-  setSelectionRange(anchor: number, focus: number): void;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: "forward" | "backward" | "none";
+  /** Selects `start` to `end`; with `direction` "backward" the caret sits at `start`. */
+  setSelectionRange(start: number, end: number, direction?: "forward" | "backward" | "none"): void;
+  /** Selects the whole value. */
+  select(): void;
+  /** Replaces the selection with `replacement`. */
+  setRangeText(replacement: string): void;
+  /** Replaces `start` to `end` with `replacement` and places the selection by `selectionMode`. */
+  setRangeText(
+    replacement: string,
+    start: number,
+    end: number,
+    selectionMode?: "select" | "start" | "end" | "preserve",
+  ): void;
 }
 
 /** An inline atom of a rich input: a mention or a chip. */
@@ -175,8 +195,6 @@ export class RichInput extends Input {
   toggleMark(name: string): void;
   /** Replaces the text from `start` to `end` with `atom`. */
   insertAtom(start: number, end: number, atom: RichAtom): void;
-  /** Selects from `anchor` to `focus`, as string indices. */
-  setSelectionRange(anchor: number, focus: number): void;
 }
 
 /**
@@ -273,6 +291,26 @@ export interface PointerEvent extends ModifierEvent {
   readonly clientY: number;
   readonly x: number;
   readonly y: number;
+  /** 1 for the mouse, 2 and up for touches. */
+  readonly pointerId: number;
+  readonly pointerType: "mouse" | "pen" | "touch";
+  readonly isPrimary: boolean;
+  /** -1 for `pointermove`, as on the web. */
+  readonly button: number;
+  readonly buttons: number;
+  /** 0.5 while a button is down, 0 otherwise: no host reports pressure yet. */
+  readonly pressure: number;
+  readonly tangentialPressure: number;
+  readonly tiltX: number;
+  readonly tiltY: number;
+  readonly twist: number;
+  readonly altitudeAngle: number;
+  readonly azimuthAngle: number;
+  readonly width: number;
+  readonly height: number;
+  /** The event itself for `pointermove` (each host move is its own event), empty otherwise. */
+  getCoalescedEvents(): PointerEvent[];
+  getPredictedEvents(): PointerEvent[];
 }
 
 /** `pointerdown`, `pointerup` and `click`. */
@@ -341,6 +379,8 @@ export interface EventMap {
   pointerenter: PointerEvent;
   pointerleave: PointerEvent;
   pointercancel: PointerEvent;
+  pointerover: PointerEvent;
+  pointerout: PointerEvent;
   wheel: WheelEvent;
   keydown: KeyboardEvent;
   keyup: KeyboardEvent;

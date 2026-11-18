@@ -1,5 +1,5 @@
 // The web APIs a ui-js realm has beyond the prelude's: base64, text encoding, crypto random
-// values, events (and unhandledrejection on the global object), user timing, setImmediate, idle callbacks and the console's timers. The
+// values, events (and unhandledrejection on the global object), matchMedia, user timing, setImmediate, idle callbacks and the console's timers. The
 // prelude evaluates this on the first use of one of them, so realms that use none start as
 // fast as before. It is a function of `__ui` and the prelude's shared console state, and
 // returns the APIs by their global names. Edit it, then run `silk task embed-assets`.
@@ -370,5 +370,59 @@
     }
   }
 
-  return { performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
+  // matchMedia lists with change listeners: `mediaChanged` runs after the window's media
+  // changed (a resize, a move to a display of another scale, a new appearance).
+  const watched = new Set();
+  class MediaQueryListEvent extends Event {
+    #media;
+    #matches;
+    constructor(type, options) {
+      super(type, options);
+      this.#media = String(options?.media ?? "");
+      this.#matches = !!options?.matches;
+    }
+    get media() { return this.#media; }
+    get matches() { return this.#matches; }
+  }
+  class MediaQueryList extends EventTarget {
+    #media;
+    #last;
+    #onchange = null;
+    constructor(media) {
+      super();
+      this.#media = media;
+      this.#last = native.matchMedia(media);
+    }
+    get media() { return this.#media; }
+    get matches() { return native.matchMedia(this.#media); }
+    get onchange() { return this.#onchange; }
+    set onchange(handler) {
+      if (this.#onchange) this.removeEventListener("change", this.#onchange);
+      this.#onchange = typeof handler === "function" ? handler : null;
+      if (this.#onchange) this.addEventListener("change", this.#onchange);
+    }
+    addEventListener(type, listener, options) {
+      super.addEventListener(type, listener, options);
+      if (type === "change" && !watched.has(this)) {
+        this.#last = this.matches;
+        watched.add(this);
+      }
+    }
+    addListener(listener) { this.addEventListener("change", listener); }
+    removeListener(listener) { this.removeEventListener("change", listener); }
+    _check() {
+      const now = this.matches;
+      if (now === this.#last) return;
+      this.#last = now;
+      this.dispatchEvent(new MediaQueryListEvent("change", { media: this.#media, matches: now }));
+    }
+  }
+  const matchMedia = (query) => {
+    return new MediaQueryList(String(query));
+  };
+  const mediaChanged = () => {
+    for (const list of watched) list._check();
+  };
+
+  return { matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })
