@@ -320,6 +320,23 @@ fn hasBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
   }
 }
 
+/// Whether node `slot` draws a `border-image`.
+fn hasBorderImage(p: &Painter<'_, '_>, slot: u32) -> bool {
+  if slot == NONE {
+    return false
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => value.borderImage.drawn()
+    Option<&Effects>.None => false
+  }
+}
+
+/// The border widths of a box with computed style `c`, zero under `border-style: none`.
+pub fn usedBorder(c: &Computed) -> Insets<f32> {
+  if c.paint.borderStyle == StyleBorder.None { return Insets<f32>.zero() }
+  return c.paint.border
+}
+
 /// Whether node `slot` has a `background-blend-mode` layer.
 fn blendsBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
   return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
@@ -493,7 +510,8 @@ effect fn decorate(
     }
   }
   let background = backgroundOf(c.paint.background)
-  let bordered = (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
+  let imageBorder = hasBorderImage(&p.*, slot)
+  let bordered = !imageBorder && (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
     || widths.left > 0.0)
     && c.paint.borderColor.a > 0.0
   let images = hasBackgrounds(&p.*, slot)
@@ -541,6 +559,18 @@ effect fn decorate(
       }
     }
     drop run p.scene.quad(quad)
+  }
+  if imageBorder {
+    // In place of the border's style, over the backgrounds; the widths stay as laid out.
+    let taken = paint_effects.takeEffects(&mut p, slot)
+    match &taken {
+      Option<Box<Effects>>.Some { value } => {
+        let effects = &value.get()[0]
+        run paint_effects.paintImageBorder(&mut p, effects, &effects.borderImage, f, usedBorder(c), mask, c.nearest)
+      }
+      Option<Box<Effects>>.None => {}
+    }
+    paint_effects.putEffects(&mut p, slot, move taken)
   }
   if c.paint.hasShadow && c.paint.shadow.inset && c.paint.shadow.color.a > 0.0 {
     drop run p.scene.shadow(
@@ -1601,6 +1631,11 @@ fn ownInk(
   }
   if c.outline.drawn() {
     reach = f32.max(reach, 2.0 + c.outline.offset + c.outline.width)
+  }
+  if let Option<&Effects>.Some { value } = node.paintEffects() {
+    let widths = usedBorder(&c)
+    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.borderImage, widths))
+    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.maskBorder, widths))
   }
   return grow(box, reach)
 }
