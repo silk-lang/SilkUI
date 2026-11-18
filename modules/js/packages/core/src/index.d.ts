@@ -126,14 +126,30 @@ export class Text extends Node {
   textContent: string;
 }
 
-/** An editable text field. `value` follows what the user types. */
+/**
+ * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
+ * string indices, as on the web.
+ */
 export class Input extends Node {
   constructor();
+  /** Setting a different value puts the caret at its end. */
   value: string;
-  readonly selectionStart: number;
-  readonly selectionEnd: number;
-  /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
-  setSelectionRange(anchor: number, focus: number): void;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: "forward" | "backward" | "none";
+  /** Selects `start` to `end`; with `direction` "backward" the caret sits at `start`. */
+  setSelectionRange(start: number, end: number, direction?: "forward" | "backward" | "none"): void;
+  /** Selects the whole value. */
+  select(): void;
+  /** Replaces the selection with `replacement`. */
+  setRangeText(replacement: string): void;
+  /** Replaces `start` to `end` with `replacement` and places the selection by `selectionMode`. */
+  setRangeText(
+    replacement: string,
+    start: number,
+    end: number,
+    selectionMode?: "select" | "start" | "end" | "preserve",
+  ): void;
 }
 
 /** An inline atom of a rich input: a mention or a chip. */
@@ -179,8 +195,6 @@ export class RichInput extends Input {
   toggleMark(name: string): void;
   /** Replaces the text from `start` to `end` with `atom`. */
   insertAtom(start: number, end: number, atom: RichAtom): void;
-  /** Selects from `anchor` to `focus`, as string indices. */
-  setSelectionRange(anchor: number, focus: number): void;
 }
 
 /**
