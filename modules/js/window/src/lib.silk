@@ -24,6 +24,7 @@
 import ui_js.lib { JsHost, JsError, ClipboardRequest }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
+import natives { NativeJobs, Finished }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
@@ -278,6 +279,23 @@ impl<'m> JsApp<'m> {
     return true
   }
 
+  /// Starts JavaScript's `fn.async(...)` calls of exported Silk functions on threads, and
+  /// settles the ones that ended, then applies what their promise jobs built. Says whether a
+  /// call ended.
+  effect fn natives(self: &mut Self, jobs: &mut NativeJobs, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let started = self.host.takeStartedNatives()
+    if started.length() != 0 { run jobs.start(move started, self.host.natives()) }
+    let mut done = run jobs.finished()
+    if done.length() == 0 { return false }
+    while done.length() > 0 {
+      let Finished { token, reply } = done.remove(0)
+      let answered = run Effect.result(self.host.answerNative(token, move reply)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+    }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
   /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
   /// `platform`, and the calls their promise jobs made, then applies what it built. Says
   /// whether there were calls.
@@ -373,11 +391,13 @@ pub struct JsClient<T> {
   /// Loads the image, icon and `url()` addresses the application names: `data:`, files and
   /// `http(s):`.
   pub loader: Loader,
+  /// The `fn.async(...)` calls of exported Silk functions running on threads.
+  jobs: NativeJobs,
 }
 
 impl<T: JsTools> JsClient<T> {
   pub fn make(tools: T) -> JsClient<T> {
-    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make() }
+    return JsClient<T> { tools: move tools, titleBar: TitleBar.Standard, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, windowDrag: false, stylesheets: StyleAssets.make(), stylesheetUpdates: SheetWatch.make(), loader: Loader.make(), jobs: NativeJobs.make() }
   }
 }
 
@@ -448,7 +468,8 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*)
-    return clipboard || shell
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    return clipboard || shell || natives
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
@@ -472,13 +493,14 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     run self.loader.watch(time)
     let loaded = run self.loader.serve(&mut tree)
     if loaded { drop run state.handle(&mut tree) }
-    return styled || polled || loaded
+    let natives = run state.natives(&mut self.jobs, &mut tree)
+    return styled || polled || loaded || natives
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
     let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(self.tools.wakeAfter()))
-    if !self.loader.pending() { return wanted }
-    // Collect running loads about once a frame.
+    if !self.loader.pending() && !self.jobs.pending() { return wanted }
+    // Collect running loads and Silk calls about once a frame.
     return match wanted {
       Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
       Option<f64>.None => Option<f64>.some(0.016)

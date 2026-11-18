@@ -1,5 +1,6 @@
 //! The host: one engine, one realm, and the loop steps a window host calls.
 import ui_js_calls.stylesheets { Compiler }
+import ui_js_calls.natives { Natives, Reply }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -37,7 +38,7 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest, StartedNative }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
@@ -288,6 +289,8 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
 impl<'m> JsHost<'m> {
   pub fn setStylesheetCompiler(self: &mut Self, compiler: Compiler) -> () { self.engine.services.stylesheetCompiler = compiler }
   pub fn stylesheetCompiler(self: &Self) -> Compiler { return self.engine.services.stylesheetCompiler }
+  /// The app's exported Silk functions, which `__ui.native` calls.
+  pub fn setNatives(self: &mut Self, natives: Natives) -> () { self.engine.services.natives = natives }
 
   /// A realm with the standard intrinsics, the `__ui` native functions, and the web globals
   /// of `prelude.js`: timers, animation frames, a console, `queueMicrotask`,
@@ -641,6 +644,48 @@ impl<'m> JsHost<'m> {
     }
     let arguments = [ValueBits.number(u32.toF64(call)), value.borrow().view()]
     let called = run Effect.result(callUi(&mut self.engine, realm, b"clipboard", &arguments))
+    realm.release(&mut self.engine, move value)
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
+  }
+
+  /// The app's exported Silk functions.
+  pub fn natives(self: &Self) -> Natives { return self.engine.services.natives }
+
+  /// Takes the `__ui.nativeStart` calls JavaScript made since the last call, oldest first. The
+  /// host runs each and answers it with [`JsHost.answerNative`].
+  pub fn takeStartedNatives(self: &mut Self) -> List<StartedNative> {
+    return Intrinsic.replace(self.engine.services.started, List<StartedNative>.make())
+  }
+
+  /// Settles the promise of `__ui.nativeStart` call `token` with what the function replied.
+  pub effect fn answerNative(self: &mut Self, token: u32, reply: Reply) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let mut kind: f64 = 0.0
+    let value = match move reply {
+      Reply.Nothing => Value.immediate(ValueBits.Undefined)
+      Reply.Number { value: number } => Value.immediate(ValueBits.number(number))
+      Reply.Flag { value: flag } => Value.immediate(ValueBits.Bool { value: flag })
+      Reply.Text { value: text } => run jsString(String.view(&text))
+      Reply.TypeError { message } => {
+        kind = 1.0
+        run jsString(String.view(&message))
+      }
+      Reply.Failed { message } => {
+        kind = 2.0
+        run jsString(String.view(&message))
+      }
+      Reply.OutOfMemory => {
+        kind = 2.0
+        run jsString("out of memory")
+      }
+    }
+    let arguments = [ValueBits.number(u32.toF64(token)), ValueBits.number(kind), value.borrow().view()]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"nativeDone", &arguments))
     realm.release(&mut self.engine, move value)
     match move called {
       Result<(), JsException>.Success { .. } => ()

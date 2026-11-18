@@ -145,7 +145,8 @@ pub effect fn headlessRequested() -> bool
 
 import platform_thread { HostPlatform, Launched }
 import vector.pixmap { Pixmap }
-import ui_inspect_server.lib { Inspector, InspectorOptions }
+import ui_inspect_server.lib { Inspector, InspectorOptions, Interaction, Startup, SLOW_INTERACTION_MS, interactionName, interactionTarget, slowLine }
+import ui_inspect_server.server { debugBuild }
 import silk.core.result { Result }
 import silk.system.host_input { HostInput, HostInputError }
 import font_collection.lib { FontCollection }
@@ -421,6 +422,15 @@ pub interface WindowClient<S, E, ? R> {
   }
 }
 
+/// The scale the first window most likely opens at, before there is one to ask.
+fn expectedScale() -> f64 {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return 2.0
+  } else {
+    return 1.0
+  }
+}
+
 fn revealsWhenDrawn() -> bool {
   static if Intrinsic.targetOperatingSystem() == "darwin" {
     return true
@@ -462,6 +472,43 @@ fn deviceSize(logical: f64, scale: f64) -> u32 {
 }
 
 /// Seconds on the monotonic clock.
+/// The interaction a debug build is timing: the first input since the last frame that ran
+/// handlers, and how long the handlers of every such input took.
+struct Waiting {
+  /// When that input was taken, in seconds on the host's clock; negative while none waits.
+  since: f64,
+  handled: f64,
+  input: String,
+  target: String,
+}
+
+impl Waiting {
+  fn none() -> Waiting {
+    return Waiting { since: -1.0, handled: 0.0, input: String.make(), target: String.make() }
+  }
+
+  /// Notes `input` before its handlers run; returns when they start, or -1 for an input that
+  /// starts no interaction (a pointer move, a key release).
+  effect fn begin(self: &mut Self, tree: &UiTree<'_>, input: &Input, clock: &mut Clock) -> f64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let name = run interactionName(input)
+    if String.byteLength(String.view(&name)) == 0 {
+      return -1.0
+    }
+    let now = run seconds(&mut clock)
+    if self.since < 0.0 {
+      self.since = now
+      self.input = move name
+      self.target = run interactionTarget(tree, input)
+    } else if String.view(&self.input) == "press" && String.view(&name) == "click" {
+      // A press and its release before the frame: one click.
+      self.input = move name
+    }
+    return now
+  }
+}
+
 effect fn seconds(clock: &mut Clock) -> f64 {
   return run clock.seconds()
 }
@@ -1016,6 +1063,12 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   inspector.deferInput()
   let mut clock = Clock.make()
   let started = run seconds(&mut clock)
+  // Debug builds time each interaction from its input to the frame that shows it, and say on
+  // standard error when one is slow (see `performance` in modules/inspect/server).
+  let watching = debugBuild() && !check
+  let mut waiting = Waiting.none()
+  let mut windowOpenAt: f64 = 0.0
+  let mut gpuAt: f64 = 0.0
   // SILK_UI_TRACE_FRAMES prints a line on standard error as each frame is presented, for
   // benchmarks that time startup and input to pixels from outside the process.
   let tracing = !check && (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
@@ -1049,8 +1102,25 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     run content.report(&mut state, &mut inspector)
   }
   run content.start(&mut state, &mut tree)
+  if tracing {
+    StderrWriter.print("silk-ui: client started\n", &())
+  }
   if !check {
     run companion.attach(&mut tree, &mut inspector)
+    // The first frame's styles, layout and paint, while the window system starts (about
+    // 100 ms on macOS): at the size asked for, the first real frame finds them done.
+    let early = FrameInput {
+      width: f64.toF32(options.width),
+      height: f64.toF32(options.height),
+      scale: f64.toF32(expectedScale()),
+      time: (run seconds(&mut clock)) - started,
+    }
+    run content.prepare(&mut state, &mut tree)
+    run content.layout(&mut state, &mut tree, early)
+    run content.frame(&mut state, &mut tree, early, &inspector)
+    if tracing {
+      StderrWriter.print("silk-ui: first frame laid out\n", &())
+    }
   }
   let mut snapshot = CpuSnapshot.make()
 
@@ -1071,6 +1141,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let window = run platform.openWindow(&windowOptions)
   let owner = window
+  windowOpenAt = (run seconds(&mut clock)) - started
   if tracing {
     StderrWriter.print("silk-ui: window open\n", &())
   }
@@ -1088,6 +1159,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
   let mut renderer = run attachRenderer(move early, raw, owner)
+  gpuAt = (run seconds(&mut clock)) - started
   if tracing {
     StderrWriter.print("silk-ui: gpu ready\n", &())
   }
@@ -1460,6 +1532,34 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               tree.clearUploads()
               drawn = drawn + 1
               let submitted = run seconds(&mut clock)
+              if watching {
+                if drawn == 1 {
+                  inspector.started(
+                    Startup {
+                      windowMs: f64.toF32(windowOpenAt * 1000.0),
+                      gpuMs: f64.toF32(gpuAt * 1000.0),
+                      firstFrameMs: f64.toF32((submitted - started) * 1000.0),
+                    },
+                  )
+                }
+                if waiting.since >= 0.0 {
+                  let shown = Interaction {
+                    frame: tree.stats.frame,
+                    input: Intrinsic.replace(waiting.input, String.make()),
+                    target: Intrinsic.replace(waiting.target, String.make()),
+                    handleMs: f64.toF32(waiting.handled * 1000.0),
+                    layoutMs: f64.toF32((layoutEnd - frameStart) * 1000.0),
+                    paintMs: f64.toF32((canvasEnd - layoutEnd) * 1000.0),
+                    totalMs: f64.toF32((submitted - waiting.since) * 1000.0),
+                  }
+                  waiting = Waiting.none()
+                  if shown.totalMs > SLOW_INTERACTION_MS {
+                    let line = run slowLine(&shown)
+                    StderrWriter.print("{}", &.(String.view(&line)))
+                  }
+                  run inspector.interaction(move shown)
+                }
+              }
               if tracing {
                 StderrWriter.print("silk-ui: frame {} submitted\n", &.(drawn))
               }
@@ -1602,11 +1702,15 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   redraw = tree.needsFrameOf(into) || (serves && inspector.wantsFrame())
                   drop run tree.useRoot(FIRST_ROOT)
                 } else {
+                  let handling = if watching { run waiting.begin(&tree, &input, &mut clock) } else { -1.0 }
                   let prevented = run content.decide(&mut state, &mut tree)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
                   if serves { run inspector.observe(&tree) }
                   run content.pump(&mut state, &mut tree)
+                  if handling >= 0.0 {
+                    waiting.handled = waiting.handled + (run seconds(&mut clock)) - handling
+                  }
                   platform.setCursor(owner, windowCursor(tree.cursor()))
                   redraw = content.needsFrame(&state.*, &tree)
                 }

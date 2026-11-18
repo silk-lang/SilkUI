@@ -96,3 +96,13 @@ test('resolves typed font URLs without rewriting local names or unrelated values
   assert.throws(() => compileStylesheet(css, { resolveUrl() { return compileStylesheet(css); } }), /cannot run inside resolveUrl/);
   assert.deepEqual(compileStylesheet(css, { strict: true }).diagnostics, [], 'resolver failures leave the compiler usable');
 });
+
+test('prefixed aliases compile as their standard property and vendor noise stays quiet', async () => {
+  const { reportDropped, standardize } = await import('../src/report.js');
+  const css = '.a{-webkit-backdrop-filter:blur(4px)} .b { -webkit-mask-image: url(a.png); -webkit-text-decoration: inherit }';
+  assert.deepEqual(compileStylesheet(standardize(css), { strict: true }).diagnostics, []);
+  const noisy = '*, ::backdrop, ::file-selector-button { margin: 0 } ::-webkit-inner-spin-button { height: auto } :-moz-focusring { outline: auto } .c { -webkit-tap-highlight-color: red; made-up-property: 1 }';
+  const lines = [];
+  reportDropped(line => lines.push(line), compileStylesheet(standardize(noisy)).diagnostics);
+  assert.deepEqual(lines, ['skipped 1 CSS feature Silk UI does not draw yet: made-up-property. SILKUI_CSS_REPORT=all lists everything dropped.']);
+});

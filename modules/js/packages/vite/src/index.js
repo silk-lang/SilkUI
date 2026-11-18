@@ -11,13 +11,15 @@
 import { spawn } from "node:child_process";
 import { writeFileSync, rmSync } from "node:fs";
 import { builtinModules } from "node:module";
-import { resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
 import { stylesheetDevPlugin } from "./stylesheets.js";
+import { reportDropped, standardize } from "./report.js";
 import { fontAssetResolver } from "./font-assets.js";
+import { NATIVES_DIR, jsModule, moduleOf, projectRoot, readDescription } from "./natives.js";
 
 /**
  * @param {object} [options]
@@ -156,14 +158,12 @@ export default function silk(options = {}) {
         if (!sheets.length) return;
         const css = sheets.map(sheet => typeof sheet.source === "string" ? sheet.source : new TextDecoder().decode(sheet.source)).join("\n");
         let compiled;
-        try { compiled = compileStylesheet(css, { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
+        try { compiled = compileStylesheet(standardize(css), { strict: options.strictStylesheets === true, resolveUrl: fontAssetResolver(stylesheetConfig, sheets, output) }); }
         catch (error) {
           const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
           this.error(error.message + (dropped ? `\n${dropped}` : ""));
         }
-        for (const diagnostic of compiled.diagnostics) {
-          this.warn(`dropped ${diagnostic.count} ${diagnostic.kind} occurrence(s): ${diagnostic.feature}`);
-        }
+        reportDropped(message => this.warn(message), compiled.diagnostics);
         for (const sheet of sheets) {
           delete output[sheet.fileName];
           delete output[sheet.fileName + ".map"];
@@ -175,10 +175,34 @@ export default function silk(options = {}) {
       if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
     },
   };
-  const plugins = [buildPlugin, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
+  const plugins = [buildPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }
+
+// `import { add } from "../silk/math.silk"`: the module becomes calls into the host, which has
+// the project's exported Silk functions compiled in. silkui describes them into .silk/natives/
+// before it runs Vite (see natives.js).
+const silkImports = {
+  name: "silk:imports",
+  enforce: "pre",
+  load(id) {
+    const file = id.split("?")[0];
+    if (!file.endsWith(".silk") || id.startsWith("\0")) return;
+    const root = projectRoot(dirname(file));
+    if (!root) this.error(`${file} is not in a Silk package: there is no silk.toml above it`);
+    const description = readDescription(root);
+    if (!description) this.error(`the Silk functions of ${root} are not described yet: build or run the app with \`silk task\`, which writes ${NATIVES_DIR}/`);
+    const module = moduleOf(description, file);
+    if (!module) this.error(`${relative(root, file)} is not exported to JavaScript: add its module to \`exports\` in silk.toml`);
+    this.addWatchFile(join(root, NATIVES_DIR, "natives.json"));
+    return { code: jsModule(module), map: null };
+  },
+  // The dev server rebuilds the host and starts it again (see dev.js): nothing to replace in place.
+  hotUpdate({ file }) {
+    if (file.endsWith(".silk") || file.includes(`${NATIVES_DIR}/`)) return [];
+  },
+};
 
 /** The areas of `MISSING` the SilkJS runtime does not have either. */
 const NOT_IN_NODE = new Set(["dom", "storage", "workers"]);

@@ -345,6 +345,22 @@ effect fn npm(dir: string, arguments: &[string]) -> ()
   }
 }
 
+/// Describes the Silk functions the project exports to its JavaScript (the modules in its
+/// manifest's `exports`) into `.silk/natives/`: what `.silk` imports become, and the host's
+/// dispatcher for them. `@silkui/vite` writes it; one too old to have the script writes nothing.
+effect fn describeNatives(project: &Project, web: string) -> ()
+  ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let script = run joined(web, "node_modules/@silkui/vite/bin/silkui-natives.js")
+  if !run exists(String.view(&script)) { return () }
+  static if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    let mut child = run start("node", &[String.view(&script), String.view(&project.root)], web, &[])
+    let code = child.wait()
+    if code != 0 { fail TaskError { message: run String.copy("silkui: could not describe the Silk functions the app exports"), status: code } }
+  } else {
+    run Task.abort("silkui: running Vite needs Windows subprocess support in Silk")
+  }
+}
+
 /// Installs the Vite project's packages when it has none yet.
 effect fn installed(dir: string) -> ()
   ! TaskError | FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
@@ -521,6 +537,7 @@ impl App {
     let project = run readProject()
     let web = run fromRoot(&project, dir)
     run installed(String.view(&web))
+    run describeNatives(&project, String.view(&web))
     let out = run fromRoot(&project, ".silk/bundle")
     app.bundled = run joined(String.view(&out), "app.js")
     app.compiledSheet = String.make()
@@ -587,6 +604,7 @@ impl App {
           run Task.abort("silkui cannot build Loom apps with commands for the web-dom target yet: the page has no shell for them")
         }
       }
+      let glue = run fromRoot(&project, ".silk/natives/natives.silk")
       let plan = Plan {
         target: target.id(),
         kind: kind,
@@ -614,6 +632,7 @@ impl App {
         command: command,
         stylesheets: app.sheetCount(),
         runtimeCss: app.runtimeCss,
+        natives: kind != Kind.Loom && run exists(String.view(&glue)),
       }
       let mut dir = run fromRoot(&project, ".silk")
       dir = run joined(String.view(&dir), target.id())
@@ -626,6 +645,17 @@ impl App {
       run refresh(String.view(&toml), String.view(&run manifest(&project, &plan)))
       let main = run joined(String.view(&dir), "src/main.silk")
       run refresh(String.view(&main), String.view(&run hostMain(&plan)))
+      let dispatcher = run joined(String.view(&dir), "src/natives.silk")
+      if plan.natives {
+        let bytes = run FileSystem.readFile(&run Path.make(String.view(&glue)))
+        let text = match String.fromUtf8(Bytes.asSlice(&bytes)) {
+          Result.Success { value } => value
+          Result.Failure { .. } => ""
+        }
+        run refresh(String.view(&dispatcher), text)
+      } else if run exists(String.view(&dispatcher)) {
+        run FileSystem.removeFile(&run Path.make(String.view(&dispatcher)))
+      }
       if target.id() == "web-canvas" {
         run refresh(String.view(&run joined(String.view(&dir), "src/webgpu_exports.silk")), String.view(&run webgpuExports()))
         run refresh(String.view(&run joined(String.view(&dir), "src/libm.silk")), String.view(&run libm()))
