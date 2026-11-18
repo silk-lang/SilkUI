@@ -10,10 +10,10 @@ positioned box, a Grid or UniformGrid a CSS grid, a TextBlock a text node.
 
 ```sh
 silk build --release --manifest-path modules/bench/silk.toml
-build/llvm/<target>/release/ui-bench                  # every benchmark (a few minutes)
-build/llvm/<target>/release/ui-bench Propagation Text # names containing either part
-build/llvm/<target>/release/ui-bench --quick          # shorter samples
-build/llvm/<target>/release/ui-bench --smoke          # each benchmark once, nothing measured
+build/<target>/release/ui-bench                  # every benchmark (a few minutes)
+build/<target>/release/ui-bench Propagation Text # names containing either part
+build/<target>/release/ui-bench --quick          # shorter samples
+build/<target>/release/ui-bench --smoke          # each benchmark once, nothing measured
 ```
 
 Measure an optimized build on a quiet machine, and compare runs of two builds on the same
@@ -48,6 +48,7 @@ that layout, so it measures at least as much work:
 | `trees::Text.change_and_lay_out` | Change the text of each of 2,000 labels in a column, and lay out |
 | `trees::Text.narrow_and_lay_out` | Change the width of a wrapping panel of 500 paragraphs by 20 px, and lay out |
 | `trees::Text.ellipsis_long_line` | Change one character of a 360 KB one-line text cut with an ellipsis in a 200 px box, and draw a frame (not a FerroUI scenario) |
+| `trees::Cards.resize_one_row` | In a flex column of 200 flex cards of 40 labelled rows, change one row's height, and lay out; once plain and once with `contain: strict` on the cards (not a FerroUI scenario) |
 | `layout_subsystem::PanelMeasureArrange.*` | Forget every kept layout result of a panel of 1,000 leaves and lay it out again |
 | `layout_subsystem::Invalidation.resize_one_leaf` | Make one of 4,000 leaves 1 px wider or narrower, and lay out |
 | `layout_subsystem::Invalidation.measure_every_leaf` | Forget every kept layout result of the 4,000 leaves and lay out |
@@ -97,7 +98,7 @@ Use optimized builds and Callgrind instruction counts for comparisons:
 
 ```sh
 valgrind --tool=callgrind --callgrind-out-file=/dev/null \
-  build/llvm/x86_64-unknown-linux-gnu/release/ui-bench --smoke \
+  build/x86_64-unknown-linux-gnu/release/ui-bench --smoke \
   'stylesheets::Tailwind.change_class[Rows=1000]'
 ```
 
@@ -115,7 +116,7 @@ path for typed pixel/percentage styles that need no ordered resolution. Context-
 font features, transforms, motion, sheets and inspector overrides use the full resolver. Both
 paths apply the same `Computed` property implementation.
 
-Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,
+Measured on x86-64 Linux with Silk `0.1.0-dev.87+37fa5f8857de`, LLVM 22.1.8,
 `--release` and Valgrind 3.24.0. Executable SHA-256:
 `59c61a512c558b7e1af145cba778364ccb7c47ea4d864b0f02dc5b4f9d5cb18e`.
 The runtime changes are in SilkUI `09bac4c8`; local runtime sources were used for all UI and
@@ -173,7 +174,7 @@ of fixed selector identities and 231,000 B of class string/atom capacity, exclud
 
 ### Initial instruction counts
 
-Measured on x86-64 Linux with Silk `0.1.0-dev.74+205aea3f5b2e`, LLVM 22.1.8,
+Measured on x86-64 Linux with Silk `0.1.0-dev.87+37fa5f8857de`, LLVM 22.1.8,
 `--release`, and Valgrind 3.24.0. The original controls use SilkUI `9f7ea7e5`; the
 stylesheet implementation uses `2696d56b`. Counts include the whole process as described above.
 The stylesheet benchmark source and compiled fixture are in this directory.

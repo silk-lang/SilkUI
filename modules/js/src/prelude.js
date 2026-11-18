@@ -108,7 +108,7 @@
   forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
   globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
   const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget"]) {
+  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent"]) {
     Object.defineProperty(globalThis, name, {
       get: () => {
         const value = api()[name];
@@ -121,6 +121,12 @@
   }
 
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // `devicePixelRatio` and `matchMedia` answer for the window's last frame; the host calls
+  // `native.media` when that changes, for the lists' `change` events.
+  Object.defineProperty(globalThis, "devicePixelRatio", { get: () => native.scale(), set: (value) => own("devicePixelRatio", value), configurable: true });
+  globalThis.matchMedia = (query) => api().matchMedia(query);
+  native.media = () => web?.mediaChanged();
 
   // The global object as an event target, for `unhandledrejection`, the one event a realm
   // sends it. The host asks `native.rejected` before it reports a rejection nothing handled.

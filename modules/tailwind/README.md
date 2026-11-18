@@ -8,18 +8,18 @@ Add `modules/tailwind` from the same SilkUI revision as a tasks dependency named
 let processor = Tailwind.make("styles/input.css", "styles/app.css")
 ```
 
-For a release task, run `processor.build()` before `App.build(Mode.Release)`:
+For a release task, run `processor.build()` before `App.build(&options)`:
 
 ```silk
 drop run processor.build()
-run app() |> App.build(Mode.Release) |> Built.write("dist")
+run app() |> App.build(&options) |> Built.write("dist")
 ```
 
 For development, wrap the app task:
 
 ```silk
 run processor.watching(
-  app() |> App.build(Mode.Dev) |> Built.launch() |> Running.watch()
+  app() |> App.dev(&options) |> Built.launch() |> Running.watch()
 )
 ```
 

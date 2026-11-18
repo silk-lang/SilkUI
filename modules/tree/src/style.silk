@@ -38,6 +38,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.ownership { Copy }
 import silk.core.equal { Equal }
 import silk.geometry.insets { Insets }
+import silk.geometry.corners { Corners }
 import silk.geometry.rect { Rect }
 import silk.num.f32
 import silk.num.i32
@@ -123,9 +124,29 @@ pub struct Computed {
   pub contain: Containment,
   /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
   pub anchor: AnchorStyle,
+  /// `user-select`: the declared keyword while the cascade runs, the used value after it
+  /// (see `usedUserSelect`). One of the `SELECT_` constants.
+  pub userSelect: u8,
 }
 
 impl Copy for Computed {}
+
+pub const SELECT_AUTO: u8 = 0
+pub const SELECT_TEXT: u8 = 1
+pub const SELECT_NONE: u8 = 2
+pub const SELECT_ALL: u8 = 3
+/// Selectable like `text`, and a scope that select-all and drags started inside stay in.
+pub const SELECT_CONTAIN: u8 = 4
+
+/// The used `user-select` (CSS UI 4 §6.1) of a node declaring `declared` under a parent whose
+/// used value is `parent`: `auto` takes `none` and `all` from the parent and is `text`
+/// otherwise. Inputs keep their own selection, so `auto` there is a contain scope.
+pub fn usedUserSelect(declared: u8, parent: u8, input: bool) -> u8 {
+  if declared != SELECT_AUTO { return declared }
+  if input { return SELECT_CONTAIN }
+  if parent == SELECT_NONE || parent == SELECT_ALL { return parent }
+  return SELECT_TEXT
+}
 
 /// `display: list-item`, `list-style-type` and `list-style-position`, and whether the node
 /// changes counters, in one byte. Type and position inherit (copied in the engine's
@@ -221,14 +242,15 @@ pub struct Containment { bits: u8 }
 
 impl Copy for Containment {}
 
-struct Contained { size: SizeContainment, paint: bool }
+struct Contained { size: SizeContainment, paint: bool, layout: bool, style: bool }
 impl Copy for Contained {}
 
 const QUERY_SHIFT: u8 = 0
 const CONTAIN_SHIFT: u8 = 2
 const CONTAIN_PAINT: u8 = 16
 const HIDDEN: u8 = 32
-const PAINT: u8 = 64
+const CONTAIN_LAYOUT: u8 = 64
+const CONTAIN_STYLE: u8 = 128
 
 fn sizeCode(size: SizeContainment) -> u8 {
   return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
@@ -245,22 +267,33 @@ impl Containment {
   pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
 
   /// Paint containment, from `contain` or `content-visibility: hidden`.
-  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
+
+  /// Layout containment, from `contain` or `content-visibility: hidden`.
+  pub fn layout(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
+
+  /// Style containment: counters changed inside stay inside.
+  pub fn style(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
 
   /// `content-visibility: hidden`: the contents are skipped like `display: none`.
   pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
 
   fn contained(self: &Self) -> Contained {
-    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
+    return Contained {
+      size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0,
+      layout: u8.bitAnd(self.bits, CONTAIN_LAYOUT) != 0, style: u8.bitAnd(self.bits, CONTAIN_STYLE) != 0,
+    }
   }
 
   fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
     let size = if hidden { SizeContainment.Size } else { contain.size }
     let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
     if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if contain.layout { bits = u8.bitOr(bits, CONTAIN_LAYOUT) }
+    if contain.style { bits = u8.bitOr(bits, CONTAIN_STYLE) }
     if hidden { bits = u8.bitOr(bits, HIDDEN) }
-    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
     self.bits = bits
+    layout.layoutContainment = hidden || contain.paint || contain.layout
     layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
     } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
@@ -355,7 +388,7 @@ fn blurInText(css: &[u8], context: &Context) -> Option<f32> {
         return Option<f32>.some(amount * context.fontSize)
       }
       if rest >= 2 && lower(css[i]) == 112 && lower(css[i + 1]) == 120 {
-        return Option<f32>.some(amount)
+        return Option<f32>.some(amount * context.zoom)
       }
       if rest >= 1 && css[i] == 41 && amount == 0.0 {
         return Option<f32>.some(0.0)
@@ -373,7 +406,7 @@ fn lower(byte: u8) -> u8 {
 
 /// `contain`'s keywords; `None` for a value that is not one.
 fn containOf(value: &Value) -> Option<Contained> {
-  let mut out = Contained { size: SizeContainment.None, paint: false }
+  let mut out = Contained { size: SizeContainment.None, paint: false, layout: false, style: false }
   if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
     if word == Keyword.None { return Option<Contained>.some(out) }
     if !containWord(&mut out, word) { return Option<Contained>.None }
@@ -398,6 +431,8 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
   if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
   if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
   if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  if word == Keyword.Layout || word == Keyword.Strict || word == Keyword.Content { out.layout = true }
+  if word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content { out.style = true }
   return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
     || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
 }
@@ -565,6 +600,8 @@ pub struct ScrollStyle {
   pub overscrollY: Overscroll,
   /// `scroll-behavior: smooth`.
   pub smooth: bool,
+  /// `overflow-anchor: none` (see `scroll_anchor`).
+  pub anchorNone: bool,
   /// `scroll-snap-type` (container) and `scroll-snap-align`/`-stop` (item), packed: see `SNAP_*`.
   pub snap: u8,
   /// `scroll-margin` of the box, in pixels.
@@ -573,6 +610,8 @@ pub struct ScrollStyle {
   pub padding: Edges,
   /// `scrollbar-color`, which inherits.
   pub colors: ScrollbarColors,
+  /// `touch-action` as `TOUCH_*` bits: the gestures the tree may take for itself.
+  pub touch: u8,
 }
 
 /// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
@@ -627,10 +666,12 @@ impl ScrollStyle {
       overscrollX: Overscroll.Auto,
       overscrollY: Overscroll.Auto,
       smooth: false,
+      anchorNone: false,
       snap: 0,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
+      touch: TOUCH_AUTO,
     }
   }
 }
@@ -654,6 +695,8 @@ impl ScrollStyle {
   /// The item's `scroll-snap-align` on that axis.
   pub fn alignX(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 3), 3) }
   pub fn alignY(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 5), 3) }
+  /// The item's `scroll-snap-stop: always`.
+  pub fn snapStop(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_STOP) != 0 }
 
   fn setSnapType(self: &mut Self, bits: u8) -> () {
     self.snap = u8.bitOr(u8.bitAnd(self.snap, 248), bits)
@@ -666,6 +709,62 @@ impl ScrollStyle {
   fn setSnapStop(self: &mut Self, always: bool) -> () {
     self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
   }
+}
+
+/// `ScrollStyle.touch` bits: the directions a touch may start panning in (`pan-left` is the
+/// finger moving right, the content scrolling left) and `pinch-zoom`.
+pub const TOUCH_PAN_LEFT: u8 = 1
+pub const TOUCH_PAN_RIGHT: u8 = 2
+pub const TOUCH_PAN_UP: u8 = 4
+pub const TOUCH_PAN_DOWN: u8 = 8
+pub const TOUCH_PINCH: u8 = 16
+pub const TOUCH_PAN_X: u8 = 3
+pub const TOUCH_PAN_Y: u8 = 12
+/// `auto` and `manipulation`: every gesture (the tree has no double-tap zoom to leave out).
+pub const TOUCH_AUTO: u8 = 31
+
+fn touchWord(word: Keyword) -> u8 {
+  return if word == Keyword.PanX { TOUCH_PAN_X }
+    else if word == Keyword.PanLeft { TOUCH_PAN_LEFT }
+    else if word == Keyword.PanRight { TOUCH_PAN_RIGHT }
+    else if word == Keyword.PanY { TOUCH_PAN_Y }
+    else if word == Keyword.PanUp { TOUCH_PAN_UP }
+    else if word == Keyword.PanDown { TOUCH_PAN_DOWN }
+    else if word == Keyword.PinchZoom { TOUCH_PINCH }
+    else { 0 }
+}
+
+/// `touch-action`: `auto`, `none`, `manipulation`, or up to one horizontal pan word, one
+/// vertical pan word and `pinch-zoom`, in any order.
+fn touchActionOf(value: &Value) -> Option<u8> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.Auto || word == Keyword.Manipulation { return Option<u8>.some(TOUCH_AUTO) }
+    if word == Keyword.None { return Option<u8>.some(0) }
+    let bits = touchWord(word)
+    return if bits == 0 { Option<u8>.None } else { Option<u8>.some(bits) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length > 3 { return Option<u8>.None }
+    let mut bits: u8 = 0
+    let mut i: usize = 0
+    while i < items.length {
+      let word = match convert.keywordOf(&items[i]) {
+        Option.Some { value: found } => found
+        Option.None => { return Option<u8>.None }
+      }
+      let one = touchWord(word)
+      // Each group (horizontal, vertical, pinch) may be named once.
+      let group: u8 = if u8.bitAnd(one, TOUCH_PAN_X) != 0 { TOUCH_PAN_X }
+        else if u8.bitAnd(one, TOUCH_PAN_Y) != 0 { TOUCH_PAN_Y }
+        else { one }
+      if one == 0 || u8.bitAnd(bits, group) != 0 { return Option<u8>.None }
+      bits = u8.bitOr(bits, one)
+      i = i + 1
+    }
+    return Option<u8>.some(bits)
+  }
+  return Option<u8>.None
 }
 
 /// `scroll-snap-type`: `none`, or an axis and an optional strictness.
@@ -859,6 +958,23 @@ fn setScrollPadding(target: &mut Dimension, value: &Value, context: &Context) ->
   }
 }
 
+/// A `zoom` value: a non-negative number or percentage, `normal` for 1. Zero is 1, as in browsers.
+pub fn zoomOf(value: &Value) -> Option<f32> {
+  if convert.isKeyword(value, Keyword.Normal) { return Option<f32>.some(1.0) }
+  return match &value.* {
+    Value.Unit { value: amount, unit } => {
+      let factor: f32 = if unit == Unit.Number { amount } else if unit == Unit.Percent { amount / 100.0 } else { -1.0 }
+      if factor < 0.0 { Option<f32>.None } else if factor == 0.0 { Option<f32>.some(1.0) } else { Option<f32>.some(factor) }
+    }
+    _ => Option<f32>.None
+  }
+}
+
+fn zoomedEdges(edges: Edges, ratio: f32) -> Edges {
+  return Edges { top: edges.top.zoomed(ratio), right: edges.right.zoomed(ratio),
+    bottom: edges.bottom.zoomed(ratio), left: edges.left.zoomed(ratio) }
+}
+
 fn setPixels(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.length(value, context) {
     Option.Some { value: found } => {
@@ -900,11 +1016,11 @@ fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
     Option.Some { value: word } => {
       if word == Keyword.Thin {
-        target.* = 1.0
+        target.* = context.zoom
       } else if word == Keyword.Medium {
-        target.* = 3.0
+        target.* = 3.0 * context.zoom
       } else if word == Keyword.Thick {
-        target.* = 5.0
+        target.* = 5.0 * context.zoom
       }
     }
     Option.None => {
@@ -973,7 +1089,8 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
         | CssProperty.AnimationDelay | CssProperty.AnimationIterationCount | CssProperty.AnimationDirection
         | CssProperty.AnimationFillMode | CssProperty.AnimationPlayState
         | CssProperty.Transition | CssProperty.TransitionProperty | CssProperty.TransitionDuration
-        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior => { return true }
+        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior
+        | CssProperty.Zoom => { return true }
       _ => {}
     }
     let font = declaration.property == CssProperty.FontSize || declaration.property == CssProperty.LineHeight
@@ -1018,7 +1135,56 @@ impl Computed {
     context.containerHeight = self.containerHeight
     context.containerInlineSize = if context.vertical { self.containerHeight } else { self.containerWidth }
     context.containerBlockSize = if context.vertical { self.containerWidth } else { self.containerHeight }
+    context.zoom = self.text.zoom
+    context.rootFontSize = context.rootFontSize * self.text.zoom
     return context
+  }
+
+  /// Sets the effective zoom to `parentZoom` times the element's own `zoom`. Inherited
+  /// lengths, which the parent computed at its zoom, move to the new one.
+  pub fn setZoom(self: &mut Self, own: f32, parentZoom: f32) -> () {
+    let zoom = parentZoom * own
+    if zoom == self.text.zoom || self.text.zoom <= 0.0 { return () }
+    let ratio = zoom / self.text.zoom
+    self.text.rezoom(zoom)
+    self.layout.borderSpacingX = self.layout.borderSpacingX * ratio
+    self.layout.borderSpacingY = self.layout.borderSpacingY * ratio
+    // Lengths the element's own declarations have not set yet hold initial values.
+    self.outline.width = self.outline.width * ratio
+    self.columnRule.width = self.columnRule.width * ratio
+  }
+
+  /// This style with every length it holds multiplied by `ratio`, for `inherit` across a change
+  /// of zoom.
+  pub fn zoomedBy(self: &Self, ratio: f32) -> Computed {
+    let mut out = self.*
+    if ratio == 1.0 { return out }
+    out.text.rezoom(self.text.zoom * ratio)
+    let l = &mut out.layout
+    l.width = l.width.zoomed(ratio)
+    l.height = l.height.zoomed(ratio)
+    l.minWidth = l.minWidth.zoomed(ratio)
+    l.minHeight = l.minHeight.zoomed(ratio)
+    l.maxWidth = l.maxWidth.zoomed(ratio)
+    l.maxHeight = l.maxHeight.zoomed(ratio)
+    l.flexBasis = l.flexBasis.zoomed(ratio)
+    l.rowGap = l.rowGap.zoomed(ratio)
+    l.columnGap = l.columnGap.zoomed(ratio)
+    l.margin = zoomedEdges(l.margin, ratio)
+    l.padding = zoomedEdges(l.padding, ratio)
+    l.inset = zoomedEdges(l.inset, ratio)
+    l.border = zoomedEdges(l.border, ratio)
+    l.borderSpacingX = l.borderSpacingX * ratio
+    l.borderSpacingY = l.borderSpacingY * ratio
+    if l.columnWidth > 0.0 { l.columnWidth = l.columnWidth * ratio }
+    out.paint.border = Insets<f32> { top: out.paint.border.top * ratio, right: out.paint.border.right * ratio,
+      bottom: out.paint.border.bottom * ratio, left: out.paint.border.left * ratio }
+    out.paint.radii = Corners<f32> { topLeft: out.paint.radii.topLeft * ratio, topRight: out.paint.radii.topRight * ratio,
+      bottomRight: out.paint.radii.bottomRight * ratio, bottomLeft: out.paint.radii.bottomLeft * ratio }
+    out.outline.width = out.outline.width * ratio
+    out.outline.offset = out.outline.offset * ratio
+    out.columnRule.width = out.columnRule.width * ratio
+    return out
   }
   pub fn containerWidthBasis(self: &Self) -> f32 {
     return match self.containerWidth { Option.Some { value } => value _ => self.viewportWidth }
@@ -1058,6 +1224,7 @@ impl Computed {
       contain: Containment.initial(),
       list: ListStyle.initial(),
       anchor: AnchorStyle.none(),
+      userSelect: SELECT_AUTO,
     }
   }
 
@@ -1464,9 +1631,19 @@ impl Computed {
       CssProperty.ScrollSnapAlign => {
         if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
       }
+      CssProperty.TouchAction => {
+        if let Option<u8>.Some { value: bits } = touchActionOf(value) { self.scroll.touch = bits }
+      }
       CssProperty.ScrollSnapStop => {
         if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
         else if convert.isKeyword(value, Keyword.Normal) { self.scroll.setSnapStop(false) }
+      }
+      CssProperty.OverflowAnchor => {
+        if convert.isKeyword(value, Keyword.None) {
+          self.scroll.anchorNone = true
+        } else if convert.isKeyword(value, Keyword.Auto) {
+          self.scroll.anchorNone = false
+        }
       }
       CssProperty.ScrollBehavior => {
         if convert.isKeyword(value, Keyword.Smooth) {
@@ -2222,7 +2399,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.orphans = f32.toUsize(found)
+              self.text.orphans = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2232,7 +2409,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.widows = f32.toUsize(found)
+              self.text.widows = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2369,6 +2546,19 @@ impl Computed {
             self.paint.backdropBlur = f32.max(0.0, found)
           }
           Option.None => {}
+        }
+      }
+      CssProperty.UserSelect => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.userSelect = SELECT_AUTO
+        } else if convert.isKeyword(value, Keyword.Text) {
+          self.userSelect = SELECT_TEXT
+        } else if convert.isKeyword(value, Keyword.None) {
+          self.userSelect = SELECT_NONE
+        } else if convert.isKeyword(value, Keyword.All) {
+          self.userSelect = SELECT_ALL
+        } else if convert.isKeyword(value, Keyword.Contain) {
+          self.userSelect = SELECT_CONTAIN
         }
       }
       CssProperty.PointerEvents => {
@@ -2653,6 +2843,7 @@ impl Computed {
     h = colorHash(h, self.text.placeholder())
     if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
     if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if self.contain.layout() { h = Hash.combine(h, 6) }
     if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
     h = Hash.combine(
       h,
@@ -2662,6 +2853,7 @@ impl Computed {
         0
       },
     )
+    h = Hash.combine(h, u8.toU64(self.userSelect))
     return h
   }
 
@@ -2688,8 +2880,8 @@ impl Computed {
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
     self.layout.tabSize = text.tabSize
-    self.layout.orphans = text.orphans
-    self.layout.widows = text.widows
+    self.layout.orphans = u32.toUsize(text.orphans)
+    self.layout.widows = u32.toUsize(text.widows)
   }
 }
 
