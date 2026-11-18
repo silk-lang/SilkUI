@@ -110,6 +110,51 @@ test("preventDefault reaches the host for cancelable events only", () => {
   assert.equal(mock.native.dispatch(9, box.nodeId, 0, 0, 0, 0, 0), false);
 });
 
+test("pointer events carry the pointer, its buttons and the spec defaults", () => {
+  const box = createBox();
+  const seen = [];
+  for (const type of ["pointerdown", "pointermove", "pointerup", "pointerover", "pointerout"]) {
+    box.addEventListener(type, (event) => seen.push([event.type, event.pointerId, event.pointerType, event.isPrimary, event.buttons, event.button, event.pressure, event.width, event.getCoalescedEvents().length]));
+  }
+  // A touch: pointer 2, type touch (2 << 4), primary (64).
+  const touch = 2 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(28, box.nodeId, 5, 5, touch, 0, 0);
+  mock.native.dispatch(0, box.nodeId, 5, 5, touch, 0, 1);
+  mock.native.dispatch(3, box.nodeId, 6, 5, touch, 0, 0);
+  mock.native.dispatch(1, box.nodeId, 6, 5, touch, 0, 0);
+  // The mouse, with shift held: pointer 1, primary.
+  mock.native.dispatch(29, box.nodeId, 6, 5, 256 + 64 + 1, 0, 0);
+  assert.deepEqual(seen, [
+    ["pointerover", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerdown", 2, "touch", true, 1, 0, 0.5, 1, 0],
+    ["pointermove", 2, "touch", true, 1, -1, 0.5, 1, 1],
+    ["pointerup", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerout", 1, "mouse", true, 0, 0, 0, 1, 0],
+  ]);
+});
+
+test("pointer capture follows the pointer that is down", () => {
+  const box = createBox();
+  box.addEventListener("pointerdown", (event) => box.setPointerCapture(event.pointerId));
+  mock.take();
+  assert.throws(() => box.setPointerCapture(9), { name: "NotFoundError" });
+  const mouse = 256 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", box.nodeId]]);
+  assert.equal(box.hasPointerCapture(1), true);
+  box.releasePointerCapture(1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", 0]]);
+  assert.equal(box.hasPointerCapture(1), false);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  // A finger that is not primary keeps its records where it went down; the tree is not asked.
+  const second = 3 * 256 + 2 * 16;
+  mock.native.dispatch(0, box.nodeId, 0, 0, second, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), []);
+  assert.equal(box.hasPointerCapture(3), true);
+  mock.native.dispatch(14, box.nodeId, 0, 0, second, 0, 0);
+  assert.equal(box.hasPointerCapture(3), false);
+});
+
 test("transition events bubble with their property and elapsed time", () => {
   const outer = createBox();
   const inner = createBox();
