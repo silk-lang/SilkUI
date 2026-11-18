@@ -145,7 +145,17 @@ check("typedarrays", true, () => {
   return new Float64Array(2).byteLength === 16 && view.getUint16(0) === 0x0102 && bytes.subarray(2).join() === "3,4" &&
     new Uint8ClampedArray([300])[0] === 255 && new BigInt64Array(1).length === 1;
 });
-check("unhandledrejection", false, () => typeof globalThis.addEventListener === "function" && typeof globalThis.PromiseRejectionEvent === "function");
+check("unhandledrejection", true, () => new Promise((resolve) => {
+  const reason = new Error("caniuse");
+  const listener = (event) => {
+    if (event.reason !== reason) return;
+    event.preventDefault();
+    globalThis.removeEventListener("unhandledrejection", listener);
+    resolve(event instanceof PromiseRejectionEvent && event.promise instanceof Promise);
+  };
+  globalThis.addEventListener("unhandledrejection", listener);
+  Promise.reject(reason);
+}));
 check("use-strict", true, () => {
   try { syntax("'use strict'; undeclaredName = 1"); return false; } catch (error) { if (!(error instanceof ReferenceError)) return false; }
   return (function () { "use strict"; return this; })() === undefined;

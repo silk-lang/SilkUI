@@ -108,7 +108,7 @@
   forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
   globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
   const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "EventTarget"]) {
+  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget"]) {
     Object.defineProperty(globalThis, name, {
       get: () => {
         const value = api()[name];
@@ -121,6 +121,16 @@
   }
 
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // The global object as an event target, for `unhandledrejection`, the one event a realm
+  // sends it. The host asks `native.rejected` before it reports a rejection nothing handled.
+  let windowTarget = null;
+  const target = () => (windowTarget ??= new globalThis.EventTarget());
+  globalThis.addEventListener = (...args) => target().addEventListener(...args);
+  globalThis.removeEventListener = (...args) => windowTarget?.removeEventListener(...args);
+  globalThis.dispatchEvent = (event) => target().dispatchEvent(event);
+  native.rejected = (promise, reason) =>
+    windowTarget !== null && !windowTarget.dispatchEvent(new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true }));
 
   // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
   // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a

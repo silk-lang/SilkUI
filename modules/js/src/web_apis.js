@@ -1,5 +1,5 @@
 // The web APIs a ui-js realm has beyond the prelude's: base64, text encoding, crypto random
-// values, events, user timing, setImmediate, idle callbacks and the console's timers. The
+// values, events (and unhandledrejection on the global object), user timing, setImmediate, idle callbacks and the console's timers. The
 // prelude evaluates this on the first use of one of them, so realms that use none start as
 // fast as before. It is a function of `__ui` and the prelude's shared console state, and
 // returns the APIs by their global names. Edit it, then run `silk task embed-assets`.
@@ -321,6 +321,17 @@
     }
     get detail() { return this.#detail; }
   }
+  class PromiseRejectionEvent extends Event {
+    #promise;
+    #reason;
+    constructor(type, options) {
+      super(type, options);
+      this.#promise = options?.promise;
+      this.#reason = options?.reason;
+    }
+    get promise() { return this.#promise; }
+    get reason() { return this.#reason; }
+  }
   class EventTarget {
     #listeners = new Map();
     addEventListener(type, listener, options) {
@@ -359,5 +370,5 @@
     }
   }
 
-  return { performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, EventTarget };
+  return { performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })
