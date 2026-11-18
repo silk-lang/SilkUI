@@ -71,6 +71,22 @@ let caret = run tree.caretRect(field)      // where the caret is drawn
 
 A selection has an `anchor` and a `focus`, so it keeps its direction. `selection.start()` and `selection.end()` read it in order.
 
+## Selecting text on the page
+
+Text outside fields is selectable too, with Chrome's rules: drag, double click for a word, triple click for a paragraph, Shift with a click or the arrow keys, and Ctrl+A (Cmd+A on a Mac). Ctrl+C copies the text as a browser does, with line breaks between blocks and tabs between table cells.
+
+```silk
+let range = run tree.textSelection()       // an Option<TextRange>, by node id
+run tree.selectText(TextRange { anchor: label, anchorOffset: 0, focus: label, focusOffset: 5 })
+let copied = run tree.selectedText()
+```
+
+`user-select` decides what can be selected: `none` leaves text out, `all` selects an element whole, and `contain` keeps Ctrl+A inside it. Buttons, links and fields start no selection when pressed.
+
+Where flex `order`, a reversed direction, grid placement or positioning shows children out of tree order, a drag selects what it crosses on screen, which browsers do not. `tree.setSelectionOrder(SelectionOrder.Tree)` selects in tree order as they do.
+
+JavaScript apps read and change the same selection with `getSelection()`.
+
 ## Scrolling
 
 A box with `css.overflowY(Overflow.Auto)` scrolls when its content is taller than it is. The wheel, the keyboard and a drag of the scrollbar all work without code.

@@ -32,6 +32,8 @@ import cssom_view
 import cssom_view { ScrollAnimation }
 import scroll_snap
 import css_anchor
+import css_cursor
+import css_cursor { CursorImage }
 import scroll_snap { SnapWait }
 import scroll_anchor
 import scroll_anchor { ScrollAnchor }
@@ -146,7 +148,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -999,6 +1001,8 @@ pub struct UiTree<'a> {
   /// The viewport `tickBases` were built in: its size is in every one of them.
   tickWidth: f32,
   tickHeight: f32,
+  /// What the host last showed for a cursor image (`cursorShown`), 0 for a keyword.
+  pub cursorShown: u64,
 }
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
@@ -1171,6 +1175,7 @@ impl<'a> UiTree<'a> {
       tickPlaces: List<u32>.make(),
       tickWidth: 0.0,
       tickHeight: 0.0,
+      cursorShown: 0,
     }
   }
 
@@ -3889,6 +3894,66 @@ impl<'a> UiTree<'a> {
   /// its path.
   pub fn cursor(self: &Self) -> Cursor {
     return interact.cursorOf(self)
+  }
+
+  /// The image CSS `cursor: url(...)` shows over the hovered node: the first of its images that
+  /// loaded, skipping those that failed. None while there is none, or while an earlier one
+  /// still loads; `cursor()` is the keyword to show then. Images not asked for yet are asked
+  /// for in the next `takeLoads`.
+  pub effect fn cursorImage(self: &mut Self) -> Option<CursorImage>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let from = interact.cursorFrom(&self.*)
+    if from.images == NONE {
+      return Option<CursorImage>.None
+    }
+    let node = self.node(from.images)
+    let declarations = match node.sheetStyle() {
+      Option.Some { value } => value.declarations.asSlice()
+      _ => node.base.asSlice()
+    }
+    let mut css = Bytes.make()
+    let mut i = declarations.length
+    while i > 0 {
+      i = i - 1
+      if declarations[i].property == CssProperty.Cursor {
+        css = run values.cssText(&declarations[i].value)
+        break
+      }
+    }
+    let urls = run css_cursor.urlsOf(css.asSlice())
+    let list = urls.asSlice()
+    let mut ids = List<u32>.make()
+    let mut k: usize = 0
+    while k < list.length {
+      run ids.append(run self.resources.cssImage(list[k].url.asSlice()))
+      k = k + 1
+    }
+    k = 0
+    while k < list.length {
+      let resource = ids.asSlice()[k]
+      match self.resources.cssImages.asSlice()[u32.toUsize(resource - CSS_IMAGE_BASE)].state {
+        CssImageState.Loaded => {
+          return Option<CursorImage>.Some {
+            value: CursorImage { resource: resource, hotX: list[k].hotX, hotY: list[k].hotY, hot: list[k].hot },
+          }
+        }
+        CssImageState.Failed => {}
+        _ => {
+          return Option<CursorImage>.None
+        }
+      }
+      k = k + 1
+    }
+    return Option<CursorImage>.None
+  }
+
+  /// The pixels of cursor `image` for a display of `scale` pixels per CSS pixel, None when the
+  /// image cannot be a cursor (a side past 256 pixels).
+  pub effect fn cursorPixels(self: &mut Self, image: CursorImage, scale: f32) -> Option<CursorPixels>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.resources.cursorPixels(image.resource, scale)
   }
 
   /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.

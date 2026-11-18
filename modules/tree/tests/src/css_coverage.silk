@@ -24,7 +24,10 @@ import silk.text.string { String }
 import ui_tree.lib { Batch, Attribute, ProtocolError }
 import svg_css.compile { Options, CompileError }
 import svg_css.compile
-import ui_tree.legacy { CpuSnapshot }
+import ui_tree.legacy { CpuSnapshot, Mutation, TreeError as EngineError }
+import ui_tree.css_cursor { CursorImage }
+import ui_tree.resources { CursorPixels }
+import codec.image { Image, ImageError }
 import vector.geometry_error { GeometryError }
 
 /// A property and the styles that make its value matter: the root's, the leading sibling's,
@@ -682,7 +685,7 @@ effect fn shownCursor(tree: &mut Tree<'_>) -> Cursor
 
 /// The CSS cursor of the hovered node shows; `auto` takes its ancestor's.
 effect fn cursorsFromStyle() -> ()
-  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ! TreeError | EngineError | CssError | ImageError | OutOfMemoryError | AssertionError<'static>
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
   let mut tree = run Tree.make(&fonts)
@@ -715,10 +718,65 @@ effect fn cursorsFromStyle() -> ()
   run restyle(&mut tree, plain, b"height: 50px; cursor: col-resize")
   let column = run shownCursor(&mut tree)
   run Testing.expect(column == Cursor.ColumnResize, "col-resize is not ew-resize")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: cell")
+  let cell = run shownCursor(&mut tree)
+  run Testing.expect(cell == Cursor.Cell, "cell is not crosshair")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: no-drop")
+  let noDrop = run shownCursor(&mut tree)
+  run Testing.expect(noDrop == Cursor.NoDrop, "no-drop is not not-allowed")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: ne-resize")
+  let corner = run shownCursor(&mut tree)
+  run Testing.expect(corner == Cursor.ResizeNorthEast, "ne-resize is one-sided")
+
+  // Images: the keyword shows until one loads; a failed one is skipped.
+  run restyle(&mut tree, plain, b"height: 50px; cursor: url(gone.png), url('hand.png') 3 4, pointer")
+  let waiting = run shownCursor(&mut tree)
+  run Testing.expect(waiting == Cursor.Pointer, "the keyword shows while the images load")
+  let engine = tree.engineMut()
+  run Testing.expect((run engine.cursorImage()).isNone(), "no image before it loads")
+  let loads = run engine.takeLoads()
+  run Testing.expect(loads.length() == 2, "every image of the list is asked for")
+  let mut gone: u32 = 0
+  let mut hand: u32 = 0
+  let list = loads.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if let Mutation.LoadImage { resource, url } = &list[i] {
+      if String.view(&url) == "gone.png" { gone = resource }
+      if String.view(&url) == "hand.png" { hand = resource }
+    }
+    i = i + 1
+  }
+  run engine.settleSource(gone, false)
+  let mut image = run Image.make(2, 2)
+  let pixels = image.dataMut()
+  let mut k: usize = 0
+  while k < pixels.length {
+    pixels[k] = if k % 4 == 3 { 128 } else if k % 4 == 0 { 64 } else { 0 }
+    k = k + 1
+  }
+  drop pixels
+  let mut batch = Batch.make()
+  run batch.decodedImage(hand, move image)
+  run engine.apply(run batch.take())
+  run engine.settleSource(hand, true)
+  match run engine.cursorImage() {
+    Option<CursorImage>.Some { value } => {
+      run Testing.expect(value.resource == hand && value.hot && value.hotX == 3.0 && value.hotY == 4.0, "the loaded image, with its hot spot")
+      match run engine.cursorPixels(value, 2.0) {
+        Option<CursorPixels>.Some { value: shown } => {
+          run Testing.expect(shown.width == 2 && shown.scale == 1.0, "a bitmap keeps its own size")
+          run Testing.expect(shown.pixels.asSlice()[0] == 128 && shown.pixels.asSlice()[3] == 128, "pixels are not premultiplied")
+        }
+        _ => { run Testing.expect(false, "cursor pixels") }
+      }
+    }
+    _ => { run Testing.expect(false, "a cursor image once one loads") }
+  }
 }
 
 test effect fn cssCoverageCursorsFromStyle() -> ()
-  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  ! TreeError | EngineError | CssError | ImageError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run cursorsFromStyle() |> Effect.provideMut<Allocator>(&mut allocator)
 }
