@@ -37,6 +37,8 @@ import window.platform { Platform }
 import window.types {
   Appearance,
   Cursor,
+  CursorImage,
+  cursorImageFits,
   DialogId,
   ImeState,
   RawSurface,
@@ -46,6 +48,7 @@ import window.types {
   WindowId,
   WindowOptions,
 }
+import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
 import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
@@ -91,6 +94,7 @@ union Command {
   ToggleFullScreen { window: WindowId },
   StartWindowDrag { window: WindowId },
   SetCursor { window: WindowId, cursor: Cursor },
+  SetCursorImage { window: WindowId, width: u32, height: u32, pixels: Bytes, hotX: u32, hotY: u32, scale: f64 },
   SetIme { window: WindowId, ime: ImeState },
   SetMenuBar { bar: MenuBar },
   ShowContextMenu { window: WindowId, x: f64, y: f64, menu: MenuBar },
@@ -865,6 +869,17 @@ effect fn execute(
     Command.ToggleFullScreen { window } => platform.toggleFullScreen(window)
     Command.StartWindowDrag { window } => platform.startWindowDrag(window)
     Command.SetCursor { window, cursor } => platform.setCursor(window, cursor)
+    Command.SetCursorImage { window, width, height, pixels, hotX, hotY, scale } => {
+      let image = CursorImage {
+        width: width,
+        height: height,
+        pixels: pixels.asSlice(),
+        hotX: hotX,
+        hotY: hotY,
+        scale: scale,
+      }
+      drop run platform.setCursorImage(window, &image)
+    }
     Command.SetIme { window, ime } => platform.setIme(window, ime)
     Command.SetMenuBar { bar } => {
       run platform.setMenuBar(&bar)
@@ -1253,6 +1268,26 @@ impl Platform for PlatformProxy {
 
   fn setCursor(self: &mut Self, window: WindowId, cursor: Cursor) -> () {
     drop run Effect.result(self.send(Command.SetCursor { window: window, cursor: cursor }))
+  }
+
+  /// Sent without waiting for the answer, so true whenever the image fits.
+  effect fn setCursorImage(self: &mut Self, window: WindowId, image: &CursorImage<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !cursorImageFits(image) {
+      return false
+    }
+    let pixels = run Bytes.copy(image.pixels)
+    run self.send(Command.SetCursorImage {
+      window: window,
+      width: image.width,
+      height: image.height,
+      pixels: move pixels,
+      hotX: image.hotX,
+      hotY: image.hotY,
+      scale: image.scale,
+    })
+    return true
   }
 
   fn setIme(self: &mut Self, window: WindowId, ime: ImeState) -> () {
@@ -1702,6 +1737,16 @@ impl Platform for HostPlatform {
       HostPlatform.Direct { platform } => platform.setCursor(window, cursor)
       HostPlatform.Headless { platform } => platform.setCursor(window, cursor)
       HostPlatform.Proxied { proxy } => proxy.setCursor(window, cursor)
+    }
+  }
+
+  effect fn setCursorImage(self: &mut Self, window: WindowId, image: &CursorImage<'_>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.setCursorImage(window, image)
+      HostPlatform.Headless { platform } => run platform.setCursorImage(window, image)
+      HostPlatform.Proxied { proxy } => run proxy.setCursorImage(window, image)
     }
   }
 

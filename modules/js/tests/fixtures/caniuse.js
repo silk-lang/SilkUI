@@ -341,7 +341,7 @@ check("rtcpeerconnection", false, () => global("RTCPeerConnection"));
 check("screen-orientation", false, () => typeof globalThis.screen?.orientation === "object");
 check("scrollintoview", true, () => typeof ui.createBox().scrollIntoView === "function");
 check("scrollintoviewifneeded", true, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
-check("selection-api", false, () => typeof globalThis.getSelection === "function");
+check("selection-api", true, () => typeof globalThis.getSelection === "function" && getSelection() === ui.getSelection() && typeof Selection === "function");
 check("setimmediate", true, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
 check("speech-recognition", false, () => global("SpeechRecognition") || global("webkitSpeechRecognition"));
 check("speech-synthesis", false, () => typeof globalThis.speechSynthesis === "object");
