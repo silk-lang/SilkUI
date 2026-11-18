@@ -4,7 +4,9 @@ import window_frames as _window_frames
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Natives, Reply, Exports, serve }
+import ui_js_calls.natives as natives
+import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
 import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
 import ui_fixtures.fixtures as fixtures
@@ -309,6 +311,40 @@ effect fn footprint(host: &mut JsHost<'_>) -> () ! OutOfMemoryError | JsError | 
   run host.module(b"import { memoryUsage } from '@silkui/core'; const before = memoryUsage(); if (!before || !(before.footprint > 0) || before.processes !== 1) throw new Error('memoryUsage gave ' + JSON.stringify(before)); globalThis.kept = new Uint8Array(64 * 1024 * 1024).fill(1); const after = memoryUsage(); globalThis.kept = null; if (!(after.footprint >= before.footprint + 32 * 1024 * 1024)) throw new Error('memoryUsage went from ' + before.footprint + ' to ' + after.footprint)", b"memory.js")
 }
 
+/// A dispatcher like the one silkui generates for an app's exported Silk functions.
+struct TestExports {}
+
+impl Exports for TestExports {
+  effect fn dispatch(self: &Self, id: u32, args: &[Arg], reply: &mut Reply) -> () ! OutOfMemoryError ? &mut Allocator {
+    if id == 299831157 {
+      if !natives.accepts(args, "nn") {
+        reply.* = run natives.wrongArguments("add(a: number, b: number)")
+        return ()
+      }
+      reply.* = Reply.Number { value: natives.number(args, 0) + natives.number(args, 1) }
+    } else if id == 380897999 {
+      let mut text = run String.copy("hi ")
+      run String.append(&mut text, natives.text(args, 0))
+      reply.* = Reply.Text { value: move text }
+    } else if id == 704977686 {
+      reply.* = run natives.failed("fail", "FileError", ())
+    } else if id == 393056494 {
+      reply.* = run natives.fromSigned(natives.signed(args, 0) * 2)
+    }
+  }
+}
+
+export "C" fn testNatives(raw: ?*mut u8) -> () as "ui_js_tests_natives" {
+  unsafe serve<TestExports>(&TestExports {}, raw)
+}
+
+/// `__ui.native` calls the app's dispatcher: numbers, text, a bigint as decimal text, a
+/// `TypeError` for arguments that do not fit, and an `InternalError` for a failure.
+effect fn exported(host: &mut JsHost<'_>) -> () ! OutOfMemoryError | JsError | platform.PlatformError ? &mut Allocator {
+  host.setNatives(unsafe Natives.fromCallback(testNatives))
+  run host.evaluate(b"const ui = globalThis.__ui; const fails = (f, kind) => { try { f() } catch (e) { return e.name === kind } return false }; if (ui.native(299831157, 2, 40) !== 42) throw new Error('add gave ' + ui.native(299831157, 2, 40)); if (ui.native(380897999, 'Silk') !== 'hi Silk') throw new Error('greet'); if (BigInt(ui.native(393056494, '-4611686018427387904')) !== -9223372036854775808n) throw new Error('twice gave ' + ui.native(393056494, '-4611686018427387904')); if (!fails(() => ui.native(299831157, 'x', 1), 'TypeError')) throw new Error('add took a string'); if (!fails(() => ui.native(704977686), 'InternalError')) throw new Error('fail did not throw'); if (ui.native(1) !== undefined) throw new Error('an unknown id answered')", b"natives.js")
+}
+
 /// `__ui.markdown` gives the tree remark gives for a sample with every construct of GFM.
 effect fn markdown(host: &mut JsHost<'_>) -> ()
   ! OutOfMemoryError | JsError | platform.PlatformError
@@ -346,6 +382,8 @@ effect fn withHost(scenario: u32) -> ()
     run Effect.result(markdown(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 1 {
     run Effect.result(footprint(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 0 {
+    run Effect.result(exported(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else {
     Result<(), OutOfMemoryError | JsError | platform.PlatformError>.Success { value: () }
   }
@@ -466,6 +504,7 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.MARK == bridge.nativeId(b"mark"), "MARK")
   run Testing.expect(bridge.MARKDOWN == bridge.nativeId(b"markdown"), "MARKDOWN")
   run Testing.expect(bridge.MEMORY_USAGE == bridge.nativeId(b"memoryUsage"), "MEMORY_USAGE")
+  run Testing.expect(bridge.NATIVE == bridge.nativeId(b"native"), "NATIVE")
   run Testing.expect(bridge.NOW == bridge.nativeId(b"now"), "NOW")
   run Testing.expect(bridge.OPEN == bridge.nativeId(b"open"), "OPEN")
   run Testing.expect(bridge.RELEASE == bridge.nativeId(b"release"), "RELEASE")

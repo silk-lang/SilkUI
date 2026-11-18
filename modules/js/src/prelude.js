@@ -93,6 +93,25 @@
 
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
 
+  // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
+  // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a
+  // TypeError and 2 an Error.
+  const nativeCalls = new Map();
+  let nextNativeCall = 0;
+  const startNative = native.nativeStart;
+  native.nativeStart = (id, ...args) => new Promise((resolve, reject) => {
+    const call = ++nextNativeCall;
+    nativeCalls.set(call, { resolve, reject });
+    startNative(call, id, ...args);
+  });
+  native.nativeDone = function (call, kind, value) {
+    const pending = nativeCalls.get(call);
+    if (!pending) return;
+    nativeCalls.delete(call);
+    if (kind === 0) pending.resolve(value);
+    else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
+  };
+
   // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
   // clipboard after the code that asked has run, then settles the promise.
   const clipboardCalls = new Map();
