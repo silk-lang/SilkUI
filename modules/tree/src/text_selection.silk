@@ -11,7 +11,7 @@
 //! (see `edit`); here an input is one atomic piece of the document.
 import engine { UiTree }
 import node { NONE, NO_INDEX }
-import mutation { NodeKind, Role }
+import mutation { NodeKind, Role, Position, Direction }
 import ui_protocol.request { HostRequest }
 import paint { borderBox }
 import style { SELECT_NONE, SELECT_ALL, SELECT_CONTAIN }
@@ -25,7 +25,7 @@ import input { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
 import paint { paddingBox }
 import scrollbar { userScrolls, usedOverflow }
 import layout.lib { FragmentKind }
-import properties.computed { DisplayOutside, DisplayInside, WhiteSpaceCollapse }
+import properties.computed { DisplayOutside, DisplayInside, WhiteSpaceCollapse, Float }
 import silk.collections.list { List }
 import silk.geometry.rect { Rect }
 import silk.core.ownership { Copy }
@@ -957,6 +957,166 @@ effect fn ordered(tree: &UiTree<'_>, start: &mut Point, end: &mut Point) -> ()
   }
 }
 
+/// Which order a selection takes where layout places children out of tree order.
+pub enum SelectionOrder {
+  /// What is seen: a drag across reordered flex items, placed grid cells or a positioned box
+  /// selects what the pointer crossed on screen, in several stretches when it has to.
+  Visual,
+  /// Tree order, as browsers select: one stretch between the ends, wherever it shows.
+  Tree,
+}
+
+/// A stretch of the selection in tree order.
+pub struct Stretch {
+  pub start: Point,
+  pub end: Point,
+}
+
+impl Copy for Stretch {}
+
+fn outOfFlow(tree: &UiTree<'_>, slot: u32) -> bool {
+  let node = tree.node(slot)
+  if node.kind == NodeKind.Text { return false }
+  let position = node.computed.layout.position
+  return position == Position.Absolute || position == Position.Fixed || node.computed.layout.float != Float.None
+}
+
+fn reorders(tree: &UiTree<'_>, slot: u32) -> bool {
+  let display = tree.node(slot).computed.layout.display
+  return display.insideIs(DisplayInside.Flex) || display.isGrid()
+}
+
+fn boxOf(tree: &UiTree<'_>, slot: u32, out: &mut Rect<f32>) -> bool {
+  let fragment = firstFragmentOf(tree, slot)
+  if fragment == NO_INDEX { return false }
+  out.* = borderBox(&tree.visualFragment(fragment))
+  return true
+}
+
+/// Reading order of two boxes: by line when they share most of a row, else top first.
+fn seenBefore(a: Rect<f32>, b: Rect<f32>, rtl: bool) -> bool {
+  let top: f32 = if a.yMin > b.yMin { a.yMin } else { b.yMin }
+  let bottom: f32 = if a.yMax < b.yMax { a.yMax } else { b.yMax }
+  let ha = a.yMax - a.yMin
+  let hb = b.yMax - b.yMin
+  let smaller: f32 = if ha < hb { ha } else { hb }
+  if bottom - top > smaller / 2.0 {
+    if rtl { return a.xMax > b.xMax }
+    return a.xMin < b.xMin
+  }
+  return a.yMin < b.yMin
+}
+
+fn positionIn(slots: &List<u32>, slot: u32) -> usize {
+  let values = slots.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == slot { return i }
+    i = i + 1
+  }
+  return NO_INDEX
+}
+
+/// The selection as stretches in tree order, in the order they read. Between two children of
+/// a flex or grid container, or with an end in a positioned or floating box, the selection
+/// covers what lies between its ends on screen: the rest of the child seen first, the children
+/// seen between, and the start of the child seen last. Otherwise, and in
+/// `SelectionOrder.Tree`, it is the one stretch between its ends.
+pub effect fn stretches(tree: &UiTree<'_>, out: &mut List<Stretch>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let mut start = Point.none()
+  let mut end = Point.none()
+  run ordered(tree, &mut start, &mut end)
+  if tree.selectionOrder == SelectionOrder.Visual && (run visualStretches(tree, start, end, &mut out)) {
+    return ()
+  }
+  out.clear()
+  run out.append(Stretch { start: start, end: end })
+}
+
+effect fn visualStretches(tree: &UiTree<'_>, start: Point, end: Point, out: &mut List<Stretch>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !start.exists() || !end.exists() { return false }
+  // The lowest element holding both ends, and its children `first` (holding the start) and
+  // `last` (holding the end).
+  let mut chain = List<u32>.make()
+  let mut at = start.slot
+  while at != NONE {
+    run chain.append(at)
+    at = tree.node(at).parent
+  }
+  let mut container = end.slot
+  let mut last = NONE
+  while container != NONE && positionIn(&chain, container) == NO_INDEX {
+    last = container
+    container = tree.node(container).parent
+  }
+  if container == NONE || last == NONE || container == start.slot { return false }
+  let first = chain.get(positionIn(&chain, container) - 1)
+  if !reorders(tree, container) && !outOfFlow(tree, first) && !outOfFlow(tree, last) { return false }
+  let mut firstBox = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  let mut lastBox = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  if !boxOf(tree, first, &mut firstBox) || !boxOf(tree, last, &mut lastBox) { return false }
+  let rtl = tree.node(container).computed.text.direction == Direction.Rtl
+  let forward = seenBefore(firstBox, lastBox, rtl)
+  let lead = if forward { first } else { last }
+  let trail = if forward { last } else { first }
+  let leadBox = if forward { firstBox } else { lastBox }
+  let trailBox = if forward { lastBox } else { firstBox }
+  // The children seen between, in reading order. Positioned and floating ones are only
+  // selected as ends.
+  let mut between = List<u32>.make()
+  let mut boxes = List<Rect<f32>>.make()
+  let mut child = firstChild(tree, container)
+  while child != NONE {
+    let mut box = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    if child != first && child != last && !outOfFlow(tree, child) && boxOf(tree, child, &mut box)
+      && seenBefore(leadBox, box, rtl) && seenBefore(box, trailBox, rtl) {
+      run between.append(child)
+      run boxes.append(box)
+      let slots = between.asMutSlice()
+      let rects = boxes.asMutSlice()
+      let mut j = slots.length - 1
+      while j > 0 && seenBefore(rects[j], rects[j - 1], rtl) {
+        let s = slots[j]
+        slots[j] = slots[j - 1]
+        slots[j - 1] = s
+        let r = rects[j]
+        rects[j] = rects[j - 1]
+        rects[j - 1] = r
+        j = j - 1
+      }
+    }
+    child = nextSibling(tree, child)
+  }
+  // Seen in tree order: the one stretch says the same.
+  if forward {
+    let from = indexOf(tree, first)
+    let to = indexOf(tree, last)
+    let mut inOrder = between.length() + 1 == to - from
+    let mut i: usize = 0
+    while inOrder && i < between.length() {
+      if indexOf(tree, between.get(i)) != from + 1 + i { inOrder = false }
+      i = i + 1
+    }
+    if inOrder { return false }
+  }
+  let leadPoint = if forward { start } else { end }
+  let trailPoint = if forward { end } else { start }
+  run out.append(Stretch { start: leadPoint, end: after(tree, lead) })
+  let mut i: usize = 0
+  while i < between.length() {
+    let slot = between.get(i)
+    run out.append(Stretch { start: before(tree, slot), end: after(tree, slot) })
+    i = i + 1
+  }
+  run out.append(Stretch { start: before(tree, trail), end: trailPoint })
+  return true
+}
+
 /// One step of a walk over the range: entering a node, or leaving an element.
 union Step { Enter { slot: u32 }, Leave { slot: u32 }, Done }
 
@@ -1042,27 +1202,32 @@ fn step(tree: &UiTree<'_>, w: &mut Walk) -> Step {
 effect fn cover(tree: &UiTree<'_>, out: &mut List<Selected>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut start = Point.none()
-  let mut end = Point.none()
-  run ordered(tree, &mut start, &mut end)
-  let mut w = walkFrom(tree, start, end)
-  while true {
-    match step(tree, &mut w) {
-      Step.Enter { slot } => {
-        if isText(tree, slot) {
-          if userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
-            let low = if slot == start.slot { start.offset } else { 0 }
-            let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
-            if low < high || slot != end.slot {
-              run out.append(Selected { slot: slot, start: low, end: high, through: slot != end.slot, atomic: false })
+  let mut parts = List<Stretch>.make()
+  run stretches(tree, &mut parts)
+  let mut k: usize = 0
+  while k < parts.length() {
+    let start = parts.get(k).start
+    let end = parts.get(k).end
+    k = k + 1
+    let mut w = walkFrom(tree, start, end)
+    while true {
+      match step(tree, &mut w) {
+        Step.Enter { slot } => {
+          if isText(tree, slot) {
+            if userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
+              let low = if slot == start.slot { start.offset } else { 0 }
+              let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
+              if low < high || slot != end.slot {
+                run out.append(Selected { slot: slot, start: low, end: high, through: slot != end.slot, atomic: false })
+              }
             }
+          } else if atomic(tree, slot) && userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
+            run out.append(Selected { slot: slot, start: 0, end: 1, through: true, atomic: true })
           }
-        } else if atomic(tree, slot) && userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
-          run out.append(Selected { slot: slot, start: 0, end: 1, through: true, atomic: true })
         }
+        Step.Leave { .. } => {}
+        Step.Done => { break }
       }
-      Step.Leave { .. } => {}
-      Step.Done => { break }
     }
   }
   sortBySlot(&mut out)
@@ -1094,10 +1259,8 @@ pub effect fn text(tree: &UiTree<'_>) -> String
   ? &mut Allocator {
   let mut out = String.make()
   if !tree.textSelection.ranged() { return move out }
-  let mut start = Point.none()
-  let mut end = Point.none()
-  run ordered(tree, &mut start, &mut end)
-  let mut w = walkFrom(tree, start, end)
+  let mut parts = List<Stretch>.make()
+  run stretches(tree, &mut parts)
   let mut emitted = false
   let mut crossed = false
   // Collapsible white space waits until text follows it on the same line; `lineStart` drops
@@ -1105,82 +1268,89 @@ pub effect fn text(tree: &UiTree<'_>) -> String
   let mut pendingSpace = false
   let mut pendingKeep = false
   let mut lineStart = true
-  while true {
-    match step(tree, &mut w) {
-      Step.Enter { slot } => {
-        if isText(tree, slot) && shown(tree, slot) {
-          let low = if slot == start.slot { start.offset } else { 0 }
-          let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
-          let keep = userSelect(tree, slot) != SELECT_NONE
-          let value = String.view(&tree.node(slot).text)
-          let bytes = String.utf8Bytes(value)
-          let collapse = tree.node(slot).computed.text.whiteSpaceCollapse
-          let spaces = collapse == WhiteSpaceCollapse.Collapse || collapse == WhiteSpaceCollapse.PreserveBreaks
-          let breaks = collapse != WhiteSpaceCollapse.Collapse
-          let mut from = NO_INDEX
-          let mut i: usize = 0
-          while i < bytes.length {
-            let b = bytes[i]
-            let inside = keep && i >= low && i < high
-            let space = spaces && (b == 32 || b == 9 || b == 13 || b == 10 && !breaks)
-            if space {
-              if from != NO_INDEX {
-                run emit(&mut out, value, from, i, &mut emitted)
-                from = NO_INDEX
-              }
-              if !lineStart {
-                pendingSpace = true
-                if inside { pendingKeep = true }
-              }
-            } else {
-              if pendingSpace {
-                if pendingKeep {
-                  run out.append(" ")
-                  emitted = true
+  let mut k: usize = 0
+  while k < parts.length() {
+    let start = parts.get(k).start
+    let end = parts.get(k).end
+    k = k + 1
+    let mut w = walkFrom(tree, start, end)
+    while true {
+      match step(tree, &mut w) {
+        Step.Enter { slot } => {
+          if isText(tree, slot) && shown(tree, slot) {
+            let low = if slot == start.slot { start.offset } else { 0 }
+            let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
+            let keep = userSelect(tree, slot) != SELECT_NONE
+            let value = String.view(&tree.node(slot).text)
+            let bytes = String.utf8Bytes(value)
+            let collapse = tree.node(slot).computed.text.whiteSpaceCollapse
+            let spaces = collapse == WhiteSpaceCollapse.Collapse || collapse == WhiteSpaceCollapse.PreserveBreaks
+            let breaks = collapse != WhiteSpaceCollapse.Collapse
+            let mut from = NO_INDEX
+            let mut i: usize = 0
+            while i < bytes.length {
+              let b = bytes[i]
+              let inside = keep && i >= low && i < high
+              let space = spaces && (b == 32 || b == 9 || b == 13 || b == 10 && !breaks)
+              if space {
+                if from != NO_INDEX {
+                  run emit(&mut out, value, from, i, &mut emitted)
+                  from = NO_INDEX
                 }
-                pendingSpace = false
-                pendingKeep = false
+                if !lineStart {
+                  pendingSpace = true
+                  if inside { pendingKeep = true }
+                }
+              } else {
+                if pendingSpace {
+                  if pendingKeep {
+                    run out.append(" ")
+                    emitted = true
+                  }
+                  pendingSpace = false
+                  pendingKeep = false
+                }
+                if inside {
+                  if from == NO_INDEX { from = i }
+                } else if from != NO_INDEX {
+                  run emit(&mut out, value, from, i, &mut emitted)
+                  from = NO_INDEX
+                }
+                lineStart = b == 10
               }
-              if inside {
-                if from == NO_INDEX { from = i }
-              } else if from != NO_INDEX {
-                run emit(&mut out, value, from, i, &mut emitted)
-                from = NO_INDEX
-              }
-              lineStart = b == 10
+              i = i + 1
+              if i >= high && !pendingSpace && from == NO_INDEX { break }
             }
-            i = i + 1
-            if i >= high && !pendingSpace && from == NO_INDEX { break }
+            if from != NO_INDEX { run emit(&mut out, value, from, minOf(i, high), &mut emitted) }
+            crossed = true
+          } else if blockLevel(tree, slot) {
+            if crossed && !endsWith(&out, 10) {
+              run out.append("\n")
+            }
+            pendingSpace = false
+            pendingKeep = false
+            lineStart = true
+            crossed = true
+          } else if tableCell(tree, slot) {
+            if crossed && indexOf(tree, slot) > 0 && !endsWith(&out, 10) { run out.append("\t") }
+            pendingSpace = false
+            pendingKeep = false
+            lineStart = true
+            crossed = true
           }
-          if from != NO_INDEX { run emit(&mut out, value, from, minOf(i, high), &mut emitted) }
+        }
+        Step.Leave { slot } => {
           crossed = true
-        } else if blockLevel(tree, slot) {
-          if crossed && !endsWith(&out, 10) {
-            run out.append("\n")
+          if blockLevel(tree, slot) && emitted {
+            if !endsWith(&out, 10) { run out.append("\n") }
+            if tree.node(slot).accessRole == Role.Paragraph && !endsWithTwo(&out) { run out.append("\n") }
+            pendingSpace = false
+            pendingKeep = false
+            lineStart = true
           }
-          pendingSpace = false
-          pendingKeep = false
-          lineStart = true
-          crossed = true
-        } else if tableCell(tree, slot) {
-          if crossed && indexOf(tree, slot) > 0 && !endsWith(&out, 10) { run out.append("\t") }
-          pendingSpace = false
-          pendingKeep = false
-          lineStart = true
-          crossed = true
         }
+        Step.Done => { break }
       }
-      Step.Leave { slot } => {
-        crossed = true
-        if blockLevel(tree, slot) && emitted {
-          if !endsWith(&out, 10) { run out.append("\n") }
-          if tree.node(slot).accessRole == Role.Paragraph && !endsWithTwo(&out) { run out.append("\n") }
-          pendingSpace = false
-          pendingKeep = false
-          lineStart = true
-        }
-      }
-      Step.Done => { break }
     }
   }
   if pendingSpace && pendingKeep { run out.append(" ") }
