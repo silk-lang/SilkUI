@@ -170,6 +170,7 @@ export class JsHost {
       format(id, mark, on) { write(OP.format, id); calls.u32(mark); calls.byte(on ? 1 : 0); },
       insertAtom(id, start, end, atom) { write(OP.insertAtom, id); calls.u32(start); calls.u32(end); calls.text(atom); },
       markdown: (text, flags) => this.markdown(text, flags),
+      svgMeasure: (op, packed, distance) => this.svgMeasure(op, packed, distance),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
       // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
@@ -249,6 +250,21 @@ export class JsHost {
       new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
       if (!exports.silkui_validate_stylesheet(pointer, source.length)) throw new TypeError('invalid compiled stylesheet');
     } finally { exports.webgpu_free(pointer, source.length); }
+  }
+
+  svgMeasure(op, packed, distance) {
+    const exports = this.instance?.exports;
+    if (!exports?.silkui_svg_measure) return op === 1 ? '0' : op === 2 ? '0 0' : '0 0 0 0';
+    const source = encoder.encode(String(packed));
+    const pointer = exports.webgpu_alloc(source.length);
+    new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
+    const result = exports.silkui_svg_measure(pointer, source.length, op, Number(distance) || 0);
+    exports.webgpu_free(pointer, source.length);
+    if (!result) throw new Error('svg measuring ran out of memory');
+    const length = new DataView(exports.memory.buffer).getUint32(result, true);
+    const answer = decoder.decode(new Uint8Array(exports.memory.buffer, result + 4, length));
+    exports.webgpu_free(result, length + 4);
+    return answer;
   }
 
   markdown(text, flags) {

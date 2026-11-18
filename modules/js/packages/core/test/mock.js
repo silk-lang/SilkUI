@@ -20,6 +20,10 @@ export function installMock() {
   ]) {
     native[name] = record(name);
   }
+  native.svgMeasure = (op, packed, distance) => {
+    calls.push(["svgMeasure", op, packed, distance]);
+    return op === 0 ? "1 2 3 4" : op === 1 ? "120" : "90 75";
+  };
   native.markdown = (text, flags) => {
     calls.push(["markdown", text, flags]);
     return '{"type":"root","children":[]}';

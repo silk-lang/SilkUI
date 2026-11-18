@@ -238,6 +238,21 @@ export class SvgElement {
   removeAttributeNS(namespace: string | null, name: string): void;
   /** The `style` attribute as declarations: `element.style.display = "none"`. */
   readonly style: Record<string, string>;
+  /**
+   * Hears pointer events (`click`, `pointerdown`, `pointerenter`...) on its shapes, as on the
+   * web; its `<svg>` turns live so the tree can tell which shape is under the pointer.
+   */
+  addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  dispatchEvent(event: globalThis.Event): boolean;
+  /** The box of its geometry in its own user space: a shape's fill, a group's children. */
+  getBBox(): { x: number; y: number; width: number; height: number };
+  /** The length of a shape's outline in user units. */
+  getTotalLength(): number;
+  /** The point `distance` along a shape's outline, clamped to its ends. */
+  getPointAtLength(distance: number): { x: number; y: number };
   insertBefore<T extends SvgElement | SvgText | Text>(child: T, before?: SvgElement | SvgText | Text | null): T;
   appendChild<T extends SvgElement | SvgText | Text>(child: T): T;
   append(...children: (SvgElement | SvgText | Text | string)[]): void;
@@ -258,6 +273,8 @@ export class Svg extends Node {
   readonly outerHTML: string;
   setAttributeNS(namespace: string | null, name: string, value: unknown): void;
   getAttributeNS(namespace: string | null, name: string): string | null;
+  /** The box of what it draws, in its user space (inside `viewBox`). */
+  getBBox(): { x: number; y: number; width: number; height: number };
   textContent: string;
 }
 

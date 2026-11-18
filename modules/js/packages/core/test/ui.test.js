@@ -728,3 +728,49 @@ test("setRangeText on a rich input keeps marks and atoms outside the range", () 
   assert.deepEqual(input.document, { text: "hellox\ufffdthere", marks: [{ start: 7, end: 12, marks: ["bold"] }], atoms: [] });
   assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 7]);
 });
+
+test("listeners on svg elements make the svg live and hear the shape under the pointer", () => {
+  mock.take();
+  const svg = createNode("svg");
+  const group = createSvgElement("g");
+  const a = createSvgElement("rect");
+  const b = createSvgElement("rect");
+  group.appendChild(a);
+  svg.append(group, b);
+  const heard = [];
+  const log = (name) => (event) => heard.push(name + ":" + event.type + "@" + (event.target.localName ?? "?") + (event.target === a ? "a" : event.target === b ? "b" : ""));
+  group.addEventListener("pointerenter", log("g"));
+  group.addEventListener("pointerleave", log("g"));
+  b.addEventListener("click", log("b"));
+  svg.addEventListener("click", log("svg"));
+  flushSvg();
+  const calls = mock.take();
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "listeners draw it live from the start");
+  const listen = calls.filter((call) => call[0] === "listen" && call[1] === svg.nodeId).at(-1);
+  for (const kind of [2, 3, 4, 5, 28, 29]) assert.ok(listen[2] & (1 << kind), "listens for kind " + kind);
+  const at = (element) => element._n * 4294967296 + 256 + 64;
+  mock.native.dispatch(28, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(4, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(3, svg.nodeId, 50, 5, at(b), 0, 0);
+  mock.native.dispatch(2, svg.nodeId, 50, 5, at(b), 0, 1);
+  mock.native.dispatch(2, svg.nodeId, 90, 90, 256 + 64, 0, 1);
+  assert.deepEqual(heard, ["g:pointerenter@g", "g:pointerleave@g", "b:click@rectb", "svg:click@rectb", "svg:click@svg"]);
+  svg.destroy();
+});
+
+test("svg elements measure their markup for getBBox and path lengths", () => {
+  mock.take();
+  const group = createSvgElement("g");
+  group.setAttribute("transform", "scale(2)");
+  const path = createSvgElement("path");
+  path.setAttribute("d", "M60 60h30v30h-30z");
+  group.appendChild(path);
+  assert.deepEqual({ ...group.getBBox() }, { x: 1, y: 2, width: 3, height: 4 });
+  assert.equal(path.getTotalLength(), 120);
+  assert.deepEqual(path.getPointAtLength(45), { x: 90, y: 75 });
+  assert.deepEqual(mock.take().map((call) => call.slice(1)), [
+    [0, "0\x1fg\x1ftransform\x1fscale(2)\x1e1\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [1, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [2, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 45],
+  ]);
+});

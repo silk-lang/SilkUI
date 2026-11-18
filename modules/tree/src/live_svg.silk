@@ -19,6 +19,7 @@ import ui_scene.scene { Scene }
 import ui_scene.path_cache { PathCache }
 import vector.geometry { Affine }
 import vector.path { Path as VectorPath }
+import vector.path as vector_path_verbs
 import vector.strips { NONZERO, EVENODD }
 import vector.stroke { Stroke, CAP_BUTT, CAP_ROUND, CAP_SQUARE, JOIN_MITER, JOIN_ROUND, JOIN_BEVEL }
 import svg_core.vector_path
@@ -146,6 +147,14 @@ const P_COLOR: u32 = 16384
 const P_STOP_COLOR: u32 = 32768
 const P_STOP_OPACITY: u32 = 65536
 const P_CLIP: u32 = 131072
+const P_POINTER: u32 = 262144
+
+// `pointer-events` as flags: which parts hit, and whether they must be painted or visible.
+const HIT_FILL: u8 = 1
+const HIT_STROKE: u8 = 2
+const HIT_PAINTED: u8 = 4
+const HIT_VISIBLE: u8 = 8
+const HIT_DEFAULT: u8 = 15
 
 /// The SVG properties an element sets, from its presentation attributes or its `style`.
 pub struct Props {
@@ -169,6 +178,8 @@ pub struct Props {
   pub stopOpacity: f32,
   /// `clip-path: url(#id)` by id hash, 0 for none.
   pub clip: u64,
+  /// `pointer-events` as `HIT_*` flags.
+  pub pointer: u8,
 }
 
 impl Props {
@@ -193,6 +204,7 @@ impl Props {
       stopColor: Paint.Color { color: black() },
       stopOpacity: 1.0,
       clip: 0,
+      pointer: HIT_DEFAULT,
     }
   }
 }
@@ -954,6 +966,32 @@ effect fn property(props: &mut Props, name: &[u8], text: &[u8]) -> ()
   } else if name == b"clip-path" {
     props.clip = urlRef(value)
     props.set = props.set | P_CLIP
+  } else if name == b"pointer-events" {
+    let flags: u8 = if same(value, b"none") {
+      0
+    } else if same(value, b"visiblepainted") || same(value, b"auto") {
+      HIT_DEFAULT
+    } else if same(value, b"visiblefill") {
+      HIT_FILL | HIT_VISIBLE
+    } else if same(value, b"visiblestroke") {
+      HIT_STROKE | HIT_VISIBLE
+    } else if same(value, b"visible") {
+      HIT_FILL | HIT_STROKE | HIT_VISIBLE
+    } else if same(value, b"painted") {
+      HIT_FILL | HIT_STROKE | HIT_PAINTED
+    } else if same(value, b"fill") {
+      HIT_FILL
+    } else if same(value, b"stroke") {
+      HIT_STROKE
+    } else if same(value, b"all") {
+      HIT_FILL | HIT_STROKE
+    } else {
+      255
+    }
+    if flags != 255 {
+      props.pointer = flags
+      props.set = props.set | P_POINTER
+    }
   }
 }
 
@@ -994,6 +1032,8 @@ fn clearProperty(props: &mut Props, name: &[u8]) -> () {
     P_STOP_COLOR
   } else if name == b"clip-path" {
     P_CLIP
+  } else if name == b"pointer-events" {
+    P_POINTER
   } else {
     0
   }
@@ -1172,6 +1212,7 @@ struct Inherited {
   evenOdd: bool,
   invisible: bool,
   color: Rgba<f32>,
+  pointer: u8,
 }
 
 impl Copy for Inherited {}
@@ -1226,6 +1267,7 @@ pub effect fn paint(svg: &LiveSvg, canvas: &mut Canvas<'_>, box: Rect<f32>, mask
       evenOdd: false,
       invisible: false,
       color: canvas.color,
+      pointer: HIT_DEFAULT,
     },
     0,
   )
@@ -1303,6 +1345,9 @@ fn inherit(svg: &LiveSvg, parent: Inherited, element: u32) -> Inherited {
   }
   if let Option<&Props>.Some { value } = propsFor(e, P_VISIBILITY) {
     out.invisible = value.invisible
+  }
+  if let Option<&Props>.Some { value } = propsFor(e, P_POINTER) {
+    out.pointer = value.pointer
   }
   return out
 }
@@ -1789,4 +1834,543 @@ effect fn gradientFor(
       },
     },
   )
+}
+
+// Geometry reads: the element under a point, bounding boxes and path lengths.
+
+pub struct FlatPoint {
+  pub x: f64,
+  pub y: f64,
+}
+
+impl Copy for FlatPoint {}
+
+/// A path as polylines: `starts` indexes each subpath's first point in `points`.
+struct Flat {
+  points: List<FlatPoint>,
+  starts: List<usize>,
+  closed: List<bool>,
+}
+
+const CURVE_STEPS: u32 = 16
+
+impl Flat {
+  fn end(self: &Self, subpath: usize) -> usize {
+    return if subpath + 1 < self.starts.length() { self.starts.get(subpath + 1) } else { self.points.length() }
+  }
+}
+
+effect fn flatten(path: &VectorPath) -> Flat ! OutOfMemoryError ? &mut Allocator {
+  let mut flat = Flat { points: List<FlatPoint>.make(), starts: List<usize>.make(), closed: List<bool>.make() }
+  let verbs = path.verbList()
+  let points = path.pointList()
+  let mut at: usize = 0
+  let mut cx: f64 = 0.0
+  let mut cy: f64 = 0.0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let verb = verbs[i]
+    if verb == vector_path_verbs.MOVE {
+      cx = points[at].x
+      cy = points[at].y
+      at = at + 1
+      run flat.starts.append(flat.points.length())
+      run flat.closed.append(false)
+      run flat.points.append(FlatPoint { x: cx, y: cy })
+    } else if verb == vector_path_verbs.LINE {
+      cx = points[at].x
+      cy = points[at].y
+      at = at + 1
+      run flat.points.append(FlatPoint { x: cx, y: cy })
+    } else if verb == vector_path_verbs.QUAD {
+      let c = points[at]
+      let p = points[at + 1]
+      at = at + 2
+      let mut k: u32 = 1
+      while k <= CURVE_STEPS {
+        let t = u32.toF64(k) / u32.toF64(CURVE_STEPS)
+        let u = 1.0 - t
+        run flat.points.append(FlatPoint {
+          x: u * u * cx + 2.0 * u * t * c.x + t * t * p.x,
+          y: u * u * cy + 2.0 * u * t * c.y + t * t * p.y,
+        })
+        k = k + 1
+      }
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.CUBIC {
+      let c1 = points[at]
+      let c2 = points[at + 1]
+      let p = points[at + 2]
+      at = at + 3
+      let mut k: u32 = 1
+      while k <= CURVE_STEPS {
+        let t = u32.toF64(k) / u32.toF64(CURVE_STEPS)
+        let u = 1.0 - t
+        let a = u * u * u
+        let b = 3.0 * u * u * t
+        let c = 3.0 * u * t * t
+        let d = t * t * t
+        run flat.points.append(FlatPoint {
+          x: a * cx + b * c1.x + c * c2.x + d * p.x,
+          y: a * cy + b * c1.y + c * c2.y + d * p.y,
+        })
+        k = k + 1
+      }
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.ARC {
+      let center = points[at]
+      let ax = points[at + 1]
+      let ay = points[at + 2]
+      let angles = points[at + 3]
+      let p = points[at + 4]
+      at = at + 5
+      let steps = f64.max(4.0, f64.ceil(f64.abs(angles.y) / (3.141592653589793 / 16.0)))
+      let n = f64.toU32(f64.min(steps, 256.0))
+      let mut k: u32 = 1
+      while k < n {
+        let angle = angles.x + angles.y * u32.toF64(k) / u32.toF64(n)
+        let cos = f64.cos(angle)
+        let sin = f64.sin(angle)
+        run flat.points.append(FlatPoint { x: center.x + ax.x * cos + ay.x * sin, y: center.y + ax.y * cos + ay.y * sin })
+        k = k + 1
+      }
+      run flat.points.append(FlatPoint { x: p.x, y: p.y })
+      cx = p.x
+      cy = p.y
+    } else if verb == vector_path_verbs.CLOSE {
+      let last = flat.closed.length()
+      if last > 0 {
+        let slots = flat.closed.asMutSlice()
+        slots[last - 1] = true
+        let first = flat.points.get(flat.starts.get(last - 1))
+        cx = first.x
+        cy = first.y
+      }
+    }
+    i = i + 1
+  }
+  return move flat
+}
+
+/// Whether (`x`, `y`) is inside the fill of `flat`, every subpath closed.
+fn insideFill(flat: &Flat, x: f64, y: f64, evenOdd: bool) -> bool {
+  let points = flat.points.asSlice()
+  let mut winding: i32 = 0
+  let mut crossings: u32 = 0
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let a = points[i]
+      let b = if i + 1 < end { points[i + 1] } else { points[start] }
+      if (a.y <= y && b.y > y) || (a.y > y && b.y <= y) {
+        let cross = (b.x - a.x) * (y - a.y) - (x - a.x) * (b.y - a.y)
+        if a.y <= y {
+          if cross > 0.0 {
+            winding = winding + 1
+            crossings = crossings + 1
+          }
+        } else if cross < 0.0 {
+          winding = winding - 1
+          crossings = crossings + 1
+        }
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return if evenOdd { crossings % 2 == 1 } else { winding != 0 }
+}
+
+fn segmentDistance(a: FlatPoint, b: FlatPoint, x: f64, y: f64) -> f64 {
+  let dx = b.x - a.x
+  let dy = b.y - a.y
+  let squared = dx * dx + dy * dy
+  let t = if squared > 0.0 { f64.max(0.0, f64.min(1.0, ((x - a.x) * dx + (y - a.y) * dy) / squared)) } else { 0.0 }
+  let px = a.x + t * dx - x
+  let py = a.y + t * dy - y
+  return f64.sqrt(px * px + py * py)
+}
+
+/// Whether (`x`, `y`) is within `half` of the outline of `flat`.
+fn nearStroke(flat: &Flat, x: f64, y: f64, half: f64) -> bool {
+  let points = flat.points.asSlice()
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let last = i + 1 >= end
+      if !last || flat.closed.get(s) {
+        let b = if last { points[start] } else { points[i + 1] }
+        if segmentDistance(points[i], b, x, y) <= half {
+          return true
+        }
+      } else if end - start == 1 && segmentDistance(points[i], points[i], x, y) <= half {
+        return true
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return false
+}
+
+fn mapPoint(m: &Affine, x: f64, y: f64) -> FlatPoint {
+  return FlatPoint { x: m.xx * x + m.xy * y + m.dx, y: m.yx * x + m.yy * y + m.dy }
+}
+
+/// The element of `svg` drawn topmost at (`x`, `y`), for a content box `box` in the same space,
+/// or 0 when the point is over none. `pointer-events`, `display`, `visibility` and clip paths
+/// decide as they do on the web.
+pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32>) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = svg.at(0)
+  if hiddenOf(root) {
+    return 0
+  }
+  let fx = f32.toF64(x)
+  let fy = f32.toF64(y)
+  if fx < f32.toF64(box.xMin) || fx > f32.toF64(box.xMax) || fy < f32.toF64(box.yMin) || fy > f32.toF64(box.yMax) {
+    return 0
+  }
+  let inherited = inherit(
+    svg,
+    Inherited {
+      fill: Paint.Color { color: black() },
+      stroke: Paint.None,
+      fillOpacity: 1.0,
+      strokeOpacity: 1.0,
+      strokeWidth: 1.0,
+      cap: CAP_BUTT,
+      join: JOIN_MITER,
+      miter: 4.0,
+      dashes: NO_ELEMENT,
+      dashOffset: 0.0,
+      evenOdd: false,
+      invisible: false,
+      color: color,
+      pointer: HIT_DEFAULT,
+    },
+    0,
+  )
+  let transform = rootTransform(svg, box)
+  return run hitGroup(svg, 0, &transform, inherited, fx, fy, 0)
+}
+
+effect fn hitGroup(svg: &LiveSvg, element: u32, transform: &Affine, inherited: Inherited, x: f64, y: f64, depth: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if depth > MAX_DEPTH {
+    return 0
+  }
+  let mut child = svg.at(element).last
+  while child != NO_ELEMENT {
+    let found = run hitElement(svg, child, transform, inherited, x, y, depth + 1)
+    if found != 0 {
+      return found
+    }
+    child = svg.at(child).previous
+  }
+  return 0
+}
+
+effect fn hitElement(svg: &LiveSvg, element: u32, parentTransform: &Affine, parentInherited: Inherited, x: f64, y: f64, depth: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let e = svg.at(element)
+  let tag = e.tag
+  if !(tag == Tag.G || tag == Tag.Svg || isShape(tag)) || hiddenOf(e) {
+    return 0
+  }
+  let transform = parentTransform.* * e.transform
+  let inherited = inherit(svg, parentInherited, element)
+  let clip = clipOf(e)
+  if clip != 0 {
+    let target = svg.find(clip)
+    if target != NO_ELEMENT && svg.at(target).tag == Tag.ClipPath && !(run insideClip(svg, target, &transform, x, y)) {
+      return 0
+    }
+  }
+  if !isShape(tag) {
+    return run hitGroup(svg, element, &transform, inherited, x, y, depth)
+  }
+  let flags = inherited.pointer
+  if flags == 0 || (flags & HIT_VISIBLE != 0 && inherited.invisible) {
+    return 0
+  }
+  let path = match &e.path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return 0
+    }
+  }
+  let inverse = match transform.inverse() {
+    Option<Affine>.Some { value } => value
+    _ => {
+      return 0
+    }
+  }
+  let local = mapPoint(&inverse, x, y)
+  let flat = run flatten(path)
+  let needsPaint = flags & HIT_PAINTED != 0
+  if flags & HIT_FILL != 0 && (!needsPaint || painted(inherited.fill)) && insideFill(&flat, local.x, local.y, inherited.evenOdd) {
+    return element
+  }
+  if flags & HIT_STROKE != 0 && (!needsPaint || painted(inherited.stroke)) && inherited.strokeWidth > 0.0 {
+    if nearStroke(&flat, local.x, local.y, f32.toF64(inherited.strokeWidth) / 2.0) {
+      return element
+    }
+  }
+  return 0
+}
+
+/// Whether (`x`, `y`) is inside the union of the shapes of clip path `clip`.
+effect fn insideClip(svg: &LiveSvg, clip: u32, transform: &Affine, x: f64, y: f64) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let c = svg.at(clip)
+  let base = transform.* * c.transform
+  let mut child = c.first
+  while child != NO_ELEMENT {
+    let e = svg.at(child)
+    if isShape(e.tag) && !hiddenOf(e) {
+      if let Option<VectorPath>.Some { value: path } = &e.path {
+        if let Option<Affine>.Some { value: inverse } = (base * e.transform).inverse() {
+          let local = mapPoint(&inverse, x, y)
+          let flat = run flatten(&path)
+          if insideFill(&flat, local.x, local.y, e.attributes.evenOdd || e.styles.evenOdd) {
+            return true
+          }
+        }
+      }
+    }
+    child = e.next
+  }
+  return false
+}
+
+/// The bounding box of element `element` in its own user space, as `getBBox()` gives it:
+/// a shape's fill geometry, a group's children under their transforms. `None` when it has
+/// no geometry.
+pub fn boundingBox(svg: &LiveSvg, element: u32) -> Option<ShapeRect> {
+  if !svg.has(element) {
+    return Option<ShapeRect>.None
+  }
+  return boxUnder(svg, element, Affine.identity(), 0)
+}
+
+fn joinBoxes(a: Option<ShapeRect>, b: Option<ShapeRect>) -> Option<ShapeRect> {
+  return match a {
+    Option<ShapeRect>.Some { value: x } => match b {
+      Option<ShapeRect>.Some { value: y } => Option<ShapeRect>.some(ShapeRect {
+        xMin: f64.min(x.xMin, y.xMin),
+        yMin: f64.min(x.yMin, y.yMin),
+        xMax: f64.max(x.xMax, y.xMax),
+        yMax: f64.max(x.yMax, y.yMax),
+      })
+      _ => a
+    }
+    _ => b
+  }
+}
+
+fn boxUnder(svg: &LiveSvg, element: u32, transform: Affine, depth: u32) -> Option<ShapeRect> {
+  if depth > MAX_DEPTH {
+    return Option<ShapeRect>.None
+  }
+  let e = svg.at(element)
+  if isShape(e.tag) {
+    if let Option<ShapePath>.Some { value: shape } = &e.shape {
+      return match bounds.pathTransformed(&shape, transform) {
+        BoundsResult.Finite { rect } => Option<ShapeRect>.some(rect)
+        _ => Option<ShapeRect>.None
+      }
+    }
+    return Option<ShapeRect>.None
+  }
+  if !(e.tag == Tag.G || e.tag == Tag.Svg) {
+    return Option<ShapeRect>.None
+  }
+  let mut out = Option<ShapeRect>.None
+  let mut child = e.first
+  while child != NO_ELEMENT {
+    let c = svg.at(child)
+    if !hiddenOf(c) {
+      out = joinBoxes(out, boxUnder(svg, child, transform * c.transform, depth + 1))
+    }
+    child = c.next
+  }
+  return out
+}
+
+/// The length of shape `element`'s outline in its user units, as `getTotalLength()` gives it.
+pub effect fn totalLength(svg: &LiveSvg, element: u32) -> f64 ! OutOfMemoryError ? &mut Allocator {
+  if !svg.has(element) {
+    return 0.0
+  }
+  let path = match &svg.at(element).path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return 0.0
+    }
+  }
+  let flat = run flatten(path)
+  let walked = walk(&flat, -1.0)
+  return walked.length
+}
+
+/// The point at `distance` along shape `element`'s outline, as `getPointAtLength()` gives
+/// it: clamped to the ends, (0, 0) for an element with no outline.
+pub effect fn pointAtLength(svg: &LiveSvg, element: u32, distance: f64) -> FlatPoint ! OutOfMemoryError ? &mut Allocator {
+  if !svg.has(element) {
+    return FlatPoint { x: 0.0, y: 0.0 }
+  }
+  let path = match &svg.at(element).path {
+    Option<VectorPath>.Some { value } => &value
+    _ => {
+      return FlatPoint { x: 0.0, y: 0.0 }
+    }
+  }
+  let flat = run flatten(path)
+  let walked = walk(&flat, f64.max(0.0, distance))
+  return walked.point
+}
+
+struct Walked {
+  length: f64,
+  point: FlatPoint,
+}
+
+/// Walks the outline of `flat`: its whole length, and the point `distance` along it (the end
+/// when it is shorter; a negative `distance` never stops).
+fn walk(flat: &Flat, distance: f64) -> Walked {
+  let points = flat.points.asSlice()
+  let mut total: f64 = 0.0
+  let mut last = FlatPoint { x: 0.0, y: 0.0 }
+  if points.length > 0 {
+    last = points[0]
+  }
+  let mut s: usize = 0
+  while s < flat.starts.length() {
+    let start = flat.starts.get(s)
+    let end = flat.end(s)
+    let mut i = start
+    while i < end {
+      let closing = i + 1 >= end
+      if !closing || flat.closed.get(s) {
+        let a = points[i]
+        let b = if closing { points[start] } else { points[i + 1] }
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let step = f64.sqrt(dx * dx + dy * dy)
+        if distance >= 0.0 && total + step >= distance {
+          let t = if step > 0.0 { (distance - total) / step } else { 0.0 }
+          return Walked { length: distance, point: FlatPoint { x: a.x + dx * t, y: a.y + dy * t } }
+        }
+        total = total + step
+        last = b
+      }
+      i = i + 1
+    }
+    s = s + 1
+  }
+  return Walked { length: total, point: last }
+}
+
+/// `value` with at most 9 decimals and no trailing zeros.
+effect fn appendShort(data: &mut List<u8>, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendNumber(&mut data.*, value)
+  while data.length() > 0 && data.get(data.length() - 1) == 48 {
+    drop data.pop()
+  }
+  if data.length() > 0 && data.get(data.length() - 1) == 46 {
+    drop data.pop()
+  }
+}
+
+/// What `measure` reads.
+pub const MEASURE_BOX: u32 = 0
+pub const MEASURE_LENGTH: u32 = 1
+pub const MEASURE_POINT: u32 = 2
+
+fn fieldEnd(bytes: &[u8], from: usize, separator: u8) -> usize {
+  let mut i = from
+  while i < bytes.length && bytes[i] != separator && bytes[i] != 30 {
+    i = i + 1
+  }
+  return i
+}
+
+fn decimal(text: &[u8]) -> u32 {
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < text.length && text[i] >= 48 && text[i] <= 57 && value < 100000000 {
+    value = value * 10 + u8.toU32(text[i] - 48)
+    i = i + 1
+  }
+  return value
+}
+
+/// Measures an element from its markup alone, for `getBBox()`, `getTotalLength()` and
+/// `getPointAtLength()` before the tree has seen it. `packed` holds the element and what is
+/// inside it as records split by U+001E, each `parent` U+001F `tag` then `name` U+001F `value`
+/// pairs; record 1 is the element (its parent 0), later records name earlier ones as their
+/// parent. Writes the box as `x y width height`, the length, or the point as `x y` to `out`.
+pub effect fn measure(packed: &[u8], op: u32, distance: f64, out: &mut List<u8>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut svg = run LiveSvg.make()
+  let mut record: u32 = 0
+  let mut at: usize = 0
+  while at < packed.length {
+    record = record + 1
+    let parentEnd = fieldEnd(packed, at, 31)
+    let parent = decimal(cut(packed, at, parentEnd))
+    let mut i = parentEnd + 1
+    if parentEnd >= packed.length || packed[parentEnd] == 30 {
+      i = parentEnd
+    }
+    let tagEnd = fieldEnd(packed, i, 31)
+    drop run svg.insert(record, cut(packed, i, tagEnd), if parent < record { parent } else { 0 }, NO_ELEMENT)
+    i = tagEnd
+    while i < packed.length && packed[i] == 31 {
+      let nameEnd = fieldEnd(packed, i + 1, 31)
+      let name = cut(packed, i + 1, nameEnd)
+      if nameEnd >= packed.length || packed[nameEnd] == 30 {
+        i = nameEnd
+        break
+      }
+      let valueEnd = fieldEnd(packed, nameEnd + 1, 31)
+      drop run svg.set(record, name, cut(packed, nameEnd + 1, valueEnd), true)
+      i = valueEnd
+    }
+    at = i + 1
+  }
+  if op == MEASURE_BOX {
+    let rect = match boundingBox(&svg, 1) {
+      Option<ShapeRect>.Some { value } => value
+      _ => ShapeRect { xMin: 0.0, yMin: 0.0, xMax: 0.0, yMax: 0.0 }
+    }
+    run appendShort(&mut out.*, rect.xMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.yMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.xMax - rect.xMin)
+    run out.append(32)
+    run appendShort(&mut out.*, rect.yMax - rect.yMin)
+  } else if op == MEASURE_LENGTH {
+    run appendShort(&mut out.*, run totalLength(&svg, 1))
+  } else {
+    let point = run pointAtLength(&svg, 1, distance)
+    run appendShort(&mut out.*, point.x)
+    run out.append(32)
+    run appendShort(&mut out.*, point.y)
+  }
 }

@@ -1,6 +1,9 @@
 //! Live svg: an icon node whose svg elements the client writes one attribute at a time draws
 //! them as paths, and a frame rasterizes only the shapes whose geometry changed.
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Input, Event, BUTTON_PRIMARY }
+import ui_tree.live_svg as live
+import silk.collections.list { List }
+import silk.num.f32
 import ui_fixtures.fixtures as fixtures
 import svg_css.written
 import svg_css.tokens { CssError }
@@ -190,4 +193,84 @@ effect fn gradients() ! TreeError | CssError | GeometryError | OutOfMemoryError 
 test effect fn liveSvgPaintsGradients() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run gradients() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn elementAt(tree: &mut UiTree<'_>, x: f32, y: f32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+  run tree.dispatch(Input.PointerDown { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0, clickCount: 1 })
+  run tree.dispatch(Input.PointerUp { x: x, y: y, button: BUTTON_PRIMARY, modifiers: 0 })
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  let mut i: usize = 0
+  while i < events.length() {
+    if events.asSlice()[i].target == SVG {
+      return events.asSlice()[i].element
+    }
+    i = i + 1
+  }
+  return 999
+}
+
+effect fn hits() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run scene(&mut batch)
+  run batch.listen(SVG, 1)
+  run batch.svgInsert(SVG, 7, "line", 0, Option<u32>.None)
+  run set(&mut batch, 7, "x1", "10")
+  run set(&mut batch, 7, "y1", "95")
+  run set(&mut batch, 7, "x2", "50")
+  run set(&mut batch, 7, "y2", "95")
+  run set(&mut batch, 7, "stroke", "black")
+  run set(&mut batch, 7, "stroke-width", "4")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let at25_25 = run elementAt(&mut tree, 25.0, 25.0)
+  run Testing.expect(at25_25 == 2, "the rect in the translated group")
+  let at75_75 = run elementAt(&mut tree, 75.0, 75.0)
+  run Testing.expect(at75_75 == 3, "a half transparent path still hits")
+  let at65_25 = run elementAt(&mut tree, 65.0, 25.0)
+  run Testing.expect(at65_25 == 5, "inside the clip")
+  let at85_25 = run elementAt(&mut tree, 85.0, 25.0)
+  run Testing.expect(at85_25 == 0, "the clip path cuts hits too")
+  let at5_5 = run elementAt(&mut tree, 5.0, 5.0)
+  run Testing.expect(at5_5 == 0, "empty svg area is the svg itself")
+  let at30_96 = run elementAt(&mut tree, 30.0, 96.0)
+  run Testing.expect(at30_96 == 7, "a line hits within its stroke width")
+  let at30_98 = run elementAt(&mut tree, 30.0, 98.5)
+  run Testing.expect(at30_98 == 0, "and not outside it")
+  run set(&mut batch, 3, "pointer-events", "none")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let through = run elementAt(&mut tree, 75.0, 75.0)
+  run Testing.expect(through == 0, "pointer-events none lets the pointer through")
+}
+
+test effect fn liveSvgTellsTheShapeUnderThePointer() ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hits() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn measured(packed: &[u8], op: u32, distance: f64) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run live.measure(packed, op, distance, &mut out)
+  return move out
+}
+
+effect fn measures() ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let square = b"0\x1fpath\x1fd\x1fM60 60h30v30h-30z"
+  let box = run measured(square, live.MEASURE_BOX, 0.0)
+  run Testing.expect(box.asSlice() == b"60 60 30 30", "a path's box")
+  let length = run measured(square, live.MEASURE_LENGTH, 0.0)
+  run Testing.expect(length.asSlice() == b"120", "its outline length, closing side included")
+  let point = run measured(square, live.MEASURE_POINT, 45.0)
+  run Testing.expect(point.asSlice() == b"90 75", "the point 45 along it")
+  let group = b"0\x1fg\x1ftransform\x1fscale(5)\x1e1\x1frect\x1fx\x1f2\x1fy\x1f2\x1fwidth\x1f6\x1fheight\x1f6\x1e1\x1fcircle\x1fcx\x1f10\x1fcy\x1f10\x1fr\x1f2"
+  let grouped = run measured(group, live.MEASURE_BOX, 0.0)
+  run Testing.expect(grouped.asSlice() == b"2 2 10 10", "a group's box joins its children in its own space")
+}
+
+test effect fn liveSvgMeasuresBoxesAndLengths() ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run measures() |> Effect.provideMut<Allocator>(&mut allocator)
 }

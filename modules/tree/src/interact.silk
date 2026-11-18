@@ -34,7 +34,8 @@ import edit
 import scroll_snap
 import touch
 import scroll_anchor
-import paint { styleSlot, borderBox, paddingBox, overflowClip }
+import paint { styleSlot, borderBox, paddingBox, overflowClip, contentBox }
+import live_svg
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
 import layout.lib { FragmentKind, InvalidNode }
@@ -160,7 +161,7 @@ pub fn inertAt(tree: &UiTree<'_>, slot: u32) -> bool {
 /// point is in the fragment's layout coordinates: where it is against the fragment as laid out,
 /// with the scroll and sticky offsets above already taken off. The walk is paint order
 /// reversed (see `stacking`): what paints last is on top.
-fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) -> u32 {
+fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool, landing: &mut Landing) -> u32 {
   if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
   }
@@ -173,7 +174,7 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) 
   let y = point.y
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
-    return hitInside(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned, &mut landing.*)
   }
   if f.kind == FragmentKind.Text {
     if !inside(borderBox(&f), x, y) {
@@ -189,16 +190,19 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) 
   }
   let slot = slotIn(&tree.slotOfCss, f.source)
   if slot == NONE {
-    return hitInside(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned, &mut landing.*)
   }
   let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
   if !clips || inside(overflowClip(&tree.node(slot).computed, &f), x, y) {
-    let below = hitInside(tree, index, x, y, pruned)
+    let below = hitInside(tree, index, x, y, pruned, &mut landing.*)
     if below != NONE {
       return below
     }
   }
   if inside(borderBox(&f), x, y) && targetable(tree, slot) {
+    landing.fragment = index
+    landing.x = x
+    landing.y = y
     return slot
   }
   return NONE
@@ -224,9 +228,9 @@ fn ownShiftOf(tree: &UiTree<'_>, index: usize) -> Vector2<f32> {
 /// What is inside fragment `index`, topmost first: a stacking context's lists in reverse paint
 /// order, else its children. A root element's box is hit where it sits in flow, as the body's
 /// is in a browser, though its background paints first (see `stacking.ROOT`).
-fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   if !layered(tree) || !tree.fragmentStacking.stacks(index) {
-    return hitChildren(tree, index, x, y, pruned)
+    return hitChildren(tree, index, x, y, pruned, &mut landing.*)
   }
   let steps = tree.fragmentStacking.steps(index)
   let mut k: usize = 0
@@ -234,9 +238,9 @@ fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u
     let step = tree.fragmentStacking.step(index, k, true)
     k = k + 1
     let found = if step == IN_FLOW {
-      hitChildren(tree, index, x, y, pruned)
+      hitChildren(tree, index, x, y, pruned, &mut landing.*)
     } else {
-      hitHoisted(tree, index, step, x, y, pruned)
+      hitHoisted(tree, index, step, x, y, pruned, &mut landing.*)
     }
     if found != NONE {
       return found
@@ -299,23 +303,23 @@ fn insideBetween(
 }
 
 /// Hit tests `entry` of stacking context `root`'s lists, where it sits in the tree.
-fn hitHoisted(tree: &UiTree<'_>, root: usize, entry: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitHoisted(tree: &UiTree<'_>, root: usize, entry: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let total = shiftBetween(tree, root, entry)
   if !insideBetween(tree, root, entry, x, y, total) {
     return NONE
   }
   let own = ownShiftOf(tree, entry)
-  return hitFragment(tree, entry, x - total.x - own.x, y - total.y - own.y, pruned)
+  return hitFragment(tree, entry, x - total.x - own.x, y - total.y - own.y, pruned, &mut landing.*)
 }
 
-fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let values = tree.output.fragments.values.asSlice()
   let skips = layered(tree)
   let mut child = values[index].lastChild
   while child != NO_INDEX {
     if !skips || !tree.fragmentStacking.hoisted(child) {
       let own = ownShiftOf(tree, child)
-      let found = hitFragment(tree, child, x - own.x, y - own.y, pruned)
+      let found = hitFragment(tree, child, x - own.x, y - own.y, pruned, &mut landing.*)
       if found != NONE {
         return found
       }
@@ -342,7 +346,21 @@ pub fn layoutHit(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
   return hitLayoutSlot(tree, x, y)
 }
 
+/// Where a hit test landed: the target's fragment and the point in its coordinates.
+pub struct Landing {
+  pub fragment: usize,
+  pub x: f32,
+  pub y: f32,
+}
+
+impl Copy for Landing {}
+
 fn hitLayoutSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
+  let mut landing = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+  return hitLanding(tree, x, y, &mut landing)
+}
+
+fn hitLanding(tree: &UiTree<'_>, x: f32, y: f32, landing: &mut Landing) -> u32 {
   let values = tree.output.fragments.values.asSlice()
   let mut index = values.length
   while index > 0 {
@@ -357,7 +375,7 @@ fn hitLayoutSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
         tree.input.width,
         tree.input.height,
       )
-      let found = hitFragment(tree, index, x - own.x, y - own.y, tree.inkCurrent())
+      let found = hitFragment(tree, index, x - own.x, y - own.y, tree.inkCurrent(), &mut landing.*)
       if found != NONE {
         return found
       }
@@ -575,7 +593,27 @@ effect fn pointerRecord(
   event.pointerId = tree.pointerId
   event.pointerType = tree.pointerType
   event.primary = tree.pointerPrimary
+  if tree.node(slot).svg.isSome() {
+    event.element = run svgElementAt(&tree.*, slot, tree.pointerX, tree.pointerY)
+  }
   run tree.queueEvent(move event)
+}
+
+/// The element of live svg node `slot` under the pointer at (`x`, `y`), 0 when the pointer is
+/// over none of its shapes or not over the node.
+effect fn svgElementAt(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut landing = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+  if eventSlot(tree, hitLanding(tree, x, y, &mut landing)) != slot || landing.fragment == NO_INDEX {
+    return 0
+  }
+  let f = tree.output.fragments.values.asSlice()[landing.fragment]
+  let node = tree.node(slot)
+  return match &node.svg {
+    Option.Some { value: svg } => run live_svg.hit(&svg.get()[0], contentBox(&f), landing.x, landing.y, node.computed.text.color)
+    _ => 0
+  }
 }
 
 /// `pointerRecord` for the touch module.
@@ -814,6 +852,7 @@ effect fn captureRecord(tree: &mut UiTree<'_>, kind: EventKind, flag: u32, slot:
   event.primary = tree.pointerPrimary
   run tree.queueEvent(move event)
 }
+
 
 /// The node holding the capture of the press, or NONE.
 pub fn captureHolder(tree: &UiTree<'_>) -> u32 {

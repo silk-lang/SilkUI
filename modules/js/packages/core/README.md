@@ -72,10 +72,14 @@ An `Svg` is one node whose markup its `SvgElement` and text children make, as an
 `fill`, `width` and every other attribute are markup, and React's spellings (`strokeWidth`)
 work too. Changes are drawn once, before the host applies the batch (`flushSvg()` draws them
 now). Without a CSS size it takes the `<svg>`'s `width` and `height`, else a square of the
-font size. Elements inside it hear no events: listen on the `Svg`.
+font size. Listeners on its elements hear pointer events on their shapes, with
+`pointerover`, `pointerout`, `pointerenter` and `pointerleave` as the pointer moves between
+them; `pointer-events`, `visibility`, `display` and clip paths decide hits as on the web.
+`getBBox()`, `getTotalLength()` and `getPointAtLength()` measure elements from their markup.
 
 Once an `Svg` has drawn, later changes go to the tree element by element, and only the shapes
-whose geometry changed rasterize again: a script can animate it every frame. The tree draws
+whose geometry changed rasterize again: a script can animate it every frame. Listeners on its
+elements make it live from its first draw. The tree draws
 `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `clipPath` and linear
 and radial gradients this way; anything else (text, masks, filters, `use`...) puts the `Svg`
 back to drawing its markup whole, which is right but slower. Browser libraries that build SVG

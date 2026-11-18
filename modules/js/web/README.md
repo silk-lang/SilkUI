@@ -24,7 +24,7 @@ through `silkui#dispatch`, one call per record between the tree's `begin` and `f
 its result is the record's prevented flag. Two suspending imports (JSPI) let the loop wait for
 JavaScript: `silkui#ready` until the app module has run, and `silkui#settle` for the
 microtasks after a dispatch, so a React commit lands in the same frame as its event.
-JavaScript never calls into the loop; the one export, `silkui_markdown`, is pure.
+JavaScript never calls into the loop; the two exports, `silkui_markdown` and `silkui_svg_measure`, are pure.
 
 The attribute and event-string helpers are shared with the native host in
 [../calls](../calls) (`ui-js-calls`), so both hosts accept the same attributes.

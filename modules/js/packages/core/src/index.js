@@ -555,7 +555,18 @@ export class Node {
   #want(kind) {
     const list = this.#listeners?.get(TYPES[kind]);
     const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
-    const flags = (wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind)) | this.#kept;
+    const flags = (wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind)) | this.#kept | (this._extra ?? 0);
+    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+  }
+
+  /** Listens again for every kind its listeners, kept kinds and `_extra` flags ask for. */
+  _relisten() {
+    let flags = this.#kept | (this._extra ?? 0);
+    for (const [type, list] of this.#listeners ?? []) {
+      const kind = KIND_OF.get(type);
+      if (kind !== undefined && list.length > 0) flags |= 1 << kind;
+    }
+    if (this._href) flags |= 1 << CLICK;
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
   }
 
@@ -1029,10 +1040,12 @@ const svgChildren = {
     if (before === child) return child;
     for (let at = this; at; at = at.parentNode) if (at === child) throw new Error("a node cannot be inserted into itself or its own subtree");
     const old = child.parentNode;
+    const listening = shapeListeners(child);
     if (old) {
       liveOwner(old)?._removed(child);
       svgChanged(old);
       old.childNodes.splice(old.childNodes.indexOf(child), 1);
+      if (listening) svgOwner(old)?._listenShapes();
     }
     child.parentNode = this;
     if (before) this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
@@ -1040,6 +1053,7 @@ const svgChildren = {
     if (child instanceof Text) child._svgText = true;
     liveOwner(this)?._inserted(child, this, before);
     svgChanged(this);
+    if (listening) svgOwner(this)?._listenShapes();
     return child;
   },
   appendChild(child) {
@@ -1054,6 +1068,7 @@ const svgChildren = {
     svgChanged(this);
     this.childNodes.splice(this.childNodes.indexOf(child), 1);
     child.parentNode = null;
+    if (shapeListeners(child)) svgOwner(this)?._listenShapes();
     return child;
   },
   get textContent() {
@@ -1074,6 +1089,34 @@ const svgChildren = {
     return markup;
   },
 };
+
+// `element` and what is inside it as `__ui.svgMeasure` reads them (ui-tree `live_svg.measure`):
+// records split by U+001E, each the parent's record number, the tag, then name/value pairs.
+function svgPacked(element) {
+  const records = [];
+  const visit = (at, parent) => {
+    const number = records.length + 1;
+    let record = parent + "\x1f" + at.localName;
+    for (const [name, value] of at._attributes()) record += "\x1f" + name + "\x1f" + value;
+    records.push(record);
+    for (const child of at.childNodes) if (child instanceof SvgElement) visit(child, number);
+  };
+  visit(element, 0);
+  return records.join("\x1e");
+}
+
+function svgBox(element) {
+  const [x, y, width, height] = native.svgMeasure(0, svgPacked(element), 0).split(" ").map(Number);
+  const Rect = globalThis.DOMRect;
+  return Rect ? new Rect(x, y, width, height) : { x, y, width, height };
+}
+
+// Whether `element` or an element inside it has listeners.
+function shapeListeners(element) {
+  if (!(element instanceof SvgElement)) return false;
+  for (const list of element._listeners?.values() ?? []) if (list.length > 0) return true;
+  return element.childNodes.some(shapeListeners);
+}
 
 function quietAncestor(element) {
   for (let at = element; at && at instanceof SvgElement; at = at.parentNode) if (QUIET_TAGS.has(at.localName)) return true;
@@ -1282,11 +1325,67 @@ export class SvgElement {
     this.remove();
   }
 
-  addEventListener(type) {
-    warnOnce("an element inside an <svg> hears no events: listen on the <svg> ('" + type + "')");
+  /**
+   * Hears pointer events on this element's shapes, as on the web: its `<svg>` turns live (see
+   * `Svg`) and the tree tells which shape is under the pointer.
+   */
+  addEventListener(type, listener, options) {
+    if (listener == null) return;
+    const capture = options === true || !!options?.capture;
+    this._listeners ??= new Map();
+    let list = this._listeners.get(type);
+    if (!list) this._listeners.set(type, (list = []));
+    if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
+    list.push({ listener, capture, once: !!options?.once });
+    svgOwner(this)?._listenShapes();
   }
 
-  removeEventListener() {}
+  removeEventListener(type, listener, options) {
+    const list = this._listeners?.get(type);
+    if (!list) return;
+    const capture = options === true || !!options?.capture;
+    const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
+    if (index < 0) return;
+    list.splice(index, 1);
+    svgOwner(this)?._listenShapes();
+  }
+
+  dispatchEvent(event) {
+    if (typeof event?.type !== "string") throw new TypeError("dispatchEvent takes an Event");
+    return dispatchEvent(adopt(event, this));
+  }
+
+  /** The box of its geometry in its own user space: a shape's fill, a group's children. */
+  getBBox() {
+    return svgBox(this);
+  }
+
+  /** The length of a shape's outline in user units. */
+  getTotalLength() {
+    return Number(native.svgMeasure(1, svgPacked(this), 0));
+  }
+
+  /** The point `distance` along a shape's outline, clamped to its ends. */
+  getPointAtLength(distance) {
+    const [x, y] = native.svgMeasure(2, svgPacked(this), Number(distance) || 0).split(" ").map(Number);
+    return { x, y };
+  }
+
+  _run(event, capture) {
+    const list = this._listeners?.get(event.type);
+    if (!list) return;
+    for (const entry of list.slice()) {
+      if (event._immediate) return;
+      if (entry.capture !== capture) continue;
+      if (entry.once) this.removeEventListener(event.type, entry.listener, entry.capture);
+      try {
+        if (typeof entry.listener === "function") entry.listener.call(this, event);
+        else entry.listener.handleEvent(event);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
 
   _markup() {
     let markup = "<" + this.localName;
@@ -1367,6 +1466,15 @@ export class Svg extends Node {
     return this.getAttribute(name);
   }
 
+  /** The box of what it draws, in its user space (inside `viewBox`). */
+  getBBox() {
+    return svgBox(this);
+  }
+
+  _attributes() {
+    return this.#attributes;
+  }
+
   _written(name, text) {
     if (!this._live) svgChanged(this);
     else if (text !== null && !liveAttribute(name, text)) this._leave();
@@ -1435,6 +1543,10 @@ export class Svg extends Node {
 
   _draw() {
     if (!nodes.has(this.nodeId) || this._live) return;
+    if (this._extra && this.childNodes.every((child) => liveable(child))) {
+      this._goLive();
+      return;
+    }
     const markup = this.outerHTML;
     if (markup === this.#markup) return;
     if (this.#markup && this.childNodes.every((child) => liveable(child))) {
@@ -1450,6 +1562,117 @@ export class Svg extends Node {
     if (this.#markup) dropIcon(this.#markup);
     this.#markup = "";
   }
+
+  /**
+   * Listens for what the listeners on its elements need. Elements are told apart only once
+   * the svg is live, so listeners make it go live.
+   */
+  _listenShapes() {
+    let types = new Set();
+    const visit = (element) => {
+      for (const [type, list] of element._listeners ?? []) if (list.length > 0) types.add(type);
+      for (const child of element.childNodes) if (child instanceof SvgElement) visit(child);
+    };
+    for (const child of this.childNodes) if (child instanceof SvgElement) visit(child);
+    let extra = 0;
+    for (const type of types) {
+      const kind = KIND_OF.get(type);
+      if (kind === undefined) continue;
+      extra |= 1 << kind;
+      if (HOVER_TYPES.has(type)) extra |= HOVER_FLAGS;
+    }
+    if (extra === (this._extra ?? 0)) return;
+    this._extra = extra;
+    this._relisten();
+    if (extra && !this._live) svgChanged(this);
+  }
+
+  /** The element numbered `n`, or null. */
+  _numbered(n) {
+    if (!n) return null;
+    const find = (element) => {
+      if (element._n === n) return element;
+      for (const child of element.childNodes) {
+        if (child instanceof SvgElement) {
+          const found = find(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+    for (const child of this.childNodes) {
+      if (child instanceof SvgElement) {
+        const found = find(child);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Sends a pointer record that came to the svg to the element under the pointer, with the
+   * over, out, enter and leave events the web sends as the pointer moves between elements.
+   */
+  _pointer(event) {
+    const type = event.type;
+    const leaving = type === "pointerout" || type === "pointerleave" || type === "pointercancel";
+    const shape = leaving ? null : this._numbered(event._element);
+    const old = this._hovered && this._hovered.parentNode && svgOwner(this._hovered) === this ? this._hovered : null;
+    let replaced = false;
+    if (shape !== old && type !== "pointerenter" && type !== "pointerleave") {
+      this._hovered = shape;
+      if (old) {
+        dispatchEvent(pointerCopy("pointerout", old, event));
+        for (let at = old; at instanceof SvgElement && !at.contains(shape); at = at.parentNode) {
+          dispatchEvent(pointerCopy("pointerleave", at, event));
+        }
+        if (type === "pointerout") replaced = true;
+      }
+      if (shape) {
+        dispatchEvent(pointerCopy("pointerover", shape, event));
+        if (type === "pointerover") {
+          replaced = true;
+          this._entering = true;
+        } else {
+          enterChain(shape, old, event);
+        }
+      }
+    }
+    if (replaced) return false;
+    if (type === "pointerenter") {
+      dispatchEvent(event);
+      if (this._entering && this._hovered) enterChain(this._hovered, null, event);
+      this._entering = false;
+      return event.defaultPrevented;
+    }
+    if (shape && type !== "pointerleave") event.target = shape;
+    dispatchEvent(event);
+    return event.defaultPrevented;
+  }
+}
+
+// Element listeners for these need the svg's moves, enters and leaves to tell hovering apart.
+const HOVER_TYPES = new Set(["pointerover", "pointerout", "pointerenter", "pointerleave"]);
+const HOVER_FLAGS = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 28) | (1 << 29);
+
+// A pointer event like `base` of type `type` at `target`.
+function pointerCopy(type, target, base) {
+  const event = new Event(type, target);
+  for (const key of Object.keys(base)) {
+    if (!(key in event) || key === "clientX" || key === "clientY" || key === "x" || key === "y") event[key] = base[key];
+  }
+  event.type = type;
+  event.target = target;
+  event.bubbles = !NO_BUBBLE.has(type);
+  event.cancelable = CANCELABLE.has(type);
+  return event;
+}
+
+// pointerenter at `shape` and its element ancestors not containing `from`, outermost first.
+function enterChain(shape, from, base) {
+  const chain = [];
+  for (let at = shape; at instanceof SvgElement && !(from && at.contains(from)); at = at.parentNode) chain.push(at);
+  for (let i = chain.length - 1; i >= 0; i--) dispatchEvent(pointerCopy("pointerenter", chain[i], base));
 }
 
 for (const name of ["insertBefore", "appendChild", "append", "removeChild"]) Svg.prototype[name] = svgChildren[name];
@@ -1902,7 +2125,8 @@ function isPointerKind(kind) {
 // spec defaults for what no host reports: pressure 0.5 while a button is down, 0 otherwise, and
 // a contact of 1 by 1 pixel with no tilt.
 function fillPointer(event, kind, bits, d) {
-  const pointerId = Math.floor(bits / 256);
+  const pointerId = Math.floor(bits / 256) % 16777216;
+  event._element = Math.floor(bits / 4294967296);
   const pointerType = POINTER_TYPES[Math.floor(bits / 16) % 4] ?? "mouse";
   const isPrimary = Math.floor(bits / 64) % 2 === 1;
   let pointer = pointers.get(pointerId);
@@ -2043,6 +2267,11 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (!target) return false;
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
+  if (target instanceof Svg && target._live && isPointerKind(kind)) {
+    const prevented = target._pointer(event);
+    if (kind === CLICK && !prevented) follow(target);
+    return prevented;
+  }
   dispatchEvent(event);
   if (kind === CLICK && !event.defaultPrevented) follow(target);
   return event.defaultPrevented;
