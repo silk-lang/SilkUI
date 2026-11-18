@@ -11,7 +11,8 @@
 //! (see `edit`); here an input is one atomic piece of the document.
 import engine { UiTree }
 import node { NONE, NO_INDEX }
-import mutation { NodeKind, Role, Position, Direction }
+import mutation { NodeKind, Role, Position, Direction, LISTEN_SELECTION_CHANGE }
+import node { Event, EventKind }
 import ui_protocol.request { HostRequest }
 import paint { borderBox }
 import style { SELECT_NONE, SELECT_ALL, SELECT_CONTAIN }
@@ -101,6 +102,12 @@ pub struct TextSelection {
   /// Whether the pointer of the press under way is past the edge of what it selects in, so
   /// frames scroll there.
   pub scrolling: bool,
+  /// Counts changes of the ends; `report` queues a `selectionchange` when it moved past
+  /// `reported`.
+  pub changes: u64,
+  reported: u64,
+  /// The node a press started a new selection in, for `selectstart`, or NONE.
+  startedAt: u32,
 }
 
 impl TextSelection {
@@ -117,6 +124,9 @@ impl TextSelection {
       preferredX: 0.0,
       hasPreferredX: false,
       scrolling: false,
+      changes: 0,
+      reported: 0,
+      startedAt: NONE,
     }
   }
 
@@ -750,6 +760,7 @@ pub effect fn select(tree: &mut UiTree<'_>, anchor: Point, focus: Point) -> ()
   s.anchor = anchor
   s.focus = focus
   s.moved = true
+  s.changes = s.changes + 1
   run refresh(&mut tree)
 }
 
@@ -829,6 +840,7 @@ pub effect fn pointerDown(
   tree.textSelection.unit = unit
   tree.textSelection.pressStart = start
   tree.textSelection.pressEnd = end
+  tree.textSelection.startedAt = point.slot
   run select(&mut tree, start, end)
 }
 
@@ -906,6 +918,9 @@ pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
       focus = Point.none()
       tree.textSelection.unit = UNIT_NONE
     }
+  }
+  if !anchor.same(tree.textSelection.anchor) || !focus.same(tree.textSelection.focus) {
+    tree.textSelection.changes = tree.textSelection.changes + 1
   }
   tree.textSelection.anchor = anchor
   tree.textSelection.focus = focus
@@ -1671,4 +1686,76 @@ pub effect fn autoscroll(tree: &mut UiTree<'_>) -> bool
   let moved = run interact.scrollChain(&mut tree, from, stepX, stepY)
   run pointerDrag(&mut tree, x, y)
   return moved
+}
+
+// Events and DOM offsets.
+
+/// What a `SelectionChange` record's `selectionStart` says when it targets a node that is not
+/// an input: a press started a new selection there (`selectstart`). Otherwise the record targets
+/// the root, for the document's `selectionchange`.
+pub const SELECT_START: usize = 1
+
+fn listens(tree: &UiTree<'_>, slot: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if u32.bitAnd(tree.node(at).listeners, LISTEN_SELECTION_CHANGE) != 0 { return true }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// Queues `selectstart` for a press that started a selection, and the document's
+/// `selectionchange` when the ends moved since the last one, for listeners. Runs after each
+/// input and batch, as `edit.reportSelection` does for inputs.
+pub effect fn report(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let started = tree.textSelection.startedAt
+  tree.textSelection.startedAt = NONE
+  if started != NONE && u32.toUsize(started) < tree.nodes.length() && listens(&tree.*, started) {
+    let mut path = List<u32>.make()
+    run tree.pathTo(started, &mut path)
+    let id = tree.node(started).id
+    let mut event = Event.make(EventKind.SelectionChange, id, move path)
+    event.selectionStart = SELECT_START
+    run tree.queueEvent(move event)
+  }
+  if tree.textSelection.changes == tree.textSelection.reported { return () }
+  tree.textSelection.reported = tree.textSelection.changes
+  let root = tree.root
+  if root == NONE || u32.bitAnd(tree.node(root).listeners, LISTEN_SELECTION_CHANGE) == 0 { return () }
+  let mut path = List<u32>.make()
+  run tree.pathTo(root, &mut path)
+  let id = tree.node(root).id
+  run tree.queueEvent(Event.make(EventKind.SelectionChange, id, move path))
+}
+
+/// The DOM offset of `point`: UTF-16 units in text, a child index in an element.
+pub fn domOffset(tree: &UiTree<'_>, point: Point) -> usize {
+  if !isText(tree, point.slot) { return point.offset }
+  return cssom_view.utf16AtByte(String.view(&tree.node(point.slot).text), point.offset)
+}
+
+/// The point at DOM offset `offset` of node `id`, clamped to the node; none for an unknown id.
+pub fn fromDom(tree: &UiTree<'_>, id: u32, offset: usize) -> Point {
+  let slot = tree.slotOf(id)
+  if slot == NONE { return Point.none() }
+  if isText(tree, slot) {
+    return at(tree, slot, cssom_view.byteAtUtf16(String.view(&tree.node(slot).text), offset, false))
+  }
+  let count = childCount(tree, slot)
+  return at(tree, slot, if offset > count { count } else { offset })
+}
+
+/// `point` as a point in text: itself in a text node, else the start of the first selectable
+/// text after it (`start`) or the end of the last one before it. None when there is none.
+pub fn textPoint(tree: &UiTree<'_>, point: Point, start: bool) -> Point {
+  if !point.exists() || isText(tree, point.slot) { return point }
+  let child = childAt(tree, point.slot, point.offset)
+  if start {
+    let found = if child != NONE { textFrom(tree, child) } else { textFrom(tree, afterSubtree(tree, point.slot)) }
+    return if found == NONE { Point.none() } else { at(tree, found, 0) }
+  }
+  let found = if child != NONE { textBefore(tree, child) } else { textBeforeEnd(tree, point.slot) }
+  return if found == NONE { Point.none() } else { at(tree, found, textLength(tree, found)) }
 }

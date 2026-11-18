@@ -243,6 +243,43 @@ export class Range extends AbstractRange {
 export function createRange(): Range;
 
 /**
+ * The document's selection, which the tree keeps (presses, drags, keys) and scripts can read
+ * and change. Its ranges are live, in tree order: one, or one per piece seen when the
+ * selection crosses children that layout reorders.
+ */
+export class Selection {
+  private constructor();
+  readonly anchorNode: Node | null;
+  readonly anchorOffset: number;
+  readonly focusNode: Node | null;
+  readonly focusOffset: number;
+  readonly isCollapsed: boolean;
+  readonly rangeCount: number;
+  readonly type: "None" | "Caret" | "Range";
+  readonly direction: "forward" | "backward" | "none";
+  getRangeAt(index: number): Range;
+  addRange(range: Range): void;
+  removeRange(range: Range): void;
+  removeAllRanges(): void;
+  empty(): void;
+  collapse(node: Node | null, offset?: number): void;
+  setPosition(node: Node | null, offset?: number): void;
+  collapseToStart(): void;
+  collapseToEnd(): void;
+  extend(node: Node, offset?: number): void;
+  setBaseAndExtent(anchorNode: Node, anchorOffset: number, focusNode: Node, focusOffset: number): void;
+  selectAllChildren(node: Node): void;
+  deleteFromDocument(): void;
+  containsNode(node: Node, allowPartialContainment?: boolean): boolean;
+  getComposedRanges(): StaticRange[];
+  /** The selected text as copying gives it. */
+  toString(): string;
+}
+
+/** The document's selection. Also installed as `globalThis.getSelection`. */
+export function getSelection(): Selection;
+
+/**
  * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
  * string indices, as on the web.
  */

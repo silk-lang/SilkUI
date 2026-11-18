@@ -28,6 +28,7 @@ import generated_web_apis { webApis }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
 import ui_tree.computed_style
 import ui_tree.cssom_view
+import ui_tree.text_selection
 import ui_tree.cssom_view { BoundaryPoint, Range }
 import ui_tree.node { NONE }
 import ui_tree.observers { Observers, Margin }
@@ -165,6 +166,15 @@ pub const HIT: u32 = 168851 // nativeId(b"hit")
 pub const HITS: u32 = 122697 // nativeId(b"hits")
 pub const CARET: u32 = 125073 // nativeId(b"caret")
 pub const RANGE_RECTS: u32 = 444035 // nativeId(b"rangeRects")
+/// The document's text selection. `selection()` applies the pending batch and leaves anchor
+/// id, offset, focus id, offset, then each stretch's start id, offset, end id, offset (see
+/// `text_selection.stretches`) for `__ui.geometry`, and answers how many stretches (0 for none).
+/// Offsets are DOM offsets: UTF-16 units in text. `setSelection(anchorId, anchorOffset, focusId,
+/// focusOffset)` selects (id 0 clears) and answers whether both nodes were found.
+/// `selectionText()` is the selection's text as copying gives it.
+pub const SELECTION: u32 = 1110422 // nativeId(b"selection")
+pub const SET_SELECTION: u32 = 975202 // nativeId(b"setSelection")
+pub const SELECTION_TEXT: u32 = 266335 // nativeId(b"selectionText")
 /// `__ui.geometry(index)`: number `index` of the last layout read.
 pub const GEOMETRY: u32 = 576810 // nativeId(b"geometry")
 /// `__ui.scrollIntoView(id, block, inline, behavior, ifNeeded)`: scrolls every scroll container
@@ -554,6 +564,9 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"cpus", arity: 0 },
     Native { name: b"timer", arity: 2 },
     Native { name: b"webApis", arity: 0 },
+    Native { name: b"selection", arity: 0 },
+    Native { name: b"setSelection", arity: 4 },
+    Native { name: b"selectionText", arity: 0 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
   return Option<Native>.none()
@@ -807,8 +820,11 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     bridge.observers.unobserve(idOf(number(argv.get(0).view())), idOf(number(argv.get(1).view())))
     return Outcome.Returned { value: ValueBits.Undefined }
   } else if function == RECT || function == RECTS || function == METRICS || function == HIT || function == HITS
-    || function == CARET || function == RANGE_RECTS || function == SCROLL_INTO_VIEW || function == SCROLL {
+    || function == CARET || function == RANGE_RECTS || function == SCROLL_INTO_VIEW || function == SCROLL
+    || function == SELECTION || function == SET_SELECTION {
     return run geometry(&mut bridge.*, function, argv)
+  } else if function == SELECTION_TEXT {
+    return run selectionText(&mut bridge.*)
   } else if function == SUPPORTS {
     let condition = run text(argv.get(0))
     let declared = argv.length() > 1 && argv.get(1).view().isString()
@@ -981,6 +997,41 @@ effect fn measured(batch: &mut Batch, tree: &mut UiTree<'_>, function: u32, args
   ? &mut Allocator {
   if batch.length() != 0 { run tree.apply(run batch.take()) }
   if tree.layoutPending() { run tree.layoutNow() }
+  if function == SELECTION {
+    run text_selection.refresh(&mut tree.*)
+    let anchor = tree.textSelection.anchor
+    let focus = tree.textSelection.focus
+    if !anchor.exists() || !focus.exists() { return 0.0 }
+    run out.append(u32.toF64(anchor.id))
+    run out.append(usize.toF64(text_selection.domOffset(&tree.*, anchor)))
+    run out.append(u32.toF64(focus.id))
+    run out.append(usize.toF64(text_selection.domOffset(&tree.*, focus)))
+    let mut parts = List<text_selection.Stretch>.make()
+    run text_selection.stretches(&tree.*, &mut parts)
+    let items = parts.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run out.append(u32.toF64(items[i].start.id))
+      run out.append(usize.toF64(text_selection.domOffset(&tree.*, items[i].start)))
+      run out.append(u32.toF64(items[i].end.id))
+      run out.append(usize.toF64(text_selection.domOffset(&tree.*, items[i].end)))
+      i = i + 1
+    }
+    return usize.toF64(items.length)
+  }
+  if function == SET_SELECTION {
+    let anchorId = idOf(args[0])
+    if anchorId == 0 {
+      run text_selection.clear(&mut tree.*)
+      return 1.0
+    }
+    let anchor = text_selection.fromDom(&tree.*, anchorId, f64.toUsize(args[1]))
+    let focus = text_selection.fromDom(&tree.*, idOf(args[2]), f64.toUsize(args[3]))
+    if !anchor.exists() || !focus.exists() { return 0.0 }
+    tree.textSelection.unit = text_selection.UNIT_NONE
+    run text_selection.select(&mut tree.*, anchor, focus)
+    return 1.0
+  }
   if function == RECT {
     let rect = run cssom_view.getBoundingClientRect(&tree.*, idOf(args[0]))
     run out.append(rect.x)
@@ -1104,6 +1155,43 @@ effect fn computed<'v>(bridge: &mut Bridge, id: u32, name: ValueRef<'v>) -> Outc
     Result.Success { value: text } => Outcome.Returned { value: text }
     Result.Failure { .. } => { fail OutOfMemoryError {} }
   }
+}
+
+/// `__ui.selectionText`: the document selection's text as copying gives it.
+effect fn selectionText(bridge: &mut Bridge) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.Undefined } }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  let read = run Effect.result(selectedText(&mut bridge.batch, &mut tree))
+  let text = match move read {
+    Result<String, TreeError | OutOfMemoryError>.Success { value } => move value
+    Result<String, TreeError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      TreeError invalid => {
+        drop invalid
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree refused a mutation before reading the selection")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  }
+  let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&text))))
+  return match move made {
+    Result.Success { value } => Outcome.Returned { value: value }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+effect fn selectedText(batch: &mut Batch, tree: &mut UiTree<'_>) -> String
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  if batch.length() != 0 { run tree.apply(run batch.take()) }
+  if tree.layoutPending() { run tree.layoutNow() }
+  run text_selection.refresh(&mut tree.*)
+  return run text_selection.text(&tree.*)
 }
 
 effect fn applyAndRead(batch: &mut Batch, tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool

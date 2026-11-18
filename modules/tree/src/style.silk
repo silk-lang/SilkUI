@@ -18,7 +18,7 @@ import layout.lib {
   CaptionSide,
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
-import properties.computed { Display }
+import properties.computed { Display, Bounds, EmphasisSide }
 import svg_css.counter_styles
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
 import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle }
@@ -29,6 +29,7 @@ import properties.values { Unit, Separator, MathOperator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
+import css_cursor { cursorOf, textCursor, textHasUrl }
 import anchor_style { AnchorStyle }
 import properties.keywords
 import silk.collections.hash { Hash, HashSeed }
@@ -124,6 +125,9 @@ pub struct Computed {
   /// The CSS `cursor`, when the node sets one other than `auto`. Hovering finds it on the
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
+  /// `cursor` lists images before its keyword, read back from the declaration on hover
+  /// (`css_cursor`).
+  pub cursorUrl: bool,
   pub contain: Containment,
   /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
   pub anchor: AnchorStyle,
@@ -882,9 +886,20 @@ fn setDimension(target: &mut Dimension, value: &Value, context: &Context) -> () 
   }
 }
 
-// A width, height, minimum, maximum or flex basis, which also takes `min(100%, 600px)`.
-fn setSize(target: &mut SizeValue, value: &Value, context: &Context) -> () {
-  match convert.size(value, context) {
+// A width, height, minimum, maximum or flex basis, which also takes `min(100%, 600px)` and
+// `clamp(200px, 50% + 2rem, 800px)`, whose bounds go in `bounds`.
+fn setSize(target: &mut SizeValue, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.sizeIn(value, context, &mut bounds.*) {
+    Option.Some { value: found } => {
+      target.* = found
+    }
+    Option.None => {}
+  }
+}
+
+// A margin, padding or inset, which also takes `clamp(1rem, 5%, 3rem)` (see `setSize`).
+fn setEdge(target: &mut Dimension, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.edge(value, context, &mut bounds.*) {
     Option.Some { value: found } => {
       target.* = found
     }
@@ -900,8 +915,8 @@ fn spacingOf(value: &Value, context: &Context) -> f32 {
   }
 }
 
-fn setGap(target: &mut Dimension, value: &Value, context: &Context) -> () {
-  match convert.dimension(value, context) {
+fn setGap(target: &mut Dimension, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.edge(value, context, &mut bounds.*) {
     Option.Some { value: found } => {
       target.* = if found.kind == DimensionKind.Auto || found.kind == DimensionKind.None {
         Dimension.keyword(DimensionKind.Normal)
@@ -1046,6 +1061,7 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
       CssProperty.WritingMode | CssProperty.Direction | CssProperty.TextOrientation
         | CssProperty.ContainerName | CssProperty.Container
         | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontVariationSettings | CssProperty.FontWidth | CssProperty.FontStretch
+        | CssProperty.FontPalette | CssProperty.FontVariantAlternates | CssProperty.FontSizeAdjust | CssProperty.FontSmooth
         | CssProperty.FontVariantLigatures | CssProperty.FontVariantCaps | CssProperty.FontVariantNumeric
         | CssProperty.FontVariantPosition | CssProperty.FontKerning
         | CssProperty.Transform | CssProperty.Translate | CssProperty.Rotate | CssProperty.Scale
@@ -1187,6 +1203,7 @@ impl Computed {
       columnRule: ColumnRule.initial(),
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
+      cursorUrl: false,
       contain: Containment.initial(),
       list: ListStyle.initial(),
       anchor: AnchorStyle.none(),
@@ -1375,12 +1392,29 @@ impl Computed {
       }
       // Sizes and edges.
       CssProperty.Cursor => {
+        self.cursorUrl = false
         match &value.* {
           Value.Keyword { value: word } => {
             self.cursor = cursorOf(keywords.name(word))
           }
           Value.Text { css } => {
-            self.cursor = cursorOf(Bytes.asSlice(&css))
+            self.cursor = textCursor(Bytes.asSlice(&css))
+            self.cursorUrl = textHasUrl(Bytes.asSlice(&css))
+          }
+          Value.Sequence { values, .. } => {
+            // `url(...) x y, ..., keyword`: the images are read back on hover.
+            self.cursorUrl = true
+            let list = values.asSlice()
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
+            if list.length > 0 {
+              if let Value.Keyword { value: word } = &list[list.length - 1] {
+                self.cursor = cursorOf(keywords.name(word))
+              }
+            }
+          }
+          Value.Function { .. } => {
+            self.cursorUrl = true
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
           }
           _ => {}
         }
@@ -1643,76 +1677,76 @@ impl Computed {
         setScrollPadding(&mut self.scroll.padding.left, value, &context)
       }
       CssProperty.Width => {
-        if !self.anchor.setSize(true, value) { setSize(&mut self.layout.width, value, &context) }
+        if !self.anchor.setSize(true, value) { setSize(&mut self.layout.width, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.Height => {
-        if !self.anchor.setSize(false, value) { setSize(&mut self.layout.height, value, &context) }
+        if !self.anchor.setSize(false, value) { setSize(&mut self.layout.height, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.MinWidth => {
-        setSize(&mut self.layout.minWidth, value, &context)
+        setSize(&mut self.layout.minWidth, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MinHeight => {
-        setSize(&mut self.layout.minHeight, value, &context)
+        setSize(&mut self.layout.minHeight, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MaxWidth => {
-        setSize(&mut self.layout.maxWidth, value, &context)
+        setSize(&mut self.layout.maxWidth, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MaxHeight => {
-        setSize(&mut self.layout.maxHeight, value, &context)
+        setSize(&mut self.layout.maxHeight, &mut self.layout.bounds, value, &context)
       }
       CssProperty.FlexBasis => {
-        setSize(&mut self.layout.flexBasis, value, &context)
+        setSize(&mut self.layout.flexBasis, &mut self.layout.bounds, value, &context)
       }
       CssProperty.RowGap => {
-        setGap(&mut self.layout.rowGap, value, &context)
+        setGap(&mut self.layout.rowGap, &mut self.layout.bounds, value, &context)
       }
       CssProperty.ColumnGap => {
-        setGap(&mut self.layout.columnGap, value, &context)
+        setGap(&mut self.layout.columnGap, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MarginTop => {
-        setDimension(&mut self.layout.margin.top, value, &context)
+        setEdge(&mut self.layout.margin.top, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingTop => {
-        setDimension(&mut self.layout.padding.top, value, &context)
+        setEdge(&mut self.layout.padding.top, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Top => {
-        if self.anchor.setEdge(0, value) { self.layout.inset.top = Dimension.auto() } else { setDimension(&mut self.layout.inset.top, value, &context) }
+        if self.anchor.setEdge(0, value) { self.layout.inset.top = Dimension.auto() } else { setEdge(&mut self.layout.inset.top, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderTopWidth => {
         setBorderWidth(&mut self.paint.border.top, value, &context)
       }
       CssProperty.MarginRight => {
-        setDimension(&mut self.layout.margin.right, value, &context)
+        setEdge(&mut self.layout.margin.right, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingRight => {
-        setDimension(&mut self.layout.padding.right, value, &context)
+        setEdge(&mut self.layout.padding.right, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Right => {
-        if self.anchor.setEdge(1, value) { self.layout.inset.right = Dimension.auto() } else { setDimension(&mut self.layout.inset.right, value, &context) }
+        if self.anchor.setEdge(1, value) { self.layout.inset.right = Dimension.auto() } else { setEdge(&mut self.layout.inset.right, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderRightWidth => {
         setBorderWidth(&mut self.paint.border.right, value, &context)
       }
       CssProperty.MarginBottom => {
-        setDimension(&mut self.layout.margin.bottom, value, &context)
+        setEdge(&mut self.layout.margin.bottom, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingBottom => {
-        setDimension(&mut self.layout.padding.bottom, value, &context)
+        setEdge(&mut self.layout.padding.bottom, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Bottom => {
-        if self.anchor.setEdge(2, value) { self.layout.inset.bottom = Dimension.auto() } else { setDimension(&mut self.layout.inset.bottom, value, &context) }
+        if self.anchor.setEdge(2, value) { self.layout.inset.bottom = Dimension.auto() } else { setEdge(&mut self.layout.inset.bottom, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderBottomWidth => {
         setBorderWidth(&mut self.paint.border.bottom, value, &context)
       }
       CssProperty.MarginLeft => {
-        setDimension(&mut self.layout.margin.left, value, &context)
+        setEdge(&mut self.layout.margin.left, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingLeft => {
-        setDimension(&mut self.layout.padding.left, value, &context)
+        setEdge(&mut self.layout.padding.left, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Left => {
-        if self.anchor.setEdge(3, value) { self.layout.inset.left = Dimension.auto() } else { setDimension(&mut self.layout.inset.left, value, &context) }
+        if self.anchor.setEdge(3, value) { self.layout.inset.left = Dimension.auto() } else { setEdge(&mut self.layout.inset.left, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderLeftWidth => {
         setBorderWidth(&mut self.paint.border.left, value, &context)
@@ -2237,6 +2271,31 @@ impl Computed {
           Option.None => {}
         }
       }
+      CssProperty.TextBox => {
+        match convert.textBox(value) {
+          Option.Some { value: found } => {
+            self.layout.textBoxTrim = found.trim
+            self.text.textBoxEdge = found.edge
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextBoxTrim => {
+        match convert.textBoxTrim(value) {
+          Option.Some { value: found } => {
+            self.layout.textBoxTrim = found
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextBoxEdge => {
+        match convert.textBoxEdge(value) {
+          Option.Some { value: found } => {
+            self.text.textBoxEdge = found
+          }
+          Option.None => {}
+        }
+      }
       CssProperty.TextIndent => {
         match convert.textIndent(value, &context) {
           Option.Some { value: found } => {
@@ -2676,6 +2735,26 @@ impl Computed {
       CssProperty.SilkSelectionColor => {
         drop setColor(&mut self.text.selectionColor, value)
       }
+      CssProperty.TextEmphasisStyle => {
+        match convert.textEmphasisStyle(value) {
+          Option.Some { value: found } => { self.text.emphasis.mark = found }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextEmphasisColor => {
+        let mut mark = self.text.color
+        let given = !convert.isKeyword(value, Keyword.Currentcolor) && setColor(&mut mark, value)
+        self.text.emphasis.color = if given { TextStyle.packFill(mark) } else { 0 }
+      }
+      CssProperty.TextEmphasisPosition => {
+        match convert.textEmphasisPosition(value) {
+          Option.Some { value: found } => {
+            self.text.emphasis.under = found.under
+            self.text.emphasis.left = found.left
+          }
+          Option.None => {}
+        }
+      }
       CssProperty.WebkitTextFillColor => {
         let mut fill = self.text.color
         let given = !convert.isKeyword(value, Keyword.Currentcolor) && setColor(&mut fill, value)
@@ -2814,6 +2893,14 @@ impl Computed {
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
     if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
+    // font-palette and font-smooth only change paint; the other extras change layout too.
+    if self.text.features.extras != 0 { h = Hash.combine(h, u32.toU64(self.text.features.extras)) }
+    if self.text.emphasis.mark != 0 {
+      h = Hash.combine(Hash.combine(h, u32.toU64(self.text.emphasis.mark)), u32.toU64(self.text.emphasis.color))
+      let side: u64 = if self.text.emphasis.under { 1 } else { 0 }
+      let edge: u64 = if self.text.emphasis.left { 2 } else { 0 }
+      h = Hash.combine(h, side + edge)
+    }
     if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
     if self.contain.layout() { h = Hash.combine(h, 6) }
     if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
@@ -2858,59 +2945,15 @@ impl Computed {
     self.layout.whiteSpaceCollapse = text.whiteSpaceCollapse
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
+    self.layout.textBoxEdge = text.textBoxEdge
+    // Vertical lines put `right` marks on their over side, horizontal ones `over` marks.
+    let vertical = text.writingMode != WritingMode.HorizontalTb
+    let under = if vertical { text.emphasis.left } else { text.emphasis.under }
+    self.layout.emphasis = if text.emphasis.mark == 0 { EmphasisSide.None } else if under { EmphasisSide.Under } else { EmphasisSide.Over }
     self.layout.tabSize = text.tabSize
     self.layout.orphans = u32.toUsize(text.orphans)
     self.layout.widows = u32.toUsize(text.widows)
   }
-}
-
-fn named(name: &[u8], word: &[u8]) -> bool {
-  if name.length != word.length { return false }
-  let mut i: usize = 0
-  while i < name.length {
-    let byte = if name[i] >= 65 && name[i] <= 90 { name[i] + 32 } else { name[i] }
-    if byte != word[i] { return false }
-    i = i + 1
-  }
-  return true
-}
-
-/// The tree's cursor for a CSS `cursor` keyword; None for `auto`. Keywords without a cursor
-/// of their own take the nearest one.
-pub fn cursorOf(name: &[u8]) -> Option<Cursor> {
-  if named(name, b"auto") { return Option<Cursor>.None }
-  if named(name, b"pointer") { return Option<Cursor>.Some { value: Cursor.Pointer } }
-  if named(name, b"text") { return Option<Cursor>.Some { value: Cursor.Text } }
-  if named(name, b"none") { return Option<Cursor>.Some { value: Cursor.None } }
-  if named(name, b"wait") { return Option<Cursor>.Some { value: Cursor.Wait } }
-  if named(name, b"progress") { return Option<Cursor>.Some { value: Cursor.Progress } }
-  if named(name, b"help") { return Option<Cursor>.Some { value: Cursor.Help } }
-  if named(name, b"context-menu") { return Option<Cursor>.Some { value: Cursor.ContextMenu } }
-  if named(name, b"copy") { return Option<Cursor>.Some { value: Cursor.Copy } }
-  if named(name, b"alias") { return Option<Cursor>.Some { value: Cursor.Alias } }
-  if named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.VerticalText } }
-  if named(name, b"col-resize") { return Option<Cursor>.Some { value: Cursor.ColumnResize } }
-  if named(name, b"row-resize") { return Option<Cursor>.Some { value: Cursor.RowResize } }
-  if named(name, b"zoom-in") { return Option<Cursor>.Some { value: Cursor.ZoomIn } }
-  if named(name, b"zoom-out") { return Option<Cursor>.Some { value: Cursor.ZoomOut } }
-  if named(name, b"move") || named(name, b"all-scroll") { return Option<Cursor>.Some { value: Cursor.Move } }
-  if named(name, b"grab") { return Option<Cursor>.Some { value: Cursor.Grab } }
-  if named(name, b"grabbing") { return Option<Cursor>.Some { value: Cursor.Grabbing } }
-  if named(name, b"not-allowed") || named(name, b"no-drop") { return Option<Cursor>.Some { value: Cursor.NotAllowed } }
-  if named(name, b"ew-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeHorizontal }
-  }
-  if named(name, b"ns-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeVertical }
-  }
-  if named(name, b"nwse-resize") || named(name, b"nw-resize") || named(name, b"se-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthWestSouthEast }
-  }
-  if named(name, b"nesw-resize") || named(name, b"ne-resize") || named(name, b"sw-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthEastSouthWest }
-  }
-  if named(name, b"crosshair") || named(name, b"cell") { return Option<Cursor>.Some { value: Cursor.Crosshair } }
-  return Option<Cursor>.Some { value: Cursor.Default }
 }
 
 fn borderEdges(border: Insets<f32>) -> Edges {

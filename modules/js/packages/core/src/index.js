@@ -36,6 +36,7 @@ function eachLiveRange(update) {
 }
 
 const CLICK = KIND_OF.get("click");
+const SELECTION_CHANGE = KIND_OF.get("selectionchange");
 const TOUCH_START = KIND_OF.get("touchstart");
 // The tree has one listener flag for the four touch kinds.
 const TOUCH_FLAG = 1 << 30;
@@ -47,6 +48,9 @@ const MOUSE_OF = new Map([
   ["pointerleave", "mouseleave"],
 ]);
 const POINTER_OF = new Map([...MOUSE_OF].map(([pointer, mouse]) => [mouse, pointer]));
+// Types the tree reports through another kind's records: `selectstart` comes as a
+// `SelectionChange` record at the node pressed.
+const LISTENS_AS = new Map([...POINTER_OF, ["selectstart", "selectionchange"]]);
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set([
   "pointerenter", "pointerleave", "mouseenter", "mouseleave", "focus", "blur", "scroll", "layout", "load",
@@ -55,7 +59,7 @@ const NO_BUBBLE = new Set([
 // The tree has a default action to skip for these. Touch records say for themselves.
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
-  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout",
+  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -680,7 +684,8 @@ export class Node {
       bit = TOUCH_FLAG;
     } else {
       const type = TYPES[kind];
-      wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href);
+      wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
+        || (kind === SELECTION_CHANGE && has("selectstart"));
       bit = 1 << kind;
     }
     const flags = (wanted ? this.#flags | bit : this.#flags & ~bit) | this.#kept;
@@ -797,7 +802,7 @@ export class Node {
   addEventListener(type, listener, options) {
     const signal = options?.signal;
     if (listener == null || signal?.aborted) return;
-    const kind = KIND_OF.get(POINTER_OF.get(type) ?? type);
+    const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
@@ -815,7 +820,7 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    const kind = KIND_OF.get(POINTER_OF.get(type) ?? type);
+    const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     if (kind !== undefined) this.#want(kind);
   }
 
@@ -2271,11 +2276,14 @@ export class Range extends AbstractRange {
   // The DOM Standard's live range steps, run by the nodes as they change.
 
   _inserted(parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === parent && this._startOffset > index) this._startOffset++;
     if (this._endNode === parent && this._endOffset > index) this._endOffset++;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _removing(child, parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (isInclusiveAncestor(child, this._startNode)) {
       this._startNode = parent;
       this._startOffset = index;
@@ -2286,9 +2294,11 @@ export class Range extends AbstractRange {
     }
     if (this._startNode === parent && this._startOffset > index) this._startOffset--;
     if (this._endNode === parent && this._endOffset > index) this._endOffset--;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _replaced(node, offset, count, added) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === node) {
       if (this._startOffset > offset + count) this._startOffset += added - count;
       else if (this._startOffset > offset) this._startOffset = offset;
@@ -2297,9 +2307,11 @@ export class Range extends AbstractRange {
       if (this._endOffset > offset + count) this._endOffset += added - count;
       else if (this._endOffset > offset) this._endOffset = offset;
     }
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _split(node, rest, offset, parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === node && this._startOffset > offset) {
       this._startNode = rest;
       this._startOffset -= offset;
@@ -2310,9 +2322,11 @@ export class Range extends AbstractRange {
     }
     if (this._startNode === parent && this._startOffset === index + 1) this._startOffset++;
     if (this._endNode === parent && this._endOffset === index + 1) this._endOffset++;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _joined(current, node, length, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === current) {
       this._startNode = node;
       this._startOffset += length;
@@ -2329,6 +2343,7 @@ export class Range extends AbstractRange {
       this._endNode = node;
       this._endOffset = length;
     }
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 }
 
@@ -2345,6 +2360,307 @@ function parentOf(node) {
 /** A new live range, collapsed at the start of the root. */
 export function createRange() {
   return new Range();
+}
+
+// The document's selection. The tree keeps it (presses, drags, keys, select all) and paints
+// it; the one `Selection` reads it from there and tells the tree what scripts change. Its
+// ranges are live Ranges in tree order, one per stretch: a selection across children that
+// layout reorders (flex order, placed grid cells, positioned boxes) has one per piece seen.
+const SELECTION = Symbol("selection");
+let theSelection = null;
+
+function checkOffset(node, offset) {
+  offset = offset >>> 0;
+  if (offset > nodeLength(node)) throw domError("IndexSizeError", "the offset is past the end of the node");
+  return offset;
+}
+
+function inDocument(node) {
+  return rootNode !== null && rootOf(node) === rootNode;
+}
+
+/** The document's selection, as `getSelection()` answers it. */
+export class Selection {
+  #anchor = null;
+  #anchorOffset = 0;
+  #focus = null;
+  #focusOffset = 0;
+  #ranges = [];
+  #backward = false;
+  // Changed by a script and not yet told to the tree.
+  #pending = false;
+
+  constructor(token) {
+    if (token !== SELECTION) throw new TypeError("Illegal constructor");
+  }
+
+  // Reads what the tree has, after telling it what a script changed.
+  #sync() {
+    if (this.#pending) this.#flush();
+    const count = native.selection?.() ?? 0;
+    const anchor = count ? nodes.get(geometry(0)) : null;
+    const focus = count ? nodes.get(geometry(2)) : null;
+    if (!anchor || !focus) {
+      if (this.#anchor) this.#forget();
+      return;
+    }
+    const stretches = [];
+    for (let i = 0; i < count; i++) {
+      const at = 4 + 4 * i;
+      const start = nodes.get(geometry(at));
+      const end = nodes.get(geometry(at + 2));
+      if (start && end) stretches.push([start, geometry(at + 1), end, geometry(at + 3)]);
+    }
+    const same = anchor === this.#anchor && geometry(1) === this.#anchorOffset && focus === this.#focus
+      && geometry(3) === this.#focusOffset && stretches.length === this.#ranges.length
+      && stretches.every(([a, b, c, d], i) => {
+        const range = this.#ranges[i];
+        return range._startNode === a && range._startOffset === b && range._endNode === c && range._endOffset === d;
+      });
+    if (same) return;
+    this.#unhook();
+    this.#anchor = anchor;
+    this.#anchorOffset = geometry(1);
+    this.#focus = focus;
+    this.#focusOffset = geometry(3);
+    this.#backward = comparePoints(anchor, this.#anchorOffset, focus, this.#focusOffset) > 0;
+    this.#ranges = stretches.map(([a, b, c, d]) => {
+      const range = new Range();
+      range._startNode = a;
+      range._startOffset = b;
+      range._endNode = c;
+      range._endOffset = d;
+      return this.#hook(range);
+    });
+  }
+
+  #flush() {
+    this.#pending = false;
+    if (!this.#anchor) native.setSelection?.(0, 0, 0, 0);
+    else native.setSelection?.(this.#anchor.nodeId, this.#anchorOffset, this.#focus.nodeId, this.#focusOffset);
+  }
+
+  #schedule() {
+    if (this.#pending) return;
+    this.#pending = true;
+    queueMicrotask(() => {
+      if (this.#pending) this.#flush();
+    });
+  }
+
+  #hook(range) {
+    range._changed = () => this.#moved(range);
+    return range;
+  }
+
+  #unhook() {
+    for (const range of this.#ranges) delete range._changed;
+  }
+
+  #forget() {
+    this.#unhook();
+    this.#anchor = this.#focus = null;
+    this.#anchorOffset = this.#focusOffset = 0;
+    this.#ranges = [];
+    this.#backward = false;
+  }
+
+  // A script or a mutation moved one of the ranges: the selection becomes that range.
+  #moved(range) {
+    const backward = this.#backward;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = backward ? range._endNode : range._startNode;
+    this.#anchorOffset = backward ? range._endOffset : range._startOffset;
+    this.#focus = backward ? range._startNode : range._endNode;
+    this.#focusOffset = backward ? range._startOffset : range._endOffset;
+    this.#schedule();
+  }
+
+  #set(anchor, anchorOffset, focus, focusOffset) {
+    const range = new Range();
+    const forward = comparePoints(anchor, anchorOffset, focus, focusOffset) <= 0;
+    range._startNode = forward ? anchor : focus;
+    range._startOffset = forward ? anchorOffset : focusOffset;
+    range._endNode = forward ? focus : anchor;
+    range._endOffset = forward ? focusOffset : anchorOffset;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = anchor;
+    this.#anchorOffset = anchorOffset;
+    this.#focus = focus;
+    this.#focusOffset = focusOffset;
+    this.#backward = !forward;
+    this.#schedule();
+  }
+
+  get anchorNode() { this.#sync(); return this.#anchor; }
+  get anchorOffset() { this.#sync(); return this.#anchorOffset; }
+  get focusNode() { this.#sync(); return this.#focus; }
+  get focusOffset() { this.#sync(); return this.#focusOffset; }
+
+  get isCollapsed() {
+    this.#sync();
+    return this.#anchor === this.#focus && this.#anchorOffset === this.#focusOffset;
+  }
+
+  get rangeCount() { this.#sync(); return this.#ranges.length; }
+
+  /** "None", "Caret" (collapsed) or "Range". */
+  get type() {
+    this.#sync();
+    return !this.#anchor ? "None" : this.isCollapsed ? "Caret" : "Range";
+  }
+
+  /** "forward" when the focus comes after the anchor, "backward" before it, "none" when collapsed. */
+  get direction() {
+    this.#sync();
+    if (!this.#anchor || this.isCollapsed) return "none";
+    return this.#backward ? "backward" : "forward";
+  }
+
+  getRangeAt(index) {
+    this.#sync();
+    index = index >>> 0;
+    if (index >= this.#ranges.length) throw domError("IndexSizeError", "the selection has no range " + index);
+    return this.#ranges[index];
+  }
+
+  /** Selects `range`, which then is the selection's own: changing it changes the selection. Does nothing while something is selected. */
+  addRange(range) {
+    if (!(range instanceof Range)) throw new TypeError("addRange takes a Range");
+    this.#sync();
+    if (this.#ranges.length || !inDocument(range._startNode)) return;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = range._startNode;
+    this.#anchorOffset = range._startOffset;
+    this.#focus = range._endNode;
+    this.#focusOffset = range._endOffset;
+    this.#backward = false;
+    this.#schedule();
+  }
+
+  removeRange(range) {
+    this.#sync();
+    if (!this.#ranges.includes(range)) throw domError("NotFoundError", "the range is not in the selection");
+    this.removeAllRanges();
+  }
+
+  removeAllRanges() {
+    if (!this.#anchor && !this.#pending && !this.#ranges.length) {
+      this.#sync();
+      if (!this.#anchor) return;
+    }
+    this.#forget();
+    this.#schedule();
+  }
+
+  empty() { this.removeAllRanges(); }
+
+  /** Puts a caret at (`node`, `offset`); `null` removes the selection. */
+  collapse(node, offset = 0) {
+    if (node === null) return this.removeAllRanges();
+    checkNode(node, "the node");
+    offset = checkOffset(node, offset);
+    if (inDocument(node)) this.#set(node, offset, node, offset);
+  }
+
+  setPosition(node, offset = 0) { return this.collapse(node, offset); }
+
+  collapseToStart() {
+    this.#sync();
+    if (!this.#ranges.length) throw domError("InvalidStateError", "nothing is selected");
+    const first = this.#ranges[0];
+    this.#set(first._startNode, first._startOffset, first._startNode, first._startOffset);
+  }
+
+  collapseToEnd() {
+    this.#sync();
+    if (!this.#ranges.length) throw domError("InvalidStateError", "nothing is selected");
+    const last = this.#ranges[this.#ranges.length - 1];
+    this.#set(last._endNode, last._endOffset, last._endNode, last._endOffset);
+  }
+
+  /** Moves the focus to (`node`, `offset`); the anchor stays. */
+  extend(node, offset = 0) {
+    checkNode(node, "the node");
+    this.#sync();
+    if (!this.#anchor) throw domError("InvalidStateError", "nothing is selected");
+    offset = checkOffset(node, offset);
+    if (inDocument(node)) this.#set(this.#anchor, this.#anchorOffset, node, offset);
+  }
+
+  setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+    checkNode(anchorNode, "the anchor node");
+    checkNode(focusNode, "the focus node");
+    anchorOffset = checkOffset(anchorNode, anchorOffset);
+    focusOffset = checkOffset(focusNode, focusOffset);
+    if (inDocument(anchorNode) && inDocument(focusNode)) this.#set(anchorNode, anchorOffset, focusNode, focusOffset);
+  }
+
+  selectAllChildren(node) {
+    checkNode(node, "the node");
+    if (inDocument(node)) this.#set(node, 0, node, node.childNodes.length);
+  }
+
+  deleteFromDocument() {
+    this.#sync();
+    for (const range of [...this.#ranges]) range.deleteContents();
+  }
+
+  /** Whether the selection holds all of `node`, or any of it with `allowPartialContainment`. */
+  containsNode(node, allowPartialContainment = false) {
+    checkNode(node, "the node");
+    this.#sync();
+    if (!this.#ranges.length || !inDocument(node)) return false;
+    const parent = node.parentNode;
+    const startNode = parent ?? node;
+    const start = parent ? indexIn(node) : 0;
+    const endNode = parent ?? node;
+    const end = parent ? start + 1 : nodeLength(node);
+    return this.#ranges.some((range) => allowPartialContainment
+      ? comparePoints(startNode, start, range._endNode, range._endOffset) < 0 && comparePoints(endNode, end, range._startNode, range._startOffset) > 0
+      : comparePoints(range._startNode, range._startOffset, startNode, start) <= 0 && comparePoints(endNode, end, range._endNode, range._endOffset) <= 0);
+  }
+
+  getComposedRanges() {
+    this.#sync();
+    return this.#ranges.map((range) => new StaticRange({
+      startContainer: range._startNode, startOffset: range._startOffset, endContainer: range._endNode, endOffset: range._endOffset,
+    }));
+  }
+
+  /** The selected text as copying gives it: rendered white space, line breaks between blocks. */
+  toString() {
+    this.#sync();
+    if (!this.#ranges.length) return "";
+    return native.selectionText?.() ?? this.#ranges.map((range) => range.toString()).join("");
+  }
+}
+
+/** The document's selection: what the user selected, which scripts can read and change. */
+export function getSelection() {
+  return (theSelection ??= new Selection(SELECTION));
+}
+
+globalThis.Selection ??= Selection;
+globalThis.getSelection ??= getSelection;
+
+// A `SelectionChange` record at a node that is not an input: `selectstart` where a press
+// started a selection (its `selectionStart` is 1), else the document's `selectionchange` at
+// the root.
+function selectionRecord(target, start) {
+  const event = new Event(start === 1 ? "selectstart" : "selectionchange", target);
+  if (start !== 1) event.bubbles = false;
+  dispatchEvent(event);
+  if (event.defaultPrevented) {
+    const selection = getSelection();
+    selection.removeAllRanges();
+    // Read back at once, so the tree stops the press before the pointer moves on.
+    void selection.rangeCount;
+  }
+  return false;
 }
 
 let rootNode = null;
@@ -2750,6 +3066,7 @@ function compatTap(click, target) {
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
   if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
