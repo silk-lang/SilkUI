@@ -21,6 +21,7 @@ import ui_tree.legacy {
 }
 import ui_tree.cssom_view as view
 import ui_tree.text_selection
+import ui_tree.text_selection { SelectionOrder }
 import ui_fixtures.fixtures as fixtures
 import svg_css.written
 import svg_css.tokens { CssError }
@@ -450,4 +451,81 @@ effect fn scrolling() ! TreeError | CssError | CssomError | OutOfMemoryError | A
 test effect fn dragsPastTheEdgeScroll() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run scrolling() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A box `id` in `parent` with text node `id + 100`.
+effect fn item(batch: &mut Batch, parent: u32, id: u32, css: &[u8], text: string) -> () ! CssError | OutOfMemoryError ? &mut Allocator {
+  run batch.create(id, NodeKind.Box)
+  run batch.append(parent, id)
+  run styled(&mut batch, id, css)
+  run batch.text(id, id + 100, text)
+}
+
+/// Container 4 holding boxes 5, 6 and 7.
+effect fn three<'f>(fonts: &'f FontCollection, container: &[u8], a: &[u8], b: &[u8], c: &[u8], texts: [string; 3]) -> UiTree<'f>
+  ! TreeError | CssError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run batch.create(4, NodeKind.Box)
+  run batch.append(1, 4)
+  run styled(&mut batch, 4, container)
+  run item(&mut batch, 4, 5, a, texts[0])
+  run item(&mut batch, 4, 6, b, texts[1])
+  run item(&mut batch, 4, 7, c, texts[2])
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  return move tree
+}
+
+/// Checks a drag in both orders: what is seen, then tree order (Chromium's answer).
+effect fn expectBothOrders(tree: &mut UiTree<'_>, expected: string, visual: string, inTree: string, what: string<'static>) -> ()
+  ! OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  tree.selectionOrder = SelectionOrder.Visual
+  run expectSelection(&mut tree, expected, visual, what)
+  tree.selectionOrder = SelectionOrder.Tree
+  run expectSelection(&mut tree, expected, inTree, what)
+  tree.selectionOrder = SelectionOrder.Visual
+}
+
+effect fn reordered() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let texts = ["One one", "Two two", "Three three"]
+  let mut tree = run three(&fonts, b"display:flex;flex-direction:row-reverse;justify-content:flex-end;column-gap:30px", b"", b"", b"", texts)
+  run drag(&mut tree, 107, 1, 105, 5)
+  run expectBothOrders(&mut tree, "107@1 105@5", "hree three\nTwo two\nOne o", "ne\nTwo two\nT", "a drag across row-reverse items selects what it crossed")
+
+  tree = run three(&fonts, b"display:flex;column-gap:30px", b"order:3", b"order:1", b"order:2", texts)
+  run drag(&mut tree, 106, 1, 105, 5)
+  run expectBothOrders(&mut tree, "106@1 105@5", "wo two\nThree three\nOne o", "ne\nT", "a drag across items placed by order selects what it crossed")
+  run drag(&mut tree, 106, 1, 107, 5)
+  run expectBothOrders(&mut tree, "106@1 107@5", "wo two\nThree", "wo two\nThree", "items seen in tree order select as one stretch")
+
+  tree = run three(&fonts, b"display:grid;grid-template-columns:150px 150px", b"grid-column:2;grid-row:1", b"grid-column:1;grid-row:1", b"", ["Cell A text", "Cell B text", "Cell C text"])
+  run drag(&mut tree, 106, 1, 105, 6)
+  run expectBothOrders(&mut tree, "106@1 105@6", "ell B text\nCell A", " text\nC", "a drag across placed grid cells selects what it crossed")
+
+  // An absolute box first in the tree, shown under two paragraphs.
+  tree = run UiTree.make(&fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run batch.create(4, NodeKind.Box)
+  run batch.append(1, 4)
+  run styled(&mut batch, 4, b"position:relative;height:200px")
+  run item(&mut batch, 4, 5, b"position:absolute;top:120px;left:0", "Positioned box text")
+  run paragraph(&mut batch, 4, 2, "First paragraph here")
+  run paragraph(&mut batch, 4, 3, "Second paragraph here")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run drag(&mut tree, 102, 2, 105, 10)
+  run expectBothOrders(&mut tree, "102@2 105@10", "rst paragraph here\n\nSecond paragraph here\n\nPositioned", " box text\nFi", "a drag onto a positioned box selects what is above it on screen")
+}
+
+test effect fn reorderedLayoutsSelectWhatIsSeen() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run reordered() |> Effect.provideMut<Allocator>(&mut allocator)
 }
