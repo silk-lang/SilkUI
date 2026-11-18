@@ -258,7 +258,7 @@ check("fileapi", NODE, async () => {
 });
 // A file dropped on a window arrives as a File-like DroppedFile: a path and a name.
 check("fileapi", true, () => new ui.DataTransfer(["/tmp/a.txt"]).files[0].name === "a.txt");
-check("filereader", false, () => global("FileReader"));
+check("filereader", NODE, () => global("FileReader"));
 check("filereadersync", false, () => global("FileReaderSync"));
 check("gamepad", false, () => typeof navigator.getGamepads === "function");
 check("geolocation", false, () => typeof navigator.geolocation === "object");
