@@ -401,7 +401,10 @@ effect fn leavesOf(tree: &UiTree<'_>, container: u32, out: &mut List<Leaf>) -> (
       let mut descend = true
       if f.kind == FragmentKind.Text && f.textData != NO_INDEX {
         if slot != NONE && isText(tree, slot) && shown(tree, slot) {
-          run out.append(Leaf { slot: slot, piece: visualPiece(tree, index), atomic: false })
+          let mut runs = tree.output.fragments.textRuns(index)
+          while runs.next() {
+            run out.append(Leaf { slot: slot, piece: cssom_view.visualTextPiece(tree, index, &runs.current), atomic: false })
+          }
         }
         descend = false
       } else if slot != NONE && f.kind == FragmentKind.Box && slot != container
@@ -436,45 +439,43 @@ effect fn leavesOf(tree: &UiTree<'_>, container: u32, out: &mut List<Leaf>) -> (
   }
 }
 
-/// A fragment's geometry where it draws. Boxes have no text range, so only the box and the line
-/// box around it are read for them.
+/// An atomic box's geometry where it draws, on the line box around it. Boxes have no text range.
 fn visualPiece(tree: &UiTree<'_>, index: usize) -> Piece {
-  let f = tree.visualFragment(index)
-  let box = borderBox(&f)
-  let mut piece = if f.textData != NO_INDEX {
-    cssom_view.visualTextPiece(tree, index)
-  } else {
-    Piece {
-      start: 0,
-      end: 0,
-      x0: box.xMin,
-      x1: box.xMax,
-      top: box.yMin,
-      bottom: box.yMax,
-      line: index,
-      lineTop: box.yMin,
-      lineBottom: box.yMax,
-      shapeKey: 0,
-      glyphs: false,
-      lineBreak: false,
-      rtl: false,
-      base: 0,
-    }
+  let box = borderBox(&tree.visualFragment(index))
+  let mut piece = Piece {
+    start: 0,
+    end: 0,
+    x0: box.xMin,
+    x1: box.xMax,
+    top: box.yMin,
+    bottom: box.yMax,
+    fragment: index,
+    line: index,
+    lineTop: box.yMin,
+    lineBottom: box.yMax,
+    lineLeft: box.xMin,
+    lineRight: box.xMax,
+    shapeKey: 0,
+    glyphs: false,
+    lineBreak: false,
+    rtl: false,
+    base: 0,
   }
-  if f.textData == NO_INDEX {
-    // An atomic inline sits on its line box: lines are grouped by it.
-    let values = tree.output.fragments.values.asSlice()
-    let mut up = values[index].parent
-    while up != NO_INDEX {
-      if values[up].kind == FragmentKind.Line {
-        let line = borderBox(&tree.visualFragment(up))
-        piece.line = up
-        piece.lineTop = line.yMin
-        piece.lineBottom = line.yMax
-        break
-      }
-      up = values[up].parent
+  // An atomic inline sits on its line box: lines are grouped by it. A line with one has a
+  // fragment, so this is the line its text runs name too.
+  let values = tree.output.fragments.values.asSlice()
+  let mut up = values[index].parent
+  while up != NO_INDEX {
+    if values[up].kind == FragmentKind.Line {
+      let line = borderBox(&tree.visualFragment(up))
+      piece.line = up
+      piece.lineTop = line.yMin
+      piece.lineBottom = line.yMax
+      piece.lineLeft = line.xMin
+      piece.lineRight = line.xMax
+      break
     }
+    up = values[up].parent
   }
   return piece
 }
@@ -945,7 +946,7 @@ pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
   }
   i = 0
   while i < changed.length() {
-    touch(&mut tree, changed.get(i))
+    run touch(&mut tree, changed.get(i))
     i = i + 1
   }
   tree.textSelection.selected = move next
@@ -953,10 +954,14 @@ pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
   tree.textSelection.moved = false
 }
 
-fn touch(tree: &mut UiTree<'_>, slot: u32) -> () {
+/// Paints text node `slot` again: its fragments' hashes change, and the paint caches are
+/// repaired for them (a selection moves no layout, so nothing else would).
+effect fn touch(tree: &mut UiTree<'_>, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
   if u32.toUsize(slot) >= tree.nodes.length() { return () }
   let node = tree.nodeMut(slot)
   node.content = node.content + 1
+  run tree.repair.nodes.append(slot)
+  tree.repair.pending = true
   tree.paintDirty = true
 }
 
@@ -1571,13 +1576,13 @@ pub effect fn extend(tree: &mut UiTree<'_>, key: string, modifiers: u32) -> bool
     let root = tree.root
     next = if forward { at(&tree.*, root, childCount(&tree.*, root)) } else { at(&tree.*, root, 0) }
   } else if lineEdge {
-    let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, line: 0, lineTop: 0.0, lineBottom: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
+    let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
     let mut x: f32 = 0.0
     if !run caretOf(&tree.*, focus, &mut piece, &mut x) { return false }
     let middle = (piece.lineTop + piece.lineBottom) * 0.5
     next = run pointAt(&tree.*, if forward { 1000000.0 } else { -1000000.0 }, middle)
   } else if key == "ArrowUp" || key == "ArrowDown" {
-    let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, line: 0, lineTop: 0.0, lineBottom: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
+    let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
     let mut x: f32 = 0.0
     if !run caretOf(&tree.*, focus, &mut piece, &mut x) {
       next = run characterStep(&tree.*, focus, forward)

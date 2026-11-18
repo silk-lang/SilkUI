@@ -151,7 +151,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments }
+import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
 import svg_css.effect_values { Image }
@@ -5692,7 +5692,8 @@ impl<'a> UiTree<'a> {
     return false
   }
 
-  /// The first line box in the first fragment of css node `css`, through in-flow blocks.
+  /// The first line box in the first fragment of css node `css`, through in-flow blocks: its
+/// fragment, or what `PlacedText.line` names it by.
   fn firstLineOf(self: &Self, css: usize) -> usize {
     if css >= self.fragmentOf.length() { return NO_INDEX }
     let top = self.fragmentOf.get(css)
@@ -5701,6 +5702,11 @@ impl<'a> UiTree<'a> {
     let mut at = values[top].firstChild
     while at != NO_INDEX {
       if values[at].kind == FragmentKind.Line { return at }
+      if values[at].kind == FragmentKind.Text && values[at].textData != NO_INDEX {
+        // A line of text alone has no fragment: its runs name it.
+        let mut runs = self.output.fragments.textRuns(at)
+        if runs.next() { return runs.current.line }
+      }
       let mut descend = values[at].kind == FragmentKind.Box
       let slot = if values[at].source == NO_INDEX { NONE } else { self.slotOfCssNode(values[at].source) }
       if descend && slot != NONE {
@@ -7137,9 +7143,8 @@ impl<'a> UiTree<'a> {
       let values = self.output.fragments.values.asSlice()
       let mut d: usize = 0
       while d < dirty.length() && !self.facesDirty {
-        let text = values[dirty.get(d)].textData
-        if text != NO_INDEX {
-          let key = self.output.fragments.texts.get(text).fontKey
+        if values[dirty.get(d)].textData != NO_INDEX {
+          let key = u32.toUsize(values[dirty.get(d)].fontKey)
           if key >= self.faces.length() || !self.faces.asSlice()[key].loaded { self.facesDirty = true }
         }
         d = d + 1
@@ -7199,10 +7204,16 @@ impl<'a> UiTree<'a> {
     if !self.facesDirty {
       return ()
     }
-    let count = self.output.fragments.texts.length()
+    // Every text fragment's font.
+    let values = self.output.fragments.values.asSlice()
+    let count = values.length
     let mut i: usize = 0
     while i < count {
-      let key = self.output.fragments.texts.get(i).fontKey
+      if values[i].textData == NO_INDEX {
+        i = i + 1
+        continue
+      }
+      let key = u32.toUsize(values[i].fontKey)
       while self.faces.length() <= key {
         run self.faces.append(FaceSlot<'a> { loaded: false, face: Option<FontFace<'a>>.None })
       }
@@ -7466,6 +7477,46 @@ impl<'a> UiTree<'a> {
     )
   }
 
+  /// The border box of fragment `index` of the last layout, where it draws: for a text fragment,
+  /// the box around its runs (empty at the origin when it has none).
+  pub fn visualBounds(self: &Self, index: usize) -> Rect<f32> {
+    let values = self.output.fragments.values.asSlice()
+    if values[index].kind != FragmentKind.Text {
+      return borderBox(&self.visualFragment(index))
+    }
+    let shift = self.shiftOf(index)
+    let mut bounds = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    let mut any = false
+    let mut runs = self.output.fragments.textRuns(index)
+    while runs.next() {
+      let x = runs.current.location.x + shift.x
+      let y = runs.current.location.y + shift.y
+      let box = Rect<f32>.new(x, y, x + runs.current.size.width, y + runs.current.size.height)
+      bounds = if any {
+        Rect<f32>.new(f32.min(bounds.xMin, box.xMin), f32.min(bounds.yMin, box.yMin), f32.max(bounds.xMax, box.xMax), f32.max(bounds.yMax, box.yMax))
+      } else {
+        box
+      }
+      any = true
+    }
+    return bounds
+  }
+
+  /// Whether (`x`, `y`) lies in the box of one of the runs of text fragment `index`, where
+  /// they draw.
+  pub fn textContains(self: &Self, index: usize, x: f32, y: f32) -> bool {
+    let shift = self.shiftOf(index)
+    let mut runs = self.output.fragments.textRuns(index)
+    while runs.next() {
+      let left = runs.current.location.x + shift.x
+      let top = runs.current.location.y + shift.y
+      if x >= left && x < left + runs.current.size.width && y >= top && y < top + runs.current.size.height {
+        return true
+      }
+    }
+    return false
+  }
+
   /// Fragment `index` of the last layout, moved to where it draws.
   pub fn visualFragment(self: &Self, index: usize) -> Fragment {
     let values = self.output.fragments.values.asSlice()
@@ -7525,6 +7576,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -7571,6 +7623,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -7648,6 +7701,7 @@ impl<'a> UiTree<'a> {
       stats: &mut stats,
       order: &mut order,
       selected: &self.textSelection.selected,
+      firstOf: &self.fragmentOf,
       frame: self.frameNumber,
       previousFrame: self.paintedAt,
       scale: self.input.scale,

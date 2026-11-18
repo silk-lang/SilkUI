@@ -34,7 +34,7 @@ import ui_text.fonts as text_fonts
 import font_rules
 import font_rules { FontRules }
 import sheet_faces { Registry as SheetFaces }
-import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind }
+import layout.lib { Tree, LayoutTree, Fragment, FragmentKind, TextFragmentKind, PlacedText, TEXT_RUN, TEXT_LINE, TEXT_LINE_CONTINUED, LINE_RECORD }
 import font_raster.cache { GlyphCache, RasterGlyph }
 import font_raster.face { FontFace }
 import font_raster.key { GlyphKey, PenPosition }
@@ -162,6 +162,8 @@ pub struct Painter<'p, 'a> {
   pub order: &'p mut List<u32>,
   /// What the document's text selection covers (`text_selection.Selected`, by slot).
   pub selected: &'p List<Selected>,
+  /// Per css-layout node: its first fragment (`UiTree.fragmentOf`).
+  pub firstOf: &'p List<usize>,
   pub frame: u64,
   /// The frame the previous scene was painted at. Frames are numbered across the tree's roots,
   /// so a subtree cached then was cached by this root.
@@ -523,7 +525,12 @@ effect fn paintGlyphMask(p: &mut Painter<'_, '_>, index: usize, mask: ContentMas
     let f = p.output.fragments.values.asSlice()[child]
     if f.kind == FragmentKind.Text {
       let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
-      run paintTextAs(&mut p, child, slot, f, mask, opaque, Option<Rgba<f32>>.None)
+      let output = p.output
+      let mut runs = output.fragments.textRuns(child)
+      while runs.next() {
+        let placed = runs.current
+        run paintTextAs(&mut p, child, slot, runFragment(&f, &placed), placed, mask, opaque, Option<Rgba<f32>>.None)
+      }
     } else {
       run paintGlyphMask(&mut p, child, mask)
     }
@@ -853,19 +860,72 @@ effect fn noPath<E>(error: E) -> u32 {
   return 0
 }
 
-/// Paints a text fragment's text shadows, then the fragment.
+/// Text fragment `f` as it would be were run `placed` its only one: where the run is, and its
+/// size. The fragment's baselines are every run's.
+fn runFragment(f: &Fragment, placed: &PlacedText) -> Fragment {
+  let mut one = f.*
+  one.worldLocation = placed.location
+  one.size = placed.size
+  return one
+}
+
+/// How far past its box a run of text of height `height` may put ink, with the style of node
+/// `slot` (see [`ownInk`]).
+fn textReach(slot: u32, nodes: &List<Node>, height: f32) -> f32 {
+  let mut reach = f32.max(height, 16.0)
+  if slot != NONE {
+    let from = nodes.asSlice()[u32.toUsize(slot)].computed().effects.shadowFrom
+    if from != NONE && u32.toUsize(from) < nodes.length() {
+      if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(from)].paintEffects() {
+        reach = reach + paint_effects.shadowReach(value.shadows.asSlice())
+      }
+    }
+  }
+  return reach
+}
+
+/// Paints the runs of text fragment `index` (a word, a space: one line of a paragraph holds
+/// many, and the fragment may hold every line), each with its text shadows. A run whose ink
+/// misses the clip is skipped, as a fragment's subtree is.
 effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let slot = styleSlot(&p.slotOfCss.*, &p.css.*, &p.nodes.*, f.source)
-  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input
-    && f.textData != NO_INDEX {
+  let s = p.scale
+  let cull = ContentMask.new(p.cull).intersect(mask).bounds
+  let mut first = true
+  let output = p.output
+  let mut runs = output.fragments.textRuns(index)
+  while runs.next() {
+    let placed = runs.current
+    let x = placed.location.x
+    let y = placed.location.y
+    let reach = textReach(slot, &p.nodes.*, placed.size.height)
+    let visible = (x - reach) * s < cull.xMax && (x + placed.size.width + reach) * s > cull.xMin
+      && (y - reach) * s < cull.yMax && (y + placed.size.height + reach) * s > cull.yMin
+    if first {
+      // The text's node takes its place in the paint order where its first run paints.
+      first = false
+      if visible { run noteOrder(&mut p, index, &f) }
+    }
+    if visible {
+      run paintTextRun(&mut p, index, slot, runFragment(&f, &placed), placed, mask)
+    }
+  }
+}
+
+/// Paints one run of a text fragment (`f` is the run's box, see [`runFragment`]): its text
+/// shadows, then the run.
+effect fn paintTextRun(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, placed: PlacedText, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if slot != NONE && p.nodes.asSlice()[u32.toUsize(slot)].kind == NodeKind.Input {
     let node = &p.nodes.asSlice()[u32.toUsize(slot)]
     let e = node.edit()
     if e.focused && !e.composing && !e.showsPlaceholder && e.anchor != e.focus {
       if selection.styled(node) {
         let foreground = selection.foreground(node)
-        let mut piece = caret.pieceOf(p.output, p.text, index)
+        let mut piece = caret.pieceOf(p.text, index, &placed)
         let r = rich.runOf(&e.runs, f.source)
         if e.hasRuns() && r != NO_INDEX {
           let found = e.runs.get(r)
@@ -891,11 +951,11 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
             while i < outside.length {
               let rect = outside[i]
               if rect.xMin < rect.xMax && rect.yMin < rect.yMax {
-                run paintTextNormally(&mut p, index, slot, f, ContentMask.new(rect))
+                run paintTextNormally(&mut p, index, slot, f, placed, ContentMask.new(rect))
               }
               i = i + 1
             }
-            run paintTextAs(&mut p, index, slot, f, selected, Option<Rgba<f32>>.None, foreground)
+            run paintTextAs(&mut p, index, slot, f, placed, selected, Option<Rgba<f32>>.None, foreground)
             return ()
           }
         }
@@ -906,7 +966,7 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
     let k = if textSlot == NONE { NO_INDEX } else { text_selection.find(p.selected, textSlot) }
     if k != NO_INDEX {
       let covered = p.selected.get(k)
-      let span = run paintDocumentSelection(&mut p, index, slot, textSlot, covered, mask)
+      let span = run paintDocumentSelection(&mut p, index, slot, textSlot, covered, placed, mask)
       if span.xMin < span.xMax && slot != NONE && selection.styled(&p.nodes.asSlice()[u32.toUsize(slot)]) {
         let foreground = selection.foreground(&p.nodes.asSlice()[u32.toUsize(slot)])
         let selected = ContentMask.new(device(span, p.scale)).intersect(mask)
@@ -921,22 +981,44 @@ effect fn paintText(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Co
           while i < outside.length {
             let rect = outside[i]
             if rect.xMin < rect.xMax && rect.yMin < rect.yMax {
-              run paintTextNormally(&mut p, index, slot, f, ContentMask.new(rect).intersect(mask))
+              run paintTextNormally(&mut p, index, slot, f, placed, ContentMask.new(rect).intersect(mask))
             }
             i = i + 1
           }
-          run paintTextAs(&mut p, index, slot, f, selected, Option<Rgba<f32>>.None, foreground)
+          run paintTextAs(&mut p, index, slot, f, placed, selected, Option<Rgba<f32>>.None, foreground)
           return ()
         }
       }
     }
   }
-  run paintTextNormally(&mut p, index, slot, f, mask)
+  run paintTextNormally(&mut p, index, slot, f, placed, mask)
 }
 
-/// Whether text fragment `index` ends its line: nothing follows it in the line box.
-fn endsLine(output: &LayoutTree, index: usize) -> bool {
+/// Whether run `t` of text fragment `index` ends its line: nothing follows it in the line box.
+fn endsLine(output: &LayoutTree, index: usize, t: &PlacedText) -> bool {
   let values = output.fragments.values.asSlice()
+  let texts = output.fragments.texts.asSlice()
+  let value = &values[index]
+  if t.record != NO_INDEX && value.textData != NO_INDEX {
+    // A later run of the fragment before the next line record is on the same line.
+    let end = value.textData + u32.toUsize(value.textCount)
+    let mut at = t.record + 1
+    while at < end {
+      let part = texts[at].part
+      if part == TEXT_RUN { return false }
+      if part == TEXT_LINE || part == TEXT_LINE_CONTINUED { return true }
+      at = at + 1
+    }
+  }
+  if t.line != NO_INDEX && t.line >= LINE_RECORD {
+    // A line kept as records: the text fragment after this one goes on with it when it
+    // opens with the same line box again.
+    let next = value.nextSibling
+    if next != NO_INDEX && values[next].textData != NO_INDEX && values[next].textCount != 0 {
+      return texts[values[next].textData].part != TEXT_LINE_CONTINUED
+    }
+    return true
+  }
   let mut at = index
   while at != NO_INDEX {
     if values[at].nextSibling != NO_INDEX { return false }
@@ -947,23 +1029,24 @@ fn endsLine(output: &LayoutTree, index: usize) -> bool {
   return true
 }
 
-/// Paints the document selection's highlight under text fragment `index` of text node
+/// Paints the document selection's highlight under run `placed` of text fragment `index` of text node
 /// `textSlot` (styled by element `slot`), at the height of its line box. A selected line end
-/// shows as a sliver after the line's last fragment. Returns what it covered, in CSS pixels.
+/// shows as a sliver after the line's last run. Returns what it covered, in CSS pixels.
 effect fn paintDocumentSelection(
   p: &mut Painter<'_, '_>,
   index: usize,
   slot: u32,
   textSlot: u32,
   covered: Selected,
+  placed: PlacedText,
   mask: ContentMask,
 ) -> Rect<f32>
   ! OutOfMemoryError
   ? &mut Allocator {
-  let piece = caret.pieceOf(p.output, p.text, index)
+  let piece = caret.pieceOf(p.text, index, &placed)
   let mut span = caret.spanX(p.text, &piece, covered.start, covered.end)
   let pastEnd = covered.end > piece.end || covered.through && covered.end >= piece.end
-  if (pastEnd || piece.lineBreak) && covered.start <= piece.end && endsLine(p.output, index) {
+  if (pastEnd || piece.lineBreak) && covered.start <= piece.end && endsLine(p.output, index, &placed) {
     let size = p.nodes.asSlice()[u32.toUsize(textSlot)].computed().text.size
     let sliver = f32.max(4.0, size * 0.25)
     if span.xMin > span.xMax {
@@ -989,7 +1072,7 @@ effect fn paintDocumentSelection(
   return span
 }
 
-effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, mask: ContentMask) -> ()
+effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f: Fragment, t: PlacedText, mask: ContentMask) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   if slot != NONE {
     if p.nodes.asSlice()[u32.toUsize(slot)].computed().effects.shadowFrom != NONE {
@@ -1017,40 +1100,25 @@ effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f:
             effects,
           )
         }
-        run paintTextAs(
-          &mut p,
-          index,
-          slot,
-          shifted,
-          mask,
-          Option<Rgba<f32>>.some(shadow.color),
-          Option<Rgba<f32>>.None,
-        )
+        run paintTextAs(&mut p, index, slot, shifted, t, mask, Option<Rgba<f32>>.some(shadow.color), Option<Rgba<f32>>.None)
         if blurred {
           run p.scene.popLayer()
         }
       }
     }
   }
-  run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None, Option<Rgba<f32>>.None)
+  run paintTextAs(&mut p, index, slot, f, t, mask, Option<Rgba<f32>>.None, Option<Rgba<f32>>.None)
 }
 
-/// The `::first-line` values over text fragment `f` of `slot` when it lies on a first line
-/// box with one. They pass to the text through the elements on the line, so a value its element
-/// changes from the block's stays (CSS Pseudo 4 §2.4); only paint values apply.
-fn firstLineOver(p: &Painter<'_, '_>, f: &Fragment, slot: u32, c: &mut Computed, color: &mut Rgba<f32>) -> () {
-  let values = p.output.fragments.values.asSlice()
-  let mut at = f.parent
-  let mut steps: usize = 0
-  while at != NO_INDEX && values[at].kind != FragmentKind.Line && steps < 16 {
-    at = values[at].parent
-    steps = steps + 1
-  }
-  if at == NO_INDEX || values[at].kind != FragmentKind.Line { return () }
+/// The `::first-line` values over run `t` of `slot` when it lies on a first line box with one.
+/// They pass to the text through the elements on the line, so a value its element changes from
+/// the block's stays (CSS Pseudo 4 §2.4); only paint values apply.
+fn firstLineOver(p: &Painter<'_, '_>, t: &PlacedText, slot: u32, c: &mut Computed, color: &mut Rgba<f32>) -> () {
+  if t.line == NO_INDEX { return () }
   let lines = p.firstLines.asSlice()
   let mut i: usize = 0
   while i < lines.length {
-    if lines[i].line == at {
+    if lines[i].line == t.line {
       let nodes = p.nodes.asSlice()
       let line = &nodes[u32.toUsize(lines[i].slot)].computed().text
       let block = &nodes[u32.toUsize(lines[i].origin)].computed().text
@@ -1075,21 +1143,21 @@ fn sameLines(a: DecorationLine, b: DecorationLine) -> bool {
 
 /// Paints a text fragment: its glyph run, as shaped during layout, and its decorations, all in
 /// `shadow` when set (a text shadow's pass).
+/// Paints run `t` of a text fragment (`f` is the run's box, see [`runFragment`]): its glyph
+/// run, as shaped during layout, and its decorations, all in `shadow` when set (a text
+/// shadow's pass).
 effect fn paintTextAs(
   p: &mut Painter<'_, '_>,
   index: usize,
   slot: u32,
   f: Fragment,
+  t: PlacedText,
   mask: ContentMask,
   shadow: Option<Rgba<f32>>,
   foreground: Option<Rgba<f32>>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if f.textData == NO_INDEX {
-    return ()
-  }
-  let t = p.output.fragments.texts.get(f.textData)
   if t.kind != TextFragmentKind.Glyphs {
     return ()
   }
@@ -1125,7 +1193,7 @@ effect fn paintTextAs(
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
-  if p.firstLines.length() != 0 { firstLineOver(&p.*, &f, slot, &mut c, &mut color) }
+  if p.firstLines.length() != 0 { firstLineOver(&p.*, &t, slot, &mut c, &mut color) }
   if let Option.Some { value } = foreground {
     color = value
     c.text.color = value
@@ -2031,10 +2099,18 @@ fn hoistedMask(p: &Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask
   return inner
 }
 
-effect fn noteOrder(p: &mut Painter<'_, '_>, f: &Fragment) -> ()
+effect fn noteOrder(p: &mut Painter<'_, '_>, index: usize, f: &Fragment) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !f.first {
+  // The first fragment of a node. A text fragment is its text node's first when the index by
+  // source says so: css-layout chains the text fragments that hold their own lines by their
+  // inline formatting box, where `first` means the first of that box.
+  let first = if f.kind == FragmentKind.Text {
+    f.source < p.firstOf.length() && p.firstOf.get(f.source) == index
+  } else {
+    f.first
+  }
+  if !first {
     return ()
   }
   let slot = slotIn(p.slotOfCss, f.source)
@@ -2073,19 +2149,28 @@ fn ownInk(
   index: usize,
 ) -> Rect<f32> {
   let f = output.fragments.values.asSlice()[index]
-  let box = borderBox(&f)
   if f.kind == FragmentKind.Text {
-    let mut reach = f32.max(f.size.height, 16.0)
+    // Every run's box, grown by its reach. No run: nothing.
+    let mut total = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
+    let mut shadow: f32 = 0.0
     if slot != NONE {
       let from = nodes.asSlice()[u32.toUsize(slot)].computed().effects.shadowFrom
       if from != NONE && u32.toUsize(from) < nodes.length() {
         if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(from)].paintEffects() {
-          reach = reach + paint_effects.shadowReach(value.shadows.asSlice())
+          shadow = paint_effects.shadowReach(value.shadows.asSlice())
         }
       }
     }
-    return grow(box, reach)
+    let mut runs = output.fragments.textRuns(index)
+    while runs.next() {
+      let x = runs.current.location.x
+      let y = runs.current.location.y
+      let reach = f32.max(runs.current.size.height, 16.0) + shadow
+      total = unite(total, Rect<f32>.new(x - reach, y - reach, x + runs.current.size.width + reach, y + runs.current.size.height + reach))
+    }
+    return total
   }
+  let box = borderBox(&f)
   if slot == NONE {
     return grow(box, 2.0)
   }
@@ -2722,11 +2807,10 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
       run paintChildren(&mut p, index, mask)
     }
     FragmentKind.Text => {
-      run noteOrder(&mut p, &f)
       run paintText(&mut p, index, f, mask)
     }
     FragmentKind.Inline => {
-      run noteOrder(&mut p, &f)
+      run noteOrder(&mut p, index, &f)
       let slot = slotIn(p.slotOfCss, f.source)
       if slot != NONE && !f.nonpainting {
         let c = p.nodes.asSlice()[u32.toUsize(slot)].computed().*
@@ -2830,7 +2914,7 @@ effect fn shiftOne(
   ! OutOfMemoryError
   ? &mut Allocator {
   let f = p.output.fragments.values.asSlice()[child]
-  run noteOrder(&mut p, &f)
+  run noteOrder(&mut p, child, &f)
   let slot = slotIn(p.slotOfCss, f.source)
   if slot != NONE && f.kind == FragmentKind.Box {
     let node = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
@@ -2921,7 +3005,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       let start = p.scene.operationCount()
       run p.scene.replay(p.previous, cache.start, cache.end)
       let end = p.scene.operationCount()
-      run noteOrder(&mut p, &f)
+      run noteOrder(&mut p, index, &f)
       run shiftCaches(&mut p, index, cache.start, start, mask)
       let nodes = p.nodes.asMutSlice()
       nodes[u32.toUsize(slot)].cache = PaintCache {
@@ -2938,7 +3022,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       return ()
     }
   }
-  run noteOrder(&mut p, &f)
+  run noteOrder(&mut p, index, &f)
   let start = p.scene.operationCount()
   let c = p.nodes.asSlice()[u32.toUsize(slot)].computed().*
   let kind = p.nodes.asSlice()[u32.toUsize(slot)].kind
@@ -3327,6 +3411,34 @@ fn ownHash(
   let f = output.fragments.values.asSlice()[index]
   let mut h = Hash.mix(seed, kindIndex(f.kind))
   h = Hash.combine(h, usize.toU64(f.source))
+  if f.kind == FragmentKind.Text {
+    // Every run: where it is and what it draws. The font and the baseline are the fragment's.
+    h = floatHash(h, f.firstBaselines.alphabetic)
+    h = Hash.combine(h, u32.toU64(f.fontKey))
+    let mut runs = output.fragments.textRuns(index)
+    while runs.next() {
+      let t = &runs.current
+      h = floatHash(h, t.location.x)
+      h = floatHash(h, t.location.y)
+      h = floatHash(h, t.size.width)
+      h = floatHash(h, t.size.height)
+      h = Hash.combine(h, usize.toU64(t.shapeKey))
+      h = Hash.combine(h, usize.toU64(t.sourceStart))
+      h = Hash.combine(h, usize.toU64(t.sourceEnd))
+      h = Hash.combine(h, u8.toU64(t.bidiLevel))
+    }
+    if slot != NONE {
+      let node = &nodes.asSlice()[u32.toUsize(slot)]
+      h = selection.hash(node, Hash.combine(h, node.paintHash))
+      if node.isGenerated() { h = floatHash(h, node.scrollX) h = floatHash(h, node.scrollY) }
+    }
+    // The text node's own content: what the document selection covers of it, say.
+    let own = slotIn(slots, f.source)
+    if own != NONE {
+      h = Hash.combine(h, nodes.asSlice()[u32.toUsize(own)].content)
+    }
+    return h
+  }
   h = floatHash(h, f.worldLocation.x)
   h = floatHash(h, f.worldLocation.y)
   h = floatHash(h, f.size.width)
@@ -3352,26 +3464,12 @@ fn ownHash(
     flags = flags + 4
   }
   h = Hash.combine(h, flags)
-  if f.textData != NO_INDEX {
-    let t = output.fragments.texts.get(f.textData)
-    h = Hash.combine(h, usize.toU64(t.shapeKey))
-    h = Hash.combine(h, usize.toU64(t.fontKey))
-    h = Hash.combine(h, usize.toU64(t.sourceStart))
-    h = Hash.combine(h, usize.toU64(t.sourceEnd))
-    h = Hash.combine(h, u8.toU64(t.bidiLevel))
-  }
   if slot != NONE {
     let node = &nodes.asSlice()[u32.toUsize(slot)]
     h = selection.hash(node, Hash.combine(h, node.paintHash))
     if node.isGenerated() {
       h = floatHash(h, node.scrollX)
       h = floatHash(h, node.scrollY)
-    }
-    if f.kind == FragmentKind.Text {
-      let own = slotIn(slots, f.source)
-      if own != NONE {
-        h = Hash.combine(h, nodes.asSlice()[u32.toUsize(own)].content)
-      }
     }
     if f.kind == FragmentKind.Box {
       h = transform.perspectiveHash(&node.computed().transform, h)
