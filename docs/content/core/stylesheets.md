@@ -125,13 +125,13 @@ silk task dev
    let processor = Tailwind.make("styles/input.css", "styles/app.css")
    match move self {
      // Builds the CSS, then keeps Tailwind watching while the app runs.
-     Tasks.Dev { target } => run processor.watching(app()
-       |> App.build(Mode.Dev)
+     Tasks.Dev { platform: _, options } => run processor.watching(app()
+       |> App.dev(&options)
        |> Built.launch()
        |> Running.watch())
-     Tasks.Build { target } => {
+     Tasks.Build { platform: _, options } => {
        drop run processor.build()
-       run app() |> App.build(Mode.Release) |> Built.write("dist")
+       run app() |> App.build(&options) |> Built.write("dist")
      }
    }
    ```
