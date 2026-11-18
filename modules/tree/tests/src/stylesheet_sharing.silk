@@ -9,13 +9,14 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.frozen { Frozen }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
 import silk.num.u32
 
 fn frame(time: f64) -> FrameInput { return FrameInput { width: 800.0, height: 300.0, scale: 1.0, time: time } }
 
-fn wide(tree: &UiTree<'_>, id: u32) -> bool { return tree.node(tree.slotOf(id)).computed.layout.width.value == 25.0 }
+fn wide(tree: &UiTree<'_>, id: u32) -> bool { return tree.node(tree.slotOf(id)).computed().layout.width.value == 25.0 }
 
 /// Whether one took the other's matched style without matching selectors itself.
 fn shared(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
@@ -288,9 +289,9 @@ effect fn startingSubjects() -> ()
   run batch.adoptStyleSheet(0, 1, bytes.asSlice())
   run tree.apply(run batch.take())
   run tree.frame(frame(0.0))
-  run Testing.expect(wide(&tree, 2) && wide(&tree, 64) && tree.node(tree.slotOf(65)).computed.layout.width.value == 5.0, "only the eligible row enters at its starting width")
+  run Testing.expect(wide(&tree, 2) && wide(&tree, 64) && tree.node(tree.slotOf(65)).computed().layout.width.value == 5.0, "only the eligible row enters at its starting width")
   run Testing.expect(shared(&tree, 2, 64), "an unrelated starting rule does not prevent equal rows from sharing their match")
-  run Testing.expect(tree.node(tree.slotOf(66)).computed.layout.width.value == 7.0, "an inline starting variable still feeds the starting cascade")
+  run Testing.expect(tree.node(tree.slotOf(66)).computed().layout.width.value == 7.0, "an inline starting variable still feeds the starting cascade")
   run tree.frame(frame(1.0))
   run Testing.expect(wide(&tree, 65) && wide(&tree, 66), "both entry transitions finish at the normal width")
 }
@@ -299,4 +300,31 @@ test effect fn startingRulesOnlyIsolateCandidateRows() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run startingSubjects() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Whether the two nodes hold one computed style (see `style_pool`).
+fn oneStyle(tree: &UiTree<'_>, first: u32, second: u32) -> bool {
+  return Frozen.same(&tree.node(tree.slotOf(first)).styled, &tree.node(tree.slotOf(second)).styled)
+}
+
+effect fn pooledStyles() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  run stack(&mut tree, 8, 2, b".wide")
+  run Testing.expect(oneStyle(&tree, 10, 20) && oneStyle(&tree, 20, 80), "equal rows hold one computed style")
+  run Testing.expect(oneStyle(&tree, 11, 12) && oneStyle(&tree, 11, 82), "and so do equal cells, under any row")
+  run Testing.expect(!oneStyle(&tree, 10, 11) && !oneStyle(&tree, 1, 10), "nodes with different values hold their own")
+  run Testing.expect(tree.stylePool.length() < 16, "twenty-five nodes hold a handful of styles")
+  run change(&mut tree, 40, "row wide", 1.0)
+  run Testing.expect(wide(&tree, 40) && !wide(&tree, 30) && !wide(&tree, 50), "a row that changes leaves its twins the style they hold")
+  run Testing.expect(!oneStyle(&tree, 40, 30) && oneStyle(&tree, 30, 50) && oneStyle(&tree, 41, 31), "and takes another, its cells keeping theirs")
+  run change(&mut tree, 40, "row", 2.0)
+  run Testing.expect(!wide(&tree, 40) && oneStyle(&tree, 40, 30), "equal again, it holds the shared one again")
+}
+
+test effect fn equalNodesHoldOneComputedStyle() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pooledStyles() |> Effect.provideMut<Allocator>(&mut allocator)
 }
