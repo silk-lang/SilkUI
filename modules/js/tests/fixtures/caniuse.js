@@ -23,6 +23,8 @@ const syntax = (source) => (0, eval)(source);
 const global = (name) => typeof globalThis[name] === "function" || (typeof globalThis[name] === "object" && globalThis[name] !== null);
 const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const NODE = { engine: false, node: true };
+// The UI layer (web_apis.js) that the node runtime does not load yet.
+const ENGINE = { engine: true, node: false };
 
 // The language.
 
@@ -163,12 +165,17 @@ check("use-strict", true, () => {
 
 // The APIs.
 
-check("abortcontroller", NODE, () => {
+check("abortcontroller", true, () => {
   const controller = new AbortController();
   let fired = false;
   controller.signal.addEventListener("abort", () => (fired = true));
+  const box = ui.createBox();
+  let heard = 0;
+  box.addEventListener("focus", () => heard++, { signal: controller.signal });
   controller.abort();
-  return controller.signal.aborted && fired && AbortSignal.timeout(10) instanceof AbortSignal;
+  box.dispatchEvent(new Event("focus"));
+  const either = AbortSignal.any([new AbortController().signal, AbortSignal.abort("why")]);
+  return controller.signal.aborted && fired && heard === 0 && either.aborted && either.reason === "why" && AbortSignal.timeout(10) instanceof AbortSignal;
 });
 check("accelerometer", false, () => global("Accelerometer"));
 check("ambient-light", false, () => global("AmbientLightSensor"));
@@ -178,7 +185,7 @@ check("atob-btoa", true, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsa
 check("audio-api", false, () => global("AudioContext"));
 // Nodes take listeners of any type, but the tree never sends these.
 check("auxclick", false, () => "onauxclick" in ui.createBox());
-check("battery-status", false, () => typeof navigator.getBattery === "function");
+check("battery-status", ENGINE, () => typeof navigator.getBattery === "function" && navigator.getBattery() instanceof Promise);
 check("blobbuilder", NODE, async () => {
   const blob = new Blob(["Silk", new Uint8Array([32, 85, 73])], { type: "text/plain" });
   return blob.size === 7 && blob.type === "text/plain" && (await blob.text()) === "Silk UI" && (await blob.slice(5).arrayBuffer()).byteLength === 2;
