@@ -84,7 +84,9 @@ import layers
 import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
-import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE }
+import text_selection
+import text_selection { TextSelection }
+import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE, usedUserSelect, SELECT_TEXT }
 import lists
 import lists { Scope }
 import paint_css { Effects }
@@ -198,6 +200,8 @@ pub struct RootState {
   /// The focused slot, or NONE.
   pub focused: u32,
   pub focusVisible: bool,
+  /// The root's text selection.
+  textSelection: TextSelection,
   /// The input of the root's last frame: its viewport.
   pub input: FrameInput,
   /// What the root's last frame did.
@@ -265,6 +269,7 @@ impl RootState {
       root: slot,
       focused: NONE,
       focusVisible: false,
+      textSelection: TextSelection.make(),
       input: FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
       stats: FrameStats.zero(),
       revision: 0,
@@ -766,6 +771,8 @@ pub struct UiTree<'a> {
   pub root: u32,
   /// The focused slot, or NONE.
   pub focused: u32,
+  /// The current root's text selection (see `text_selection`).
+  pub textSelection: TextSelection,
   /// Where focus goes back to when it leaves a focus trap's subtree by removal: by trap id,
   /// the id of the node focused before focus went into the trap, as a modal `<dialog>` does.
   returns: List<FocusReturn>,
@@ -1015,6 +1022,7 @@ impl<'a> UiTree<'a> {
       slotOfCss: List<u32>.make(),
       root: NONE,
       focused: NONE,
+      textSelection: TextSelection.make(),
       returns: List<FocusReturn>.make(),
       inerts: 0,
       families: Families.make(),
@@ -3097,6 +3105,7 @@ impl<'a> UiTree<'a> {
       root: Intrinsic.replace(self.root, NONE),
       focused: Intrinsic.replace(self.focused, NONE),
       focusVisible: Intrinsic.replace(self.focusVisible, false),
+      textSelection: Intrinsic.replace(self.textSelection, TextSelection.make()),
       input: Intrinsic.replace(
         self.input,
         FrameInput { width: 0.0, height: 0.0, scale: 1.0, time: 0.0 },
@@ -3163,6 +3172,7 @@ impl<'a> UiTree<'a> {
     self.root = s.root
     self.focused = s.focused
     self.focusVisible = s.focusVisible
+    self.textSelection = Intrinsic.replace(s.textSelection, TextSelection.make())
     self.input = s.input
     self.stats = s.stats
     self.revision = s.revision
@@ -5020,6 +5030,7 @@ impl<'a> UiTree<'a> {
         let before = node.computed.text
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
+        let selects = node.computed.userSelect
         let barColors = node.computed.scroll.colors
         let listStyle = node.computed.list
         let shadow = node.computed.effects
@@ -5037,7 +5048,7 @@ impl<'a> UiTree<'a> {
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || &barColors != &after.scroll.colors || &listStyle != &after.list
+          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -5255,6 +5266,11 @@ impl<'a> UiTree<'a> {
     }
     let node = self.node(slot)
     let kind = node.kind
+    computed.userSelect = usedUserSelect(
+      computed.userSelect,
+      if parent == NONE { SELECT_TEXT } else { self.node(parent).computed.userSelect },
+      kind == NodeKind.Input,
+    )
     // `content-visibility: hidden` skips its contents the way `display: none` does.
     if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
@@ -6219,6 +6235,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.loadFaces()
+    run text_selection.refresh(&mut self)
     if self.paintDirty {
       self.paintCachesStale = true
     }
@@ -6262,6 +6279,7 @@ impl<'a> UiTree<'a> {
         height: self.input.height,
         stats: &mut self.stats,
         order: &mut self.paintOrder,
+        selected: &self.textSelection.selected,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -6302,6 +6320,7 @@ impl<'a> UiTree<'a> {
         height: self.input.height,
         stats: &mut self.stats,
         order: &mut self.paintOrder,
+        selected: &self.textSelection.selected,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -6371,6 +6390,7 @@ impl<'a> UiTree<'a> {
       height: self.input.height,
       stats: &mut stats,
       order: &mut order,
+      selected: &self.textSelection.selected,
       frame: self.frameNumber,
       previousFrame: self.paintedAt,
       scale: self.input.scale,

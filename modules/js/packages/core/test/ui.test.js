@@ -470,7 +470,7 @@ test("selectionchange moves the caret of an input and names a rich input's typin
   mock.take();
   let seen = null;
   input.addEventListener("selectionchange", (event) => (seen = event));
-  assert.equal(mock.take()[0][0], "listen");
+  assert.deepEqual(mock.take(), [], "an input hears selection changes from the start");
   // Bytes 5 and 6 are the end of the object character and of "x".
   globalThis.__ui.dispatch(27, input.nodeId, 5, 6, 0, 1, 0);
   assert.equal(seen.type, "selectionchange");
@@ -639,4 +639,71 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   assert.equal(await held, false);
   mock.native.shellEvent(4, 1, 0, 0, "");
   assert.equal(pressed, 1);
+});
+
+test("input selection offsets are UTF-16 indices, as in Chrome", () => {
+  const input = createInput();
+  const listened = mock.take().find((call) => call[0] === "listen" && call[1] === input.nodeId);
+  assert.ok(listened && (listened[2] & (1 << 11)) && (listened[2] & (1 << 27)), "it keeps value and selection current");
+
+  // a, 4-byte emoji (2 units), é (2 bytes), 漢字 (3 bytes each), b.
+  const value = "a\u{1F600}\u00e9\u6f22\u5b57b";
+  input.value = value;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [7, 7], "a new value puts the caret at its end");
+  mock.take();
+
+  input.setSelectionRange(1, 4, "backward");
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 4, "backward"]);
+  assert.deepEqual(mock.take(), [["select", input.nodeId, 7, 1]], "anchor at the end, in bytes");
+
+  // The rest of these follow what Chrome answered for the same calls.
+  input.setSelectionRange(5, 2);
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [2, 2, "forward"]);
+  input.setSelectionRange(0, 99);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 7]);
+  input.selectionStart = 3;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 7]);
+  input.selectionEnd = 1;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [1, 1]);
+
+  input.setSelectionRange(1, 3);
+  input.setRangeText("XY");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["aXY\u00e9\u6f22\u5b57b", 1, 3]);
+  input.value = "hello world";
+  input.setSelectionRange(2, 4);
+  input.setRangeText("ZZZ", 6, 11, "select");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["hello ZZZ", 6, 9]);
+  input.setRangeText("Q", 0, 1, "start");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Qello ZZZ", 0, 0]);
+  input.setRangeText("W", 0, 1, "end");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Wello ZZZ", 1, 1]);
+  input.setSelectionRange(3, 8);
+  input.setRangeText("", 0, 5);
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], [" ZZZ", 0, 3]);
+  input.select();
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 4]);
+  assert.throws(() => input.setRangeText("x", 3, 1), (error) => error.name === "IndexSizeError");
+
+  // The tree reports bytes: the caret after the emoji and the combining mark.
+  input.value = "a\u{1F600}e\u0301\u6f22";
+  globalThis.__ui.dispatch(27, input.nodeId, 5, 8, 0, 0, 0);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 5]);
+  globalThis.__ui.dispatch(11, input.nodeId, 14, 14, 0, 0, 0, input.value + "\u5b57", "insertText");
+  assert.deepEqual([input.value.length, input.selectionStart], [7, 7]);
+});
+
+test("setRangeText on a rich input keeps marks and atoms outside the range", () => {
+  const input = createRichInput();
+  input.defineMark("bold", { fontWeight: 700 });
+  input.document = { text: "hi " + OBJECT + " there", marks: [{ start: 4, end: 10, marks: ["bold"] }], atoms: [{ kind: "mention", label: "@a", data: "" }] };
+  input.setRangeText("hello", 0, 2, "end");
+  assert.deepEqual(input.document, {
+    text: "hello " + OBJECT + " there",
+    marks: [{ start: 7, end: 13, marks: ["bold"] }],
+    atoms: [{ kind: "mention", label: "@a", data: "" }],
+  });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 5]);
+  input.setRangeText("x" + OBJECT, 5, 8, "select");
+  assert.deepEqual(input.document, { text: "hellox\ufffdthere", marks: [{ start: 7, end: 12, marks: ["bold"] }], atoms: [] });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 7]);
 });
