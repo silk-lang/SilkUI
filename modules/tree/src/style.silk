@@ -418,8 +418,8 @@ pub struct EffectState {
   pub declared: bool,
   /// Whether `will-change` makes the box a stacking context.
   pub stacks: bool,
-  /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
-  /// `paint.radii` holds the length part.
+  /// Whether a corner radius has a percentage or a vertical radius of its own, which
+  /// `paint_css.Effects` holds; `paint.radii` holds the horizontal length parts.
   pub radiusShare: bool,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
@@ -991,6 +991,76 @@ fn setRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context
   }
 }
 
+/// Whether `value` is a valid corner radius: a length-percentage, not negative.
+fn validRadius(value: &Value, context: &Context) -> bool {
+  return match convert.dimension(value, context) {
+    Option.Some { value: found } => (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+      || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0
+    Option.None => false
+  }
+}
+
+/// A corner radius longhand: one radius for both axes, or a horizontal and a vertical one
+/// (`8px 4px`). `length` keeps the horizontal length part; a vertical radius is noted in
+/// `effects` for `paint_css` to read, as a percentage is.
+fn setCornerRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context: &Context) -> () {
+  match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => {
+      let items = values.asSlice()
+      if items.length == 2 {
+        setCornerPair(&mut length.*, &mut effects.*, &items[0], &items[1], true, context)
+      }
+    }
+    _ => setCornerPair(&mut length.*, &mut effects.*, value, value, false, context)
+  }
+}
+
+/// A corner's radii: `horizontal`, and `vertical` when `paired` (else the same).
+fn setCornerPair(length: &mut f32, effects: &mut EffectState, horizontal: &Value, vertical: &Value, paired: bool, context: &Context) -> () {
+  if !validRadius(horizontal, context) {
+    return
+  }
+  if paired {
+    if !validRadius(vertical, context) {
+      return
+    }
+    effects.radiusShare = true
+    effects.declared = true
+  }
+  if hasPercent(horizontal) { setRadius(&mut length.*, &mut effects.*, horizontal, context) } else { setPixels(&mut length.*, horizontal, context) }
+}
+
+/// How many space-separated values `value` lists (one for a single value).
+fn spacedCount(value: &Value) -> usize {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => values.length()
+    _ => 1
+  }
+}
+
+/// Value `index` of a list of `spacedCount(value)` values.
+fn spacedItem(value: &Value, index: usize) -> &Value {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => &values.asSlice()[index]
+    _ => value
+  }
+}
+
+/// Which of `count` values (one to four) corner `corner` takes, top-left first, as `margin`
+/// repeats them.
+fn cornerPick(count: usize, corner: usize) -> usize {
+  if count == 1 {
+    return 0
+  }
+  if count == 2 {
+    return corner % 2
+  }
+  if count == 3 {
+    return if corner == 3 { 1 } else { corner }
+  }
+  return corner
+}
+
 /// A border width: a length, or `thin`, `medium`, `thick`.
 fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
@@ -1256,6 +1326,45 @@ impl Computed {
     }
   }
 
+  /// `border-radius`: one to four radii, then optionally a slash and one to four vertical radii.
+  fn radiusShorthand(self: &mut Self, value: &Value, context: &Context) -> () {
+    let mut horizontal = value
+    let mut vertical = value
+    let mut paired = false
+    match &value.* {
+      Value.Sequence { separator: Separator.Slash, values } => {
+        let items = values.asSlice()
+        if items.length != 2 {
+          return ()
+        }
+        horizontal = &items[0]
+        vertical = &items[1]
+        paired = true
+      }
+      _ => {}
+    }
+    let across = spacedCount(horizontal)
+    let down = spacedCount(vertical)
+    if across == 0 || across > 4 || down == 0 || down > 4 {
+      return ()
+    }
+    let mut corner: usize = 0
+    while corner < 4 {
+      let h = spacedItem(horizontal, cornerPick(across, corner))
+      let v = spacedItem(vertical, cornerPick(down, corner))
+      if corner == 0 {
+        setCornerPair(&mut self.paint.radii.topLeft, &mut self.effects, h, v, paired, context)
+      } else if corner == 1 {
+        setCornerPair(&mut self.paint.radii.topRight, &mut self.effects, h, v, paired, context)
+      } else if corner == 2 {
+        setCornerPair(&mut self.paint.radii.bottomRight, &mut self.effects, h, v, paired, context)
+      } else {
+        setCornerPair(&mut self.paint.radii.bottomLeft, &mut self.effects, h, v, paired, context)
+      }
+      corner = corner + 1
+    }
+  }
+
   /// Applies a shorthand of two longhands: one value for both, or one each.
   fn two(self: &mut Self, value: &Value, a: CssProperty, b: CssProperty, context: &Context) -> () {
     match &value.* {
@@ -1350,7 +1459,7 @@ impl Computed {
         self.four(value, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth, &context)
       }
       CssProperty.BorderRadius => {
-        self.four(value, CssProperty.BorderTopLeftRadius, CssProperty.BorderTopRightRadius, CssProperty.BorderBottomRightRadius, CssProperty.BorderBottomLeftRadius, &context)
+        self.radiusShorthand(value, &context)
       }
       // The tree paints one border color and style, so every side sets the same one.
       CssProperty.BorderColor => {
@@ -1752,16 +1861,16 @@ impl Computed {
         setBorderWidth(&mut self.paint.border.left, value, &context)
       }
       CssProperty.BorderTopLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context)
       }
       CssProperty.BorderTopRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context)
       }
       // Keywords.
       CssProperty.Position => {
