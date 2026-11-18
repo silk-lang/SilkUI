@@ -123,9 +123,29 @@ pub struct Computed {
   pub contain: Containment,
   /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
   pub anchor: AnchorStyle,
+  /// `user-select`: the declared keyword while the cascade runs, the used value after it
+  /// (see `usedUserSelect`). One of the `SELECT_` constants.
+  pub userSelect: u8,
 }
 
 impl Copy for Computed {}
+
+pub const SELECT_AUTO: u8 = 0
+pub const SELECT_TEXT: u8 = 1
+pub const SELECT_NONE: u8 = 2
+pub const SELECT_ALL: u8 = 3
+/// Selectable like `text`, and a scope that select-all and drags started inside stay in.
+pub const SELECT_CONTAIN: u8 = 4
+
+/// The used `user-select` (CSS UI 4 §6.1) of a node declaring `declared` under a parent whose
+/// used value is `parent`: `auto` takes `none` and `all` from the parent and is `text`
+/// otherwise. Inputs keep their own selection, so `auto` there is a contain scope.
+pub fn usedUserSelect(declared: u8, parent: u8, input: bool) -> u8 {
+  if declared != SELECT_AUTO { return declared }
+  if input { return SELECT_CONTAIN }
+  if parent == SELECT_NONE || parent == SELECT_ALL { return parent }
+  return SELECT_TEXT
+}
 
 /// `display: list-item`, `list-style-type` and `list-style-position`, and whether the node
 /// changes counters, in one byte. Type and position inherit (copied in the engine's
@@ -551,6 +571,8 @@ pub struct ScrollStyle {
   pub padding: Edges,
   /// `scrollbar-color`, which inherits.
   pub colors: ScrollbarColors,
+  /// `touch-action` as `TOUCH_*` bits: the gestures the tree may take for itself.
+  pub touch: u8,
 }
 
 /// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
@@ -610,6 +632,7 @@ impl ScrollStyle {
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
+      touch: TOUCH_AUTO,
     }
   }
 }
@@ -647,6 +670,62 @@ impl ScrollStyle {
   fn setSnapStop(self: &mut Self, always: bool) -> () {
     self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
   }
+}
+
+/// `ScrollStyle.touch` bits: the directions a touch may start panning in (`pan-left` is the
+/// finger moving right, the content scrolling left) and `pinch-zoom`.
+pub const TOUCH_PAN_LEFT: u8 = 1
+pub const TOUCH_PAN_RIGHT: u8 = 2
+pub const TOUCH_PAN_UP: u8 = 4
+pub const TOUCH_PAN_DOWN: u8 = 8
+pub const TOUCH_PINCH: u8 = 16
+pub const TOUCH_PAN_X: u8 = 3
+pub const TOUCH_PAN_Y: u8 = 12
+/// `auto` and `manipulation`: every gesture (the tree has no double-tap zoom to leave out).
+pub const TOUCH_AUTO: u8 = 31
+
+fn touchWord(word: Keyword) -> u8 {
+  return if word == Keyword.PanX { TOUCH_PAN_X }
+    else if word == Keyword.PanLeft { TOUCH_PAN_LEFT }
+    else if word == Keyword.PanRight { TOUCH_PAN_RIGHT }
+    else if word == Keyword.PanY { TOUCH_PAN_Y }
+    else if word == Keyword.PanUp { TOUCH_PAN_UP }
+    else if word == Keyword.PanDown { TOUCH_PAN_DOWN }
+    else if word == Keyword.PinchZoom { TOUCH_PINCH }
+    else { 0 }
+}
+
+/// `touch-action`: `auto`, `none`, `manipulation`, or up to one horizontal pan word, one
+/// vertical pan word and `pinch-zoom`, in any order.
+fn touchActionOf(value: &Value) -> Option<u8> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.Auto || word == Keyword.Manipulation { return Option<u8>.some(TOUCH_AUTO) }
+    if word == Keyword.None { return Option<u8>.some(0) }
+    let bits = touchWord(word)
+    return if bits == 0 { Option<u8>.None } else { Option<u8>.some(bits) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length > 3 { return Option<u8>.None }
+    let mut bits: u8 = 0
+    let mut i: usize = 0
+    while i < items.length {
+      let word = match convert.keywordOf(&items[i]) {
+        Option.Some { value: found } => found
+        Option.None => { return Option<u8>.None }
+      }
+      let one = touchWord(word)
+      // Each group (horizontal, vertical, pinch) may be named once.
+      let group: u8 = if u8.bitAnd(one, TOUCH_PAN_X) != 0 { TOUCH_PAN_X }
+        else if u8.bitAnd(one, TOUCH_PAN_Y) != 0 { TOUCH_PAN_Y }
+        else { one }
+      if one == 0 || u8.bitAnd(bits, group) != 0 { return Option<u8>.None }
+      bits = u8.bitOr(bits, one)
+      i = i + 1
+    }
+    return Option<u8>.some(bits)
+  }
+  return Option<u8>.None
 }
 
 /// `scroll-snap-type`: `none`, or an axis and an optional strictness.
@@ -1050,6 +1129,7 @@ impl Computed {
       contain: Containment.initial(),
       list: ListStyle.initial(),
       anchor: AnchorStyle.none(),
+      userSelect: SELECT_AUTO,
     }
   }
 
@@ -1455,6 +1535,9 @@ impl Computed {
       }
       CssProperty.ScrollSnapAlign => {
         if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
+      }
+      CssProperty.TouchAction => {
+        if let Option<u8>.Some { value: bits } = touchActionOf(value) { self.scroll.touch = bits }
       }
       CssProperty.ScrollSnapStop => {
         if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
@@ -2209,7 +2292,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.orphans = f32.toUsize(found)
+              self.text.orphans = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2219,7 +2302,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.widows = f32.toUsize(found)
+              self.text.widows = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2356,6 +2439,19 @@ impl Computed {
             self.paint.backdropBlur = f32.max(0.0, found)
           }
           Option.None => {}
+        }
+      }
+      CssProperty.UserSelect => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.userSelect = SELECT_AUTO
+        } else if convert.isKeyword(value, Keyword.Text) {
+          self.userSelect = SELECT_TEXT
+        } else if convert.isKeyword(value, Keyword.None) {
+          self.userSelect = SELECT_NONE
+        } else if convert.isKeyword(value, Keyword.All) {
+          self.userSelect = SELECT_ALL
+        } else if convert.isKeyword(value, Keyword.Contain) {
+          self.userSelect = SELECT_CONTAIN
         }
       }
       CssProperty.PointerEvents => {
@@ -2650,6 +2746,7 @@ impl Computed {
         0
       },
     )
+    h = Hash.combine(h, u8.toU64(self.userSelect))
     return h
   }
 
@@ -2676,8 +2773,8 @@ impl Computed {
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
     self.layout.tabSize = text.tabSize
-    self.layout.orphans = text.orphans
-    self.layout.widows = text.widows
+    self.layout.orphans = u32.toUsize(text.orphans)
+    self.layout.widows = u32.toUsize(text.widows)
   }
 }
 

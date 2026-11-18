@@ -15,7 +15,9 @@ import input {
   BUTTON_PRIMARY,
   BUTTON_AUXILIARY,
   BUTTON_SECONDARY,
-  BUTTON_BACK
+  BUTTON_BACK,
+  POINTER_PEN,
+  POINTER_TOUCH
 }
 import request { HostRequest as RawHostRequest }
 import rich { MarkSpan, Atom }
@@ -141,6 +143,15 @@ pub union Input {
   /// The press ended without a release the tree should act on: active states and pointer
   /// capture end, and no click follows.
   PointerCancel,
+  /// A finger touched the screen. `id` is the host's number for the touch while it is down,
+  /// `time` the host's frame clock in seconds.
+  TouchStart { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  TouchMove { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  TouchEnd { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  /// The system took touch `id`: its pointer is cancelled.
+  TouchCancel { pub id: u32 },
+  /// A trackpad pinch: `delta` is the change of the magnification, 0.1 for 10% larger.
+  Pinch { pub x: f32, pub y: f32, pub delta: f32, pub modifiers: Modifiers },
   /// A wheel or trackpad scroll. Positive `deltaY` scrolls down.
   Wheel { pub x: f32, pub y: f32, pub deltaX: f32, pub deltaY: f32, pub modifiers: Modifiers },
   KeyDown { pub key: String, pub code: String, pub modifiers: Modifiers, pub repeat: bool },
@@ -223,6 +234,34 @@ impl Input {
       }
       Input.PointerLeave => RawInput.PointerLeave
       Input.PointerCancel => RawInput.PointerCancel
+      Input.TouchStart { id, x, y, modifiers, time } => RawInput.TouchStart {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchMove { id, x, y, modifiers, time } => RawInput.TouchMove {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchEnd { id, x, y, modifiers, time } => RawInput.TouchEnd {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchCancel { id } => RawInput.TouchCancel { id: id }
+      Input.Pinch { x, y, delta, modifiers } => RawInput.Pinch {
+        x: x,
+        y: y,
+        delta: delta,
+        modifiers: modifiers.toBits(),
+      }
       Input.Wheel { x, y, deltaX, deltaY, modifiers } => RawInput.Wheel {
         x: x,
         y: y,
@@ -252,11 +291,43 @@ impl Input {
   }
 }
 
-/// Where the pointer was and which modifiers were held.
+/// What a pointer is, as DOM `PointerEvent.pointerType`.
+pub enum PointerKind {
+  Mouse,
+  Pen,
+  Touch,
+}
+
+impl PointerKind {
+  pub fn fromNumber(value: u32) -> PointerKind {
+    if value == POINTER_TOUCH {
+      return PointerKind.Touch
+    }
+    if value == POINTER_PEN {
+      return PointerKind.Pen
+    }
+    return PointerKind.Mouse
+  }
+
+  /// The DOM name: `"mouse"`, `"pen"` or `"touch"`.
+  pub fn name(self: Self) -> string<'static> {
+    return match self {
+      PointerKind.Mouse => "mouse"
+      PointerKind.Pen => "pen"
+      PointerKind.Touch => "touch"
+    }
+  }
+}
+
+/// Where the pointer was and which modifiers were held, and which pointer it was: `id` is
+/// DOM `pointerId` (1 for the mouse), `primary` DOM `isPrimary`.
 pub struct Pointer {
   pub x: f32,
   pub y: f32,
   pub modifiers: Modifiers,
+  pub id: u32,
+  pub kind: PointerKind,
+  pub primary: bool,
 }
 
 impl Copy for Pointer {}
@@ -433,6 +504,10 @@ pub union Event {
   PointerMove { pub pointer: Pointer },
   PointerEnter { pub pointer: Pointer },
   PointerLeave { pub pointer: Pointer },
+  /// The pointer moved onto the target from outside it, as DOM `pointerover`; bubbles.
+  PointerOver { pub pointer: Pointer },
+  /// The pointer moved off the target, as DOM `pointerout`; bubbles.
+  PointerOut { pub pointer: Pointer },
   /// Deltas are CSS pixels, positive down and right.
   Wheel { pub pointer: Pointer, pub deltaX: f32, pub deltaY: f32 },
   KeyDown { pub key: Key, pub repeat: bool },
@@ -496,6 +571,8 @@ impl Event {
       Event.PointerMove { .. } => EventKind.PointerMove
       Event.PointerEnter { .. } => EventKind.PointerEnter
       Event.PointerLeave { .. } => EventKind.PointerLeave
+      Event.PointerOver { .. } => EventKind.PointerOver
+      Event.PointerOut { .. } => EventKind.PointerOut
       Event.Wheel { .. } => EventKind.Wheel
       Event.KeyDown { .. } => EventKind.KeyDown
       Event.KeyUp { .. } => EventKind.KeyUp
@@ -560,7 +637,14 @@ impl EventRecord {
       run path.append(NodeId.of(ids[i]))
       i = i + 1
     }
-    let pointer = Pointer { x: raw.x, y: raw.y, modifiers: Modifiers.fromBits(raw.modifiers) }
+    let pointer = Pointer {
+      x: raw.x,
+      y: raw.y,
+      modifiers: Modifiers.fromBits(raw.modifiers),
+      id: raw.pointerId,
+      kind: PointerKind.fromNumber(raw.pointerType),
+      primary: raw.primary,
+    }
     let event = match raw.kind {
       EventKind.PointerDown => Event.PointerDown {
         pointer: pointer,
@@ -579,6 +663,8 @@ impl EventRecord {
       EventKind.PointerMove => Event.PointerMove { pointer: pointer }
       EventKind.PointerEnter => Event.PointerEnter { pointer: pointer }
       EventKind.PointerLeave => Event.PointerLeave { pointer: pointer }
+      EventKind.PointerOver => Event.PointerOver { pointer: pointer }
+      EventKind.PointerOut => Event.PointerOut { pointer: pointer }
       EventKind.Wheel => Event.Wheel { pointer: pointer, deltaX: raw.deltaX, deltaY: raw.deltaY }
       EventKind.KeyDown => Event.KeyDown {
         key: Key {
@@ -721,6 +807,8 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.AnimationEnd => 33554432
     EventKind.AnimationCancel => 67108864
     EventKind.SelectionChange => 134217728
+    EventKind.PointerOver => 268435456
+    EventKind.PointerOut => 536870912
   }
 }
 

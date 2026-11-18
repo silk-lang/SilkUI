@@ -19,10 +19,10 @@ if (!process.env.PARITY_BINARY) {
   });
 }
 const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
-const targets = await readdir(join(root, 'build/llvm'));
+const targets = await readdir(join(root, 'build'));
 const target = targets.find(name => name.startsWith(arch) && name.includes(
   process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'windows' : 'linux'));
-const binary = process.env.PARITY_BINARY ?? join(root, 'build/llvm', target, 'debug',
+const binary = process.env.PARITY_BINARY ?? join(root, 'build', target, 'dev',
   'ui-stylesheet-parity' + (process.platform === 'win32' ? '.exe' : ''));
 const native = JSON.parse(execFileSync(binary, { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }));
 assert.equal(native.cases.length, cases.length);

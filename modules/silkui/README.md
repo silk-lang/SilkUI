@@ -2,25 +2,26 @@
 
 The front door of Silk UI. A project defines its app once, in `silk/tasks.silk`, and builds and
 runs it with pipelines of steps: `silk task dev` opens it with the development tools, and
-`silk task build` writes the release program. silkui generates the Silk host for each target,
+`silk task build --release` writes the release program. silkui generates the Silk host for each target,
 so the project never assembles hosts, fonts, GPU start-up or bundles by hand.
 
 | Written in | Files the project owns | What silkui generates |
 | --- | --- | --- |
-| React, Foldkit, plain JS | `silk.toml`, `silk/tasks.silk`, the JavaScript in `js/`, and `package.json` and `vite.config.js` beside `silk.toml` | The window host in `.silk/window/`, with the bundle embedded in release builds |
-| Loom | `silk.toml`, `silk/tasks.silk`, `silk/app.silk` with the model, view and update | A host per target in `.silk/<target>/` that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
+| React, Foldkit, plain JS | `silk.toml`, `silk/tasks.silk`, the JavaScript in `js/`, and `package.json` and `vite.config.js` beside `silk.toml` | A generated window entry module, with the bundle embedded in release builds |
+| Loom | `silk.toml`, `silk/tasks.silk`, `silk/app.silk` with the model, view and update | An entry module per target that runs the app's `Model`: a window program, or a wasm program and the page that loads it |
 
 One root holds both projects, so `silk` and `npm` commands both run there. The manifest's
 `source = "silk"` points Silk at `silk/` (without it, Silk reads `src/`).
 
-`.silk/` is git-ignored (silkui writes its `.gitignore`) and rewritten on every build. It is
-readable: each host is a manifest and a `main.silk` of a few lines that call into
-[silkui-window](window).
+Generated modules and bundles are cached build steps. Each compilation uses the application's
+manifest and explicit dependencies; its entry module calls into [silkui-window](window) or
+the selected Loom host. `silk task plan` publishes compilation requests for editors without
+compiling the application.
 
 ## The app and the pipelines
 
 ```silk
-import silkui.app { App, Framework, Target, Window, Mode, Built, Running }
+import silkui.app { App, Framework, Target, Window, Built, Running }
 
 effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
   return run App.make("my-app")
@@ -29,14 +30,14 @@ effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
 }
 
 // in TaskSet.perform:
-Tasks.Dev { target } => run app()
-  |> App.only(String.view(&target))
-  |> App.build(Mode.Dev)
+Tasks.Dev { platform, options } => run app()
+  |> App.only(String.view(&platform))
+  |> App.dev(&options)
   |> Built.launch()
   |> Running.watch()
-Tasks.Build { target } => run app()
-  |> App.only(String.view(&target))
-  |> App.build(Mode.Release)
+Tasks.Build { platform, options } => run app()
+  |> App.only(String.view(&platform))
+  |> App.build(&options)
   |> Built.write("dist")
 ```
 
@@ -47,14 +48,13 @@ An app goes through three stages, and each step is scoped under the stage it tak
 
 | Step | Gives | What it does |
 | --- | --- | --- |
-| `App.only(id)` | App | Keeps only target `id` (a `--target` flag); empty keeps them all |
-| `App.bundle(mode)` | App | Runs `vite build` for a JavaScript app (in `Mode.Dev` on the Engine it only installs packages: the dev server serves the modules) |
-| `App.host(mode)` | App | Writes the host of each target into `.silk/<target>/`; `Mode.Dev` hosts have the development tools |
-| `App.compile(mode)` | Built | Runs `silk build` on each host |
-| `App.build(mode)` | Built | The three above, in order |
+| `App.only(id)` | App | Keeps only platform `id` (the `--platform` flag); empty keeps them all |
+| `app.compilations(&options)` | Build | Describes the selected hosts as standard compilations, with generated entry modules and release bundles as prerequisites; runs no tools |
+| `App.build(&options)` | Built | Compiles the graph without the development tools and assembles browser pages |
+| `App.dev(&options)` | Built | The same with the development tools, and it installs the Vite packages the dev server needs |
 | `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<project name>`, and each page to `<dir>/<target>/`, and lists them with their sizes and the build time |
 | `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
-| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change under `src/` of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
+| `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change in the Silk sources of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
 
 `App.tap(fn)`, `Built.tap(fn)` and `Running.tap(fn)` run a function on the value and pass it
 on; `App.map` and `Built.map` take an effect closure that makes a new value of the same
@@ -69,9 +69,13 @@ effect fn sign<'env, E, ?R>(built: once Effect<'env; Built ! E ? R>) -> Built ! 
 }
 ```
 
-`Mode.Release` and `Mode.Debug` builds never include the development tools: no reload, no
-development server, no inspector. `Mode.Debug` is the same program unoptimized, with debug
-information, as `silk build` makes without `--release`.
+Tasks flatten the standard `silk.build.graph.Options` flags: `--release` selects speed
+optimization, `--optimize` selects an optimization mode, `--debug` controls debug information,
+and `--target` selects a native target triple. `--platform` selects the UI host. Only
+`App.dev` builds include the development tools (reload, the development server, the
+inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptimized, as
+`silk build` makes it. Development builds optimize the renderer, inspector server and runtime
+packages while keeping the application unoptimized.
 
 ## The definition
 
@@ -156,57 +160,28 @@ that fills the page (Chrome or Edge 137 and later: the page waits on the GPU thr
 does layout and text.
 
 `build` writes a static site to `dist/<target>/`: `index.html`, `app.wasm` and the scripts that
-load it, which any static file server can serve. `dev --target web-canvas` (or `web-dom`) serves
-it from `.silk/<target>/site/`, rebuilds when `src/` changes, and the open page reloads itself.
+load it, which any static file server can serve. `dev --platform web-canvas` (or `web-dom`) serves
+it from `build/pages/<target>/site/`, rebuilds when `src/` changes, and the open page reloads itself.
 A `web-canvas` rebuild links the whole tree to wasm, which takes a minute or two; `web-dom`
 takes seconds.
 
 ## The project's manifest
 
-The tasks depend on silkui; the app does not. A JavaScript project has no Silk code of its own:
+The manifest names every package the tasks and generated hosts use. Start from the complete
+[JavaScript example](examples/js/silk.toml) or [Loom example](examples/loom/silk.toml),
+and preserve the dependency aliases when adapting it. No dependencies are inferred from a
+repository layout.
 
-```toml
-[package]
-name = "my-app"
-version = "0.1.0"
-silk-version = "0.1.0-dev.74+205aea3f5b2e"
-
-[profiles.tasks.dependencies]
-silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "…", path = "modules/silkui", package = "silkui" }
-```
-
-A Loom project is a library whose `app` module is the app, so the generated host can import
-it:
-
-```toml
-[package]
-name = "my-app"
-version = "0.1.0"
-silk-version = "0.1.0-dev.74+205aea3f5b2e"
-kind = "library"
-main = "app.silk"
-exports = ["app"]
-
-[dependencies]
-loom = { git = "https://github.com/silk-lang/loom.git", rev = "…", path = "modules/loom", package = "loom" }
-
-[profiles.tasks]
-main = "tasks.silk"
-
-[profiles.tasks.dependencies]
-silkui = { git = "https://github.com/silk-lang/silkui.git", rev = "…", path = "modules/silkui", package = "silkui" }
-```
+A JavaScript project's entry point is `tasks.silk`. It lists `silkui`, the window hosts,
+`ui_tree`, `ui_inspect_server`, `silkjs` and `node_runtime`. A Loom project is a library
+with `main = "app.silk"` and `exports = ["app"]`; it also lists the Loom window and web hosts
+and their platform dependencies. The examples pin compatible Git revisions so each package
+has one identity throughout the graph.
 
 A JavaScript project that imports Silk functions (`import { add } from "../silk/math.silk"`)
 is a library in the same way: its `exports` are the modules JavaScript can import. silkui
 describes them into `.silk/natives/` before it runs Vite, and the host depends on the project
 and hands the bridge their dispatcher. [examples/native](examples/native) is one.
-
-The generated hosts depend on `silkui-window` from the same place as the `silkui` dependency,
-so they always match it. A Loom app's hosts run Loom's targets (`silkui-window-loom`,
-`silkui-web-canvas`, `silkui-web-dom`), which live in [the Loom repository](https://github.com/silk-lang/loom)
-under `modules/silkui`; they come from the same place as the app's `loom` dependency, so the
-app and its host share one Loom. That dependency's `path` must end in `modules/loom`.
 
 ## Limits
 
