@@ -15,7 +15,7 @@ import container_watch
 import style_change
 import style_change { Change }
 import container_watch { Watch }
-import style_media { Preferences }
+import style_media { Preferences, MediaState }
 import properties.convert as properties_convert
 import properties.convert { Context }
 import properties.catalog
@@ -33,6 +33,8 @@ import cssom_view { ScrollAnimation }
 import scroll_snap
 import css_anchor
 import scroll_snap { SnapWait }
+import scroll_anchor
+import scroll_anchor { ScrollAnchor }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
@@ -816,6 +818,8 @@ pub struct UiTree<'a> {
   pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
+  /// Scroll containers away from their block start and their anchors (see `scroll_anchor`).
+  pub scrollAnchors: List<ScrollAnchor>,
   /// The last `Node.styleClass` handed out.
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
@@ -1036,6 +1040,7 @@ impl<'a> UiTree<'a> {
       cssAnchorUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
+      scrollAnchors: List<ScrollAnchor>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
       computedStamps: 0,
@@ -1702,6 +1707,9 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let before = self.current
+    if self.laidOutCurrent() && !self.stylesDirty && !self.stylesPending {
+      run scroll_anchor.select(&mut self)
+    }
     run self.applyAll(move batch)
     run edit.reportSelection(&mut self)
     if self.current != before && self.rootOpen(before) {
@@ -3751,7 +3759,7 @@ impl<'a> UiTree<'a> {
       drop run self.useRoot(keyed)
     }
     let interruptsScroll = match &input {
-      Input.Wheel { .. } => true
+      Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
       Input.KeyDown { .. } => true
       _ => false
@@ -3777,7 +3785,7 @@ impl<'a> UiTree<'a> {
     }
     self.pendingRoot = self.current
     let interruptsScroll = match &input.* {
-      Input.Wheel { .. } => true
+      Input.Wheel { deltaX, deltaY, .. } => !scroll_snap.continuesFling(&self.*, deltaX, deltaY)
       Input.PointerDown { .. } => true
       Input.KeyDown { .. } => true
       _ => false
@@ -3830,8 +3838,10 @@ impl<'a> UiTree<'a> {
     self.viewScrollState.interruptTarget(
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
+    let fromX = self.node(slot).scrollX
+    let fromY = self.node(slot).scrollY
     run interact.scrolledElsewhere(&mut self, slot, x, y)
-    run scroll_snap.userScrolled(&mut self, slot)
+    run scroll_snap.userScrolled(&mut self, slot, fromX, fromY, false)
   }
 
   pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
@@ -4413,6 +4423,22 @@ impl<'a> UiTree<'a> {
       }
       slot = slot + 1
     }
+  }
+
+  /// The media `input` gives the current root's stylesheets: what a script's `matchMedia`
+  /// evaluates its queries against.
+  pub fn mediaState(self: &Self, input: FrameInput) -> MediaState {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let mut environment = Environment.headless(0.0, 0.0)
+    if at != usize.MAX {
+      environment = self.styleSheets.asSlice()[at].environment
+    } else if let Option<Preferences>.Some { value } = &self.hostStylePreferences {
+      value.apply(&mut environment)
+    }
+    environment.initial.viewportWidth = f32.toF64(input.width)
+    environment.initial.viewportHeight = f32.toF64(input.height)
+    environment.resolutionDppx = f32.toF64(input.scale)
+    return MediaState.of(environment)
   }
 
   /// Updates host media inputs without restyling until a condition changes truth.
@@ -5759,6 +5785,17 @@ impl<'a> UiTree<'a> {
 
   // Frames.
 
+  /// Whether the last layout still describes css-layout's tree: no change since.
+  pub fn laidOutCurrent(self: &Self) -> bool {
+    return self.layout.revision() == self.laidOutRevision
+  }
+
+  /// Whether the last layout has a fragment for every node it could: no node was created or
+  /// moved since, though styles may have changed.
+  pub fn laidOutNodes(self: &Self) -> bool {
+    return self.laidOutRevision != usize.MAX && self.layout.structureRevision() <= self.laidOutRevision
+  }
+
   /// Whether a frame would draw something new: styles, layout or scroll offsets changed, or a
   /// scroll into view waits. Hosts that draw only on demand ask after applying batches and
   /// dispatching input.
@@ -5804,6 +5841,9 @@ impl<'a> UiTree<'a> {
     run animation.tick(&mut self)
     style_change.begin(&mut self)
     run self.resolveStyles()
+    if self.laidOutNodes() {
+      run scroll_anchor.select(&mut self)
+    }
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
@@ -5830,6 +5870,9 @@ impl<'a> UiTree<'a> {
     run self.settleAnchors()
     run self.finishStyleChange()
     run self.notifyLayout()
+    if self.laidOutCurrent() {
+      run scroll_anchor.select(&mut self)
+    }
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
     run self.paintFrame()
@@ -5971,6 +6014,9 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     style_change.begin(&mut self)
     run self.resolveStyles()
+    if self.laidOutNodes() {
+      run scroll_anchor.select(&mut self)
+    }
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     if run interact.settleScrolls(&mut self) {
@@ -5979,6 +6025,9 @@ impl<'a> UiTree<'a> {
     run self.settleVirtual()
     run self.settleAnchors()
     run self.finishStyleChange()
+    if self.laidOutCurrent() {
+      run scroll_anchor.select(&mut self)
+    }
   }
 
   effect fn refineContainers(self: &mut Self) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -6074,6 +6123,7 @@ impl<'a> UiTree<'a> {
     self.stats.layoutSkipped = false
     if !moved {
       run self.indexFragments()
+      if self.scrollAnchors.length() != 0 { run scroll_anchor.adjust(&mut self) }
     }
     self.layoutObserversDirty = true
     return !moved

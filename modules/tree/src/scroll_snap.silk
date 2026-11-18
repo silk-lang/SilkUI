@@ -3,7 +3,11 @@
 //! with the scrollport (shrunk by `scroll-padding`).
 //!
 //! A user scroll (wheel, keys, a scrollbar thumb, a compositor scroll) snaps once it has been
-//! still for `IDLE`, with a smooth scroll. A script scroll snaps its destination right away.
+//! still for `IDLE`, with a smooth scroll. A wheel stream that slows down the way momentum does
+//! (a fling) is aimed at once: the tree predicts where it would come to rest, scrolls smoothly
+//! to the snap position there, and takes the rest of the fling. A user scroll never passes an
+//! area with `scroll-snap-stop: always`: it stops on the first one past where it started.
+//! A script scroll snaps its destination right away.
 //! After a layout, a mandatory container that no longer rests on a snap position goes back to
 //! one (Scroll Snap 1 §5.1).
 import engine { UiTree }
@@ -22,11 +26,28 @@ import silk.num.f64
 /// momentum events, short enough to feel like the end of the gesture.
 pub const IDLE: f64 = 0.12
 
+/// Below this gap, in seconds, wheel events are one stream whose speed is measured.
+const STREAM: f64 = 0.05
+/// Wheel events of a stream before a fling can be recognised.
+const FLING_EVENTS: u32 = 4
+/// The least speed, in pixels a second, of a fling.
+const FLING_SPEED: f32 = 300.0
+
 /// A container a user scrolled, and when.
 pub struct SnapWait {
   pub slot: u32,
   pub id: u32,
   pub time: f64,
+  /// The offset before the gesture, for `scroll-snap-stop: always`.
+  pub fromX: f32,
+  pub fromY: f32,
+  /// The measured speed, in pixels a second, the speed before it, and events in the stream.
+  pub vx: f32,
+  pub vy: f32,
+  pub speed: f32,
+  pub events: u32,
+  /// A fling is aimed: the rest of it goes nowhere.
+  pub aimed: bool,
 }
 
 impl Copy for SnapWait {}
@@ -36,8 +57,22 @@ fn container(tree: &UiTree<'_>, slot: u32) -> bool {
   return s.snapsX() || s.snapsY()
 }
 
-/// A user scrolled `slot`: snap it once scrolling stops.
-pub effect fn userScrolled(tree: &mut UiTree<'_>, slot: u32) -> ()
+fn waitOf(tree: &UiTree<'_>, slot: u32) -> usize {
+  let id = tree.node(slot).id
+  let mut i: usize = 0
+  while i < tree.snapWaits.length() {
+    let wait = tree.snapWaits.get(i)
+    if wait.slot == slot && wait.id == id {
+      return i
+    }
+    i = i + 1
+  }
+  return NO_INDEX
+}
+
+/// A user scrolled `slot` from (`fromX`, `fromY`): snap it once scrolling stops. `stream` is
+/// a wheel scroll the tree made, whose fling it may aim.
+pub effect fn userScrolled(tree: &mut UiTree<'_>, slot: u32, fromX: f32, fromY: f32, stream: bool) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !tree.snapUsed || !container(&tree.*, slot) {
@@ -45,16 +80,92 @@ pub effect fn userScrolled(tree: &mut UiTree<'_>, slot: u32) -> ()
   }
   let time = tree.input.time
   let id = tree.node(slot).id
+  let x = tree.node(slot).scrollX
+  let y = tree.node(slot).scrollY
+  let at = waitOf(&tree.*, slot)
+  if at == NO_INDEX {
+    run tree.snapWaits.append(SnapWait { slot: slot, id: id, time: time, fromX: fromX, fromY: fromY,
+      vx: 0.0, vy: 0.0, speed: 0.0, events: 1, aimed: false })
+    return ()
+  }
+  let mut wait = tree.snapWaits.get(at)
+  let gap = time - wait.time
+  wait.time = time
+  if !stream || gap <= 0.0 || gap > STREAM {
+    wait.events = 1
+    wait.vx = 0.0
+    wait.vy = 0.0
+    wait.speed = 0.0
+    tree.snapWaits.set(at, wait)
+    return ()
+  }
+  let dt = f64.toF32(gap)
+  let mut vx = (x - fromX) / dt
+  let mut vy = (y - fromY) / dt
+  if wait.events > 1 {
+    vx = (vx + wait.vx) * 0.5
+    vy = (vy + wait.vy) * 0.5
+  }
+  let speed = f32.sqrt(vx * vx + vy * vy)
+  let slowing = wait.events >= FLING_EVENTS && speed > FLING_SPEED && speed < wait.speed
+    && vx * wait.vx >= 0.0 && vy * wait.vy >= 0.0
+  // Momentum decays exponentially: the speeds of two events give its time constant, and the
+  // distance left is the speed times it.
+  let tau: f32 = if slowing { f32.max(0.05, f32.min(1.0, dt / f32.log(wait.speed / speed))) } else { 0.0 }
+  wait.events = wait.events + 1
+  wait.vx = vx
+  wait.vy = vy
+  wait.speed = speed
+  if slowing && !wait.aimed {
+    wait.aimed = true
+    tree.snapWaits.set(at, wait)
+    let target = run aimedAt(&tree.*, slot, x + vx * tau, y + vy * tau, wait.fromX, wait.fromY)
+    if f32.abs(target[0] - x) >= 0.5 || f32.abs(target[1] - y) >= 0.5 {
+      run cssom_view.snapTo(&mut tree.*, slot, target[0], target[1], true)
+    }
+    return ()
+  }
+  tree.snapWaits.set(at, wait)
+}
+
+/// Whether a wheel scroll by (`dx`, `dy`) goes on with an aimed fling, so it leaves the smooth
+/// scroll to the snap position running.
+pub fn continuesFling(tree: &UiTree<'_>, dx: f32, dy: f32) -> bool {
   let mut i: usize = 0
   while i < tree.snapWaits.length() {
     let wait = tree.snapWaits.get(i)
-    if wait.slot == slot && wait.id == id {
-      tree.snapWaits.set(i, SnapWait { slot: slot, id: id, time: time })
-      return ()
+    if wait.aimed && tree.input.time - wait.time <= IDLE && dx * wait.vx >= 0.0 && dy * wait.vy >= 0.0 {
+      return true
     }
     i = i + 1
   }
-  run tree.snapWaits.append(SnapWait { slot: slot, id: id, time: time })
+  return false
+}
+
+/// Whether a wheel scroll of `slot` by (`dx`, `dy`) is the rest of an aimed fling, which goes
+/// nowhere. A scroll the other way, or after a pause, ends the fling.
+pub fn absorbs(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool {
+  if !tree.snapUsed || tree.snapWaits.length() == 0 {
+    return false
+  }
+  let at = waitOf(&tree.*, slot)
+  if at == NO_INDEX {
+    return false
+  }
+  let mut wait = tree.snapWaits.get(at)
+  if !wait.aimed {
+    return false
+  }
+  let gap = tree.input.time - wait.time
+  if gap > IDLE || dx * wait.vx < 0.0 || dy * wait.vy < 0.0 {
+    wait.aimed = false
+    wait.events = 0
+    tree.snapWaits.set(at, wait)
+    return false
+  }
+  wait.time = tree.input.time
+  tree.snapWaits.set(at, wait)
+  return true
 }
 
 /// Whether a user scroll waits to snap: the host keeps drawing frames until it has.
@@ -65,6 +176,28 @@ pub fn waiting(tree: &UiTree<'_>) -> bool {
 /// The snapped destination of a scroll of `slot` to (`x`, `y`), or (`x`, `y`) when `slot` is
 /// not a snap container or no snap position is close enough.
 pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run choose(tree, slot, x, y, x, y)
+}
+
+/// The destination of a user scroll of `slot` from (`fromX`, `fromY`) that would come to rest at
+/// (`x`, `y`): the nearest snap position, unless it passes an area with `scroll-snap-stop:
+/// always` first.
+pub effect fn aimedAt(tree: &UiTree<'_>, slot: u32, x: f32, y: f32, fromX: f32, fromY: f32) -> [f32; 2]
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run choose(tree, slot, x, y, fromX, fromY)
+}
+
+/// Whether `candidate` lies past `from` on the way to `to`, and closer to `from` than `stop`.
+fn passes(candidate: f32, from: f32, to: f32, stop: f32) -> bool {
+  if to > from + 0.5 { return candidate > from + 0.5 && candidate < to - 0.5 && candidate < stop }
+  if to < from - 0.5 { return candidate < from - 0.5 && candidate > to + 0.5 && candidate > stop }
+  return false
+}
+
+effect fn choose(tree: &UiTree<'_>, slot: u32, x: f32, y: f32, fromX: f32, fromY: f32) -> [f32; 2]
   ! OutOfMemoryError
   ? &mut Allocator {
   if !tree.snapUsed || !container(tree, slot) {
@@ -87,6 +220,9 @@ pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
   let atY = tree.node(slot).scrollY
   let mut best = [x, y]
   let mut bestDistance = [f32.INFINITY, f32.INFINITY]
+  // The first `scroll-snap-stop: always` position the scroll passes, per axis.
+  let mut stop = [if x > fromX { f32.INFINITY } else { -f32.INFINITY }, if y > fromY { f32.INFINITY } else { -f32.INFINITY }]
+  let mut stopped = [false, false]
   let mut stack = List<u32>.make()
   let mut children = List<u32>.make()
   run tree.childSlots(slot, &mut children)
@@ -106,6 +242,10 @@ pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
         let area = Rect<f32>.new(b.xMin - m.left, b.yMin - m.top, b.xMax + m.right, b.yMax + m.bottom)
         if snapX && ax != SNAP_NONE {
           let candidate = range.clampX(atX + shift(ax, area.xMin, area.xMax, port.xMin, port.xMax))
+          if ic.scroll.snapStop() && passes(candidate, fromX, x, stop[0]) {
+            stop[0] = candidate
+            stopped[0] = true
+          }
           let distance = f32.abs(candidate - x)
           if distance < bestDistance[0] {
             bestDistance[0] = distance
@@ -114,6 +254,10 @@ pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
         }
         if snapY && ay != SNAP_NONE {
           let candidate = range.clampY(atY + shift(ay, area.yMin, area.yMax, port.yMin, port.yMax))
+          if ic.scroll.snapStop() && passes(candidate, fromY, y, stop[1]) {
+            stop[1] = candidate
+            stopped[1] = true
+          }
           let distance = f32.abs(candidate - y)
           if distance < bestDistance[1] {
             bestDistance[1] = distance
@@ -133,6 +277,9 @@ pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
     if bestDistance[0] > port.width() / 3.0 { best[0] = x }
     if bestDistance[1] > port.height() / 3.0 { best[1] = y }
   }
+  // An `always` area is a snap position the scroll may not pass, whatever the strictness.
+  if stopped[0] && ((x > fromX && best[0] > stop[0]) || (x < fromX && best[0] < stop[0])) { best[0] = stop[0] }
+  if stopped[1] && ((y > fromY && best[1] > stop[1]) || (y < fromY && best[1] < stop[1])) { best[1] = stop[1] }
   return best
 }
 
@@ -181,11 +328,11 @@ pub effect fn settle(tree: &mut UiTree<'_>) -> ()
       || tree.node(wait.slot).id != wait.id
     if gone {
       drop tree.snapWaits.remove(i)
-    } else if tree.thumbSlot == wait.slot || now - wait.time < IDLE {
+    } else if tree.thumbSlot == wait.slot || now - wait.time < IDLE || cssom_view.animatesSlot(&tree.*, wait.slot) {
       i = i + 1
     } else {
       drop tree.snapWaits.remove(i)
-      drop run snapNow(&mut tree, wait.slot, true)
+      drop run snapFrom(&mut tree, wait.slot, wait.fromX, wait.fromY)
     }
   }
 }
@@ -222,6 +369,19 @@ fn busy(tree: &UiTree<'_>, slot: u32) -> bool {
     i = i + 1
   }
   return cssom_view.animatesSlot(tree, slot)
+}
+
+effect fn snapFrom(tree: &mut UiTree<'_>, slot: u32, fromX: f32, fromY: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let x = tree.node(slot).scrollX
+  let y = tree.node(slot).scrollY
+  let target = run choose(&tree.*, slot, x, y, fromX, fromY)
+  if f32.abs(target[0] - x) < 0.5 && f32.abs(target[1] - y) < 0.5 {
+    return false
+  }
+  run cssom_view.snapTo(&mut tree.*, slot, target[0], target[1], true)
+  return true
 }
 
 effect fn snapNow(tree: &mut UiTree<'_>, slot: u32, smooth: bool) -> bool
