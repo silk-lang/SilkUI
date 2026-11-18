@@ -96,6 +96,7 @@ import lists
 import first_letter
 import lists { Scope }
 import paint_css { Effects }
+import offset_path
 import paint_css
 import font_units
 import font_units { Source as FontSource }
@@ -663,6 +664,9 @@ pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaratio
   let text = run values.cssText(&declaration.value)
   let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
+  if which == transform.OFFSET_PATH_PROPERTY && computed.transform.offset.path == transform.PATH_SHAPE {
+    computed.effects.declared = true
+  }
   if !computed.usesViewport && style.viewportDependent(declaration) {
     computed.usesViewport = true
   }
@@ -684,6 +688,12 @@ fn transformProperty(property: CssProperty) -> u32 {
     CssProperty.Perspective => transform.PERSPECTIVE_PROPERTY
     CssProperty.PerspectiveOrigin => transform.PERSPECTIVE_ORIGIN_PROPERTY
     CssProperty.BackfaceVisibility => transform.BACKFACE_PROPERTY
+    CssProperty.OffsetPath => transform.OFFSET_PATH_PROPERTY
+    CssProperty.OffsetDistance => transform.OFFSET_DISTANCE_PROPERTY
+    CssProperty.OffsetRotate => transform.OFFSET_ROTATE_PROPERTY
+    CssProperty.OffsetAnchor => transform.OFFSET_ANCHOR_PROPERTY
+    CssProperty.OffsetPosition => transform.OFFSET_POSITION_PROPERTY
+    CssProperty.TransformStyle => transform.TRANSFORM_STYLE_PROPERTY
     _ => NONE
   }
 }
@@ -837,6 +847,11 @@ pub struct UiTree<'a> {
   pub snapUsed: bool,
   /// A style used anchor positioning (`anchor-name` or an anchored box).
   pub cssAnchorUsed: bool,
+  /// A style used `offset-path` (see `offset_path.settle`).
+  pub offsetUsed: bool,
+  /// Whether some style ever set `transform-style: preserve-3d`: until then paint and hit
+  /// testing skip the 3D rendering context checks.
+  pub preserveUsed: bool,
   pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
@@ -1086,6 +1101,8 @@ impl<'a> UiTree<'a> {
       firstLines: List<first_letter.FirstLine>.make(),
       snapUsed: false,
       cssAnchorUsed: false,
+      offsetUsed: false,
+      preserveUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
       scrollAnchors: List<ScrollAnchor>.make(),
@@ -2686,6 +2703,7 @@ impl<'a> UiTree<'a> {
       content: 1,
       editing: move editing,
       effects: Option<Box<Effects>>.None,
+      offsetPlaced: Option<transform.Placement>.None,
       semantics: Option<Box<Semantics>>.None,
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -5806,6 +5824,8 @@ impl<'a> UiTree<'a> {
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
+    if computed.transform.offset.path != transform.PATH_NONE { self.offsetUsed = true }
+    if computed.transform.preserve3d { self.preserveUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     if computed.anchor.name != 0 || computed.anchor.anchored() {
@@ -6379,6 +6399,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     run self.notifyLayout()
     if self.laidOutCurrent() {
@@ -6535,6 +6556,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     if self.laidOutCurrent() {
       run scroll_anchor.select(&mut self)
@@ -6862,6 +6884,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6907,6 +6930,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6981,6 +7005,7 @@ impl<'a> UiTree<'a> {
       seed: self.seed,
       only: slot,
       inside: false,
+      planes: self.preserveUsed,
     }
     run paintRoots(&mut painter, window)
     drop painter

@@ -44,7 +44,7 @@ import layout.lib { Fragment, FragmentKind, InvalidNode }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import silk.geometry.point { Point2 }
+import silk.geometry.point { Point2, Point3 }
 import transform
 import silk.geometry.rect { Rect }
 import layers
@@ -122,12 +122,12 @@ fn inside(rect: Rect<f32>, x: f32, y: f32) -> bool {
 /// transform flattens it, the point maps behind the viewer, or it shows a hidden back face.
 fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f32>> {
   let point = Point2<f32> { x: x, y: y }
-  match layers.transformOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+  if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+    return Option<Point2<f32>>.None
+  }
+  match layers.flatOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
     Option.Some { value } => {
-      if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
-        return Option<Point2<f32>>.None
-      }
-      return match transform.flatten(value).inverse() {
+      return match value.inverse() {
         Option.Some { value: inverse } => transform.map(&inverse, x, y)
         Option.None => Option<Point2<f32>>.None
       }
@@ -167,13 +167,59 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) 
   if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
   }
+  // A plane of a 3D rendering context is hit through the context's root, by depth.
+  if tree.preserveUsed {
+    if layers.planeParent(&tree.output, &tree.slotOfCss, &tree.nodes, index) != NO_INDEX {
+      return NONE
+    }
+    if layers.establishes(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+      return hitContext(tree, index, px, py)
+    }
+  }
   let local = intoLocal(tree, index, px, py)
   if local.isNone() {
     return NONE
   }
   let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
-  let x = point.x
-  let y = point.y
+  return hitPlane(tree, index, point.x, point.y, pruned)
+}
+
+/// The frontmost target under (`px`, `py`), in the space around fragment `root`, among the
+/// planes of the 3D rendering context `root` establishes: each plane's own content is hit
+/// where the point meets it, and the nearest plane hit wins (the later one in tree order
+/// between coplanar ones), as in Chromium.
+fn hitContext(tree: &UiTree<'_>, root: usize, px: f32, py: f32) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let mut best = NONE
+  let mut bestDepth: f32 = 0.0
+  let end = values[root].nextSibling
+  let mut at = root
+  while at != NO_INDEX && at != end {
+    if layers.contextOf(&tree.output, &tree.slotOfCss, &tree.nodes, at) == root
+      && !layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, at) {
+      let m = layers.accumulated(&tree.output, &tree.slotOfCss, &tree.nodes, at)
+      if let Option.Some { value: inverse } = transform.flatten(m).inverse() {
+        if let Option.Some { value: local } = transform.map(&inverse, px, py) {
+          let h = m.transformHomogeneous(Point3<f32> { x: local.x, y: local.y, z: 0.0 })
+          let depth: f32 = if h[3] != 0.0 { h[2] / h[3] } else { 0.0 }
+          if best == NONE || depth >= bestDepth - 0.05 {
+            let found = hitPlane(tree, at, local.x, local.y, false)
+            if found != NONE {
+              best = found
+              bestDepth = depth
+            }
+          }
+        }
+      }
+    }
+    at = layers.nextInTree(&tree.output, at, root)
+  }
+  return best
+}
+
+/// The topmost target under (`x`, `y`), in fragment `index`'s own layout space, in it and its
+/// descendants.
+fn hitPlane(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
     return hitInside(tree, index, x, y, pruned)
