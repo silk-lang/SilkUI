@@ -178,6 +178,7 @@ import silk.num.f64
 import silk.num.u64
 import ui_tree.input { Input, BUTTON_PRIMARY }
 import ui_tree.inspect { info, NodeInfo }
+import ui_tree.digest { digestLayout, DigestBox, DigestText }
 import ui_tree.node { NONE }
 import silk.geometry.rect { Rect }
 
@@ -2334,7 +2335,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
           &((setupEnd - started) * 1000.0, (startEnd - setupEnd) * 1000.0, (layoutStart - startEnd) * 1000.0),
         )
         if let Option<String>.Some { value: wanted } = move run environmentVariable("SILK_UI_BENCH_DIGEST") {
-          benchDigest(&tree, String.view(&wanted) == "dump")
+          run benchDigest(&tree, String.view(&wanted) == "dump")
         }
       } else {
         // `SILK_UI_BENCH_TRACE=<ms>`: one line for each frame whose layout step took that long.
@@ -2412,73 +2413,92 @@ fn digestMix(hash: u64, value: f32) -> u64 {
   return u64.wrappingMultiply(u64.bitXor(hash, u32.toU64(f32.toBits(value))), 1099511628211)
 }
 
-/// SILK_UI_BENCH_DIGEST prints digests of the first frame's layout, to compare builds:
-/// `boxes` over every fragment that is not text (where it is, its size and overflow), `glyphs`
-/// over every glyph in fragment order (its node, glyph, cluster, advance and where it draws, to
-/// 1/64 pixel), which does not depend on how glyphs are grouped into fragments, and `runs`
-/// over the text fragments themselves (their source ranges and exact glyph values).
-fn benchDigest(tree: &UiTree<'_>, dump: bool) -> () {
-  let fragments = tree.output.fragments.values.asSlice()
-  let mut boxes: u64 = 14695981039346656037
-  let mut glyphsDigest: u64 = 14695981039346656037
-  let mut runs: u64 = 14695981039346656037
-  let mut boxCount: usize = 0
-  let mut textCount: usize = 0
+/// SILK_UI_BENCH_DIGEST prints digests of the first frame's layout, to compare builds. None of
+/// them depends on how css-layout stores lines of text (see `ui_tree.digest`):
+/// `boxes` over every box and inline box in fragment order (where it is, its size and overflow);
+/// `glyphs` over every glyph in paint order (its node, glyph, cluster, advance and where it
+/// draws, to 1/64 pixel), which does not depend on how glyphs are grouped into runs either;
+/// `runs` over the runs of text in paint order (source range, box, baseline, the line box they
+/// sit on, and exact glyph values). `glyph-set` and `run-set` are the same in no order: they
+/// stay equal when only the order of runs differs.
+effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut boxList = List<DigestBox>.make()
+  let mut textList = List<DigestText>.make()
+  let counts = run digestLayout(tree, &mut boxList, &mut textList)
+  let seed: u64 = 14695981039346656037
+  let mut boxes: u64 = seed
+  let mut glyphsDigest: u64 = seed
+  let mut glyphSet: u64 = 0
+  let mut runs: u64 = seed
+  let mut runSet: u64 = 0
   let mut glyphCount: usize = 0
   let mut index: usize = 0
-  while index < fragments.length {
-    let fragment = &fragments[index]
-    if fragment.textData == usize.MAX {
-      boxCount = boxCount + 1
-      boxes = digestMix(digestMix(digestMix(digestMix(boxes, fragment.worldLocation.x), fragment.worldLocation.y), fragment.size.width), fragment.size.height)
-      boxes = digestMix(digestMix(boxes, fragment.scrollableOverflow.width), fragment.scrollableOverflow.height)
-    } else {
-      textCount = textCount + 1
-      let text = tree.output.fragments.texts.get(fragment.textData)
-      runs = digestMix(digestMix(digestMix(runs, usize.toF32(fragment.source)), usize.toF32(text.sourceStart)), usize.toF32(text.sourceEnd))
-      runs = digestMix(digestMix(digestMix(digestMix(runs, fragment.worldLocation.x), fragment.worldLocation.y), fragment.size.width), fragment.size.height)
-      if text.shapeKey >= tree.provider.text.glyphs.length() {
-        index = index + 1
-        continue
-      }
+  while index < boxList.length() {
+    let box = boxList.get(index)
+    boxes = digestMix(boxes, if box.inline { 2.0 } else { 1.0 })
+    boxes = digestMix(digestMix(digestMix(digestMix(boxes, box.x), box.y), box.width), box.height)
+    boxes = digestMix(digestMix(boxes, box.overflowWidth), box.overflowHeight)
+    index = index + 1
+  }
+  index = 0
+  while index < textList.length() {
+    let text = textList.get(index)
+    let mut mixed: u64 = seed
+    mixed = digestMix(digestMix(digestMix(mixed, usize.toF32(text.source)), usize.toF32(text.start)), usize.toF32(text.end))
+    mixed = digestMix(digestMix(digestMix(digestMix(mixed, text.x), text.y), text.width), text.height)
+    mixed = digestMix(digestMix(digestMix(mixed, text.baseline), text.lineTop), text.lineHeight)
+    mixed = digestMix(digestMix(digestMix(mixed, usize.toF32(text.fontKey)), usize.toF32(text.kind)), usize.toF32(text.bidiLevel))
+    let mut pen: f32 = 0.0
+    let mut ids: u64 = 0
+    let mut length: usize = 0
+    if text.shapeKey < tree.provider.text.glyphs.length() {
       let glyphs = tree.provider.text.glyphs.glyphsOf(text.shapeKey)
-      let mut pen: f32 = 0.0
+      length = glyphs.length
       let mut glyph: usize = 0
       while glyph < glyphs.length {
         let entry = glyphs[glyph]
         // A glyph's cluster counts from its run's start: the offset in the text node is digested.
-        let cluster = text.sourceStart + u32.toUsize(entry.cluster)
-        runs = digestMix(digestMix(digestMix(digestMix(digestMix(runs, u32.toF32(entry.glyph)), usize.toF32(cluster)), entry.x), entry.y), entry.advance)
-        glyphsDigest = digestMix(digestMix(digestMix(glyphsDigest, usize.toF32(fragment.source)), u32.toF32(entry.glyph)), usize.toF32(cluster))
-        glyphsDigest = digestMix(glyphsDigest, f32.floor((fragment.worldLocation.x + entry.x) * 64.0 + 0.5))
-        glyphsDigest = digestMix(glyphsDigest, f32.floor((fragment.worldLocation.y + entry.y) * 64.0 + 0.5))
-        glyphsDigest = digestMix(glyphsDigest, f32.floor(entry.advance * 64.0 + 0.5))
+        let cluster = text.start + u32.toUsize(entry.cluster)
+        mixed = digestMix(digestMix(digestMix(digestMix(digestMix(mixed, u32.toF32(entry.glyph)), usize.toF32(cluster)), entry.x), entry.y), entry.advance)
+        let mut one: u64 = seed
+        one = digestMix(digestMix(digestMix(one, usize.toF32(text.source)), u32.toF32(entry.glyph)), usize.toF32(cluster))
+        one = digestMix(one, f32.floor((text.x + entry.x) * 64.0 + 0.5))
+        one = digestMix(one, f32.floor((text.y + text.baseline + entry.y) * 64.0 + 0.5))
+        one = digestMix(one, f32.floor(entry.advance * 64.0 + 0.5))
+        glyphsDigest = u64.wrappingMultiply(u64.bitXor(glyphsDigest, one), 1099511628211)
+        glyphSet = u64.wrappingAdd(glyphSet, one)
         pen = pen + entry.advance
+        ids = u64.wrappingAdd(u64.wrappingMultiply(ids, 31), u32.toU64(entry.glyph))
         glyph = glyph + 1
       }
       glyphCount = glyphCount + glyphs.length
-      if dump {
-        // SILK_UI_BENCH_DIGEST=dump: a line for each text fragment, to find what differs.
-        let mut ids: u64 = 0
-        glyph = 0
-        while glyph < glyphs.length {
-          ids = u64.wrappingAdd(u64.wrappingMultiply(ids, 31), u32.toU64(glyphs[glyph].glyph))
-          glyph = glyph + 1
-        }
-        StderrWriter.print(
-          "T {} {} {} {} {} {} {} {} {} {}\n",
-          &(
-            fragment.source, text.sourceStart, text.sourceEnd, text.fontKey,
-            fragment.worldLocation.x, fragment.worldLocation.y, fragment.size.width, glyphs.length, ids, pen,
-          ),
-        )
-      }
+    }
+    runs = u64.wrappingMultiply(u64.bitXor(runs, mixed), 1099511628211)
+    runSet = u64.wrappingAdd(runSet, mixed)
+    if dump {
+      // SILK_UI_BENCH_DIGEST=dump: a line for each run of text, to find what differs.
+      StderrWriter.print(
+        "T {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+        &(
+          text.source, text.start, text.end, text.fontKey,
+          text.x, text.y, text.width, text.height, text.lineTop, text.lineHeight, length, ids, pen,
+        ),
+      )
     }
     index = index + 1
   }
   StderrWriter.print(
-    "bench: digest boxes={} glyphs={} runs={} box-fragments={} text-fragments={} glyph-count={}\n",
-    &(boxes, glyphsDigest, runs, boxCount, textCount, glyphCount),
+    "bench: digest boxes={} glyphs={} glyph-set={} runs={} run-set={} glyph-count={} texts={}\n",
+    &(boxes, glyphsDigest, glyphSet, runs, runSet, glyphCount, counts.texts),
+  )
+  StderrWriter.print(
+    "bench: fragments={} box={} inline={} line={} (empty={} plain={} single-run={}) text={} (in-plain-lines={})\n",
+    &(
+      counts.fragments, counts.boxes, counts.inlines, counts.lines, counts.emptyLines, counts.plainLines,
+      counts.singleLines, counts.textFragments, counts.plainTexts,
+    ),
   )
 }
 
