@@ -944,6 +944,9 @@ pub struct UiTree<'a> {
   /// What changed for them short of that: the fragments a layout pass wrote, the nodes a
   /// restyle or a mutation repaints. The next refresh works out those alone (see `repair`).
   pub repair: Repair,
+  /// The slots of the nodes that listen for layout (see `notifyLayout`): each one that began
+  /// to, until the next report finds it gone or no longer listening.
+  layoutListeners: List<u32>,
   /// Whether a scroll offset changed since the last frame.
   pub scrolled: bool,
   /// Whether some node may hold a scroll offset other than zero: set by every write of one,
@@ -1186,6 +1189,7 @@ impl<'a> UiTree<'a> {
       fragmentStacking: Stacking.make(),
       paintCachesStale: true,
       repair: Repair.make(),
+      layoutListeners: List<u32>.make(),
       scrolled: false,
       offsets: false,
       scrolledSlots: List<u32>.make(),
@@ -2408,8 +2412,10 @@ impl<'a> UiTree<'a> {
         if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
           node.layoutReported = false
         }
+        let asksLayout = u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 && u32.bitAnd(flags, LISTEN_LAYOUT) != 0
         node.listeners = flags
         self.layoutObserversDirty = true
+        if asksLayout { run self.layoutListeners.append(slot) }
       }
       Mutation.OpenRoot { root, node, options } => {
         let slot = run self.require(index, node)
@@ -7023,8 +7029,26 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.layoutObserversDirty = false
-    let mut i: usize = 0
-    while i < self.nodes.length() {
+    // The nodes that listen, in slot order, without those that stopped or are gone.
+    let mut listening = Intrinsic.replace(self.layoutListeners, List<u32>.make())
+    run listening.sort()
+    let mut kept: usize = 0
+    let mut at: usize = 0
+    while at < listening.length() {
+      let slot = listening.get(at)
+      at = at + 1
+      if kept != 0 && listening.get(kept - 1) == slot { continue }
+      if u32.toUsize(slot) >= self.nodes.length() { continue }
+      let listener = self.node(slot)
+      if !listener.live || u32.bitAnd(listener.listeners, LISTEN_LAYOUT) == 0 { continue }
+      listening.set(kept, slot)
+      kept = kept + 1
+    }
+    listening.truncate(kept)
+    let mut l: usize = 0
+    while l < listening.length() {
+      let i = u32.toUsize(listening.get(l))
+      l = l + 1
       let node = &self.nodes.asSlice()[i]
       if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0
         && !self.inParkedRoot(usize.toU32(i)) {
@@ -7048,8 +7072,8 @@ impl<'a> UiTree<'a> {
           }
         }
       }
-      i = i + 1
     }
+    self.layoutListeners = move listening
   }
 
   /// Fills `fragmentOf` from the last layout.
