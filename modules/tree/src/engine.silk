@@ -31,6 +31,7 @@ import inspect
 import cssom_view
 import cssom_view { ScrollAnimation }
 import scroll_snap
+import css_anchor
 import scroll_snap { SnapWait }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
@@ -803,6 +804,9 @@ pub struct UiTree<'a> {
   pub listsUsed: bool,
   /// Whether any node is a scroll snap container (see `scroll_snap`).
   pub snapUsed: bool,
+  /// A style used anchor positioning (`anchor-name` or an anchored box).
+  pub cssAnchorUsed: bool,
+  pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
   /// The last `Node.styleClass` handed out.
@@ -1020,6 +1024,8 @@ impl<'a> UiTree<'a> {
       stylesPending: false,
       listsUsed: false,
       snapUsed: false,
+      cssAnchorUsed: false,
+      cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
@@ -5186,6 +5192,10 @@ impl<'a> UiTree<'a> {
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
+    if computed.anchor.name != 0 || computed.anchor.anchored() {
+      self.cssAnchorUsed = true
+      css_anchor.apply(&self, slot, self.node(slot).id, &mut computed)
+    }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
     if animationUnits & 2 != 0 && !computed.usesContainer {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
@@ -5735,8 +5745,11 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut pass: usize = 0
-    while pass <= self.anchors.length() {
-      if !(run anchoring.settle(&mut self)) {
+    while pass <= self.anchors.length() + 3 {
+      let popups = run anchoring.settle(&mut self)
+      // A box placed against a CSS anchor can move or size the next one: a few passes.
+      let css = pass < 4 && (run css_anchor.settle(&mut self))
+      if !popups && !css {
         break
       }
       run self.resolveStyles()
