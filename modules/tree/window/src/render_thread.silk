@@ -52,6 +52,7 @@ import silk.core.result { Result }
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
+import metal_hud
 import silk.text.string { String }
 import silk.num.f64
 import silk.num.u64
@@ -86,6 +87,8 @@ pub struct RenderReport {
   pub present: f64,
   /// Milliseconds between the last two presents, 0 before the second.
   pub interval: f64,
+  /// Frames the UI thread handed over that a newer frame replaced before they were drawn.
+  pub dropped: u64,
 }
 
 impl Copy for RenderReport {}
@@ -101,6 +104,7 @@ impl RenderReport {
       draw: 0.0,
       present: 0.0,
       interval: 0.0,
+      dropped: 0,
     }
   }
 }
@@ -234,6 +238,15 @@ struct State {
   format: u32,
   failure: Option<GpuError>,
   report: RenderReport,
+  /// Milliseconds between presents since [`RenderThread.takePresented`] last took them, and
+  /// the frames replaced in the mailbox since then.
+  presented: List<f64>,
+  dropped: u64,
+  /// The Metal HUD to show (1) or hide (0) on the first window's layer, -1 when nothing changes.
+  hud: i32,
+  /// Present each frame at once instead of at the display's next refresh (see
+  /// [`RenderThread.setUncapped`]).
+  uncapped: bool,
 }
 
 impl Transferable for State {}
@@ -467,6 +480,54 @@ impl RenderThread {
     return self.shared.get().lock().get().report
   }
 
+  /// Shows or hides the Metal Performance HUD over the window's frames (macOS 13 and later;
+  /// elsewhere nothing happens). It measures what the window's layer presents.
+  pub fn setMetalHud(self: &mut Self, on: bool) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.hud = if on { 1 } else { 0 }
+    drop guard
+    self.wake.unpark()
+  }
+
+  /// Presents each frame of the first window at once (`on`) instead of at the display's next
+  /// refresh, where the surface can: for measuring how many frames a second the app could
+  /// draw. Frames may tear.
+  pub fn setUncapped(self: &mut Self, on: bool) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.uncapped = on
+  }
+
+  /// Waits until the render thread has taken the last frame handed over (see
+  /// [`RenderThread.pending`]), or has stopped.
+  pub fn waitTaken(self: &mut Self) -> () {
+    while self.pending() && !stopped(&self.shared) {
+      self.parker.park()
+    }
+  }
+
+  /// Whether the last frame handed over still waits for the render thread, which is busy with
+  /// the one before. A new frame now would replace it undrawn: the host waits for the next
+  /// display refresh instead, as a browser holds back a frame while the GPU is behind.
+  pub fn pending(self: &Self) -> bool {
+    return Option<FrameJob>.isSome(&self.shared.get().lock().get().job)
+  }
+
+  /// Moves the milliseconds between the presents since the last call into `out`, oldest
+  /// first, and returns how many handed-over frames were replaced undrawn since then.
+  pub effect fn takePresented(self: &mut Self, out: &mut List<f64>) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    run out.appendSlice(state.presented.asSlice())
+    state.presented.clear()
+    let dropped = state.dropped
+    state.dropped = 0
+    return dropped
+  }
+
   /// Waits until `frames` frames have been presented, or the render thread stopped on an error,
   /// which this then fails with.
   pub effect fn waitFrames(self: &mut Self, frames: u64) -> RenderReport
@@ -560,6 +621,8 @@ effect fn post(
       } = move value
       drop e
       state.spare = Option<Scene>.some(move old)
+      state.dropped = state.dropped + 1
+      state.report.dropped = state.report.dropped + 1
     }
     Option<FrameJob>.None => ()
   }
@@ -678,6 +741,10 @@ effect fn makeShared() -> Arc<Mutex<State>>
     format: 0,
     failure: Option<GpuError>.None,
     report: RenderReport.none(),
+    presented: List<f64>.make(),
+    dropped: 0,
+    hud: -1,
+    uncapped: false,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -762,7 +829,7 @@ fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
       state.redraw = false
       Option<Work>.some(Work.Redraw)
     } else if state.extraJobs.length() != 0 || state.opening.length() != 0
-      || state.closing.length() != 0 {
+      || state.closing.length() != 0 || state.hud >= 0 {
       Option<Work>.some(Work.Others)
     } else {
       Option<Work>.None
@@ -990,6 +1057,23 @@ fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
   values.ready = true
 }
 
+fn uncappedOf(shared: &Arc<Mutex<State>>) -> bool {
+  return shared.get().lock().get().uncapped
+}
+
+fn takeHud(shared: &Arc<Mutex<State>>) -> i32 {
+  let mut guard = shared.get().lock()
+  return Intrinsic.replace(guard.getMut().hud, -1)
+}
+
+/// Shows or hides the Metal HUD on `raw`, when it is a Metal layer.
+fn metalHud(raw: RawSurface, on: bool) -> () {
+  match raw {
+    RawSurface.MetalLayer { layer } => metal_hud.show(layer, on)
+    _ => ()
+  }
+}
+
 /// Records a presented frame.
 fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
   let mut guard = shared.get().lock()
@@ -998,10 +1082,21 @@ fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
   values.report = report
   values.report.frames = previous.frames + 1
   values.report.painted = previous.painted + report.painted
+  values.report.dropped = previous.dropped
   if report.status < 0 {
     values.report.status = previous.status
   }
+  // An interval over a second is the window idling, not a slow frame. The list is bounded for
+  // a host that never takes it.
+  if report.interval > 0.0 && report.interval < 1000.0 && values.presented.length() < MAX_PRESENTED {
+    let mut heap = Allocator.systemAllocatorProvider()
+    drop run Effect.result(values.presented.append(report.interval))
+      |> Effect.provideMut<Allocator>(&mut heap)
+  }
 }
+
+/// How many present intervals wait for [`RenderThread.takePresented`] at most.
+const MAX_PRESENTED: usize = 1024
 
 /// Keeps the storage of a frame that is no longer drawn for the next copy.
 fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
@@ -1076,6 +1171,7 @@ effect fn renderLoop(
     }
   }
   let owner = surface.window
+  let raw = surface.raw
   let target = match unsafe targetOf(&owner, surface.raw) {
     Option<SurfaceTarget>.Some { value } => move value
     Option<SurfaceTarget>.None => {
@@ -1129,6 +1225,16 @@ effect fn renderLoop(
   wakeUi.unpark()
   let mut others = List<ExtraSurface>.make()
 
+  let mut canImmediate = false
+  let modes = capabilities.presentModes()
+  let mut m: usize = 0
+  while m < modes.length {
+    if modes[m] == flags.WGPUPresentMode_Immediate {
+      canImmediate = true
+    }
+    m = m + 1
+  }
+  let mut immediate = false
   let mut configuredWidth: u32 = 0
   let mut configuredHeight: u32 = 0
   let mut previousPresented = 0.0
@@ -1144,6 +1250,10 @@ effect fn renderLoop(
       _ => false
     }
     if !quitting {
+      let hud = takeHud(shared)
+      if hud >= 0 {
+        metalHud(raw, hud == 1)
+      }
       run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
       run writeUploads(shared, &device, &queue, &mut textures)
       run drawOthers(
@@ -1159,6 +1269,8 @@ effect fn renderLoop(
     }
     let fresh = match move work {
       Work.Job { job } => {
+        // The mailbox is free again: the UI thread may be waiting to fill it.
+        wakeUi.unpark()
         let mut next = move job
         run adopt(shared, &mut next)
         match move Intrinsic.replace(current, Option<FrameJob>.some(move next)) {
@@ -1187,6 +1299,12 @@ effect fn renderLoop(
       recordFrame(shared, RenderReport.none())
       wakeUi.unpark()
       continue
+    }
+    let wantsImmediate = uncappedOf(shared) && canImmediate
+    if wantsImmediate != immediate {
+      immediate = wantsImmediate
+      configuration.setPresentMode(if immediate { flags.WGPUPresentMode_Immediate } else { flags.WGPUPresentMode_Fifo })
+      configuredWidth = 0
     }
     if job.width != configuredWidth || job.height != configuredHeight {
       gpuSurface.resize(&mut configuration, job.width, job.height)
@@ -1242,6 +1360,7 @@ effect fn renderLoop(
       } else {
         (presented - previousPresented) * 1000.0
       },
+      dropped: 0,
     }
     current = Option<FrameJob>.some(move job)
     recordFrame(shared, report)

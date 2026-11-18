@@ -1908,3 +1908,29 @@ export function memoryUsage() {
   const footprint = native.memoryUsage?.() ?? 0;
   return footprint > 0 ? { footprint, processes: 1 } : null;
 }
+
+let frameStatsSince = 0;
+
+/**
+ * The frames the window put on screen since the last call (since the app started, the first
+ * time). `frames` counts presents, which `requestAnimationFrame` cannot: a callback can run
+ * for a frame the GPU never drew. `dropped` counts painted frames a newer one replaced before
+ * the GPU took them; `p50` to `max` are milliseconds between presents. `null` where the host
+ * has no window of its own (a browser build).
+ */
+export function frameStats() {
+  if (!native.frameStats) return null;
+  const now = performance.now();
+  const seconds = (now - frameStatsSince) / 1000;
+  frameStatsSince = now;
+  const frames = native.frameStats(0);
+  return {
+    frames,
+    fps: seconds > 0 ? frames / seconds : 0,
+    dropped: native.frameStats(1),
+    p50: native.frameStats(2),
+    p95: native.frameStats(3),
+    p99: native.frameStats(4),
+    max: native.frameStats(5),
+  };
+}
