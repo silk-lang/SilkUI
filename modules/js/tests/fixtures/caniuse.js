@@ -265,6 +265,10 @@ check("silkui-memory-usage", true, () => {
   const usage = ui.memoryUsage();
   return usage !== null && usage.footprint > 0 && usage.processes === 1;
 });
+check("silkui-frame-stats", true, () => {
+  const stats = ui.frameStats();
+  return stats !== null && typeof stats.fps === "number" && typeof stats.p95 === "number";
+});
 check("notifications", true, () => Notification === ui.Notification && Notification.permission === "granted" &&
   typeof Notification.requestPermission === "function");
 check("objectrtc", false, () => global("RTCIceGatherer"));

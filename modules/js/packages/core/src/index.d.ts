@@ -501,3 +501,25 @@ export interface MemoryUsage {
  * to call every second; `null` when the host cannot say.
  */
 export function memoryUsage(): MemoryUsage | null;
+
+/** What the window put on screen over a stretch of time; see `frameStats`. */
+export interface FrameStats {
+  /** Frames presented. */
+  frames: number;
+  /** `frames` per second over the stretch. */
+  fps: number;
+  /** Painted frames a newer frame replaced before the GPU drew them. */
+  dropped: number;
+  /** Milliseconds between presents: median, 95th and 99th percentile, longest. */
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+}
+
+/**
+ * The frames the window presented since the last call (since the app started, the first
+ * time), which `requestAnimationFrame` cannot count. Cheap enough to call every second;
+ * `null` in a browser build.
+ */
+export function frameStats(): FrameStats | null;
