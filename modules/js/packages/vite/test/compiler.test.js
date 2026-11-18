@@ -6,7 +6,7 @@ test('compiles layers, variables, conditions, and modern colors using the shippe
   const source = '@layer theme, utilities; @layer theme { :root { --gap: 4px } } @layer utilities { .card:hover { padding: calc(var(--gap) * 2); color: color-mix(in oklch, red 30%, blue) } } @media (min-width: 10px) { .card { display: flex } }';
   const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
   assert.equal(new TextDecoder().decode(bytes.slice(0, 8)), 'SILKCSS\0');
-  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 8);
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 9);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
   assert.equal(new TextDecoder().decode(bytes).includes(source), false);
@@ -32,7 +32,7 @@ test('results keep their bytes after subsequent compilations and memory growth',
 test('ships generated pseudo programs and diagnoses unsupported content', () => {
   const source = `.card { &::before { content: ""; } &::after { content: attr(data-label, "fallback"); color: red; } }`;
   const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
-  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 8);
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 9);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
   assert.deepEqual(compileStylesheet('.card::before { content: counter(item); }', { strict: true }).diagnostics, []);
@@ -49,7 +49,7 @@ test('ships container units and serialized condition programs', () => {
   assert.deepEqual(compileStylesheet(declarations, { strict: true }).diagnostics, []);
   const source = `${declarations} @container card (width > calc(10em + 1px)) and ((height > 20px) or unknown(value)) { .child { width: 50cqw } }`;
   const { bytes, diagnostics } = compileStylesheet(source, { strict: true });
-  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 8);
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 9);
   assert.deepEqual(compileStylesheet(source).bytes, bytes);
   assert.deepEqual(diagnostics, []);
 });
@@ -70,7 +70,7 @@ test('compiles tree part targets and reports unavailable pseudo-elements', () =>
 test('ships typed font faces and diagnoses unsupported display timing', () => {
   const css = `@layer fonts { @media (width > 300px) { @font-face { font-family: "Brand Face"; src: local("Brand Full"), url("fonts/brand.woff2") format("woff2"); font-weight: 100 900; font-width: 75% 125%; font-style: oblique -10deg 20deg; unicode-range: U+0-FF, U+4??; font-display: swap; } } }`;
   const { bytes, diagnostics } = compileStylesheet(css, { strict: true });
-  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 8);
+  assert.equal(new DataView(bytes.buffer).getUint32(8, true), 9);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(css).bytes, bytes);
   assert.equal(new TextDecoder().decode(bytes).includes(css), false);
