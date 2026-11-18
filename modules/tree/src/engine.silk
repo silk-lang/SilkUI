@@ -22,7 +22,7 @@ import properties.catalog
 import svg_css.written as css_written
 import properties.keywords { Keyword }
 import properties.values { Value }
-import layout.lib { Fragmentainers, computeFragmented }
+import layout.lib { Fragmentainers, computeFragmented, FontRequest, LineHeight }
 import virtual_list { VirtualList, VirtualRange }
 import virtual_list as virtual
 import anchoring
@@ -32,6 +32,8 @@ import cssom_view
 import cssom_view { ScrollAnimation }
 import scroll_snap
 import css_anchor
+import css_cursor
+import css_cursor { CursorImage }
 import scroll_snap { SnapWait }
 import scroll_anchor
 import scroll_anchor { ScrollAnchor }
@@ -89,6 +91,7 @@ import text_selection { SelectionOrder }
 import text_selection { TextSelection }
 import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE, usedUserSelect, SELECT_TEXT }
 import lists
+import first_letter
 import lists { Scope }
 import paint_css { Effects }
 import paint_css
@@ -102,7 +105,7 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
@@ -143,7 +146,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -167,7 +170,8 @@ import layout.lib {
   NaturalDimensions,
   Style as CssStyle,
   SizeValue,
-  FloatShape
+  FloatShape,
+  FragmentKind
 }
 import layout.lib as Engine
 import silk.collections.bytes { Bytes }
@@ -814,6 +818,14 @@ pub struct UiTree<'a> {
   /// Some node is a list item or changes counters, or generated content names one: each
   /// style pass ends with the counters pass (`lists.update`).
   pub listsUsed: bool,
+  /// Some node has had a `::first-letter` box: edits under one may move its letter.
+  pub letterUsed: bool,
+  /// Blocks whose `::first-letter` the style pass syncs once their subtrees are styled: the
+  /// letter's text is found by its descendants' computed floats and displays.
+  letterPending: List<u32>,
+  /// Blocks with a `::first-line` style, and the first line box of each from the last layout.
+  pub lineOrigins: List<u32>,
+  pub firstLines: List<first_letter.FirstLine>,
   /// Whether any node is a scroll snap container (see `scroll_snap`).
   pub snapUsed: bool,
   /// A style used anchor positioning (`anchor-name` or an anchored box).
@@ -982,6 +994,8 @@ pub struct UiTree<'a> {
   /// The viewport `tickBases` were built in: its size is in every one of them.
   tickWidth: f32,
   tickHeight: f32,
+  /// What the host last showed for a cursor image (`cursorShown`), 0 for a keyword.
+  pub cursorShown: u64,
 }
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
@@ -1057,6 +1071,10 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       listsUsed: false,
+      letterUsed: false,
+      letterPending: List<u32>.make(),
+      lineOrigins: List<u32>.make(),
+      firstLines: List<first_letter.FirstLine>.make(),
       snapUsed: false,
       cssAnchorUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
@@ -1148,6 +1166,7 @@ impl<'a> UiTree<'a> {
       tickPlaces: List<u32>.make(),
       tickWidth: 0.0,
       tickHeight: 0.0,
+      cursorShown: 0,
     }
   }
 
@@ -1722,6 +1741,7 @@ impl<'a> UiTree<'a> {
     }
     run self.applyAll(move batch)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
     if self.current != before && self.rootOpen(before) {
       drop run self.useRoot(before)
     }
@@ -2736,6 +2756,7 @@ impl<'a> UiTree<'a> {
     )
     let moved = self.nodeMut(childSlot)
     moved.parent = parentSlot
+    if self.letterUsed || self.letterRulesUsed() { self.restyleLetterOrigins(parentSlot) }
     match self.sheetReads() {
       Option<u32>.Some { value: reads } => {
         let text = self.node(childSlot).kind == NodeKind.Text
@@ -2761,6 +2782,7 @@ impl<'a> UiTree<'a> {
     if parent == NONE && slot != self.root {
       return ()
     }
+    if self.letterUsed && parent != NONE && !self.node(slot).isGenerated() { run self.detachLetters(slot, parent) }
     let before = if parent == NONE { NONE } else { self.elementBeside(slot, true) }
     let after = if parent == NONE { NONE } else { self.elementBeside(slot, false) }
     run Effect.catchAll(self.layout.remove(NodeId { index: css }), layoutFailed)
@@ -3616,6 +3638,12 @@ impl<'a> UiTree<'a> {
     let node = self.nodeMut(slot)
     node.text = move value
     node.content = node.content + 1
+    if (self.letterUsed || self.letterRulesUsed()) && !self.node(slot).isGenerated() { self.restyleLetterOrigins(slot) }
+  }
+
+  fn letterRulesUsed(self: &Self) -> bool {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter
   }
 
   /// Where focus goes when `focused` leaves the tree with the subtree at `removed`: the node
@@ -3783,6 +3811,7 @@ impl<'a> UiTree<'a> {
     run interact.begin(&mut self, &input)
     run interact.finish(&mut self, move input, false)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
   }
 
   /// The first half of `dispatch`: hit testing, hover, and the record of the input itself
@@ -3819,6 +3848,7 @@ impl<'a> UiTree<'a> {
     drop run self.useRoot(started)
     run interact.finish(&mut self, move input, prevented)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
   }
 
   /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
@@ -3834,6 +3864,66 @@ impl<'a> UiTree<'a> {
   /// its path.
   pub fn cursor(self: &Self) -> Cursor {
     return interact.cursorOf(self)
+  }
+
+  /// The image CSS `cursor: url(...)` shows over the hovered node: the first of its images that
+  /// loaded, skipping those that failed. None while there is none, or while an earlier one
+  /// still loads; `cursor()` is the keyword to show then. Images not asked for yet are asked
+  /// for in the next `takeLoads`.
+  pub effect fn cursorImage(self: &mut Self) -> Option<CursorImage>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let from = interact.cursorFrom(&self.*)
+    if from.images == NONE {
+      return Option<CursorImage>.None
+    }
+    let node = self.node(from.images)
+    let declarations = match node.sheetStyle() {
+      Option.Some { value } => value.declarations.asSlice()
+      _ => node.base.asSlice()
+    }
+    let mut css = Bytes.make()
+    let mut i = declarations.length
+    while i > 0 {
+      i = i - 1
+      if declarations[i].property == CssProperty.Cursor {
+        css = run values.cssText(&declarations[i].value)
+        break
+      }
+    }
+    let urls = run css_cursor.urlsOf(css.asSlice())
+    let list = urls.asSlice()
+    let mut ids = List<u32>.make()
+    let mut k: usize = 0
+    while k < list.length {
+      run ids.append(run self.resources.cssImage(list[k].url.asSlice()))
+      k = k + 1
+    }
+    k = 0
+    while k < list.length {
+      let resource = ids.asSlice()[k]
+      match self.resources.cssImages.asSlice()[u32.toUsize(resource - CSS_IMAGE_BASE)].state {
+        CssImageState.Loaded => {
+          return Option<CursorImage>.Some {
+            value: CursorImage { resource: resource, hotX: list[k].hotX, hotY: list[k].hotY, hot: list[k].hot },
+          }
+        }
+        CssImageState.Failed => {}
+        _ => {
+          return Option<CursorImage>.None
+        }
+      }
+      k = k + 1
+    }
+    return Option<CursorImage>.None
+  }
+
+  /// The pixels of cursor `image` for a display of `scale` pixels per CSS pixel, None when the
+  /// image cannot be a cursor (a side past 256 pixels).
+  pub effect fn cursorPixels(self: &mut Self, image: CursorImage, scale: f32) -> Option<CursorPixels>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.resources.cursorPixels(image.resource, scale)
   }
 
   /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
@@ -4976,6 +5066,315 @@ impl<'a> UiTree<'a> {
     if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
   }
 
+  /// Keeps the `::first-letter` box of block container `origin` (CSS Pseudo 4 §2.5): an inline
+  /// box before the text the letter comes from, under that text's parent, holding the letter;
+  /// css-layout reads that text from after the letter.
+  @inlineNever
+  /// Whether `syncFirstLetter` has anything to do at `slot`.
+  fn letterCandidate(self: &Self, slot: u32) -> bool {
+    let node = self.node(slot)
+    if node.kind != NodeKind.Box || node.isGenerated() { return false }
+    let held = match node.identity() { Option.Some { value } => value.letterBox != NONE || value.letterRules _ => false }
+    if held { return true }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter
+  }
+
+  effect fn syncFirstLetter(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let node = self.node(origin)
+    if node.kind != NodeKind.Box || node.isGenerated() { return () }
+    let old = match node.identity() { Option.Some { value } => value.letterBox _ => NONE }
+    let ruled = match node.identity() { Option.Some { value } => value.letterRules _ => false }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter && node.rendered && first_letter.blockContainer(&node.computed)
+    if !enabled && old == NONE && !ruled { return () }
+    let mut prepared = Option<Resolved>.None
+    let mut wanted = false
+    if enabled {
+      let rendered = old != NONE && style_change.rendered(&self, old)
+      let value = run self.resolveGeneratedStyle(origin, PseudoTarget.FirstLetter, StateBits.empty(), rendered)
+      wanted = value.declarations.length() != 0
+      prepared = Option<Resolved>.some(move value)
+    }
+    if wanted || ruled {
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.letterRules = wanted
+    }
+    let target = if wanted { self.letterTarget(origin) } else { NONE }
+    let mut letter = first_letter.Letter { start: 0, end: 0 }
+    if target != NONE {
+      let holder = self.node(target).parent
+      let collapse = if holder == NONE { WhiteSpaceCollapse.Collapse } else { self.node(holder).computed.text.whiteSpaceCollapse }
+      letter = first_letter.letterOf(String.utf8Bytes(String.view(&self.node(target).text)), collapse != WhiteSpaceCollapse.Preserve && collapse != WhiteSpaceCollapse.BreakSpaces && collapse != WhiteSpaceCollapse.PreserveSpaces)
+    }
+    // An inner block's own ::first-letter takes the letter its ancestors would.
+    if letter.end != 0 {
+      let held = match self.node(target).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      let other = if held == NONE { NONE } else { self.node(held).generatedOrigin() }
+      if other != NONE && other != origin {
+        if self.within(other, origin) { letter.end = 0 }
+        else { run self.releaseFirstLetter(other) }
+      }
+    }
+    let mut slot = old
+    if slot != NONE && (letter.end == 0 || self.letterTextOf(slot) != target) {
+      run self.releaseFirstLetter(origin)
+      slot = NONE
+    }
+    if letter.end == 0 { return () }
+    if slot == NONE {
+      let id = self.node(origin).id
+      let holder = self.node(target).parent
+      slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.FirstLetter)
+      let child = run self.createNode(0, id, NodeKind.Text, origin, PseudoTarget.FirstLetter)
+      let boxCss = self.node(slot).css
+      let holderCss = self.node(holder).css
+      let targetCss = self.node(target).css
+      let childCss = self.node(child).css
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: holderCss }, NodeId { index: boxCss }, Option<NodeId>.some(NodeId { index: targetCss })), layoutFailed)
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: childCss }, Option<NodeId>.None), layoutFailed)
+      let boxNode = self.nodeMut(slot)
+      boxNode.parent = holder
+      let boxIdentity = run boxNode.identityMut()
+      boxIdentity.letterText = target
+      let textNode = self.nodeMut(child)
+      textNode.parent = slot
+      let targetNode = self.nodeMut(target)
+      let targetIdentity = run targetNode.identityMut()
+      targetIdentity.letterBox = slot
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.letterBox = slot
+      self.letterUsed = true
+      // Its parent's walk may already be past: the pass reaches it through its ancestors.
+      self.restyleLocal(slot)
+    }
+    let full = String.view(&self.node(target).text)
+    let piece = run String.copy(String.slice(full, letter.start, letter.end - letter.start))
+    run self.fillGenerated(slot, move piece)
+    let targetCss = self.node(target).css
+    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end), layoutFailed)
+    if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+  }
+
+  /// `initial-letter` on the `::first-letter` box `slot`: sizes and places it against its
+  /// origin's first available font (see `first_letter.dropCap`).
+  effect fn dropCap(self: &mut Self, slot: u32, computed: &mut Computed) -> () ! OutOfMemoryError ? &mut Allocator {
+    let origin = self.node(slot).generatedOrigin()
+    let first = match self.node(slot).identity() { Option.Some { value } => value.generatedTarget == PseudoTarget.FirstLetter _ => false }
+    if !first || origin == NONE { return () }
+    let letter = match self.node(slot).sheetStyle() { Option.Some { value } => first_letter.initialLetter(value.declarations.asSlice()) _ => first_letter.InitialLetter { size: 0.0, sink: 0 } }
+    if letter.size < 1.0 { return () }
+    let paragraph = self.faceOf(self.node(origin).computed.text, self.node(origin).fontKey)
+    let key = run self.fontKeyOf(computed.text)
+    let own = self.faceOf(computed.text, key)
+    first_letter.dropCap(&mut computed.*, letter, paragraph, own)
+  }
+
+  fn faceOf(self: &Self, text: TextStyle, key: usize) -> first_letter.Face {
+    let measured = self.provider.text.font(FontRequest { key: key,
+      writingMode: text.writingMode, textOrientation: text.textOrientation, direction: text.direction })
+    let known = measured.fontSize > 0.0
+    let ascent = if known { measured.ascent } else { text.size * 0.8 }
+    let descent = if known { measured.descent } else { text.size * 0.2 }
+    let lineHeight = match text.lineHeight {
+      LineHeight.Number { value } => text.size * value
+      LineHeight.Length { value } => value
+      LineHeight.Normal => if known { measured.ascent + measured.descent + measured.lineGap } else { text.size }
+    }
+    return first_letter.Face { size: text.size, ascent: ascent, descent: descent,
+      capHeight: if known { measured.capHeight } else { text.size * 0.7 }, lineHeight: lineHeight }
+  }
+
+  /// Keeps the `::first-line` style of block container `origin` (CSS Pseudo 4 §2.4) in a node
+  /// outside layout, whose values paint the text of the block's first line box.
+  @inlineNever
+  effect fn syncFirstLine(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let node = self.node(origin)
+    if node.kind != NodeKind.Box || node.isGenerated() { return () }
+    let old = match node.identity() { Option.Some { value } => value.lineBox _ => NONE }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLine && node.rendered && first_letter.blockContainer(&node.computed)
+    if !enabled && old == NONE { return () }
+    let mut prepared = Option<Resolved>.None
+    if enabled {
+      let value = run self.resolveGeneratedStyle(origin, PseudoTarget.FirstLine, StateBits.empty(), false)
+      if value.declarations.length() != 0 { prepared = Option<Resolved>.some(move value) }
+    }
+    if prepared.isNone() {
+      if old != NONE {
+        let originNode = self.nodeMut(origin)
+        let identity = run originNode.identityMut()
+        identity.lineBox = NONE
+        run self.destroy(0, old)
+        self.paintDirty = true
+      }
+      return ()
+    }
+    let mut slot = old
+    if slot == NONE {
+      let id = self.node(origin).id
+      slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.FirstLine)
+      let lineNode = self.nodeMut(slot)
+      lineNode.parent = origin
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.lineBox = slot
+      run self.lineOrigins.append(origin)
+    }
+    if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+    drop run self.resolve(slot, false)
+    self.paintDirty = true
+  }
+
+  /// Finds the first line box of each block with a `::first-line` style, after layout.
+  effect fn indexFirstLines(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.firstLines.clear()
+    let mut kept: usize = 0
+    let mut i: usize = 0
+    while i < self.lineOrigins.length() {
+      let origin = self.lineOrigins.get(i)
+      i = i + 1
+      let box = if self.node(origin).live { match self.node(origin).identity() { Option.Some { value } => value.lineBox _ => NONE } } else { NONE }
+      if box == NONE || self.lineOriginSeen(origin, kept) { continue }
+      self.lineOrigins.set(kept, origin)
+      kept = kept + 1
+      let line = self.firstLineOf(self.node(origin).css)
+      if line != NO_INDEX { run self.firstLines.append(first_letter.FirstLine { line: line, slot: box, origin: origin }) }
+    }
+    self.lineOrigins.truncate(kept)
+  }
+
+  fn lineOriginSeen(self: &Self, origin: u32, kept: usize) -> bool {
+    let mut j: usize = 0
+    while j < kept {
+      if self.lineOrigins.get(j) == origin { return true }
+      j = j + 1
+    }
+    return false
+  }
+
+  /// The first line box in the first fragment of css node `css`, through in-flow blocks.
+  fn firstLineOf(self: &Self, css: usize) -> usize {
+    if css >= self.fragmentOf.length() { return NO_INDEX }
+    let top = self.fragmentOf.get(css)
+    if top == NO_INDEX { return NO_INDEX }
+    let values = self.output.fragments.values.asSlice()
+    let mut at = values[top].firstChild
+    while at != NO_INDEX {
+      if values[at].kind == FragmentKind.Line { return at }
+      let mut descend = values[at].kind == FragmentKind.Box
+      let slot = if values[at].source == NO_INDEX { NONE } else { self.slotOfCssNode(values[at].source) }
+      if descend && slot != NONE {
+        let layout = &self.node(slot).computed.layout
+        descend = layout.float == Float.None && layout.position != Position.Absolute && layout.position != Position.Fixed
+          && layout.display.insideIs(DisplayInside.Flow)
+      }
+      if descend && values[at].firstChild != NO_INDEX {
+        at = values[at].firstChild
+        continue
+      }
+      while at != top && values[at].nextSibling == NO_INDEX { at = values[at].parent }
+      if at == top { break }
+      at = values[at].nextSibling
+    }
+    return NO_INDEX
+  }
+
+  fn letterTextOf(self: &Self, box: u32) -> u32 {
+    return match self.node(box).identity() { Option.Some { value } => value.letterText _ => NONE }
+  }
+
+  /// The text the first letter of block container `origin` comes from: the first text of its
+  /// first formatted line, through inline and block descendants in flow, or NONE when an
+  /// atomic inline or other content comes first.
+  fn letterTarget(self: &Self, origin: u32) -> u32 {
+    let top = self.node(origin).css
+    let mut at = self.layout.nodes.asSlice()[top].firstChild
+    while at != NO_INDEX {
+      let slot = self.slotOfCssNode(at)
+      let mut descend = false
+      if slot != NONE {
+        let node = self.node(slot)
+        if node.kind == NodeKind.Text {
+          if !blankText(String.utf8Bytes(String.view(&node.text))) { return slot }
+        } else if node.kind != NodeKind.Box {
+          return NONE
+        } else {
+          let target = match node.identity() { Option.Some { value } => value.generatedTarget _ => PseudoTarget.None }
+          let layout = &node.computed.layout
+          if target == PseudoTarget.Marker || target == PseudoTarget.FirstLetter || layout.display.isNone() {
+          } else if layout.float != Float.None || layout.position == Position.Absolute || layout.position == Position.Fixed {
+          } else if layout.display.isContents() || layout.display.insideIs(DisplayInside.Flow) {
+            descend = true
+          } else {
+            return NONE
+          }
+        }
+      }
+      let links = self.layout.nodes.asSlice()
+      if descend && links[at].firstChild != NO_INDEX {
+        at = links[at].firstChild
+        continue
+      }
+      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      if at == top { break }
+      at = links[at].nextSibling
+    }
+    return NONE
+  }
+
+  /// Takes the `::first-letter` box of `origin` away and gives its text the letter back.
+  effect fn releaseFirstLetter(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let box = match self.node(origin).identity() { Option.Some { value } => value.letterBox _ => NONE }
+    if box == NONE { return () }
+    let originNode = self.nodeMut(origin)
+    let identity = run originNode.identityMut()
+    identity.letterBox = NONE
+    let text = self.letterTextOf(box)
+    if text != NONE && self.node(text).live && self.node(text).kind == NodeKind.Text {
+      let held = match self.node(text).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      if held == box {
+        let textNode = self.nodeMut(text)
+        let textIdentity = run textNode.identityMut()
+        textIdentity.letterBox = NONE
+        let textCss = self.node(text).css
+        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0), layoutFailed)
+      }
+    }
+    run self.destroy(0, box)
+  }
+
+  /// An edit at `from` can change the first letter of a block above it: those that have or
+  /// want one restyle, which places it again.
+  fn restyleLetterOrigins(self: &mut Self, from: u32) -> () {
+    let mut at = from
+    while at != NONE {
+      let marked = match self.node(at).identity() { Option.Some { value } => value.letterRules || value.letterBox != NONE _ => false }
+      if marked && !self.node(at).isGenerated() { self.restyleLocal(at) }
+      at = self.node(at).parent
+    }
+  }
+
+  /// Before `slot` leaves its parent: a letter box it holds whose origin stays behind, or the
+  /// letter of the text it is, goes back to its text.
+  effect fn detachLetters(self: &mut Self, slot: u32, parent: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut at = parent
+    while at != NONE {
+      let box = match self.node(at).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      if box != NONE && !self.node(at).isGenerated() && (self.letterTextOf(box) == slot || self.within(box, slot)) {
+        run self.releaseFirstLetter(at)
+      }
+      at = self.node(at).parent
+    }
+    self.restyleLetterOrigins(parent)
+  }
+
   /// Sets the text of generated box `slot` to `text`, when it differs.
   pub effect fn fillGenerated(self: &mut Self, slot: u32, text: String) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -5043,6 +5442,8 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasFirstLetter = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLetter)
+        roots[sheetIndex].hasFirstLine = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLine)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasScrollbars = scrollbar_parts.present(&roots[sheetIndex].sheets)
@@ -5097,6 +5498,8 @@ impl<'a> UiTree<'a> {
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
         run self.syncGenerated(slot)
         if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
+        if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
+        if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
@@ -5136,6 +5539,17 @@ impl<'a> UiTree<'a> {
           a = a + 1
         }
       }
+    }
+    if self.letterPending.length() != 0 {
+      let mut i: usize = 0
+      while i < self.letterPending.length() {
+        let origin = self.letterPending.get(i)
+        run self.syncFirstLetter(origin)
+        i = i + 1
+      }
+      self.letterPending.clear()
+      // A new or moved letter box asked for its own style.
+      if self.stylesPending { run self.resolveStyles() }
     }
     if self.listsUsed { run lists.update(&mut self) }
   }
@@ -5421,6 +5835,7 @@ impl<'a> UiTree<'a> {
       }
       self.easingStops = move finalStops
     }
+    if self.letterUsed && kind == NodeKind.Box && self.node(slot).isGenerated() { run self.dropCap(slot, &mut computed) }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
     let zoomChanged = self.node(slot).computed.text.zoom != computed.text.zoom
@@ -6182,6 +6597,7 @@ impl<'a> UiTree<'a> {
         self.fragmentOf.set(source, i)
       }
     }
+    if self.lineOrigins.length() != 0 { run self.indexFirstLines() }
   }
 
   /// Loads the raster face of every font key the layout's text fragments use.
@@ -6319,6 +6735,7 @@ impl<'a> UiTree<'a> {
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
+        firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneB,
@@ -6360,6 +6777,7 @@ impl<'a> UiTree<'a> {
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
+        firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneA,
@@ -6430,6 +6848,7 @@ impl<'a> UiTree<'a> {
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
       textInk: &mut self.textInk,
+      firstLines: &self.firstLines,
       resources: &mut self.resources,
       paths: &mut self.paths,
       scene: &mut scene,
@@ -6579,6 +6998,8 @@ effect fn resourceFailed(error: ResourceError) -> bool {
 /// restyle.
 fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
   return left.writingMode == right.writingMode && left.textOrientation == right.textOrientation
+    && &left.textBoxEdge == &right.textBoxEdge
+    && &left.emphasis == &right.emphasis
     && left.textAlignLast == right.textAlignLast
     && left.textWrap == right.textWrap
     && left.whiteSpaceCollapse == right.whiteSpaceCollapse
@@ -6782,4 +7203,14 @@ pub fn isSvgUrl(url: &[u8]) -> bool {
     return true
   }
   return false
+}
+
+fn blankText(text: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < text.length {
+    let c = text[i]
+    if c != 32 && c != 9 && c != 10 && c != 12 && c != 13 { return false }
+    i = i + 1
+  }
+  return true
 }

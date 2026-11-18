@@ -2,7 +2,7 @@
 import atlas.atlas { Atlas, AtlasError, AtlasTile }
 import sprites.icons { IconCache, IconId, IconOptions, IconStyle }
 import sprites.images { ImageId, ImageStore }
-import svg_render.lib { Environment, RenderError }
+import svg_render.lib { Environment, RenderError, Pixmap }
 import svg_render.environment { noHostStyles }
 import svg_core.structure { Options as StructureOptions }
 import svg_core.resources { DataOnly, Limits as ResourceLimits, ProcessingMode, Resolver }
@@ -32,6 +32,8 @@ import silk.text.string { String }
 import silk.collections.bytes { Bytes }
 import silk.core.result { Result }
 import silk.num.usize
+import silk.num.u8
+import silk.num.f64
 
 /// The size an icon is rendered at to tell whether it paints only with `currentColor`.
 const CLASSIFY_SIZE: u32 = 32
@@ -363,6 +365,43 @@ effect fn imageTile(images: &mut ImageStore, atlas: &mut Atlas, id: ImageId) -> 
   return run images.tile(&mut atlas, id)
 }
 
+/// A cursor image: `width * height` RGBA pixels, not premultiplied, `scale` pixels per CSS
+/// pixel.
+pub struct CursorPixels {
+  pub width: u32,
+  pub height: u32,
+  pub pixels: Bytes,
+  pub scale: f32,
+}
+
+effect fn noPixmap(error: RenderError) -> Option<Pixmap> {
+  drop error
+  return Option<Pixmap>.None
+}
+
+fn capped(value: u32) -> u32 {
+  return if value > 255 { 255 } else { value }
+}
+
+/// Premultiplied RGBA as straight RGBA.
+effect fn straight(premultiplied: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = run Bytes.copy(premultiplied)
+  let pixels = out.asMutSlice()
+  let mut i: usize = 0
+  while i + 3 < pixels.length {
+    let a = u8.toU32(pixels[i + 3])
+    if a > 0 && a < 255 {
+      pixels[i] = u32.toU8(capped((u8.toU32(pixels[i]) * 255 + a / 2) / a))
+      pixels[i + 1] = u32.toU8(capped((u8.toU32(pixels[i + 1]) * 255 + a / 2) / a))
+      pixels[i + 2] = u32.toU8(capped((u8.toU32(pixels[i + 2]) * 255 + a / 2) / a))
+    }
+    i = i + 4
+  }
+  return move out
+}
+
 /// The first resource id the tree gives the images stylesheets name with `url()`. Clients
 /// number their own resources from 1, and host font faces start at 0x80000000.
 pub const CSS_IMAGE_BASE: u32 = 0x7F000000
@@ -588,6 +627,54 @@ impl Resources {
   /// Whether `icon` paints only with `currentColor`, so its tile is a mask to tint.
   pub fn tinted(self: &Self, icon: IconId) -> bool {
     return self.icons.tinted(icon)
+  }
+
+  /// Resource `id` as cursor pixels: an image at its own size, an icon at its own size (32
+  /// pixels a side when it gives none) times `scale`. None when it is not loaded or a side
+  /// passes 256 pixels.
+  pub effect fn cursorPixels(self: &mut Self, id: u32, scale: f32) -> Option<CursorPixels>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match self.get(id) {
+      Option<Resource>.Some { value: Resource.Image { image, width, height } } => {
+        if width > 256 || height > 256 {
+          return Option<CursorPixels>.None
+        }
+        return match self.images.image(image) {
+          Option<&Image>.Some { value } => Option<CursorPixels>.Some {
+            value: CursorPixels { width: width, height: height, pixels: run straight(value.data()), scale: 1.0 },
+          }
+          _ => Option<CursorPixels>.None
+        }
+      }
+      Option<Resource>.Some { value: Resource.Icon { icon } } => {
+        let ownWidth = self.icons.width(icon)
+        let ownHeight = self.icons.height(icon)
+        let ratio = self.icons.ratio(icon)
+        let mut w = if ownWidth > 0.0 { ownWidth } else if ownHeight > 0.0 && ratio > 0.0 { ownHeight * ratio } else { 32.0 }
+        let mut h = if ownHeight > 0.0 { ownHeight } else if ratio > 0.0 { w / ratio } else { 32.0 }
+        w = w * f32.toF64(scale)
+        h = h * f32.toF64(scale)
+        if w < 1.0 || h < 1.0 || w > 256.0 || h > 256.0 {
+          return Option<CursorPixels>.None
+        }
+        let width = f64.toU32(f64.ceil(w))
+        let height = f64.toU32(f64.ceil(h))
+        let host = hostOf(&self.host, black())
+        let rendered = run Effect.catch<RenderError>(self.icons.rendered(&host, icon, width, height), noPixmap)
+          |> Effect.provideMut<Resolver>(&mut self.resolver)
+        drop host
+        return match &rendered {
+          Option<Pixmap>.Some { value } => Option<CursorPixels>.Some {
+            value: CursorPixels { width: width, height: height, pixels: run straight(value.data()), scale: scale },
+          }
+          _ => Option<CursorPixels>.None
+        }
+      }
+      _ => {
+        return Option<CursorPixels>.None
+      }
+    }
   }
 
   /// The tile of `image`, or None when it cannot be placed.
