@@ -164,9 +164,10 @@ check("accelerometer", false, () => global("Accelerometer"));
 check("ambient-light", false, () => global("AmbientLightSensor"));
 check("async-clipboard", true, () => typeof navigator.clipboard.readText === "function" && typeof navigator.clipboard.writeText === "function");
 check("async-clipboard", false, () => typeof navigator.clipboard.read === "function" || typeof navigator.clipboard.write === "function" || global("ClipboardItem"));
-check("atob-btoa", NODE, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsayBVSQ==") === "Silk UI");
+check("atob-btoa", true, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsayBVSQ==") === "Silk UI");
 check("audio-api", false, () => global("AudioContext"));
-check("auxclick", false, () => { ui.createBox().addEventListener("auxclick", () => {}); return true; });
+// Nodes take listeners of any type, but the tree never sends these.
+check("auxclick", false, () => "onauxclick" in ui.createBox());
 check("battery-status", false, () => typeof navigator.getBattery === "function");
 check("blobbuilder", NODE, async () => {
   const blob = new Blob(["Silk", new Uint8Array([32, 85, 73])], { type: "text/plain" });
@@ -187,9 +188,9 @@ check("channel-messaging", NODE, () => new Promise((resolve) => {
   port2.onmessage = (event) => { port1.close(); port2.close(); resolve(event.data.n === 2); };
   port1.postMessage({ n: 2 });
 }));
-check("clipboard", false, () => { ui.createInput().addEventListener("paste", () => {}); return true; });
+check("clipboard", false, () => global("ClipboardEvent"));
 check("console-basic", true, () => ["log", "info", "warn", "error", "debug"].every((name) => typeof console[name] === "function"));
-check("console-time", NODE, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
+check("console-time", true, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
 check("constraint-validation", false, () => typeof ui.createInput().checkValidity === "function");
 check("createimagebitmap", false, () => typeof globalThis.createImageBitmap === "function");
 check("credential-management", false, () => typeof navigator.credentials === "object");
@@ -202,13 +203,25 @@ check("cryptography", NODE, async () => {
   return digest[0] === 0xba && digest[31] === 0xad && opened.join() === "1,2,3";
 });
 check("css-supports-api", false, () => typeof CSS === "object" && typeof CSS.supports === "function");
-check("customevent", { engine: false, node: true }, () => new CustomEvent("ping", { detail: 3 }).detail === 3);
-// A node listens only to the tree's own event types, so a custom event cannot reach a listener.
-check("customevent", false, () => { ui.createBox().addEventListener("ping", () => {}); return true; });
+check("customevent", true, () => new CustomEvent("ping", { detail: 3 }).detail === 3);
+check("customevent", true, () => {
+  const outer = ui.createBox();
+  const inner = ui.createBox();
+  outer.append(inner);
+  let detail = 0;
+  outer.addEventListener("ping", (event) => { detail = event.target === inner ? event.detail : -1; });
+  inner.dispatchEvent(new CustomEvent("ping", { detail: 3, bubbles: true }));
+  const target = new EventTarget();
+  let heard = false;
+  target.addEventListener("ping", () => { heard = true; });
+  target.dispatchEvent(new Event("ping"));
+  return detail === 3 && heard;
+});
 check("deviceorientation", false, () => global("DeviceOrientationEvent"));
 check("dom-range", false, () => global("Range") || typeof globalThis.document?.createRange === "function");
 check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
-check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function" || typeof ui.createBox().scroll === "function");
+check("element-scroll-methods", true, () => typeof ui.createBox().scroll === "function");
+check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function");
 check("eme", false, () => typeof navigator.requestMediaKeySystemAccess === "function");
 check("eventsource", false, () => global("EventSource"));
 check("fetch", NODE, () => typeof fetch === "function" && new Request("http://localhost/x", { method: "POST" }).method === "POST" &&
@@ -224,17 +237,17 @@ check("filereadersync", false, () => global("FileReaderSync"));
 check("gamepad", false, () => typeof navigator.getGamepads === "function");
 check("geolocation", false, () => typeof navigator.geolocation === "object");
 check("getboundingclientrect", false, () => typeof ui.createBox().getBoundingClientRect === "function");
-check("getrandomvalues", NODE, () => {
+check("getrandomvalues", true, () => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return bytes.some((byte) => byte !== 0) && typeof crypto.randomUUID() === "string";
 });
 check("gyroscope", false, () => global("Gyroscope"));
-check("hardwareconcurrency", NODE, () => navigator.hardwareConcurrency >= 1);
+check("hardwareconcurrency", true, () => navigator.hardwareConcurrency >= 1);
 check("high-resolution-time", true, () => {
   const start = performance.now();
   return typeof start === "number" && performance.now() >= start;
 });
-check("high-resolution-time", NODE, () => typeof performance.timeOrigin === "number" && performance.timeOrigin > 0);
+check("high-resolution-time", true, () => typeof performance.timeOrigin === "number" && performance.timeOrigin > 0);
 check("imagecapture", false, () => global("ImageCapture"));
 check("ime", false, () => typeof ui.createInput().inputMethodContext === "object");
 check("indexeddb", false, () => global("indexedDB"));
@@ -285,14 +298,14 @@ check("requestanimationframe", true, () => node ? typeof requestAnimationFrame =
   const id = requestAnimationFrame((time) => resolve(typeof time === "number"));
   if (typeof id !== "number") resolve(false);
 }));
-check("requestidlecallback", false, () => typeof globalThis.requestIdleCallback === "function");
+check("requestidlecallback", true, () => new Promise((resolve) => requestIdleCallback((deadline) => resolve(deadline.timeRemaining() > 0 && deadline.didTimeout === false))));
 check("resizeobserver", false, () => global("ResizeObserver"));
 check("rtcpeerconnection", false, () => global("RTCPeerConnection"));
 check("screen-orientation", false, () => typeof globalThis.screen?.orientation === "object");
 check("scrollintoview", false, () => typeof ui.createBox().scrollIntoView === "function");
 check("scrollintoviewifneeded", false, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
 check("selection-api", false, () => typeof globalThis.getSelection === "function");
-check("setimmediate", NODE, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
+check("setimmediate", true, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
 check("speech-recognition", false, () => global("SpeechRecognition") || global("webkitSpeechRecognition"));
 check("speech-synthesis", false, () => typeof globalThis.speechSynthesis === "object");
 check("stream", false, () => typeof navigator.mediaDevices?.getUserMedia === "function");
@@ -303,11 +316,11 @@ check("streams", NODE, async () => {
   await upper.pipeTo(new WritableStream({ write(chunk) { seen.push(chunk); } }));
   return seen.join() === "A,B";
 });
-check("textencoder", NODE, () => {
+check("textencoder", true, () => {
   const bytes = new TextEncoder().encode("Silk ✓");
   return bytes.length === 8 && new TextDecoder().decode(bytes) === "Silk ✓" && new TextDecoder("utf-16le").decode(new Uint8Array([65, 0])) === "A";
 });
-check("touch", false, () => { ui.createBox().addEventListener("touchstart", () => {}); return true; });
+check("touch", false, () => global("TouchEvent"));
 check("url", NODE, () => {
   const url = new URL("../b?x=1#top", "https://example.com/a/c");
   return url.href === "https://example.com/b?x=1#top" && url.hostname === "example.com" && url.searchParams.get("x") === "1";
@@ -317,7 +330,7 @@ check("urlsearchparams", NODE, () => {
   params.append("c", "x y");
   return params.getAll("a").join() === "1,3" && params.toString() === "a=1&b=2&a=3&c=x+y";
 });
-check("user-timing", NODE, () => {
+check("user-timing", true, () => {
   performance.mark("caniuse-start");
   performance.mark("caniuse-end");
   const measure = performance.measure("caniuse", "caniuse-start", "caniuse-end");
