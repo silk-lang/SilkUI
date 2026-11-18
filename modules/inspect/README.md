@@ -78,7 +78,7 @@ and how many `Events` steps came out different. `copyMutation`, `copyBatch`, `co
 ```sh
 silk test --manifest-path modules/inspect/tests/silk.toml --root src/tests.silk
 silk build --manifest-path modules/inspect/tests/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-tests modules/inspect/tests/goldens [--update]
+build/x86_64-unknown-linux-gnu/dev/ui-inspect-tests modules/inspect/tests/goldens [--update]
 ```
 
 - Queries over the inbox fixture: buttons by role and name, rows named by their text, text

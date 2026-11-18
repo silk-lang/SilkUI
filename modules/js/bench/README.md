@@ -212,7 +212,7 @@ it animates rather than idle.
 (cd modules/js/examples/react-counter && npm run build && npm run build:web)
 (cd modules/js/examples/react-counter/electron && npm install && node node_modules/electron/install.js)
 (cd modules/js/examples/react-counter/tauri && cargo build --release)
-silk build --manifest-path modules/js/demo/silk.toml --profile production
+silk task --manifest-path modules/js/demo/silk.toml production --release
 node modules/js/bench/run.mjs --app starter --runs 5 --cold-runs 3
 ```
 

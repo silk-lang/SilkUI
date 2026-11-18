@@ -71,7 +71,7 @@ The input commands go through the app's real input path. A click from the CLI is
 ```sh
 silk build --manifest-path modules/inspect/mcp/silk.toml
 
-claude mcp add silk-ui -- "$PWD/build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-mcp" \
+claude mcp add silk-ui -- "$PWD/build/x86_64-unknown-linux-gnu/dev/ui-inspect-mcp" \
   --connect "$PWD/silk-ui-inspect.sock"
 ```
 

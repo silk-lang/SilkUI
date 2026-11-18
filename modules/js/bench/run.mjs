@@ -48,7 +48,7 @@ const median = (values) => {
 
 // ---------------------------------------------------------------- targets
 
-const silkBuild = (profile, name) => join(repo, "build/llvm", triple, profile, name);
+const silkBuild = (profile, name) => join(repo, "build", triple, profile, name);
 const electronDir = join(here, "electron/node_modules/electron/dist");
 const tauriBinary = join(here, "tauri/target/release/bench-counter-tauri");
 const silkBundle = join(here, "dist/silk/app.js");
@@ -59,14 +59,14 @@ const counterTargets = [
   {
     name: "ui-js",
     label: "ui-js (SilkJS + React)",
-    command: silkBuild("production", "ui-js-demo"),
+    command: silkBuild("release", "ui-js-demo"),
     args: [silkBundle],
     cwd: repo,
     env: { SILK_UI_TRACE_FRAMES: "1" },
     gpuCache: true,
     title: "Silk UI",
-    ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", silkBundle], ["@silkui/core", join(repo, "modules/js/packages/core/src/index.js")]],
-    debugBinary: silkBuild("debug", "ui-js-demo"),
+    ships: [["binary", silkBuild("release", "ui-js-demo")], ["bundle", silkBundle], ["@silkui/core", join(repo, "modules/js/packages/core/src/index.js")]],
+    debugBinary: silkBuild("dev", "ui-js-demo"),
     bundle: silkBundle,
     interactive: true,
   },
@@ -120,7 +120,7 @@ const counterTargets = [
     // No JavaScript: the first frame is the first one presented.
     firstFrame: /^silk-ui: frame 1 presented/,
     ships: [["binary", silkBuild("release", "tree-window")]],
-    debugBinary: silkBuild("debug", "tree-window"),
+    debugBinary: silkBuild("dev", "tree-window"),
     interactive: false,
   },
   {
@@ -146,14 +146,14 @@ const starterTargets = [
   {
     name: "ui-js",
     label: "ui-js (SilkJS + React)",
-    command: silkBuild("production", "ui-js-demo"),
+    command: silkBuild("release", "ui-js-demo"),
     args: [join(starter, "dist/app.js")],
     cwd: repo,
     env: { SILK_UI_TRACE_FRAMES: "1" },
     gpuCache: true,
     title: "Silk UI",
     firstFrame: starterFirstFrame,
-    ships: [["binary", silkBuild("production", "ui-js-demo")], ["bundle", join(starter, "dist/app.js")], ["@silkui/core", join(repo, "modules/js/packages/core/src/index.js")]],
+    ships: [["binary", silkBuild("release", "ui-js-demo")], ["bundle", join(starter, "dist/app.js")], ["@silkui/core", join(repo, "modules/js/packages/core/src/index.js")]],
     bundle: join(starter, "dist/app.js"),
     interactive: false,
   },
