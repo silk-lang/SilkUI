@@ -19,7 +19,7 @@ const TYPES = [
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
-  "animationcancel", "selectionchange",
+  "animationcancel", "selectionchange", "pointerover", "pointerout",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
@@ -567,6 +567,31 @@ export class Node {
 
   focus() {
     native.focus(this.nodeId);
+  }
+
+  /**
+   * Sends the pointer's records here until it lifts, as DOM `setPointerCapture`. Throws
+   * `NotFoundError` for a pointer that is not down. The tree moves the capture of the
+   * primary pointer; another finger keeps sending to the node it went down on.
+   */
+  setPointerCapture(pointerId) {
+    const pointer = pointers.get(pointerId);
+    if (!pointer) throw domError("NotFoundError", `no active pointer with id ${pointerId}`);
+    if (!pointer.buttons) return;
+    pointer.capture = this;
+    if (pointer.primary) native.capture(this.nodeId);
+  }
+
+  releasePointerCapture(pointerId) {
+    const pointer = pointers.get(pointerId);
+    if (!pointer) throw domError("NotFoundError", `no active pointer with id ${pointerId}`);
+    if (pointer.capture !== this) return;
+    pointer.capture = null;
+    if (pointer.primary) native.capture(0);
+  }
+
+  hasPointerCapture(pointerId) {
+    return pointers.get(pointerId)?.capture === this;
   }
 
   scrollTo(x, y) {
@@ -1522,12 +1547,72 @@ export class Event {
   }
 }
 
+// The pointers down or hovering, by `pointerId`: their buttons and the node holding their
+// capture.
+const pointers = new Map();
+
+function domError(name, message) {
+  const DOMExceptionClass = globalThis.DOMException;
+  if (DOMExceptionClass) return new DOMExceptionClass(message, name);
+  const error = new Error(message);
+  error.name = name;
+  return error;
+}
+
+const POINTER_TYPES = ["mouse", "pen", "touch"];
+// DOM `buttons` bits by `button`: primary 1, secondary 2, auxiliary 4, back 8, forward 16.
+const BUTTON_BITS = [1, 4, 2, 8, 16];
+
+function isPointerKind(kind) {
+  return kind <= 5 || kind === 14 || kind === 28 || kind === 29;
+}
+
+// The members of DOM `PointerEvent` the record carries (see ui-js-calls `pointerBits`), and the
+// spec defaults for what no host reports: pressure 0.5 while a button is down, 0 otherwise, and
+// a contact of 1 by 1 pixel with no tilt.
+function fillPointer(event, kind, bits, d) {
+  const pointerId = Math.floor(bits / 256);
+  const pointerType = POINTER_TYPES[Math.floor(bits / 16) % 4] ?? "mouse";
+  const isPrimary = Math.floor(bits / 64) % 2 === 1;
+  let pointer = pointers.get(pointerId);
+  if (!pointer) {
+    pointer = { buttons: 0, capture: null, primary: isPrimary };
+    pointers.set(pointerId, pointer);
+  }
+  if (kind === 0) pointer.buttons |= BUTTON_BITS[d] ?? 0;
+  else if (kind === 1) pointer.buttons &= ~(BUTTON_BITS[d] ?? 0);
+  event.pointerId = pointerId;
+  event.pointerType = pointerType;
+  event.isPrimary = isPrimary;
+  event.buttons = pointer.buttons;
+  event.pressure = pointer.buttons ? 0.5 : 0;
+  event.tangentialPressure = 0;
+  event.tiltX = 0;
+  event.tiltY = 0;
+  event.twist = 0;
+  event.altitudeAngle = Math.PI / 2;
+  event.azimuthAngle = 0;
+  event.width = 1;
+  event.height = 1;
+  if (kind !== 0 && kind !== 1 && kind !== 2) event.button = kind === 3 ? -1 : 0;
+  const coalesced = kind === 3 ? [event] : [];
+  event.getCoalescedEvents = () => coalesced;
+  event.getPredictedEvents = () => [];
+  // A pointer that lifted, or a touch that left, is gone; the mouse stays.
+  if ((kind === 1 && !pointer.buttons) || kind === 14) {
+    pointer.capture = null;
+    if (pointerType !== "mouse") pointers.delete(pointerId);
+  }
+}
+
 function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
-  if (kind <= 6 || kind === 14) {
+  if (kind <= 6 || kind === 14 || kind === 28 || kind === 29) {
     event.clientX = event.x = a;
     event.clientY = event.y = b;
   }
-  if (kind <= 8 || kind === 14) {
+  if (isPointerKind(kind)) fillPointer(event, kind, modifiers, d);
+  if (kind === 16) for (const pointer of pointers.values()) if (pointer.capture === event.target) pointer.capture = null;
+  if (kind <= 8 || kind === 14 || kind === 28 || kind === 29) {
     event.shiftKey = (modifiers & 1) !== 0;
     event.ctrlKey = (modifiers & 2) !== 0;
     event.altKey = (modifiers & 4) !== 0;

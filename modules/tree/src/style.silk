@@ -555,6 +555,8 @@ pub struct ScrollStyle {
   pub padding: Edges,
   /// `scrollbar-color`, which inherits.
   pub colors: ScrollbarColors,
+  /// `touch-action` as `TOUCH_*` bits: the gestures the tree may take for itself.
+  pub touch: u8,
 }
 
 /// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
@@ -614,6 +616,7 @@ impl ScrollStyle {
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
+      touch: TOUCH_AUTO,
     }
   }
 }
@@ -651,6 +654,62 @@ impl ScrollStyle {
   fn setSnapStop(self: &mut Self, always: bool) -> () {
     self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
   }
+}
+
+/// `ScrollStyle.touch` bits: the directions a touch may start panning in (`pan-left` is the
+/// finger moving right, the content scrolling left) and `pinch-zoom`.
+pub const TOUCH_PAN_LEFT: u8 = 1
+pub const TOUCH_PAN_RIGHT: u8 = 2
+pub const TOUCH_PAN_UP: u8 = 4
+pub const TOUCH_PAN_DOWN: u8 = 8
+pub const TOUCH_PINCH: u8 = 16
+pub const TOUCH_PAN_X: u8 = 3
+pub const TOUCH_PAN_Y: u8 = 12
+/// `auto` and `manipulation`: every gesture (the tree has no double-tap zoom to leave out).
+pub const TOUCH_AUTO: u8 = 31
+
+fn touchWord(word: Keyword) -> u8 {
+  return if word == Keyword.PanX { TOUCH_PAN_X }
+    else if word == Keyword.PanLeft { TOUCH_PAN_LEFT }
+    else if word == Keyword.PanRight { TOUCH_PAN_RIGHT }
+    else if word == Keyword.PanY { TOUCH_PAN_Y }
+    else if word == Keyword.PanUp { TOUCH_PAN_UP }
+    else if word == Keyword.PanDown { TOUCH_PAN_DOWN }
+    else if word == Keyword.PinchZoom { TOUCH_PINCH }
+    else { 0 }
+}
+
+/// `touch-action`: `auto`, `none`, `manipulation`, or up to one horizontal pan word, one
+/// vertical pan word and `pinch-zoom`, in any order.
+fn touchActionOf(value: &Value) -> Option<u8> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.Auto || word == Keyword.Manipulation { return Option<u8>.some(TOUCH_AUTO) }
+    if word == Keyword.None { return Option<u8>.some(0) }
+    let bits = touchWord(word)
+    return if bits == 0 { Option<u8>.None } else { Option<u8>.some(bits) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length > 3 { return Option<u8>.None }
+    let mut bits: u8 = 0
+    let mut i: usize = 0
+    while i < items.length {
+      let word = match convert.keywordOf(&items[i]) {
+        Option.Some { value: found } => found
+        Option.None => { return Option<u8>.None }
+      }
+      let one = touchWord(word)
+      // Each group (horizontal, vertical, pinch) may be named once.
+      let group: u8 = if u8.bitAnd(one, TOUCH_PAN_X) != 0 { TOUCH_PAN_X }
+        else if u8.bitAnd(one, TOUCH_PAN_Y) != 0 { TOUCH_PAN_Y }
+        else { one }
+      if one == 0 || u8.bitAnd(bits, group) != 0 { return Option<u8>.None }
+      bits = u8.bitOr(bits, one)
+      i = i + 1
+    }
+    return Option<u8>.some(bits)
+  }
+  return Option<u8>.None
 }
 
 /// `scroll-snap-type`: `none`, or an axis and an optional strictness.
@@ -1466,6 +1525,9 @@ impl Computed {
       }
       CssProperty.ScrollSnapAlign => {
         if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
+      }
+      CssProperty.TouchAction => {
+        if let Option<u8>.Some { value: bits } = touchActionOf(value) { self.scroll.touch = bits }
       }
       CssProperty.ScrollSnapStop => {
         if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
