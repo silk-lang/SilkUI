@@ -297,7 +297,9 @@ effect fn fingersBody() -> ()
   let mut secondary: usize = 0
   let mut i: usize = 0
   while i < values.length {
-    if values[i].pointerId == 3 {
+    let touchRecord = values[i].kind == EventKind.TouchStart || values[i].kind == EventKind.TouchMove
+      || values[i].kind == EventKind.TouchEnd
+    if values[i].pointerId == 3 && !touchRecord {
       run Testing.expect(!values[i].primary && values[i].pointerType == POINTER_TOUCH, "the second finger is not primary")
       secondary = secondary + 1
     }
@@ -349,4 +351,97 @@ test effect fn aTrackpadPinchIsAControlWheel() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pinchBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Runs `input` with its records prevented, as a handler calling `preventDefault` would, and
+/// gives back the records.
+effect fn preventing(tree: &mut UiTree<'_>, input: Input, again: Input) -> List<Event>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run tree.begin(&input)
+  let events = run drain(&mut tree)
+  run tree.finish(move again, true)
+  return move events
+}
+
+effect fn touchEventsBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection, &[])
+
+  // A finger's touch records follow its pointer records, at the node it went down on.
+  run start(&mut tree, 1, X, 300.0, 0.0)
+  let down = run drain(&mut tree)
+  let pressed = firstOf(&down, EventKind.PointerDown)
+  let touched = firstOf(&down, EventKind.TouchStart)
+  run Testing.expect(pressed < touched && touched < down.length(), "touchstart follows pointerdown")
+  let startTarget = down.asSlice()[touched].target
+  run Testing.expect(
+    down.asSlice()[touched].detail == 1 && down.asSlice()[touched].pointerId == 2
+      && down.asSlice()[touched].pointerType == POINTER_TOUCH,
+    "a cancelable touchstart for touch 2",
+  )
+  // Past the slop the touchmove goes first and the tree pans after it.
+  run slide(&mut tree, 1, X, 250.0, 0.5)
+  let moved = run drain(&mut tree)
+  let first = firstOf(&moved, EventKind.TouchMove)
+  run Testing.expect(
+    first < firstOf(&moved, EventKind.PointerCancel) && moved.asSlice()[first].detail == 1
+      && moved.asSlice()[first].target == startTarget,
+    "the deciding touchmove is cancelable and comes before the pointercancel",
+  )
+  run slide(&mut tree, 1, X, 200.0, 1.0)
+  let panning = run drain(&mut tree)
+  let later = firstOf(&panning, EventKind.TouchMove)
+  run Testing.expect(
+    later < panning.length() && panning.asSlice()[later].detail == 0 && panning.asSlice()[later].target == startTarget,
+    "while the tree pans, touchmove goes on, not cancelable, to the same node",
+  )
+  run end(&mut tree, 1, X, 200.0, 3.0)
+  let ended = run drain(&mut tree)
+  run Testing.expect(countKind(&ended, EventKind.TouchEnd) == 1, "and touchend ends it")
+  run tree.frame(at(3.1))
+  let scrolled = listY(&tree)
+
+  // A prevented touchmove before the pan keeps the gesture: no scroll, pointer moves go on.
+  run start(&mut tree, 2, X, 300.0, 4.0)
+  drop run drain(&mut tree)
+  drop run preventing(
+    &mut tree,
+    Input.TouchMove { id: 2, x: X, y: 250.0, modifiers: 0, time: 4.5 },
+    Input.TouchMove { id: 2, x: X, y: 250.0, modifiers: 0, time: 4.5 },
+  )
+  let kept = run drain(&mut tree)
+  run Testing.expect(listY(&tree) == scrolled && countKind(&kept, EventKind.PointerCancel) == 0, "a prevented touchmove does not pan")
+  run Testing.expect(countKind(&kept, EventKind.PointerMove) == 1, "and the move reaches the client as a pointer move")
+  run slide(&mut tree, 2, X, 150.0, 5.0)
+  run Testing.expect(listY(&tree) == scrolled, "for the rest of the gesture")
+  run end(&mut tree, 2, X, 150.0, 5.5)
+  drop run drain(&mut tree)
+
+  // A prevented touchstart: no pan, and the tap clicks nothing.
+  drop run preventing(
+    &mut tree,
+    Input.TouchStart { id: 3, x: 100.0, y: 112.0, modifiers: 0, time: 6.0 },
+    Input.TouchStart { id: 3, x: 100.0, y: 112.0, modifiers: 0, time: 6.0 },
+  )
+  run end(&mut tree, 3, 100.0, 112.0, 6.1)
+  let tapped = run drain(&mut tree)
+  run Testing.expect(
+    countKind(&tapped, EventKind.PointerUp) == 1 && countKind(&tapped, EventKind.TouchEnd) == 1
+      && countKind(&tapped, EventKind.Click) == 0,
+    "a prevented touchstart makes a tap without a click",
+  )
+  // The next tap clicks again.
+  run start(&mut tree, 4, 100.0, 112.0, 7.0)
+  run end(&mut tree, 4, 100.0, 112.0, 7.1)
+  let again = run drain(&mut tree)
+  run Testing.expect(countKind(&again, EventKind.Click) == 1, "and the next tap clicks")
+}
+
+test effect fn touchEventsFollowPointerEventsAndCanKeepTheGesture() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run touchEventsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
