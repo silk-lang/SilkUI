@@ -67,6 +67,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
 import silk.num.f64
 import silk.num.u32
+import silk.num.usize
 import silk.text.string { String }
 
 /// `__ui.*` in the runtime's realm: the bridge's functions, from the embedder's first id.
@@ -435,6 +436,17 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     self.release(move returned)
   }
 
+  /// Runs IntersectionObserver and ResizeObserver on `tree`'s last layout (see `JsHost.observe`).
+  pub effect fn observe<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.bridge.observers.any() { return }
+    self.bridge.geometry.clear()
+    let count = run self.bridge.observers.update(&tree.*, &mut self.bridge.geometry)
+    if count == 0 { return }
+    self.bridge.attach(&mut tree)
+    let returned = run self.callReporting(b"observed", &[ValueBits.number(usize.toF64(count))])
+    self.release(move returned)
+  }
+
   /// One turn of the runtime's loop, waiting at most `seconds` (with no limit when negative)
   /// for a timer, a completion or a window event. Says whether the turn left mutations for the tree.
   pub effect fn turn(self: &mut Self, seconds: f64) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -535,16 +547,20 @@ impl NodeClient {
 impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient {
   effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     let root = tree.current
     drop run self.stylesheets.serve(&mut tree.*, root)
     run tree.frame(input)
+    run state.observe(&mut tree)
     drop run self.load(&mut state, &mut tree)
   }
 
   effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     drop run self.stylesheets.serve(&mut tree.*, root)
     run tree.frameRoot(root, input)
+    run state.observe(&mut tree)
     drop run self.load(&mut state, &mut tree)
   }
 
@@ -558,6 +574,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn event(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, event: &Event) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     if run state.desktop(&mut tree, event) {
       drop run self.load(&mut state, &mut tree)
       return true
@@ -576,6 +593,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn update(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     if self.windowDrag {
       self.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
@@ -589,6 +607,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     // The entry ran before the window opened; what it built is the first frame.
     drop run state.flush(&mut tree)
     drop run self.load(&mut state, &mut tree)
@@ -602,6 +621,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
 
   effect fn poll(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64) -> bool
     ! WindowError | TreeError | OutOfMemoryError ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
     run self.loader.watch(time)
     let loaded = run self.load(&mut state, &mut tree)
@@ -630,6 +650,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn wait(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, seconds: f64) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     run state.turn(seconds)
     let flushed = run state.flush(&mut tree)
     let loaded = run self.load(&mut state, &mut tree)
@@ -643,6 +664,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn pump(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     drop run state.handle(&mut tree)
     drop run self.load(&mut state, &mut tree)
   }
@@ -650,6 +672,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn decide(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     let prevented = run state.handle(&mut tree)
     drop run self.load(&mut state, &mut tree)
     return prevented
@@ -658,6 +681,7 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
   effect fn tick(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.bridge.attach(&mut tree)
     // Timers are the runtime's and run in `wait`; a frame runs the animation callbacks.
     if animation { run state.frame(time) }
     drop run state.flush(&mut tree)

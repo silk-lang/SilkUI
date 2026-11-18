@@ -476,6 +476,10 @@ impl<'m> JsHost<'m> {
     return self.engine.services.batch.length()
   }
 
+  /// Lets `getComputedStyle` read `tree`: call it before each call that runs JavaScript, with
+  /// the tree [`JsHost.flushRaw`] applies to. The tree must stay where it is while it runs.
+  pub fn attach<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () { self.engine.services.attach(&mut tree) }
+
   /// Applies what JavaScript queued to `tree`.
   pub effect fn flush(self: &mut Self, tree: &mut Tree<'_>) -> () ! ProtocolError | OutOfMemoryError ? &mut Allocator {
     if self.engine.services.batch.length() == 0 { return }
@@ -695,6 +699,29 @@ impl<'m> JsHost<'m> {
       }
       run drainIn(&mut self.engine, realm)
     }
+  }
+
+  /// Whether IntersectionObserver or ResizeObserver watch anything.
+  pub fn observing(self: &Self) -> bool { return self.engine.services.observers.any() }
+
+  /// Runs IntersectionObserver and ResizeObserver on `tree`'s last layout. When an observation
+  /// changed, JavaScript gets the entries (`__ui.observed(count)`, read with `__ui.geometry`).
+  /// Call after each layout, before paint. Without observations it does nothing.
+  pub effect fn observe<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    if !self.engine.services.observers.any() { return () }
+    self.engine.services.geometry.clear()
+    let count = run self.engine.services.observers.update(&tree.*, &mut self.engine.services.geometry)
+    if count == 0 { return () }
+    self.attach(&mut tree)
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let arguments = [ValueBits.number(usize.toF64(count))]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"observed", &arguments))
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
   }
 
   /// Hands `line`, a message from the development server, to JavaScript (`__ui.devMessage`).

@@ -226,7 +226,7 @@ check("cryptography", NODE, async () => {
   const opened = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
   return digest[0] === 0xba && digest[31] === 0xad && opened.join() === "1,2,3";
 });
-check("css-supports-api", false, () => typeof CSS === "object" && typeof CSS.supports === "function");
+check("css-supports-api", true, () => typeof CSS === "object" && typeof CSS.supports === "function");
 check("customevent", true, () => new CustomEvent("ping", { detail: 3 }).detail === 3);
 check("customevent", true, () => {
   const outer = ui.createBox();
@@ -254,7 +254,7 @@ check("dom-range", true, () => {
 });
 check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
 check("element-scroll-methods", true, () => typeof ui.createBox().scroll === "function");
-check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function");
+check("element-scroll-methods", true, () => typeof ui.createBox().scrollBy === "function");
 check("eme", false, () => typeof navigator.requestMediaKeySystemAccess === "function");
 check("eventsource", false, () => global("EventSource"));
 check("fetch", NODE, () => typeof fetch === "function" && new Request("http://localhost/x", { method: "POST" }).method === "POST" &&
@@ -269,7 +269,7 @@ check("filereader", false, () => global("FileReader"));
 check("filereadersync", false, () => global("FileReaderSync"));
 check("gamepad", false, () => typeof navigator.getGamepads === "function");
 check("geolocation", false, () => typeof navigator.geolocation === "object");
-check("getboundingclientrect", false, () => typeof ui.createBox().getBoundingClientRect === "function");
+check("getboundingclientrect", true, () => typeof ui.createBox().getBoundingClientRect === "function");
 check("getrandomvalues", true, () => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return bytes.some((byte) => byte !== 0) && typeof crypto.randomUUID() === "string";
@@ -296,8 +296,8 @@ check("input-selection", true, () => {
   field.select();
   return field.selectionStart === 0 && field.selectionEnd === 5;
 });
-check("intersectionobserver", false, () => global("IntersectionObserver"));
-check("intersectionobserver-v2", false, () => global("IntersectionObserver"));
+check("intersectionobserver", true, () => global("IntersectionObserver"));
+check("intersectionobserver-v2", true, () => global("IntersectionObserver"));
 check("magnetometer", false, () => global("Magnetometer"));
 check("matchesselector", false, () => typeof ui.createBox().matches === "function");
 check("matchmedia", true, () => typeof globalThis.matchMedia === "function" && typeof matchMedia("(min-width: 1px)").matches === "boolean");
@@ -336,11 +336,11 @@ check("requestanimationframe", true, () => node ? typeof requestAnimationFrame =
   if (typeof id !== "number") resolve(false);
 }));
 check("requestidlecallback", true, () => new Promise((resolve) => requestIdleCallback((deadline) => resolve(deadline.timeRemaining() > 0 && deadline.didTimeout === false))));
-check("resizeobserver", false, () => global("ResizeObserver"));
+check("resizeobserver", true, () => global("ResizeObserver"));
 check("rtcpeerconnection", false, () => global("RTCPeerConnection"));
 check("screen-orientation", false, () => typeof globalThis.screen?.orientation === "object");
-check("scrollintoview", false, () => typeof ui.createBox().scrollIntoView === "function");
-check("scrollintoviewifneeded", false, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
+check("scrollintoview", true, () => typeof ui.createBox().scrollIntoView === "function");
+check("scrollintoviewifneeded", true, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
 check("selection-api", false, () => typeof globalThis.getSelection === "function");
 check("setimmediate", true, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
 check("speech-recognition", false, () => global("SpeechRecognition") || global("webkitSpeechRecognition"));
@@ -357,7 +357,16 @@ check("textencoder", true, () => {
   const bytes = new TextEncoder().encode("Silk ✓");
   return bytes.length === 8 && new TextDecoder().decode(bytes) === "Silk ✓" && new TextDecoder("utf-16le").decode(new Uint8Array([65, 0])) === "A";
 });
-check("touch", false, () => global("TouchEvent"));
+check("touch", true, () => {
+  const box = ui.createBox();
+  let seen = null;
+  box.addEventListener("touchstart", (event) => { seen = event; });
+  const finger = 2 * 256 + 2 * 16 + 64;
+  globalThis.__ui.dispatch(30, box.nodeId, 5, 6, finger, 1, 0);
+  globalThis.__ui.dispatch(32, box.nodeId, 5, 6, finger, 1, 0);
+  return seen !== null && seen.cancelable && seen.touches.length === 1 && seen.changedTouches.item(0).identifier === 2
+    && seen.targetTouches[0].target === box && seen.changedTouches[0].clientY === 6;
+});
 check("url", NODE, () => {
   const url = new URL("../b?x=1#top", "https://example.com/a/c");
   return url.href === "https://example.com/b?x=1#top" && url.hostname === "example.com" && url.searchParams.get("x") === "1";

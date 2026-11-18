@@ -205,6 +205,7 @@ impl<'m> JsApp<'m> {
 
   /// Runs the entry module and applies what it built.
   pub effect fn startEntry(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let ran = run Effect.result(self.host.module(self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move ran)
     run self.host.flushRaw(&mut tree)
@@ -213,6 +214,7 @@ impl<'m> JsApp<'m> {
   /// Runs `source` as a script named `name`, prints what it wrote and threw, and applies
   /// what it built.
   pub effect fn script(self: &mut Self, tree: &mut UiTree<'_>, source: &[u8], name: &[u8]) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let ran = run Effect.result(self.host.evaluate(source, name)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move ran)
     run self.host.flushRaw(&mut tree)
@@ -221,6 +223,7 @@ impl<'m> JsApp<'m> {
   /// Hands `line`, a message from a development server, to JavaScript (`__ui.devMessage`),
   /// prints what it wrote and threw, and applies what it built.
   pub effect fn message(self: &mut Self, tree: &mut UiTree<'_>, line: string) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let handed = run Effect.result(self.host.devMessage(line)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move handed)
     run self.host.flushRaw(&mut tree)
@@ -230,6 +233,7 @@ impl<'m> JsApp<'m> {
   /// [`JsApp.define`] defined again. Says whether there is a new realm; the window keeps
   /// the old one when there is not.
   pub effect fn fresh(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let compiler = self.host.stylesheetCompiler()
     let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move unloaded)
@@ -237,7 +241,10 @@ impl<'m> JsApp<'m> {
     run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
     let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     match move opened {
-      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => { self.host = move value }
+      Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => {
+        self.host = move value
+        self.host.attach(&mut tree)
+      }
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
         JsError { message } => {
@@ -291,6 +298,7 @@ impl<'m> JsApp<'m> {
   /// Answers JavaScript's clipboard calls through `platform`, and the calls their promise
   /// jobs made, then applies what it built. Says whether there were calls.
   effect fn clipboard(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
       let requests = self.host.takeClipboard()
@@ -312,6 +320,7 @@ impl<'m> JsApp<'m> {
   /// settles the ones that ended, then applies what their promise jobs built. Says whether a
   /// call ended.
   effect fn natives(self: &mut Self, jobs: &mut NativeJobs, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let started = self.host.takeStartedNatives()
     if started.length() != 0 { run jobs.start(move started, self.host.natives()) }
     let mut done = run jobs.finished()
@@ -329,6 +338,7 @@ impl<'m> JsApp<'m> {
   /// `platform`, and the calls their promise jobs made, then applies what it built. Says
   /// whether there were calls.
   effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
       let requests = self.host.takeShell()
@@ -349,6 +359,7 @@ impl<'m> JsApp<'m> {
   /// Hands a desktop event (a file drag, a global shortcut, the tray, a notification click)
   /// to JavaScript and applies what it built. Says whether `event` was one.
   effect fn desktop(self: &mut Self, tree: &mut UiTree<'_>, event: &Event) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let mut was = false
     let ran = run Effect.result(deliverShellInto(&mut self.host, &tree.*, event, &mut was)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move ran)
@@ -358,7 +369,16 @@ impl<'m> JsApp<'m> {
 
   /// Delivers the tree's queued records and reports the listener exceptions. Says whether a
   /// listener prevented a default.
+  /// Runs the observers after a layout, and applies what their callbacks changed.
+  effect fn observe(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if !self.host.observing() { return () }
+    let ran = run Effect.result(self.host.observe(&mut tree)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.settle(move ran)
+    run self.host.flushRaw(&mut tree)
+  }
+
   effect fn handle(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.host.attach(&mut tree)
     let delivered = run Effect.result(self.host.deliverRaw(&mut tree)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     let mut prevented = false
     let outcome = match move delivered {
@@ -458,6 +478,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let root = tree.current
     drop run self.stylesheets.serve(&mut tree.*, root)
     run tree.frame(input)
+    run state.observe(&mut tree)
     run self.load(&mut state, &mut tree)
   }
 
@@ -465,6 +486,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     drop run self.stylesheets.serve(&mut tree.*, root)
     run tree.frameRoot(root, input)
+    run state.observe(&mut tree)
     run self.load(&mut state, &mut tree)
   }
 
@@ -564,6 +586,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
   effect fn tick(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    state.host.attach(&mut tree)
     let ran = run Effect.result(state.host.tick(time, animation)) |> Effect.provideMut<Allocator>(&mut state.allocator)
     run state.settle(move ran)
     run state.host.flushRaw(&mut tree)

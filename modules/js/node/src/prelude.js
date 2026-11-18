@@ -31,6 +31,23 @@
     if (failure) throw failure.error;
   };
 
+  // Media queries answer for the window's last frame, as in the engine runtime.
+  if (native.matchMedia && globalThis.matchMedia === undefined) {
+    globalThis.matchMedia = (query) => {
+      const media = String(query);
+      return {
+        media,
+        get matches() { return native.matchMedia(media); },
+        onchange: null,
+        addEventListener() {},
+        removeEventListener() {},
+        addListener() {},
+        removeListener() {},
+        dispatchEvent() { return true; },
+      };
+    };
+  }
+
   // Idle callbacks run from a timer, with a 50 ms budget as the web gives at most.
   globalThis.requestIdleCallback ??= (callback) => {
     if (typeof callback !== "function") throw new TypeError("requestIdleCallback needs a function");
