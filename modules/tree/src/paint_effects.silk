@@ -2,7 +2,7 @@
 //! gradients with any number of stops, sized, positioned and repeated), `text-shadow`, and the isolated layers for
 //! `filter`, `mix-blend-mode`, `clip-path` and `mask`. A run of filter functions that the scene
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
-import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
+import paint { Painter, borderBox, paddingBox, contentBox, device, snapped, radiiOf }
 import paint_css { Effects, Layers, Clip, TextShadow }
 import vector.layer { BLEND_NORMAL }
 import resources { Resource }
@@ -58,6 +58,7 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.corners { Corners }
+import ui_scene.radii { Radii }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
@@ -162,24 +163,6 @@ fn sameRect(a: Rect<f32>, b: Rect<f32>) -> bool {
   return f32.abs(a.xMin - b.xMin) < 0.01 && f32.abs(a.yMin - b.yMin) < 0.01
     && f32.abs(a.xMax - b.xMax) < 0.01
     && f32.abs(a.yMax - b.yMax) < 0.01
-}
-
-fn hasRadius(r: Corners<f32>) -> bool {
-  return r.topLeft > 0.0 || r.topRight > 0.0 || r.bottomRight > 0.0 || r.bottomLeft > 0.0
-}
-
-/// The corners of `outer` radii moved in by the edges between the border box and `inner`.
-pub fn insetCorners(radii: Corners<f32>, outer: Rect<f32>, inner: Rect<f32>) -> Corners<f32> {
-  let left = inner.xMin - outer.xMin
-  let top = inner.yMin - outer.yMin
-  let right = outer.xMax - inner.xMax
-  let bottom = outer.yMax - inner.yMax
-  return Corners<f32>.new(
-    f32.max(0.0, radii.topLeft - f32.max(left, top)),
-    f32.max(0.0, radii.topRight - f32.max(right, top)),
-    f32.max(0.0, radii.bottomRight - f32.max(right, bottom)),
-    f32.max(0.0, radii.bottomLeft - f32.max(left, bottom)),
-  )
 }
 
 /// A box of fragment `f` in CSS pixels.
@@ -383,7 +366,7 @@ effect fn paintGradient(
   image: &Image,
   tile: Rect<f32>,
   clip: ContentMask,
-  radii: Corners<f32>,
+  radii: Radii,
   stops: &mut List<Stop>,
 ) -> ()
   ! OutOfMemoryError
@@ -588,7 +571,7 @@ pub effect fn paintLayers(
   effects: &Effects,
   layers: &Layers,
   f: &Fragment,
-  radii: Corners<f32>,
+  radii: Radii,
   mask: ContentMask,
   initialOrigin: GeometryBox,
   text: bool,
@@ -641,7 +624,7 @@ pub effect fn paintLayers(
     }
     let area = boxOf(f, layers.origin(layer, initialOrigin))
     let painting = clipBox(f, clipKind)
-    let paintingRadii = insetCorners(radii, device(border, s), device(painting, s))
+    let paintingRadii = radii.insetTo(device(border, s), device(painting, s))
     let size = tileSize(effects, layers.size(layer), area, natural, ratio)
     let repeat = layers.repeat(layer)
     let mut tw = size[0]
@@ -696,7 +679,7 @@ pub effect fn paintLayers(
       if mode != BLEND_NORMAL { run p.scene.popLayer() }
       continue
     }
-    let rounded = hasRadius(paintingRadii)
+    let rounded = paintingRadii.isRounded()
     if rounded {
       drop run p.scene.pushEffectLayer(
         clip.bounds,
@@ -726,7 +709,7 @@ pub effect fn paintLayers(
             f32.round((x + tw) * s),
             f32.round((y + th) * s),
           )
-          run paintGradient(&mut p, effects, image, snapped, clip, Corners<f32>.zero(), &mut stops)
+          run paintGradient(&mut p, effects, image, snapped, clip, Radii.zero(), &mut stops)
           drawn = drawn + 1
         }
         i = i + 1
@@ -754,7 +737,7 @@ effect fn paintPictures(
   tw: f32,
   th: f32,
   painting: Rect<f32>,
-  radii: Corners<f32>,
+  radii: Radii,
   mask: ContentMask,
   clip: ContentMask,
 ) -> ()
@@ -764,7 +747,7 @@ effect fn paintPictures(
   let area = device(painting, s)
   // Images round with their own clip; icons draw as glyphs, which need a rounded mask layer.
   let layered = match picture {
-    Resource.Icon { .. } => hasRadius(radii)
+    Resource.Icon { .. } => radii.isRounded()
     _ => false
   }
   if layered {
@@ -799,6 +782,7 @@ effect fn paintPictures(
                   opacity: 1.0,
                   cornerRadii: radii,
                   grayscale: false,
+                  nearest: false,
                 },
               )
             }
@@ -822,8 +806,9 @@ effect fn paintPictures(
                       mask: clip,
                       tile: value,
                       opacity: 1.0,
-                      cornerRadii: Corners<f32>.zero(),
+                      cornerRadii: Radii.zero(),
                       grayscale: false,
+                      nearest: false,
                     },
                   )
                 }
@@ -1020,8 +1005,7 @@ pub effect fn pushEffects(
   outer.backdropBlur = c.paint.backdropBlur * s
   outer.clip = device(borderBox(f), s)
   if backdrop {
-    // The backdrop takes one radius: the top-left corner's, as in `rounded-*` cards.
-    outer.radius = scaledCorners(radiiOf(&p.*, slot, c, f), s).topLeft
+    outer.radii = radiiOf(&p.*, slot, c, f).scaled(s)
   }
   drop run p.scene.pushEffectLayer(
     if backdrop { mask.bounds } else { bounds },
@@ -1030,7 +1014,7 @@ pub effect fn pushEffects(
     outer,
   )
   if masked {
-    let corners = scaledCorners(radiiOf(&p.*, slot, c, f), s)
+    let corners = radiiOf(&p.*, slot, c, f).scaled(s)
     run paintMask(&mut p, slot, f, corners, mask)
   }
   let mut opened: u32 = 1
@@ -1070,7 +1054,7 @@ pub fn putEffects(p: &mut Painter<'_, '_>, slot: u32, effects: Option<Box<Effect
 
 /// Paints node `slot`'s `clip-path` and mask images into a mask layer of the layer open now.
 /// Both together multiply: the mask images go in a layer the clip shape masks.
-effect fn paintMask(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, radii: Corners<f32>, mask: ContentMask) -> ()
+effect fn paintMask(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, radii: Radii, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let taken = takeEffects(&mut p, slot)
@@ -1083,7 +1067,7 @@ effect fn paintMask(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, radii: Cor
   putEffects(&mut p, slot, move taken)
 }
 
-effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, radii: Corners<f32>, mask: ContentMask) -> ()
+effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, radii: Radii, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let clipped = effects.clip.length() != 0
@@ -1113,7 +1097,7 @@ fn opaque() -> Background {
 }
 
 /// Fills `rect` (CSS pixels) with corner radii `radii` (device pixels) in opaque black.
-effect fn shapeQuad(p: &mut Painter<'_, '_>, rect: Rect<f32>, radii: Corners<f32>, mask: ContentMask) -> ()
+effect fn shapeQuad(p: &mut Painter<'_, '_>, rect: Rect<f32>, radii: Radii, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut quad = Quad.fill(device(rect, p.scale), mask, opaque())
@@ -1140,13 +1124,21 @@ effect fn shapeEllipse(p: &mut Painter<'_, '_>, cx: f32, cy: f32, rx: f32, ry: f
 }
 
 /// The rounded corners of a basic shape in `box` (CSS pixels), in device pixels.
-fn shapeCorners(effects: &Effects, corners: ShapeCorners, w: f32, h: f32, s: f32) -> Corners<f32> {
-  return Corners<f32>.new(
-    f32.min(effects.pixels(corners.x[0], w), effects.pixels(corners.y[0], h)) * s,
-    f32.min(effects.pixels(corners.x[1], w), effects.pixels(corners.y[1], h)) * s,
-    f32.min(effects.pixels(corners.x[2], w), effects.pixels(corners.y[2], h)) * s,
-    f32.min(effects.pixels(corners.x[3], w), effects.pixels(corners.y[3], h)) * s,
-  )
+fn shapeCorners(effects: &Effects, corners: ShapeCorners, w: f32, h: f32, s: f32) -> Radii {
+  return Radii.new(
+    Corners<f32>.new(
+      effects.pixels(corners.x[0], w),
+      effects.pixels(corners.x[1], w),
+      effects.pixels(corners.x[2], w),
+      effects.pixels(corners.x[3], w),
+    ),
+    Corners<f32>.new(
+      effects.pixels(corners.y[0], h),
+      effects.pixels(corners.y[1], h),
+      effects.pixels(corners.y[2], h),
+      effects.pixels(corners.y[3], h),
+    ),
+  ).fitted(w, h).scaled(s)
 }
 
 fn edgeOr(effects: &Effects, edge: Option<ExprId>, basis: f32, otherwise: f32) -> f32 {
@@ -1163,7 +1155,7 @@ effect fn clipShape(
   effects: &Effects,
   source: &ClipSource,
   f: &Fragment,
-  radii: Corners<f32>,
+  radii: Radii,
   mask: ContentMask,
 ) -> ()
   ! OutOfMemoryError
@@ -1176,7 +1168,7 @@ effect fn clipShape(
     }
     ClipSource.Box { reference } => {
       let area = boxOf(f, reference)
-      run shapeQuad(&mut p, area, insetCorners(radii, device(border, s), device(area, s)), mask)
+      run shapeQuad(&mut p, area, radii.insetTo(device(border, s), device(area, s)), mask)
     }
     ClipSource.Shape { shape, reference } => {
       let area = boxOf(f, reference)
@@ -1244,7 +1236,7 @@ effect fn clipShape(
           }
           if rx > 0.0 && ry > 0.0 && f32.abs(rx - ry) < 0.01 {
             let rect = Rect<f32>.new(cx - rx, cy - ry, cx + rx, cy + ry)
-            run shapeQuad(&mut p, rect, Corners<f32>.new(rx * s, rx * s, rx * s, rx * s), mask)
+            run shapeQuad(&mut p, rect, Radii.uniform(rx * s), mask)
           } else if rx > 0.0 && ry > 0.0 {
             run shapeEllipse(&mut p, cx * s, cy * s, rx * s, ry * s, mask)
           }
@@ -1275,7 +1267,7 @@ effect fn clipShape(
           run shapePath(&mut p, &converted, &transform, evenodd, mask)
         }
         Shape.Commands { .. } => {
-          run shapeQuad(&mut p, area, Corners<f32>.zero(), mask)
+          run shapeQuad(&mut p, area, Radii.zero(), mask)
         }
       }
     }
