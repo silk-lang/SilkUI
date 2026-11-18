@@ -9,10 +9,12 @@ import keys { codeName, keyName }
 import window.event { Event, Key, MouseButton, Phase, ScrollDelta, Modifiers }
 import window.types { Wait }
 import silk.geometry.vector { Vector2 }
-import window.types { Cursor as WindowCursor, ImeState, WindowId, Appearance }
+import window.types { Cursor as WindowCursor, CursorImage as WindowCursorImage, ImeState, WindowId, Appearance }
 import window.platform { Platform }
 import ui_tree.legacy { UiTree, Input, Cursor, HostRequest, ImeArea, NodeInfo }
 import ui_tree.lib { RootEventKind }
+import ui_tree.css_cursor { CursorImage }
+import ui_tree.resources { CursorPixels }
 import ui_tree.mutation { FIRST_ROOT }
 import ui_tree.inspect
 import ui_tree.mutation { LISTEN_WHEEL, NodeKind }
@@ -337,13 +339,51 @@ pub effect fn serveInput<P: Platform>(
   }
 }
 
+/// Shows the hovered node's cursor in `window`, `scale` pixels per point: the image its CSS
+/// `cursor` lists once one has loaded and the platform draws images, else its keyword. An image
+/// is made again only when it changes.
+pub effect fn showCursor<P: Platform>(platform: &mut P, window: WindowId, tree: &mut UiTree<'_>, scale: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match run tree.cursorImage() {
+    Option<CursorImage>.Some { value } => {
+      let mix = u32.toU64(f32.toBits(value.hotX)) * 31 + u32.toU64(f32.toBits(value.hotY)) * 7
+        + u32.toU64(f32.toBits(f64.toF32(scale))) + u32.toU64(window.value) * 131
+      let key = u32.toU64(value.resource) * 4294967296 + mix % 4294967295 + 1
+      if key == tree.cursorShown {
+        return ()
+      }
+      if let Option<CursorPixels>.Some { value: pixels } = run tree.cursorPixels(value, f64.toF32(scale)) {
+        let ratio = f32.toF64(pixels.scale)
+        let hotX = if value.hot { f64.toU32(f64.max(0.0, f32.toF64(value.hotX) * ratio)) } else { 0 }
+        let hotY = if value.hot { f64.toU32(f64.max(0.0, f32.toF64(value.hotY) * ratio)) } else { 0 }
+        let image = WindowCursorImage {
+          width: pixels.width,
+          height: pixels.height,
+          pixels: pixels.pixels.asSlice(),
+          hotX: if hotX >= pixels.width { pixels.width - 1 } else { hotX },
+          hotY: if hotY >= pixels.height { pixels.height - 1 } else { hotY },
+          scale: ratio,
+        }
+        if run platform.setCursorImage(window, &image) {
+          tree.cursorShown = key
+          return ()
+        }
+      }
+    }
+    Option<CursorImage>.None => {}
+  }
+  tree.cursorShown = 0
+  platform.setCursor(window, windowCursor(tree.cursor()))
+}
+
 /// The window cursor for a tree cursor.
 pub fn windowCursor(cursor: Cursor) -> WindowCursor {
   return match cursor {
     Cursor.Default => WindowCursor.Arrow
     Cursor.Pointer => WindowCursor.PointingHand
     Cursor.Text => WindowCursor.IBeam
-    Cursor.Move => WindowCursor.OpenHand
+    Cursor.Move => WindowCursor.Move
     Cursor.Grab => WindowCursor.OpenHand
     Cursor.Grabbing => WindowCursor.ClosedHand
     Cursor.NotAllowed => WindowCursor.NotAllowed
@@ -364,6 +404,17 @@ pub fn windowCursor(cursor: Cursor) -> WindowCursor {
     Cursor.Help => WindowCursor.Help
     Cursor.ZoomIn => WindowCursor.ZoomIn
     Cursor.ZoomOut => WindowCursor.ZoomOut
+    Cursor.Cell => WindowCursor.Cell
+    Cursor.NoDrop => WindowCursor.NoDrop
+    Cursor.AllScroll => WindowCursor.AllScroll
+    Cursor.ResizeNorth => WindowCursor.ResizeUp
+    Cursor.ResizeEast => WindowCursor.ResizeRight
+    Cursor.ResizeSouth => WindowCursor.ResizeDown
+    Cursor.ResizeWest => WindowCursor.ResizeLeft
+    Cursor.ResizeNorthEast => WindowCursor.ResizeUpRight
+    Cursor.ResizeNorthWest => WindowCursor.ResizeUpLeft
+    Cursor.ResizeSouthEast => WindowCursor.ResizeDownRight
+    Cursor.ResizeSouthWest => WindowCursor.ResizeDownLeft
   }
 }
 
