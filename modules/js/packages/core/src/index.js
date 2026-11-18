@@ -1943,6 +1943,67 @@ export function memoryUsage() {
   return footprint > 0 ? { footprint, processes: 1 } : null;
 }
 
+// `getComputedStyle`: one native read per property, made when the property is read, so a
+// declaration stays live and costs nothing for the properties nobody asks for.
+const readComputed = native.computed ?? (() => undefined);
+const computedId = Symbol("node");
+// Property names by the name they were asked by, null for the declaration's own members.
+const computedNames = new Map();
+const lowerNames = new Map();
+function computedName(key, target) {
+  let name = computedNames.get(key);
+  if (name === undefined) {
+    name = key in target ? null : key === "cssFloat" ? "float"
+      : key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, "-$1-");
+    computedNames.set(key, name);
+  }
+  return name;
+}
+
+class CSSStyleDeclaration {
+  constructor(id) { Object.defineProperty(this, computedId, { value: id }); }
+  getPropertyValue(name) {
+    let lower = lowerNames.get(name);
+    if (lower === undefined) {
+      lower = String(name).toLowerCase();
+      if (typeof name === "string") lowerNames.set(name, lower);
+    }
+    return readComputed(this[computedId], lower) ?? "";
+  }
+  getPropertyPriority() { return ""; }
+  setProperty() { throw new TypeError("a computed style cannot be changed"); }
+  removeProperty() { throw new TypeError("a computed style cannot be changed"); }
+  get cssText() { return ""; }
+  get length() { return 0; }
+  item() { return ""; }
+}
+
+const computedTraps = {
+  get(target, key, receiver) {
+    if (typeof key === "string") {
+      const name = computedName(key, target);
+      if (name !== null) return readComputed(target[computedId], name) ?? "";
+    }
+    return Reflect.get(target, key, receiver);
+  },
+  set() { throw new TypeError("a computed style cannot be changed"); },
+};
+
+/**
+ * The values the tree resolved for `node` (an @silkui/core node, or an element of a DOM layer
+ * over one): typed and animated properties as they are now, box sizes, margins, padding and
+ * border widths as laid out, the rest as cascaded with lengths in pixels. Each property read
+ * is one call into the tree; it applies pending changes and lays out only when something
+ * changed since the last layout. Shorthands, custom properties and pseudo-elements read "".
+ */
+export function getComputedStyle(node, pseudo) {
+  const id = node?.nodeId ?? node?.node?.nodeId;
+  if (typeof id !== "number") throw new TypeError("getComputedStyle takes a node");
+  return new Proxy(new CSSStyleDeclaration(pseudo ? 0 : id), computedTraps);
+}
+
+globalThis.getComputedStyle ??= getComputedStyle;
+
 let frameStatsSince = 0;
 
 /**

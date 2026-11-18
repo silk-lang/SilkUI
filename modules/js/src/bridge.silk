@@ -22,7 +22,9 @@ import silk.system.system_info { SystemInfo, SystemInfoError }
 import silk.system.system_info_native { OsSystemInfo }
 import ui_tree.process_memory
 import generated_web_apis { webApis }
-import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom }
+import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
+import ui_tree.computed_style
+import silk.mem.pointer { Pointer }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
@@ -117,6 +119,10 @@ pub const FRAME_STATS: u32 = 687480 // nativeId(b"frameStats")
 pub const RANDOM: u32 = 264774 // nativeId(b"random")
 /// `__ui.cpus()`: how many threads can run at once, for `navigator.hardwareConcurrency`.
 pub const CPUS: u32 = 1029073 // nativeId(b"cpus")
+/// `__ui.computed(id, name)`: the computed value of longhand `name` of node `id`, as
+/// `getComputedStyle` gives it, or undefined when there is none or the host attached no tree.
+/// The pending batch reaches the tree first, and a pending layout runs.
+pub const COMPUTED: u32 = 383089 // nativeId(b"computed")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
@@ -246,6 +252,9 @@ pub struct Bridge {
   /// What `__ui.frameStats(0)` took, sorted, and its replaced frames.
   pub taken: List<f64>,
   pub takenDropped: u64,
+  /// The `UiTree` the host attached for `__ui.computed`, null when none: JavaScript runs only
+  /// inside host calls, and the host attaches its tree before each.
+  pub tree: ?*mut u8,
 }
 
 /// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
@@ -304,7 +313,15 @@ impl Bridge {
       dropped: 0,
       taken: List<f64>.make(),
       takenDropped: 0,
+      tree: Pointer.null<u8>(),
     }
+  }
+
+  /// Lets `__ui.computed` read `tree`, which must stay where it is while JavaScript runs.
+  pub fn attach<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () {
+    self.tree = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(
+      unsafe Intrinsic.pointerReinterpret<*mut UiTree<'t>, *mut u8>(Pointer.fromMutRef<UiTree<'t>>(&mut tree.*)),
+    )
   }
 
   /// Adds frames the window presented: the milliseconds between presents, and how many
@@ -389,6 +406,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"atomStyle", arity: 3 },
     Native { name: b"attribute", arity: 3 },
     Native { name: b"cancelTimer", arity: 1 },
+    Native { name: b"computed", arity: 2 },
     Native { name: b"clearStyle", arity: 2 },
     Native { name: b"clipboardRead", arity: 1 },
     Native { name: b"clipboardWrite", arity: 2 },
@@ -636,6 +654,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run Random.fillBytes(&mut bytes) |> Effect.provideMut<Random>(&mut source)
     let bits = u8.toU32(bytes[0]) + u8.toU32(bytes[1]) * 256 + u8.toU32(bytes[2]) * 65536 + u8.toU32(bytes[3]) * 16777216
     return Outcome.Returned { value: ValueBits.number(u32.toF64(bits)) }
+  } else if function == COMPUTED {
+    return run computed(&mut bridge.*, first, argv.get(1))
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {
@@ -748,6 +768,44 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.select(first, f64.toUsize(number(argv.get(1).view())), f64.toUsize(number(argv.get(2).view())))
   }
   return Outcome.Returned { value: ValueBits.Undefined }
+}
+
+/// `__ui.computed`: applies the pending batch to the attached tree, then reads the value.
+effect fn computed<'v>(bridge: &mut Bridge, id: u32, name: ValueRef<'v>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) || !name.view().isString() { return Outcome.Returned { value: ValueBits.Undefined } }
+  let property = run Strings.toUtf8(name.view(), false)
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  let mut out = Bytes.make()
+  let read = run Effect.result(applyAndRead(&mut bridge.batch, &mut tree, id, property.asSlice(), &mut out))
+  let found = match move read {
+    Result<bool, TreeError | OutOfMemoryError>.Success { value } => value
+    Result<bool, TreeError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      TreeError invalid => {
+        drop invalid
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree refused a mutation before getComputedStyle")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  }
+  if !found { return Outcome.Returned { value: ValueBits.Undefined } }
+  let made = run Effect.result(Strings.fromUtf8(out.asSlice()))
+  return match move made {
+    Result.Success { value: text } => Outcome.Returned { value: text }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+effect fn applyAndRead(batch: &mut Batch, tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  if batch.length() != 0 { run tree.apply(run batch.take()) }
+  return run computed_style.write(&mut tree.*, id, name, &mut out.*)
 }
 
 impl EngineServices for Bridge {

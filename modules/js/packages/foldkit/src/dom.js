@@ -6,7 +6,7 @@
 // this file adds what the DOM has on top (attributes, reflected properties, text content,
 // selectors). It installs `document`, `window` and the classes Foldkit tests with
 // `instanceof`, where the realm does not have them.
-import { Event, SvgElement as SvgMarkup, createNode, createSvgElement, createText, mount } from "@silkui/core";
+import { Event, SvgElement as SvgMarkup, createNode, createSvgElement, createText, getComputedStyle, mount } from "@silkui/core";
 
 const HTML = "http://www.w3.org/1999/xhtml";
 const SVG = "http://www.w3.org/2000/svg";
@@ -831,11 +831,8 @@ const windowMembers = {
     return { media: query, matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} };
   },
 
-  getComputedStyle(element) {
-    return {
-      getPropertyValue: (name) => element.style.getPropertyValue(name),
-      "transition-property": element.style.getPropertyValue("transition-property") || "all",
-    };
+  getComputedStyle(element, pseudo) {
+    return getComputedStyle(element, pseudo);
   },
 
   MutationObserver: class MutationObserver {

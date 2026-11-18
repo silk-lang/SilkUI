@@ -366,7 +366,9 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 5 {
+  let ran = if scenario == 6 {
+    run Effect.result(computedStyles(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 5 {
     run Effect.result(svgMarkup(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 4 {
     run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -404,7 +406,13 @@ effect fn withHost(scenario: u32) -> ()
   }
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
-    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
   }
   match move checked {
     Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Success { .. } => ()
@@ -488,6 +496,7 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
   run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
   run Testing.expect(bridge.CLEAR_STYLE == bridge.nativeId(b"clearStyle"), "CLEAR_STYLE")
+  run Testing.expect(bridge.COMPUTED == bridge.nativeId(b"computed"), "COMPUTED")
   run Testing.expect(bridge.CLIPBOARD_READ == bridge.nativeId(b"clipboardRead"), "CLIPBOARD_READ")
   run Testing.expect(bridge.CLIPBOARD_WRITE == bridge.nativeId(b"clipboardWrite"), "CLIPBOARD_WRITE")
   run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
@@ -674,4 +683,26 @@ test effect fn inlineSvgMarkupAndDataUrlsReachTheNativeTree() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(5) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn computedStyles(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.evaluate(b"if (__ui.computed(1, 'width') !== undefined) throw new Error('a host with no tree answered')", b"test")
+  host.attach(tree.engineMut())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/computed-style.js")
+  run host.module(source.asSlice(), b"computed-style.js")
+  run host.evaluate(b"if (!globalThis.computedStyleChecked) throw new Error('the checks did not run')", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+}
+
+/// `getComputedStyle` reads the tree through `__ui.computed`, applying pending mutations first.
+test effect fn getComputedStyleReadsTheTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(6) |> Effect.provideMut<Allocator>(&mut allocator)
 }

@@ -508,6 +508,23 @@ export interface MemoryUsage {
  */
 export function memoryUsage(): MemoryUsage | null;
 
+/**
+ * The values the tree resolved for `node`, read one property at a time: typed and animated
+ * properties as they are now, box sizes, margins, padding and border widths as laid out, the
+ * rest as cascaded with lengths in pixels. Shorthands, custom properties and pseudo-elements
+ * read "". Also installed as `globalThis.getComputedStyle`.
+ */
+export function getComputedStyle(node: Node | { node: Node }, pseudo?: string | null): ComputedStyle;
+
+/** What `getComputedStyle` returns: read-only, live, a value per camelCase property name. */
+export type ComputedStyle = {
+  getPropertyValue(name: string): string;
+  getPropertyPriority(name: string): string;
+  item(index: number): string;
+  readonly cssText: string;
+  readonly length: number;
+} & { readonly [property: string]: string };
+
 /** What the window put on screen over a stretch of time; see `frameStats`. */
 export interface FrameStats {
   /** Frames presented. */
