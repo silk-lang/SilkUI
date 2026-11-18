@@ -33,7 +33,7 @@
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
 import stylesheets
-import host { Kind, Plan, main as hostMain, page as hostPage, webgpuExports, libm }
+import host { Kind, Plan, Allows, main as hostMain, page as hostPage, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import bundle as Bundles
 import web { Server, site }
@@ -250,8 +250,25 @@ impl Framework {
 pub enum Runtime {
   /// The SilkJS Engine: lean, no Node or web platform APIs. The default.
   Engine,
-  /// The full SilkJS runtime: Node's APIs and the web APIs Node has. No hot reload yet.
+  /// The composable SilkJS runtime: the web platform's APIs, `fetch` and sockets, Web Crypto,
+  /// TLS, compression streams and the files the user picks; [`App.allow`] adds more of Node's.
+  /// No hot reload yet.
   Node,
+}
+
+/// What an app on the SilkJS runtime ([`Runtime.node`]) may reach beyond its light set. Each
+/// one costs binary size and start time, so an app allows only what it uses.
+pub enum Access {
+  /// The whole file system through `node:fs`, not only the files the user picks.
+  Files,
+  /// `node:child_process`.
+  Processes,
+  /// `WebAssembly`.
+  Wasm,
+  /// `node:sqlite`.
+  Database,
+  /// Native Node addons.
+  Addons,
 }
 
 impl Runtime {
@@ -287,6 +304,7 @@ pub struct App {
   named: string<'static>,
   writtenIn: Framework,
   runsOn: Runtime,
+  allows: Allows,
   runtimeCss: bool,
   places: List<Target>,
   custom: string<'static>,
@@ -563,6 +581,7 @@ effect fn hostPlan(app: &App, project: &Project, target: Target, dev: bool) -> P
     runtimeCss: app.runtimeCss,
     natives: kind != Kind.Loom && app.custom == "" && run exists(String.view(&run nativesFile(project))),
     metalHud: hud,
+    allows: app.allows,
   }
 }
 
@@ -653,6 +672,7 @@ impl App {
       named: name,
       writtenIn: Framework.Js { dir: "." },
       runsOn: Runtime.Engine,
+      allows: Allows.none(),
       runtimeCss: false,
       places: List<Target>.make(),
       custom: "",
@@ -683,6 +703,21 @@ impl App {
     ? R {
     let mut app = run move self
     app.runsOn = runtime
+    return move app
+  }
+
+  /// Lets an app on the SilkJS runtime reach `access` beyond its light set.
+  pub effect fn allow<'env, E, ? R>(self: once Effect<'env; App ! E ? R>, access: Access) -> App
+    ! E
+    ? R {
+    let mut app = run move self
+    match access {
+      Access.Files => { app.allows.files = true }
+      Access.Processes => { app.allows.processes = true }
+      Access.Wasm => { app.allows.wasm = true }
+      Access.Database => { app.allows.database = true }
+      Access.Addons => { app.allows.addons = true }
+    }
     return move app
   }
 
