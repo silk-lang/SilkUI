@@ -183,14 +183,15 @@ pub struct Containment { bits: u8 }
 
 impl Copy for Containment {}
 
-struct Contained { size: SizeContainment, paint: bool }
+struct Contained { size: SizeContainment, paint: bool, layout: bool, style: bool }
 impl Copy for Contained {}
 
 const QUERY_SHIFT: u8 = 0
 const CONTAIN_SHIFT: u8 = 2
 const CONTAIN_PAINT: u8 = 16
 const HIDDEN: u8 = 32
-const PAINT: u8 = 64
+const CONTAIN_LAYOUT: u8 = 64
+const CONTAIN_STYLE: u8 = 128
 
 fn sizeCode(size: SizeContainment) -> u8 {
   return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
@@ -207,22 +208,33 @@ impl Containment {
   pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
 
   /// Paint containment, from `contain` or `content-visibility: hidden`.
-  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
+
+  /// Layout containment, from `contain` or `content-visibility: hidden`.
+  pub fn layout(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
+
+  /// Style containment: counters changed inside stay inside.
+  pub fn style(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
 
   /// `content-visibility: hidden`: the contents are skipped like `display: none`.
   pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
 
   fn contained(self: &Self) -> Contained {
-    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
+    return Contained {
+      size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0,
+      layout: u8.bitAnd(self.bits, CONTAIN_LAYOUT) != 0, style: u8.bitAnd(self.bits, CONTAIN_STYLE) != 0,
+    }
   }
 
   fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
     let size = if hidden { SizeContainment.Size } else { contain.size }
     let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
     if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if contain.layout { bits = u8.bitOr(bits, CONTAIN_LAYOUT) }
+    if contain.style { bits = u8.bitOr(bits, CONTAIN_STYLE) }
     if hidden { bits = u8.bitOr(bits, HIDDEN) }
-    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
     self.bits = bits
+    layout.layoutContainment = hidden || contain.paint || contain.layout
     layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
     } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
@@ -335,7 +347,7 @@ fn lower(byte: u8) -> u8 {
 
 /// `contain`'s keywords; `None` for a value that is not one.
 fn containOf(value: &Value) -> Option<Contained> {
-  let mut out = Contained { size: SizeContainment.None, paint: false }
+  let mut out = Contained { size: SizeContainment.None, paint: false, layout: false, style: false }
   if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
     if word == Keyword.None { return Option<Contained>.some(out) }
     if !containWord(&mut out, word) { return Option<Contained>.None }
@@ -360,6 +372,8 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
   if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
   if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
   if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  if word == Keyword.Layout || word == Keyword.Strict || word == Keyword.Content { out.layout = true }
+  if word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content { out.style = true }
   return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
     || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
 }
@@ -527,6 +541,8 @@ pub struct ScrollStyle {
   pub overscrollY: Overscroll,
   /// `scroll-behavior: smooth`.
   pub smooth: bool,
+  /// `overflow-anchor: none` (see `scroll_anchor`).
+  pub anchorNone: bool,
   /// `scroll-snap-type` (container) and `scroll-snap-align`/`-stop` (item), packed: see `SNAP_*`.
   pub snap: u8,
   /// `scroll-margin` of the box, in pixels.
@@ -591,6 +607,7 @@ impl ScrollStyle {
       overscrollX: Overscroll.Auto,
       overscrollY: Overscroll.Auto,
       smooth: false,
+      anchorNone: false,
       snap: 0,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
@@ -619,6 +636,8 @@ impl ScrollStyle {
   /// The item's `scroll-snap-align` on that axis.
   pub fn alignX(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 3), 3) }
   pub fn alignY(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 5), 3) }
+  /// The item's `scroll-snap-stop: always`.
+  pub fn snapStop(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_STOP) != 0 }
 
   fn setSnapType(self: &mut Self, bits: u8) -> () {
     self.snap = u8.bitOr(u8.bitAnd(self.snap, 248), bits)
@@ -1491,6 +1510,13 @@ impl Computed {
       CssProperty.ScrollSnapStop => {
         if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
         else if convert.isKeyword(value, Keyword.Normal) { self.scroll.setSnapStop(false) }
+      }
+      CssProperty.OverflowAnchor => {
+        if convert.isKeyword(value, Keyword.None) {
+          self.scroll.anchorNone = true
+        } else if convert.isKeyword(value, Keyword.Auto) {
+          self.scroll.anchorNone = false
+        }
       }
       CssProperty.ScrollBehavior => {
         if convert.isKeyword(value, Keyword.Smooth) {
@@ -2665,6 +2691,7 @@ impl Computed {
     h = colorHash(h, self.text.placeholder())
     if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
     if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if self.contain.layout() { h = Hash.combine(h, 6) }
     if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
     h = Hash.combine(
       h,

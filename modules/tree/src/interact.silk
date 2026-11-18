@@ -33,6 +33,7 @@ import node { NONE, NO_INDEX, Event, EventKind }
 import edit
 import scroll_snap
 import touch
+import scroll_anchor
 import paint { styleSlot, borderBox, paddingBox, overflowClip }
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
@@ -1290,6 +1291,23 @@ effect fn ignoreInvalid(error: InvalidNode) -> () {
 effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if !writeOffset(&mut tree, slot, x, y) {
+    return false
+  }
+  run scroll_anchor.scrolled(&mut tree, slot)
+  return true
+}
+
+/// A scroll anchoring adjustment of `slot` (see `scroll_anchor`): a scroll that keeps the anchor.
+pub effect fn anchorScroll(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if writeOffset(&mut tree, slot, x, y) {
+    run scrollRecord(&mut tree, slot)
+  }
+}
+
+fn writeOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool {
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   if node.scrollX == x && node.scrollY == y {
     return false
@@ -1367,7 +1385,11 @@ effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> boo
     let c = tree.node(at).computed
     let canX = userScrolls(usedOverflow(&c, true))
     let canY = userScrolls(usedOverflow(&c, false))
-    if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX {
+    if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX && scroll_snap.absorbs(&mut tree.*, at, restX, restY) {
+      // The rest of a fling aimed at a snap position.
+      restX = 0.0
+      restY = 0.0
+    } else if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX {
       let range = rangeAt(&tree.*, at)
       let x = tree.node(at).scrollX
       let y = tree.node(at).scrollY
@@ -1386,7 +1408,7 @@ effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> boo
       if run setOffset(&mut tree, at, nx, ny) {
         moved = true
         run scrollRecord(&mut tree, at)
-        run scroll_snap.userScrolled(&mut tree, at)
+        run scroll_snap.userScrolled(&mut tree, at, x, y, true)
       }
       // `overscroll-behavior` other than auto keeps the rest from the containers outside.
       if c.scroll.overscrollX != Overscroll.Auto {
@@ -1572,7 +1594,7 @@ effect fn dragThumb(tree: &mut UiTree<'_>) -> ()
   }
   if changed {
     run scrollRecord(&mut tree, slot)
-    run scroll_snap.userScrolled(&mut tree, slot)
+    run scroll_snap.userScrolled(&mut tree, slot, x, y, false)
   }
 }
 

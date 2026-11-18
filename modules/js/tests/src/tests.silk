@@ -8,6 +8,7 @@ import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Native
 import ui_js_calls.natives as natives
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
+import ui_tree.style_media { MediaState }
 import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
@@ -272,6 +273,14 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(reports[0].level == 3 && String.view(&reports[0].text) == "Uncaught (in promise) Error: lost", "the report carries the reason")
   run Testing.expect(String.view(&reports[1].text) == "Uncaught (in promise) TypeError: async", "an async function that throws is reported")
 
+  // devicePixelRatio and matchMedia follow the window's scale, and lists with listeners
+  // hear when the answer flips, as when a window moves to a display of another scale.
+  run host.setMedia(MediaState.initial(1.0))
+  run host.evaluate(b"globalThis.flips = []; const dense = matchMedia('(min-resolution: 2dppx)'); dense.addEventListener('change', (event) => flips.push(event.matches + ' ' + event.media)); matchMedia('(resolution: 1x)').onchange = (event) => flips.push('one ' + event.matches); if (devicePixelRatio !== 1 || dense.matches || !matchMedia('(resolution: 96dpi)').matches || matchMedia('(width <').matches) throw new Error('at 1x')", b"test")
+  run host.setMedia(MediaState.initial(2.0))
+  run host.setMedia(MediaState.initial(2.0))
+  run host.evaluate(b"if (devicePixelRatio !== 2 || !matchMedia('(max-resolution: 192dpi)').matches || !matchMedia('(resolution: 2x)').matches) throw new Error('at 2x'); if (flips.join() !== 'true (min-resolution: 2dppx),one false') throw new Error('flips were ' + flips.join())", b"test")
+
   // The development server's lines reach JavaScript, and what it sends and asks comes back.
   run host.evaluate(b"__ui.devMessage = (line) => { __ui.devSend('echo ' + line); Promise.resolve().then(() => __ui.devReload()) }", b"test")
   run Testing.expect(!host.takeReload(), "nothing asked for a reload yet")
@@ -408,7 +417,13 @@ effect fn withHost(scenario: u32) -> ()
   }
   match move checked {
     Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Success { .. } => ()
-    Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Failure { error } => { fail move error }
+    Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
   }
 }
 
@@ -527,6 +542,11 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.STYLE_SHEET == bridge.nativeId(b"styleSheet"), "STYLE_SHEET")
   run Testing.expect(bridge.STYLE == bridge.nativeId(b"style"), "STYLE")
   run Testing.expect(bridge.TIMER == bridge.nativeId(b"timer"), "TIMER")
+  run Testing.expect(bridge.RANDOM == bridge.nativeId(b"random"), "RANDOM")
+  run Testing.expect(bridge.CPUS == bridge.nativeId(b"cpus"), "CPUS")
+  run Testing.expect(bridge.WEB_APIS == bridge.nativeId(b"webApis"), "WEB_APIS")
+  run Testing.expect(bridge.SCALE == bridge.nativeId(b"scale"), "SCALE")
+  run Testing.expect(bridge.MATCH_MEDIA == bridge.nativeId(b"matchMedia"), "MATCH_MEDIA")
   let mut at: usize = 0
   while true {
     let native = match bridge.native(at) {
