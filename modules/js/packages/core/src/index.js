@@ -794,6 +794,31 @@ export class Node {
     native.scrollIntoView?.(this.nodeId, code, code, 0, 1);
   }
 
+  /** Whether this node matches CSS `selector`, by the same matcher as stylesheets. */
+  matches(selector) {
+    return queried(0, this, selector) === 1;
+  }
+
+  webkitMatchesSelector(selector) {
+    return this.matches(selector);
+  }
+
+  /** This node or its nearest ancestor that matches `selector`, or null. */
+  closest(selector) {
+    return nodes.get(queried(1, this, selector)) ?? null;
+  }
+
+  /** The first descendant, in tree order, that matches `selector`, or null. */
+  querySelector(selector) {
+    return nodes.get(queried(2, this, selector)) ?? null;
+  }
+
+  /** Every descendant that matches `selector`, in tree order: a static list. */
+  querySelectorAll(selector) {
+    const ids = queried(3, this, selector);
+    return typeof ids === "string" && ids !== "" ? ids.split(",").map((id) => nodes.get(Number(id))).filter(Boolean) : [];
+  }
+
   /**
    * As on the web. `options` is `true` or `{ capture: true }` for the capture phase, and
    * `{ once: true }` for a listener that runs once. A type the tree has no event for is the
@@ -3397,6 +3422,17 @@ export function unregisterShortcut(accelerator) {
 export function memoryUsage() {
   const footprint = native.memoryUsage?.() ?? 0;
   return footprint > 0 ? { footprint, processes: 1 } : null;
+}
+
+// Selector queries run in the host on its tree (`__ui.query`); a host without one (the web
+// canvas build) answers undefined, which reads as no match.
+function queried(mode, node, selector) {
+  const answer = native.query?.(mode, node.nodeId, String(selector));
+  if (answer === -1) {
+    const message = "'" + selector + "' is not a valid selector";
+    throw typeof DOMException === "function" ? new DOMException(message, "SyntaxError") : new SyntaxError(message);
+  }
+  return answer;
 }
 
 // `getComputedStyle`: one native read per property, made when the property is read, so a
