@@ -39,8 +39,8 @@ The project root holds both the Silk and the npm side, so `silk task dev` and `n
 
 | Path | What it is |
 | --- | --- |
-| `silk.toml` | The manifest. `source = "silk"` points Silk at `silk/`. Its one dependency, `silkui`, is for the tasks |
-| `silk/tasks.silk` | The app definition, and the `dev` and `build` tasks |
+| `silk.toml` | The manifest. `source = "silk"` points Silk at `silk/`. Its explicit dependencies include the tasks, hosts and runtime packages |
+| `silk/tasks.silk` | The app definition, and the `dev`, `build` and `plan` tasks |
 | `js/` | The app |
 | `package.json`, `vite.config.js` | The npm packages, and Vite with `@silkui/vite` in its config |
 
@@ -58,7 +58,7 @@ effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
 }
 ```
 
-Below it, `dev` and `build` are pipelines of steps, written out so you can read and change them. silkui generates the program that opens the window into `.silk/`, so there is no host code in the project.
+Below it, `dev` and `build` are pipelines of steps, written out so you can read and change them. silkui generates the window entry module as a cached build step, so there is no host code to maintain in the project.
 
 ## Build it
 
@@ -77,7 +77,7 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
     |> App.target(Target.webCanvas(Page { title: "My app" }))
 ```
 
-`silk task dev --target web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
+`silk task dev --platform web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build --release` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
 
 ## Call Silk from JavaScript
 

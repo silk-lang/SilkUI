@@ -7,7 +7,7 @@ It speaks MCP over stdio and talks to the app through the inspector protocol
 
 ```sh
 silk build --manifest-path modules/inspect/mcp/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-mcp [--connect ADDRESS]
+build/x86_64-unknown-linux-gnu/dev/ui-inspect-mcp [--connect ADDRESS]
 ```
 
 ## Setup
@@ -22,7 +22,7 @@ app is down is a tool error that says where the server looked.
 Claude Code, from the repository root:
 
 ```sh
-claude mcp add silk-ui -- "$PWD/build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-mcp" \
+claude mcp add silk-ui -- "$PWD/build/x86_64-unknown-linux-gnu/dev/ui-inspect-mcp" \
   --connect "$PWD/silk-ui-inspect.sock"
 SILK_UI_INSPECT="$PWD/silk-ui-inspect.sock" ui-tree-demo &   # or any app serving the inspector
 ```

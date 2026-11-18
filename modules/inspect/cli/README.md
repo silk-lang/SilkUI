@@ -5,7 +5,7 @@ request to a running Silk UI and prints the answer.
 
 ```sh
 silk build --manifest-path modules/inspect/cli/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-cli snapshot
+build/x86_64-unknown-linux-gnu/dev/ui-inspect-cli snapshot
 ```
 
 ```text

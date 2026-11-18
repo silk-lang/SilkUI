@@ -444,7 +444,7 @@ For people and agents looking at a running UI (`inspect.silk`):
 ```sh
 silk test --manifest-path modules/tree/tests/silk.toml --root src/tests.silk
 silk build --manifest-path modules/tree/tests/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-tests modules/tree/tests/goldens [--update]
+build/x86_64-unknown-linux-gnu/dev/ui-tree-tests modules/tree/tests/goldens [--update]
 silk task browser check-tree
 silk test --manifest-path modules/tree/window/tests/silk.toml --root src/tests.silk
 silk task native demo modules/tree/demo -- check
