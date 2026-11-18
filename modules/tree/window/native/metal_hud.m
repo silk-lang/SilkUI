@@ -4,10 +4,25 @@
 #import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 static int32_t hud_default = 0;
 
-void silk_ui_metal_hud_default(int32_t on) { hud_default = on; }
+// Metal loads the HUD only when MTL_HUD_ENABLED is set as it starts: `developerHUDProperties`
+// on a layer neither loads it later nor hides it once the variable is set (macOS 27). So the
+// switches set the variable before the first Metal device exists.
+static void enable_before_metal(void) { setenv("MTL_HUD_ENABLED", "1", 1); }
+
+__attribute__((constructor)) static void silk_ui_metal_hud_from_environment(void) {
+    const char *asked = getenv("SILK_UI_METAL_HUD");
+    if (asked && *asked && strcmp(asked, "0") != 0) enable_before_metal();
+}
+
+void silk_ui_metal_hud_default(int32_t on) {
+    hud_default = on;
+    if (on) enable_before_metal();
+}
 
 int32_t silk_ui_metal_hud_default_on(void) { return hud_default; }
 
