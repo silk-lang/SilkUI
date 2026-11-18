@@ -87,7 +87,7 @@ import font_units { Source as FontSource }
 import motion
 import motion { Running }
 import animation
-import animation { Rule, Playing }
+import animation { Rule, Playing, KeptSamples }
 import timing
 import timing { EasingStops }
 import transform
@@ -936,6 +936,9 @@ pub struct UiTree<'a> {
   /// again (see `resolve`). `tickPlaces[slot]` is the node's index here + 1, or 0.
   pub tickBases: List<TickBase>,
   pub tickPlaces: List<u32>,
+  /// The viewport `tickBases` were built in: its size is in every one of them.
+  tickWidth: f32,
+  tickHeight: f32,
 }
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
@@ -943,6 +946,8 @@ pub struct TickBase {
   /// The node it is of, [`NONE`] once it no longer holds.
   pub id: u32,
   pub computed: Computed,
+  /// The keyframe values of its first animation over `computed`.
+  pub samples: KeptSamples,
 }
 
 impl<'a> UiTree<'a> {
@@ -1083,6 +1088,8 @@ impl<'a> UiTree<'a> {
       animations: List<Playing>.make(),
       tickBases: List<TickBase>.make(),
       tickPlaces: List<u32>.make(),
+      tickWidth: 0.0,
+      tickHeight: 0.0,
     }
   }
 
@@ -4710,14 +4717,14 @@ impl<'a> UiTree<'a> {
     let id = self.node(slot).id
     if place != 0 {
       let bases = self.tickBases.asMutSlice()
-      bases[u32.toUsize(place) - 1] = TickBase { id: id, computed: computed.* }
+      bases[u32.toUsize(place) - 1] = TickBase { id: id, computed: computed.*, samples: KeptSamples.none() }
       return ()
     }
     let held = self.tickPlaces.length()
     if at >= held {
       run self.tickPlaces.appendRepeated(0, at + 1 - held)
     }
-    run self.tickBases.append(TickBase { id: id, computed: computed.* })
+    run self.tickBases.append(TickBase { id: id, computed: computed.*, samples: KeptSamples.none() })
     self.tickPlaces.set(at, usize.toU32(self.tickBases.length()))
   }
 
@@ -5094,6 +5101,12 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
+    if self.tickWidth != self.input.width || self.tickHeight != self.input.height {
+      self.tickBases.clear()
+      self.tickPlaces.clear()
+      self.tickWidth = self.input.width
+      self.tickHeight = self.input.height
+    }
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
@@ -5208,7 +5221,8 @@ impl<'a> UiTree<'a> {
       else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
       if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
         let fontUnits = run font_units.inherited(&mut self, slot, &computed)
-        run animation.apply(&self, slot, &mut computed, &fontUnits, true)
+        let mut unkept = KeptSamples.none()
+        run animation.apply(&self, slot, &mut computed, &fontUnits, true, &mut unkept)
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
@@ -5230,7 +5244,17 @@ impl<'a> UiTree<'a> {
       if animated != 0 {
         let key = run self.fontKeyOf(computed.text)
         let currentUnits = font_units.context(&self, slot, &computed, key)
-        run animation.apply(&self, slot, &mut computed, &currentUnits, false)
+        // The keyframes' values hold while the style under the animations and the font their
+        // units read do: the font moves when an animation sets its size.
+        let held = self.tickBaseOf(slot)
+        let steady = held != usize.MAX && u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) == 0
+          && computed.text.size == underlyingFontSize
+        let mut kept = if steady { self.tickBases.asSlice()[held].samples } else { KeptSamples.none() }
+        run animation.apply(&self, slot, &mut computed, &currentUnits, false, &mut kept)
+        if steady {
+          let bases = self.tickBases.asMutSlice()
+          bases[held].samples = kept
+        }
       }
     } else {
       self.easingStops = move stops

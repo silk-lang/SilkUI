@@ -509,9 +509,62 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
   return u64.bitXor(fields, u64.bitAnd(fields, importantFields(&tree.*, slot)))
 }
 
+/// The value a keyframe gives a field over the style under a node's animations. It holds
+/// until that style changes, so frames of the clock do not apply the keyframe's declarations
+/// again for it.
+pub struct KeptSample {
+  /// The frame of the rule, `usize.MAX` for an empty place.
+  pub frame: usize,
+  pub field: u32,
+  pub value: Sample,
+}
+
+impl Copy for KeptSample {}
+
+/// The keyframe values of a node's first animation, kept with the style under its animations
+/// (see `UiTree.tickBases`): four places, the oldest replaced.
+pub struct KeptSamples {
+  pub items: [KeptSample; 4],
+  pub next: usize,
+  /// The rule the values are of, 0 for none.
+  pub name: u64,
+}
+
+impl Copy for KeptSamples {}
+
+impl KeptSamples {
+  pub fn none() -> KeptSamples {
+    let empty = KeptSample { frame: usize.MAX, field: 0, value: Sample.Number { value: 0.0 } }
+    return KeptSamples { items: [empty; 4], next: 0, name: 0 }
+  }
+
+  fn find(self: &Self, name: u64, frame: usize, field: u32) -> Option<Sample> {
+    if self.name != name { return Option<Sample>.None }
+    let mut i: usize = 0
+    while i < 4 {
+      if self.items[i].frame == frame && self.items[i].field == field {
+        return Option<Sample>.some(self.items[i].value)
+      }
+      i = i + 1
+    }
+    return Option<Sample>.None
+  }
+
+  fn keep(self: &mut Self, name: u64, frame: usize, field: u32, value: Sample) -> () {
+    if self.name != name {
+      self.* = KeptSamples.none()
+      self.name = name
+    }
+    self.items[self.next] = KeptSample { frame: frame, field: field, value: value }
+    self.next = (self.next + 1) % 4
+  }
+}
+
 /// Writes the values of the node's animations at the frame clock over `computed`; later
-/// animations in its list win.
-pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, units: &Context, fonts: bool) -> ()
+/// animations in its list win. `kept` holds keyframe values worked out over the same style
+/// under the animations and takes the ones worked out now; pass `KeptSamples.none()` when that
+/// style, or the font the keyframes' units read, may have changed.
+pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, units: &Context, fonts: bool, kept: &mut KeptSamples) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if tree.animations.length() == 0 {
@@ -528,8 +581,9 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, units
   let mut i = range[0]
   while i < range[1] {
     if list[i].id == id {
-      let base = computed.*
-      run applyOne(tree, &list[i], &base, now, blocked, &mut computed, units, fonts)
+      // Only the first animation reads the style under them all: a later one reads what the
+      // ones before it wrote, which moves with the clock.
+      run applyOne(tree, &list[i], now, blocked, &mut computed, units, fonts, &mut kept, i == range[0] && !fonts)
     }
     i = i + 1
   }
@@ -551,7 +605,26 @@ effect fn frameValue(tree: &UiTree<'_>, slot: u32, rule: &Rule, frame: usize, fi
   return motion.sample(&styled, field)
 }
 
-effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f64, blocked: u64, computed: &mut Computed, units: &Context, fonts: bool) -> ()
+// `frameValue`, from `kept` when it holds it and `keeps` says it may.
+effect fn keptValue(tree: &UiTree<'_>, slot: u32, rule: &Rule, frame: usize, field: u32, base: &Computed, units: &Context, kept: &mut KeptSamples, keeps: bool) -> Sample
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !keeps {
+    return run frameValue(tree, slot, rule, frame, field, base, units)
+  }
+  if let Option<Sample>.Some { value } = kept.find(rule.hash, frame, field) {
+    return value
+  }
+  let value = run frameValue(tree, slot, rule, frame, field, base, units)
+  kept.keep(rule.hash, frame, field, value)
+  return value
+}
+
+/// A field's value at the clock, held until every field has read the style it is written over.
+struct Moved { field: u32, value: Sample }
+impl Copy for Moved {}
+
+effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, now: f64, blocked: u64, computed: &mut Computed, units: &Context, fonts: bool, kept: &mut KeptSamples, keeps: bool) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut overall: f64 = 0.0
@@ -565,10 +638,25 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
   let p = directed(&playing.spec, overall)
   let frames = rule.frames.asSlice()
   let size = motion.boxSize(tree, playing.slot)
+  // Every field reads the style as it was before this animation: the values wait here and
+  // are written once all are known. More fields than places take a copy of the style instead.
+  let mut moved: [Moved; 8] = [Moved { field: 0, value: Sample.Number { value: 0.0 } }; 8]
+  let mut count: usize = 0
+  let mut copied = false
+  let mut copy = Computed.inheriting(TextStyle.initial())
   let mut field: u32 = 0
   while field < motion.FIELDS {
     let bit = u64.shiftLeft(1, u32.toU64(field))
     if (field == motion.FONT_SIZE) == fonts && u64.bitAnd(rule.fields, bit) != 0 && u64.bitAnd(blocked, bit) == 0 {
+      if count == 8 && !copied {
+        copy = computed.*
+        copied = true
+        let mut w: usize = 0
+        while w < count {
+          motion.write(&mut computed, moved[w].field, moved[w].value)
+          w = w + 1
+        }
+      }
       // The frames around p that set the field; a missing end is the underlying value.
       let mut before = usize.MAX
       let mut after = usize.MAX
@@ -585,16 +673,18 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       }
       let fromOffset: f32 = if before == usize.MAX { 0.0 } else { frames[before].offset }
       let toOffset: f32 = if after == usize.MAX { 1.0 } else { frames[after].offset }
+      let base: &Computed = if copied { &copy } else { &computed.* }
       let from = if before == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(tree, playing.slot, rule, before, field, base, units)
+        run keptValue(tree, playing.slot, rule, before, field, base, units, &mut kept, keeps)
       }
       let to = if after == usize.MAX {
         motion.sample(base, field)
       } else {
-        run frameValue(tree, playing.slot, rule, after, field, base, units)
+        run keptValue(tree, playing.slot, rule, after, field, base, units, &mut kept, keeps)
       }
+      drop base
       let easing = if before != usize.MAX && frames[before].eased {
         frames[before].easing
       } else {
@@ -607,9 +697,22 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, base: &Computed, now: f
       } else {
         f32.max(0.0, f32.min(1.0, (p - fromOffset) / span))
       }
-      motion.write(&mut computed, field, motion.mix(field, from, to, easing.at(t, &tree.easingStops), size[0], size[1]))
+      let value = motion.mix(field, from, to, easing.at(t, &tree.easingStops), size[0], size[1])
+      if copied {
+        motion.write(&mut computed, field, value)
+      } else {
+        moved[count] = Moved { field: field, value: value }
+        count = count + 1
+      }
     }
     field = field + 1
+  }
+  if !copied {
+    let mut w: usize = 0
+    while w < count {
+      motion.write(&mut computed, moved[w].field, moved[w].value)
+      w = w + 1
+    }
   }
 }
 
