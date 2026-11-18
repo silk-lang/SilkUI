@@ -40,6 +40,9 @@ import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, decla
 /// renumbering the others. The ids start above the runtime callbacks' (`REJECTION`). Each
 /// constant below spells its hash out (a constant cannot call a function); a test checks
 /// them, and that no two names share an id.
+/// How many present intervals a [`Bridge`] keeps for `__ui.frameStats` at most.
+const MAX_PRESENTS: usize = 4096
+
 pub fn nativeId(name: &[u8]) -> u32 {
   let mut hash: u32 = 0
   let mut i: usize = 0
@@ -92,6 +95,11 @@ pub const LOG: u32 = 172868 // nativeId(b"log")
 /// `__ui.memoryUsage()`: the process's memory in bytes as the system shows it to users, 0 when
 /// it cannot say (see `process_memory`).
 pub const MEMORY_USAGE: u32 = 838122 // nativeId(b"memoryUsage")
+/// `__ui.frameStats(field)`: the frames the window presented. Field 0 takes the frames since the
+/// last take and returns how many; 1 is how many painted frames were replaced undrawn among
+/// them, 2 to 5 the 50th, 95th and 99th percentile and the longest of their milliseconds
+/// between presents (0 without frames).
+pub const FRAME_STATS: u32 = 687480 // nativeId(b"frameStats")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
 pub const NOW: u32 = 174806 // nativeId(b"now")
 /// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
@@ -208,6 +216,13 @@ pub struct Bridge {
   pub clipboard: List<ClipboardRequest>,
   /// Desktop calls JavaScript asked for (notifications, the tray, global shortcuts).
   pub shell: List<ShellRequest>,
+  /// Milliseconds between the window's presents since `__ui.frameStats(0)` last took them, and
+  /// the painted frames replaced undrawn since then (see [`Bridge.presented`]).
+  pub presents: List<f64>,
+  pub dropped: u64,
+  /// What `__ui.frameStats(0)` took, sorted, and its replaced frames.
+  pub taken: List<f64>,
+  pub takenDropped: u64,
 }
 
 /// A `__ui.shell` call waiting for the host. `text` holds the op's fields, separated by U+001F:
@@ -254,7 +269,51 @@ impl Bridge {
       frames: List<Keyframe>.make(),
       clipboard: List<ClipboardRequest>.make(),
       shell: List<ShellRequest>.make(),
+      presents: List<f64>.make(),
+      dropped: 0,
+      taken: List<f64>.make(),
+      takenDropped: 0,
     }
+  }
+
+  /// Adds frames the window presented: the milliseconds between presents, and how many
+  /// painted frames were replaced before the GPU drew them. An app that never reads them
+  /// keeps the newest few thousand.
+  pub effect fn presented(self: &mut Self, intervals: &[f64], dropped: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.presents.length() + intervals.length > MAX_PRESENTS { self.presents.clear() }
+    run self.presents.appendSlice(intervals)
+    self.dropped = self.dropped + dropped
+  }
+
+  /// Takes the presents that wait into `taken`, sorted, for `__ui.frameStats`.
+  fn takePresents(self: &mut Self) -> () {
+    // The two lists swap, so neither allocates again once they have grown.
+    let used = Intrinsic.replace(self.taken, List<f64>.make())
+    self.taken = Intrinsic.replace(self.presents, move used)
+    self.presents.clear()
+    self.takenDropped = self.dropped
+    self.dropped = 0
+    let items = self.taken.asMutSlice()
+    let mut i: usize = 1
+    while i < items.length {
+      let value = items[i]
+      let mut at = i
+      while at > 0 && items[at - 1] > value {
+        items[at] = items[at - 1]
+        at = at - 1
+      }
+      items[at] = value
+      i = i + 1
+    }
+  }
+
+  /// The `fraction` percentile of what `takePresents` took, nearest rank; 0 when it took none.
+  fn takenPercentile(self: &Self, fraction: f64) -> f64 {
+    let items = self.taken.asSlice()
+    if items.length == 0 { return 0.0 }
+    let rank = f64.toUsize(f64.ceil(fraction * usize.toF64(items.length)))
+    let at = if rank == 0 { 0 } else { rank - 1 }
+    return items[if at >= items.length { items.length - 1 } else { at }]
   }
 
   /// Takes timer `id` out. Says whether it was there.
@@ -310,6 +369,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"focus", arity: 1 },
     Native { name: b"fontFamily", arity: 2 },
     Native { name: b"format", arity: 3 },
+    Native { name: b"frameStats", arity: 1 },
     Native { name: b"insertAtom", arity: 4 },
     Native { name: b"insertBefore", arity: 3 },
     Native { name: b"keyframe", arity: 2 },
@@ -471,6 +531,23 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.logs.append(LogEntry { level: first, text: move line })
   } else if function == NOW {
     return Outcome.Returned { value: ValueBits.number(bridge.now) }
+  } else if function == FRAME_STATS {
+    if first == 0 {
+      bridge.takePresents()
+      return Outcome.Returned { value: ValueBits.number(usize.toF64(bridge.taken.length())) }
+    }
+    let value = if first == 1 {
+      u64.toF64(bridge.takenDropped)
+    } else if first == 2 {
+      bridge.takenPercentile(0.5)
+    } else if first == 3 {
+      bridge.takenPercentile(0.95)
+    } else if first == 4 {
+      bridge.takenPercentile(0.99)
+    } else {
+      bridge.takenPercentile(1.0)
+    }
+    return Outcome.Returned { value: ValueBits.number(value) }
   } else if function == MEMORY_USAGE {
     return Outcome.Returned { value: ValueBits.number(u64.toF64(process_memory.footprint())) }
   } else if function == TIMER {

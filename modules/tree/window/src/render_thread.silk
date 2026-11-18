@@ -86,6 +86,8 @@ pub struct RenderReport {
   pub present: f64,
   /// Milliseconds between the last two presents, 0 before the second.
   pub interval: f64,
+  /// Frames the UI thread handed over that a newer frame replaced before they were drawn.
+  pub dropped: u64,
 }
 
 impl Copy for RenderReport {}
@@ -101,6 +103,7 @@ impl RenderReport {
       draw: 0.0,
       present: 0.0,
       interval: 0.0,
+      dropped: 0,
     }
   }
 }
@@ -234,6 +237,10 @@ struct State {
   format: u32,
   failure: Option<GpuError>,
   report: RenderReport,
+  /// Milliseconds between presents since [`RenderThread.takePresented`] last took them, and
+  /// the frames replaced in the mailbox since then.
+  presented: List<f64>,
+  dropped: u64,
 }
 
 impl Transferable for State {}
@@ -467,6 +474,27 @@ impl RenderThread {
     return self.shared.get().lock().get().report
   }
 
+  /// Whether the last frame handed over still waits for the render thread, which is busy with
+  /// the one before. A new frame now would replace it undrawn: the host waits for the next
+  /// display refresh instead, as a browser holds back a frame while the GPU is behind.
+  pub fn pending(self: &Self) -> bool {
+    return Option<FrameJob>.isSome(&self.shared.get().lock().get().job)
+  }
+
+  /// Moves the milliseconds between the presents since the last call into `out`, oldest
+  /// first, and returns how many handed-over frames were replaced undrawn since then.
+  pub effect fn takePresented(self: &mut Self, out: &mut List<f64>) -> u64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    run out.appendSlice(state.presented.asSlice())
+    state.presented.clear()
+    let dropped = state.dropped
+    state.dropped = 0
+    return dropped
+  }
+
   /// Waits until `frames` frames have been presented, or the render thread stopped on an error,
   /// which this then fails with.
   pub effect fn waitFrames(self: &mut Self, frames: u64) -> RenderReport
@@ -560,6 +588,8 @@ effect fn post(
       } = move value
       drop e
       state.spare = Option<Scene>.some(move old)
+      state.dropped = state.dropped + 1
+      state.report.dropped = state.report.dropped + 1
     }
     Option<FrameJob>.None => ()
   }
@@ -678,6 +708,8 @@ effect fn makeShared() -> Arc<Mutex<State>>
     format: 0,
     failure: Option<GpuError>.None,
     report: RenderReport.none(),
+    presented: List<f64>.make(),
+    dropped: 0,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -998,10 +1030,21 @@ fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
   values.report = report
   values.report.frames = previous.frames + 1
   values.report.painted = previous.painted + report.painted
+  values.report.dropped = previous.dropped
   if report.status < 0 {
     values.report.status = previous.status
   }
+  // An interval over a second is the window idling, not a slow frame. The list is bounded for
+  // a host that never takes it.
+  if report.interval > 0.0 && report.interval < 1000.0 && values.presented.length() < MAX_PRESENTED {
+    let mut heap = Allocator.systemAllocatorProvider()
+    drop run Effect.result(values.presented.append(report.interval))
+      |> Effect.provideMut<Allocator>(&mut heap)
+  }
 }
+
+/// How many present intervals wait for [`RenderThread.takePresented`] at most.
+const MAX_PRESENTED: usize = 1024
 
 /// Keeps the storage of a frame that is no longer drawn for the next copy.
 fn retire(shared: &Arc<Mutex<State>>, job: FrameJob) -> () {
@@ -1242,6 +1285,7 @@ effect fn renderLoop(
       } else {
         (presented - previousPresented) * 1000.0
       },
+      dropped: 0,
     }
     current = Option<FrameJob>.some(move job)
     recordFrame(shared, report)

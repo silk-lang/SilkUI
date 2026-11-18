@@ -368,6 +368,13 @@ pub interface WindowClient<S, E, ? R> {
     return false
   }
 
+  /// Hears the frames the window presented since the last call: the milliseconds between
+  /// presents, oldest first, and how many painted frames a newer one replaced before the GPU
+  /// drew them.
+  effect fn presented(self: &mut Self, state: &mut S, intervals: &[f64], dropped: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
   /// Whether this window can serve the inspector. A client whose answer is a constant
   /// false (a production build) leaves the inspector's code out of the program: the host
   /// checks this before every use of it, and passes an inspector that is off.
@@ -1128,6 +1135,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
+  let mut intervals = List<f64>.make()
 
   let initial = platform.contentSize(window)
   let mut width = initial.width
@@ -1285,6 +1293,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if !check {
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree)
+      let dropped = run renderer.takePresented(&mut intervals)
+      if intervals.length() != 0 || dropped != 0 {
+        run content.presented(&mut state, intervals.asSlice(), dropped)
+        intervals.clear()
+      }
     }
     if serves && inspector.enabled() {
       run content.report(&mut state, &mut inspector)
@@ -1361,7 +1374,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       } else {
         match &value {
           Event.RequestFrame { targetTime, .. } => {
-            if deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
+            // The GPU has not taken the last frame yet: a new one would replace it undrawn,
+            // and requestAnimationFrame would run for frames nobody sees. As a browser does,
+            // this refresh is skipped and the next one tries again.
+            let behind = !check && !reveal && renderer.pending()
+            if !behind && deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
               let area = clientSize(width, height, &dock)
               let viewport = FrameInput {
                 width: f64.toF32(area.width),

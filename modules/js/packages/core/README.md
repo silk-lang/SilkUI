@@ -173,6 +173,22 @@ the host runs the app, its tree and its JavaScript in one process. In a web-canv
 is the wasm tree's memory only, without the page's JavaScript heap. It is `null` when the
 host cannot say.
 
+`frameStats()` says what reached the screen since its last call: frames presented, presents
+per second, painted frames the GPU never drew, and the milliseconds between presents. Count
+frames with it rather than with `requestAnimationFrame`, which runs once per frame the app
+paints, not per frame the display shows.
+
+```ts
+import { frameStats } from "@silkui/core";
+
+setInterval(() => {
+  const { fps, dropped, p95 } = frameStats();
+}, 1000);
+```
+
+Intervals are taken where the render thread presents, and a gap over a second (an idle
+window) is left out of the percentiles. It is `null` in a browser build.
+
 ### Attributes and accessibility
 
 `setAttribute(name, value)` sets the tree's attributes: `tabIndex`, `disabled`, `label`,
