@@ -1,0 +1,1195 @@
+//! The document's text selection, as Chromium makes it: an anchor and a focus, each a point
+//! in the tree (a text node and a byte offset, or an element and a child index), the range
+//! between them in tree order, and its ends found from where the pointer is on screen.
+//!
+//! A press on text places a collapsed selection, a drag moves the focus, a double click selects
+//! a word and a triple click a paragraph (later moves extend by the same unit), and Shift with a
+//! press extends. `user-select` decides what can be selected: `none` text is never highlighted
+//! or copied, and a press on it starts nothing; an `all` element is selected whole.
+//!
+//! Offsets are UTF-8 byte offsets into a text node's text. Inputs keep their own selection
+//! (see `edit`); here an input is one atomic piece of the document.
+import engine { UiTree }
+import node { NONE, NO_INDEX }
+import mutation { NodeKind, Role }
+import ui_protocol.request { HostRequest }
+import paint { borderBox }
+import style { SELECT_NONE, SELECT_ALL }
+import caret
+import caret { Piece }
+import cssom_view
+import interact
+import edit
+import edit { Keymap }
+import layout.lib { FragmentKind }
+import properties.computed { DisplayOutside, DisplayInside, WhiteSpaceCollapse }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u32
+import silk.num.usize
+import silk.text.segmentation
+import silk.text.string { String }
+
+/// A boundary point: in text node `slot` at byte `offset`, or in element `slot` before its
+/// child `offset` (children counted without generated boxes). `id` tells a slot that was
+/// reused for another node apart from the one the point was made in.
+pub struct Point {
+  pub slot: u32,
+  pub id: u32,
+  pub offset: usize,
+}
+
+impl Copy for Point {}
+
+impl Point {
+  pub fn none() -> Point { return Point { slot: NONE, id: 0, offset: 0 } }
+  pub fn exists(self: &Self) -> bool { return self.slot != NONE }
+  pub fn same(self: &Self, other: Point) -> bool {
+    return self.slot == other.slot && self.offset == other.offset
+  }
+}
+
+/// How a press selects: by character, word or paragraph.
+pub const UNIT_NONE: u32 = 0
+pub const UNIT_CHARACTERS: u32 = 1
+pub const UNIT_WORDS: u32 = 2
+pub const UNIT_PARAGRAPHS: u32 = 3
+
+/// What of one text node (or one atomic node) the selection covers, for painting.
+pub struct Selected {
+  pub slot: u32,
+  pub start: usize,
+  pub end: usize,
+  /// The selection goes on past the node's end: the line break after its last line is
+  /// selected too.
+  pub through: bool,
+  /// An image, icon, canvas or input inside the selection, tinted whole.
+  pub atomic: bool,
+}
+
+impl Copy for Selected {}
+
+impl Selected {
+  fn same(self: &Self, other: &Selected) -> bool {
+    return self.slot == other.slot && self.start == other.start && self.end == other.end
+      && self.through == other.through && self.atomic == other.atomic
+  }
+}
+
+pub struct TextSelection {
+  pub anchor: Point,
+  pub focus: Point,
+  /// The press under way: its unit, and the unit it selected first (a word, a paragraph), which
+  /// the selection keeps covering while the pointer moves.
+  pub unit: u32,
+  pub pressStart: Point,
+  pub pressEnd: Point,
+  /// The covered nodes in slot order, rebuilt when the selection or the tree changes.
+  pub selected: List<Selected>,
+  /// The tree revision `selected` was built at, and whether the ends moved since.
+  builtAt: u64,
+  pub moved: bool,
+}
+
+impl TextSelection {
+  pub fn make() -> TextSelection {
+    return TextSelection {
+      anchor: Point.none(),
+      focus: Point.none(),
+      unit: UNIT_NONE,
+      pressStart: Point.none(),
+      pressEnd: Point.none(),
+      selected: List<Selected>.make(),
+      builtAt: 0,
+      moved: false,
+    }
+  }
+
+  /// Whether anything is selected (a collapsed selection is a caret and shows nothing).
+  pub fn ranged(self: &Self) -> bool {
+    return self.anchor.exists() && self.focus.exists() && !self.anchor.same(self.focus)
+  }
+}
+
+/// The covered part of `slot`, or None. `selected` is sorted by slot.
+pub fn find(selected: &List<Selected>, slot: u32) -> usize {
+  let values = selected.asSlice()
+  let mut low: usize = 0
+  let mut high = values.length
+  while low < high {
+    let middle = (low + high) / 2
+    if values[middle].slot < slot {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  if low < values.length && values[low].slot == slot { return low }
+  return NO_INDEX
+}
+
+// Tree navigation over the nodes a DOM would have: generated boxes are left out.
+
+fn slotIn(slots: &List<u32>, index: usize) -> u32 {
+  if index < slots.length() { return slots.get(index) }
+  return NONE
+}
+
+fn counted(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && !tree.node(slot).isGenerated()
+}
+
+fn firstChild(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let nodes = tree.layout.nodes.asSlice()
+  let mut child = nodes[tree.node(slot).css].firstChild
+  while child != NO_INDEX {
+    let found = tree.slotOfCssNode(child)
+    if counted(tree, found) { return found }
+    child = nodes[child].nextSibling
+  }
+  return NONE
+}
+
+fn nextSibling(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let nodes = tree.layout.nodes.asSlice()
+  let mut at = nodes[tree.node(slot).css].nextSibling
+  while at != NO_INDEX {
+    let found = tree.slotOfCssNode(at)
+    if counted(tree, found) { return found }
+    at = nodes[at].nextSibling
+  }
+  return NONE
+}
+
+/// The `index`th child of `slot`, or NONE past the last.
+fn childAt(tree: &UiTree<'_>, slot: u32, index: usize) -> u32 {
+  let mut child = firstChild(tree, slot)
+  let mut i: usize = 0
+  while child != NONE && i < index {
+    child = nextSibling(tree, child)
+    i = i + 1
+  }
+  return child
+}
+
+fn indexOf(tree: &UiTree<'_>, slot: u32) -> usize {
+  let parent = tree.node(slot).parent
+  if parent == NONE { return 0 }
+  let mut child = firstChild(tree, parent)
+  let mut i: usize = 0
+  while child != NONE && child != slot {
+    child = nextSibling(tree, child)
+    i = i + 1
+  }
+  return i
+}
+
+fn childCount(tree: &UiTree<'_>, slot: u32) -> usize {
+  let mut child = firstChild(tree, slot)
+  let mut i: usize = 0
+  while child != NONE {
+    child = nextSibling(tree, child)
+    i = i + 1
+  }
+  return i
+}
+
+fn isText(tree: &UiTree<'_>, slot: u32) -> bool { return tree.node(slot).kind == NodeKind.Text }
+
+fn textLength(tree: &UiTree<'_>, slot: u32) -> usize {
+  return String.byteLength(String.view(&tree.node(slot).text))
+}
+
+/// The point before or after node `slot` in its parent.
+fn before(tree: &UiTree<'_>, slot: u32) -> Point {
+  let parent = tree.node(slot).parent
+  if parent == NONE { return at(tree, slot, 0) }
+  return at(tree, parent, indexOf(tree, slot))
+}
+
+fn after(tree: &UiTree<'_>, slot: u32) -> Point {
+  let parent = tree.node(slot).parent
+  if parent == NONE { return at(tree, slot, childCount(tree, slot)) }
+  return at(tree, parent, indexOf(tree, slot) + 1)
+}
+
+fn at(tree: &UiTree<'_>, slot: u32, offset: usize) -> Point {
+  return Point { slot: slot, id: tree.node(slot).id, offset: offset }
+}
+
+/// Whether `point` still names a node of the current root, and an offset inside it.
+fn valid(tree: &UiTree<'_>, point: Point) -> bool {
+  if point.slot == NONE || u32.toUsize(point.slot) >= tree.nodes.length() { return false }
+  let node = tree.node(point.slot)
+  if !node.live || node.id != point.id { return false }
+  let mut top = point.slot
+  while tree.node(top).parent != NONE { top = tree.node(top).parent }
+  return top == tree.root
+}
+
+/// `point` clamped to its node: a text offset onto a character boundary of the text as it is
+/// now, a child index onto the children there are.
+fn clamped(tree: &UiTree<'_>, point: Point) -> Point {
+  let mut out = point
+  if isText(tree, point.slot) {
+    let text = String.view(&tree.node(point.slot).text)
+    let length = String.byteLength(text)
+    if out.offset > length { out.offset = length }
+    while out.offset > 0 && !String.isCharBoundary(text, out.offset) { out.offset = out.offset - 1 }
+  } else {
+    let count = childCount(tree, point.slot)
+    if out.offset > count { out.offset = count }
+  }
+  return out
+}
+
+/// The ancestors of `slot` from the root down, `slot` last, each as its index in its parent.
+effect fn path(tree: &UiTree<'_>, slot: u32, out: &mut List<usize>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let mut at = slot
+  while tree.node(at).parent != NONE {
+    run out.append(indexOf(tree, at))
+    at = tree.node(at).parent
+  }
+  // Reverse into root-first order.
+  let values = out.asMutSlice()
+  let mut i: usize = 0
+  let mut j = values.length
+  while i + 1 < j {
+    j = j - 1
+    let kept = values[i]
+    values[i] = values[j]
+    values[j] = kept
+    i = i + 1
+  }
+}
+
+/// Tree order of two points: -1, 0 or 1. A point is its node's path with its offset after it;
+/// a path that is a prefix of another comes first, as an element's point before child `k` is
+/// before everything inside that child.
+pub effect fn compare(tree: &UiTree<'_>, a: Point, b: Point) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if a.slot == b.slot {
+    if a.offset < b.offset { return -1 }
+    if a.offset > b.offset { return 1 }
+    return 0
+  }
+  let mut left = List<usize>.make()
+  let mut right = List<usize>.make()
+  run path(tree, a.slot, &mut left)
+  run path(tree, b.slot, &mut right)
+  run left.append(a.offset)
+  run right.append(b.offset)
+  let l = left.asSlice()
+  let r = right.asSlice()
+  let mut i: usize = 0
+  while i < l.length && i < r.length {
+    if l[i] < r[i] { return -1 }
+    if l[i] > r[i] { return 1 }
+    i = i + 1
+  }
+  if l.length < r.length { return -1 }
+  if l.length > r.length { return 1 }
+  return 0
+}
+
+// What styles say.
+
+fn userSelect(tree: &UiTree<'_>, slot: u32) -> u8 { return tree.node(slot).computed.userSelect }
+
+/// The outermost `user-select: all` element holding `slot`, or NONE.
+fn allRoot(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let mut found = NONE
+  let mut at = slot
+  while at != NONE {
+    let node = tree.node(at)
+    if node.computed.userSelect == SELECT_ALL && node.kind != NodeKind.Text { found = at }
+    at = node.parent
+  }
+  return found
+}
+
+/// Whether node `slot` starts a new line of text: a block-level box, a table row, or a flex or
+/// grid item. Table cells are separated by tabs instead.
+fn blockLevel(tree: &UiTree<'_>, slot: u32) -> bool {
+  let node = tree.node(slot)
+  if node.kind == NodeKind.Text { return false }
+  let display = node.computed.layout.display
+  if display.isNone() || display.isContents() { return false }
+  if display.insideIs(DisplayInside.TableCell) { return false }
+  if display.outsideIs(DisplayOutside.Block) { return true }
+  let parent = node.parent
+  if parent != NONE {
+    let outer = tree.node(parent).computed.layout.display
+    if outer.insideIs(DisplayInside.Flex) || outer.isGrid() { return true }
+  }
+  return false
+}
+
+fn tableCell(tree: &UiTree<'_>, slot: u32) -> bool {
+  return tree.node(slot).kind != NodeKind.Text
+    && tree.node(slot).computed.layout.display.insideIs(DisplayInside.TableCell)
+}
+
+/// Images, icons, canvases and inputs: selected whole or not at all.
+fn atomic(tree: &UiTree<'_>, slot: u32) -> bool {
+  let kind = tree.node(slot).kind
+  return kind == NodeKind.Image || kind == NodeKind.Icon || kind == NodeKind.Canvas || kind == NodeKind.Input
+}
+
+fn shown(tree: &UiTree<'_>, slot: u32) -> bool {
+  let node = tree.node(slot)
+  return node.rendered && node.computed.text.visible
+}
+
+// Points from positions on screen.
+
+/// One thing a point can land on: a text fragment, or an atomic box.
+struct Leaf {
+  slot: u32,
+  piece: Piece,
+  atomic: bool,
+}
+
+impl Copy for Leaf {}
+
+/// The text fragments and atomic boxes drawn for `container`'s subtree.
+effect fn leavesOf(tree: &UiTree<'_>, container: u32, out: &mut List<Leaf>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  let css = tree.node(container).css
+  let mut fragment = if css < tree.fragmentOf.length() { tree.fragmentOf.get(css) } else { NO_INDEX }
+  let values = tree.output.fragments.values.asSlice()
+  let mut stack = List<usize>.make()
+  while fragment != NO_INDEX {
+    run stack.append(fragment)
+    while stack.length() != 0 {
+      let last = stack.length() - 1
+      let index = stack.get(last)
+      stack.truncate(last)
+      let f = values[index]
+      let slot = slotIn(&tree.slotOfCss, f.source)
+      let mut descend = true
+      if f.kind == FragmentKind.Text && f.textData != NO_INDEX {
+        if slot != NONE && isText(tree, slot) && shown(tree, slot) {
+          run out.append(Leaf { slot: slot, piece: visualPiece(tree, index), atomic: false })
+        }
+        descend = false
+      } else if slot != NONE && f.kind == FragmentKind.Box && slot != container
+        && (atomic(tree, slot) || firstChild(tree, slot) == NONE && !blockLevel(tree, slot)) {
+        if shown(tree, slot) {
+          let box = borderBox(&tree.visualFragment(index))
+          let mut piece = visualPiece(tree, index)
+          piece.x0 = box.xMin
+          piece.x1 = box.xMax
+          piece.top = box.yMin
+          piece.bottom = box.yMax
+          run out.append(Leaf { slot: slot, piece: piece, atomic: true })
+        }
+        descend = false
+      }
+      if descend {
+        // Children pushed in reverse pop in order.
+        let mut children = List<usize>.make()
+        let mut child = f.firstChild
+        while child != NO_INDEX {
+          run children.append(child)
+          child = values[child].nextSibling
+        }
+        let mut i = children.length()
+        while i > 0 {
+          i = i - 1
+          run stack.append(children.get(i))
+        }
+      }
+    }
+    fragment = tree.nextSourceFragment.get(fragment)
+  }
+}
+
+/// A fragment's geometry where it draws. Boxes have no text range, so only the box and the line
+/// box around it are read for them.
+fn visualPiece(tree: &UiTree<'_>, index: usize) -> Piece {
+  let f = tree.visualFragment(index)
+  let box = borderBox(&f)
+  let mut piece = if f.textData != NO_INDEX {
+    cssom_view.visualTextPiece(tree, index)
+  } else {
+    Piece {
+      start: 0,
+      end: 0,
+      x0: box.xMin,
+      x1: box.xMax,
+      top: box.yMin,
+      bottom: box.yMax,
+      line: index,
+      lineTop: box.yMin,
+      lineBottom: box.yMax,
+      shapeKey: 0,
+      glyphs: false,
+      lineBreak: false,
+      rtl: false,
+      base: 0,
+    }
+  }
+  if f.textData == NO_INDEX {
+    // An atomic inline sits on its line box: lines are grouped by it.
+    let values = tree.output.fragments.values.asSlice()
+    let mut up = values[index].parent
+    while up != NO_INDEX {
+      if values[up].kind == FragmentKind.Line {
+        let line = borderBox(&tree.visualFragment(up))
+        piece.line = up
+        piece.lineTop = line.yMin
+        piece.lineBottom = line.yMax
+        break
+      }
+      up = values[up].parent
+    }
+  }
+  return piece
+}
+
+fn horizontalDistance(x: f32, x0: f32, x1: f32) -> f32 {
+  if x < x0 { return x0 - x }
+  if x > x1 { return x - x1 }
+  return 0.0
+}
+
+/// The leaf a point at (`x`, `y`) belongs to: on the line holding `y` nearest to `x`; between
+/// lines, on the first line below (as Chromium picks the next block in the gap between two);
+/// below everything, on the last line.
+fn nearestLeaf(leaves: &List<Leaf>, x: f32, y: f32) -> usize {
+  let values = leaves.asSlice()
+  let mut best = NO_INDEX
+  let mut bestRank: u32 = 3
+  let mut bestVertical = f32.MAX
+  let mut bestHorizontal = f32.MAX
+  let mut i: usize = 0
+  while i < values.length {
+    let p = values[i].piece
+    let rank = rankOf(p, y)
+    let vertical: f32 = if rank == 0 { 0.0 } else if rank == 1 { p.lineTop - y } else { y - p.lineBottom }
+    let horizontal = horizontalDistance(x, p.x0, p.x1)
+    let better = rank < bestRank || rank == bestRank && (vertical < bestVertical - 0.01
+      || f32.abs(vertical - bestVertical) <= 0.01 && horizontal < bestHorizontal)
+    if better {
+      best = i
+      bestRank = rank
+      bestVertical = vertical
+      bestHorizontal = horizontal
+    }
+    i = i + 1
+  }
+  return best
+}
+
+fn rankOf(p: Piece, y: f32) -> u32 {
+  return if y >= p.lineTop && y < p.lineBottom { 0 } else if p.lineTop >= y { 1 } else { 2 }
+}
+
+/// The leaf that starts (or, with `last`, ends) line `line`, left to right.
+fn lineEdge(leaves: &List<Leaf>, line: usize, last: bool) -> usize {
+  let values = leaves.asSlice()
+  let mut best = NO_INDEX
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].piece.line == line {
+      if best == NO_INDEX || last && values[i].piece.x1 >= values[best].piece.x1
+        || !last && values[i].piece.x0 < values[best].piece.x0 { best = i }
+    }
+    i = i + 1
+  }
+  return best
+}
+
+/// The point nearest to (`x`, `y`) in CSS pixels of the viewport, found from what is drawn
+/// there: the hit element's text and atomic boxes, the nearest line first.
+pub effect fn pointAt(tree: &UiTree<'_>, x: f32, y: f32) -> Point
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut container = interact.hitSlot(tree, x, y)
+  if container == NONE { container = tree.root }
+  if container == NONE { return Point.none() }
+  if isText(tree, container) { container = tree.node(container).parent }
+  if atomic(tree, container) && container != tree.root {
+    let box = borderBox(&tree.visualFragment(firstFragmentOf(tree, container)))
+    if x < (box.xMin + box.xMax) * 0.5 { return before(tree, container) }
+    return after(tree, container)
+  }
+  let mut leaves = List<Leaf>.make()
+  run leavesOf(tree, container, &mut leaves)
+  let index = nearestLeaf(&leaves, x, y)
+  if index == NO_INDEX { return at(tree, container, 0) }
+  let mut leaf = leaves.get(index)
+  let rank = rankOf(leaf.piece, y)
+  if rank != 0 {
+    // Above a line (in the gap over it, or over all the content) is its start; below the last
+    // line is its end, wherever the pointer is across.
+    let wanted = lineEdge(&leaves, leaf.piece.line, rank == 2)
+    leaf = leaves.get(wanted)
+    if leaf.atomic {
+      return if rank == 2 { after(tree, leaf.slot) } else { before(tree, leaf.slot) }
+    }
+    let edge = if rank == 2 { if leaf.piece.lineBreak { leaf.piece.start } else { leaf.piece.end } } else { leaf.piece.start }
+    return at(tree, leaf.slot, edge)
+  }
+  if leaf.atomic {
+    if x < (leaf.piece.x0 + leaf.piece.x1) * 0.5 { return before(tree, leaf.slot) }
+    return after(tree, leaf.slot)
+  }
+  let mut pieces = List<Piece>.make()
+  let values = leaves.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].slot == leaf.slot && !values[i].atomic { run pieces.append(values[i].piece) }
+    i = i + 1
+  }
+  let mut boundaries = List<usize>.make()
+  run segmentation.graphemes(String.view(&tree.node(leaf.slot).text), &mut boundaries)
+  let middle = (leaf.piece.lineTop + leaf.piece.lineBottom) * 0.5
+  let byte = caret.offsetNear(&tree.provider.text, &pieces, &boundaries, x, middle)
+  if byte == NO_INDEX { return at(tree, leaf.slot, 0) }
+  return at(tree, leaf.slot, byte)
+}
+
+fn firstFragmentOf(tree: &UiTree<'_>, slot: u32) -> usize {
+  let css = tree.node(slot).css
+  return if css < tree.fragmentOf.length() { tree.fragmentOf.get(css) } else { NO_INDEX }
+}
+
+// Units.
+
+/// One text node of a paragraph and where its text starts in the paragraph's text.
+struct Run {
+  slot: u32,
+  start: usize,
+}
+
+impl Copy for Run {}
+
+/// A paragraph: the inline content between two block boundaries, as one string.
+struct Paragraph {
+  runs: List<Run>,
+  text: String,
+  /// The point right after the paragraph: the start of the block that ends it, or after the
+  /// block holding it.
+  end: Point,
+}
+
+/// The nearest block-level ancestor of `slot` (or the root).
+fn blockOf(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let mut at = tree.node(slot).parent
+  while at != NONE {
+    if blockLevel(tree, at) || tableCell(tree, at) || tree.node(at).parent == NONE { return at }
+    at = tree.node(at).parent
+  }
+  return slot
+}
+
+/// The paragraph holding text node `slot`.
+effect fn paragraphOf(tree: &UiTree<'_>, slot: u32) -> Paragraph
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let block = blockOf(tree, slot)
+  let mut out = Paragraph { runs: List<Run>.make(), text: String.make(), end: after(tree, block) }
+  let mut found = false
+  // Walk the block's inline content; a block-level descendant ends one paragraph and starts
+  // the next, and is not entered.
+  let mut stack = List<u32>.make()
+  let mut child = firstChild(tree, block)
+  let mut pending = List<u32>.make()
+  while child != NONE {
+    run pending.append(child)
+    child = nextSibling(tree, child)
+  }
+  let mut i = pending.length()
+  while i > 0 {
+    i = i - 1
+    run stack.append(pending.get(i))
+  }
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let at = stack.get(last)
+    stack.truncate(last)
+    if blockLevel(tree, at) || tableCell(tree, at) {
+      if found {
+        out.end = Point { slot: at, id: tree.node(at).id, offset: 0 }
+        return move out
+      }
+      out.runs.clear()
+      out.text.clear()
+      continue
+    }
+    if isText(tree, at) {
+      if at == slot { found = true }
+      run out.runs.append(Run { slot: at, start: String.byteLength(String.view(&out.text)) })
+      run out.text.append(String.view(&tree.node(at).text))
+      continue
+    }
+    if !shown(tree, at) { continue }
+    pending.clear()
+    let mut inner = firstChild(tree, at)
+    while inner != NONE {
+      run pending.append(inner)
+      inner = nextSibling(tree, inner)
+    }
+    let mut k = pending.length()
+    while k > 0 {
+      k = k - 1
+      run stack.append(pending.get(k))
+    }
+  }
+  return move out
+}
+
+/// Where text point `point` is in paragraph `p`'s text.
+fn inParagraph(p: &Paragraph, point: Point) -> usize {
+  let runs = p.runs.asSlice()
+  let mut i: usize = 0
+  while i < runs.length {
+    if runs[i].slot == point.slot { return runs[i].start + point.offset }
+    i = i + 1
+  }
+  return 0
+}
+
+/// The point at byte `offset` of paragraph `p`'s text (at the end of a run rather than the
+/// start of the next).
+fn fromParagraph(tree: &UiTree<'_>, p: &Paragraph, offset: usize, preferEnd: bool) -> Point {
+  let runs = p.runs.asSlice()
+  let mut i: usize = 0
+  while i < runs.length {
+    let start = runs[i].start
+    let end = start + textLength(tree, runs[i].slot)
+    let last = i + 1 == runs.length
+    if offset < end || offset == end && (preferEnd || last) {
+      return at(tree, runs[i].slot, offset - start)
+    }
+    i = i + 1
+  }
+  return p.end
+}
+
+/// The unit around `point`: the word or paragraph it is in, as a start and an end point.
+effect fn unitAt(tree: &UiTree<'_>, point: Point, unit: u32, start: &mut Point, end: &mut Point) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  start.* = point
+  end.* = point
+  if unit == UNIT_CHARACTERS || !point.exists() || !isText(tree, point.slot) { return () }
+  let p = run paragraphOf(tree, point.slot)
+  let offset = inParagraph(&p, point)
+  let text = String.view(&p.text)
+  if unit == UNIT_WORDS {
+    let span = run edit.wordAt(text, offset)
+    // Chromium's words break at a full stop between letters ("foo.bar"), not between digits.
+    let bytes = String.utf8Bytes(text)
+    let mut low = span.start
+    let mut high = span.end
+    let mut i = span.start
+    while i < span.end {
+      if bytes[i] == 46 && i > span.start && i + 1 < span.end && !(digit(bytes[i - 1]) && digit(bytes[i + 1])) {
+        if i < offset { low = i + 1 } else if i < high { high = i }
+      }
+      i = i + 1
+    }
+    start.* = fromParagraph(tree, &p, low, false)
+    end.* = fromParagraph(tree, &p, high, true)
+    return ()
+  }
+  // A preserved line break inside the paragraph ends it too.
+  let bytes = String.utf8Bytes(text)
+  let mut low = offset
+  while low > 0 && bytes[low - 1] != 10 { low = low - 1 }
+  let mut high = offset
+  while high < bytes.length && bytes[high] != 10 { high = high + 1 }
+  start.* = fromParagraph(tree, &p, low, false)
+  end.* = if high < bytes.length { fromParagraph(tree, &p, high + 1, false) } else { p.end }
+}
+
+fn digit(b: u8) -> bool { return b >= 48 && b <= 57 }
+
+// Changing the selection.
+
+/// Selects from `anchor` to `focus`.
+pub effect fn select(tree: &mut UiTree<'_>, anchor: Point, focus: Point) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = &mut tree.textSelection
+  if s.anchor.same(anchor) && s.focus.same(focus) { return () }
+  s.anchor = anchor
+  s.focus = focus
+  s.moved = true
+  run refresh(&mut tree)
+}
+
+pub effect fn clear(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  tree.textSelection.unit = UNIT_NONE
+  run select(&mut tree, Point.none(), Point.none())
+}
+
+/// Whether a press on `slot` (or a node above it) cannot start a selection: `user-select:
+/// none`, buttons and links (which are pressed, or dragged, instead).
+fn refuses(tree: &UiTree<'_>, slot: u32) -> bool {
+  if userSelect(tree, slot) == SELECT_NONE { return true }
+  let mut at = slot
+  while at != NONE {
+    let pressed = tree.node(at).accessRole
+    if pressed == Role.Button || pressed == Role.Link { return true }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// `point` moved out of a `user-select: all` element to its start or its end.
+effect fn widened(tree: &UiTree<'_>, point: Point, toEnd: bool) -> Point
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !point.exists() { return point }
+  let whole = allRoot(tree, point.slot)
+  if whole == NONE { return point }
+  return if toEnd { after(tree, whole) } else { before(tree, whole) }
+}
+
+/// A primary press at (`x`, `y`) on node `hit`, not on an input and not prevented.
+pub effect fn pointerDown(
+  tree: &mut UiTree<'_>,
+  hit: u32,
+  x: f32,
+  y: f32,
+  clickCount: u32,
+  shift: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  tree.textSelection.unit = UNIT_NONE
+  if hit == NONE || refuses(&tree.*, hit) {
+    run clear(&mut tree)
+    return ()
+  }
+  let point = run pointAt(&tree.*, x, y)
+  if !point.exists() {
+    run clear(&mut tree)
+    return ()
+  }
+  let unit = if clickCount <= 1 { UNIT_CHARACTERS } else if clickCount % 2 == 0 { UNIT_WORDS } else { UNIT_PARAGRAPHS }
+  let ranged = tree.textSelection.ranged() || tree.textSelection.anchor.exists()
+  if shift && unit == UNIT_CHARACTERS && ranged && valid(&tree.*, tree.textSelection.anchor) {
+    let mut anchor = tree.textSelection.anchor
+    if tree.keymap == Keymap.Mac && valid(&tree.*, tree.textSelection.focus) {
+      // Mac selections have no direction: the end farther from the press stays.
+      anchor = run fartherEnd(&tree.*, point)
+    }
+    tree.textSelection.unit = UNIT_CHARACTERS
+    tree.textSelection.pressStart = anchor
+    tree.textSelection.pressEnd = anchor
+    let forward = (run compare(&tree.*, anchor, point)) <= 0
+    let focus = run widened(&tree.*, point, forward)
+    run select(&mut tree, anchor, focus)
+    return ()
+  }
+  let mut start = point
+  let mut end = point
+  run unitAt(&tree.*, point, unit, &mut start, &mut end)
+  start = run widened(&tree.*, start, false)
+  end = run widened(&tree.*, end, true)
+  tree.textSelection.unit = unit
+  tree.textSelection.pressStart = start
+  tree.textSelection.pressEnd = end
+  run select(&mut tree, start, end)
+}
+
+/// The end of the selection farther in tree order from `point`, comparing byte distance when
+/// both ends and the point share a text node.
+effect fn fartherEnd(tree: &UiTree<'_>, point: Point) -> Point
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = &tree.textSelection
+  let mut start = s.anchor
+  let mut end = s.focus
+  if (run compare(tree, start, end)) > 0 {
+    start = s.focus
+    end = s.anchor
+  }
+  if (run compare(tree, point, start)) <= 0 { return end }
+  if (run compare(tree, point, end)) >= 0 { return start }
+  if start.slot == point.slot && end.slot == point.slot {
+    return if point.offset - start.offset < end.offset - point.offset { end } else { start }
+  }
+  return s.anchor
+}
+
+/// The pointer moved to (`x`, `y`) with the button down after a press that selects.
+pub effect fn pointerDrag(tree: &mut UiTree<'_>, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let unit = tree.textSelection.unit
+  if unit == UNIT_NONE { return () }
+  let pressStart = tree.textSelection.pressStart
+  let pressEnd = tree.textSelection.pressEnd
+  if !valid(&tree.*, pressStart) || !valid(&tree.*, pressEnd) {
+    tree.textSelection.unit = UNIT_NONE
+    return ()
+  }
+  let point = run pointAt(&tree.*, x, y)
+  if !point.exists() { return () }
+  let mut start = point
+  let mut end = point
+  run unitAt(&tree.*, point, unit, &mut start, &mut end)
+  // Past the first unit's end the selection grows forward from its start, before its start it
+  // grows backward from its end; over it, the first unit stays selected.
+  if (run compare(&tree.*, start, pressStart)) < 0 {
+    let focus = run widened(&tree.*, start, false)
+    run select(&mut tree, pressEnd, focus)
+  } else if (run compare(&tree.*, end, pressEnd)) > 0 {
+    let focus = run widened(&tree.*, end, true)
+    run select(&mut tree, pressStart, focus)
+  } else {
+    run select(&mut tree, pressStart, pressEnd)
+  }
+}
+
+pub fn pointerUp(tree: &mut UiTree<'_>) -> () { tree.textSelection.unit = UNIT_NONE }
+
+// Keeping up with the tree.
+
+/// Checks the ends against the tree and rebuilds what is covered when either changed. Ends in
+/// nodes that left the document clear the selection; text that got shorter pulls them in.
+pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.textSelection.moved && tree.textSelection.builtAt == tree.revision { return () }
+  let mut anchor = tree.textSelection.anchor
+  let mut focus = tree.textSelection.focus
+  if anchor.exists() || focus.exists() {
+    if valid(&tree.*, anchor) && valid(&tree.*, focus) {
+      anchor = clamped(&tree.*, anchor)
+      focus = clamped(&tree.*, focus)
+    } else {
+      anchor = Point.none()
+      focus = Point.none()
+      tree.textSelection.unit = UNIT_NONE
+    }
+  }
+  tree.textSelection.anchor = anchor
+  tree.textSelection.focus = focus
+  let mut next = List<Selected>.make()
+  if tree.textSelection.ranged() {
+    run cover(&tree.*, &mut next)
+  }
+  // Nodes whose highlight changed paint again; the others replay.
+  let mut changed = List<u32>.make()
+  let old = tree.textSelection.selected.asSlice()
+  let mut i: usize = 0
+  while i < old.length {
+    let j = find(&next, old[i].slot)
+    if j == NO_INDEX || !next.asSlice()[j].same(&old[i]) { run changed.append(old[i].slot) }
+    i = i + 1
+  }
+  let fresh = next.asSlice()
+  i = 0
+  while i < fresh.length {
+    if find(&tree.textSelection.selected, fresh[i].slot) == NO_INDEX { run changed.append(fresh[i].slot) }
+    i = i + 1
+  }
+  i = 0
+  while i < changed.length() {
+    touch(&mut tree, changed.get(i))
+    i = i + 1
+  }
+  tree.textSelection.selected = move next
+  tree.textSelection.builtAt = tree.revision
+  tree.textSelection.moved = false
+}
+
+fn touch(tree: &mut UiTree<'_>, slot: u32) -> () {
+  if u32.toUsize(slot) >= tree.nodes.length() { return () }
+  let node = tree.nodeMut(slot)
+  node.content = node.content + 1
+  tree.paintDirty = true
+}
+
+/// The start and end of the selection in tree order.
+effect fn ordered(tree: &UiTree<'_>, start: &mut Point, end: &mut Point) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  start.* = tree.textSelection.anchor
+  end.* = tree.textSelection.focus
+  if (run compare(tree, start.*, end.*)) > 0 {
+    start.* = tree.textSelection.focus
+    end.* = tree.textSelection.anchor
+  }
+}
+
+/// One step of a walk over the range: entering a node, or leaving an element.
+union Step { Enter { slot: u32 }, Leave { slot: u32 }, Done }
+
+impl Copy for Step {}
+
+/// A walk over the nodes from `start` to `end` in tree order.
+struct Walk {
+  at: u32,
+  /// Whether `at` is still to be entered (rather than left).
+  entering: bool,
+  endSlot: u32,
+  endText: bool,
+  /// For an element end: the child the range stops before, or NONE to stop when leaving the
+  /// element itself.
+  stopBefore: u32,
+  done: bool,
+}
+
+fn walkFrom(tree: &UiTree<'_>, start: Point, end: Point) -> Walk {
+  let mut first = start.slot
+  let mut entering = true
+  if !isText(tree, start.slot) {
+    let child = childAt(tree, start.slot, start.offset)
+    if child != NONE {
+      first = child
+    } else {
+      // Past the last child: the next step leaves the element.
+      entering = false
+    }
+  }
+  let endText = isText(tree, end.slot)
+  return Walk {
+    at: first,
+    entering: entering,
+    endSlot: end.slot,
+    endText: endText,
+    stopBefore: if endText { NONE } else { childAt(tree, end.slot, end.offset) },
+    done: false,
+  }
+}
+
+fn step(tree: &UiTree<'_>, w: &mut Walk) -> Step {
+  if w.done || w.at == NONE { return Step.Done }
+  let current = w.at
+  if w.entering {
+    if !w.endText && current == w.stopBefore {
+      w.done = true
+      return Step.Done
+    }
+    if w.endText && current == w.endSlot {
+      w.done = true
+      return Step.Enter { slot: current }
+    }
+    let child = firstChild(tree, current)
+    if child != NONE {
+      w.at = child
+    } else {
+      w.entering = false
+    }
+    return Step.Enter { slot: current }
+  }
+  // Leaving `current`: an element end that is `current` itself stops here, inside it.
+  if !w.endText && w.stopBefore == NONE && current == w.endSlot {
+    w.done = true
+    return Step.Done
+  }
+  let sibling = nextSibling(tree, current)
+  if sibling != NONE {
+    w.at = sibling
+    w.entering = true
+  } else {
+    w.at = tree.node(current).parent
+    w.entering = false
+  }
+  if isText(tree, current) || firstChild(tree, current) == NONE && !blockLevel(tree, current) && !tableCell(tree, current) {
+    // Leaves have nothing to close; step on.
+    return step(tree, &mut w)
+  }
+  return Step.Leave { slot: current }
+}
+
+/// What the selection covers, node by node.
+effect fn cover(tree: &UiTree<'_>, out: &mut List<Selected>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut start = Point.none()
+  let mut end = Point.none()
+  run ordered(tree, &mut start, &mut end)
+  let mut w = walkFrom(tree, start, end)
+  while true {
+    match step(tree, &mut w) {
+      Step.Enter { slot } => {
+        if isText(tree, slot) {
+          if userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
+            let low = if slot == start.slot { start.offset } else { 0 }
+            let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
+            if low < high || slot != end.slot {
+              run out.append(Selected { slot: slot, start: low, end: high, through: slot != end.slot, atomic: false })
+            }
+          }
+        } else if atomic(tree, slot) && userSelect(tree, slot) != SELECT_NONE && shown(tree, slot) {
+          run out.append(Selected { slot: slot, start: 0, end: 1, through: true, atomic: true })
+        }
+      }
+      Step.Leave { .. } => {}
+      Step.Done => { break }
+    }
+  }
+  sortBySlot(&mut out)
+}
+
+fn sortBySlot(list: &mut List<Selected>) -> () {
+  // Insertion sort: walks mostly produce runs of increasing slots.
+  let values = list.asMutSlice()
+  let mut i: usize = 1
+  while i < values.length {
+    let item = values[i]
+    let mut j = i
+    while j > 0 && values[j - 1].slot > item.slot {
+      values[j] = values[j - 1]
+      j = j - 1
+    }
+    values[j] = item
+    i = i + 1
+  }
+}
+
+// Copying.
+
+/// The selected text as Chromium copies it: rendered text with white space collapsed, a line
+/// break around each block, two after a paragraph, a tab between table cells, and nothing from
+/// `user-select: none` text.
+pub effect fn text(tree: &UiTree<'_>) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut out = String.make()
+  if !tree.textSelection.ranged() { return move out }
+  let mut start = Point.none()
+  let mut end = Point.none()
+  run ordered(tree, &mut start, &mut end)
+  let mut w = walkFrom(tree, start, end)
+  let mut emitted = false
+  let mut crossed = false
+  // Collapsible white space waits until text follows it on the same line; `lineStart` drops
+  // it at the start of a line.
+  let mut pendingSpace = false
+  let mut pendingKeep = false
+  let mut lineStart = true
+  while true {
+    match step(tree, &mut w) {
+      Step.Enter { slot } => {
+        if isText(tree, slot) && shown(tree, slot) {
+          let low = if slot == start.slot { start.offset } else { 0 }
+          let high = if slot == end.slot { end.offset } else { textLength(tree, slot) }
+          let keep = userSelect(tree, slot) != SELECT_NONE
+          let value = String.view(&tree.node(slot).text)
+          let bytes = String.utf8Bytes(value)
+          let collapse = tree.node(slot).computed.text.whiteSpaceCollapse
+          let spaces = collapse == WhiteSpaceCollapse.Collapse || collapse == WhiteSpaceCollapse.PreserveBreaks
+          let breaks = collapse != WhiteSpaceCollapse.Collapse
+          let mut from = NO_INDEX
+          let mut i: usize = 0
+          while i < bytes.length {
+            let b = bytes[i]
+            let inside = keep && i >= low && i < high
+            let space = spaces && (b == 32 || b == 9 || b == 13 || b == 10 && !breaks)
+            if space {
+              if from != NO_INDEX {
+                run emit(&mut out, value, from, i, &mut emitted)
+                from = NO_INDEX
+              }
+              if !lineStart {
+                pendingSpace = true
+                if inside { pendingKeep = true }
+              }
+            } else {
+              if pendingSpace {
+                if pendingKeep {
+                  run out.append(" ")
+                  emitted = true
+                }
+                pendingSpace = false
+                pendingKeep = false
+              }
+              if inside {
+                if from == NO_INDEX { from = i }
+              } else if from != NO_INDEX {
+                run emit(&mut out, value, from, i, &mut emitted)
+                from = NO_INDEX
+              }
+              lineStart = b == 10
+            }
+            i = i + 1
+            if i >= high && !pendingSpace && from == NO_INDEX { break }
+          }
+          if from != NO_INDEX { run emit(&mut out, value, from, minOf(i, high), &mut emitted) }
+          crossed = true
+        } else if blockLevel(tree, slot) {
+          if crossed && !endsWith(&out, 10) {
+            run out.append("\n")
+          }
+          pendingSpace = false
+          pendingKeep = false
+          lineStart = true
+          crossed = true
+        } else if tableCell(tree, slot) {
+          if crossed && indexOf(tree, slot) > 0 && !endsWith(&out, 10) { run out.append("\t") }
+          pendingSpace = false
+          pendingKeep = false
+          lineStart = true
+          crossed = true
+        }
+      }
+      Step.Leave { slot } => {
+        crossed = true
+        if blockLevel(tree, slot) && emitted {
+          if !endsWith(&out, 10) { run out.append("\n") }
+          if tree.node(slot).accessRole == Role.Paragraph && !endsWithTwo(&out) { run out.append("\n") }
+          pendingSpace = false
+          pendingKeep = false
+          lineStart = true
+        }
+      }
+      Step.Done => { break }
+    }
+  }
+  if pendingSpace && pendingKeep { run out.append(" ") }
+  return move out
+}
+
+effect fn emit(out: &mut String, value: string, low: usize, high: usize, emitted: &mut bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if high <= low { return () }
+  run out.append(String.slice(value, low, high - low))
+  emitted.* = true
+}
+
+fn minOf(a: usize, b: usize) -> usize { return if a < b { a } else { b } }
+
+fn maxOf(a: usize, b: usize) -> usize { return if a > b { a } else { b } }
+
+fn endsWith(out: &String, byte: u8) -> bool {
+  let bytes = String.utf8Bytes(String.view(out))
+  return bytes.length != 0 && bytes[bytes.length - 1] == byte
+}
+
+fn endsWithTwo(out: &String) -> bool {
+  let bytes = String.utf8Bytes(String.view(out))
+  return bytes.length >= 2 && bytes[bytes.length - 1] == 10 && bytes[bytes.length - 2] == 10
+}
+
+/// Ctrl+C (Cmd+C on a Mac) with text selected: the selected text goes to the clipboard.
+pub effect fn copy(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run refresh(&mut tree)
+  if !tree.textSelection.ranged() { return false }
+  let copied = run text(&tree.*)
+  if String.byteLength(String.view(&copied)) == 0 { return false }
+  run tree.requests.append(HostRequest.WriteClipboard { text: move copied })
+  return true
+}
