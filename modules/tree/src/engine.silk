@@ -137,6 +137,7 @@ import node {
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
+import svg_css.effect_values { Image }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -421,6 +422,10 @@ effect fn layoutFailed<E>(error: E) -> never
   ! TreeError {
   drop error
   fail TreeError.Layout
+}
+
+effect fn noShape(error: TreeError) -> () {
+  drop error
 }
 
 effect fn viewFailed(error: CssomError) -> never
@@ -1117,6 +1122,19 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     if self.resources.settleCssImage(resource, ok) {
       self.paintCachesStale = true
+      // Floats whose `shape-outside` is a stylesheet image wrap around it once it loads.
+      let mut i: usize = 0
+      while i < self.nodes.length() {
+        let node = &self.nodes.asSlice()[i]
+        let imaged = node.live && node.kind != NodeKind.Text && match node.paintEffects() {
+          Option<&Effects>.Some { value } => value.shapeImage.length() != 0
+          Option<&Effects>.None => false
+        }
+        if imaged {
+          run Effect.catch<TreeError>(self.updateShape(usize.toU32(i)), noShape)
+        }
+        i = i + 1
+      }
       return ()
     }
     let at = u32.toUsize(resource)
@@ -1136,6 +1154,30 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+  }
+
+  /// Gives css-layout the `shape-outside` of element `slot`, asking for its image first.
+  effect fn updateShape(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut url = Bytes.make()
+    if let Option<&Effects>.Some { value } = self.node(slot).paintEffects() {
+      if value.shapeImage.length() != 0 {
+        if let Image.Url { url: named } = &value.shapeImage.asSlice()[0] {
+          run url.append(Bytes.asSlice(&named))
+        }
+      }
+    }
+    if url.length() != 0 {
+      drop run self.resources.cssImage(Bytes.asSlice(&url))
+    }
+    let node = self.node(slot)
+    let css = node.css
+    let shape = match node.paintEffects() {
+      Option<&Effects>.Some { value } => run float_shapes.of(value, node.computed.paint.radii, &self.resources, float_shapes.contentSize(&node.computed.layout))
+      Option<&Effects>.None => FloatShape.make()
+    }
+    run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
   }
 
   fn sourceState(self: &Self, resource: u32) -> u8 {
@@ -5333,11 +5375,7 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
       run self.resolveGrid(slot, &computed)
-      let shape = match self.node(slot).paintEffects() {
-        Option<&Effects>.Some { value } => run float_shapes.of(value, computed.paint.radii)
-        Option<&Effects>.None => FloatShape.make()
-      }
-      run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
+      run self.updateShape(slot)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
