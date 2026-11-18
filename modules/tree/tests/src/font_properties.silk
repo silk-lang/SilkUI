@@ -1,6 +1,7 @@
 //! font-palette, @font-palette-values, font-variant-alternates with @font-feature-values,
 //! font-size-adjust and font-smooth.
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, info }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Mutation, info }
+import ui_assets.assets as assets
 import ui_fixtures.fixtures as fixtures
 import font_collection.lib { FontCollection }
 import svg_css.compile { CompileError, Options }
@@ -14,6 +15,7 @@ import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.num.f32
+import silk.num.f64
 
 /// lib-fonts' COLRv1 fixture ("Raster ColrV1"): "A" is a 1em square of palette entry 0, red
 /// in palette 0 (light) and yellow in palette 1 (dark).
@@ -170,3 +172,115 @@ test effect fn fontSmoothNoneDrawsAliasedGlyphs() ! TreeError | CompileError | C
   run smoothing() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+
+/// A tree with "iiiiiiiiii" in `Brand` (falling back to Noto Sans) from a sheet face with
+/// `font-display: <display>`, framed at time 0. Returns the face's load id through `tree`.
+effect fn displayTree<'f>(fonts: &'f FontCollection, display: &[u8]) -> UiTree<'f>
+  ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator {
+  let mut sheet = run Bytes.copy(b"@font-face{font-family:Brand;src:url(brand.ttf);font-display:")
+  run Bytes.append(&mut sheet, display)
+  run Bytes.append(&mut sheet, b"}")
+  return run build(fonts, Bytes.asSlice(&sheet), b"font-family:Brand,'Noto Sans';background:white", "iiiiiiiiii")
+}
+
+effect fn frameAt(tree: &mut UiTree<'_>, time: f64) ! TreeError | OutOfMemoryError ? &mut Allocator {
+  run tree.frame(FrameInput { width: 400.0, height: 100.0, scale: 1.0, time: time })
+}
+
+/// Whether any text pixel is drawn.
+effect fn inked(tree: &mut UiTree<'_>) -> bool ! TreeError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let mut y: u32 = 0
+  while y < 24 {
+    let mut x: u32 = 0
+    while x < 120 {
+      let pixel = painted.pixel(x, y)
+      if pixel.a > 128 && pixel.r < 128 { return true }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return false
+}
+
+effect fn boxWidth(tree: &UiTree<'_>) -> f32 ! OutOfMemoryError ? &mut Allocator {
+  return match run info(tree, 2) { Option.Some { value } => value.bounds.width() _ => 0.0 }
+}
+
+/// Loads the one face `tree` asked for, at `time`.
+effect fn loadAt(tree: &mut UiTree<'_>, time: f64) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let loads = run tree.takeLoads()
+  if loads.length() != 1 { return false }
+  let id = match &loads.asSlice()[0] {
+    Mutation.LoadFontFace { face, .. } => face
+    _ => { return false }
+  }
+  drop run tree.loadFontFace(id, run Bytes.copy(assets.geistMonoFont()), 0)
+  run frameAt(&mut tree, time)
+  return true
+}
+
+effect fn display() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut swap = run displayTree(&fonts, b"swap")
+  run Testing.expect(run inked(&mut swap), "swap shows the fallback at once")
+  let fallbackWidth = run boxWidth(&swap)
+
+  let mut block = run displayTree(&fonts, b"block")
+  run Testing.expect(f64Near(block.fontWake(), 3.0), "the tree wakes when the block period ends")
+  run Testing.expect(!run inked(&mut block), "block hides text while the face loads")
+  run frameAt(&mut block, 2.9)
+  run Testing.expect(!run inked(&mut block), "for 3 seconds")
+  run frameAt(&mut block, 3.0)
+  run Testing.expect(run inked(&mut block), "then the fallback shows")
+  let loaded1 = run loadAt(&mut block, 10.0)
+  run Testing.expect(loaded1, "the face loads")
+  let width1 = run boxWidth(&block)
+  run Testing.expect(width1 > fallbackWidth * 1.5, "and the face swaps in whenever it loads")
+
+  let mut auto = run displayTree(&fonts, b"auto")
+  run Testing.expect(!run inked(&mut auto), "auto blocks as block does")
+  let loaded2 = run loadAt(&mut auto, 0.5)
+  run Testing.expect(loaded2, "the face loads")
+  let ink2 = run inked(&mut auto)
+  run Testing.expect(ink2, "a face loading in the block period shows at once")
+
+  let mut fallback = run displayTree(&fonts, b"fallback")
+  run Testing.expect(!run inked(&mut fallback), "fallback blocks briefly")
+  run frameAt(&mut fallback, 0.1)
+  run Testing.expect(run inked(&mut fallback), "for 100 ms")
+  let loaded3 = run loadAt(&mut fallback, 2.0)
+  run Testing.expect(loaded3, "the face loads")
+  let width3 = run boxWidth(&fallback)
+  run Testing.expect(width3 > fallbackWidth * 1.5, "and swaps within 3 seconds")
+  let mut late = run displayTree(&fonts, b"fallback")
+  run frameAt(&mut late, 3.1)
+  run Testing.expect(late.fontWake() < 0.0, "nothing is left to wait for")
+  let loaded4 = run loadAt(&mut late, 3.2)
+  run Testing.expect(loaded4, "the face loads")
+  let width4 = run boxWidth(&late)
+  run Testing.expect(close(width4, fallbackWidth), "a face loading later keeps the fallback")
+  run Testing.expect((run late.takeLoads()).length() == 0, "and is not asked for again")
+
+  let mut optional = run displayTree(&fonts, b"optional")
+  run Testing.expect(!run inked(&mut optional), "optional blocks briefly")
+  let loaded5 = run loadAt(&mut optional, 0.05)
+  run Testing.expect(loaded5, "the face loads")
+  let width5 = run boxWidth(&optional)
+  run Testing.expect(width5 > fallbackWidth * 1.5, "a face ready within 100 ms is used")
+  let mut missed = run displayTree(&fonts, b"optional")
+  run frameAt(&mut missed, 0.1)
+  let loaded6 = run loadAt(&mut missed, 0.2)
+  run Testing.expect(loaded6, "the face loads")
+  let width6 = run boxWidth(&missed)
+  run Testing.expect(close(width6, fallbackWidth), "later, the fallback stays")
+}
+
+fn f64Near(a: f64, b: f64) -> bool { return f64.abs(a - b) < 0.001 }
+
+test effect fn fontDisplayBlocksSwapsAndGivesUp() ! TreeError | CompileError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run display() |> Effect.provideMut<Allocator>(&mut allocator)
+}

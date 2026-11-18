@@ -67,6 +67,46 @@ pub struct FaceRule {
   pub style: FaceStyle,
   /// `unicode-range`; empty means every code point.
   pub ranges: List<UnicodeRange>,
+  /// `font-display`.
+  pub display: FontDisplay,
+}
+
+/// CSS `font-display`: how long text waits for a loading face, invisible (the block period),
+/// then how long it shows a fallback the face can still replace (the swap period). After
+/// both, a face that loads is not used. Periods follow Chromium.
+pub enum FontDisplay {
+  /// As `block`.
+  Auto,
+  /// 3 s invisible, then swap whenever it loads.
+  Block,
+  /// No block period; swap whenever it loads.
+  Swap,
+  /// 100 ms invisible, then 3 s to swap.
+  Fallback,
+  /// 100 ms invisible, and no swap period.
+  Optional,
+}
+
+impl FontDisplay {
+  /// The block period, in seconds.
+  pub fn block(self: Self) -> f64 {
+    return match self {
+      FontDisplay.Auto => 3.0
+      FontDisplay.Block => 3.0
+      FontDisplay.Swap => 0.0
+      FontDisplay.Fallback => 0.1
+      FontDisplay.Optional => 0.1
+    }
+  }
+
+  /// When the swap period ends, in seconds from the load's start; negative when it never does.
+  pub fn swapEnd(self: Self) -> f64 {
+    return match self {
+      FontDisplay.Fallback => 3.1
+      FontDisplay.Optional => 0.1
+      _ => -1.0
+    }
+  }
 }
 
 impl FaceRule {
@@ -82,6 +122,7 @@ impl FaceRule {
       width: Range.point(100.0),
       style: FaceStyle.Normal,
       ranges: List<UnicodeRange>.make(),
+      display: FontDisplay.Auto,
     }
   }
 }
@@ -109,6 +150,11 @@ struct Declared {
   state: FaceState,
   /// The face in the set once ready, else `usize.MAX`.
   face: usize,
+  display: FontDisplay,
+  /// When text first asked for it, in the set's time; negative before.
+  since: f64,
+  /// Its file came after its swap period: it stays unused (`Failed`) and is not retried.
+  expired: bool,
 }
 
 /// One entry of the faces text in a style tries, in order: an installed face, or a member of
@@ -137,6 +183,8 @@ pub struct FontSet<'a> {
   wanted: List<usize>,
   /// Counts changes to what font matching can return.
   pub generation: u64,
+  /// The time, in seconds, that `font-display` periods count in; the host sets it per frame.
+  pub now: f64,
 }
 
 fn covers(ranges: &[UnicodeRange], cp: u32) -> bool {
@@ -292,6 +340,7 @@ impl<'a> FontSet<'a> {
       declared: List<Declared>.make(),
       wanted: List<usize>.make(),
       generation: 0,
+      now: 0.0,
     }
   }
 
@@ -395,6 +444,9 @@ impl<'a> FontSet<'a> {
         ranges: List<UnicodeRange>.make(),
         state: FaceState.Ready,
         face: installed + i,
+        display: FontDisplay.Swap,
+        since: -1.0,
+        expired: false,
       }
       run self.declared.append(move entry)
       i = i + 1
@@ -421,6 +473,9 @@ impl<'a> FontSet<'a> {
         ranges: move rule.ranges,
         state: FaceState.Unloaded,
         face: usize.MAX,
+        display: rule.display,
+        since: -1.0,
+        expired: false,
       },
     )
     self.generation = self.generation + 1
@@ -468,7 +523,8 @@ impl<'a> FontSet<'a> {
   }
 
   pub fn retry(self: &mut Self, declared: usize) -> bool {
-    if !self.active(declared) || self.declared.asSlice()[declared].state != FaceState.Failed { return false }
+    if !self.active(declared) || self.declared.asSlice()[declared].state != FaceState.Failed
+      || self.declared.asSlice()[declared].expired { return false }
     let entries = self.declared.asMutSlice()
     entries[declared].state = FaceState.Loading
     return true
@@ -483,7 +539,14 @@ impl<'a> FontSet<'a> {
     if declared >= self.declared.length() {
       return false
     }
-    if self.declared.asSlice()[declared].state == FaceState.Ready {
+    if self.declared.asSlice()[declared].state == FaceState.Ready || self.declared.asSlice()[declared].expired {
+      return true
+    }
+    if self.late(declared) {
+      // After the swap period the fallback stays: the file is not used, and not retried.
+      let entries = self.declared.asMutSlice()
+      entries[declared].state = FaceState.Failed
+      entries[declared].expired = true
       return true
     }
     let entry = &self.declared.asSlice()[declared]
@@ -519,6 +582,81 @@ impl<'a> FontSet<'a> {
       let entries = self.declared.asMutSlice()
       entries[declared].state = FaceState.Failed
     }
+  }
+
+  /// Whether declared face `declared`'s swap period is over.
+  fn late(self: &Self, declared: usize) -> bool {
+    let entry = &self.declared.asSlice()[declared]
+    let end = entry.display.swapEnd()
+    return end >= 0.0 && entry.since >= 0.0 && self.now - entry.since >= end
+  }
+
+  /// Whether declared face `declared` loaded after its swap period, so it is never used.
+  pub fn expired(self: &Self, declared: usize) -> bool {
+    return declared < self.declared.length() && self.declared.asSlice()[declared].expired
+  }
+
+  /// Whether text with `chain` is invisible now: a face of it is loading in its block period.
+  pub fn blocking(self: &Self, chain: &[Link]) -> bool {
+    let mut i: usize = 0
+    while i < chain.length {
+      let link = chain[i]
+      if link.declared == usize.MAX {
+        return false
+      }
+      let entry = &self.declared.asSlice()[link.declared]
+      if entry.active && entry.state == FaceState.Loading && entry.since >= 0.0
+        && self.now - entry.since < entry.display.block() {
+        return true
+      }
+      if entry.active && entry.state == FaceState.Ready {
+        return false
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The next time a block or swap period ends, or a negative number when none runs.
+  pub fn nextDeadline(self: &Self) -> f64 {
+    let mut next: f64 = -1.0
+    let entries = self.declared.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      let entry = &entries[i]
+      if entry.active && entry.state == FaceState.Loading && entry.since >= 0.0 {
+        let block = entry.since + entry.display.block()
+        if block > self.now && (next < 0.0 || block < next) {
+          next = block
+        }
+        let swap = entry.display.swapEnd()
+        if swap >= 0.0 && entry.since + swap > self.now && (next < 0.0 || entry.since + swap < next) {
+          next = entry.since + swap
+        }
+      }
+      i = i + 1
+    }
+    return next
+  }
+
+  /// Gives up on faces still loading after their swap period: their fallback stays, and a
+  /// file that comes later is not used. True when one gave up.
+  pub fn expireLate(self: &mut Self) -> bool {
+    let mut changed = false
+    let mut i: usize = 0
+    while i < self.declared.length() {
+      if self.declared.asSlice()[i].state == FaceState.Loading && self.late(i) {
+        let entries = self.declared.asMutSlice()
+        entries[i].state = FaceState.Failed
+        entries[i].expired = true
+        changed = true
+      }
+      i = i + 1
+    }
+    if changed {
+      self.generation = self.generation + 1
+    }
+    return changed
   }
 
   /// The number of added and declared faces.
@@ -759,6 +897,7 @@ impl<'a> FontSet<'a> {
         } else if state == FaceState.Unloaded {
           let entries = self.declared.asMutSlice()
           entries[link.declared].state = FaceState.Loading
+          entries[link.declared].since = self.now
           run self.wanted.append(link.declared)
         }
       }
