@@ -77,6 +77,10 @@ The client opens a root with a number it chooses, a node, and options such as a 
 
 This is what Silk UI's [windows](/native/windows/) are built on.
 
+## Page zoom
+
+In a window, Ctrl (Cmd on macOS) with `+`, `-` and `0` zoom the page as a browser does: lengths and text grow, and the page reflows, with media queries and viewport units reading a viewport that many times smaller. A key handler that prevents the key keeps it from zooming. To set the zoom from code, for a setting the app remembers, call `tree.setPageZoom(1.5)`. In a browser tab the browser zooms the page itself.
+
 ## In a browser tab
 
 The same host runs in a browser: the program is built for WebAssembly and draws on a canvas with WebGPU. That is a different thing from Silk UI's [document backend](/core/browser/), which uses real DOM nodes. On a canvas the tree does its own layout and text, pixel for pixel as it does natively.

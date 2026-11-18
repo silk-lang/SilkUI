@@ -88,6 +88,87 @@ effect fn alignAndProximity() -> ()
   run Testing.expect(near.scrollOffset(2).y == 130.0, "proximity snaps nearby")
 }
 
+/// A wheel stream that slows down like momentum, from `first` pixels a frame by `ratio` each
+/// frame, 16ms apart from `start`; returns the time after it and checks the offset never goes
+/// past `limit`.
+effect fn fling(tree: &mut UiTree<'_>, start: f64, first: f32, ratio: f32, count: u32, limit: f32) -> f64
+  ! TreeError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let mut time = start
+  let mut delta = first
+  let mut i: u32 = 0
+  while i < count {
+    run tree.dispatch(Input.Wheel { x: 10.0, y: 10.0, deltaX: 0.0, deltaY: delta, modifiers: 0 })
+    time = time + 0.016
+    run tree.frame(frameAt(time))
+    run Testing.expect(tree.scrollOffset(2).y <= limit + 0.01, "an aimed fling never goes past its snap position")
+    delta = delta * ratio
+    i = i + 1
+  }
+  return time
+}
+
+effect fn flings() -> ()
+  ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  run snapper(&mut tree, b"display:block;width:200px;height:100px;overflow-y:auto;scroll-snap-type:y mandatory", b"display:block;height:100px;scroll-snap-align:start")
+  run tree.frame(frameAt(0.0))
+  // 27 + 24.3 + ... comes to rest about 270px on, near the row at 330.
+  let mut time = run fling(&mut tree, 0.0, 27.0, 0.9, 40, 330.0)
+  run Testing.expect(tree.snapWaits.length() == 1 && tree.snapWaits.get(0).aimed, "a slowing wheel stream is taken for a fling and aimed")
+  time = time + 0.3
+  run tree.frame(frameAt(time))
+  time = time + 1.0
+  run tree.frame(frameAt(time))
+  run Testing.expect(tree.scrollOffset(2).y == 330.0, "the fling ends on the snap position where it would come to rest")
+  run Testing.expect(!tree.needsFrame(), "and stops asking for frames")
+  // Even steps, as keys or a mouse wheel give, are not a fling.
+  let mut steady = run UiTree.make(&fonts)
+  run snapper(&mut steady, b"display:block;width:200px;height:100px;overflow-y:auto;scroll-snap-type:y mandatory", b"display:block;height:100px;scroll-snap-align:start")
+  run steady.frame(frameAt(0.0))
+  drop run fling(&mut steady, 0.0, 10.0, 1.0, 8, 1000.0)
+  run Testing.expect(steady.scrollOffset(2).y == 110.0 && !steady.snapWaits.get(0).aimed, "a steady stream scrolls freely")
+}
+
+effect fn stops() -> ()
+  ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  run snapper(&mut tree, b"display:block;width:200px;height:100px;overflow-y:auto;scroll-snap-type:y mandatory", b"display:block;height:100px;scroll-snap-align:start")
+  let mut batch = Batch.make()
+  run styled(&mut batch, 11, b"display:block;height:100px;scroll-snap-align:start;scroll-snap-stop:always")
+  run tree.apply(run batch.take())
+  run tree.frame(frameAt(0.0))
+  run tree.dispatch(Input.Wheel { x: 10.0, y: 10.0, deltaX: 0.0, deltaY: 250.0, modifiers: 0 })
+  run tree.frame(frameAt(0.05))
+  run tree.frame(frameAt(0.3))
+  run tree.frame(frameAt(1.5))
+  run Testing.expect(tree.scrollOffset(2).y == 130.0, "a scroll past a scroll-snap-stop: always row stops on it")
+  let mut time = run fling(&mut tree, 1.5, 12.0, 0.9, 40, 1000.0)
+  time = time + 1.5
+  run tree.frame(frameAt(time))
+  run Testing.expect(tree.scrollOffset(2).y == 230.0, "a fling starting on it may leave it, and snaps as usual")
+  let mut back = run fling(&mut tree, time, -27.0, 0.9, 40, 1000.0)
+  back = back + 1.5
+  run tree.frame(frameAt(back))
+  run Testing.expect(tree.scrollOffset(2).y == 130.0, "a fling back stops on the always row instead of passing it")
+}
+
+test effect fn scrollSnapAimsFlings() -> ()
+  ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run flings() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn scrollSnapStopAlwaysIsNotPassed() -> ()
+  ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stops() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 test effect fn scrollSnapSettlesAfterTheWheelAndOnScriptScrolls() -> ()
   ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
