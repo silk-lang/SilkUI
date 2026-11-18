@@ -1,6 +1,5 @@
 // The Metal Performance HUD on a window's CAMetalLayer (macOS 13 and later): the frame rate,
-// frame times and GPU time Metal measures for what the layer actually presents. Metal draws it
-// only when MTL_HUD_ENABLED was set before it started, so it is set as early as possible.
+// frame times and GPU time Metal measures for what the layer actually presents.
 
 #import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
@@ -10,17 +9,19 @@
 
 static int32_t hud_default = 0;
 
+// Metal loads the HUD only when MTL_HUD_ENABLED is set as it starts: `developerHUDProperties`
+// on a layer neither loads it later nor hides it once the variable is set (macOS 27). So the
+// switches set the variable before the first Metal device exists.
+static void enable_before_metal(void) { setenv("MTL_HUD_ENABLED", "1", 1); }
+
 __attribute__((constructor)) static void silk_ui_metal_hud_from_environment(void) {
     const char *asked = getenv("SILK_UI_METAL_HUD");
-    if (asked && asked[0] && strcmp(asked, "0") != 0) {
-        setenv("MTL_HUD_ENABLED", "1", 1);
-        hud_default = 1;
-    }
+    if (asked && *asked && strcmp(asked, "0") != 0) enable_before_metal();
 }
 
 void silk_ui_metal_hud_default(int32_t on) {
     hud_default = on;
-    if (on) setenv("MTL_HUD_ENABLED", "1", 1);
+    if (on) enable_before_metal();
 }
 
 int32_t silk_ui_metal_hud_default_on(void) { return hud_default; }
