@@ -1,0 +1,241 @@
+//! CSS Scroll Snap 1: a snap container (`scroll-snap-type`) comes to rest where one of its
+//! snap areas (`scroll-snap-align` on a descendant, grown by its `scroll-margin`) lines up
+//! with the scrollport (shrunk by `scroll-padding`).
+//!
+//! A user scroll (wheel, keys, a scrollbar thumb, a compositor scroll) snaps once it has been
+//! still for `IDLE`, with a smooth scroll. A script scroll snaps its destination right away.
+//! After a layout, a mandatory container that no longer rests on a snap position goes back to
+//! one (Scroll Snap 1 §5.1).
+import engine { UiTree }
+import node { NO_INDEX }
+import paint { borderBox, paddingBox }
+import scrollbar { rangeOf, scrolls, usedOverflow }
+import style { SNAP_NONE, SNAP_START, SNAP_END }
+import silk.collections.list { List }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+
+/// Seconds a user scroll stays still before it snaps: longer than the gap between wheel or
+/// momentum events, short enough to feel like the end of the gesture.
+pub const IDLE: f64 = 0.12
+
+/// A container a user scrolled, and when.
+pub struct SnapWait {
+  pub slot: u32,
+  pub id: u32,
+  pub time: f64,
+}
+
+impl Copy for SnapWait {}
+
+fn container(tree: &UiTree<'_>, slot: u32) -> bool {
+  let s = &tree.node(slot).computed.scroll
+  return s.snapsX() || s.snapsY()
+}
+
+/// A user scrolled `slot`: snap it once scrolling stops.
+pub effect fn userScrolled(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.snapUsed || !container(&tree.*, slot) {
+    return ()
+  }
+  let time = tree.input.time
+  let id = tree.node(slot).id
+  let mut i: usize = 0
+  while i < tree.snapWaits.length() {
+    let wait = tree.snapWaits.get(i)
+    if wait.slot == slot && wait.id == id {
+      tree.snapWaits.set(i, SnapWait { slot: slot, id: id, time: time })
+      return ()
+    }
+    i = i + 1
+  }
+  run tree.snapWaits.append(SnapWait { slot: slot, id: id, time: time })
+}
+
+/// Whether a user scroll waits to snap: the host keeps drawing frames until it has.
+pub fn waiting(tree: &UiTree<'_>) -> bool {
+  return tree.snapWaits.length() != 0
+}
+
+/// The snapped destination of a scroll of `slot` to (`x`, `y`), or (`x`, `y`) when `slot` is
+/// not a snap container or no snap position is close enough.
+pub effect fn snapped(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> [f32; 2]
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.snapUsed || !container(tree, slot) {
+    return [x, y]
+  }
+  let index = fragmentOf(tree, slot)
+  if index == NO_INDEX {
+    return [x, y]
+  }
+  let c = tree.node(slot).computed
+  let f = tree.visualFragment(index)
+  let port = c.scroll.port(paddingBox(&f))
+  let range = rangeOf(&c, &f)
+  let mandatory = c.scroll.snapMandatory()
+  let snapX = c.scroll.snapsX() && scrolls(usedOverflow(&c, true))
+  let snapY = c.scroll.snapsY() && scrolls(usedOverflow(&c, false))
+  // Positions are found at the current offset; a candidate is that offset plus the distance
+  // its area has to move to line up with the port.
+  let atX = tree.node(slot).scrollX
+  let atY = tree.node(slot).scrollY
+  let mut best = [x, y]
+  let mut bestDistance = [f32.INFINITY, f32.INFINITY]
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run tree.childSlots(slot, &mut children)
+  run pushAll(&mut stack, &children)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let item = stack.get(last)
+    stack.truncate(last)
+    let ic = tree.node(item).computed
+    let at = fragmentOf(tree, item)
+    if at != NO_INDEX {
+      let ax = ic.scroll.alignX()
+      let ay = ic.scroll.alignY()
+      if ax != SNAP_NONE || ay != SNAP_NONE {
+        let b = borderBox(&tree.visualFragment(at))
+        let m = ic.scroll.margin
+        let area = Rect<f32>.new(b.xMin - m.left, b.yMin - m.top, b.xMax + m.right, b.yMax + m.bottom)
+        if snapX && ax != SNAP_NONE {
+          let candidate = range.clampX(atX + shift(ax, area.xMin, area.xMax, port.xMin, port.xMax))
+          let distance = f32.abs(candidate - x)
+          if distance < bestDistance[0] {
+            bestDistance[0] = distance
+            best[0] = candidate
+          }
+        }
+        if snapY && ay != SNAP_NONE {
+          let candidate = range.clampY(atY + shift(ay, area.yMin, area.yMax, port.yMin, port.yMax))
+          let distance = f32.abs(candidate - y)
+          if distance < bestDistance[1] {
+            bestDistance[1] = distance
+            best[1] = candidate
+          }
+        }
+      }
+    }
+    // A nested scroll container snaps its own descendants.
+    if !(scrolls(usedOverflow(&ic, true)) || scrolls(usedOverflow(&ic, false))) {
+      run tree.childSlots(item, &mut children)
+      run pushAll(&mut stack, &children)
+    }
+  }
+  // Proximity snaps only near a position: within a third of the scrollport.
+  if !mandatory {
+    if bestDistance[0] > port.width() / 3.0 { best[0] = x }
+    if bestDistance[1] > port.height() / 3.0 { best[1] = y }
+  }
+  return best
+}
+
+effect fn pushAll(stack: &mut List<u32>, items: &List<u32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i = items.length()
+  while i > 0 {
+    i = i - 1
+    run stack.append(items.get(i))
+  }
+}
+
+fn fragmentOf(tree: &UiTree<'_>, slot: u32) -> usize {
+  let node = tree.node(slot)
+  if !node.live {
+    return NO_INDEX
+  }
+  return if node.css < tree.fragmentOf.length() { tree.fragmentOf.get(node.css) } else { NO_INDEX }
+}
+
+/// How far the scroll offset moves so that the area's `align` edge meets the port's.
+fn shift(align: u8, min: f32, max: f32, portMin: f32, portMax: f32) -> f32 {
+  if align == SNAP_START {
+    return min - portMin
+  }
+  if align == SNAP_END {
+    return max - portMax
+  }
+  return (min + max) * 0.5 - (portMin + portMax) * 0.5
+}
+
+/// Snaps the containers whose user scroll has been still for `IDLE`, and puts mandatory
+/// containers that a layout moved off a snap position back on one.
+pub effect fn settle(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.snapUsed {
+    return ()
+  }
+  let now = tree.input.time
+  let mut i: usize = 0
+  while i < tree.snapWaits.length() {
+    let wait = tree.snapWaits.get(i)
+    let gone = u32.toUsize(wait.slot) >= tree.nodes.length() || !tree.node(wait.slot).live
+      || tree.node(wait.slot).id != wait.id
+    if gone {
+      drop tree.snapWaits.remove(i)
+    } else if tree.thumbSlot == wait.slot || now - wait.time < IDLE {
+      i = i + 1
+    } else {
+      drop tree.snapWaits.remove(i)
+      drop run snapNow(&mut tree, wait.slot, true)
+    }
+  }
+}
+
+/// After a layout: a mandatory snap container that rests off every snap position, and is not
+/// being scrolled, moves to the nearest one at once.
+pub effect fn resnap(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !tree.snapUsed || tree.stats.layoutSkipped {
+    return false
+  }
+  let mut moved = false
+  let mut slot: u32 = 0
+  while u32.toUsize(slot) < tree.nodes.length() {
+    let node = tree.node(slot)
+    if node.live && node.computed.scroll.snapMandatory() && container(&tree.*, slot) && !busy(&tree.*, slot) {
+      moved = (run snapNow(&mut tree, slot, false)) || moved
+    }
+    slot = slot + 1
+  }
+  return moved
+}
+
+fn busy(tree: &UiTree<'_>, slot: u32) -> bool {
+  if tree.thumbSlot == slot {
+    return true
+  }
+  let mut i: usize = 0
+  while i < tree.snapWaits.length() {
+    if tree.snapWaits.get(i).slot == slot {
+      return true
+    }
+    i = i + 1
+  }
+  return cssom_view.animatesSlot(tree, slot)
+}
+
+effect fn snapNow(tree: &mut UiTree<'_>, slot: u32, smooth: bool) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let x = tree.node(slot).scrollX
+  let y = tree.node(slot).scrollY
+  let target = run snapped(&tree.*, slot, x, y)
+  if f32.abs(target[0] - x) < 0.5 && f32.abs(target[1] - y) < 0.5 {
+    return false
+  }
+  run cssom_view.snapTo(&mut tree.*, slot, target[0], target[1], smooth)
+  return true
+}
+
+import cssom_view
+import silk.num.u32

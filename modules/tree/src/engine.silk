@@ -30,6 +30,8 @@ import anchoring { Anchored }
 import inspect
 import cssom_view
 import cssom_view { ScrollAnimation }
+import scroll_snap
+import scroll_snap { SnapWait }
 import svg_css.cssom_view_window { ScrollState, ViewTarget, ViewTargetKind }
 import svg_css.cssom_error { CssomError }
 import ui_protocol.grid { Grid }
@@ -799,6 +801,10 @@ pub struct UiTree<'a> {
   /// Some node is a list item or changes counters, or generated content names one: each
   /// style pass ends with the counters pass (`lists.update`).
   pub listsUsed: bool,
+  /// Whether any node is a scroll snap container (see `scroll_snap`).
+  pub snapUsed: bool,
+  /// User scrolls of snap containers that snap once they stop.
+  pub snapWaits: List<SnapWait>,
   /// The last `Node.styleClass` handed out.
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
@@ -1013,6 +1019,8 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       listsUsed: false,
+      snapUsed: false,
+      snapWaits: List<SnapWait>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
       computedStamps: 0,
@@ -3787,6 +3795,7 @@ impl<'a> UiTree<'a> {
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
     run interact.scrolledElsewhere(&mut self, slot, x, y)
+    run scroll_snap.userScrolled(&mut self, slot)
   }
 
   pub fn scrollOffset(self: &Self, id: u32) -> Vector2<f32> {
@@ -5174,6 +5183,7 @@ impl<'a> UiTree<'a> {
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
+    if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     let animationUnits = if simpleStyles { 0 } else { animation.relativeUnits(&self, slot, &computed.animation, &stops) }
@@ -5653,6 +5663,7 @@ impl<'a> UiTree<'a> {
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
+      || scroll_snap.waiting(self)
       || motion.animating(self)
       || animation.animating(self)
       || self.layout.revision() != self.laidOutRevision
@@ -5688,6 +5699,10 @@ impl<'a> UiTree<'a> {
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    run scroll_snap.settle(&mut self)
+    if run scroll_snap.resnap(&mut self) {
+      run self.layoutFrame()
+    }
     if run interact.settleScrolls(&mut self) {
       run self.layoutFrame()
       drop run interact.settleScrolls(&mut self)
