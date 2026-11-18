@@ -34,8 +34,15 @@ import ui_inspect_server.lib {
   MemoryPair,
   Session,
   TOPIC_HIGHLIGHT,
-  TOPIC_EVENTS
+  TOPIC_EVENTS,
+  Interaction,
+  Startup,
+  interactionName,
+  interactionTarget,
+  slowLine
 }
+import ui_inspect.synth { pointOf }
+import silk.geometry.vector { Vector2 }
 import ui_tree.input { Input }
 import ui_inspect.lib { InspectOptions, inspectNode }
 import ui_tree.css
@@ -1363,7 +1370,7 @@ effect fn mcpBody() -> ()
     &mut tree,
     "{\"jsonrpc\":\"2.0\",\"id\":\"t\",\"method\":\"tools/list\"}",
   )
-  run Testing.expect(toolCount(&tools) == 27, "twenty-seven tools")
+  run Testing.expect(toolCount(&tools) == 28, "twenty-eight tools")
   run Testing.expect(same(text(&tools, "id"), "t"), "string ids are echoed")
 
   // Snapshot is describe; inspect is the node view.
@@ -1865,6 +1872,61 @@ effect fn devtoolsBody() -> ()
   run Testing.expect(
     String.contains(String.view(&recent), "\"timed\":true,\"slowestMs\":0,"),
     "timed, though the last frames round to nothing",
+  )
+
+  // Interactions, named the way a person would name what they did and to what.
+  let archive = (run pointOf(&tree, 20)) |> Option<Vector2<f32>>.unwrapOr(Vector2<f32>.new(0.0, 0.0))
+  let released = Input.PointerUp { x: archive.x, y: archive.y, button: 0, modifiers: 0 }
+  let clicked = run interactionName(&released)
+  run Testing.expect(String.view(&clicked) == "click", "a release is a click")
+  let target = run interactionTarget(&tree, &released)
+  run Testing.expect(String.view(&target) == "button \"Archive\"", "on the button under it")
+  let hovering = run interactionName(&Input.PointerMove { x: 1.0, y: 1.0, modifiers: 0 })
+  run Testing.expect(hovering.ownedByteLength() == 0, "a move is no interaction")
+  let nowhere = run interactionTarget(&tree, &Input.TextInput { text: run String.copy("a") })
+  run Testing.expect(String.view(&nowhere) == "the window", "typing with nothing focused")
+  protocol.timeline.startup = Option<Startup>.some(Startup { windowMs: 40.0, gpuMs: 90.0, firstFrameMs: 120.0 })
+  run protocol.timeline.interaction(
+    Interaction {
+      frame: 7,
+      input: move clicked,
+      target: move target,
+      handleMs: 150.0,
+      layoutMs: 20.0,
+      paintMs: 12.5,
+      totalMs: 182.5,
+    },
+  )
+  run protocol.timeline.interaction(
+    Interaction {
+      frame: 8,
+      input: run String.copy("key Enter"),
+      target: run String.copy("textbox \"Title\""),
+      handleMs: 1.0,
+      layoutMs: 2.0,
+      paintMs: 1.0,
+      totalMs: 4.0,
+    },
+  )
+  let waits = run raw(&mut protocol, &mut tree, "{\"cmd\":\"performance\"}")
+  run Testing.expect(
+    String.contains(String.view(&waits), "\"startup\":{\"windowMs\":40,\"gpuMs\":90,\"firstFrameMs\":120}"),
+    "startup steps",
+  )
+  run Testing.expect(String.contains(String.view(&waits), "\"memoryBytes\":"), "memory")
+  run Testing.expect(
+    String.contains(String.view(&waits), "\"slow\":1,\"slowest\":{\"frame\":7,\"input\":\"click\",\"target\":\"button \\\"Archive\\\"\",\"totalMs\":182.5,"),
+    "the slow one, named",
+  )
+  let later = run raw(&mut protocol, &mut tree, "{\"cmd\":\"performance\",\"since\":7}")
+  run Testing.expect(
+    String.contains(String.view(&later), "\"slow\":0") && String.contains(String.view(&later), "key Enter"),
+    "since a frame",
+  )
+  let line = run slowLine(&protocol.timeline.interactions.asSlice()[0])
+  run Testing.expect(
+    String.view(&line) == "silk-ui: slow click on button \"Archive\": 183 ms to the next frame (handlers 150 ms, layout 20 ms, paint 13 ms)\n",
+    "the line a debug build says",
   )
 
   // Styles are edited while the app runs, and put back.

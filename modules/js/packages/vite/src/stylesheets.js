@@ -1,4 +1,5 @@
 import { compileStylesheet } from './compiler.js';
+import { reportDropped, standardize } from './report.js';
 
 const CSS = /\.(?:css|less|sass|scss|styl|stylus|pcss|postcss|sss)(?:$|\?)/;
 const marker = /[?&]silk-sheet(?:&|$)/;
@@ -53,7 +54,7 @@ if (import.meta.hot) {
       }
       let result;
       try {
-        result = compileStylesheet(expression.value, { strict, resolveUrl(url) {
+        result = compileStylesheet(standardize(expression.value), { strict, resolveUrl(url) {
           if (!url) return url;
           const origin = server?.config.server.origin ?? server?.resolvedUrls?.local[0] ?? server?.resolvedUrls?.network[0];
           try { return new URL(url, origin).href; }
@@ -64,9 +65,7 @@ if (import.meta.hot) {
         const dropped = error.diagnostics?.map(item => `${item.kind}: ${item.feature} (${item.count})`).join("\n");
         this.error(error.message + (dropped ? `\n${dropped}` : ""));
       }
-      for (const diagnostic of result.diagnostics) {
-        this.warn(`dropped ${diagnostic.count} ${diagnostic.kind} occurrence(s): ${diagnostic.feature}`);
-      }
+      reportDropped(message => this.warn(message), result.diagnostics);
       return { code: `export default ${JSON.stringify(Buffer.from(result.bytes).toString('base64'))};`, map: { mappings: '' } };
     },
   }];
