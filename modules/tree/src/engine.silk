@@ -2679,6 +2679,7 @@ impl<'a> UiTree<'a> {
       base: List<Declaration>.make(),
       extras: Option<Box<NodeExtras>>.None,
       styled: move styled,
+      moving: Option<Box<Computed>>.None,
       fontKey: 0,
       paintHash: 0,
       text: String.make(),
@@ -2936,6 +2937,7 @@ impl<'a> UiTree<'a> {
       node.extras = Option<Box<NodeExtras>>.None
       node.text.clearAndFree()
       node.label.clearAndFree()
+      node.moving = Option<Box<Computed>>.None
       node.editing = Option<Box<EditState>>.None
       node.effects = Option<Box<Effects>>.None
       node.semantics = Option<Box<Semantics>>.None
@@ -5193,10 +5195,29 @@ impl<'a> UiTree<'a> {
   /// Gives the node at `slot` the style `value`: the handle it has when that already holds
   /// these values, else the pool's handle to them.
   pub effect fn setComputed(self: &mut Self, slot: u32, value: &Computed) -> () ! OutOfMemoryError ? &mut Allocator {
-    if style_pool.same(self.node(slot).computed(), value) { return () }
+    let node = self.node(slot)
+    if node.moving.isNone() && style_pool.same(node.styled.get(), value) { return () }
     let shared = run self.stylePool.share(value)
     let target = self.nodeMut(slot)
     target.styled = move shared
+    target.moving = Option<Box<Computed>>.None
+  }
+
+  /// Gives the node at `slot` the style `value` of a frame of the clock. An animation or a
+  /// transition gives a node a style no other has and replaces it next frame: through the
+  /// pool each frame would key it, hash it and allocate it. The node holds it alone instead
+  /// and the next frame writes over it; its next full restyle shares again (`setComputed`).
+  effect fn setMovingComputed(self: &mut Self, slot: u32, value: &Computed) -> () ! OutOfMemoryError ? &mut Allocator {
+    let target = self.nodeMut(slot)
+    match &mut target.moving {
+      Option<Box<Computed>>.Some { value: held } => {
+        let place = held.getMut()
+        place[0] = value.*
+      }
+      Option<Box<Computed>>.None => {
+        target.moving = Option<Box<Computed>>.Some { value: run Box<Computed>.make(value.*) }
+      }
+    }
   }
 
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
@@ -6136,7 +6157,7 @@ impl<'a> UiTree<'a> {
     let paintHash = computed.paintHash(&self.seed)
     let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
     if lender == NONE { self.computedStamps = stamp }
-    run self.setComputed(slot, &computed)
+    if tick { run self.setMovingComputed(slot, &computed) } else { run self.setComputed(slot, &computed) }
     let target = self.nodeMut(slot)
     target.computedStamp = stamp
     target.rendered = rendered
