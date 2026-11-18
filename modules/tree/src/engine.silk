@@ -381,6 +381,14 @@ fn nodeOf(mutation: &Mutation) -> u32 {
 
 /// Whether a mutation that names no node changes every root: a resource, a font family. A new
 /// node is nobody's yet, and a root mutation changes its own root.
+/// Whether `mutation` only moves a scroll container's content.
+fn scrollsOnly(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.ScrollTo { .. } => true
+    _ => false
+  }
+}
+
 fn reachesEveryRoot(mutation: &Mutation) -> bool {
   return match &mutation.* {
     Mutation.Create { .. } => false
@@ -906,6 +914,12 @@ pub struct UiTree<'a> {
   /// cleared by `settleScrolls` when it finds none, so a tree that never scrolled skips its
   /// walk over the nodes.
   pub offsets: bool,
+  /// The most nodes the tree has held since it last gave back what a larger tree left
+  /// (see `releaseSlack`).
+  heldNodes: usize,
+  /// The nodes that may hold a scroll offset (see `interact.settleScrolls`): each node whose
+  /// offset left zero since it was last settled.
+  pub scrolledSlots: List<u32>,
   /// Whether no scroll offset changed between the previous frame and this one.
   scrollsStill: bool,
   pub textInk: List<TextInk>,
@@ -1132,6 +1146,8 @@ impl<'a> UiTree<'a> {
       paintCachesStale: true,
       scrolled: false,
       offsets: false,
+      scrolledSlots: List<u32>.make(),
+      heldNodes: 0,
       scrollsStill: false,
       textInk: List<TextInk>.make(),
       facesDirty: true,
@@ -1860,7 +1876,11 @@ impl<'a> UiTree<'a> {
     } else if reachesEveryRoot(&mutation) {
       self.changedEveryRoot()
     }
-    self.applied = true
+    // A scroll moves what is painted and changes none of it: the fragments' hashes and ink
+    // stand, and `setOffset` says the frame scrolled.
+    if !scrollsOnly(&mutation) {
+      self.applied = true
+    }
     match move mutation {
       Mutation.SetAnchor { id, target, options } => {
         run anchoring.configure(&mut self, index, id, target, options)
@@ -2949,6 +2969,39 @@ impl<'a> UiTree<'a> {
       siftUp(&mut self.free, added)
       i = i + 1
     }
+  }
+
+  /// Gives back what laying out and painting a much larger tree left, once the tree holds
+  /// under a quarter of the nodes it held: the layout's output and caches, the shaped text
+  /// and what each frame fills for its fragments. The frame then lays the smaller tree out
+  /// afresh, as its first frame did. With other roots open, whose layouts hold shaped text
+  /// too, the shaped text stays.
+  fn releaseSlack(self: &mut Self) -> () {
+    let live = self.liveNodes()
+    if live >= self.heldNodes {
+      self.heldNodes = live
+      return
+    }
+    if self.heldNodes < RELEASE_NODES || live * 4 >= self.heldNodes {
+      return
+    }
+    self.heldNodes = live
+    self.output = LayoutTree.make()
+    self.laidOutRevision = usize.MAX
+    if self.parked.length() == 0 {
+      self.provider.text.release()
+    }
+    self.paintOrder.clearAndFree()
+    self.fragmentHashes.clearAndFree()
+    self.fragmentInk.clearAndFree()
+    self.fragmentScrollers.clearAndFree()
+    self.textInk.clearAndFree()
+    self.fragmentOf.clearAndFree()
+    self.nextSourceFragment.clearAndFree()
+    self.paintIndexOf.clearAndFree()
+    self.fragmentStacking = Stacking.make()
+    self.paintCachesStale = true
+    self.facesDirty = true
   }
 
   /// How many nodes the tree holds.
@@ -6432,6 +6485,7 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
     run self.trimNodes()
+    self.releaseSlack()
     if self.applied || self.paintDirty {
       self.paintCachesStale = true
     }
@@ -7215,6 +7269,10 @@ fn takeLowest(free: &mut List<u32>) -> u32 {
   }
   return lowest
 }
+
+/// A tree gives back what a larger one left only after it has held this many nodes
+/// (see `UiTree.releaseSlack`).
+const RELEASE_NODES: usize = 4096
 
 /// The node table is not trimmed below this many slots (see `UiTree.trimNodes`).
 const TRIM_NODES: usize = 1024

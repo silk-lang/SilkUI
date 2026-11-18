@@ -1401,7 +1401,7 @@ effect fn ignoreInvalid(error: InvalidNode) -> () {
 effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !writeOffset(&mut tree, slot, x, y) {
+  if !run writeOffset(&mut tree, slot, x, y) {
     return false
   }
   run scroll_anchor.scrolled(&mut tree, slot)
@@ -1412,19 +1412,27 @@ effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
 pub effect fn anchorScroll(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if writeOffset(&mut tree, slot, x, y) {
+  if run writeOffset(&mut tree, slot, x, y) {
     run scrollRecord(&mut tree, slot)
   }
 }
 
-fn writeOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool {
+effect fn writeOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   if node.scrollX == x && node.scrollY == y {
     return false
   }
+  let listed = node.scrollX != 0.0 || node.scrollY != 0.0
   node.scrollX = x
   node.scrollY = y
   if node.isGenerated() { tree.paintDirty = true }
+  drop node
+  if !listed {
+    // `settleScrolls` clamps the nodes listed here.
+    run tree.scrolledSlots.append(slot)
+  }
 
   // Layout never sees scroll offsets: paint and the geometry queries apply them (see `layers`).
   tree.scrolled = true
@@ -1619,27 +1627,48 @@ pub effect fn settleScrolls(tree: &mut UiTree<'_>) -> bool
   if !tree.offsets {
     return changed
   }
-  let mut held = false
-  let mut slot: u32 = 0
-  while u32.toUsize(slot) < tree.nodes.length() {
-    let node = tree.node(slot)
-    if node.live && (node.scrollX != 0.0 || node.scrollY != 0.0) {
-      held = true
+  // Only the nodes `setOffset` listed can hold one: a long page is not walked for them.
+  let mut kept: usize = 0
+  let mut at: usize = 0
+  while at < tree.scrolledSlots.length() {
+    let slot = tree.scrolledSlots.get(at)
+    at = at + 1
+    if u32.toUsize(slot) >= tree.nodes.length() {
+      continue
+    }
+    let live = tree.node(slot).live
+    let scrollX = tree.node(slot).scrollX
+    let scrollY = tree.node(slot).scrollY
+    if !live || (scrollX == 0.0 && scrollY == 0.0) {
+      continue
+    }
+    let mut listed = false
+    let mut before: usize = 0
+    while before < kept {
+      if tree.scrolledSlots.get(before) == slot {
+        listed = true
+      }
+      before = before + 1
+    }
+    if listed {
+      continue
+    }
+    tree.scrolledSlots.set(kept, slot)
+    kept = kept + 1
 
-      // Another root's layout is not this one: its offsets wait for its own frame.
-      if !tree.inParkedRoot(slot) {
-        let range = rangeAt(&tree.*, slot)
-        let x = range.clampX(node.scrollX)
-        let y = range.clampY(node.scrollY)
-        if run setOffset(&mut tree, slot, x, y) {
-          run scrollRecord(&mut tree, slot)
-          changed = true
-        }
+    // Another root's layout is not this one: its offsets wait for its own frame.
+    if !tree.inParkedRoot(slot) {
+      let range = rangeAt(&tree.*, slot)
+      let x = range.clampX(scrollX)
+      let y = range.clampY(scrollY)
+      if run setOffset(&mut tree, slot, x, y) {
+        run scrollRecord(&mut tree, slot)
+        changed = true
       }
     }
-    slot = slot + 1
   }
-  tree.offsets = held
+  tree.scrolledSlots.truncate(kept)
+  tree.offsets = kept != 0
   return changed
 }
 
