@@ -235,7 +235,16 @@ check("customevent", true, () => {
   return detail === 3 && heard;
 });
 check("deviceorientation", false, () => global("DeviceOrientationEvent"));
-check("dom-range", false, () => global("Range") || typeof globalThis.document?.createRange === "function");
+check("dom-range", true, () => {
+  const box = ui.createBox(null, ui.createText("Hello world"));
+  const range = new Range();
+  range.setStart(box.firstChild, 2);
+  range.setEnd(box.firstChild, 7);
+  box.firstChild.insertData(0, ">");
+  const moved = range.startOffset === 3 && range.toString() === "llo w";
+  const fragment = range.extractContents();
+  return moved && fragment.firstChild.data === "llo w" && box.firstChild.data === ">Heorld" && range.collapsed;
+});
 check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
 check("element-scroll-methods", true, () => typeof ui.createBox().scroll === "function");
 check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function");
@@ -272,9 +281,13 @@ check("indexeddb2", false, () => global("indexedDB"));
 check("input-file-directory", false, () => typeof globalThis.showDirectoryPicker === "function");
 check("input-selection", true, () => {
   const field = ui.createInput();
-  field.value = "Hello";
-  field.setSelectionRange(1, 3);
-  return typeof field.selectionStart === "number" && typeof field.selectionEnd === "number";
+  field.value = "a\u{1F600}\u00e9b";
+  field.setSelectionRange(1, 4, "backward");
+  if (field.selectionStart !== 1 || field.selectionEnd !== 4 || field.selectionDirection !== "backward") return false;
+  field.setRangeText("XY", 1, 3, "select");
+  if (field.value !== "aXY\u00e9b" || field.selectionEnd !== 3) return false;
+  field.select();
+  return field.selectionStart === 0 && field.selectionEnd === 5;
 });
 check("intersectionobserver", false, () => global("IntersectionObserver"));
 check("intersectionobserver-v2", false, () => global("IntersectionObserver"));
