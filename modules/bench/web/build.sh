@@ -10,7 +10,7 @@ optimization="${OPTIMIZATION:-speed}"
 # not. The entry runs in 64 KiB (10,000 rows), so 256 KiB leaves room.
 cd "$root"
 silk build --manifest-path "$here/silk.toml" \
-  --profile-input "{\"target\":\"wasm32-unknown-unknown\",\"optimization\":\"$optimization\",\"debug\":false,\"stack-size\":\"256KiB\"}"
+  --target wasm32-unknown-unknown --optimization "$optimization" --debug false
 
 # With PRERENDER=1 the same program, built for this machine, draws the first view, which goes
 # into index.html. It is off by default: the entries the benchmark compares this one with
@@ -18,11 +18,12 @@ silk build --manifest-path "$here/silk.toml" \
 prerender="${PRERENDER:-0}"
 if [ "$prerender" = 1 ]; then
   silk build --manifest-path "$here/silk.toml"
-  native="$(ls -d "$root"/build/llvm/*/debug | grep -v wasm32 | head -1)/ui-bench-web"
+  silk plan --manifest-path "$here/silk.toml"
+  native="$(python3 "$root/tools/request-output.py" "$root/build/requests" ui-bench-web)"
 fi
 
 profile=release
-[ "$optimization" = "size" ] && profile=release-size
+[ "$optimization" = "size" ] && profile=size
 mkdir -p "$target/dist"
 cp "$here/page/package.json" "$here/page/package-lock.json" "$target/"
 # index.html up to the marker, then the first view with nothing around it (white space would
@@ -34,8 +35,7 @@ after="$(sed '1,/<!--shell-->/d' "$here/page/index.html")"
   if [ "$prerender" = 1 ]; then "$native" shell; fi
   printf '%s\n' "$after"
 } > "$target/index.html"
-cp "$root/build/llvm/wasm32-unknown-unknown/$profile/ui-bench-web" "$target/dist/bench.wasm"
-# loom-dom's page script, from Silk's checkout of the Loom commit this package pins.
-loom="${SILK_HOME:-$HOME/.silk}/git/$(sed -n 's/.*silk-lang\/loom.git", rev = "\([0-9a-f]*\)".*/\1/p' "$here/silk.toml" | head -1)"
-cp "$loom/modules/loom/dom/js/silk-ui-dom.js" "$target/dist/silk-ui-dom.js"
+cp "$root/build/wasm32-unknown-unknown/$profile/ui-bench-web.wasm" "$target/dist/bench.wasm"
+dom="$(silk package-path --manifest "$here/silk.toml" --dependency loom_dom --path js/silk-ui-dom.js | python3 -c 'import json,sys; print(json.load(sys.stdin))')"
+cp "$dom" "$target/dist/silk-ui-dom.js"
 echo "Built $target"
