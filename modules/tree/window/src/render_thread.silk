@@ -244,6 +244,9 @@ struct State {
   dropped: u64,
   /// The Metal HUD to show (1) or hide (0) on the first window's layer, -1 when nothing changes.
   hud: i32,
+  /// Present each frame at once instead of at the display's next refresh (see
+  /// [`RenderThread.setUncapped`]).
+  uncapped: bool,
 }
 
 impl Transferable for State {}
@@ -487,6 +490,23 @@ impl RenderThread {
     self.wake.unpark()
   }
 
+  /// Presents each frame of the first window at once (`on`) instead of at the display's next
+  /// refresh, where the surface can: for measuring how many frames a second the app could
+  /// draw. Frames may tear.
+  pub fn setUncapped(self: &mut Self, on: bool) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.uncapped = on
+  }
+
+  /// Waits until the render thread has taken the last frame handed over (see
+  /// [`RenderThread.pending`]), or has stopped.
+  pub fn waitTaken(self: &mut Self) -> () {
+    while self.pending() && !stopped(&self.shared) {
+      self.parker.park()
+    }
+  }
+
   /// Whether the last frame handed over still waits for the render thread, which is busy with
   /// the one before. A new frame now would replace it undrawn: the host waits for the next
   /// display refresh instead, as a browser holds back a frame while the GPU is behind.
@@ -724,6 +744,7 @@ effect fn makeShared() -> Arc<Mutex<State>>
     presented: List<f64>.make(),
     dropped: 0,
     hud: -1,
+    uncapped: false,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -1036,6 +1057,10 @@ fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
   values.ready = true
 }
 
+fn uncappedOf(shared: &Arc<Mutex<State>>) -> bool {
+  return shared.get().lock().get().uncapped
+}
+
 fn takeHud(shared: &Arc<Mutex<State>>) -> i32 {
   let mut guard = shared.get().lock()
   return Intrinsic.replace(guard.getMut().hud, -1)
@@ -1200,6 +1225,16 @@ effect fn renderLoop(
   wakeUi.unpark()
   let mut others = List<ExtraSurface>.make()
 
+  let mut canImmediate = false
+  let modes = capabilities.presentModes()
+  let mut m: usize = 0
+  while m < modes.length {
+    if modes[m] == flags.WGPUPresentMode_Immediate {
+      canImmediate = true
+    }
+    m = m + 1
+  }
+  let mut immediate = false
   let mut configuredWidth: u32 = 0
   let mut configuredHeight: u32 = 0
   let mut previousPresented = 0.0
@@ -1234,6 +1269,8 @@ effect fn renderLoop(
     }
     let fresh = match move work {
       Work.Job { job } => {
+        // The mailbox is free again: the UI thread may be waiting to fill it.
+        wakeUi.unpark()
         let mut next = move job
         run adopt(shared, &mut next)
         match move Intrinsic.replace(current, Option<FrameJob>.some(move next)) {
@@ -1262,6 +1299,12 @@ effect fn renderLoop(
       recordFrame(shared, RenderReport.none())
       wakeUi.unpark()
       continue
+    }
+    let wantsImmediate = uncappedOf(shared) && canImmediate
+    if wantsImmediate != immediate {
+      immediate = wantsImmediate
+      configuration.setPresentMode(if immediate { flags.WGPUPresentMode_Immediate } else { flags.WGPUPresentMode_Fifo })
+      configuredWidth = 0
     }
     if job.width != configuredWidth || job.height != configuredHeight {
       gpuSurface.resize(&mut configuration, job.width, job.height)

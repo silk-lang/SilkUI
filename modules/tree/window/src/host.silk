@@ -489,6 +489,36 @@ fn deviceSize(logical: f64, scale: f64) -> u32 {
 }
 
 /// Seconds on the monotonic clock.
+/// What `SILK_UI_FRAME_STATS` adds up between its lines: seconds on the UI thread, milliseconds
+/// on the render thread.
+struct FrameTimes {
+  frames: u64,
+  since: f64,
+  tick: f64,
+  layout: f64,
+  paint: f64,
+  submit: f64,
+  acquire: f64,
+  draw: f64,
+  present: f64,
+}
+
+impl FrameTimes {
+  fn none() -> FrameTimes {
+    return FrameTimes {
+      frames: 0,
+      since: 0.0,
+      tick: 0.0,
+      layout: 0.0,
+      paint: 0.0,
+      submit: 0.0,
+      acquire: 0.0,
+      draw: 0.0,
+      present: 0.0,
+    }
+  }
+}
+
 /// The interaction a debug build is timing: the first input since the last frame that ran
 /// handlers, and how long the handlers of every such input took.
 struct Waiting {
@@ -1089,6 +1119,14 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // SILK_UI_TRACE_FRAMES prints a line on standard error as each frame is presented, for
   // benchmarks that time startup and input to pixels from outside the process.
   let tracing = !check && (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
+  // SILK_UI_FRAME_STATS prints a line on standard error each second: the frames painted and the
+  // average milliseconds of each step of one, on this thread and on the render thread.
+  let timing = !check && (run environmentVariable("SILK_UI_FRAME_STATS")).isSome()
+  // SILK_UI_UNCAPPED draws frames one after another instead of one per display refresh, and
+  // presents them without waiting for the display: how many frames a second the app could
+  // draw, for benchmarks. Frames may tear, and the app takes a whole processor core.
+  let uncapped = !check && (run environmentVariable("SILK_UI_UNCAPPED")).isSome()
+  let mut timed = FrameTimes.none()
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
@@ -1188,6 +1226,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if !check && (hudAsked || metal_hud.defaultOn()) {
     renderer.setMetalHud(true)
   }
+  if uncapped {
+    renderer.setUncapped(true)
+  }
 
   // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
   // the tree takes the offsets on its next pass.
@@ -1244,7 +1285,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
     let wait = if check {
       Wait.Seconds { seconds: 0.016 }
-    } else if reveal {
+    } else if reveal || uncapped {
       Wait.Poll
     } else {
       let mut deadline = match content.nextDeadline(&state.*) {
@@ -1350,7 +1391,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
     }
     let time = (run seconds(&mut clock)) - started
-    if (check || reveal) && next.isNone() {
+    if (check || reveal || uncapped) && next.isNone() {
+      if uncapped {
+        // No frame is replaced undrawn: this one starts as soon as the last is taken.
+        renderer.waitTaken()
+      }
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
     }
     let mut redraw = backgroundChanged
@@ -1453,6 +1498,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if check && drawn == 1 {
                 run content.checkInput(&mut state, &mut tree, viewport, options.checkClick)
               }
+              let tickStart = run seconds(&mut clock)
               if !check && content.wantsFrames(&state.*) {
                 run content.tick(&mut state, &mut tree, time, true)
               }
@@ -1617,6 +1663,35 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 platform.focus(owner)
                 if tracing {
                   StderrWriter.print("silk-ui: window shown\n", &())
+                }
+              }
+              if timing {
+                let report = renderer.report()
+                timed.frames = timed.frames + 1
+                timed.tick = timed.tick + (frameStart - tickStart)
+                timed.layout = timed.layout + (layoutEnd - frameStart)
+                timed.paint = timed.paint + (canvasEnd - layoutEnd)
+                timed.submit = timed.submit + (submitted - canvasEnd)
+                timed.acquire = timed.acquire + report.acquire
+                timed.draw = timed.draw + report.draw
+                timed.present = timed.present + report.present
+                if submitted - timed.since >= 1.0 {
+                  let n = u64.toF64(timed.frames)
+                  StderrWriter.print(
+                    "frame-stats: frames={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={}\n",
+                    &(
+                      timed.frames,
+                      timed.tick * 1000.0 / n,
+                      timed.layout * 1000.0 / n,
+                      timed.paint * 1000.0 / n,
+                      timed.submit * 1000.0 / n,
+                      timed.acquire / n,
+                      timed.draw / n,
+                      timed.present / n
+                    ),
+                  )
+                  timed = FrameTimes.none()
+                  timed.since = submitted
                 }
               }
               if content.profile(&state.*) {
