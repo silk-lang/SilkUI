@@ -1,32 +1,34 @@
-//! A JavaScript app in a window on the full SilkJS runtime (`Runtime.node()`): Node's APIs and
-//! the web APIs Node has, with `@silkui/core` beside them. What the hosts silkui generates for
-//! such an app run. There is no hot reload on the runtime yet: the development host runs the
-//! bundle at the path its command line gives, once.
+//! A JavaScript app in a window on the composable SilkJS runtime (`Runtime.node()`), with
+//! `@silkui/core` beside the capabilities the host composes. What the hosts silkui generates
+//! for such an app run: each builds its `Capabilities` from the types this module exports and
+//! passes them, with the `UiApi` among them, to `release` or `develop`. There is no hot reload
+//! on the runtime yet: the development host runs the bundle at the path its command line
+//! gives, once.
 import ui_js.lib { uiPackage, StylesheetCompiler, runtimeStylesheets }
-import ui_js_node.lib { NodeWindow, NodeClient }
-import ui_js_node.lib { UiApi }
-import node_runtime.libs.core.capabilities { Capabilities, OsProcesses, OsNetwork, OsSystemInfo, ThreadWorkers }
-import node_runtime.libs.core.module_sources { NodeResolution }
-import node_runtime.libs.core.platforms { OsPlatform }
-import node_runtime.libs.core.files { OsFiles }
-import wasm.wamr { WamrWasm }
-import compress.compress { NativeCompression }
-import http2.nghttp2 { Nghttp2 }
-import http.llhttp { Llhttp }
-import database.sqlite_database { SqliteDatabase }
-import openssl.openssl_capabilities { OpenSslCrypto, OpenSslTls }
-import inspector.node_inspector { NodeInspector }
-import amaro.amaro_stripping { Amaro }
-import addons.dlopen_addons { DlopenAddons }
+import ui_js_node.lib { NodeWindow, NodeClient, writeHeapImage }
+pub import ui_js_node.lib { UiApi }
+// What a generated host composes its runtime from: the light set every app gets, and what an
+// app allows beyond it.
+pub import node_runtime.libs.core.capabilities { Capabilities, Composition, OsProcesses, OsNetwork, OsSystemInfo, EmptyCompression, EmptyHttp2, EmptyDatabase, EmptyAddons, EmptyProcesses, EmptyTypeStripping, EmptyWorkers, EmptyInspector, EmptyWasm }
+pub import node_runtime.libs.core.module_sources { MemoryModules, MemoryModule }
+pub import node_runtime.libs.core.platforms { OsPlatform }
+pub import node_runtime.libs.core.files { OsFiles, GrantedFiles }
+pub import silkhttp.silk_http { SilkHttp }
+pub import silkcrypto.silk_crypto { SilkCrypto }
+pub import silktls.silk_tls { SilkTls }
+pub import silkcompress.silk_compression { SilkCompression }
+pub import wasm.wamr { WamrWasm }
+pub import database.sqlite_database { SqliteDatabase }
+pub import addons.dlopen_addons { DlopenAddons }
 import ui_tree.legacy { TreeError }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import silk.system.filesystem { FileError }
-import ui_tree_window.host { RunOptions, StartedGpu, startGpu }
+import ui_tree_window.host { RunOptions, StartedGpu, startGpu, environmentVariable }
 import ui_tree_window.platform_thread { Launched, launch }
 import ui_tree_window.console { StderrWriter }
-pub import silkui_window.js { Settings, TitleBar, Natives, showMetalHud }
-import silkui_window.js { failed, systemFonts }
+pub import silkui_window.js { Settings, TitleBar, Natives, showMetalHud, failed }
+import silkui_window.js { systemFonts }
 import silkjs.js_atomics_native { SynchronizationError }
 import silkjs.js_libc_platform as platform
 import window.types { WindowError }
@@ -36,14 +38,19 @@ import vector.geometry_error { GeometryError }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.concurrency.thread { Transferable }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.system.host_input { HostInput }
+import silk.system.host_input { HostInput, HostInputError }
 
-effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32
+effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
+  let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
+  if tracing { StderrWriter.print("silkui: program started\n", &()) }
   let gpu = run startGpu(false)
+  if tracing { StderrWriter.print("silkui: gpu started\n", &()) }
   let fonts = run systemFonts()
+  if tracing { StderrWriter.print("silkui: fonts loaded\n", &()) }
   let options = RunOptions {
     title: settings.title,
     width: settings.width,
@@ -65,6 +72,8 @@ effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Opt
   client.stylesheets = move sheets
   client.stylesheetUpdates = move updates
   let mut window = NodeWindow.make(&fonts, move options, move client)
+  // A release host starts the runtime from the heap image silkui appends to it.
+  if source.length != 0 { window.ownProcess() }
   run window.define(b"@silkui/core", uiPackage())
   if source.length != 0 {
     run window.entry(b"/app/app.js", source)
@@ -72,14 +81,12 @@ effect fn program(settings: Settings, entry: &[u8], source: &[u8], launched: Opt
     let read = run platform.readFile(entry)
     run window.entry(b"/app/app.js", read.asSlice())
   }
-  // Every capability, as Node has: the app may read files, run processes and load Wasm.
-  let api = run UiApi.make()
-  return run window.start(b"app", api, Capabilities { platform: OsPlatform {}, modules: NodeResolution {}, files: OsFiles {}, compression: NativeCompression.make(), http2: Nghttp2.make(), crypto: OpenSslCrypto.make(), tls: OpenSslTls.make(), database: SqliteDatabase.make(), addons: DlopenAddons.make(), processes: OsProcesses {}, network: OsNetwork {}, http: Llhttp.make(), systemInfo: OsSystemInfo {}, typeStripping: Amaro {}, workers: ThreadWorkers {}, inspector: NodeInspector.make(), wasm: WamrWasm.make(), hostApi: api })
+  return run window.start(b"app", api, move capabilities)
 }
 
-fn ran(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32 {
+fn ran<C: Composition>(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(program(settings, Bytes.asSlice(&entry), source, move launched, move sheets, move updates, compiler), failed)
+  return run Effect.catchAll(program(settings, Bytes.asSlice(&entry), source, move launched, move sheets, move updates, compiler, api, move capabilities), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -88,45 +95,74 @@ effect fn noArgument<E>(error: E) -> Option<Bytes> {
   return Option<Bytes>.None
 }
 
-effect fn started(settings: Settings, entry: Bytes, source: &'static [u8], sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32 ? &mut HostInput {
+/// Capabilities on their way to the app's thread. A runtime hands its capabilities to each of
+/// its worker threads too (`forWorker`), so every set can cross threads.
+struct Sent<C> { api: UiApi, capabilities: C }
+impl<C> Transferable for Sent<C> {}
+
+/// The path after `--silk-write-heap-image`, when that is the host's first argument.
+effect fn imageRequest() -> Option<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  match move run HostInput.argument(1) {
+    Option<Bytes>.Some { value } => {
+      if Bytes.asSlice(&value) != b"--silk-write-heap-image" { return Option<Bytes>.None }
+    }
+    Option<Bytes>.None => { return Option<Bytes>.None }
+  }
+  return run HostInput.argument(2)
+}
+
+effect fn started<C: Composition + 'static>(settings: Settings, entry: Bytes, source: &'static [u8], sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let path = move entry
+  // `silk task build` runs a release host this way to append its heap image.
+  if source.length != 0 {
+    let image = run Effect.catchAll(imageRequest(), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move image {
+      Option<Bytes>.Some { value } => {
+        return run Effect.catchAll(writeHeapImage(b"app", Bytes.asSlice(&value), move capabilities), failed)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+      Option<Bytes>.None => ()
+    }
+  }
+  let sent = Sent<C> { api: api, capabilities: move capabilities }
   // The main thread keeps the OS event loop; the app and the runtime run on their own.
   return run Effect.catchAll(
-    launch(|launched: Option<Launched>| -> i32 { return ran(settings, move path, source, move launched, move sheets, move updates, compiler) }),
+    launch(|launched: Option<Launched>| -> i32 { return ran(settings, move path, source, move launched, move sheets, move updates, compiler, sent.api, move sent.capabilities) }),
     failed,
   )
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-effect fn loaded(settings: Settings, entry: Bytes, source: &'static [u8], sources: &[&[u8]], updatePath: string, compiler: StylesheetCompiler) -> i32
+effect fn loaded<C: Composition + 'static>(settings: Settings, entry: Bytes, source: &'static [u8], sources: &[&[u8]], updatePath: string, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32
   ! FileError | OutOfMemoryError ? &mut Allocator | &mut HostInput {
   let sheets = run StyleAssets.from(sources)
   let updates = run SheetWatch.from(updatePath)
-  return run started(settings, move entry, source, move sheets, move updates, compiler)
+  return run started(settings, move entry, source, move sheets, move updates, compiler, api, move capabilities)
 }
 
-/// The release host's `main`: the bundle `source` is part of the binary.
-pub effect fn release(settings: Settings, source: &'static [u8]) -> i32 ? &mut HostInput {
-  return run releaseWithSheets(settings, source, &[])
+/// The release host's `main`: the bundle `source` is part of the binary. `capabilities` hold
+/// `api` as their `hostApi`.
+pub effect fn release<C: Composition + 'static>(settings: Settings, source: &'static [u8], api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
+  return run releaseWithSheets(settings, source, &[], api, move capabilities)
 }
 
-pub effect fn releaseWithSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+pub effect fn releaseWithSheets<C: Composition + 'static>(settings: Settings, source: &'static [u8], sheets: &[&[u8]], api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets, "", StylesheetCompiler.off()), failed)
+  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets, "", StylesheetCompiler.off(), api, move capabilities), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// The development host's `main`: `<host> <bundle>` runs the bundle at that path.
-pub effect fn develop(settings: Settings) -> i32 ? &mut HostInput {
-  return run developWithSheets(settings, &[])
+pub effect fn develop<C: Composition + 'static>(settings: Settings, api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
+  return run developWithSheets(settings, &[], api, move capabilities)
 }
 
-pub effect fn developWithSheets(settings: Settings, sheets: &[&[u8]]) -> i32 ? &mut HostInput {
-  return run developWithSheetUpdates(settings, sheets, "")
+pub effect fn developWithSheets<C: Composition + 'static>(settings: Settings, sheets: &[&[u8]], api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
+  return run developWithSheetUpdates(settings, sheets, "", api, move capabilities)
 }
 
-pub effect fn developWithSheetUpdates(settings: Settings, sheets: &[&[u8]], updatePath: string) -> i32 ? &mut HostInput {
+pub effect fn developWithSheetUpdates<C: Composition + 'static>(settings: Settings, sheets: &[&[u8]], updatePath: string, api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
   let entry = match move run Effect.catchAll(HostInput.argument(1), noArgument) |> Effect.provideMut<Allocator>(&mut allocator) {
     Option<Bytes>.Some { value } => move value
@@ -135,12 +171,12 @@ pub effect fn developWithSheetUpdates(settings: Settings, sheets: &[&[u8]], upda
       return 2
     }
   }
-  return run Effect.catchAll(loaded(settings, move entry, b"", sheets, updatePath, runtimeStylesheets()), failed)
+  return run Effect.catchAll(loaded(settings, move entry, b"", sheets, updatePath, runtimeStylesheets(), api, move capabilities), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-pub effect fn releaseWithRuntimeSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+pub effect fn releaseWithRuntimeSheets<C: Composition + 'static>(settings: Settings, source: &'static [u8], sheets: &[&[u8]], api: UiApi, capabilities: C) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets, "", runtimeStylesheets()), failed)
+  return run Effect.catchAll(loaded(settings, Bytes.make(), source, sheets, "", runtimeStylesheets(), api, move capabilities), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
