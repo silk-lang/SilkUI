@@ -201,6 +201,9 @@ pub struct RawGlyph {
   pub yAdvance: i32,
   pub xOffset: i32,
   pub yOffset: i32,
+  /// Whether the text may be cut where the glyph's cluster starts: both sides, shaped apart,
+  /// give the glyphs they have here (the shaper did not flag the cluster unsafe to break).
+  pub safe: bool,
 }
 
 impl Copy for RawGlyph {}
@@ -234,6 +237,8 @@ pub struct FontState<'a> {
   metrics: List<FontMetrics>,
   instances: List<Instance>,
   data: List<Option<ShaperData<'a>>>,
+  /// Per face in `data`: whether it shapes with AAT tables (morx, mort, kerx).
+  aat: List<bool>,
   plans: List<PlanEntry<'a>>,
   buffer: Buffer,
   /// Shaping results by text, instance, range, direction and script. Shaping is a pure
@@ -243,8 +248,10 @@ pub struct FontState<'a> {
   shaped: List<Shaped>,
   shapedText: List<u8>,
   shapedGlyphs: List<RawGlyph>,
-  /// Shaper calls the cache did not answer, for tests and benchmarks.
+  /// Shaper calls the cache did not answer, and the bytes of text they shaped, for tests and
+  /// benchmarks.
   pub shaperCalls: usize,
+  pub shaperBytes: usize,
   /// Round ascent, descent and line gap to whole pixels, as Blink does on every platform.
   pub roundMetrics: bool,
 }
@@ -386,6 +393,7 @@ impl<'a> FontState<'a> {
       metrics: List<FontMetrics>.make(),
       instances: List<Instance>.make(),
       data: List<Option<ShaperData<'a>>>.make(),
+      aat: List<bool>.make(),
       plans: List<PlanEntry<'a>>.make(),
       buffer: Buffer.new(),
       shapedIndex: HashMap<Word, u32>.make(Hash.seed(0x7368617065)),
@@ -393,6 +401,7 @@ impl<'a> FontState<'a> {
       shapedText: List<u8>.make(),
       shapedGlyphs: List<RawGlyph>.make(),
       shaperCalls: 0,
+      shaperBytes: 0,
       roundMetrics: true,
     }
   }
@@ -488,12 +497,19 @@ impl<'a> FontState<'a> {
     ? &mut Allocator {
     while self.data.length() <= face {
       run self.data.append(Option<ShaperData<'a>>.None)
+      run self.aat.append(false)
     }
     if self.data.asSlice()[face].isSome() {
       return true
     }
     if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
       self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
+      self.aat.set(
+        face,
+        font.tableData(Tag.fromU32(0x6d6f7278)).isSome()
+          || font.tableData(Tag.fromU32(0x6d6f7274)).isSome()
+          || font.tableData(Tag.fromU32(0x6b657278)).isSome(),
+      )
       return true
     }
     return false
@@ -760,6 +776,7 @@ impl<'a> FontState<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.shaperCalls = self.shaperCalls + 1
+    self.shaperBytes = self.shaperBytes + (end - start)
     let wanted = run shaperFeatures(features)
     let face = self.instances.asSlice()[instance].face
     if !run self.loadFace(face) {
@@ -845,6 +862,7 @@ impl<'a> FontState<'a> {
               yAdvance: position.yAdvance,
               xOffset: position.xOffset,
               yOffset: position.yOffset,
+              safe: (info.flags & 1) == 0,
             },
           )
         }
@@ -859,6 +877,18 @@ impl<'a> FontState<'a> {
       return Treatment.normal()
     }
     return self.styles.asSlice()[self.keys.get(key).style].treatment
+  }
+
+  /// Whether glyphs shaped with key `key` may be taken from a longer shaped text at clusters
+  /// that are `RawGlyph.safe`. Not with AAT tables: their state machines do not flag every
+  /// cluster whose glyphs depend on text further on.
+  pub fn sliceable(self: &Self, key: usize) -> bool {
+    let info = self.keys.get(key)
+    if info.instance == usize.MAX {
+      return false
+    }
+    let face = self.instances.asSlice()[info.instance].face
+    return face < self.aat.length() && !self.aat.get(face)
   }
 
   /// CSS pixels per font unit for key `key`.
