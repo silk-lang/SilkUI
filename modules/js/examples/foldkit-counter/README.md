@@ -14,7 +14,7 @@ count rolls. It is the [React starter](../react-counter)'s twin, and draws with 
 From `modules/js`, `npm ci && npm run build`, then from the repository root:
 
 ```sh
-silk run --manifest-path modules/js/demo/silk.toml --profile dev modules/js/examples/foldkit-counter/dist/app.js
+silk run --manifest-path modules/js/demo/silk.toml --optimization none modules/js/examples/foldkit-counter/dist/app.js
 ```
 
 `npm run typecheck` checks the program with TypeScript.

@@ -93,7 +93,7 @@ Script lines are `ui-inspect-cli` commands served through a local inspector sess
 `wait <time>`, `size` and `record`/`stop` (raw RGBA frames handed to ffmpeg). See
 [headless.silk](src/headless.silk) and docs/content/native/testing.md.
 
-    SILK_UI_HEADLESS=script.txt build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-window-demo
+    SILK_UI_HEADLESS=script.txt build/x86_64-unknown-linux-gnu/dev/ui-tree-window-demo
 
 The check dispatches a click and Tab through the real input path, verifies the
 updated text, and compares GPU output with the CPU reference. `--debug` builds a
