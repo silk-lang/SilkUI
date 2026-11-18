@@ -22,6 +22,18 @@ const TYPES = [
   "animationcancel", "selectionchange", "pointerover", "pointerout",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
+
+// The live `Range`s (see Range below), held weakly: a range nobody holds stops being updated.
+const liveRanges = new Set();
+
+function eachLiveRange(update) {
+  for (const ref of liveRanges) {
+    const range = ref.deref();
+    if (range) update(range);
+    else liveRanges.delete(ref);
+  }
+}
+
 const CLICK = KIND_OF.get("click");
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
@@ -150,6 +162,12 @@ class Look {
     let css = "";
     for (const name in this.#values) css += cssName(name) + ":" + this.#values[name] + ";";
     return css;
+  }
+
+  _copyTo(look) {
+    look.#values = Object.assign(Object.create(null), this.#values);
+    const css = this.cssText;
+    if (css) native.style(look.#node.nodeId, css, look.#state);
   }
 }
 
@@ -410,6 +428,61 @@ export class Node {
     return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
   }
 
+  /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
+  get nodeType() {
+    return 1;
+  }
+
+  hasChildNodes() {
+    return this.childNodes.length > 0;
+  }
+
+  /** A copy with the same looks and attributes, and with `deep` copies of the children. */
+  cloneNode(deep = false) {
+    const copy = this._shallowClone();
+    if (this.#base) this.#base._copyTo(copy.look("base"));
+    for (const state in this.#looks ?? {}) this.#looks[state]._copyTo(copy.look(state));
+    for (const [name, value] of this.#attributes ?? []) copy.setAttribute(name, value);
+    if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
+    return copy;
+  }
+
+  _shallowClone() {
+    return new Node(this.kind);
+  }
+
+  /** Joins adjacent text children and drops empty ones, in the whole subtree. */
+  normalize() {
+    for (let node = this.firstChild; node; ) {
+      if (node.nodeType !== 3) {
+        node.normalize();
+        node = node.nextSibling;
+        continue;
+      }
+      let next = node.nextSibling;
+      if (node.length === 0) {
+        node.remove();
+        node = next;
+        continue;
+      }
+      let joined = "";
+      for (let sibling = next; sibling?.nodeType === 3; sibling = sibling.nextSibling) joined += sibling.data;
+      let length = node.length;
+      node.replaceData(length, 0, joined);
+      for (let current = next; current?.nodeType === 3; current = current.nextSibling) {
+        const index = indexIn(current);
+        eachLiveRange((range) => range._joined(current, node, length, index));
+        length += current.length;
+      }
+      while (next?.nodeType === 3) {
+        const after = next.nextSibling;
+        next.remove();
+        next = after;
+      }
+      node = next;
+    }
+  }
+
   /** Whether `other` is this node or inside it. */
   contains(other) {
     for (let node = other; node; node = node.parentNode) if (node === this) return true;
@@ -418,12 +491,25 @@ export class Node {
 
   /** Inserts `child` before `before`, or last without it. A child already in the tree moves. */
   insertBefore(child, before = null) {
-    if (child.contains(this)) throw new Error("a node cannot be inserted into itself or its own subtree");
-    if (before && before.parentNode !== this) throw new Error("the node to insert before is not a child of this node");
-    if (before === child) return child;
+    if (child.contains(this)) throw domError("HierarchyRequestError", "a node cannot be inserted into itself or its own subtree");
+    if (this.nodeType === 3) throw domError("HierarchyRequestError", "text has no children");
+    if (before && before.parentNode !== this) throw domError("NotFoundError", "the node to insert before is not a child of this node");
+    if (child.nodeType === 11) {
+      for (const node of [...child.childNodes]) this.insertBefore(node, before);
+      return child;
+    }
+    if (before === child) before = child.nextSibling;
     const old = child.parentNode;
-    if (old) old.childNodes.splice(old.childNodes.indexOf(child), 1);
+    if (old) {
+      const index = old.childNodes.indexOf(child);
+      if (liveRanges.size) eachLiveRange((range) => range._removing(child, old, index));
+      old.childNodes.splice(index, 1);
+    }
     child.parentNode = this;
+    if (liveRanges.size) {
+      const index = before ? this.childNodes.indexOf(before) : this.childNodes.length;
+      eachLiveRange((range) => range._inserted(this, index));
+    }
     if (before) {
       this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
       native.insertBefore(this.nodeId, child.nodeId, before.nodeId);
@@ -438,6 +524,17 @@ export class Node {
     return this.insertBefore(child, null);
   }
 
+  /** Puts `node` where `child` is and detaches `child`. */
+  replaceChild(node, child) {
+    if (child.parentNode !== this) throw domError("NotFoundError", "the node to replace is not a child of this node");
+    if (node === child) return child;
+    let before = child.nextSibling;
+    if (before === node) before = node.nextSibling;
+    this.removeChild(child);
+    this.insertBefore(node, before);
+    return child;
+  }
+
   /** Appends nodes, and strings as text nodes. */
   append(...children) {
     for (const child of children) this.insertBefore(typeof child === "string" ? createText(child) : child, null);
@@ -445,8 +542,10 @@ export class Node {
 
   /** Detaches `child` and its subtree. It keeps its state and can be inserted again. */
   removeChild(child) {
-    if (child.parentNode !== this) throw new Error("the node to remove is not a child of this node");
-    this.childNodes.splice(this.childNodes.indexOf(child), 1);
+    if (child.parentNode !== this) throw domError("NotFoundError", "the node to remove is not a child of this node");
+    const index = this.childNodes.indexOf(child);
+    if (liveRanges.size) eachLiveRange((range) => range._removing(child, this, index));
+    this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
     return child;
@@ -461,7 +560,9 @@ export class Node {
     if (rootNode && this.contains(rootNode)) { clearAdoptedSheets(); rootNode = null; }
     const parent = this.parentNode;
     if (parent) {
-      parent.childNodes.splice(parent.childNodes.indexOf(this), 1);
+      const index = parent.childNodes.indexOf(this);
+      if (liveRanges.size) eachLiveRange((range) => range._removing(this, parent, index));
+      parent.childNodes.splice(index, 1);
       this.parentNode = null;
     }
     native.destroy(this.nodeId);
@@ -686,11 +787,19 @@ export class Text extends Node {
   }
 
   set data(value) {
-    value = String(value);
-    if (value === this.#data && value !== "") return;
-    this.#data = value;
-    native.setText(this.nodeId, value);
-    if (this._svgText) svgChanged(this);
+    this.replaceData(0, this.#data.length, value == null ? "" : value);
+  }
+
+  get nodeType() {
+    return 3;
+  }
+
+  get nodeValue() {
+    return this.#data;
+  }
+
+  set nodeValue(value) {
+    this.data = value;
   }
 
   get textContent() {
@@ -699,6 +808,63 @@ export class Text extends Node {
 
   set textContent(value) {
     this.data = value;
+  }
+
+  get length() {
+    return this.#data.length;
+  }
+
+  _shallowClone() {
+    return new Text(this.#data);
+  }
+
+  substringData(offset, count) {
+    offset = offset >>> 0;
+    if (offset > this.#data.length) throw domError("IndexSizeError", "the offset is past the end of the text");
+    return this.#data.substring(offset, offset + (count >>> 0));
+  }
+
+  appendData(data) {
+    this.replaceData(this.#data.length, 0, data);
+  }
+
+  insertData(offset, data) {
+    this.replaceData(offset, 0, data);
+  }
+
+  deleteData(offset, count) {
+    this.replaceData(offset, count, "");
+  }
+
+  replaceData(offset, count, data) {
+    offset = offset >>> 0;
+    count = count >>> 0;
+    data = String(data);
+    const old = this.#data;
+    if (offset > old.length) throw domError("IndexSizeError", "the offset is past the end of the text");
+    if (offset + count > old.length) count = old.length - offset;
+    if (liveRanges.size) eachLiveRange((range) => range._replaced(this, offset, count, data.length));
+    const value = old.slice(0, offset) + data + old.slice(offset + count);
+    if (value === old && value !== "") return;
+    this.#data = value;
+    native.setText(this.nodeId, value);
+    if (this._svgText) svgChanged(this);
+  }
+
+  /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
+  splitText(offset) {
+    offset = offset >>> 0;
+    const length = this.#data.length;
+    if (offset > length) throw domError("IndexSizeError", "the offset is past the end of the text");
+    const rest = new Text(this.#data.slice(offset));
+    const parent = this.parentNode;
+    if (parent) {
+      parent.insertBefore(rest, this.nextSibling);
+      const index = indexIn(this);
+      if (liveRanges.size) eachLiveRange((range) => range._split(this, rest, offset, parent, index));
+    }
+    this.replaceData(offset, length - offset, "");
+    return rest;
   }
 }
 
@@ -720,6 +886,12 @@ export class Input extends Node {
   /** The text the selection offsets index into. */
   _text() {
     return this.#value;
+  }
+
+  _shallowClone() {
+    const copy = new this.constructor();
+    copy.value = this.#value;
+    return copy;
   }
 
   get value() {
@@ -932,6 +1104,10 @@ export class Image extends Node {
   _forget() {
     if (this.#src) dropAddress(this.#src);
     this.#src = "";
+  }
+
+  _shallowClone() {
+    return new Image(this.#src);
   }
 }
 
@@ -1430,6 +1606,10 @@ export class Svg extends Node {
     svgChanged(this);
   }
 
+  _shallowClone() {
+    return new Svg();
+  }
+
   getAttribute(name) {
     return treeAttribute(String(name)) ? super.getAttribute(name) : this.#attributes.get(svgName(name)) ?? null;
   }
@@ -1802,6 +1982,12 @@ export class RichInput extends Input {
     return this.#document;
   }
 
+  _shallowClone() {
+    const copy = new RichInput();
+    copy.document = this.#document;
+    return copy;
+  }
+
   /** Replaces the document. The caret goes to the end and the undo history is forgotten. */
   set document(document) {
     const text = String(document?.text ?? "");
@@ -1940,6 +2126,545 @@ export function createInput(style) {
   const input = new Input();
   if (style) input.style.set(style);
   return input;
+}
+
+/**
+ * Nodes held together outside the tree, as the DOM's `DocumentFragment`. Inserting it
+ * inserts its children, in order, and leaves it empty.
+ */
+export class DocumentFragment extends Node {
+  constructor() {
+    super("box");
+  }
+
+  get nodeType() {
+    return 11;
+  }
+
+  _shallowClone() {
+    return new DocumentFragment();
+  }
+}
+
+export function createDocumentFragment() {
+  return new DocumentFragment();
+}
+
+// Ranges, as the DOM Standard defines them, over the nodes of this module. Every change to
+// the tree passes through these nodes, so live ranges follow it here, with no native calls.
+
+function nodeLength(node) {
+  return node.nodeType === 3 ? node.length : node.childNodes.length;
+}
+
+function indexIn(node) {
+  return node.parentNode ? node.parentNode.childNodes.indexOf(node) : 0;
+}
+
+function rootOf(node) {
+  while (node.parentNode) node = node.parentNode;
+  return node;
+}
+
+function isInclusiveAncestor(ancestor, node) {
+  for (; node; node = node.parentNode) if (node === ancestor) return true;
+  return false;
+}
+
+// -1 when `a` comes before `b` in tree order, 1 after, 0 the same node. One root.
+function treeOrder(a, b) {
+  if (a === b) return 0;
+  const up = [];
+  for (let node = a; node; node = node.parentNode) up.push(node);
+  const other = [];
+  for (let node = b; node; node = node.parentNode) other.push(node);
+  let i = up.length - 1;
+  let j = other.length - 1;
+  while (i >= 0 && j >= 0 && up[i] === other[j]) {
+    i--;
+    j--;
+  }
+  if (i < 0) return -1;
+  if (j < 0) return 1;
+  const siblings = up[i + 1].childNodes;
+  return siblings.indexOf(up[i]) < siblings.indexOf(other[j]) ? -1 : 1;
+}
+
+// The position of boundary point (a, aOffset) relative to (b, bOffset): -1 before, 0 equal,
+// 1 after. Both are in one tree.
+function comparePoints(a, aOffset, b, bOffset) {
+  if (a === b) return aOffset === bOffset ? 0 : aOffset < bOffset ? -1 : 1;
+  if (treeOrder(a, b) > 0) return -comparePoints(b, bOffset, a, aOffset);
+  if (isInclusiveAncestor(a, b)) {
+    let child = b;
+    while (child.parentNode !== a) child = child.parentNode;
+    if (indexIn(child) < aOffset) return 1;
+  }
+  return -1;
+}
+
+// The next node in tree order inside `within`, or null.
+function following(node, within, skipChildren = false) {
+  if (!skipChildren && node.childNodes.length) return node.childNodes[0];
+  for (; node && node !== within; node = node.parentNode) {
+    const next = node.nextSibling;
+    if (next) return next;
+  }
+  return null;
+}
+
+function checkNode(node, what) {
+  if (!(node instanceof Node)) throw new TypeError(what + " is not a node");
+  return node;
+}
+
+/** The fields every range has: two boundary points. */
+export class AbstractRange {
+  constructor() {
+    if (new.target === AbstractRange) throw new TypeError("Illegal constructor");
+  }
+
+  get startContainer() {
+    return this._startNode;
+  }
+
+  get startOffset() {
+    return this._startOffset;
+  }
+
+  get endContainer() {
+    return this._endNode;
+  }
+
+  get endOffset() {
+    return this._endOffset;
+  }
+
+  get collapsed() {
+    return this._startNode === this._endNode && this._startOffset === this._endOffset;
+  }
+}
+
+/** A range that does not follow changes to the tree, and is not checked when made. */
+export class StaticRange extends AbstractRange {
+  constructor(init) {
+    super();
+    if (init == null || typeof init !== "object") throw new TypeError("StaticRange needs its four members");
+    for (const key of ["startContainer", "startOffset", "endContainer", "endOffset"]) {
+      if (init[key] === undefined) throw new TypeError("StaticRange needs " + key);
+    }
+    this._startNode = checkNode(init.startContainer, "startContainer");
+    this._startOffset = init.startOffset >>> 0;
+    this._endNode = checkNode(init.endContainer, "endContainer");
+    this._endOffset = init.endOffset >>> 0;
+  }
+}
+
+// The node a new range starts in: the mounted root, else a detached one of its own.
+let rangeHome = null;
+
+/** A live range: it follows insertions, removals and text changes, as on the web. */
+export class Range extends AbstractRange {
+  static START_TO_START = 0;
+  static START_TO_END = 1;
+  static END_TO_END = 2;
+  static END_TO_START = 3;
+
+  constructor() {
+    super();
+    const home = rootNode ?? (rangeHome ??= new Node("box"));
+    this._startNode = this._endNode = home;
+    this._startOffset = this._endOffset = 0;
+    liveRanges.add(new WeakRef(this));
+  }
+
+  get commonAncestorContainer() {
+    let container = this._startNode;
+    while (!isInclusiveAncestor(container, this._endNode)) container = container.parentNode;
+    return container;
+  }
+
+  // Called after the boundary points change; a selection's range tells the tree.
+  _changed() {}
+
+  #set(node, offset, start) {
+    checkNode(node, "the container");
+    offset = offset >>> 0;
+    if (offset > nodeLength(node)) throw domError("IndexSizeError", "the offset is past the end of the node");
+    if (start) {
+      if (rootOf(node) !== rootOf(this._startNode) || comparePoints(node, offset, this._endNode, this._endOffset) > 0) {
+        this._endNode = node;
+        this._endOffset = offset;
+      }
+      this._startNode = node;
+      this._startOffset = offset;
+    } else {
+      if (rootOf(node) !== rootOf(this._startNode) || comparePoints(node, offset, this._startNode, this._startOffset) < 0) {
+        this._startNode = node;
+        this._startOffset = offset;
+      }
+      this._endNode = node;
+      this._endOffset = offset;
+    }
+    this._changed();
+  }
+
+  setStart(node, offset) {
+    this.#set(node, offset, true);
+  }
+
+  setEnd(node, offset) {
+    this.#set(node, offset, false);
+  }
+
+  setStartBefore(node) {
+    this.#set(parentOf(node), indexIn(node), true);
+  }
+
+  setStartAfter(node) {
+    this.#set(parentOf(node), indexIn(node) + 1, true);
+  }
+
+  setEndBefore(node) {
+    this.#set(parentOf(node), indexIn(node), false);
+  }
+
+  setEndAfter(node) {
+    this.#set(parentOf(node), indexIn(node) + 1, false);
+  }
+
+  collapse(toStart = false) {
+    if (toStart) {
+      this._endNode = this._startNode;
+      this._endOffset = this._startOffset;
+    } else {
+      this._startNode = this._endNode;
+      this._startOffset = this._endOffset;
+    }
+    this._changed();
+  }
+
+  selectNode(node) {
+    const parent = parentOf(node);
+    const index = indexIn(node);
+    this.#select(parent, index, parent, index + 1);
+  }
+
+  selectNodeContents(node) {
+    checkNode(node, "the node");
+    this.#select(node, 0, node, nodeLength(node));
+  }
+
+  #select(startNode, startOffset, endNode, endOffset) {
+    this._startNode = startNode;
+    this._startOffset = startOffset;
+    this._endNode = endNode;
+    this._endOffset = endOffset;
+    this._changed();
+  }
+
+  compareBoundaryPoints(how, sourceRange) {
+    how = Number(how) & 0xffff;
+    if (how > 3) throw domError("NotSupportedError", "compareBoundaryPoints takes 0 to 3");
+    if (!(sourceRange instanceof Range)) throw new TypeError("compareBoundaryPoints takes a Range");
+    if (rootOf(this._startNode) !== rootOf(sourceRange._startNode)) throw domError("WrongDocumentError", "the ranges are in different trees");
+    const thisStart = how === 0 || how === 3;
+    const otherStart = how === 0 || how === 1;
+    return comparePoints(
+      thisStart ? this._startNode : this._endNode,
+      thisStart ? this._startOffset : this._endOffset,
+      otherStart ? sourceRange._startNode : sourceRange._endNode,
+      otherStart ? sourceRange._startOffset : sourceRange._endOffset,
+    );
+  }
+
+  #checkPoint(node, offset) {
+    if (offset > nodeLength(node)) throw domError("IndexSizeError", "the offset is past the end of the node");
+  }
+
+  comparePoint(node, offset) {
+    checkNode(node, "the node");
+    offset = offset >>> 0;
+    if (rootOf(node) !== rootOf(this._startNode)) throw domError("WrongDocumentError", "the node is in a different tree");
+    this.#checkPoint(node, offset);
+    if (comparePoints(node, offset, this._startNode, this._startOffset) < 0) return -1;
+    if (comparePoints(node, offset, this._endNode, this._endOffset) > 0) return 1;
+    return 0;
+  }
+
+  isPointInRange(node, offset) {
+    checkNode(node, "the node");
+    offset = offset >>> 0;
+    if (rootOf(node) !== rootOf(this._startNode)) return false;
+    this.#checkPoint(node, offset);
+    return comparePoints(node, offset, this._startNode, this._startOffset) >= 0
+      && comparePoints(node, offset, this._endNode, this._endOffset) <= 0;
+  }
+
+  intersectsNode(node) {
+    checkNode(node, "the node");
+    if (rootOf(node) !== rootOf(this._startNode)) return false;
+    const parent = node.parentNode;
+    if (!parent) return true;
+    const offset = indexIn(node);
+    return comparePoints(parent, offset, this._endNode, this._endOffset) < 0
+      && comparePoints(parent, offset + 1, this._startNode, this._startOffset) > 0;
+  }
+
+  cloneRange() {
+    const copy = new Range();
+    copy.#select(this._startNode, this._startOffset, this._endNode, this._endOffset);
+    return copy;
+  }
+
+  detach() {}
+
+  #contains(node) {
+    return rootOf(node) === rootOf(this._startNode)
+      && comparePoints(node, 0, this._startNode, this._startOffset) > 0
+      && comparePoints(node, nodeLength(node), this._endNode, this._endOffset) < 0;
+  }
+
+  #partlyContains(node) {
+    return isInclusiveAncestor(node, this._startNode) !== isInclusiveAncestor(node, this._endNode);
+  }
+
+  toString() {
+    const start = this._startNode;
+    const end = this._endNode;
+    if (start === end && start.nodeType === 3) return start.data.slice(this._startOffset, this._endOffset);
+    let text = start.nodeType === 3 ? start.data.slice(this._startOffset) : "";
+    const within = this.commonAncestorContainer;
+    for (let node = following(within, within); node; node = following(node, within)) {
+      if (node.nodeType === 3 && this.#contains(node)) text += node.data;
+    }
+    if (end.nodeType === 3) text += end.data.slice(0, this._endOffset);
+    return text;
+  }
+
+  // The parts of the contents algorithms the three of them share.
+  #split() {
+    const startNode = this._startNode;
+    const endNode = this._endNode;
+    const common = this.commonAncestorContainer;
+    const children = common.childNodes;
+    const first = isInclusiveAncestor(startNode, endNode) ? null : children.find((child) => this.#partlyContains(child)) ?? null;
+    let last = null;
+    if (!isInclusiveAncestor(endNode, startNode)) {
+      for (let i = children.length - 1; i >= 0; i--) {
+        if (this.#partlyContains(children[i])) {
+          last = children[i];
+          break;
+        }
+      }
+    }
+    return { common, first, last, contained: children.filter((child) => this.#contains(child)) };
+  }
+
+  // Where the range collapses after its contents leave.
+  #after() {
+    if (isInclusiveAncestor(this._startNode, this._endNode)) return [this._startNode, this._startOffset];
+    let reference = this._startNode;
+    while (reference.parentNode && !isInclusiveAncestor(reference.parentNode, this._endNode)) reference = reference.parentNode;
+    return [reference.parentNode, indexIn(reference) + 1];
+  }
+
+  deleteContents() {
+    if (this.collapsed) return;
+    const startNode = this._startNode;
+    const startOffset = this._startOffset;
+    const endNode = this._endNode;
+    const endOffset = this._endOffset;
+    if (startNode === endNode && startNode.nodeType === 3) {
+      startNode.replaceData(startOffset, endOffset - startOffset, "");
+      return;
+    }
+    const remove = [];
+    const within = this.commonAncestorContainer;
+    for (let node = following(within, within); node; ) {
+      if (this.#contains(node)) {
+        remove.push(node);
+        node = following(node, within, true);
+      } else {
+        node = following(node, within);
+      }
+    }
+    const [node, offset] = this.#after();
+    if (startNode.nodeType === 3) startNode.replaceData(startOffset, startNode.length - startOffset, "");
+    for (const child of remove) child.remove();
+    if (endNode.nodeType === 3) endNode.replaceData(0, endOffset, "");
+    this.#select(node, offset, node, offset);
+  }
+
+  #contents(extract) {
+    const fragment = new DocumentFragment();
+    if (this.collapsed) return fragment;
+    const startNode = this._startNode;
+    const startOffset = this._startOffset;
+    const endNode = this._endNode;
+    const endOffset = this._endOffset;
+    if (startNode === endNode && startNode.nodeType === 3) {
+      const clone = startNode.cloneNode();
+      clone.data = startNode.substringData(startOffset, endOffset - startOffset);
+      fragment.appendChild(clone);
+      if (extract) startNode.replaceData(startOffset, endOffset - startOffset, "");
+      return fragment;
+    }
+    const { first, last, contained } = this.#split();
+    const after = extract ? this.#after() : null;
+    if (first?.nodeType === 3) {
+      const clone = startNode.cloneNode();
+      clone.data = startNode.substringData(startOffset, startNode.length - startOffset);
+      fragment.appendChild(clone);
+      if (extract) startNode.replaceData(startOffset, startNode.length - startOffset, "");
+    } else if (first) {
+      const clone = first.cloneNode();
+      fragment.appendChild(clone);
+      const inner = new Range();
+      inner.#select(startNode, startOffset, first, nodeLength(first));
+      clone.appendChild(inner.#contents(extract));
+    }
+    for (const child of contained) fragment.appendChild(extract ? child : child.cloneNode(true));
+    if (last?.nodeType === 3) {
+      const clone = endNode.cloneNode();
+      clone.data = endNode.substringData(0, endOffset);
+      fragment.appendChild(clone);
+      if (extract) endNode.replaceData(0, endOffset, "");
+    } else if (last) {
+      const clone = last.cloneNode();
+      fragment.appendChild(clone);
+      const inner = new Range();
+      inner.#select(last, 0, endNode, endOffset);
+      clone.appendChild(inner.#contents(extract));
+    }
+    if (extract) this.#select(after[0], after[1], after[0], after[1]);
+    return fragment;
+  }
+
+  /** Moves the contents into a new fragment and collapses the range where they were. */
+  extractContents() {
+    return this.#contents(true);
+  }
+
+  /** Copies the contents into a new fragment. */
+  cloneContents() {
+    return this.#contents(false);
+  }
+
+  /** Inserts `node` at the start of the range. */
+  insertNode(node) {
+    checkNode(node, "the node");
+    const start = this._startNode;
+    if ((start.nodeType === 3 && !start.parentNode) || start === node) {
+      throw domError("HierarchyRequestError", "cannot insert the node there");
+    }
+    let reference = start.nodeType === 3 ? start : start.childNodes[this._startOffset] ?? null;
+    const parent = reference ? reference.parentNode : start;
+    if (isInclusiveAncestor(node, parent)) throw domError("HierarchyRequestError", "a node cannot be inserted into itself");
+    if (parent.nodeType === 3) throw domError("HierarchyRequestError", "text has no children");
+    if (start.nodeType === 3) reference = start.splitText(this._startOffset);
+    if (node === reference) reference = node.nextSibling;
+    if (node.parentNode) node.remove();
+    let offset = reference ? indexIn(reference) : nodeLength(parent);
+    offset += node.nodeType === 11 ? node.childNodes.length : 1;
+    parent.insertBefore(node, reference);
+    if (this.collapsed) this.#set(parent, offset, false);
+  }
+
+  /** Wraps the contents in `newParent`. */
+  surroundContents(newParent) {
+    checkNode(newParent, "the new parent");
+    const within = this.commonAncestorContainer;
+    for (let node = within; node; node = following(node, within)) {
+      if (node.nodeType !== 3 && this.#partlyContains(node)) {
+        throw domError("InvalidStateError", "the range splits an element");
+      }
+    }
+    if (newParent.nodeType === 11) throw domError("InvalidNodeTypeError", "a fragment cannot surround the range");
+    const fragment = this.extractContents();
+    while (newParent.firstChild) newParent.removeChild(newParent.firstChild);
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
+  }
+
+  // The DOM Standard's live range steps, run by the nodes as they change.
+
+  _inserted(parent, index) {
+    if (this._startNode === parent && this._startOffset > index) this._startOffset++;
+    if (this._endNode === parent && this._endOffset > index) this._endOffset++;
+  }
+
+  _removing(child, parent, index) {
+    if (isInclusiveAncestor(child, this._startNode)) {
+      this._startNode = parent;
+      this._startOffset = index;
+    }
+    if (isInclusiveAncestor(child, this._endNode)) {
+      this._endNode = parent;
+      this._endOffset = index;
+    }
+    if (this._startNode === parent && this._startOffset > index) this._startOffset--;
+    if (this._endNode === parent && this._endOffset > index) this._endOffset--;
+  }
+
+  _replaced(node, offset, count, added) {
+    if (this._startNode === node) {
+      if (this._startOffset > offset + count) this._startOffset += added - count;
+      else if (this._startOffset > offset) this._startOffset = offset;
+    }
+    if (this._endNode === node) {
+      if (this._endOffset > offset + count) this._endOffset += added - count;
+      else if (this._endOffset > offset) this._endOffset = offset;
+    }
+  }
+
+  _split(node, rest, offset, parent, index) {
+    if (this._startNode === node && this._startOffset > offset) {
+      this._startNode = rest;
+      this._startOffset -= offset;
+    }
+    if (this._endNode === node && this._endOffset > offset) {
+      this._endNode = rest;
+      this._endOffset -= offset;
+    }
+    if (this._startNode === parent && this._startOffset === index + 1) this._startOffset++;
+    if (this._endNode === parent && this._endOffset === index + 1) this._endOffset++;
+  }
+
+  _joined(current, node, length, index) {
+    if (this._startNode === current) {
+      this._startNode = node;
+      this._startOffset += length;
+    }
+    if (this._endNode === current) {
+      this._endNode = node;
+      this._endOffset += length;
+    }
+    if (this._startNode === current.parentNode && this._startOffset === index) {
+      this._startNode = node;
+      this._startOffset = length;
+    }
+    if (this._endNode === current.parentNode && this._endOffset === index) {
+      this._endNode = node;
+      this._endOffset = length;
+    }
+  }
+}
+
+for (const [name, value] of [["START_TO_START", 0], ["START_TO_END", 1], ["END_TO_END", 2], ["END_TO_START", 3]]) {
+  Object.defineProperty(Range.prototype, name, { value, enumerable: true });
+}
+
+function parentOf(node) {
+  checkNode(node, "the node");
+  if (!node.parentNode) throw domError("InvalidNodeTypeError", "the node has no parent");
+  return node.parentNode;
+}
+
+/** A new live range, collapsed at the start of the root. */
+export function createRange() {
+  return new Range();
 }
 
 let rootNode = null;
@@ -2472,6 +3197,10 @@ export class Notification {
 }
 
 globalThis.Notification ??= Notification;
+globalThis.AbstractRange ??= AbstractRange;
+globalThis.StaticRange ??= StaticRange;
+globalThis.Range ??= Range;
+globalThis.DocumentFragment ??= DocumentFragment;
 
 function hex(bytes) {
   let text = "";

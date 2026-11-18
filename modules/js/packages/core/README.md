@@ -60,6 +60,8 @@ mount(createBox({ position: "absolute", inset: 0, display: "flex", alignItems: "
 | `createBox(style?, ...children)` | A box with `style` as its base look. Strings among the children become text nodes |
 | `createText(data?)` | A text node. It takes its look from its parent |
 | `createInput(style?)` | An editable text field. `value`, `selectionStart`, `selectionEnd`, `selectionDirection`, `setSelectionRange`, `select` and `setRangeText` work as on an `<input>`, in UTF-16 string indices |
+| `createRange()`, `new Range()`, `new StaticRange(init)` | DOM Standard ranges over the app's nodes. Live ranges follow insertions, removals and text edits (`insertData`, `splitText`, `normalize` and the rest of Text's methods) |
+| `createDocumentFragment()` | Nodes held outside the tree, as `DocumentFragment`; `cloneContents` and `extractContents` return one |
 | `createRichInput(style?)` | A text field with marks and inline atoms (see below) |
 | `createImage(src, style?)` | An image, as an `<img>`: `src` is a `data:` URL, a file or an `http(s):` address. An SVG file draws as an inline `<svg>` |
 | `createSvgElement(tag)` | `document.createElementNS` for SVG: an `Svg` root for `"svg"`, else an `SvgElement` (`path`, `g`, ...) to append inside one |
