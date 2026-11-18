@@ -85,6 +85,7 @@ import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import text_selection
+import text_selection { SelectionOrder }
 import text_selection { TextSelection }
 import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE, usedUserSelect, SELECT_TEXT }
 import lists
@@ -842,6 +843,12 @@ pub struct UiTree<'a> {
   /// The viewport the styles' viewport units last resolved against.
   unitsWidth: f32,
   unitsHeight: f32,
+  /// The page zoom: the root's effective zoom before its own `zoom`. Media queries and viewport
+  /// units see the viewport divided by it, so a zoomed page reflows as a browser's does.
+  pageZoomFactor: f32,
+  /// Whether Ctrl (Cmd on macOS) with `=`, `-` and `0` changes the page zoom. Hosts whose
+  /// platform zooms on its own, a browser, leave it off.
+  pub zoomKeys: bool,
   /// The frame the current root last painted at: its subtrees cached then can be replayed.
   paintedAt: u64,
   pub stats: FrameStats,
@@ -934,6 +941,8 @@ pub struct UiTree<'a> {
   pub requests: List<HostRequest>,
   /// The modifier keys editing shortcuts use; the compilation target's by default.
   pub keymap: Keymap,
+  /// Whether text selections follow what is seen or the tree where layout reorders children.
+  pub selectionOrder: SelectionOrder,
   /// The id of the current root, and whether it is open. Before any root opens, the current
   /// root is the first one, closed.
   pub current: u32,
@@ -1066,6 +1075,8 @@ impl<'a> UiTree<'a> {
       styledViewport: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       unitsWidth: 0.0,
       unitsHeight: 0.0,
+      pageZoomFactor: 1.0,
+      zoomKeys: false,
       paintedAt: 0,
       stats: FrameStats.zero(),
       events: List<Event>.make(),
@@ -1117,6 +1128,7 @@ impl<'a> UiTree<'a> {
       paintDirty: false,
       requests: List<HostRequest>.make(),
       keymap: NATIVE_KEYMAP,
+      selectionOrder: SelectionOrder.Visual,
       current: FIRST_ROOT,
       currentOpen: false,
       currentOptions: RootOptions.default(),
@@ -4057,6 +4069,8 @@ impl<'a> UiTree<'a> {
     let kind = self.node(slot).kind
     let resource = self.node(slot).resource
     let fontSize = self.node(slot).computed.text.size
+    // Natural sizes scale with `zoom`, as replaced elements do in browsers.
+    let zoom = self.node(slot).computed.text.zoom
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
     if kind != NodeKind.Image && kind != NodeKind.Icon {
@@ -4066,7 +4080,7 @@ impl<'a> UiTree<'a> {
     if let Option<Resource>.Some { value } = shown {
       match value {
         Resource.Image { width, height, .. } => {
-          natural.size = OptionalSize.definite(u32.toF32(width), u32.toF32(height))
+          natural.size = OptionalSize.definite(u32.toF32(width) * zoom, u32.toF32(height) * zoom)
           if height != 0 {
             natural.aspectRatio = u32.toF32(width) / u32.toF32(height)
           }
@@ -4077,7 +4091,7 @@ impl<'a> UiTree<'a> {
           let width = self.resources.iconWidth(icon)
           let height = self.resources.iconHeight(icon)
           if width > 0.0 && height > 0.0 {
-            natural.size = OptionalSize.definite(f64.toF32(width), f64.toF32(height))
+            natural.size = OptionalSize.definite(f64.toF32(width) * zoom, f64.toF32(height) * zoom)
             natural.aspectRatio = f64.toF32(width / height)
           } else {
             natural.size = OptionalSize.definite(fontSize, fontSize)
@@ -4355,6 +4369,40 @@ impl<'a> UiTree<'a> {
   }
 
   /// Restyles the nodes whose declarations use viewport units, after the viewport changed.
+  /// The page zoom (see `setPageZoom`).
+  pub fn pageZoom(self: &Self) -> f32 { return self.pageZoomFactor }
+
+  /// Zooms the whole page, as a browser's Ctrl/Cmd + and - do: every length multiplies by
+  /// `zoom` (from 0.25 to 5), text is laid out at the larger size and the page reflows against
+  /// a viewport `zoom` times smaller. Returns whether the zoom changed.
+  pub fn setPageZoom(self: &mut Self, zoom: f32) -> bool {
+    let wanted: f32 = f32.max(MIN_PAGE_ZOOM, f32.min(MAX_PAGE_ZOOM, zoom))
+    if wanted == self.pageZoomFactor { return false }
+    self.pageZoomFactor = wanted
+    self.stylesDirty = true
+    let count = self.nodes.length()
+    let mut slot: usize = 0
+    while slot < count {
+      if self.nodes.asSlice()[slot].live { self.restyle(usize.toU32(slot)) }
+      slot = slot + 1
+    }
+    return true
+  }
+
+  /// The viewport width in CSS pixels, which media queries and viewport units read.
+  pub fn cssWidth(self: &Self) -> f32 { return self.input.width / self.pageZoomFactor }
+  pub fn cssHeight(self: &Self) -> f32 { return self.input.height / self.pageZoomFactor }
+
+  /// The text the root inherits: the initial values at the page zoom.
+  pub fn rootText(self: &Self) -> TextStyle {
+    let mut text = TextStyle.initial()
+    text.rezoom(self.pageZoomFactor)
+    return text
+  }
+
+  /// The style the root inherits from.
+  pub fn rootParent(self: &Self) -> Computed { return Computed.inheriting(self.rootText()) }
+
   fn restyleViewportUnits(self: &mut Self) -> () {
     let count = self.nodes.length()
     let mut slot: usize = 0
@@ -4746,7 +4794,7 @@ impl<'a> UiTree<'a> {
     }
     if !same { return NONE }
     let values = &other.computed
-    if values.viewportWidth != self.input.width || values.viewportHeight != self.input.height || values.usesContainer { return NONE }
+    if values.viewportWidth != self.cssWidth() || values.viewportHeight != self.cssHeight() || values.usesContainer { return NONE }
     let none = usize.MAX
     if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
       || values.transition.easings.start != none || values.transition.discrete.start != none || values.animation.names.start != none { return NONE }
@@ -4802,7 +4850,7 @@ impl<'a> UiTree<'a> {
 
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
     if lender != NONE { return self.node(lender).computed }
-    return Computed.inViewport(inherited, self.input.width, self.input.height)
+    return Computed.inViewport(inherited, self.cssWidth(), self.cssHeight())
   }
 
   effect fn syncGenerated(self: &mut Self, origin: u32) -> ()
@@ -4938,18 +4986,21 @@ impl<'a> UiTree<'a> {
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.input.width != self.unitsWidth || self.input.height != self.unitsHeight {
-      self.unitsWidth = self.input.width
-      self.unitsHeight = self.input.height
+    if self.cssWidth() != self.unitsWidth || self.cssHeight() != self.unitsHeight {
+      self.unitsWidth = self.cssWidth()
+      self.unitsHeight = self.cssHeight()
       self.restyleViewportUnits()
     }
     let conditionIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if conditionIndex != usize.MAX {
+      let cssWidth = self.cssWidth()
+      let cssHeight = self.cssHeight()
+      let pageZoom = self.pageZoomFactor
       let roots = self.styleSheets.asMutSlice()
       let mut environment = roots[conditionIndex].environment
-      environment.initial.viewportWidth = f32.toF64(self.input.width)
-      environment.initial.viewportHeight = f32.toF64(self.input.height)
-      environment.resolutionDppx = f32.toF64(self.input.scale)
+      environment.initial.viewportWidth = f32.toF64(cssWidth)
+      environment.initial.viewportHeight = f32.toF64(cssHeight)
+      environment.resolutionDppx = f32.toF64(self.input.scale * pageZoom)
       let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
       roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
       match move updated {
@@ -5181,10 +5232,7 @@ impl<'a> UiTree<'a> {
       self.tickHeight = self.input.height
     }
     let parent = self.node(slot).parent
-    let mut inherited = TextStyle.initial()
-    if parent != NONE {
-      inherited = self.node(parent).computed.text
-    }
+    let inherited = if parent != NONE { self.node(parent).computed.text } else { self.rootText() }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
@@ -5194,9 +5242,10 @@ impl<'a> UiTree<'a> {
     let lender = if based != usize.MAX || simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
     let mut computed = if based != usize.MAX { self.tickBases.asSlice()[based].computed } else { self.valuesToStartFrom(lender, inherited) }
     if based == usize.MAX {
-    // border-collapse, border-spacing and caption-side inherit.
+    // border-collapse, border-spacing, caption-side and empty-cells inherit.
     if lender == NONE && parent != NONE {
       inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
+      computed.emptyCellsHide = self.node(parent).computed.emptyCellsHide
       computed.list = ListStyle.inherited(self.node(parent).computed.list)
     }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
@@ -5234,13 +5283,13 @@ impl<'a> UiTree<'a> {
     // `outline: none` or another outline in any of them replaces it, as in a browser.
     if self.focused == slot && initialNode.kind != NodeKind.Text && (self.focusVisible || initialNode.kind == NodeKind.Input) {
       computed.outline.auto = true
-      computed.outline.width = FOCUS_RING_WIDTH
+      computed.outline.width = FOCUS_RING_WIDTH * computed.text.zoom
     }
     if simpleStyles {
       self.applyPixelStyles(slot, &mut computed)
     } else {
       let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
-      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+      let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
     }
@@ -5283,7 +5332,7 @@ impl<'a> UiTree<'a> {
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
       if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
         before = computed
-        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
         let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
         run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
         if sheetStarting {
@@ -5309,7 +5358,7 @@ impl<'a> UiTree<'a> {
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
-        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
         let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
         let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
         run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
@@ -5371,6 +5420,7 @@ impl<'a> UiTree<'a> {
     }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
+    let zoomChanged = self.node(slot).computed.text.zoom != computed.text.zoom
     if parent != NONE {
       let above = self.node(parent).computed.effects
       computed.effects.shadowFrom = above.shadowFrom
@@ -5412,7 +5462,7 @@ impl<'a> UiTree<'a> {
         identity.containerNames = move names
       }
     }
-    if kind == NodeKind.Icon && sizeChanged {
+    if (kind == NodeKind.Icon && sizeChanged) || (kind == NodeKind.Image && zoomChanged) {
       run self.updateNatural(slot)
     }
     if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
@@ -5747,6 +5797,7 @@ impl<'a> UiTree<'a> {
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
+      || self.textSelection.scrolling
       || scroll_snap.waiting(self)
       || touch.animating(self)
       || motion.animating(self)
@@ -5787,6 +5838,9 @@ impl<'a> UiTree<'a> {
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    if run text_selection.autoscroll(&mut self) {
+      run self.layoutFrame()
+    }
     run touch.advance(&mut self)
     run scroll_snap.settle(&mut self)
     if run scroll_snap.resnap(&mut self) {
@@ -6580,6 +6634,8 @@ fn writtenFamily(declaration: &Declaration) -> bool {
 
 /// The width of the default focus ring, as Chromium draws `outline: auto`.
 const FOCUS_RING_WIDTH: f32 = 2.0
+const MIN_PAGE_ZOOM: f32 = 0.25
+const MAX_PAGE_ZOOM: f32 = 5.0
 
 /// A focus trap and the node focus returns to when the trap is removed (see `returnSlot`).
 struct FocusReturn {

@@ -1221,6 +1221,31 @@ fn same(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
+// Ctrl (Cmd on macOS) with `=` or `+` zooms in a step, with `-` out, with `0` back to 100%, in
+// the steps browsers take.
+fn zoomKey(tree: &mut UiTree<'_>, key: &[u8], modifiers: u32) -> bool {
+  let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
+  if u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) != primary || key.length != 1 { return false }
+  let steps: [f32; 17] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0]
+  let now = tree.pageZoom()
+  let mut next = now
+  if key[0] == 48 {
+    next = 1.0
+  } else if key[0] == 61 || key[0] == 43 {
+    let mut i: usize = 0
+    while i < steps.length && steps[i] <= now + 0.001 { i = i + 1 }
+    if i < steps.length { next = steps[i] }
+  } else if key[0] == 45 {
+    let mut i: usize = steps.length
+    while i > 0 && steps[i - 1] >= now - 0.001 { i = i - 1 }
+    if i > 0 { next = steps[i - 1] }
+  } else {
+    return false
+  }
+  drop tree.setPageZoom(next)
+  return true
+}
+
 fn enterClicks(kind: Role) -> bool {
   return kind == Role.Button || kind == Role.Link || kind == Role.MenuItem || kind == Role.Tab
     || kind == Role.Option
@@ -1376,7 +1401,7 @@ pub effect fn panChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bo
 /// Scrolls by (`dx`, `dy`) from `slot` outwards: each axis scrolls the nearest container that
 /// can still move that way, and what it cannot take goes to the containers around it. Returns
 /// whether any container moved.
-effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
+pub effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut moved = false
@@ -1820,9 +1845,17 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
 
 /// Ctrl+C, or Cmd+C with the Mac keymap.
 fn copyKey(tree: &UiTree<'_>, key: string, modifiers: u32) -> bool {
+  return commandKey(tree, key, modifiers, "c")
+}
+
+/// Ctrl with letter `lower` (Cmd with the Mac keymap), either case.
+fn commandKey(tree: &UiTree<'_>, key: string, modifiers: u32, lower: string) -> bool {
   let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
   let held = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META)
-  return held == primary && (key == "c" || key == "C")
+  if held != primary { return false }
+  let a = String.utf8Bytes(key)
+  let b = String.utf8Bytes(lower)
+  return a.length == 1 && (a[0] == b[0] || a[0] + 32 == b[0])
 }
 
 /// `finish` for pointer, wheel and key input.
@@ -1950,6 +1983,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       drop run scrollChain(&mut tree, if layoutHit != NONE { layoutHit } else { hit }, deltaX, deltaY)
     }
     Input.KeyDown { key, modifiers, repeat, .. } => {
+      if tree.zoomKeys && !prevented && zoomKey(&mut tree, String.utf8Bytes(String.view(&key)), modifiers) { return () }
       let target = keyTarget(&tree.*)
       if target == NONE {
         tree.suppressText = false
@@ -1970,6 +2004,13 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
       if same && copyKey(&tree.*, String.view(&key), modifiers) && run text_selection.copy(&mut tree) {
+        return ()
+      }
+      let editing = tree.focused != NONE && tree.node(tree.focused).kind == NodeKind.Input
+      if same && !editing && commandKey(&tree.*, String.view(&key), modifiers, "a") && run text_selection.selectAll(&mut tree) {
+        return ()
+      }
+      if same && !editing && run text_selection.extend(&mut tree, String.view(&key), modifiers) {
         return ()
       }
       if plain && String.view(&key) == "Tab" {
