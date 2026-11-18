@@ -2,7 +2,7 @@
 //! capture, clicks, focus and tab order, keyboard clicks, and nested scrolling. Everything a
 //! client hears about comes out as `Event` records; nothing calls back into it.
 import engine { UiTree }
-import input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, POINTER_TOUCH }
+import input { Input, EditCommand, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, POINTER_TOUCH }
 import mutation {
   NodeKind,
   StyleState,
@@ -31,6 +31,7 @@ import mutation {
 }
 import node { NONE, NO_INDEX, Event, EventKind }
 import edit
+import clipboard
 import scroll_snap
 import touch
 import scroll_anchor
@@ -81,6 +82,15 @@ fn alive(tree: &UiTree<'_>, slot: u32, id: u32) -> bool {
 }
 
 /// Whether `slot` is in the tree under the root.
+/// The slot of node `id` while it is alive and in the tree, or NONE.
+fn liveSlot(tree: &UiTree<'_>, id: u32) -> u32 {
+  let slot = tree.slotOf(id)
+  if slot == NONE || !tree.node(slot).live || !attached(tree, slot) {
+    return NONE
+  }
+  return slot
+}
+
 fn attached(tree: &UiTree<'_>, slot: u32) -> bool {
   let mut at = slot
   while at != NONE {
@@ -1784,7 +1794,21 @@ pub effect fn beginInput(tree: &mut UiTree<'_>, input: &Input) -> ()
     }
     Input.TextInput { .. } => {}
     Input.ImePreedit { .. } => {}
-    Input.Paste { .. } => {}
+    Input.Command { command } => {
+      let target = keyTarget(&tree.*)
+      remember(&mut tree, target)
+      run clipboard.beginCommand(&mut tree, target, command)
+    }
+    Input.Paste { target, text, html, image } => {
+      let slot = liveSlot(&tree.*, target)
+      remember(&mut tree, slot)
+      run clipboard.beginPaste(&mut tree, slot, &text, &html, &image)
+    }
+    Input.Edit { target, inputType, text } => {
+      let slot = liveSlot(&tree.*, target)
+      remember(&mut tree, slot)
+      run clipboard.beginEdit(&mut tree, slot, &inputType, &text)
+    }
     Input.TouchStart { .. } => {}
     Input.TouchMove { .. } => {}
     Input.TouchEnd { .. } => {}
@@ -1942,6 +1966,16 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       // Editing and keyboard clicks belong to the node the key went to. When a handler moved
       // focus or removed that node, they do not fall on whatever has focus now.
       let same = target == remembered(&tree.*)
+      if same {
+        if let Option<EditCommand>.Some { value: command } = clipboard.shortcut(tree.keymap, String.view(&key), modifiers) {
+          if command == EditCommand.Paste {
+            run clipboard.requestPaste(&mut tree, target)
+          } else if clipboard.matters(&tree.*, target) {
+            run tree.queueFollowUp(Input.Command { command: command })
+          }
+          return ()
+        }
+      }
       if same && target == tree.focused && tree.node(target).kind == NodeKind.Input
         && run edit.keyDown(&mut tree, target, &key, modifiers) {
         return ()
@@ -1977,8 +2011,19 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
     Input.ImePreedit { text, selectionStart, selectionEnd } => {
       run edit.preedit(&mut tree, move text, selectionStart, selectionEnd)
     }
-    Input.Paste { target, text } => {
-      run edit.paste(&mut tree, target, move text)
+    Input.Command { command } => {
+      let slot = remembered(&tree.*)
+      run clipboard.finishCommand(&mut tree, slot, command, prevented)
+    }
+    Input.Paste { text, .. } => {
+      let slot = remembered(&tree.*)
+      run clipboard.finishPaste(&mut tree, slot, move text, prevented)
+    }
+    Input.Edit { inputType, text, .. } => {
+      let slot = remembered(&tree.*)
+      if !prevented && slot != NONE {
+        run edit.applyEdit(&mut tree, slot, String.view(&inputType), String.view(&text))
+      }
     }
     Input.TouchStart { .. } => {}
     Input.TouchMove { .. } => {}

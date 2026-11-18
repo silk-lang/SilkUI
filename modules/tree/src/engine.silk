@@ -326,6 +326,8 @@ fn keyboardInput(input: &Input) -> bool {
     Input.TextInput { .. } => true
     Input.ImePreedit { .. } => true
     Input.Paste { .. } => true
+    Input.Command { .. } => true
+    Input.Edit { .. } => true
     _ => false
   }
 }
@@ -925,6 +927,10 @@ pub struct UiTree<'a> {
   pub paintDirty: bool,
   /// Requests for the host (clipboard), oldest first.
   pub requests: List<HostRequest>,
+  /// Input the tree fed itself as the default action of another: the copy or cut of a
+  /// shortcut, the edit of a cut or paste. Hosts run each through `begin` and `finish` like
+  /// their own input (`takeFollowUp`).
+  pub followUps: List<Input>,
   /// The modifier keys editing shortcuts use; the compilation target's by default.
   pub keymap: Keymap,
   /// The id of the current root, and whether it is open. Before any root opens, the current
@@ -1108,6 +1114,7 @@ impl<'a> UiTree<'a> {
       layoutObserversDirty: false,
       paintDirty: false,
       requests: List<HostRequest>.make(),
+      followUps: List<Input>.make(),
       keymap: NATIVE_KEYMAP,
       current: FIRST_ROOT,
       currentOpen: false,
@@ -3761,6 +3768,30 @@ impl<'a> UiTree<'a> {
     run interact.begin(&mut self, &input)
     run interact.finish(&mut self, move input, false)
     run edit.reportSelection(&mut self)
+    while self.followUps.length() > 0 {
+      let next = self.followUps.remove(0)
+      run self.dispatch(move next)
+    }
+  }
+
+  /// Queues `input` to follow the one under way, as a host's own input would. The tree queues
+  /// the copy or cut of a shortcut and the edit of a cut or paste, so each gets its own
+  /// records and its own say for the client; a host answering `HostRequest.ReadClipboard`
+  /// queues its `Input.Paste`.
+  pub effect fn queueFollowUp(self: &mut Self, input: Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.followUps.append(move input)
+  }
+
+  /// The next queued follow-up input, oldest first. A host that splits input into `begin`
+  /// and `finish` runs each one the same way after the input that queued it and after serving
+  /// requests; `dispatch` runs them itself.
+  pub fn takeFollowUp(self: &mut Self) -> Option<Input> {
+    if self.followUps.length() == 0 {
+      return Option<Input>.None
+    }
+    return Option<Input>.some(self.followUps.remove(0))
   }
 
   /// The first half of `dispatch`: hit testing, hover, and the record of the input itself

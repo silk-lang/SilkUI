@@ -4,6 +4,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String, InvalidUtf8 }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -347,8 +348,9 @@ pub effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryErr
   }
 }
 
-/// The position of `kind` in the ui-protocol `LISTEN_*` flags, which is the number JavaScript
-/// receives as the event's kind.
+/// The number JavaScript receives as the event's kind: its position in the ui-protocol
+/// `LISTEN_*` flags up to `PointerOut`, then 30 to 33 for copy, cut, paste and beforeinput
+/// (which share the last two flags).
 pub fn kindCode(kind: EventKind) -> u32 {
   if kind == EventKind.PointerDown { return 0 }
   if kind == EventKind.PointerUp { return 1 }
@@ -379,6 +381,10 @@ pub fn kindCode(kind: EventKind) -> u32 {
   if kind == EventKind.AnimationCancel { return 26 }
   if kind == EventKind.PointerOver { return 28 }
   if kind == EventKind.PointerOut { return 29 }
+  if kind == EventKind.Copy { return 30 }
+  if kind == EventKind.Cut { return 31 }
+  if kind == EventKind.Paste { return 32 }
+  if kind == EventKind.BeforeInput { return 33 }
   return 27
 }
 
@@ -476,6 +482,16 @@ pub effect fn eventStrings(event: &Event) -> EventStrings ! OutOfMemoryError ? &
       second = run String.copy(change.inputType.name())
       present = [true, true]
     }
+    Event.Paste { data } => {
+      first = run String.copy(String.view(&data.text))
+      second = run String.copy(String.view(&data.html))
+      present = [true, true]
+    }
+    Event.BeforeInput { inputType, data } => {
+      first = run String.copy(String.view(&data))
+      second = run String.copy(inputType.name())
+      present = [true, true]
+    }
     _ => match motionOf(event) {
       Option<&Motion>.Some { value: motion } => {
         first = run String.copy(String.view(&motion.name))
@@ -486,9 +502,30 @@ pub effect fn eventStrings(event: &Event) -> EventStrings ! OutOfMemoryError ? &
     }
   }
   let mut packed = run richStrings(event)
+  if let Event.Paste { data } = &event.* {
+    packed[0] = run binaryText(data.image.asSlice())
+  }
   let marks = Intrinsic.replace(packed[0], String.make())
   let atoms = Intrinsic.replace(packed[1], String.make())
   return EventStrings { texts: [move first, move second, move marks, move atoms], present: present }
+}
+
+/// `bytes` as text of one character per byte, U+0000 to U+00FF, which reaches JavaScript as
+/// a binary string.
+pub effect fn binaryText(bytes: &[u8]) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let mut i: usize = 0
+  while i < bytes.length {
+    let byte = bytes[i]
+    if byte < 128 {
+      run out.append(byte)
+    } else {
+      run out.append(192 + byte / 64)
+      run out.append(128 + byte % 64)
+    }
+    i = i + 1
+  }
+  return unsafe String.fromBytesUnchecked(run Bytes.copy(out.asSlice()))
 }
 
 /// A rich input's marks and atoms in an input record, packed as `__ui.richText` takes them

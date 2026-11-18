@@ -1206,16 +1206,24 @@ pub effect fn textInput(tree: &mut UiTree<'_>, text: String) -> ()
   run insert(&mut tree, slot, String.view(&text), "insertText", GROUP_TYPING)
 }
 
-/// `Input.Paste`: the clipboard text a `ReadClipboard` request asked for.
-pub effect fn paste(tree: &mut UiTree<'_>, target: u32, text: String) -> ()
+/// `Input.Edit` that no `beforeinput` handler prevented: `text` replaces the selection of the
+/// focused input `slot`, as `inputType` (`insertFromPaste`, `deleteByCut`).
+pub effect fn applyEdit(tree: &mut UiTree<'_>, slot: u32, inputType: string, text: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let slot = focusedInput(&tree.*)
-  if !editable(&tree.*, slot) || tree.node(slot).id != target {
+  if !editable(&tree.*, slot) || slot != focusedInput(&tree.*) {
     return ()
   }
   run endComposition(&mut tree, slot)
-  run insert(&mut tree, slot, String.view(&text), "insertFromPaste", GROUP_NONE)
+  if String.byteLength(text) == 0 {
+    let lo = state(&tree.*, slot).low()
+    let hi = state(&tree.*, slot).high()
+    if lo != hi {
+      run replace(&mut tree, slot, lo, hi, "", inputType, GROUP_NONE)
+    }
+    return ()
+  }
+  run insert(&mut tree, slot, text, inputType, GROUP_NONE)
 }
 
 // Focus.
@@ -1583,7 +1591,9 @@ effect fn plainText(tree: &UiTree<'_>, slot: u32, lo: usize, hi: usize) -> Strin
   return move out
 }
 
-effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
+/// Copies the selection of input `slot` to the clipboard as plain text, as the default of a
+/// copy or cut does. Returns false when nothing is selected.
+pub effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let lo = state(&tree.*, slot).low()
@@ -1596,7 +1606,42 @@ effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   return true
 }
 
-fn letter(key: string, lower: string) -> bool {
+/// Whether input `slot` has a selection that is not a caret.
+pub fn hasSelection(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && state(tree, slot).low() != state(tree, slot).high()
+}
+
+/// The default of a cut in input `slot`: the selection goes to the clipboard. Returns whether
+/// it did, so the caller queues the `deleteByCut` edit.
+pub effect fn cutSelection(tree: &mut UiTree<'_>, slot: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !editable(&tree.*, slot) {
+    return false
+  }
+  return run copySelection(&mut tree, slot)
+}
+
+/// Undo (`redo` false) or redo in input `slot`, from the Edit menu as from the shortcuts.
+pub effect fn undo(tree: &mut UiTree<'_>, slot: u32, redo: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !editable(&tree.*, slot) {
+    return ()
+  }
+  run endComposition(&mut tree, slot)
+  run history(&mut tree, slot, redo)
+}
+
+/// Selects all of input `slot`, from the Edit menu as from the shortcut.
+pub effect fn selectEverything(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run endComposition(&mut tree, slot)
+  run selectAll(&mut tree, slot)
+}
+
+pub fn letter(key: string, lower: string) -> bool {
   if key == lower {
     return true
   }
@@ -1629,26 +1674,6 @@ pub effect fn keyDown(tree: &mut UiTree<'_>, slot: u32, key: &String, modifiers:
     if letter(k, "a") {
       run endComposition(&mut tree, slot)
       run selectAll(&mut tree, slot)
-      return true
-    }
-    if letter(k, "c") {
-      drop run copySelection(&mut tree, slot)
-      return true
-    }
-    if letter(k, "x") {
-      let copied = run copySelection(&mut tree, slot)
-      if copied && editableHere {
-        let lo = state(&tree.*, slot).low()
-        let hi = state(&tree.*, slot).high()
-        run replace(&mut tree, slot, lo, hi, "", "deleteByCut", GROUP_NONE)
-      }
-      return true
-    }
-    if letter(k, "v") {
-      if editableHere {
-        let id = tree.node(slot).id
-        run tree.requests.append(HostRequest.ReadClipboard { target: id })
-      }
       return true
     }
     if letter(k, "z") {

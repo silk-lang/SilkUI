@@ -24,6 +24,10 @@ interface Handlers<T extends Silk.Node> {
   onBlur: Silk.Event;
   onInput: Silk.InputEvent<T>;
   onSelectionChange: Silk.SelectionEvent<T>;
+  onCopy: Silk.ClipboardEvent;
+  onCut: Silk.ClipboardEvent;
+  onPaste: Silk.ClipboardEvent;
+  onBeforeInput: Silk.BeforeInputEvent<T>;
   onScroll: Silk.ScrollEvent;
   onLayout: Silk.LayoutEvent;
   onGotPointerCapture: Silk.Event;

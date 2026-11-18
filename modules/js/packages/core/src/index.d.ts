@@ -323,6 +323,17 @@ export interface SelectionEvent<T extends Node = Input> extends Event {
   readonly selectionEnd: number;
 }
 
+/** An edit about to change an input (`beforeinput`), as the web's `InputEvent`. Preventing it cancels the edit. */
+export interface BeforeInputEvent<T extends Node = Input> extends Event {
+  readonly target: FieldOf<T>;
+  readonly inputType: string;
+  /** The text the edit inserts. */
+  readonly data: string | null;
+  readonly dataTransfer: DataTransfer | null;
+  readonly isComposing: boolean;
+  getTargetRanges(): never[];
+}
+
 export interface ScrollEvent extends Event {
   readonly scrollLeft: number;
   readonly scrollTop: number;
@@ -363,6 +374,10 @@ export interface EventMap {
   blur: Event;
   input: InputEvent;
   selectionchange: SelectionEvent;
+  copy: ClipboardEvent;
+  cut: ClipboardEvent;
+  paste: ClipboardEvent;
+  beforeinput: BeforeInputEvent;
   scroll: ScrollEvent;
   layout: LayoutEvent;
   gotpointercapture: Event;
@@ -451,14 +466,58 @@ export class DroppedFile {
   readonly type: string;
 }
 
-/** What a file drag carries. `files` is filled in `drop`, as on the web. */
+/** A file in a `DataTransfer` that is no file on disk, such as a pasted image: the runtime's `File`. */
+export interface DataFile {
+  readonly name: string;
+  readonly type: string;
+  readonly size: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  text(): Promise<string>;
+}
+
+/** One entry of a `DataTransfer`. */
+export interface DataTransferItem {
+  readonly kind: "string" | "file";
+  readonly type: string;
+  getAsString(callback: (value: string) => void): void;
+  getAsFile(): DataFile | DroppedFile | null;
+}
+
+export interface DataTransferItemList extends Iterable<DataTransferItem> {
+  readonly length: number;
+  readonly [index: number]: DataTransferItem;
+  add(data: string, type: string): DataTransferItem;
+  add(file: DataFile | DroppedFile): DataTransferItem;
+  remove(index: number): void;
+  clear(): void;
+}
+
+/**
+ * What a copy, cut, paste or file drag carries, as the web's. `new DataTransfer()` is empty
+ * and writable; a paste's is read-only, and after its event none can be read.
+ */
 export class DataTransfer {
-  readonly files: DroppedFile[];
-  readonly items: { kind: "file"; type: string; getAsFile(): DroppedFile }[];
-  readonly types: string[];
+  constructor();
+  readonly files: readonly (DataFile | DroppedFile)[];
+  readonly items: DataTransferItemList;
+  readonly types: readonly string[];
   dropEffect: string;
   effectAllowed: string;
   getData(format: string): string;
+  setData(format: string, data: string): void;
+  clearData(format?: string): void;
+  setDragImage(image: unknown, x: number, y: number): void;
+}
+
+/**
+ * A copy, cut or paste at the focused node, as the web's. A `copy` or `cut` listener that sets
+ * data on `clipboardData` and prevents the default puts that data on the clipboard; a `paste`
+ * listener reads what it holds (`text/plain`, `text/html`, a pasted PNG in `files`), and
+ * preventing it keeps the paste out of the input.
+ */
+export class ClipboardEvent extends Event {
+  constructor(type: string, init?: { bubbles?: boolean; cancelable?: boolean; composed?: boolean; clipboardData?: DataTransfer | null });
+  readonly clipboardData: DataTransfer | null;
 }
 
 /** Files dragged from another app over the window (`dragenter`, `dragover`, `dragleave`, `drop`). */

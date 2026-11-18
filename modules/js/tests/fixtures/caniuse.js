@@ -203,7 +203,16 @@ check("channel-messaging", NODE, () => new Promise((resolve) => {
   port2.onmessage = (event) => { port1.close(); port2.close(); resolve(event.data.n === 2); };
   port1.postMessage({ n: 2 });
 }));
-check("clipboard", false, () => global("ClipboardEvent"));
+check("clipboard", true, () => {
+  const data = new DataTransfer();
+  data.setData("text/plain", "x");
+  const event = new ClipboardEvent("copy", { clipboardData: data });
+  let heard = null;
+  const node = ui.createBox();
+  node.addEventListener("copy", (copy) => (heard = copy.clipboardData.getData("text")));
+  node.dispatchEvent(event);
+  return event instanceof ClipboardEvent && heard === "x";
+});
 check("console-basic", true, () => ["log", "info", "warn", "error", "debug"].every((name) => typeof console[name] === "function"));
 check("console-time", true, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
 check("constraint-validation", false, () => typeof ui.createInput().checkValidity === "function");

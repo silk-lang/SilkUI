@@ -9,7 +9,8 @@ import ui_js_calls.natives as natives
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
 import ui_tree.style_media { MediaState }
-import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState, EditCommand, ClipboardData as ClipboardData2 }
+import ui_tree.legacy { HostRequest as HostRequestRaw }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.runtime_memory { RuntimeAllocator }
@@ -414,7 +415,9 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 5 {
+  let ran = if scenario == 6 {
+    run Effect.result(clipboardEvents(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 5 {
     run Effect.result(svgMarkup(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 4 {
     run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -645,6 +648,55 @@ test effect fn constructedStylesheetsCompileReplaceAndRemoveInTheNativeTree() ->
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(3) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Copy, cut and paste from a JavaScript app: a prevented copy puts the listener's data on
+/// the clipboard, a paste carries every flavor, and a prevented beforeinput keeps the paste
+/// out of the input.
+effect fn clipboardEvents(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { createBox, createInput, mount, ClipboardEvent } from '@silkui/core'; globalThis.seen = []; const root = createBox(); globalThis.field = createInput(); root.append(field); mount(root); root.addEventListener('copy', (event) => { seen.push(event.type + ' ' + (event instanceof ClipboardEvent)); event.clipboardData.setData('text/plain', 'mine'); event.clipboardData.setData('text/html', '<b>mine</b>'); event.preventDefault(); }); root.addEventListener('paste', (event) => { const data = event.clipboardData; seen.push('paste ' + data.types.join() + ' ' + data.getData('text') + ' ' + data.getData('text/html') + ' ' + data.files[0].type + ' ' + data.files[0].size); }); field.addEventListener('beforeinput', (event) => { seen.push(event.inputType + ' ' + event.data); event.preventDefault(); }); field.focus();", b"clipboard-events.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  drop host.takeClipboard()
+
+  run host.input(&mut tree, Input.Command { command: EditCommand.Copy })
+  let mut requests = host.takeClipboard()
+  let wrote = match requests.remove(0) {
+    ClipboardRequest.WriteItem { entries, .. } => {
+      let e = entries.asSlice()
+      e.length == 2 && e[0].data.asSlice() == b"mine" && e[1].mime.view() == "text/html"
+    }
+    _ => false
+  }
+  run Testing.expect(wrote, "a prevented copy writes what its listener set")
+  let mut asked = List<HostRequestRaw>.make()
+  run tree.engineMut().takeRequests(&mut asked)
+  run Testing.expect(asked.length() == 0, "and the tree copies nothing")
+
+  run host.input(&mut tree, Input.Command { command: EditCommand.Paste })
+  run tree.engineMut().takeRequests(&mut asked)
+  let target = match &asked.asSlice()[0] {
+    HostRequestRaw.ReadClipboard { target } => target
+    _ => 0
+  }
+  run Testing.expect(asked.length() == 1 && target != 0, "Edit > Paste asks for the clipboard for the focused field")
+  let mut image = List<u8>.make()
+  run image.appendSlice(b"\x89PNG")
+  run host.input(&mut tree, Input.Paste {
+    target: NodeId.of(target),
+    data: ClipboardData2 { text: run String.copy("plain"), html: run String.copy("<i>x</i>"), image: move image },
+  })
+  run host.evaluate(b"if (seen.join('|') !== 'copy true|paste text/plain,text/html,Files plain <i>x</i> image/png 4|insertFromPaste plain') throw new Error('clipboard events ran as ' + seen.join('|')); if (field.value !== '') throw new Error('the prevented paste went in: ' + field.value)", b"test")
+}
+
+test effect fn clipboardEventsReachJavaScript() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(6) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 import ui_tree.access { accessibleName }

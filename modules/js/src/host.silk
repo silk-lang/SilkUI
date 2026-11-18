@@ -6,7 +6,7 @@ import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.text.string { String }
 import silk.num.u32
-import ui_tree.lib { Tree, ProtocolError, Input, EventRecord, Event, Motion }
+import ui_tree.lib { Tree, PendingInput, ProtocolError, Input, EventRecord, Event, Motion }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree.node { Event as RawEvent }
 import silkjs.js_engine { Engine }
@@ -64,7 +64,6 @@ pub struct JsHost<'m> {
   closed: bool,
 }
 
-/// A JavaScript string of `value`, or undefined when it is too long to be one.
 /// `bytes` as a string of one code unit per byte (a "binary string").
 effect fn jsLatin1(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
   let made = run Effect.result(Strings.fromLatin1(bytes))
@@ -77,6 +76,7 @@ effect fn jsLatin1(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
   }
 }
 
+/// A JavaScript string of `value`, or undefined when it is too long to be one.
 effect fn jsString(value: string) -> Value ! OutOfMemoryError ? &mut Allocator {
   let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(value)))
   return match move made {
@@ -89,12 +89,15 @@ effect fn jsString(value: string) -> Value ! OutOfMemoryError ? &mut Allocator {
 }
 
 /// The two strings of an event: key and code for key events, the value and the input type
-/// for input, undefined otherwise.
+/// for input, a paste's text and HTML, a beforeinput's data and input type, undefined
+/// otherwise.
 pub effect fn firstString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
   return match &event.* {
     Event.KeyDown { key, .. } => run jsString(String.view(&key.key))
     Event.KeyUp { key } => run jsString(String.view(&key.key))
     Event.Input { change } => run jsString(String.view(&change.value))
+    Event.Paste { data } => run jsString(String.view(&data.text))
+    Event.BeforeInput { data, .. } => run jsString(String.view(&data))
     _ => match motionOf(event) {
       Option<&Motion>.Some { value: motion } => run jsString(String.view(&motion.name))
       Option<&Motion>.None => Value.immediate(ValueBits.Undefined)
@@ -107,6 +110,8 @@ pub effect fn secondString(event: &Event) -> Value ! OutOfMemoryError ? &mut All
     Event.KeyDown { key, .. } => run jsString(String.view(&key.code))
     Event.KeyUp { key } => run jsString(String.view(&key.code))
     Event.Input { change } => run jsString(change.inputType.name())
+    Event.Paste { data } => run jsString(String.view(&data.html))
+    Event.BeforeInput { inputType, .. } => run jsString(inputType.name())
     _ => match motionOf(event) {
       Option<&Motion>.Some { value: motion } => run jsString(String.view(&motion.pseudoElement))
       Option<&Motion>.None => Value.immediate(ValueBits.Undefined)
@@ -115,8 +120,12 @@ pub effect fn secondString(event: &Event) -> Value ! OutOfMemoryError ? &mut All
 }
 
 /// The third and fourth strings of an event: a rich input's marks and atoms, packed as
-/// `__ui.richText` takes them (empty for every other record).
+/// `__ui.richText` takes them, and a paste's PNG as a binary string (empty for every other
+/// record).
 pub effect fn thirdString(event: &Event) -> Value ! OutOfMemoryError ? &mut Allocator {
+  if let Event.Paste { data } = &event.* {
+    return run jsLatin1(data.image.asSlice())
+  }
   let packed = run richStrings(event)
   return run jsString(String.view(&packed[0]))
 }
@@ -542,27 +551,34 @@ impl<'m> JsHost<'m> {
   /// JavaScript fails, the tree still finishes the input (with its default) and takes the
   /// mutations made so far, and then the failure is reported.
   pub effect fn input(self: &mut Self, tree: &mut Tree<'_>, value: Input) -> () ! ProtocolError | OutOfMemoryError | JsError ? &mut Allocator {
-    let pending = run tree.begin(move value)
-    let handled = run Effect.result(self.deliver(&mut tree))
+    let mut next = Option<PendingInput>.some(run tree.begin(move value))
     let mut failure = Option<JsError>.none()
-    let mut prevented = false
-    match move handled {
-      Result<bool, OutOfMemoryError | JsError>.Success { value: flag } => { prevented = flag }
-      Result<bool, OutOfMemoryError | JsError>.Failure { error } => match move error {
-        OutOfMemoryError allocation => { fail move allocation }
-        JsError { message } => { failure = Option<JsError>.some(JsError { message: move message }) }
-      }
-    }
-    run tree.finish(move pending, prevented)
-    if failure.isNone() {
-      let after = run Effect.result(self.deliver(&mut tree))
-      match move after {
-        Result<bool, OutOfMemoryError | JsError>.Success { .. } => ()
-        Result<bool, OutOfMemoryError | JsError>.Failure { error } => match move error {
-          OutOfMemoryError allocation => { fail move allocation }
-          JsError { message } => { failure = Option<JsError>.some(JsError { message: move message }) }
+
+    // The input, then each one the tree queued after it (a shortcut's copy, a paste's edit).
+    while let Option<PendingInput>.Some { value: pending } = move next {
+      let mut prevented = false
+      if failure.isNone() {
+        let handled = run Effect.result(self.deliver(&mut tree))
+        match move handled {
+          Result<bool, OutOfMemoryError | JsError>.Success { value: flag } => { prevented = flag }
+          Result<bool, OutOfMemoryError | JsError>.Failure { error } => match move error {
+            OutOfMemoryError allocation => { fail move allocation }
+            JsError { message } => { failure = Option<JsError>.some(JsError { message: move message }) }
+          }
         }
       }
+      run tree.finish(move pending, prevented)
+      if failure.isNone() {
+        let after = run Effect.result(self.deliver(&mut tree))
+        match move after {
+          Result<bool, OutOfMemoryError | JsError>.Success { .. } => ()
+          Result<bool, OutOfMemoryError | JsError>.Failure { error } => match move error {
+            OutOfMemoryError allocation => { fail move allocation }
+            JsError { message } => { failure = Option<JsError>.some(JsError { message: move message }) }
+          }
+        }
+      }
+      next = run tree.beginFollowUp()
     }
     run self.flush(&mut tree)
     match move failure {
