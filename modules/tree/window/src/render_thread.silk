@@ -52,6 +52,7 @@ import silk.core.result { Result }
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
+import metal_hud
 import silk.text.string { String }
 import silk.num.f64
 import silk.num.u64
@@ -241,6 +242,8 @@ struct State {
   /// the frames replaced in the mailbox since then.
   presented: List<f64>,
   dropped: u64,
+  /// The Metal HUD to show (1) or hide (0) on the first window's layer, -1 when nothing changes.
+  hud: i32,
 }
 
 impl Transferable for State {}
@@ -472,6 +475,16 @@ impl RenderThread {
   /// What the render thread last reported.
   pub fn report(self: &Self) -> RenderReport {
     return self.shared.get().lock().get().report
+  }
+
+  /// Shows or hides the Metal Performance HUD over the window's frames (macOS 13 and later;
+  /// elsewhere nothing happens). It measures what the window's layer presents.
+  pub fn setMetalHud(self: &mut Self, on: bool) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.hud = if on { 1 } else { 0 }
+    drop guard
+    self.wake.unpark()
   }
 
   /// Whether the last frame handed over still waits for the render thread, which is busy with
@@ -710,6 +723,7 @@ effect fn makeShared() -> Arc<Mutex<State>>
     report: RenderReport.none(),
     presented: List<f64>.make(),
     dropped: 0,
+    hud: -1,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -794,7 +808,7 @@ fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
       state.redraw = false
       Option<Work>.some(Work.Redraw)
     } else if state.extraJobs.length() != 0 || state.opening.length() != 0
-      || state.closing.length() != 0 {
+      || state.closing.length() != 0 || state.hud >= 0 {
       Option<Work>.some(Work.Others)
     } else {
       Option<Work>.None
@@ -1022,6 +1036,19 @@ fn markReady(shared: &Arc<Mutex<State>>, format: u32) -> () {
   values.ready = true
 }
 
+fn takeHud(shared: &Arc<Mutex<State>>) -> i32 {
+  let mut guard = shared.get().lock()
+  return Intrinsic.replace(guard.getMut().hud, -1)
+}
+
+/// Shows or hides the Metal HUD on `raw`, when it is a Metal layer.
+fn metalHud(raw: RawSurface, on: bool) -> () {
+  match raw {
+    RawSurface.MetalLayer { layer } => metal_hud.show(layer, on)
+    _ => ()
+  }
+}
+
 /// Records a presented frame.
 fn recordFrame(shared: &Arc<Mutex<State>>, report: RenderReport) -> () {
   let mut guard = shared.get().lock()
@@ -1119,6 +1146,7 @@ effect fn renderLoop(
     }
   }
   let owner = surface.window
+  let raw = surface.raw
   let target = match unsafe targetOf(&owner, surface.raw) {
     Option<SurfaceTarget>.Some { value } => move value
     Option<SurfaceTarget>.None => {
@@ -1187,6 +1215,10 @@ effect fn renderLoop(
       _ => false
     }
     if !quitting {
+      let hud = takeHud(shared)
+      if hud >= 0 {
+        metalHud(raw, hud == 1)
+      }
       run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
       run writeUploads(shared, &device, &queue, &mut textures)
       run drawOthers(
