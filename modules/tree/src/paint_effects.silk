@@ -3,7 +3,8 @@
 //! `filter`, `mix-blend-mode`, `clip-path` and `mask`. A run of filter functions that the scene
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
 import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
-import paint_css { Effects, Layers, Clip, TextShadow }
+import paint_css { Effects, Layers, Clip, TextShadow, ATTACH_FIXED, ATTACH_LOCAL }
+import ui_scene.scroll { ScrollAxis, ScrollLink, ROOT_GROUP, UNBOUNDED }
 import vector.layer { BLEND_NORMAL }
 import resources { Resource }
 import atlas.atlas { AtlasTile }
@@ -578,8 +579,16 @@ fn tiles(repeat: Repeat, start: f32, size: f32, lo: f32, hi: f32, areaLo: f32, a
   }
 }
 
+/// Every layer: `local` ones as `scroll`, for a box that does not scroll.
+pub const SCOPE_ALL: u8 = 0
+/// The layers of a scroll container outside its scroll group: all but the `local` ones.
+pub const SCOPE_OUTER: u8 = 1
+/// Only the `local` layers, inside the scroll group, placed on `localBox`.
+pub const SCOPE_LOCAL: u8 = 2
+
 /// Paints the image layers of `layers` for fragment `f` (CSS pixels) clipped to `mask`, bottom
-/// layer first. `radii` (device pixels) round the border box; `initialOrigin` is the origin box
+/// layer first. `scope` picks layers by `background-attachment` (see `SCOPE_*`); `fixed` layers
+/// are placed on the viewport and stay there while the scroll containers around them scroll. `radii` (device pixels) round the border box; `initialOrigin` is the origin box
 /// when none is set (padding box for backgrounds, border box for masks). `text` paints only the
 /// `background-clip: text` layers, over the border box, for the caller to mask with the glyphs;
 /// otherwise those layers are left out.
@@ -593,6 +602,8 @@ pub effect fn paintLayers(
   initialOrigin: GeometryBox,
   text: bool,
   nearest: bool,
+  scope: u8,
+  localBox: Rect<f32>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -640,9 +651,28 @@ pub effect fn paintLayers(
     if !drawable || (clipKind == Clip.Text) != text {
       continue
     }
-    let area = boxOf(f, layers.origin(layer, initialOrigin))
-    let painting = clipBox(f, clipKind)
-    let paintingRadii = insetCorners(radii, device(border, s), device(painting, s))
+    let attachment = layers.attachment(layer)
+    if (scope == SCOPE_LOCAL) != (attachment == ATTACH_LOCAL) && scope != SCOPE_ALL {
+      continue
+    }
+    let local = scope == SCOPE_LOCAL
+    let fixed = attachment == ATTACH_FIXED && !text
+    let mut area = if local { localBox } else { boxOf(f, layers.origin(layer, initialOrigin)) }
+    let mut painting = if local { localBox } else { clipBox(f, clipKind) }
+    let mut paintingRadii = insetCorners(radii, device(border, s), device(painting, s))
+    let mut layerMask = mask
+    let mut opened: u32 = 0
+    if fixed {
+      // Drawn in window space under groups that undo every scroll around the box, cut to the
+      // box's painting area in its own space: scrolling moves the cut, not the image.
+      let cut = mask.intersect(ContentMask.rounded(device(painting, s), paintingRadii))
+      opened = run openFixed(&mut p, cut)
+      area = Rect<f32>.new(0.0, 0.0, p.width, p.height)
+      painting = area
+      paintingRadii = Corners<f32>.zero()
+      layerMask = ContentMask.new(device(area, s))
+    }
+    let mask = layerMask
     let size = tileSize(effects, layers.size(layer), area, natural, ratio)
     let repeat = layers.repeat(layer)
     let mut tw = size[0]
@@ -656,6 +686,7 @@ pub effect fn paintLayers(
       th = ah / f32.max(1.0, f32.round(ah / th))
     }
     if tw <= 0.0 || th <= 0.0 {
+      run closeFixed(&mut p, opened)
       continue
     }
     let mut x0 = area.xMin
@@ -673,6 +704,7 @@ pub effect fn paintLayers(
     let nx = f32.toUsize(across[2])
     let ny = f32.toUsize(down[2])
     if nx == 0 || ny == 0 {
+      run closeFixed(&mut p, opened)
       continue
     }
     // background-blend-mode: the layer blends with the layers and color under it, in the
@@ -685,7 +717,8 @@ pub effect fn paintLayers(
       Option<Resource>.Some { value } => {
         run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest)
         if mode != BLEND_NORMAL { run p.scene.popLayer() }
-        continue
+        run closeFixed(&mut p, opened)
+      continue
       }
       Option<Resource>.None => {}
     }
@@ -695,6 +728,7 @@ pub effect fn paintLayers(
       // Snapped like the background color under it, so their edges agree.
       run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops)
       if mode != BLEND_NORMAL { run p.scene.popLayer() }
+      run closeFixed(&mut p, opened)
       continue
     }
     let rounded = hasRadius(paintingRadii)
@@ -740,6 +774,48 @@ pub effect fn paintLayers(
     if mode != BLEND_NORMAL {
       run p.scene.popLayer()
     }
+    run closeFixed(&mut p, opened)
+  }
+}
+
+/// Opens the groups a `fixed` layer draws in: each undoes one scroll group open now, innermost
+/// first, and the first is cut to `cut`. Returns how many it opened, for [`closeFixed`].
+effect fn openFixed(p: &mut Painter<'_, '_>, cut: ContentMask) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut links = List<ScrollLink>.make()
+  let mut g = p.scene.openGroup()
+  while g != ROOT_GROUP {
+    let group = p.scene.scrollGroups()[u32.toUsize(g)]
+    run links.append(ScrollLink { node: group.link.node, x: undone(group.link.x), y: undone(group.link.y) })
+    g = group.parent
+  }
+  if links.length() == 0 {
+    run links.append(ScrollLink { node: NONE, x: ScrollAxis.fixed(), y: ScrollAxis.fixed() })
+  }
+  drop run p.scene.pushRoundedScrollGroup(links.get(0), cut, cut.bounds)
+  let all = Rect<f32>.new(-UNBOUNDED, -UNBOUNDED, UNBOUNDED, UNBOUNDED)
+  let mut i: usize = 1
+  while i < links.length() {
+    drop run p.scene.pushScrollGroup(links.get(i), all, all)
+    i = i + 1
+  }
+  return usize.toU32(links.length())
+}
+
+/// The axis that moves back what `axis` moves. A clamped axis (a sticky box) stays as it is.
+fn undone(axis: ScrollAxis) -> ScrollAxis {
+  if axis.low > -UNBOUNDED || axis.high < UNBOUNDED { return ScrollAxis.fixed() }
+  return ScrollAxis { factor: 0.0 - axis.factor, base: 0.0 - axis.base, low: -UNBOUNDED, high: UNBOUNDED }
+}
+
+effect fn closeFixed(p: &mut Painter<'_, '_>, opened: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < opened {
+    run p.scene.popScrollGroup()
+    i = i + 1
   }
 }
 
@@ -1105,7 +1181,7 @@ effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, 
     run p.scene.popLayer()
   }
   if imaged {
-    run paintLayers(&mut p, effects, &effects.masks, f, radii, mask, GeometryBox.Border, false, nearest)
+    run paintLayers(&mut p, effects, &effects.masks, f, radii, mask, GeometryBox.Border, false, nearest, SCOPE_ALL, Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
   }
   if clipped && imaged {
     run p.scene.popLayer()

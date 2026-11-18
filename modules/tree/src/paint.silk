@@ -46,6 +46,7 @@ import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition }
 import ui_scene.effects { LayerEffects }
 import paint_effects
 import paint_css { Effects, TextShadow, Clip }
+import paint_css
 import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
 import ui_scene.path_cache { PathCache }
@@ -371,7 +372,7 @@ effect fn paintTextClip(p: &mut Painter<'_, '_>, index: usize, slot: u32, c: &Co
   match &taken {
     Option<Box<Effects>>.Some { value } => {
       let effects = &value.get()[0]
-      run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, true, c.nearest)
+      run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, true, c.nearest, backgroundScope(c), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
     }
     Option<Box<Effects>>.None => {}
   }
@@ -395,6 +396,42 @@ effect fn paintGlyphMask(p: &mut Painter<'_, '_>, index: usize, mask: ContentMas
     }
     child = f.nextSibling
   }
+}
+
+/// Which background layers a box paints with its border: a scroll container leaves its `local`
+/// ones to [`paintLocalBackgrounds`].
+fn backgroundScope(c: &Computed) -> u8 {
+  return if layers.scroller(c) { paint_effects.SCOPE_OUTER } else { paint_effects.SCOPE_ALL }
+}
+
+/// The `background-attachment: local` layers of scroll container `slot`, in its scroll group
+/// under its content, placed on its padding box grown to all it scrolls over.
+effect fn paintLocalBackgrounds(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !hasBackgrounds(&p.*, slot) { return }
+  let taken = paint_effects.takeEffects(&mut p, slot)
+  match &taken {
+    Option<Box<Effects>>.Some { value } => {
+      let effects = &value.get()[0]
+      if effects.backgrounds.attached(paint_css.ATTACH_LOCAL) {
+        let port = paddingBox(f)
+        let over = f.scrollableOverflow
+        let ox = f.worldLocation.x + over.x
+        let oy = f.worldLocation.y + over.y
+        let local = Rect<f32>.new(
+          f32.min(port.xMin, ox),
+          f32.min(port.yMin, oy),
+          f32.max(port.xMax, ox + over.width),
+          f32.max(port.yMax, oy + over.height),
+        )
+        let radii = Corners<f32>.zero()
+        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest, paint_effects.SCOPE_LOCAL, local)
+      }
+    }
+    Option<Box<Effects>>.None => {}
+  }
+  paint_effects.putEffects(&mut p, slot, move taken)
 }
 
 effect fn decorate(
@@ -482,7 +519,7 @@ effect fn decorate(
     match &taken {
       Option<Box<Effects>>.Some { value } => {
         let effects = &value.get()[0]
-        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest)
+        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest, backgroundScope(c), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
       }
       Option<Box<Effects>>.None => {}
     }
@@ -2194,6 +2231,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let saved = p.cull
     if scrolled && open {
       inner = run openScroller(&mut p, slot, &c, &f, inner)
+      if c.text.visible && !f.nonpainting { run paintLocalBackgrounds(&mut p, slot, &c, &f, inner) }
     }
     if !scrolled || open {
       if input {
