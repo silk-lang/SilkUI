@@ -25,6 +25,7 @@ const OP = {
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
+  capture: 29,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -148,6 +149,7 @@ export class JsHost {
         return known ? true : undefined;
       },
       focus(id) { write(OP.focus, id); },
+      capture(id) { write(OP.capture, id); },
       remove(id) { write(OP.remove, id); },
       destroy(id) { write(OP.destroy, id); },
       scrollTo(id, x, y) { write(OP.scrollTo, id); calls.f64(x); calls.f64(y); },
