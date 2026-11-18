@@ -75,7 +75,6 @@ match in tree order wins.
 | `ui_edits` | `edits` | the style edits and comments people made, for the agent to carry into the code: `status` (`open` for the work left), `kind`, `since` |
 | `ui_comment` | `comment` | a comment on the target (or the app), or with `reply` an answer in a comment's thread |
 | `ui_resolve` | `resolve` | marks `entries` (or `entry`) done once the code does what they ask; `reopen` opens them again |
-| `ui_metal_hud` | `metalHud` | shows or hides the Metal Performance HUD over the window on macOS |
 | `ui_pick_mode` | `pickMode` | lets the person point at a node in the app's window; ask again for `picked` |
 | `ui_audit` | `audit` | accessibility issues: unnamed controls, missing roles, unreachable or small targets, low contrast |
 

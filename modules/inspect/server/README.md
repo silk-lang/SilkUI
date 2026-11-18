@@ -183,7 +183,6 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `edits` | `status` (`open`, `resolved`; both without it), `kind` (`edit`, `comment`), `since` (a `seq`) | `seq`, `open`, `edits`, `comments` (see the edit log) |
 | `comment` | `text`, `author`, and a target (none: the app as a whole) or `reply` (a comment's id) | `entry`: the comment, `seq` |
 | `resolve` | `entry` (an id) or `entries` (ids), `reopen` | `entries`: each entry now, `seq`; an unknown id is an error and changes nothing |
-| `metalHud` | `on` (left out: just asks) | `on`. Shows or hides the Metal Performance HUD over the window (macOS 13 and later): the presented frames per second, frame times and GPU time Metal measures |
 | `pickMode` | `on` (left out: just asks) | `on`; `picked`: the node the last pick chose. While on, the app's own pointer highlights what it is over and the next click selects it instead of reaching the app |
 | `audit` | target (optional, a subtree) | `issues`: `{"rule", "message", "node"}` for `unnamed`, `no-role`, `not-focusable`, `small-target` (under 24 by 24) and `contrast` (under 4.5, or 3 for large text); `count`, `checked` |
 | `viewEvents` | `topic` (an extension view topic), `events` (records, see `remote.silk`) | `queued`: the records queued for the view (none while nobody has it open) |

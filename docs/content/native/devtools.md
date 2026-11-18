@@ -101,7 +101,7 @@ ui-inspect-cli screen-reader.transcript
 
 An fps counter built on `requestAnimationFrame` counts the frames the app paints. When the GPU falls behind, that is more than the screen shows. Two things count what is presented:
 
-- On macOS 13 and later, the Metal Performance HUD draws the presented frames per second, the frame times and the GPU time over the window. Start any build with `SILK_UI_METAL_HUD=1` (`SILK_UI_METAL_HUD=1 silk task dev`), give the window target `.metalHud(true)`, or switch it while the app runs with `ui-inspect-cli metal-hud on` or the `ui_metal_hud` tool. Other systems show nothing.
+- On macOS 13 and later, the Metal Performance HUD draws the presented frames per second, the frame times and the GPU time over the window. Start any build with `SILK_UI_METAL_HUD=1` (`SILK_UI_METAL_HUD=1 silk task dev`) or give the window target `.metalHud(true)`. Metal decides at startup, so the HUD cannot be switched while the app runs. Other systems show nothing.
 - In JavaScript, `frameStats()` from `@silkui/core` returns what was presented since its last call: `{ frames, fps, dropped, p50, p95, p99, max }`, with frame times in milliseconds. `dropped` counts painted frames the GPU never drew.
 
 ## Turning it off for good
