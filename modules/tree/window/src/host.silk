@@ -1122,6 +1122,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           Option<String>.Some { value } => headless.number(String.view(&value))
           Option<String>.None => -1.0
         }
+        let trace = match move run environmentVariable("SILK_UI_BENCH_TRACE") {
+          Option<String>.Some { value } => headless.number(String.view(&value))
+          Option<String>.None => -1.0
+        }
         return run runBench<H, S, E, R>(
           &mut state,
           collection,
@@ -1132,6 +1136,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           f64.toU32(headless.number(String.view(&spec))),
           x,
           y,
+          trace,
         )
       }
       if let Option<String>.Some { value: script } = move run headless.requested() {
@@ -2220,6 +2225,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     frames: u32,
     pointerX: f64,
     pointerY: f64,
+    trace: f64,
   ) -> i32
     ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? R | &mut Allocator {
@@ -2260,6 +2266,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       scale: 2.0,
       time: 0.0,
     }
+    // `SILK_UI_VERIFY_CACHES=1`: every repair of the paint caches is compared with a rebuild.
+    tree.repair.verify = (run environmentVariable("SILK_UI_VERIFY_CACHES")).isSome()
     let mut frame: u32 = 0
     let mut counted: u32 = 0
     let mut tickSum: f64 = 0.0
@@ -2317,6 +2325,28 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
           benchDigest(&tree, String.view(&wanted) == "dump")
         }
       } else {
+        // `SILK_UI_BENCH_TRACE=<ms>`: one line for each frame whose layout step took that long.
+        if trace >= 0.0 && (layoutEnd - layoutStart) * 1000.0 >= trace {
+          StderrWriter.print(
+            "bench-frame: frame={} layout-ms={} skipped={} mode={} laid-out={} reused={} resolved={} all={} moved-ranges={} edited-ranges={} uncarried={} why={} nodes={} fragments={}\n",
+            &(
+              frame,
+              (layoutEnd - layoutStart) * 1000.0,
+              tree.stats.layoutSkipped,
+              tree.output.lastMode,
+              tree.stats.layout.fullLayouts,
+              tree.stats.layout.reusedLayouts,
+              tree.output.fragments.resolved,
+              tree.output.fragments.resolvedAll,
+              tree.output.fragments.resolvedMoved,
+              tree.output.fragments.resolvedEdited,
+              tree.repair.uncarried,
+              tree.repair.uncarriedWhy,
+              tree.stats.nodes,
+              tree.stats.fragments,
+            ),
+          )
+        }
         counted = counted + 1
         tickSum = tickSum + (layoutStart - tickStart)
         layoutSum = layoutSum + (layoutEnd - layoutStart)
@@ -2355,6 +2385,10 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       }
       frame = frame + 1
     }
+    StderrWriter.print(
+      "bench: paint-caches repaired={} rebuilt={} (uncarried={} fragile={}) verify={} mismatches={}\n",
+      &(tree.repair.repairs, tree.repair.rebuilds, tree.repair.uncarried, tree.repair.fragileRebuilds, tree.repair.verify, tree.repair.mismatches),
+    )
     StderrWriter.print("bench: done\n", &())
     run inspector.close()
     platform.closeWindow(owner)
