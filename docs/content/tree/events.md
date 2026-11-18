@@ -118,6 +118,8 @@ What a finger does on its own follows `touch-action`, as in a browser. Once the 
 .carousel { touch-action: pan-y; }   /* the page scrolls, horizontal swipes are the app's */
 ```
 
+Each finger also gets touch records, `TouchStart`, `TouchMove`, `TouchEnd` and `TouchCancel`, for nodes listening with `LISTEN_TOUCH`. They come after the finger's pointer records and go to the node the finger went down on until it lifts, as DOM touch events do. A touch record a handler can still act on has `detail` 1. Preventing a `TouchStart`, or the `TouchMove` that would start a pan, keeps the whole gesture from the tree: nothing pans, and the tap does not click. Preventing a finger's pointer records does not, as on the web. Once the tree pans, `TouchMove` goes on with `detail` 0. JavaScript apps get these as `TouchEvent`s with `touches`, `targetTouches` and `changedTouches`, followed by a tap's compatibility mouse events just before its click.
+
 A trackpad pinch arrives as `Input.Pinch` and reaches clients as browsers report it: a wheel record with control held, `deltaY` negative when zooming in.
 
 ## Answering

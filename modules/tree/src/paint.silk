@@ -4,10 +4,14 @@
 //! paths. Clips become content masks and opacity an isolated layer. A subtree whose paint inputs
 //! did not change since the previous frame is copied from the previous scene with
 //! `Scene.replay`.
-import layout.lib { WritingMode }
+import layout.lib { WritingMode, DisplayInside, BorderCollapse }
 import mutation { ObjectFit, Overflow, Dimension, DimensionKind }
 import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position }
 import style { Computed, Fill }
+import first_letter
+import properties.computed as computed_values
+import read_fonts.model.charmap { Charmap }
+import properties.computed { DecorationLine }
 import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
 import resources { Resources, Resource }
 import scrollbar { geometryOf, Thumb, rangeOf, scrolls, usedOverflow }
@@ -49,6 +53,7 @@ import ui_scene.effects { LayerEffects }
 import paint_effects
 import depth_sort
 import depth_sort { Polygon }
+import table_borders
 import paint_css { Effects, TextShadow, Clip }
 import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
@@ -116,6 +121,8 @@ pub struct Painter<'p, 'a> {
   pub atlas: &'p mut Atlas,
   pub glyphs: &'p mut GlyphCache,
   pub textInk: &'p mut List<TextInk>,
+  /// The first line boxes with a `::first-line` style (see `firstLineOver`).
+  pub firstLines: &'p List<first_letter.FirstLine>,
   pub resources: &'p mut Resources,
   pub paths: &'p mut PathCache,
   pub scene: &'p mut Scene,
@@ -317,6 +324,12 @@ fn backgroundOf(fill: Fill) -> Background {
   }
 }
 
+/// `empty-cells: hide` on a cell with nothing in flow, in a table with separate borders.
+fn emptyHidden(c: &Computed, f: &Fragment) -> bool {
+  return c.emptyCellsHide && f.firstChild == NO_INDEX && c.layout.borderCollapse == BorderCollapse.Separate
+    && c.layout.display.insideIs(DisplayInside.TableCell)
+}
+
 fn hasEdge(edges: u8, bit: u8) -> bool {
   return u8.bitAnd(edges, bit) != 0
 }
@@ -478,7 +491,8 @@ effect fn decorate(
     )
   }
   let mut widths = Insets<f32>.zero()
-  if c.paint.borderStyle != StyleBorder.None {
+  // A collapsed table's borders are painted by the table (table_borders).
+  if c.paint.borderStyle != StyleBorder.None && !table_borders.collapsedPart(c) {
     if hasEdge(edges, 1) {
       widths.top = borderWidth(c.paint.border.top * s)
     }
@@ -687,23 +701,30 @@ effect fn paintColumnRules(
           if previous != NO_INDEX {
             let a = borderBox(&values[previous])
             let b = borderBox(&values[column])
-            let left = if b.xMin >= a.xMax {
-              a.xMax
-            } else {
-              b.xMax
-            }
-            let right = if b.xMin >= a.xMax {
-              b.xMin
-            } else {
-              a.xMin
-            }
-            let middle = (left + right) * 0.5
             let half = rule.width * 0.5
-            let top = f32.min(a.yMin, b.yMin)
-            let bottom = f32.max(a.yMax, b.yMax)
-            let line = snapped(device(Rect<f32>.new(middle - half, top, middle + half, bottom), s))
+            // Columns of a vertical writing mode follow each other downwards:
+            // their rule runs across, between them.
+            let across = b.xMin < a.xMax && a.xMin < b.xMax
+            let mut rect = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+            if across {
+              let upper = if b.yMin >= a.yMax { a.yMax } else { b.yMax }
+              let lower = if b.yMin >= a.yMax { b.yMin } else { a.yMin }
+              let middle = (upper + lower) * 0.5
+              // A vertical-rl column flow's own box starts at the column's right
+              // edge, so the rule spans the column set's width instead.
+              let setRect = borderBox(&values[set])
+              rect = Rect<f32>.new(setRect.xMin, middle - half, setRect.xMax, middle + half)
+            } else {
+              let left = if b.xMin >= a.xMax { a.xMax } else { b.xMax }
+              let right = if b.xMin >= a.xMax { b.xMin } else { a.xMin }
+              let middle = (left + right) * 0.5
+              rect = Rect<f32>.new(middle - half, f32.min(a.yMin, b.yMin), middle + half, f32.max(a.yMax, b.yMax))
+            }
+            let line = snapped(device(rect, s))
             let w = f32.max(1.0, line.xMax - line.xMin)
-            let bounds = Rect<f32>.new(line.xMin, line.yMin, line.xMin + w, line.yMax)
+            let h = f32.max(1.0, line.yMax - line.yMin)
+            let mut bounds = Rect<f32>.new(line.xMin, line.yMin, line.xMin + w, line.yMax)
+            if across { bounds = Rect<f32>.new(line.xMin, line.yMin, line.xMax, line.yMin + h) }
             if rule.style == StyleBorder.Dashed {
               let mut quad = Quad.fill(
                 bounds,
@@ -711,6 +732,7 @@ effect fn paintColumnRules(
                 Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
               )
               quad.borderWidths = Insets<f32> { top: 0.0, right: 0.0, bottom: 0.0, left: w }
+              if across { quad.borderWidths = Insets<f32> { top: h, right: 0.0, bottom: 0.0, left: 0.0 } }
               quad.borderColor = color
               quad.borderStyle = BorderStyle.Dashed
               drop run p.scene.quad(quad)
@@ -919,6 +941,44 @@ effect fn paintTextNormally(p: &mut Painter<'_, '_>, index: usize, slot: u32, f:
   run paintTextAs(&mut p, index, slot, f, mask, Option<Rgba<f32>>.None, Option<Rgba<f32>>.None)
 }
 
+/// The `::first-line` values over text fragment `f` of `slot` when it lies on a first line
+/// box with one. They pass to the text through the elements on the line, so a value its element
+/// changes from the block's stays (CSS Pseudo 4 §2.4); only paint values apply.
+fn firstLineOver(p: &Painter<'_, '_>, f: &Fragment, slot: u32, c: &mut Computed, color: &mut Rgba<f32>) -> () {
+  let values = p.output.fragments.values.asSlice()
+  let mut at = f.parent
+  let mut steps: usize = 0
+  while at != NO_INDEX && values[at].kind != FragmentKind.Line && steps < 16 {
+    at = values[at].parent
+    steps = steps + 1
+  }
+  if at == NO_INDEX || values[at].kind != FragmentKind.Line { return () }
+  let lines = p.firstLines.asSlice()
+  let mut i: usize = 0
+  while i < lines.length {
+    if lines[i].line == at {
+      let nodes = p.nodes.asSlice()
+      let line = &nodes[u32.toUsize(lines[i].slot)].computed.text
+      let block = &nodes[u32.toUsize(lines[i].origin)].computed.text
+      if &c.text.color == &block.color { c.text.color = line.color }
+      if c.text.fillColor == block.fillColor { c.text.fillColor = line.fillColor }
+      if sameLines(c.text.decoration, block.decoration) && &c.text.decorationColor == &block.decorationColor && c.text.wavy == block.wavy {
+        c.text.decoration = line.decoration
+        c.text.decorationColor = line.decorationColor
+        c.text.hasDecorationColor = line.hasDecorationColor
+        c.text.wavy = line.wavy
+      }
+      color.* = c.text.fill()
+      return ()
+    }
+    i = i + 1
+  }
+}
+
+fn sameLines(a: DecorationLine, b: DecorationLine) -> bool {
+  return a.underline == b.underline && a.overline == b.overline && a.lineThrough == b.lineThrough
+}
+
 /// Paints a text fragment: its glyph run, as shaped during layout, and its decorations, all in
 /// `shadow` when set (a text shadow's pass).
 effect fn paintTextAs(
@@ -967,6 +1027,7 @@ effect fn paintTextAs(
       limit = String.byteLength(String.view(&e.display)) - 3
     }
   }
+  if p.firstLines.length() != 0 { firstLineOver(&p.*, &f, slot, &mut c, &mut color) }
   if let Option.Some { value } = foreground {
     color = value
     c.text.color = value
@@ -1183,6 +1244,10 @@ effect fn paintTextAs(
       }
     }
   }
+  if c.text.emphasis.mark != 0 && p.nodes.asSlice()[u32.toUsize(slot)].kind != NodeKind.Input {
+    let markColor = if shadowed || c.text.emphasis.color == 0 { color } else { unpackColor(c.text.emphasis.color) }
+    run paintEmphasis(&mut p, slot, &f, t.shapeKey, t.fontKey, &c, markColor, mask)
+  }
   let line = c.text.decoration
   if line.underline || line.overline || line.lineThrough {
     let size = shaped.size
@@ -1271,6 +1336,142 @@ effect fn paintTextAs(
         mask,
       )
     }
+  }
+}
+
+fn unpackColor(word: u32) -> Rgba<f32> {
+  return Rgba<f32> {
+    r: u32.toF32(word & 255) / 255.0,
+    g: u32.toF32((word / 256) & 255) / 255.0,
+    b: u32.toF32((word / 65536) & 255) / 255.0,
+    a: u32.toF32(word / 16777216) / 255.0,
+  }
+}
+
+/// `text-emphasis` marks (CSS Text Decoration 3 §3): one per typographic character of the
+/// fragment, none on spaces, controls and punctuation, centered on the character's advance, half
+/// the font size, beyond the text's over or under edge. Keyword marks are drawn as shapes; a
+/// string's first character from the text's own face when it has the glyph.
+effect fn paintEmphasis(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, shapeKey: usize, fontKey: usize,
+  c: &Computed, color: Rgba<f32>, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let emphasis = c.text.emphasis
+  let mode = c.text.writingMode
+  let vertical = mode != WritingMode.HorizontalTb
+  let reverse = mode == WritingMode.SidewaysLr
+  let s = p.scale
+  let size = p.text.glyphRun(shapeKey).size
+  let m = size * 0.5
+  let under = if vertical { emphasis.left } else { emphasis.under }
+  let mut mark = emphasis.mark
+  if mark < computed_values.EMPHASIS_KEYWORD + 16 && mark >= computed_values.EMPHASIS_KEYWORD && mark % 8 == 0 {
+    // `filled` or `open` alone: circles across, sesame down.
+    let shape: u32 = if vertical { 5 } else { 2 }
+    mark = mark + shape
+  }
+  let mut custom: u32 = 0
+  if mark >= 32 && fontKey < p.faces.length() {
+    if let Option<FontFace>.Some { value: face } = &p.faces.asSlice()[fontKey].face {
+      let map = Charmap.new(&face.font)
+      if let Option.Some { value: glyph } = map.mapUnicode(mark) { custom = glyph.toU32() }
+    }
+    if custom == 0 { return () }
+  }
+  // Centers first: the glyphs and the text are borrowed from the painter that draws.
+  let mut centers = List<f32>.make()
+  let glyphs = p.text.runGlyphs(shapeKey)
+  // The fragment's own text node: `slot` is the element that styles it.
+  let own = slotIn(&p.slotOfCss.*, f.source)
+  if own == NONE { return () }
+  let text = String.utf8Bytes(String.view(&p.nodes.asSlice()[u32.toUsize(own)].text))
+  let mut i: usize = 0
+  while i < glyphs.length {
+    let cluster = glyphs[i].cluster
+    // An upright glyph's pen sits at the end of its advance in the line direction.
+    let back: f32 = if vertical && glyphs[i].upright { glyphs[i].advance } else { 0.0 }
+    let mut low = glyphs[i].x - back
+    let mut high = glyphs[i].x - back + glyphs[i].advance
+    let mut j = i + 1
+    while j < glyphs.length && glyphs[j].cluster == cluster {
+      let shift: f32 = if glyphs[j].upright { glyphs[j].advance } else { 0.0 }
+      low = f32.min(low, glyphs[j].x - shift)
+      high = f32.max(high, glyphs[j].x - shift + glyphs[j].advance)
+      j = j + 1
+    }
+    i = j
+    if cluster >= text.length || !first_letter.emphasized(first_letter.decodeAt(text, cluster)) { continue }
+    let along = (low + high) * 0.5
+    if !vertical {
+      run centers.append(f.worldLocation.x + along)
+      run centers.append(if under { f.worldLocation.y + f.size.height + m * 0.5 } else { f.worldLocation.y - m * 0.5 })
+    } else {
+      // Beside the em box, centered in the line: the half-leading does not push marks away.
+      let middle = f.worldLocation.x + f.size.width * 0.5
+      run centers.append(if under { middle - (size + m) * 0.5 } else { middle + (size + m) * 0.5 })
+      run centers.append(if reverse { f.worldLocation.y + f.size.height - along } else { f.worldLocation.y + along })
+    }
+  }
+  let mut k: usize = 0
+  while k + 1 < centers.length() {
+    let cx = centers.get(k)
+    let cy = centers.get(k + 1)
+    k = k + 2
+    if custom != 0 {
+      if let Option<FontFace>.Some { value: face } = &p.faces.asSlice()[fontKey].face {
+        let mut outline = GlyphRasterizer.make()
+        if run outline.outlinePath(&face, custom, f32.toF64(m * s), 0.0, 0.0) {
+          // The mark's em box is centered: its baseline sits 0.35 em below the center.
+          let transform = Affine.new(1.0, 0.0, 0.0, 1.0, f32.toF64((cx - m * 0.5) * s), f32.toF64((cy + m * 0.35) * s))
+          drop run Effect.catchAll(p.paths.fill(&mut p.scene, 0, outline.lastPath(), &transform, NONZERO, Background.solid(color), mask), noPath)
+        }
+      }
+      continue
+    }
+    run emphasisShape(&mut p, mark - computed_values.EMPHASIS_KEYWORD, cx * s, cy * s, m * s, color, mask)
+  }
+}
+
+/// Keyword mark `code` (shape plus 8 when open) centered at (`x`, `y`), in an `em` box, device
+/// pixels.
+effect fn emphasisShape(p: &mut Painter<'_, '_>, code: u32, x: f32, y: f32, em: f32, color: Rgba<f32>, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let open = code >= 8
+  let shape = code % 8
+  let transform = Affine.new(f32.toF64(em), 0.0, 0.0, f32.toF64(em), f32.toF64(x), f32.toF64(y))
+  let line = Stroke.make(0.08)
+  let mut path = VectorPath.make()
+  let mut inner = VectorPath.make()
+  if shape == 1 { run path.circle(0.0, 0.0, 0.17) }
+  else if shape == 2 { run path.circle(0.0, 0.0, 0.4) }
+  else if shape == 3 {
+    run path.circle(0.0, 0.0, 0.4)
+    run inner.circle(0.0, 0.0, 0.2)
+  } else if shape == 4 {
+    run path.moveTo(0.0, -0.4)
+    run path.lineTo(0.42, 0.32)
+    run path.lineTo(-0.42, 0.32)
+    run path.close()
+  } else if shape == 5 {
+    // A sesame dot (U+FE45): a teardrop, its tail up and to the left.
+    run path.moveTo(-0.17, -0.36)
+    run path.cubicTo(0.05, -0.22, 0.3, -0.05, 0.25, 0.15)
+    run path.cubicTo(0.22, 0.35, -0.05, 0.38, -0.08, 0.18)
+    run path.cubicTo(-0.1, 0.0, -0.12, -0.2, -0.17, -0.36)
+    run path.close()
+  } else {
+    return ()
+  }
+  if open {
+    drop run Effect.catchAll(p.paths.stroke(&mut p.scene, 0, &path, &line, &transform, Background.solid(color), mask), noPath)
+    if shape == 3 { drop run Effect.catchAll(p.paths.stroke(&mut p.scene, 0, &inner, &line, &transform, Background.solid(color), mask), noPath) }
+  } else if shape == 3 {
+    // ◉: a ring around a dot.
+    drop run Effect.catchAll(p.paths.stroke(&mut p.scene, 0, &path, &line, &transform, Background.solid(color), mask), noPath)
+    drop run Effect.catchAll(p.paths.fill(&mut p.scene, 0, &inner, &transform, NONZERO, Background.solid(color), mask), noPath)
+  } else {
+    drop run Effect.catchAll(p.paths.fill(&mut p.scene, 0, &path, &transform, NONZERO, Background.solid(color), mask), noPath)
   }
 }
 
@@ -2591,7 +2792,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let opened = run paint_effects.pushEffects(&mut p, slot, &c, &f, mask.bounds, mask)
     if c.text.visible && !f.nonpainting {
       let rootPaints = p.only == NONE && p.stacking.rootElement(index)
-      if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints {
+      if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints && !emptyHidden(&c, &f) {
         run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
         if c.effects.declared && textClipped(&p.*, slot) {
           run paintTextClip(&mut p, index, slot, &c, &f, mask)
@@ -2633,6 +2834,10 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     if scrolled && open {
       p.cull = saved
       run p.scene.popScrollGroup()
+    }
+    if c.text.visible && !f.nonpainting && c.layout.borderCollapse == BorderCollapse.Collapse
+      && c.layout.display.insideIs(DisplayInside.Table) {
+      run table_borders.paint(&mut p.scene, &p.output.*, &p.slotOfCss.*, &p.nodes.*, index, slot, p.scale, mask)
     }
     if c.clips() && c.text.visible {
       run paintThumbs(&mut p, slot, &c, &f, mask)
