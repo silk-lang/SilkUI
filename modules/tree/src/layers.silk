@@ -346,12 +346,143 @@ pub fn containingFragment(output: &LayoutTree, slots: &List<u32>, nodes: &List<N
   return last
 }
 
-/// `transformOf` flattened onto the plane.
+/// How fragment `index`'s layout space maps onto its parent's, on the plane: its transform
+/// flattened, or None when it has none. In a 3D rendering context it is what the context's
+/// accumulated matrices make of it: the child's plane mapped into its parent's plane, so that
+/// composing the maps up the tree flattens only once, where the context does.
+@inlineAlways
 pub fn flatOf(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Option<Matrix3<f32>> {
   return match transformOf(output, slots, nodes, index) {
-    Option.Some { value } => Option<Matrix3<f32>>.some(transform.flatten(value))
+    Option.Some { value } => Option<Matrix3<f32>>.some(flatIn(output, slots, nodes, index, value))
     Option.None => Option<Matrix3<f32>>.None
   }
+}
+
+/// `flatOf` for fragment `index` with the transform `own`, kept out of line so the common
+/// untransformed case stays cheap.
+@inlineNever
+fn flatIn(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize, own: Matrix4<f32>) -> Matrix3<f32> {
+  let parent = planeParent(output, slots, nodes, index)
+  if parent == NO_INDEX {
+    return transform.flatten(own)
+  }
+  let outer = accumulated(output, slots, nodes, parent)
+  let inner = transform.flatten(outer * own)
+  return match transform.flatten(outer).inverse() {
+    Option.Some { value } => value * inner
+    Option.None => transform.flatten(own)
+  }
+}
+
+/// Whether node `node` keeps its children in its 3D rendering context: `transform-style:
+/// preserve-3d` without a grouping property that flattens it (opacity, filters, clip paths,
+/// masks, blending, isolation, overflow clipping), as Chromium decides it.
+pub fn preserves(node: &Node) -> bool {
+  let c = &node.computed
+  return c.transform.preserve3d && node.kind != NodeKind.Text && c.paint.opacity >= 1.0
+    && c.paint.backdropBlur <= 0.0 && !c.effects.layered && !c.clips()
+}
+
+/// The fragment of the nearest element box above fragment `index`, or NO_INDEX.
+fn parentElement(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> usize {
+  let values = output.fragments.values.asSlice()
+  let mut at = values[index].parent
+  while at != NO_INDEX {
+    if elementSlot(output, slots, nodes, at) != NONE {
+      return at
+    }
+    at = values[at].parent
+  }
+  return NO_INDEX
+}
+
+/// For fragment `index` with a plane of its own in a 3D rendering context it does not
+/// establish, the fragment of the box whose context it extends; NO_INDEX otherwise. A child of
+/// a box that preserves 3D has a plane when it is transformed, preserves 3D itself or hides
+/// its back face; any other child paints into its parent's plane, where it lies anyway.
+pub fn planeParent(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> usize {
+  let slot = elementSlot(output, slots, nodes, index)
+  if slot == NONE {
+    return NO_INDEX
+  }
+  let t = &nodes.asSlice()[u32.toUsize(slot)].computed.transform
+  if !t.any() && !t.preserve3d && !t.hideBackface {
+    return NO_INDEX
+  }
+  let parent = parentElement(output, slots, nodes, index)
+  if parent == NO_INDEX
+    || !preserves(&nodes.asSlice()[u32.toUsize(elementSlot(output, slots, nodes, parent))]) {
+    return NO_INDEX
+  }
+  return parent
+}
+
+/// Whether fragment `index` establishes a 3D rendering context: it preserves 3D and does not
+/// extend its parent's.
+pub fn establishes(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> bool {
+  let slot = elementSlot(output, slots, nodes, index)
+  return slot != NONE && preserves(&nodes.asSlice()[u32.toUsize(slot)])
+    && planeParent(output, slots, nodes, index) == NO_INDEX
+}
+
+/// The fragment of the root of the 3D rendering context in which fragment `index` has a plane
+/// of its own (itself when it establishes one), or NO_INDEX.
+pub fn contextOf(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> usize {
+  let mut at = planeParent(output, slots, nodes, index)
+  if at == NO_INDEX {
+    return if establishes(output, slots, nodes, index) { index } else { NO_INDEX }
+  }
+  let mut up = planeParent(output, slots, nodes, at)
+  while up != NO_INDEX {
+    at = up
+    up = planeParent(output, slots, nodes, at)
+  }
+  return at
+}
+
+/// The fragment after `index` in tree order within the subtree of `root`, or NO_INDEX.
+pub fn nextInTree(output: &LayoutTree, index: usize, root: usize) -> usize {
+  let values = output.fragments.values.asSlice()
+  if values[index].firstChild != NO_INDEX {
+    return values[index].firstChild
+  }
+  let mut at = index
+  while at != root && at != NO_INDEX {
+    if values[at].nextSibling != NO_INDEX {
+      return values[at].nextSibling
+    }
+    at = values[at].parent
+  }
+  return NO_INDEX
+}
+
+/// The 3D matrix from fragment `index`'s layout space to the space its 3D rendering context
+/// flattens into: its own transform, after those of the planes it extends up to the context's
+/// root. Outside a context, its own transform.
+pub fn accumulated(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Matrix4<f32> {
+  let mut m = ownMatrix(output, slots, nodes, index)
+  let mut at = planeParent(output, slots, nodes, index)
+  while at != NO_INDEX {
+    m = ownMatrix(output, slots, nodes, at) * m
+    at = planeParent(output, slots, nodes, at)
+  }
+  return m
+}
+
+/// `transformOf`, or for a box without a transform its parent's `perspective`, which reaches
+/// the planes of a 3D rendering context through it.
+fn ownMatrix(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Matrix4<f32> {
+  if let Option.Some { value } = transformOf(output, slots, nodes, index) {
+    return value
+  }
+  let parent = parentElement(output, slots, nodes, index)
+  if parent != NO_INDEX {
+    let pc = &nodes.asSlice()[u32.toUsize(elementSlot(output, slots, nodes, parent))].computed
+    if pc.transform.deep() {
+      return transform.perspectiveOf(&pc.transform, borderOf(&output.fragments.values.asSlice()[parent]))
+    }
+  }
+  return Matrix4<f32>.identity()
 }
 
 /// Whether fragment `index` is a transformed box showing its back with `backface-visibility:
@@ -360,6 +491,9 @@ pub fn hiddenBack(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, in
   let slot = elementSlot(output, slots, nodes, index)
   if slot == NONE || !nodes.asSlice()[u32.toUsize(slot)].computed.transform.hideBackface {
     return false
+  }
+  if planeParent(output, slots, nodes, index) != NO_INDEX {
+    return transform.backFacing(&accumulated(output, slots, nodes, index))
   }
   return match transformOf(output, slots, nodes, index) {
     Option.Some { value } => transform.backFacing(&value)
@@ -379,17 +513,58 @@ pub fn visualRect(
   width: f32,
   height: f32,
 ) -> Rect<f32> {
+  // The corners travel up exactly while every one maps in front of the viewer, so the box
+  // bounds the mapped quad, not boxes of boxes; after that, boxes. Until the first transform
+  // the rect itself is exact.
+  let mut xs: [f32; 4] = [0.0; 4]
+  let mut ys: [f32; 4] = [0.0; 4]
+  let mut corners = false
+  let mut exact = true
   let mut out = rect
   let mut at = index
   while at != NO_INDEX {
     match flatOf(output, slots, nodes, at) {
       Option.Some { value } => {
+        if exact && !corners {
+          xs = [out.xMin, out.xMax, out.xMax, out.xMin]
+          ys = [out.yMin, out.yMin, out.yMax, out.yMax]
+          corners = true
+        }
+        if exact {
+          let mut k: usize = 0
+          while k < 4 && exact {
+            match transform.map(&value, xs[k], ys[k]) {
+              Option.Some { value: point } => {
+                xs[k] = point.x
+                ys[k] = point.y
+              }
+              Option.None => {
+                exact = false
+              }
+            }
+            k = k + 1
+          }
+        }
         out = transform.mapRect(&value, out)
       }
       Option.None => {}
     }
     let own = ownShift(output, slots, css, nodes, at, width, height)
     out = moved(out, own)
+    if corners && exact {
+      let mut k: usize = 0
+      while k < 4 {
+        xs[k] = xs[k] + own.x
+        ys[k] = ys[k] + own.y
+        k = k + 1
+      }
+      out = Rect<f32>.new(
+        f32.min(f32.min(xs[0], xs[1]), f32.min(xs[2], xs[3])),
+        f32.min(f32.min(ys[0], ys[1]), f32.min(ys[2], ys[3])),
+        f32.max(f32.max(xs[0], xs[1]), f32.max(xs[2], xs[3])),
+        f32.max(f32.max(ys[0], ys[1]), f32.max(ys[2], ys[3])),
+      )
+    }
     at = output.fragments.values.asSlice()[at].parent
   }
   return out
