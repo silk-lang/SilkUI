@@ -15,6 +15,8 @@ interface Handlers<T extends Silk.Node> {
   onPointerEnter: Silk.PointerEvent;
   onPointerLeave: Silk.PointerEvent;
   onPointerCancel: Silk.PointerEvent;
+  onPointerOver: Silk.PointerEvent;
+  onPointerOut: Silk.PointerEvent;
   onWheel: Silk.WheelEvent;
   onKeyDown: Silk.KeyboardEvent;
   onKeyUp: Silk.KeyboardEvent;
