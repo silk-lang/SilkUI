@@ -591,16 +591,36 @@ class HTMLInputElement extends HTMLElement {
     return this.node.selectionStart;
   }
 
+  set selectionStart(value) {
+    this.node.selectionStart = value;
+  }
+
   get selectionEnd() {
     return this.node.selectionEnd;
   }
 
-  setSelectionRange(start, end) {
-    this.node.setSelectionRange(start, end);
+  set selectionEnd(value) {
+    this.node.selectionEnd = value;
+  }
+
+  get selectionDirection() {
+    return this.node.selectionDirection;
+  }
+
+  set selectionDirection(value) {
+    this.node.selectionDirection = value;
+  }
+
+  setSelectionRange(start, end, direction) {
+    this.node.setSelectionRange(start, end, direction);
+  }
+
+  setRangeText(...args) {
+    this.node.setRangeText(...args);
   }
 
   select() {
-    this.node.setSelectionRange(0, this.node.value.length);
+    this.node.select();
   }
 }
 

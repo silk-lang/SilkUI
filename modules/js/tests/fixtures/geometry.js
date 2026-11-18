@@ -1,7 +1,7 @@
 // Layout reads, scrolling, CSS.supports and the observers on the tree. The host runs this,
 // then lays out a frame and runs the observers, then `geometryAfterFrame`.
 import {
-  IntersectionObserver, ResizeObserver, createBox, elementFromPoint, elementsFromPoint, mount, supports,
+  IntersectionObserver, ResizeObserver, createBox, createRange, createText, elementFromPoint, elementsFromPoint, mount, supports,
 } from "@silkui/core";
 
 const check = (label, got, want) => {
@@ -106,3 +106,15 @@ globalThis.geometryAfterFrame = (step) => {
     globalThis.geometryChecked = true;
   }
 };
+
+// Range geometry: a range over text has rectangles, read through the tree.
+{
+  const text = createText("hello world");
+  root.appendChild(text);
+  const range = createRange();
+  range.setStart(text, 0);
+  range.setEnd(text, 5);
+  check("range rects", range.getClientRects().length > 0, true);
+  check("range bounds", range.getBoundingClientRect().width > 0, true);
+  root.removeChild(text);
+}
