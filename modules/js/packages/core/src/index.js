@@ -800,7 +800,8 @@ export class Node {
    * app's own, sent with `dispatchEvent`.
    */
   addEventListener(type, listener, options) {
-    if (listener == null) return;
+    const signal = options?.signal;
+    if (listener == null || signal?.aborted) return;
     const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
@@ -809,6 +810,7 @@ export class Node {
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
     if (kind !== undefined) this.#want(kind);
+    signal?.addEventListener("abort", () => this.removeEventListener(type, listener, capture), { once: true });
   }
 
   removeEventListener(type, listener, options) {
