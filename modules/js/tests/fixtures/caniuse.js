@@ -265,9 +265,13 @@ check("indexeddb2", false, () => global("indexedDB"));
 check("input-file-directory", false, () => typeof globalThis.showDirectoryPicker === "function");
 check("input-selection", true, () => {
   const field = ui.createInput();
-  field.value = "Hello";
-  field.setSelectionRange(1, 3);
-  return typeof field.selectionStart === "number" && typeof field.selectionEnd === "number";
+  field.value = "a\u{1F600}\u00e9b";
+  field.setSelectionRange(1, 4, "backward");
+  if (field.selectionStart !== 1 || field.selectionEnd !== 4 || field.selectionDirection !== "backward") return false;
+  field.setRangeText("XY", 1, 3, "select");
+  if (field.value !== "aXY\u00e9b" || field.selectionEnd !== 3) return false;
+  field.select();
+  return field.selectionStart === 0 && field.selectionEnd === 5;
 });
 check("intersectionobserver", false, () => global("IntersectionObserver"));
 check("intersectionobserver-v2", false, () => global("IntersectionObserver"));
