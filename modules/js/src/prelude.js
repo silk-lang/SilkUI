@@ -108,7 +108,7 @@
   forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
   globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
   const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent"]) {
+  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
     Object.defineProperty(globalThis, name, {
       get: () => {
         const value = api()[name];
@@ -185,6 +185,7 @@
   if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
   Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
   Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
+  Object.defineProperty(globalThis.navigator, "getBattery", { value: () => api().getBattery(), writable: true, configurable: true });
 
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
