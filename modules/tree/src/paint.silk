@@ -4,7 +4,7 @@
 //! paths. Clips become content masks and opacity an isolated layer. A subtree whose paint inputs
 //! did not change since the previous frame is copied from the previous scene with
 //! `Scene.replay`.
-import layout.lib { WritingMode }
+import layout.lib { WritingMode, DisplayInside, BorderCollapse }
 import mutation { ObjectFit, Overflow, Dimension, DimensionKind }
 import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position }
 import style { Computed, Fill }
@@ -45,6 +45,7 @@ import ui_scene.scene { Scene }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition }
 import ui_scene.effects { LayerEffects }
 import paint_effects
+import table_borders
 import paint_css { Effects, TextShadow, Clip }
 import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
@@ -301,6 +302,12 @@ fn backgroundOf(fill: Fill) -> Background {
   }
 }
 
+/// `empty-cells: hide` on a cell with nothing in flow, in a table with separate borders.
+fn emptyHidden(c: &Computed, f: &Fragment) -> bool {
+  return c.emptyCellsHide && f.firstChild == NO_INDEX && c.layout.borderCollapse == BorderCollapse.Separate
+    && c.layout.display.insideIs(DisplayInside.TableCell)
+}
+
 fn hasEdge(edges: u8, bit: u8) -> bool {
   return u8.bitAnd(edges, bit) != 0
 }
@@ -441,7 +448,8 @@ effect fn decorate(
     )
   }
   let mut widths = Insets<f32>.zero()
-  if c.paint.borderStyle != StyleBorder.None {
+  // A collapsed table's borders are painted by the table (table_borders).
+  if c.paint.borderStyle != StyleBorder.None && !table_borders.collapsedPart(c) {
     if hasEdge(edges, 1) {
       widths.top = borderWidth(c.paint.border.top * s)
     }
@@ -2168,7 +2176,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let opened = run paint_effects.pushEffects(&mut p, slot, &c, &f, mask.bounds, mask)
     if c.text.visible && !f.nonpainting {
       let rootPaints = p.only == NONE && p.stacking.rootElement(index)
-      if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints {
+      if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints && !emptyHidden(&c, &f) {
         run decorate(&mut p, slot, &c, &f, f.decorationEdges, mask)
         if c.effects.declared && textClipped(&p.*, slot) {
           run paintTextClip(&mut p, index, slot, &c, &f, mask)
@@ -2204,6 +2212,10 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     if scrolled && open {
       p.cull = saved
       run p.scene.popScrollGroup()
+    }
+    if c.text.visible && !f.nonpainting && c.layout.borderCollapse == BorderCollapse.Collapse
+      && c.layout.display.insideIs(DisplayInside.Table) {
+      run table_borders.paint(&mut p.scene, &p.output.*, &p.slotOfCss.*, &p.nodes.*, index, slot, p.scale, mask)
     }
     if c.clips() && c.text.visible {
       run paintThumbs(&mut p, slot, &c, &f, mask)
