@@ -573,13 +573,18 @@ export class Node {
     native.scrollTo(this.nodeId, x, y);
   }
 
+  scroll(x, y) {
+    native.scrollTo(this.nodeId, x, y);
+  }
+
   /**
    * As on the web. `options` is `true` or `{ capture: true }` for the capture phase, and
-   * `{ once: true }` for a listener that runs once.
+   * `{ once: true }` for a listener that runs once. A type the tree has no event for is the
+   * app's own, sent with `dispatchEvent`.
    */
   addEventListener(type, listener, options) {
+    if (listener == null) return;
     const kind = KIND_OF.get(type);
-    if (kind === undefined && !DRAG_TYPES.has(type)) throw new TypeError("the tree has no event '" + type + "'");
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
@@ -598,6 +603,12 @@ export class Node {
     list.splice(index, 1);
     const kind = KIND_OF.get(type);
     if (kind !== undefined) this.#want(kind);
+  }
+
+  /** Sends `event` (an `Event` or `CustomEvent`) through the tree from this node, as on the web. */
+  dispatchEvent(event) {
+    if (typeof event?.type !== "string") throw new TypeError("dispatchEvent takes an Event");
+    return dispatchEvent(adopt(event, this));
   }
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
@@ -1563,7 +1574,8 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
  * listener prevented the default.
  */
 export function dispatchEvent(event) {
-  const path = event.composedPath();
+  const path = [];
+  for (let node = event.target; node; node = node.parentNode) path.push(node);
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
@@ -1585,6 +1597,28 @@ export function dispatchEvent(event) {
   event.eventPhase = 0;
   event.currentTarget = null;
   return !event.defaultPrevented;
+}
+
+// An event the app made, from the runtime's `Event` class: its target and phase become
+// fields the dispatcher sets, and its stop methods record what the dispatcher reads.
+function adopt(event, target) {
+  if (!("_stopped" in event)) {
+    let stopped = false;
+    let immediate = false;
+    const stop = event.stopPropagation;
+    const stopNow = event.stopImmediatePropagation;
+    Object.defineProperties(event, {
+      _stopped: { get: () => stopped || event.cancelBubble === true, configurable: true },
+      _immediate: { get: () => immediate, configurable: true },
+      stopPropagation: { value() { stopped = true; stop?.call(event); }, configurable: true },
+      stopImmediatePropagation: { value() { stopped = immediate = true; stopNow?.call(event); }, configurable: true },
+    });
+  }
+  for (const [name, value] of [["target", target], ["currentTarget", null], ["eventPhase", 0]]) {
+    if (Object.getOwnPropertyDescriptor(event, name)?.writable) event[name] = value;
+    else Object.defineProperty(event, name, { value, writable: true, configurable: true });
+  }
+  return event;
 }
 
 // The host calls this for every event record, before the tree runs the default action.
