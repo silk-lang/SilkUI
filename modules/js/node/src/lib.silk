@@ -33,12 +33,11 @@ import font_collection.lib { FontCollection }
 import node_runtime.runtime.embed { Host, Options }
 import node_runtime.runtime.embed as embed
 import node_runtime.runtime.session { Runtime, Turn, wakeAt }
-import node_runtime.libs.core.embedder { Embedder, EmbedderCall }
-import node_runtime.libs.core.embedder as embedder
+import node_runtime.libs.core.capabilities { Composition, HostApi, HOST_API_FIRST }
 import node_runtime.libs.core.host { Services }
 import silkjs.js_engine { Engine }
 import silkjs.js_value { ValueBits }
-import silkjs.js_realm { Arguments, lendRealm }
+import silkjs.js_realm { Arguments, Realm, lendRealm }
 import silkjs.js_owned_value { Value }
 import silkjs.js_core_types { NativeFunctionId, NativeCallProtocol, NativeErrorKind }
 import silkjs.js_exceptions { JsException }
@@ -64,6 +63,8 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
+import silk.core.ownership { Copy }
 import silk.num.f64
 import silk.num.u32
 import silk.text.string { String }
@@ -74,45 +75,61 @@ export "C" fn wakeRuntime(address: usize) -> () as "ui_js_node_wake" {
   wakeAt(address)
 }
 
-export "C" fn uiNative(state: ?*mut u8, raw: ?*mut u8) -> u32 as "ui_js_node_native" {
-  let mut stateAnchor: u8 = 0
-  let mut callAnchor: u8 = 0
-  let mut argumentsAnchor: u8 = 0
-  let ui = unsafe Pointer.borrowMut<u8, Bridge>(&mut stateAnchor, unsafe embedder.typed<Bridge>(state))
-  let request = unsafe Pointer.borrowMut<u8, EmbedderCall>(&mut callAnchor, unsafe embedder.typed<EmbedderCall>(raw))
-  let arguments = unsafe Pointer.borrowMut<u8, Arguments<'static>>(&mut argumentsAnchor, unsafe embedder.typed<Arguments<'static>>(request.arguments))
-  let mut allocator = Allocator.systemAllocatorProvider()
-  let called = run Effect.result(bridge.call(&mut ui.*, request.id - embedder.FIRST, arguments.*)) |> Effect.provideMut<Allocator>(&mut allocator)
-  return match move called {
-    Result<Outcome, OutOfMemoryError>.Success { value } => match move value {
-      Outcome.Returned { value: result } => {
-        request.result = result
-        embedder.STATUS_RETURNED
-      }
+/// `__ui.*` in the runtime's realm: the runtime's [`HostApi`], whose ids from
+/// [`HOST_API_FIRST`] are the bridge's functions. The bridge belongs to the running
+/// [`NodeApp`], which lends it before each turn and callback.
+pub struct UiApi { slot: *mut BridgeSlot }
+impl Copy for UiApi {}
+
+unsafe extern "C" fn calloc(count: usize, size: usize) -> ?*mut u8
+/// Where a [`UiApi`] finds the bridge it calls.
+pub struct BridgeSlot { bridge: ?*mut Bridge }
+
+impl UiApi {
+  /// An API with no bridge lent yet. Its slot stays allocated for the life of the process.
+  pub effect fn make() -> UiApi ! OutOfMemoryError ? &mut Allocator {
+    let allocation = unsafe calloc(1, Layout.of<BridgeSlot>().bytes)
+    if Pointer.isNull<u8>(allocation) { fail OutOfMemoryError {} }
+    let slot = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut BridgeSlot>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(allocation))
+    unsafe Pointer.put<BridgeSlot>(slot, BridgeSlot { bridge: Pointer.null<Bridge>() })
+    return UiApi { slot: slot }
+  }
+  fn lend(self: &Self, bridge: &mut Bridge) -> () {
+    let mut anchor: u8 = 0
+    let slot = unsafe Pointer.borrowMut<u8, BridgeSlot>(&mut anchor, self.slot)
+    slot.bridge = Pointer.fromMutRef<Bridge>(&mut bridge.*)
+  }
+}
+
+impl HostApi for UiApi {
+  // Worker threads get no window: their `__ui` calls find no bridge.
+  fn forWorker(self: &Self) -> Self { return self.* }
+  effect fn call<'r, 'm, 'w, C: Composition>(self: &Self, engine: &mut Engine<'m, Services<C>>, id: u32, realm: Realm<'r>, argc: i32, argv: Arguments<'w>) -> ValueBits
+    ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut anchor: u8 = 0
+    let slot = unsafe Pointer.borrowMut<u8, BridgeSlot>(&mut anchor, self.slot)
+    if Pointer.isNull<Bridge>(slot.bridge) { return ValueBits.Undefined }
+    let mut bridgeAnchor: u8 = 0
+    let ui = unsafe Pointer.borrowMut<u8, Bridge>(&mut bridgeAnchor, unsafe Intrinsic.pointerRequalify<?*mut Bridge, *mut Bridge>(slot.bridge))
+    let called = run bridge.call(&mut ui.*, id - HOST_API_FIRST, argv)
+    return match move called {
+      Outcome.Returned { value } => value
       Outcome.TypeError { message } => {
-        let mut engineAnchor: u8 = 0
-        let engine = unsafe Pointer.borrowMut<u8, Engine<'static, Services>>(&mut engineAnchor, unsafe embedder.typed<Engine<'static, Services>>(request.engine))
-        let context = request.context
         let memory = engine.memory
-        drop run Effect.result(errors.throwError(&mut engine.*, memory, unsafe lendRealm(&context, context), NativeErrorKind.Type, message.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator)
-        embedder.STATUS_THREW
+        return run errors.throwError(&mut engine.*, memory, realm, NativeErrorKind.Type, message.asSlice())
       }
       Outcome.Failed { message } => {
-        let mut engineAnchor: u8 = 0
-        let engine = unsafe Pointer.borrowMut<u8, Engine<'static, Services>>(&mut engineAnchor, unsafe embedder.typed<Engine<'static, Services>>(request.engine))
-        let context = request.context
         let memory = engine.memory
-        drop run Effect.result(errors.throwError(&mut engine.*, memory, unsafe lendRealm(&context, context), NativeErrorKind.Internal, message.asSlice())) |> Effect.provideMut<Allocator>(&mut allocator)
-        embedder.STATUS_THREW
+        return run errors.throwError(&mut engine.*, memory, realm, NativeErrorKind.Internal, message.asSlice())
       }
     }
-    Result<Outcome, OutOfMemoryError>.Failure { .. } => embedder.STATUS_OUT_OF_MEMORY
   }
 }
 
 /// A ui-js application in a started runtime: the bridge its `__ui` functions write to.
-pub struct NodeApp<'r, 'e, 'm> {
-  runtime: &'r mut Runtime<'e, 'm>,
+pub struct NodeApp<'r, 'e, 'm, C> {
+  runtime: &'r mut Runtime<'e, 'm, C>,
+  api: UiApi,
   bridge: Bridge,
   openers: Openers,
   /// The runtime finished (process.exit): the window closes.
@@ -121,19 +138,19 @@ pub struct NodeApp<'r, 'e, 'm> {
 }
 
 
-impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
-  /// Installs `__ui` and the prelude in `runtime`'s realm.
-  pub effect fn make(runtime: &'r mut Runtime<'e, 'm>) -> NodeApp<'r, 'e, 'm> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0 }
+impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
+  /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
+  pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0 }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
     return move app
   }
 
-  /// Points the runtime's embedder at this app's bridge, which may have moved since.
+  /// Points the runtime's [`UiApi`] at this app's bridge, which may have moved since.
   fn lend(self: &mut Self) -> () {
-    self.runtime.setEmbedder(Embedder { state: embedder.erase<Bridge>(&mut self.bridge), native: uiNative })
+    self.api.lend(&mut self.bridge)
   }
 
   effect fn install(self: &mut Self) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
@@ -146,7 +163,7 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
     while true {
       match bridge.native(at) {
         Option.Some { value } => {
-          let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: embedder.FIRST + bridge.nativeId(value.name) }, value.name, value.arity, NativeCallProtocol.Generic, 0)
+          let function = run functions.newFunction(&mut engine.*, memory, realm, NativeFunctionId.Host { id: HOST_API_FIRST + bridge.nativeId(value.name) }, value.name, value.arity, NativeCallProtocol.Generic, 0)
           run common.define(&mut engine.*, realm, ui.borrow(), value.name, unsafe Value.adoptBits(function), 7)
         }
         Option.None => { break }
@@ -501,7 +518,7 @@ impl NodeClient {
 
   /// Starts the loads the last batch asked for; what ended is told to the application's
   /// `load` and `error` listeners at once.
-  effect fn load<'r, 'e, 'm>(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> bool
+  effect fn load<'r, 'e, 'm, C: Composition>(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if !(run self.loader.serve(&mut tree)) { return false }
@@ -510,40 +527,47 @@ impl NodeClient {
   }
 }
 
-impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient {
-  effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+/// A [`NodeClient`] as the window client of a runtime of capabilities `C`.
+struct Driven<'c, C> {
+  client: &'c mut NodeClient,
+  // Names `C` in the type, which the window client's conformance needs; always null.
+  composition: ?*mut C,
+}
+
+impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never, never> for Driven<'c, C> {
+  effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let root = tree.current
-    drop run self.stylesheets.serve(&mut tree.*, root)
+    drop run self.client.stylesheets.serve(&mut tree.*, root)
     run tree.frame(input)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
   }
 
-  effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
+  effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
-    drop run self.stylesheets.serve(&mut tree.*, root)
+    drop run self.client.stylesheets.serve(&mut tree.*, root)
     run tree.frameRoot(root, input)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
   }
 
-  fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm>, options: &mut WindowOptions<'_>) -> () {
-    options.titleBar = self.titleBar
-    options.titleBarHeight = self.titleBarHeight
-    options.controlsLeft = self.controlsLeft
-    options.controlsTop = self.controlsTop
+  fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm, C>, options: &mut WindowOptions<'_>) -> () {
+    options.titleBar = self.client.titleBar
+    options.titleBarHeight = self.client.titleBarHeight
+    options.controlsLeft = self.client.controlsLeft
+    options.controlsTop = self.client.controlsTop
   }
 
-  effect fn event(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, event: &Event) -> bool
+  effect fn event(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, event: &Event) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
     if run state.desktop(&mut tree, event) {
-      drop run self.load(&mut state, &mut tree)
+      drop run self.client.load(&mut state, &mut tree)
       return true
     }
     static if Intrinsic.targetOperatingSystem() == "darwin" {
       if let Event.MouseDown { button, position, .. } = &event.* {
-        if self.titleBar == TitleBar.Transparent && button == MouseButton.Left && position.y < self.titleBarHeight {
-          self.windowDrag = true
+        if self.client.titleBar == TitleBar.Transparent && button == MouseButton.Left && position.y < self.client.titleBarHeight {
+          self.client.windowDrag = true
           return true
         }
       }
@@ -551,45 +575,45 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     return false
   }
 
-  effect fn update(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool
+  effect fn update(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.windowDrag {
-      self.windowDrag = false
+    if self.client.windowDrag {
+      self.client.windowDrag = false
       Platform.startWindowDrag(&mut platform.*, window)
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*)
-    let natives = run state.natives(&mut self.jobs, &mut tree)
+    let natives = run state.natives(&mut self.client.jobs, &mut tree)
     return clipboard || shell || natives
   }
 
-  effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
+  effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     // The entry ran before the window opened; what it built is the first frame.
     drop run state.flush(&mut tree)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
   }
 
-  effect fn opened(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, platform: &mut HostPlatform, window: WindowId) -> ()
+  effect fn opened(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
     platform.alsoWake(AlsoWake { wake: wakeRuntime, token: state.runtime.wakerAddress() })
   }
 
-  effect fn poll(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64) -> bool
+  effect fn poll(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, time: f64) -> bool
     ! WindowError | TreeError | OutOfMemoryError ? &mut Allocator {
-    let styled = run self.stylesheetUpdates.poll(&mut self.stylesheets, &mut tree, time)
-    run self.loader.watch(time)
-    let loaded = run self.load(&mut state, &mut tree)
-    let natives = run state.natives(&mut self.jobs, &mut tree)
+    let styled = run self.client.stylesheetUpdates.poll(&mut self.client.stylesheets, &mut tree, time)
+    run self.client.loader.watch(time)
+    let loaded = run self.client.load(&mut state, &mut tree)
+    let natives = run state.natives(&mut self.client.jobs, &mut tree)
     return styled || loaded || natives
   }
 
-  fn wakeAfter(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> Option<f64> {
-    let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(Option<f64>.None))
-    if !self.loader.pending() && !self.jobs.pending() { return wanted }
+  fn wakeAfter(self: &Self, state: &NodeApp<'r, 'e, 'm, C>) -> Option<f64> {
+    let wanted = self.client.loader.watchAfter(self.client.stylesheetUpdates.wakeAfter(Option<f64>.None))
+    if !self.client.loader.pending() && !self.client.jobs.pending() { return wanted }
     // Collect running loads and Silk calls about once a frame.
     return match wanted {
       Option<f64>.Some { value } => Option<f64>.some(f64.min(value, 0.016))
@@ -597,20 +621,20 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     }
   }
 
-  fn quitting(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+  fn quitting(self: &Self, state: &NodeApp<'r, 'e, 'm, C>) -> bool {
     return state.finished
   }
 
-  fn waitsItself(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+  fn waitsItself(self: &Self, state: &NodeApp<'r, 'e, 'm, C>) -> bool {
     return true
   }
 
-  effect fn wait(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, seconds: f64) -> bool
+  effect fn wait(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, seconds: f64) -> bool
     ! WindowError | TreeError | OutOfMemoryError
     ? &mut Allocator {
     run state.turn(seconds)
     let flushed = run state.flush(&mut tree)
-    let loaded = run self.load(&mut state, &mut tree)
+    let loaded = run self.client.load(&mut state, &mut tree)
     return flushed || loaded
   }
 
@@ -618,35 +642,35 @@ impl<'r, 'e, 'm> WindowClient<NodeApp<'r, 'e, 'm>, never, never> for NodeClient 
     return false
   }
 
-  effect fn pump(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> ()
+  effect fn pump(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     drop run state.handle(&mut tree)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
   }
 
-  effect fn decide(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>) -> bool
+  effect fn decide(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let prevented = run state.handle(&mut tree)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
     return prevented
   }
 
-  effect fn tick(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
+  effect fn tick(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, time: f64, animation: bool) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     // Timers are the runtime's and run in `wait`; a frame runs the animation callbacks.
     if animation { run state.frame(time) }
     drop run state.flush(&mut tree)
-    drop run self.load(&mut state, &mut tree)
+    drop run self.client.load(&mut state, &mut tree)
   }
 
-  fn wantsFrames(self: &Self, state: &NodeApp<'r, 'e, 'm>) -> bool {
+  fn wantsFrames(self: &Self, state: &NodeApp<'r, 'e, 'm, C>) -> bool {
     return state.wantsFrame()
   }
 
-  effect fn presented(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm>, intervals: &[f64], dropped: u64) -> ()
+  effect fn presented(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, intervals: &[f64], dropped: u64) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     run state.bridge.presented(intervals, dropped)
@@ -667,6 +691,8 @@ pub struct NodeWindow<'f> {
   modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The runtime's `HostApi`, set by `start`.
+  api: Option<UiApi>,
   /// What failed in the window host, kept until `run` returns.
   failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>,
 }
@@ -680,6 +706,7 @@ impl<'f> NodeWindow<'f> {
       modules: List<Defined>.make(),
       name: List<u8>.make(),
       source: List<u8>.make(),
+      api: Option<UiApi>.None,
       failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None,
     }
   }
@@ -701,14 +728,16 @@ impl<'f> NodeWindow<'f> {
     run self.source.appendSlice(source)
   }
 
-  /// Starts the runtime on this thread with `executable` as its `process.argv[0]`, runs the
-  /// entry and the window until it closes or the application calls `process.exit`, and
-  /// returns the exit status.
-  pub effect fn start(self: &mut Self, executable: &[u8]) -> i32
+  /// Starts the runtime on this thread with `executable` as its `process.argv[0]` and
+  /// `capabilities` (`node_runtime.libs.core.capabilities.Capabilities`, whose `hostApi` is
+  /// `api`), runs the entry and the window until it closes or the application calls
+  /// `process.exit`, and returns the exit status.
+  pub effect fn start<C: Composition>(self: &mut Self, executable: &[u8], api: UiApi, capabilities: C) -> i32
     ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError
     ? &mut Allocator {
     let options = run Options.make(executable)
-    let status = run embed.start(move options, &mut self.*)
+    self.api = Option<UiApi>.some(api)
+    let status = run embed.start(move options, &mut self.*, move capabilities)
     let failure = Intrinsic.replace(self.failure, Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None)
     match move failure {
       Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.Some { value } => { fail move value }
@@ -719,8 +748,9 @@ impl<'f> NodeWindow<'f> {
 }
 
 impl<'f> Host for NodeWindow<'f> {
-  effect fn drive<'e, 'm>(self: &mut Self, runtime: &mut Runtime<'e, 'm>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = run NodeApp.make(&mut runtime.*)
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    let api = match self.api { Option<UiApi>.Some { value } => value Option<UiApi>.None => { return 1 } }
+    let mut app = run NodeApp.make(&mut runtime.*, api)
     app.bridge.stylesheetCompiler = self.client.stylesheetCompiler
     app.bridge.natives = self.client.natives
     let items = self.modules.asSlice()
@@ -736,7 +766,8 @@ impl<'f> Host for NodeWindow<'f> {
       Option<RunOptions>.Some { value } => move value
       Option<RunOptions>.None => { return 1 }
     }
-    let ran = run Effect.result(runWindow(&mut app, self.fonts, List<Mutation>.make(), move options, Inspector.off(), &mut self.client))
+    let mut client = Driven<C> { client: &mut self.client, composition: Pointer.null<C>() }
+    let ran = run Effect.result(runWindow(&mut app, self.fonts, List<Mutation>.make(), move options, Inspector.off(), &mut client))
     let status = match move ran {
       Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
       Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => match move error {
