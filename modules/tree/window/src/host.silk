@@ -447,9 +447,9 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
 /// A tree is not watched for memory to hand back until it has held this many nodes.
 const RELIEF_NODES: usize = 2048
 
-/// Frames a tree stays under half its largest size before freed memory is first handed back:
-/// longer than the scenes and the renderer wait before they drop what a larger frame left.
-const RELIEF_FRAMES: u32 = 300
+/// A frame that lays out this many boxes in full leaves freed memory to hand back: what
+/// preparing that much text took.
+const RELIEF_BOXES: usize = 4096
 
 /// Hands the pages of freed memory back to the system. An allocator keeps what a busy screen
 /// freed, to give it out again; under a quiet screen that only counts against the app.
@@ -1154,7 +1154,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // The most nodes the tree has held since freed memory was last handed back, and the frames
   // in a row it has held under half of that.
   let mut heldNodes: usize = 0
-  let mut quietFrames: u32 = 0
+  // Freed memory is handed back at `releaseAt` (seconds since the start, negative for never),
+  // `releaseLeft` times with longer waits between: the scenes, the renderer and the script
+  // engine each let go of what a busy screen needed some time after it is gone. By the
+  // clock, not by frames: a window that stops changing draws none.
+  let mut releaseWanted = false
+  let mut releaseAt: f64 = -1.0
+  let mut releaseLeft: u32 = 0
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
@@ -1304,6 +1310,16 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
     // Wait for input or a frame, at most until the next timer.
     let now = (run seconds(&mut clock)) - started
+    if releaseWanted {
+      releaseWanted = false
+      releaseAt = now + 1.5
+      releaseLeft = 3
+    }
+    if releaseAt >= 0.0 && now >= releaseAt {
+      releaseFreed()
+      releaseLeft = releaseLeft - 1
+      releaseAt = if releaseLeft == 0 { -1.0 } else if releaseLeft == 2 { now + 4.0 } else { now + 12.0 }
+    }
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
     if backgroundChanged {
       platform.requestFrame(owner)
@@ -1331,6 +1347,12 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
       if let Option<f64>.Some { value } = companion.nextDeadline() {
         let due = f64.max(0.0, value - now)
+        if deadline < 0.0 || due < deadline {
+          deadline = due
+        }
+      }
+      if releaseAt >= 0.0 {
+        let due = f64.max(0.0, releaseAt - now)
         if deadline < 0.0 || due < deadline {
           deadline = due
         }
@@ -1672,23 +1694,17 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if tracing {
                 StderrWriter.print("silk-ui: frame {} submitted\n", &.(drawn))
               }
+              // A tree under half its largest size, or a frame that laid out a great many
+              // boxes, leaves freed memory behind (see `releaseFreed`).
               let nodes = tree.liveNodes()
               if nodes >= heldNodes {
                 heldNodes = nodes
-                quietFrames = 0
               } else if heldNodes >= RELIEF_NODES && nodes * 2 < heldNodes {
-                // More than once: the scenes, the renderer and the script engine each let go
-                // of what the larger tree needed some time after it is gone.
-                quietFrames = quietFrames + 1
-                if quietFrames == RELIEF_FRAMES || quietFrames == RELIEF_FRAMES * 4 {
-                  releaseFreed()
-                } else if quietFrames >= RELIEF_FRAMES * 12 {
-                  releaseFreed()
-                  heldNodes = nodes
-                  quietFrames = 0
-                }
-              } else {
-                quietFrames = 0
+                heldNodes = nodes
+                releaseWanted = true
+              }
+              if tree.stats.layout.fullLayouts >= RELIEF_BOXES {
+                releaseWanted = true
               }
 
               // Check mode and lowest-latency apps wait for each frame on this thread.
