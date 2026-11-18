@@ -228,7 +228,16 @@ check("customevent", true, () => {
   return detail === 3 && heard;
 });
 check("deviceorientation", false, () => global("DeviceOrientationEvent"));
-check("dom-range", false, () => global("Range") || typeof globalThis.document?.createRange === "function");
+check("dom-range", true, () => {
+  const box = ui.createBox(null, ui.createText("Hello world"));
+  const range = new Range();
+  range.setStart(box.firstChild, 2);
+  range.setEnd(box.firstChild, 7);
+  box.firstChild.insertData(0, ">");
+  const moved = range.startOffset === 3 && range.toString() === "llo w";
+  const fragment = range.extractContents();
+  return moved && fragment.firstChild.data === "llo w" && box.firstChild.data === ">Heorld" && range.collapsed;
+});
 check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
 check("element-scroll-methods", true, () => typeof ui.createBox().scroll === "function");
 check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function");
