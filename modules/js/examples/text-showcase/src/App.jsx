@@ -160,11 +160,11 @@ function Vertical() {
           <box style={{ writingMode: "vertical-rl", fontFamily: jp, fontSize: 18, lineHeight: 1.85, color: ink, height: 470 }}>
             日本語の文章は、昔から縦に書かれてきた。行は上から下へ進み、右から左へと重なっていく。新聞や小説、詩集の多くは、今も縦組みで印刷されている。2026年の今、Silk UIはこの組み方を画面の上で再現する。漢字と仮名は正立し、ラテン文字は横に倒れて流れる。句読点は行の中で位置を変え、読む目は自然に次の行へ移る。
           </box>
-          <box style={{ writingMode: "vertical-rl", fontFamily: jp, fontWeight: 700, fontSize: 38, lineHeight: 1.2, color: accent, height: 470 }}>
+          <box className="emphasis" style={{ writingMode: "vertical-rl", fontFamily: jp, fontWeight: 700, fontSize: 38, lineHeight: 1.2, color: accent, height: 470 }}>
             縦書きの美しさ
           </box>
         </box>
-        <Tag>vertical-rl · lines flow right to left · Latin turns sideways</Tag>
+        <Tag>vertical-rl · Latin turns sideways · text-emphasis: sesame</Tag>
       </box>
       <box style={{ ...column, gap: 12, justifyContent: "center", alignItems: "center" }}>
         <box style={{ writingMode: "vertical-rl", textOrientation: "upright", fontFamily: display, fontWeight: 700, fontSize: 30, lineHeight: 1, color: ink, height: 300 }}>
