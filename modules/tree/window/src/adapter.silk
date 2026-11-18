@@ -6,7 +6,9 @@ import accessibility { Bridge, Publisher }
 import platform_thread { AccessLink, HostPlatform }
 import silk.core.effect { Effect }
 import keys { codeName, keyName }
-import window.event { Event, Key, MouseButton, Phase, ScrollDelta, Modifiers }
+import window.event { Event, Key, MouseButton, Phase, ScrollDelta, Modifiers, EditCommand as WindowEditCommand }
+import window.menu { MenuBar, Shortcut }
+import ui_tree.input { EditCommand }
 import window.types { Wait }
 import silk.geometry.vector { Vector2 }
 import window.types { Cursor as WindowCursor, ImeState, WindowId, Appearance }
@@ -223,8 +225,52 @@ pub effect fn toInputAt(event: &Event, time: f64) -> Option<Input>
         selectionEnd: selectionEnd,
       },
     }
+    Event.EditCommand { command, .. } => Option<Input>.Some {
+      value: Input.Command { command: editCommand(command) },
+    }
     _ => Option<Input>.None
   }
+}
+
+fn editCommand(command: WindowEditCommand) -> EditCommand {
+  return match command {
+    WindowEditCommand.Undo => EditCommand.Undo
+    WindowEditCommand.Redo => EditCommand.Redo
+    WindowEditCommand.Cut => EditCommand.Cut
+    WindowEditCommand.Copy => EditCommand.Copy
+    WindowEditCommand.Paste => EditCommand.Paste
+    WindowEditCommand.SelectAll => EditCommand.SelectAll
+  }
+}
+
+/// The first action of the edit menu `serve` opens for `HostRequest.ShowEditMenu`: each item
+/// comes back as `Event.MenuAction` with this plus its `EditCommand` index (undo 0 to select
+/// all 5), which `editMenuEvent` turns into the `Event.EditCommand` it stands for.
+pub const EDIT_MENU_ACTION: u32 = 4293918720
+
+/// `event` as the host should handle it: an item of the edit menu becomes the edit command of
+/// `window`, the one whose input opened it; every other event stays as it is.
+pub fn editMenuEvent(event: Event, window: WindowId) -> Event {
+  if let Event.MenuAction { action } = &event {
+    if action >= EDIT_MENU_ACTION && action <= EDIT_MENU_ACTION + 5 {
+      let index = action - EDIT_MENU_ACTION
+      let command = if index == 0 {
+        WindowEditCommand.Undo
+      } else if index == 1 {
+        WindowEditCommand.Redo
+      } else if index == 2 {
+        WindowEditCommand.Cut
+      } else if index == 3 {
+        WindowEditCommand.Copy
+      } else if index == 4 {
+        WindowEditCommand.Paste
+      } else {
+        WindowEditCommand.SelectAll
+      }
+      return Event.EditCommand { window: window, command: command }
+    }
+  }
+  return move event
 }
 
 /// Dispatches `event` to `tree` when it is input. Returns whether it was.
@@ -395,6 +441,15 @@ pub effect fn serveInput<P: Platform>(
           })
         }
         run platform.writeClipboardItem(entries.asSlice())
+      }
+      HostRequest.ShowEditMenu { x, y, cut, copy, paste } => {
+        let mut menu = MenuBar.make()
+        run menu.item("Cut", EDIT_MENU_ACTION + 2, Option<Shortcut>.None, cut, false)
+        run menu.item("Copy", EDIT_MENU_ACTION + 3, Option<Shortcut>.None, copy, false)
+        run menu.item("Paste", EDIT_MENU_ACTION + 4, Option<Shortcut>.None, paste, false)
+        run menu.separator()
+        run menu.item("Select All", EDIT_MENU_ACTION + 5, Option<Shortcut>.None, true, false)
+        drop run platform.showContextMenu(window, f32.toF64(x), f32.toF64(y), &menu)
       }
       HostRequest.ReadClipboard { target } => {
         let paste = run readPaste(&mut platform, target)
