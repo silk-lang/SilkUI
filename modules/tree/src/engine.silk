@@ -43,6 +43,8 @@ import float_shapes
 import expand
 import font_features
 import font_features { VariationTable }
+import font_rules
+import font_rules { FontRules }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -140,6 +142,7 @@ import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE,
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
+import ui_text.fonts as text_fonts
 import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
@@ -781,6 +784,8 @@ pub struct UiTree<'a> {
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
   pub sheetFaces: SheetFaces,
+  /// `@font-palette-values` and `@font-feature-values` rules, and font property handles.
+  pub fontRules: FontRules,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -1009,6 +1014,7 @@ impl<'a> UiTree<'a> {
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
       sheetFaces: SheetFaces.make(),
+      fontRules: FontRules.make(),
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -1232,7 +1238,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) || writtenHandle(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1263,6 +1269,26 @@ impl<'a> UiTree<'a> {
           run out.append(Declaration {
             property: CssProperty.FontVariationSettings,
             value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
+        }
+      } else if writtenHandle(&declared[i]) {
+        // A negative number: font_features.apply reads -(handle + 1). Values that do not
+        // parse are dropped.
+        let text = run values.cssText(&declared[i].value)
+        let css = Bytes.asSlice(&text)
+        let property = declared[i].property
+        let handle = if property == CssProperty.FontPalette {
+          run self.fontRules.paletteHandle(css)
+        } else if property == CssProperty.FontVariantAlternates {
+          run self.fontRules.alternatesHandle(css)
+        } else {
+          run self.fontRules.adjustHandle(css)
+        }
+        if let Option.Some { value: id } = handle {
+          run out.append(Declaration {
+            property: property,
+            value: values.number(-u32.toF32(id) - 1.0),
             important: declared[i].important,
           })
         }
@@ -2217,6 +2243,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.CloseRoot { root } => {
         run sheet_faces.close(&mut self, root)
+        font_rules.close(&mut self.fontRules, root)
         run self.closeRoot(index, root)
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
@@ -4067,7 +4094,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
-    let treatment = Treatment {
+    let mut treatment = Treatment {
       letterSpacing: text.letterSpacing,
       wordSpacing: text.wordSpacing,
       transform: text.textTransform,
@@ -4077,6 +4104,8 @@ impl<'a> UiTree<'a> {
       hyphens: text.hyphens,
       features: text.features,
     }
+    // Palette and smoothing are paint's: keys do not differ by them.
+    treatment.features.extras = text_fonts.withExtrasField(text_fonts.withExtrasField(text.features.extras, text_fonts.EXTRAS_PALETTE, 0), text_fonts.EXTRAS_SMOOTH, 0)
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
@@ -4090,6 +4119,16 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    let mut named = List<Bytes>.make()
+    if text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES) != 0 {
+      let mut f: usize = 0
+      while f < families.length() {
+        if let Family.Named { name } = &families.asSlice()[f] {
+          run named.append(run Bytes.copy(Bytes.asSlice(&name)))
+        }
+        f = f + 1
+      }
+    }
     run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
@@ -4103,6 +4142,15 @@ impl<'a> UiTree<'a> {
     }
     request.treatment = treatment
     request.variations = self.variations.axes(text.features.variations)
+    request.sizeAdjust = self.fontRules.adjust(text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_SIZE_ADJUST))
+    let alternates = text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES)
+    if alternates != 0 {
+      let mut pairs = List<u32>.make()
+      run self.fontRules.alternates(self.current, alternates, named.asSlice(), &mut pairs)
+      let defined = if pairs.length() == 0 { Option<u32>.None } else { run self.provider.text.fonts.defineFeatures(pairs.asSlice()) }
+      let resolved = match defined { Option.Some { value } => value _ => 0 }
+      request.treatment.features.extras = text_fonts.withExtrasField(request.treatment.features.extras, text_fonts.EXTRAS_ALTERNATES, resolved)
+    }
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4117,6 +4165,22 @@ impl<'a> UiTree<'a> {
       },
     )
     return key
+  }
+
+  /// The root's `@font-feature-values` changed: its styles get new font keys.
+  fn fontRulesChanged(self: &mut Self) -> () {
+    let entries = self.fontKeys.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].root == self.current { entries[i].family = NONE }
+      i = i + 1
+    }
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
   }
 
   // Font faces added at run time.
@@ -4920,7 +4984,10 @@ impl<'a> UiTree<'a> {
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
-    if self.stylesDirty { run sheet_faces.sync(&mut self) }
+    if self.stylesDirty {
+      run sheet_faces.sync(&mut self)
+      if run font_rules.sync(&mut self) { self.fontRulesChanged() }
+    }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       let roots = self.styleSheets.asMutSlice()
@@ -6169,6 +6236,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6209,6 +6279,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6278,6 +6351,9 @@ impl<'a> UiTree<'a> {
       output: &self.output,
       text: &self.provider.text,
       faces: &self.faces,
+      fontRules: &self.fontRules,
+      sheetFaces: &self.sheetFaces,
+      root: self.current,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
       textInk: &mut self.textInk,
@@ -6469,6 +6545,19 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
 fn writtenVariations(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontVariationSettings && convert.number(&declaration.value).isNone()
     && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
+}
+
+// A `font-palette`, `font-variant-alternates` or `font-size-adjust` not yet a handle.
+fn writtenHandle(declaration: &Declaration) -> bool {
+  if font_features.extrasShift(declaration.property) == 0xFFFFFFFF { return false }
+  if let Option.Some { value } = convert.number(&declaration.value) {
+    if value < 0.0 { return false }
+  }
+  return !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
