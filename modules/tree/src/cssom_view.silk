@@ -11,6 +11,7 @@ import mutation { NodeKind, Position, Direction }
 import paint { borderBox, paddingBox, styleSlot }
 import scrollbar { rangeOf, scrolls, usedOverflow }
 import interact
+import scroll_snap
 import caret
 import layout.lib { FragmentKind, WritingMode, DisplayOutside, DisplayInside }
 import svg_css.cssom_geometry { DOMRect, DOMPoint }
@@ -33,6 +34,7 @@ import svg_css.cssom_view_geometry {
   NO_GEOMETRY_NODE
 }
 import silk.collections.list { List }
+import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
@@ -348,7 +350,10 @@ pub effect fn requestScroll(
   if slot == NONE {
     fail CssomError.NotFoundError
   }
-  let target = scrollTarget(&tree.*, id, x, y)
+  let clamped = scrollTarget(&tree.*, id, x, y)
+  // Scroll Snap 1 §6.2: a script scroll ends on a snap position.
+  let snap = run scroll_snap.snapped(&tree.*, slot, f64.toF32(clamped.x), f64.toF32(clamped.y))
+  let target = scrollTarget(&tree.*, id, f32.toF64(snap[0]), f32.toF64(snap[1]))
   let offset = tree.scrollOffset(id)
   let smooth = computedSmooth || tree.node(slot).computed.scroll.smooth
   let request = run tree.viewScrollState.begin(
@@ -376,6 +381,39 @@ pub effect fn requestScroll(
     )
   }
   return request
+}
+
+/// Whether a smooth scroll of node `slot` is running.
+pub fn animatesSlot(tree: &UiTree<'_>, slot: u32) -> bool {
+  let id = tree.node(slot).id
+  let mut index: usize = 0
+  while index < tree.viewScrollAnimations.length() {
+    let request = tree.viewScrollAnimations.get(index).request
+    if request.target.kind == ViewTargetKind.Element && request.target.id == u32.toUsize(id) && pending(tree, request.id) {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+/// Scroll snap moves node `slot` to its snap position, smoothly or at once.
+pub effect fn snapTo(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32, smooth: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run Effect.catch<CssomError>(snapRequest(&mut tree.*, slot, x, y, smooth), noRequest)
+}
+
+effect fn snapRequest(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32, smooth: bool) -> ()
+  ! CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  let behavior = if smooth { ScrollBehavior.Smooth } else { ScrollBehavior.Instant }
+  let id = tree.node(slot).id
+  drop run requestScroll(&mut tree.*, id, f32.toF64(x), f32.toF64(y), behavior, false, true)
+}
+
+effect fn noRequest(error: CssomError) -> () {
+  drop error
 }
 
 pub effect fn applyScrollUpdate(tree: &mut UiTree<'_>, request: ScrollRequest, x: f64, y: f64) -> ()

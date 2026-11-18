@@ -524,6 +524,8 @@ pub struct ScrollStyle {
   pub overscrollY: Overscroll,
   /// `scroll-behavior: smooth`.
   pub smooth: bool,
+  /// `scroll-snap-type` (container) and `scroll-snap-align`/`-stop` (item), packed: see `SNAP_*`.
+  pub snap: u8,
   /// `scroll-margin` of the box, in pixels.
   pub margin: Insets<f32>,
   /// `scroll-padding` of the scroll container; `auto` is zero.
@@ -584,11 +586,104 @@ impl ScrollStyle {
       overscrollX: Overscroll.Auto,
       overscrollY: Overscroll.Auto,
       smooth: false,
+      snap: 0,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
     }
   }
+}
+
+/// `ScrollStyle.snap` bits: the container's snapping axes and strictness, then the item's
+/// alignment per axis (`SNAP_NONE` to `SNAP_END`) and `scroll-snap-stop: always`.
+pub const SNAP_X: u8 = 1
+pub const SNAP_Y: u8 = 2
+pub const SNAP_MANDATORY: u8 = 4
+pub const SNAP_STOP: u8 = 128
+pub const SNAP_NONE: u8 = 0
+pub const SNAP_START: u8 = 1
+pub const SNAP_CENTER: u8 = 2
+pub const SNAP_END: u8 = 3
+
+impl ScrollStyle {
+  /// Whether the box is a snap container on that axis.
+  pub fn snapsX(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_X) != 0 }
+  pub fn snapsY(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_Y) != 0 }
+  pub fn snapMandatory(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_MANDATORY) != 0 }
+  /// The item's `scroll-snap-align` on that axis.
+  pub fn alignX(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 3), 3) }
+  pub fn alignY(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 5), 3) }
+
+  fn setSnapType(self: &mut Self, bits: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 248), bits)
+  }
+
+  fn setSnapAlign(self: &mut Self, x: u8, y: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 135), u8.bitOr(u8.shiftLeft(x, 3), u8.shiftLeft(y, 5)))
+  }
+
+  fn setSnapStop(self: &mut Self, always: bool) -> () {
+    self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
+  }
+}
+
+/// `scroll-snap-type`: `none`, or an axis and an optional strictness.
+fn snapTypeOf(value: &Value) -> Option<u8> {
+  let mut axis: u8 = 0
+  let mut strict: u8 = 0
+  let mut words: [Keyword; 2] = [Keyword.None; 2]
+  let mut count: usize = 0
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    words[0] = word
+    count = 1
+  } else if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<u8>.None }
+    let mut i: usize = 0
+    while i < 2 {
+      match convert.keywordOf(&items[i]) {
+        Option.Some { value: word } => { words[i] = word }
+        Option.None => { return Option<u8>.None }
+      }
+      i = i + 1
+    }
+    count = 2
+  } else {
+    return Option<u8>.None
+  }
+  let first = words[0]
+  if first == Keyword.None { return if count == 1 { Option<u8>.some(0) } else { Option<u8>.None } }
+  // Block and inline are y and x in horizontal writing modes.
+  axis = if first == Keyword.X || first == Keyword.Inline { SNAP_X }
+    else if first == Keyword.Y || first == Keyword.Block { SNAP_Y }
+    else if first == Keyword.Both { u8.bitOr(SNAP_X, SNAP_Y) } else { 0 }
+  if axis == 0 { return Option<u8>.None }
+  if count == 2 {
+    if words[1] == Keyword.Mandatory { strict = SNAP_MANDATORY } else if words[1] != Keyword.Proximity { return Option<u8>.None }
+  }
+  return Option<u8>.some(u8.bitOr(axis, strict))
+}
+
+fn snapAlignWord(word: Keyword) -> u8 {
+  return if word == Keyword.None { SNAP_NONE } else if word == Keyword.Start { SNAP_START }
+    else if word == Keyword.Center { SNAP_CENTER } else if word == Keyword.End { SNAP_END } else { 255 }
+}
+
+/// `scroll-snap-align`: one value for both axes, or the block (y) then the inline (x) one.
+fn snapAlignOf(value: &Value) -> Option<[u8; 2]> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    let a = snapAlignWord(word)
+    return if a == 255 { Option<[u8; 2]>.None } else { Option<[u8; 2]>.some([a, a]) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<[u8; 2]>.None }
+    let block = match convert.keywordOf(&items[0]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    let inline = match convert.keywordOf(&items[1]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    if block == 255 || inline == 255 { return Option<[u8; 2]>.None }
+    return Option<[u8; 2]>.some([inline, block])
+  }
+  return Option<[u8; 2]>.None
 }
 
 impl ScrollStyle {
@@ -1316,6 +1411,16 @@ impl Computed {
       }
       CssProperty.OverscrollBehaviorY => {
         setOverscroll(&mut self.scroll.overscrollY, value)
+      }
+      CssProperty.ScrollSnapType => {
+        if let Option<u8>.Some { value: bits } = snapTypeOf(value) { self.scroll.setSnapType(bits) }
+      }
+      CssProperty.ScrollSnapAlign => {
+        if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
+      }
+      CssProperty.ScrollSnapStop => {
+        if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
+        else if convert.isKeyword(value, Keyword.Normal) { self.scroll.setSnapStop(false) }
       }
       CssProperty.ScrollBehavior => {
         if convert.isKeyword(value, Keyword.Smooth) {
