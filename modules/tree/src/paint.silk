@@ -51,6 +51,7 @@ import ui_scene.primitives {
   Shadow,
   Underline
 }
+import ui_scene.radii { Radii, cornerOf }
 import ui_scene.scene { Scene }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ScrollPosition }
 import ui_scene.effects { LayerEffects }
@@ -268,11 +269,10 @@ fn clipMask(p: &Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment) -> Conte
     return ContentMask.new(clip)
   }
   let r = radiiOf(p, slot, c, f)
-  if r.topLeft <= 0.0 && r.topRight <= 0.0 && r.bottomRight <= 0.0 && r.bottomLeft <= 0.0 {
+  if !r.isRounded() {
     return ContentMask.new(clip)
   }
-  let radii = paint_effects.insetCorners(scaledCorners(r, p.scale), device(borderBox(f), p.scale), clip)
-  return ContentMask.rounded(clip, radii)
+  return ContentMask.rounded(clip, r.scaled(p.scale).insetTo(device(borderBox(f), p.scale), clip))
 }
 
 pub fn contentBox(f: &Fragment) -> Rect<f32> {
@@ -281,43 +281,84 @@ pub fn contentBox(f: &Fragment) -> Rect<f32> {
   return Rect<f32>.new(x, y, x + f.contentRect.width, y + f.contentRect.height)
 }
 
-pub fn scaledCorners(radii: Corners<f32>, scale: f32) -> Corners<f32> {
-  return Corners<f32>.new(
-    radii.topLeft * scale,
-    radii.topRight * scale,
-    radii.bottomRight * scale,
-    radii.bottomLeft * scale,
-  )
-}
-
-/// The corner radii of fragment `f`'s border box with style `c`, in CSS pixels.
-pub fn radiiOf(p: &Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment) -> Corners<f32> {
-  if !c.effects.radiusShare {
-    return c.paint.radii
-  }
+/// The corner radii of fragment `f`'s border box with style `c`, in CSS pixels, as CSS resolves
+/// them: horizontal percentages of the width, vertical ones of the height, all shrunk together
+/// when they overlap.
+pub fn radiiOf(p: &Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment) -> Radii {
   return radiiIn(p, slot, c, f.size.width, f.size.height)
 }
 
-/// The corner radii of node `slot` with style `c` over a `width` by `height` border box. A
-/// percentage takes the shorter side, so the corners stay circular.
-fn radiiIn(p: &Painter<'_, '_>, slot: u32, c: &Computed, width: f32, height: f32) -> Corners<f32> {
+/// Whether style `c` rounds any corner.
+pub fn rounds(c: &Computed) -> bool {
+  let r = c.paint.radii
+  return c.effects.radiusShare || r.topLeft > 0.0 || r.topRight > 0.0 || r.bottomRight > 0.0 || r.bottomLeft > 0.0
+}
+
+/// The corner radii of node `slot` with style `c` over a `width` by `height` border box.
+pub fn radiiIn(p: &Painter<'_, '_>, slot: u32, c: &Computed, width: f32, height: f32) -> Radii {
   let r = c.paint.radii
   if !c.effects.radiusShare || slot == NONE {
-    return r
-  }
-  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
-    Option<&Effects>.Some { value } => {
-      let share = value.radii
-      let basis = f32.max(0.0, f32.min(width, height))
-      Corners<f32>.new(
-        r.topLeft + share.topLeft * basis,
-        r.topRight + share.topRight * basis,
-        r.bottomRight + share.bottomRight * basis,
-        r.bottomLeft + share.bottomLeft * basis,
-      )
+    if r.topLeft <= 0.0 && r.topRight <= 0.0 && r.bottomRight <= 0.0 && r.bottomLeft <= 0.0 {
+      return Radii.zero()
     }
-    Option<&Effects>.None => r
+    return Radii.circular(r).fitted(width, height)
   }
+  return nodeRadii(&p.nodes.asSlice()[u32.toUsize(slot)], c, width, height)
+}
+
+/// The corner radii of `node` with style `c` over a `width` by `height` border box.
+pub fn nodeRadii(node: &Node, c: &Computed, width: f32, height: f32) -> Radii {
+  let r = c.paint.radii
+  if c.effects.radiusShare {
+    match node.paintEffects() {
+      Option<&Effects>.Some { value } => {
+        return resolvedRadii(r, value, width, height)
+      }
+      Option<&Effects>.None => {}
+    }
+  }
+  if r.topLeft <= 0.0 && r.topRight <= 0.0 && r.bottomRight <= 0.0 && r.bottomLeft <= 0.0 {
+    return Radii.zero()
+  }
+  return Radii.circular(r).fitted(width, height)
+}
+
+/// Whether (`x`, `y`) lies inside `rect` with corners `radii`, as hit testing follows them.
+pub fn insideRounded(rect: Rect<f32>, radii: Radii, x: f32, y: f32) -> bool {
+  if x < rect.xMin || y < rect.yMin || x >= rect.xMax || y >= rect.yMax {
+    return false
+  }
+  if !radii.isRounded() {
+    return true
+  }
+  let left = x < (rect.xMin + rect.xMax) * 0.5
+  let up = y < (rect.yMin + rect.yMax) * 0.5
+  let ex = cornerOf(radii.x, left, up)
+  let ey = cornerOf(radii.y, left, up)
+  if ex <= 0.0 || ey <= 0.0 {
+    return true
+  }
+  let dx = if left { rect.xMin + ex - x } else { x - (rect.xMax - ex) }
+  let dy = if up { rect.yMin + ey - y } else { y - (rect.yMax - ey) }
+  if dx <= 0.0 || dy <= 0.0 {
+    return true
+  }
+  let nx = dx / ex
+  let ny = dy / ey
+  return nx * nx + ny * ny <= 1.0
+}
+
+/// Radii with horizontal lengths `r` and the rest from `effects`, over a `width` by `height` box.
+pub fn resolvedRadii(r: Corners<f32>, effects: &Effects, width: f32, height: f32) -> Radii {
+  let w = f32.max(0.0, width)
+  let h = f32.max(0.0, height)
+  let px = effects.radii
+  let py = effects.radiiY
+  let ly = effects.lengthsY
+  return Radii.new(
+    Corners<f32>.new(r.topLeft + px.topLeft * w, r.topRight + px.topRight * w, r.bottomRight + px.bottomRight * w, r.bottomLeft + px.bottomLeft * w),
+    Corners<f32>.new(ly.topLeft + py.topLeft * h, ly.topRight + py.topRight * h, ly.bottomRight + py.bottomRight * h, ly.bottomLeft + py.bottomLeft * h),
+  ).fitted(width, height)
 }
 
 fn backgroundOf(fill: Fill) -> Background {
@@ -336,6 +377,28 @@ fn emptyHidden(c: &Computed, f: &Fragment) -> bool {
 
 fn hasEdge(edges: u8, bit: u8) -> bool {
   return u8.bitAnd(edges, bit) != 0
+}
+
+/// `r` with the corners on the sides `edges` leaves out (a box split across lines) square.
+fn cutCorners(r: Corners<f32>, edges: u8) -> Corners<f32> {
+  let mut c = r
+  if !hasEdge(edges, 1) {
+    c.topLeft = 0.0
+    c.topRight = 0.0
+  }
+  if !hasEdge(edges, 2) {
+    c.topRight = 0.0
+    c.bottomRight = 0.0
+  }
+  if !hasEdge(edges, 4) {
+    c.bottomRight = 0.0
+    c.bottomLeft = 0.0
+  }
+  if !hasEdge(edges, 8) {
+    c.topLeft = 0.0
+    c.bottomLeft = 0.0
+  }
+  return c
 }
 
 /// Draws the shadow, background and border of a box with computed style `c` over `rect`
@@ -423,7 +486,7 @@ effect fn paintTextClip(
   run paintGlyphMask(&mut p, index, mask)
   run p.scene.popLayer()
   let background = backgroundOf(c.paint.background)
-  let radii = scaledCorners(radiiOf(&p.*, slot, c, f), s)
+  let radii = radiiOf(&p.*, slot, c, f).scaled(s)
   if colorClipOf(&p.*, slot) == Clip.Text && !background.isTransparent() {
     let mut quad = Quad.fill(bounds, mask, background)
     quad.cornerRadii = radii
@@ -486,7 +549,7 @@ effect fn paintLocalBackgrounds(p: &mut Painter<'_, '_>, slot: u32, c: &Computed
           f32.max(port.xMax, ox + over.width),
           f32.max(port.yMax, oy + over.height),
         )
-        let radii = Corners<f32>.zero()
+        let radii = Radii.zero()
         run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest, paint_effects.SCOPE_LOCAL, local)
       }
     }
@@ -507,22 +570,9 @@ effect fn decorate(
   ? &mut Allocator {
   let s = p.scale
   let bounds = snapped(device(borderBox(f), s))
-  let mut radii = scaledCorners(radiiOf(&p.*, slot, c, f), s)
-  if !hasEdge(edges, 1) {
-    radii.topLeft = 0.0
-    radii.topRight = 0.0
-  }
-  if !hasEdge(edges, 2) {
-    radii.topRight = 0.0
-    radii.bottomRight = 0.0
-  }
-  if !hasEdge(edges, 4) {
-    radii.bottomRight = 0.0
-    radii.bottomLeft = 0.0
-  }
-  if !hasEdge(edges, 8) {
-    radii.topLeft = 0.0
-    radii.bottomLeft = 0.0
+  let mut radii = radiiOf(&p.*, slot, c, f).scaled(s)
+  if edges != 15 {
+    radii = Radii.new(cutCorners(radii.x, edges), cutCorners(radii.y, edges))
   }
   if c.paint.hasShadow && !c.paint.shadow.inset && c.paint.shadow.color.a > 0.0 {
     drop run p.scene.shadow(
@@ -583,7 +633,7 @@ effect fn decorate(
       mask,
       background,
     )
-    quad.cornerRadii = paint_effects.insetCorners(radii, device(borderBox(f), s), device(area, s))
+    quad.cornerRadii = radii.insetTo(device(borderBox(f), s), device(area, s))
     drop run p.scene.quad(quad)
   }
   if images {
@@ -635,11 +685,13 @@ effect fn decorate(
     paint_effects.putEffects(&mut p, slot, move taken)
   }
   if c.paint.hasShadow && c.paint.shadow.inset && c.paint.shadow.color.a > 0.0 {
+    // An inset shadow lies inside the padding box, with its radii.
+    let inside = Rect<f32>.new(bounds.xMin + widths.left, bounds.yMin + widths.top, bounds.xMax - widths.right, bounds.yMax - widths.bottom)
     drop run p.scene.shadow(
       Shadow {
-        bounds: bounds,
+        bounds: inside,
         mask: mask,
-        cornerRadii: radii,
+        cornerRadii: radii.insetTo(bounds, inside),
         color: c.paint.shadow.color,
         blurRadius: c.paint.shadow.blur * s,
         offset: Vector2<f32> { x: c.paint.shadow.offsetX * s, y: c.paint.shadow.offsetY * s },
@@ -684,29 +736,10 @@ effect fn paintOutline(
   if outer.xMax <= outer.xMin || outer.yMax <= outer.yMin {
     return ()
   }
-  let radius = |r: f32| -> f32 {
-    return if r > 0.0 {
-      f32.max(0.0, r + reach) * s
-    } else {
-      0.0
-    }
+  let mut quad = Quad.fill(device(outer, s), mask, Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }))
+  if rounds(c) {
+    quad.cornerRadii = radiiIn(&p.*, slot, c, rect.xMax - rect.xMin, rect.yMax - rect.yMin).spread(reach).scaled(s)
   }
-  let mut quad = Quad.fill(
-    device(outer, s),
-    mask,
-    Background.solid(Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
-  )
-  let radii = if c.effects.radiusShare {
-    radiiIn(&p.*, slot, c, rect.xMax - rect.xMin, rect.yMax - rect.yMin)
-  } else {
-    c.paint.radii
-  }
-  quad.cornerRadii = Corners<f32>.new(
-    radius(radii.topLeft),
-    radius(radii.topRight),
-    radius(radii.bottomRight),
-    radius(radii.bottomLeft),
-  )
   let w = o.width * s
   quad.borderWidths = Insets<f32> { top: w, right: w, bottom: w, left: w }
   quad.borderColor = color
@@ -1287,7 +1320,7 @@ effect fn paintTextAs(
                   mask: mask,
                   tile: value.tile,
                   opacity: color.a,
-                  cornerRadii: Corners<f32>.zero(),
+                  cornerRadii: Radii.zero(),
                   grayscale: false,
                   nearest: false,
                 },
@@ -1616,7 +1649,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
   let resource = node.resource
   let s = p.scale
   let content = device(contentBox(f), s)
-  let corners = scaledCorners(radiiOf(&p.*, slot, &c, f), s)
+  let corners = radiiOf(&p.*, slot, &c, f).scaled(s).insetTo(device(borderBox(f), s), content)
   // An image showing an SVG file draws it as an icon.
   let bitmap = match p.resources.get(resource) {
     Option<Resource>.Some { value } => match value {
@@ -1697,7 +1730,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
                   mask: mask,
                   tile: placed,
                   opacity: 1.0,
-                  cornerRadii: Corners<f32>.zero(),
+                  cornerRadii: Radii.zero(),
                   grayscale: false,
                   nearest: false,
                 },
@@ -1744,7 +1777,7 @@ effect fn paintCanvas(
           (origin.yMin + y + height) * s,
         )
         let mut quad = Quad.fill(bounds, mask, Background.solid(color))
-        quad.cornerRadii = Corners<f32>.uniform(radius * s)
+        quad.cornerRadii = Radii.uniform(radius * s)
         drop run p.scene.quad(quad)
       }
       CanvasCommand.MoveTo { x, y } => {
@@ -2848,7 +2881,7 @@ effect fn paintTrack(
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut quad = Quad.fill(device(rect, p.scale), mask, Background.solid(color))
-  quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
+  quad.cornerRadii = Radii.uniform(3.0 * p.scale)
   drop run p.scene.quad(quad)
 }
 
@@ -2981,7 +3014,7 @@ effect fn paintThumb(
     return ()
   }
   let mut quad = Quad.fill(device(thumb.rect, p.scale), mask, Background.solid(color))
-  quad.cornerRadii = Corners<f32>.uniform(3.0 * p.scale)
+  quad.cornerRadii = Radii.uniform(3.0 * p.scale)
   drop run p.scene.quad(quad)
 }
 
@@ -3005,7 +3038,7 @@ effect fn paintScrollbarPart(
   }
   let scale = p.scale
   let mut quad = Quad.fill(device(rect, scale), mask, background)
-  quad.cornerRadii = scaledCorners(paint.radii, scale)
+  quad.cornerRadii = Radii.circular(paint.radii).scaled(scale)
   if bordered {
     quad.borderWidths = Insets<f32> {
       top: borderWidth(paint.border.top * scale),

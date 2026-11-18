@@ -1,5 +1,5 @@
-//! Pixel checks for properties the Can I use probes cannot see: `caret-color` (the probe
-//! fixture has no focused input) and `object-fit` (it has no image).
+//! Pixel checks for what the Can I use probes cannot see: `caret-color` (the probe
+//! fixture has no focused input), `object-fit` (it has no image) and corner shapes.
 import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Attribute }
 import silk.core.option { Option }
 import silk.text.string { String }
@@ -727,4 +727,55 @@ effect fn emptyCells() ! TreeError | CssError | GeometryError | OutOfMemoryError
 test effect fn pixelEmptyCellsHide() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run emptyCells() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The pixel at (x, y) of a 200x100 box with `style` on white, as 0 white, 1 red, 2 black, 3 other.
+effect fn radiusPixel(style: &[u8], x: u32, y: u32) -> u8 ! TreeError | CssError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let own = run written.declarations(style)
+  run batch.style(2, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let p = painted.pixel(x, y)
+  if white(p.r, p.g, p.b) { return 0 }
+  if p.r > 240 && p.g < 15 && p.b < 15 { return 1 }
+  if p.r < 15 && p.g < 15 && p.b < 15 { return 2 }
+  return 3
+}
+
+/// Expected values are Chromium's pixels for the same styles.
+effect fn ellipticalRadii() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let slash = b"display:block;width:200px;height:100px;background-color:red;border-radius:100px / 50px"
+  run Testing.expect(u8.toU32(run radiusPixel(slash, 15, 15)) == 0, "the slash form makes an elliptical corner")
+  run Testing.expect(u8.toU32(run radiusPixel(slash, 30, 30)) == 1, "inside the elliptical corner paints")
+  let percent = b"display:block;width:200px;height:100px;background-color:red;border-radius:50%"
+  run Testing.expect(u8.toU32(run radiusPixel(percent, 15, 15)) == 0, "50% of a wide box is an ellipse")
+  run Testing.expect(u8.toU32(run radiusPixel(percent, 30, 30)) == 1, "50% keeps the inside")
+  let overlap = b"display:block;width:200px;height:100px;background-color:red;border-top-left-radius:160px 80px;border-top-right-radius:160px 80px"
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 15, 15)) == 0, "overlapping radii shrink by one factor")
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 30, 30)) == 1, "the shrunk corner keeps the inside")
+  run Testing.expect(u8.toU32(run radiusPixel(overlap, 185, 15)) == 0, "both top corners shrink alike")
+  let longhand = b"display:block;width:200px;height:100px;background-color:red;border-top-left-radius:100px 50px"
+  run Testing.expect(u8.toU32(run radiusPixel(longhand, 15, 15)) == 0, "a longhand takes a horizontal and vertical radius")
+  run Testing.expect(u8.toU32(run radiusPixel(longhand, 195, 3)) == 1, "other corners stay square")
+  let ring = b"display:block;box-sizing:border-box;width:200px;height:100px;background-color:red;border:10px solid black;border-radius:40px / 20px"
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 3, 3)) == 0, "outside the outer ellipse is clear")
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 12, 12)) == 2, "the inner corner is the outer ellipse less the borders")
+  run Testing.expect(u8.toU32(run radiusPixel(ring, 25, 15)) == 1, "the padding box starts at the inner ellipse")
+}
+
+test effect fn pixelBorderRadiusMatchesChromium() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run ellipticalRadii() |> Effect.provideMut<Allocator>(&mut allocator)
 }
