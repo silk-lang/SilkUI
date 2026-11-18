@@ -350,7 +350,16 @@ check("textencoder", true, () => {
   const bytes = new TextEncoder().encode("Silk ✓");
   return bytes.length === 8 && new TextDecoder().decode(bytes) === "Silk ✓" && new TextDecoder("utf-16le").decode(new Uint8Array([65, 0])) === "A";
 });
-check("touch", false, () => global("TouchEvent"));
+check("touch", true, () => {
+  const box = ui.createBox();
+  let seen = null;
+  box.addEventListener("touchstart", (event) => { seen = event; });
+  const finger = 2 * 256 + 2 * 16 + 64;
+  globalThis.__ui.dispatch(30, box.nodeId, 5, 6, finger, 1, 0);
+  globalThis.__ui.dispatch(32, box.nodeId, 5, 6, finger, 1, 0);
+  return seen !== null && seen.cancelable && seen.touches.length === 1 && seen.changedTouches.item(0).identifier === 2
+    && seen.targetTouches[0].target === box && seen.changedTouches[0].clientY === 6;
+});
 check("url", NODE, () => {
   const url = new URL("../b?x=1#top", "https://example.com/a/c");
   return url.href === "https://example.com/b?x=1#top" && url.hostname === "example.com" && url.searchParams.get("x") === "1";
