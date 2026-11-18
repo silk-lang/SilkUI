@@ -149,9 +149,11 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots }
+import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import repair { Repair, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -384,6 +386,24 @@ fn nodeOf(mutation: &Mutation) -> u32 {
 /// Whether a mutation that names no node changes every root: a resource, a font family. A new
 /// node is nobody's yet, and a root mutation changes its own root.
 /// Whether `mutation` only moves a scroll container's content.
+/// Whether all a mutation changes of what is painted is its node's own paint inputs, styles
+/// and layout (see `UiTree.repair`).
+fn repaintsNode(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.Create { .. } => true
+    Mutation.InsertBefore { .. } => true
+    Mutation.Remove { .. } => true
+    Mutation.Destroy { .. } => true
+    Mutation.SetStyle { .. } => true
+    Mutation.SetCustomProperty { .. } => true
+    Mutation.ClearStyle { .. } => true
+    Mutation.SetText { .. } => true
+    Mutation.SetAttribute { .. } => true
+    Mutation.SetListeners { .. } => true
+    _ => false
+  }
+}
+
 fn scrollsOnly(mutation: &Mutation) -> bool {
   return match &mutation.* {
     Mutation.ScrollTo { .. } => true
@@ -909,9 +929,12 @@ pub struct UiTree<'a> {
   pub fragmentScrollers: List<bool>,
   /// Per fragment of the last layout: where stacking paints it (see `stacking`).
   pub fragmentStacking: Stacking,
-  /// Whether the fragment hashes and ink are out of date: layout, styles or mutations changed
-  /// since they were computed. Scrolling leaves them as they are.
+  /// Whether the fragment hashes, ink and stacking must all be worked out again: something
+  /// changed that `repair` does not follow. Scrolling leaves them as they are.
   paintCachesStale: bool,
+  /// What changed for them short of that: the fragments a layout pass wrote, the nodes a
+  /// restyle or a mutation repaints. The next refresh works out those alone (see `repair`).
+  pub repair: Repair,
   /// Whether a scroll offset changed since the last frame.
   pub scrolled: bool,
   /// Whether some node may hold a scroll offset other than zero: set by every write of one,
@@ -1153,6 +1176,7 @@ impl<'a> UiTree<'a> {
       fragmentScrollers: List<bool>.make(),
       fragmentStacking: Stacking.make(),
       paintCachesStale: true,
+      repair: Repair.make(),
       scrolled: false,
       offsets: false,
       scrolledSlots: List<u32>.make(),
@@ -1878,6 +1902,18 @@ impl<'a> UiTree<'a> {
     // stand, and `setOffset` says the frame scrolled.
     if !scrollsOnly(&mutation) {
       self.applied = true
+      // What a mutation changes of the paint is its node's own, a restyle's, which says so
+      // itself, or a layout's, which css-layout reports: the caches are repaired for those.
+      // Any other mutation rebuilds them.
+      if repaintsNode(&mutation) {
+        let slot = if about == NONE { NONE } else { self.slotOf(about) }
+        if slot != NONE {
+          run self.repair.nodes.append(slot)
+          self.repair.pending = true
+        }
+      } else {
+        self.paintCachesStale = true
+      }
     }
     match move mutation {
       Mutation.SetAnchor { id, target, options } => {
@@ -2995,6 +3031,7 @@ impl<'a> UiTree<'a> {
     self.paintIndexOf.clearAndFree()
     self.fragmentStacking = Stacking.make()
     self.paintCachesStale = true
+    self.repair.reset()
     self.facesDirty = true
   }
 
@@ -3230,6 +3267,7 @@ impl<'a> UiTree<'a> {
     if root == self.current {
       self.stylesDirty = true
       self.applied = true
+      self.paintCachesStale = true
       return ()
     }
     let at = self.parkedIndex(root)
@@ -3311,6 +3349,9 @@ impl<'a> UiTree<'a> {
 
   /// Moves the per-root state out of the tree, leaving that of a root never framed.
   fn park(self: &mut Self) -> RootState {
+    // What was pending for the paint caches is not kept: they are rebuilt.
+    if self.repair.pending { self.paintCachesStale = true }
+    self.repair.reset()
     return RootState {
       id: self.current,
       options: Intrinsic.replace(self.currentOptions, RootOptions.default()),
@@ -3395,7 +3436,8 @@ impl<'a> UiTree<'a> {
     self.stylesDirty = s.stylesDirty
     self.applied = s.applied
     self.paintDirty = s.paintDirty
-    self.paintCachesStale = s.paintCachesStale
+    self.paintCachesStale = s.paintCachesStale || s.applied
+    self.repair.reset()
     self.layoutObserversDirty = s.layoutObserversDirty
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
@@ -3435,6 +3477,7 @@ impl<'a> UiTree<'a> {
     if s.touched {
       self.stylesDirty = true
       self.applied = true
+      self.paintCachesStale = true
       self.layoutObserversDirty = true
       self.laidOutRevision = usize.MAX
     }
@@ -5804,7 +5847,8 @@ impl<'a> UiTree<'a> {
           || placedBefore != transform.placementHash(&styled.computed().transform, 0)
           || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0)
         if repaints {
-          self.paintCachesStale = true
+          run self.repair.nodes.append(slot)
+          self.repair.pending = true
         }
         let after = &self.node(slot).computed().*
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
@@ -6548,7 +6592,8 @@ impl<'a> UiTree<'a> {
     self.frameNumber = self.frameNumber + 1
     run self.trimNodes()
     self.releaseSlack()
-    if self.applied || self.paintDirty {
+    // A mutation said what it repaints when it was applied (see `repaintsNode`).
+    if self.paintDirty {
       self.paintCachesStale = true
     }
     self.applied = false
@@ -6590,6 +6635,8 @@ impl<'a> UiTree<'a> {
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
     // variant that changes layout is laid out in the same frame.
     if !self.stats.layoutSkipped || self.scrolled {
+      // The hit test prunes by ink and follows stacking when those are current.
+      if self.pointerInside && !self.paintDirty { run self.refreshPaintCaches() }
       run interact.refreshHover(&mut self)
       run self.resolveStyles()
       run self.layoutFrame()
@@ -6843,16 +6890,22 @@ impl<'a> UiTree<'a> {
       )
     }
     self.output.fragments.resolveLocations()
-    self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
     self.revision = self.revision + 1
+    // A viewport of another size moves what sticks to it.
+    if self.input.width != self.laidOut.width || self.input.height != self.laidOut.height {
+      self.paintCachesStale = true
+    }
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
     self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
-    if !moved {
-      run self.indexFragments()
+    if moved {
+      // Only visual offsets changed: every fragment may have moved, none was renumbered.
+      self.paintCachesStale = true
+    } else {
+      run self.carryFragments()
       if self.scrollAnchors.length() != 0 { run scroll_anchor.adjust(&mut self) }
     }
     self.layoutObserversDirty = true
@@ -6901,20 +6954,114 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.facesDirty = true
-    self.fragmentOf.clear()
-    run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
-    let values = self.output.fragments.values.asSlice()
-    self.nextSourceFragment.clear()
-    run self.nextSourceFragment.appendRepeated(NO_INDEX, values.length)
-    let mut i = values.length
-    while i > 0 {
-      i = i - 1
-      let source = values[i].source
-      if source < self.fragmentOf.length() && !values[i].positioningShell {
-        self.nextSourceFragment.set(i, self.fragmentOf.get(source))
-        self.fragmentOf.set(source, i)
+    run buildIndex(
+      &self.output,
+      self.layout.nodes.length(),
+      &mut self.fragmentOf,
+      &mut self.nextSourceFragment,
+      &mut self.repair.index,
+    )
+  }
+
+  /// After a layout pass: brings what the tree keeps per fragment to the fragments css-layout
+  /// kept (`FragmentArena.carried`), and notes the others for the next refresh of the paint
+  /// caches. The index by source is repaired at once: geometry queries read it before paint.
+  effect fn carryFragments(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.output.fragments.values.length()
+    let old = self.nextSourceFragment.length()
+    let mut plan = Intrinsic.replace(self.repair.plan, CarryPlan.make())
+    let mut dirty = Intrinsic.replace(self.repair.dirty, List<usize>.make())
+    dirty.clear()
+    let mut why: u8 = 1
+    let mut carried = self.output.fragments.carriedKnown
+    if carried {
+      why = 2
+      carried = run plan.set(self.output.fragments.carried.asSlice(), old, count)
+    }
+    if carried {
+      run plan.uncovered(&mut dirty)
+      // When much changed, working everything out again costs less than repairing it.
+      why = 4
+      carried = dirty.length() <= count / 4 + 64
+    }
+    if carried {
+      why = 3
+      carried = run repairIndex(
+        &plan,
+        &self.output,
+        self.layout.nodes.length(),
+        &mut self.fragmentOf,
+        &mut self.nextSourceFragment,
+        &mut self.repair.index,
+        dirty.asSlice(),
+      )
+    }
+    if !carried {
+      run self.indexFragments()
+      if !self.paintCachesStale {
+        self.repair.uncarried = self.repair.uncarried + 1
+        self.repair.uncarriedWhy = why
+      }
+      self.paintCachesStale = true
+    } else {
+      // A text fragment of a font not seen before loads its face.
+      let values = self.output.fragments.values.asSlice()
+      let mut d: usize = 0
+      while d < dirty.length() && !self.facesDirty {
+        let text = values[dirty.get(d)].textData
+        if text != NO_INDEX {
+          let key = self.output.fragments.texts.get(text).fontKey
+          if key >= self.faces.length() || !self.faces.asSlice()[key].loaded { self.facesDirty = true }
+        }
+        d = d + 1
       }
     }
+    if !self.paintCachesStale {
+      if self.fragmentHashes.length() != old || self.fragmentInk.length() != old
+        || self.fragmentScrollers.length() != old || !self.fragmentStacking.carries(old) {
+        self.paintCachesStale = true
+      } else {
+        let empty = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+        run carryList<u64>(&plan, &mut self.fragmentHashes, &mut self.repair.spareHashes, 0)
+        run carryList<Rect<f32>>(&plan, &mut self.fragmentInk, &mut self.repair.spareInk, empty)
+        run carryList<bool>(&plan, &mut self.fragmentScrollers, &mut self.repair.spareFlags, false)
+        run self.fragmentStacking.carry(&plan)
+        // What was pending from an earlier pass moves too, or is gone.
+        if !plan.identity {
+          let pending = self.repair.fragments.asMutSlice()
+          let mut kept: usize = 0
+          let mut i: usize = 0
+          while i < pending.length {
+            let to = plan.newIndex(pending[i])
+            if to != NO_INDEX {
+              pending[kept] = to
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragments.truncate(kept)
+        } else {
+          let pending = self.repair.fragments.asMutSlice()
+          let mut kept: usize = 0
+          let mut i: usize = 0
+          while i < pending.length {
+            if pending[i] < count {
+              pending[kept] = pending[i]
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragments.truncate(kept)
+        }
+        run self.repair.fragments.appendSlice(dirty.asSlice())
+        self.repair.pending = true
+      }
+    }
+    if self.paintCachesStale { self.repair.settle() }
+    self.repair.plan = move plan
+    self.repair.dirty = move dirty
     if self.lineOrigins.length() != 0 { run self.indexFirstLines() }
   }
 
@@ -6948,11 +7095,175 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let count = self.output.fragments.values.length()
-    if !self.paintCachesStale && self.fragmentHashes.length() == count
-      && self.fragmentInk.length() == count && self.fragmentStacking.covers(count) {
+    let sized = self.fragmentHashes.length() == count && self.fragmentInk.length() == count
+      && self.fragmentScrollers.length() == count
+    if !self.paintCachesStale && !self.repair.pending && sized && self.fragmentStacking.covers(count) {
       return ()
     }
-    run cacheFragments(
+    // Only what changed, when that is known and no fragment's caches read another's.
+    let mut repaired = !self.paintCachesStale && sized && self.fragmentStacking.carries(count)
+      && self.nextSourceFragment.length() == count
+    if repaired && self.repair.fragile {
+      self.repair.fragileRebuilds = self.repair.fragileRebuilds + 1
+      repaired = false
+    }
+    if repaired {
+      repaired = run self.repairPaintCaches()
+    }
+    if repaired {
+      self.repair.repairs = self.repair.repairs + 1
+    } else {
+      self.repair.rebuilds = self.repair.rebuilds + 1
+      self.repair.fragile = run cacheFragments(
+        &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+        self.input.width, self.input.height,
+        &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+      )
+      run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
+      run foldLiftedRoots(
+        &self.fragmentStacking,
+        &mut self.fragmentHashes,
+        &mut self.fragmentInk,
+        &mut self.fragmentScrollers,
+      )
+      self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    }
+    self.repair.settle()
+    self.paintCachesStale = false
+    if repaired && self.repair.verify { run self.verifyPaintCaches() }
+  }
+
+  /// Works out again the caches of the fragments noted in `repair`, of the fragments of its
+  /// nodes, and of every fragment above those. False when it cannot: the caller rebuilds.
+  effect fn repairPaintCaches(self: &mut Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let values = self.output.fragments.values.asSlice()
+    let count = values.length
+    let mut dirty = Intrinsic.replace(self.repair.fragments, List<usize>.make())
+    let mut stack = Intrinsic.replace(self.repair.stack, List<usize>.make())
+    let mut marks = Intrinsic.replace(self.repair.marks, List<bool>.make())
+    if marks.length() < count {
+      let have = marks.length()
+      run marks.appendRepeated(false, count - have)
+    }
+    // Each fragment once.
+    let mut kept: usize = 0
+    let mut d: usize = 0
+    while d < dirty.length() {
+      let index = dirty.get(d)
+      if index < count && !marks.get(index) {
+        marks.set(index, true)
+        dirty.set(kept, index)
+        kept = kept + 1
+      }
+      d = d + 1
+    }
+    dirty.truncate(kept)
+
+    // The fragments a node's paint inputs reach: its own, and those of the text and the
+    // boxes the tree made inside it, which paint with its style (see `styleSlot`).
+    let layoutNodes = self.layout.nodes.asSlice()
+    let mut n: usize = 0
+    while n < self.repair.nodes.length() {
+      let slot = self.repair.nodes.get(n)
+      n = n + 1
+      if u32.toUsize(slot) >= self.nodes.length() || !self.node(slot).live { continue }
+      let text = self.node(slot).kind == NodeKind.Text
+      let own = self.node(slot).css
+      stack.clear()
+      run stack.append(own)
+      while stack.length() != 0 {
+        let last = stack.length() - 1
+        let css = stack.get(last)
+        stack.truncate(last)
+        if css >= layoutNodes.length { continue }
+        let mut fragment = if css < self.fragmentOf.length() { self.fragmentOf.get(css) } else { NO_INDEX }
+        while fragment != NO_INDEX && fragment < count {
+          if !marks.get(fragment) {
+            marks.set(fragment, true)
+            run dirty.append(fragment)
+          }
+          fragment = self.nextSourceFragment.get(fragment)
+        }
+        if text { continue }
+        let mut child = layoutNodes[css].firstChild
+        while child != NO_INDEX {
+          let owner = self.slotOfCssNode(child)
+          if owner == NONE || self.node(owner).kind == NodeKind.Text {
+            run stack.append(child)
+          }
+          child = layoutNodes[child].nextSibling
+        }
+      }
+    }
+
+    // Every fragment above a changed one folds it in.
+    let listed = dirty.length()
+    d = 0
+    while d < listed {
+      let mut at = values[dirty.get(d)].parent
+      while at != NO_INDEX && !marks.get(at) {
+        marks.set(at, true)
+        run dirty.append(at)
+        at = values[at].parent
+      }
+      d = d + 1
+    }
+    d = 0
+    while d < dirty.length() {
+      marks.set(dirty.get(d), false)
+      d = d + 1
+    }
+    self.repair.stack = move stack
+    self.repair.marks = move marks
+    run dirty.sort()
+
+    run self.fragmentStacking.repair(
+      &self.output, &self.slotOfCss, &self.layout, &self.nodes, &self.fragmentOf, dirty.asSlice(),
+    )
+    // A fixed box's root is folded into the roots that paint it: those start over.
+    let lifts = self.repair.lifted || self.fragmentStacking.lifted.length() != 0
+    if lifts {
+      run dirty.appendSlice(self.fragmentStacking.roots.asSlice())
+      run sortUnique(&mut dirty)
+    }
+    let mut ordered = true
+    let fragile = repairFragments(
+      &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+      self.input.width, self.input.height,
+      &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+      dirty.asSlice(), &mut ordered,
+    )
+    dirty.clear()
+    self.repair.fragments = move dirty
+    if fragile || !ordered {
+      return false
+    }
+    if lifts {
+      run foldLiftedRoots(
+        &self.fragmentStacking,
+        &mut self.fragmentHashes,
+        &mut self.fragmentInk,
+        &mut self.fragmentScrollers,
+      )
+    }
+    self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    return true
+  }
+
+  /// Compares the repaired caches and the index by source with a full rebuild, which then
+  /// stands; `repair.mismatches` counts the refreshes that differed.
+  effect fn verifyPaintCaches(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hashes = Intrinsic.replace(self.fragmentHashes, List<u64>.make())
+    let ink = Intrinsic.replace(self.fragmentInk, List<Rect<f32>>.make())
+    let scrollers = Intrinsic.replace(self.fragmentScrollers, List<bool>.make())
+    let stacking = Intrinsic.replace(self.fragmentStacking, Stacking.make())
+    let firsts = Intrinsic.replace(self.fragmentOf, List<usize>.make())
+    let nexts = Intrinsic.replace(self.nextSourceFragment, List<usize>.make())
+    let fragile = run cacheFragments(
       &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
       self.input.width, self.input.height,
       &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
@@ -6964,12 +7275,38 @@ impl<'a> UiTree<'a> {
       &mut self.fragmentInk,
       &mut self.fragmentScrollers,
     )
-    self.paintCachesStale = false
+    let facesDirty = self.facesDirty
+    run self.indexFragments()
+    self.facesDirty = facesDirty
+    let count = self.output.fragments.values.length()
+    let mut same = !fragile && hashes.length() == count && ink.length() == count && scrollers.length() == count
+      && nexts.length() == count && firsts.length() == self.fragmentOf.length()
+      && stacking.matches(&self.fragmentStacking)
+    let mut i: usize = 0
+    while same && i < count {
+      let a = ink.get(i)
+      let b = self.fragmentInk.get(i)
+      same = hashes.get(i) == self.fragmentHashes.get(i) && scrollers.get(i) == self.fragmentScrollers.get(i)
+        && a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+        && nexts.get(i) == self.nextSourceFragment.get(i)
+      i = i + 1
+    }
+    i = 0
+    while same && i < firsts.length() {
+      same = firsts.get(i) == self.fragmentOf.get(i)
+      i = i + 1
+    }
+    if !same {
+      self.repair.mismatches = self.repair.mismatches + 1
+      if VERIFY_ALWAYS { Intrinsic.trap("ui-tree: repaired paint caches differ from a rebuild") }
+    }
+    self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    self.repair.fragile = fragile
   }
 
   /// Whether the fragment ink describes the last layout, so hit testing can skip by it.
   pub fn inkCurrent(self: &Self) -> bool {
-    return !self.paintCachesStale
+    return !self.paintCachesStale && !self.repair.pending
       && self.fragmentInk.length() == self.output.fragments.values.length()
   }
 
@@ -7141,6 +7478,8 @@ impl<'a> UiTree<'a> {
   pub effect fn paintSubtree(self: &mut Self, slot: u32, scene: &mut Scene) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    // Between a layout pass and the refresh, stacking lists no roots to paint from.
+    if self.repair.pending && !self.paintCachesStale { run self.refreshPaintCaches() }
     let window = ContentMask.new(
       Rect<f32>.new(
         0.0,

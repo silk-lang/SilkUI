@@ -19,6 +19,7 @@
 import layout.lib { FragmentKind, LayoutTree, Tree }
 import mutation { NodeKind, Position }
 import node { NONE, NO_INDEX, Node }
+import repair { CarryPlan, carryList, sortUnique }
 import style { Computed, DisplayInside }
 import silk.collections.list { List }
 import silk.core.option { Option }
@@ -185,6 +186,58 @@ pub fn rootOf(output: &LayoutTree, index: usize) -> usize {
   return at
 }
 
+/// For fragment root `index` that a node's box makes (a fixed box), the fragment root of
+/// the nearest node above it in `css` that has a fragment (`firsts`: each node's first), or
+/// `NO_INDEX`.
+fn rootAbove(output: &LayoutTree, css: &Tree, firsts: &List<usize>, index: usize) -> usize {
+  let values = output.fragments.values.asSlice()
+  let nodes = css.nodes.asSlice()
+  let mut node = values[index].source
+  while node < nodes.length {
+    node = nodes[node].parent
+    if node == NO_INDEX || node >= firsts.length() {
+      return NO_INDEX
+    }
+    let fragment = firsts.get(node)
+    if fragment != NO_INDEX {
+      let root = rootOf(output, fragment)
+      return if root == index { NO_INDEX } else { root }
+    }
+  }
+  return NO_INDEX
+}
+
+/// What stacking says of fragment `index` by itself: its flags and stack level, before the
+/// lists are made (see [`Stacking.settle`]).
+fn layerOf(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index: usize) -> Layer {
+  let f = &output.fragments.values.asSlice()[index]
+  let mut layer = Layer.none()
+  if f.parent == NO_INDEX {
+    layer.flags = CONTEXT
+    // A fixed box is a fragment root of its own: it stacks in the root context of the
+    // tree it is in (see `rootAbove`), not over everything.
+    if let Option<&Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
+      layer.flags = CONTEXT | HOISTED
+      if !value.zAuto {
+        layer.z = value.zIndex
+      }
+    }
+  } else if let Option<&Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
+    let item = !value.zAuto && isItem(output, slots, nodes, index)
+    if createsContext(value, item) {
+      layer.flags = CONTEXT | HOISTED
+    } else if value.layout.position != Position.Static {
+      layer.flags = HOISTED
+    } else if belowRoot(output, slots, index) {
+      layer.flags = ROOT
+    }
+    if !value.zAuto && zApplies(value, item) {
+      layer.z = value.zIndex
+    }
+  }
+  return layer
+}
+
 /// What [`Stacking.step`] returns where a context's in-flow content goes.
 pub const IN_FLOW: usize = usize.MAX - 1
 
@@ -203,6 +256,17 @@ pub struct Stacking {
   pub lifted: List<LiftedRoot>,
   /// The fragments without a parent, in order: where painting starts.
   pub roots: List<usize>,
+  /// The fragments with a flag or without a parent, ascending: all that the lists above are
+  /// made from, so a layout that changed few fragments need not look at the others.
+  marked: List<usize>,
+  /// Whether the rest describes the layout `layers` covers: not between `carry` and `repair`.
+  valid: bool,
+  /// The css-layout structure revision and node count `doc` was numbered at.
+  docRevision: usize,
+  docNodes: usize,
+  spareLayers: List<Layer>,
+  spareMarked: List<usize>,
+  touched: List<usize>,
 }
 
 impl Stacking {
@@ -215,11 +279,65 @@ impl Stacking {
       firstFragment: List<usize>.make(),
       lifted: List<LiftedRoot>.make(),
       roots: List<usize>.make(),
+      marked: List<usize>.make(),
+      valid: false,
+      docRevision: usize.MAX,
+      docNodes: 0,
+      spareLayers: List<Layer>.make(),
+      spareMarked: List<usize>.make(),
+      touched: List<usize>.make(),
     }
   }
 
   /// Whether this describes a layout of `count` fragments.
   pub fn covers(self: &Self, count: usize) -> bool {
+    return self.valid && self.layers.length() == count
+  }
+
+  /// Whether this and `other` say the same of every fragment and hold the same lists.
+  pub fn matches(self: &Self, other: &Stacking) -> bool {
+    if self.layers.length() != other.layers.length() || self.entries.length() != other.entries.length()
+      || self.elements.length() != other.elements.length() || self.lifted.length() != other.lifted.length()
+      || self.roots.length() != other.roots.length() {
+      return false
+    }
+    let mut i: usize = 0
+    while i < self.layers.length() {
+      let a = self.layers.get(i)
+      let b = other.layers.get(i)
+      if a.flags != b.flags || a.z != b.z || a.count != b.count || a.negative != b.negative
+        || (a.count != 0 && a.first != b.first) {
+        return false
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < self.entries.length() {
+      let a = self.entries.get(i)
+      let b = other.entries.get(i)
+      if a.context != b.context || a.z != b.z || a.fragment != b.fragment { return false }
+      i = i + 1
+    }
+    i = 0
+    while i < self.elements.length() {
+      if self.elements.get(i) != other.elements.get(i) { return false }
+      i = i + 1
+    }
+    i = 0
+    while i < self.lifted.length() {
+      if self.lifted.get(i).fragment != other.lifted.get(i).fragment || self.lifted.get(i).context != other.lifted.get(i).context { return false }
+      i = i + 1
+    }
+    i = 0
+    while i < self.roots.length() {
+      if self.roots.get(i) != other.roots.get(i) { return false }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Whether `repair` can bring this up to a layout of `count` fragments.
+  pub fn carries(self: &Self, count: usize) -> bool {
     return self.layers.length() == count
   }
 
@@ -298,66 +416,191 @@ impl Stacking {
     ? &mut Allocator {
     let count = output.fragments.values.length()
     self.layers.clear()
-    self.entries.clear()
-    self.elements.clear()
+    self.marked.clear()
     run self.layers.reserveExact(count)
-    self.lifted.clear()
-    self.roots.clear()
-    let values = output.fragments.values.asSlice()
-    let mut hoists: usize = 0
     let mut index: usize = 0
     while index < count {
-      let f = &values[index]
-      let mut layer = Layer.none()
-      if f.parent == NO_INDEX {
-        run self.roots.append(index)
-        layer.flags = CONTEXT
-        // A fixed box is a fragment root of its own: it stacks in the root context of the
-        // tree it is in (see `rootAbove`), not over everything.
-        if let Option<&Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
-          layer.flags = CONTEXT | HOISTED
-          if !value.zAuto {
-            layer.z = value.zIndex
-          }
-        }
-      } else if let Option<&Computed>.Some { value } = boxStyle(output, slots, nodes, index) {
-        let item = !value.zAuto && isItem(output, slots, nodes, index)
-        if createsContext(value, item) {
-          layer.flags = CONTEXT | HOISTED
-        } else if value.layout.position != Position.Static {
-          layer.flags = HOISTED
-        } else if belowRoot(output, slots, index) {
-          layer.flags = ROOT
-          run self.elements.append(index)
-        }
-        if !value.zAuto && zApplies(value, item) {
-          layer.z = value.zIndex
-        }
-      }
-      if (layer.flags & HOISTED) != 0 {
-        hoists = hoists + 1
+      let layer = layerOf(output, slots, nodes, index)
+      if layer.flags != 0 || output.fragments.values.asSlice()[index].parent == NO_INDEX {
+        run self.marked.append(index)
       }
       run self.layers.append(layer)
       index = index + 1
     }
-    if hoists == 0 {
-      return ()
+    // The first fragment of each node, for fixed boxes' roots.
+    let mut firsts = Intrinsic.replace(self.firstFragment, List<usize>.make())
+    firsts.clear()
+    let mut roots: usize = 0
+    let values = output.fragments.values.asSlice()
+    index = 0
+    while index < self.marked.length() && roots < 2 {
+      if values[self.marked.get(index)].parent == NO_INDEX { roots = roots + 1 }
+      index = index + 1
     }
-    run self.order(css)
-    self.firstFragment.clear()
-    if self.roots.length() > 1 {
-      run self.firstFragment.appendRepeated(NO_INDEX, css.nodes.length())
+    if roots > 1 {
+      run firsts.appendRepeated(NO_INDEX, css.nodes.length())
       index = count
       while index > 0 {
         index = index - 1
         let source = values[index].source
-        if source < self.firstFragment.length() { self.firstFragment.set(source, index) }
+        if source < firsts.length() { firsts.set(source, index) }
       }
+    }
+    run self.settle(output, css, &firsts)
+    self.firstFragment = move firsts
+  }
+
+  /// Moves what is kept per fragment to the fragments of a layout that kept the runs of
+  /// `plan` from the one before. Until `repair`, nothing here describes the layout.
+  pub effect fn carry(self: &mut Self, plan: &CarryPlan) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    self.valid = false
+    self.entries.clear()
+    self.lifted.clear()
+    self.roots.clear()
+    self.elements.clear()
+    run carryList<Layer>(plan, &mut self.layers, &mut self.spareLayers, Layer.none())
+    if plan.identity {
+      // What is past the end is gone.
+      let mut kept = self.marked.length()
+      while kept > 0 && self.marked.get(kept - 1) >= plan.newCount { kept = kept - 1 }
+      self.marked.truncate(kept)
+      return ()
+    }
+    let old = self.marked.asSlice()
+    self.spareMarked.clear()
+    let segments = plan.segments.asSlice()
+    let mut s: usize = 0
+    while s < segments.length {
+      let segment = segments[s]
+      let mut low: usize = 0
+      let mut high = old.length
+      while low < high {
+        let mid = low + (high - low) / 2
+        if old[mid] < segment.from { low = mid + 1 } else { high = mid }
+      }
+      while low < old.length && old[low] - segment.from < segment.length {
+        run self.spareMarked.append(segment.to + (old[low] - segment.from))
+        low = low + 1
+      }
+      s = s + 1
+    }
+    let moved = Intrinsic.replace(self.spareMarked, List<usize>.make())
+    self.spareMarked = Intrinsic.replace(self.marked, move moved)
+  }
+
+  /// [`Stacking.update`] after [`Stacking.carry`]: works out the fragments of `dirty` again
+  /// (ascending; every fragment `carry` did not cover, and any other that changed), and the
+  /// lists from the marked fragments. `firsts` is each css-layout node's first fragment.
+  pub effect fn repair(
+    self: &mut Self,
+    output: &LayoutTree,
+    slots: &List<u32>,
+    css: &Tree,
+    nodes: &List<Node>,
+    firsts: &List<usize>,
+    dirty: &[usize],
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let values = output.fragments.values.asSlice()
+    // A box's flags read its parent's display and whether anything above it is a node's: the
+    // children of a changed fragment are worked out again too, through those that are no
+    // node's. So is every root, whose flags `settle` rewrites.
+    self.touched.clear()
+    let mut d: usize = 0
+    while d < dirty.length {
+      run self.touched.append(dirty[d])
+      d = d + 1
+    }
+    let mut at: usize = 0
+    while at < self.touched.length() {
+      let parent = self.touched.get(at)
+      at = at + 1
+      if at <= dirty.length || slotIn(slots, values[parent].source) == NONE {
+        let mut child = values[parent].firstChild
+        while child != NO_INDEX {
+          run self.touched.append(child)
+          child = values[child].nextSibling
+        }
+      }
+    }
+    let mut m: usize = 0
+    while m < self.marked.length() {
+      let index = self.marked.get(m)
+      if values[index].parent == NO_INDEX { run self.touched.append(index) }
+      m = m + 1
+    }
+    run sortUnique(&mut self.touched)
+
+    // The marked fragments: those that stand, and those worked out again that qualify.
+    self.spareMarked.clear()
+    let touched = self.touched.asSlice()
+    let old = self.marked.asSlice()
+    let mut o: usize = 0
+    let mut t: usize = 0
+    while t < touched.length {
+      let index = touched[t]
+      while o < old.length && old[o] < index {
+        run self.spareMarked.append(old[o])
+        o = o + 1
+      }
+      if o < old.length && old[o] == index { o = o + 1 }
+      let layer = layerOf(output, slots, nodes, index)
+      self.layers.set(index, layer)
+      if layer.flags != 0 || values[index].parent == NO_INDEX {
+        run self.spareMarked.append(index)
+      }
+      t = t + 1
+    }
+    while o < old.length {
+      run self.spareMarked.append(old[o])
+      o = o + 1
+    }
+    let marked = Intrinsic.replace(self.spareMarked, List<usize>.make())
+    self.spareMarked = Intrinsic.replace(self.marked, move marked)
+    run self.settle(output, css, firsts)
+  }
+
+  /// The lists, from the marked fragments' flags: roots, root elements, and every context's
+  /// entries.
+  effect fn settle(self: &mut Self, output: &LayoutTree, css: &Tree, firsts: &List<usize>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let values = output.fragments.values.asSlice()
+    self.entries.clear()
+    self.elements.clear()
+    self.lifted.clear()
+    self.roots.clear()
+    self.valid = true
+    let mut hoists: usize = 0
+    let mut m: usize = 0
+    while m < self.marked.length() {
+      let index = self.marked.get(m)
+      let mut layer = self.layers.get(index)
+      layer.first = 0
+      layer.count = 0
+      layer.negative = 0
+      self.layers.set(index, layer)
+      if values[index].parent == NO_INDEX { run self.roots.append(index) }
+      if (layer.flags & ROOT) != 0 { run self.elements.append(index) }
+      if (layer.flags & HOISTED) != 0 { hoists = hoists + 1 }
+      m = m + 1
+    }
+    if hoists == 0 {
+      return ()
+    }
+    if self.docRevision != css.structureRevision() || self.docNodes != css.nodes.length() {
+      run self.order(css)
+      self.docRevision = css.structureRevision()
+      self.docNodes = css.nodes.length()
     }
 
     // Each hoisted fragment joins the lists of the nearest context above it.
-    index = 0
-    while index < count {
+    m = 0
+    while m < self.marked.length() {
+      let index = self.marked.get(m)
       let layer = self.layers.get(index)
       if (layer.flags & HOISTED) != 0 {
         let mut at = values[index].parent
@@ -365,7 +608,7 @@ impl Stacking {
           at = values[at].parent
         }
         if values[index].parent == NO_INDEX {
-          at = self.rootAbove(output, css, index)
+          at = rootAbove(output, css, firsts, index)
           if at == NO_INDEX {
             // Nothing above it: it stays a root of its own and paints over the others.
             let mut layer = self.layers.get(index)
@@ -385,7 +628,7 @@ impl Stacking {
           run self.entries.append(Entry { context: at, z: layer.z, doc: doc, fragment: index })
         }
       }
-      index = index + 1
+      m = m + 1
     }
     run self.entries.sort()
     let mut i: usize = 0
@@ -404,25 +647,6 @@ impl Stacking {
     }
   }
 
-  /// For fragment root `index` that a node's box makes (a fixed box), the fragment root of
-  /// the nearest node above it in `css` that has a fragment, or `NO_INDEX`.
-  fn rootAbove(self: &Self, output: &LayoutTree, css: &Tree, index: usize) -> usize {
-    let values = output.fragments.values.asSlice()
-    let nodes = css.nodes.asSlice()
-    let mut node = values[index].source
-    while node < nodes.length {
-      node = nodes[node].parent
-      if node == NO_INDEX || node >= self.firstFragment.length() {
-        return NO_INDEX
-      }
-      let fragment = self.firstFragment.get(node)
-      if fragment != NO_INDEX {
-        let root = rootOf(output, fragment)
-        return if root == index { NO_INDEX } else { root }
-      }
-    }
-    return NO_INDEX
-  }
 
   /// Numbers the nodes of `css` in document order.
   effect fn order(self: &mut Self, css: &Tree) -> ()
