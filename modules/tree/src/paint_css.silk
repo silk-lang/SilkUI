@@ -88,7 +88,7 @@ pub fn handles(property: CssProperty) -> bool {
 /// (`Computed` keeps their lengths).
 pub fn reads(property: CssProperty) -> bool {
   return handles(property) || isRadius(property) || property == CssProperty.Isolation
-    || property == CssProperty.WillChange
+    || property == CssProperty.WillChange || property == CssProperty.OffsetPath
 }
 
 fn isRadius(property: CssProperty) -> bool {
@@ -314,6 +314,8 @@ pub struct Effects {
   pub shapeBox: bool,
   /// `shape-margin`, a length or percentage in `numerics`.
   pub shapeMargin: Option<ExprId>,
+  /// Zero or one `offset-path` basic shape or `path()`; `transform.Offset` holds the rest.
+  pub offset: List<ClipSource>,
   /// Same declarations at the same font size and color hash alike.
   pub hash: u64,
 }
@@ -337,6 +339,7 @@ impl Effects {
       shape: List<ClipSource>.make(),
       shapeBox: false,
       shapeMargin: Option<ExprId>.None,
+      offset: List<ClipSource>.make(),
       hash: 0,
     }
   }
@@ -633,6 +636,10 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     }
     return
   }
+  if property == CssProperty.OffsetPath {
+    run applyOffsetPath(&mut effects.*, &source, &mut cursor, &context)
+    return
+  }
   if property == CssProperty.ShapeOutside || property == CssProperty.ShapeMargin {
     run applyShape(&mut effects.*, property, css, &source, &mut cursor, &context)
     return
@@ -738,6 +745,39 @@ effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], s
       effects.shape.clear()
       run effects.shape.append(move clip)
       effects.shapeBox = named
+    }
+    EffectValue other => {
+      drop other
+    }
+  }
+}
+
+/// `offset-path`'s basic shapes and `path()`, read with `clip-path`'s grammar; a box alone, a
+/// `ray()` and the rest leave none here (`transform.Offset` reads those).
+effect fn applyOffsetPath(effects: &mut Effects, source: &Input<'_>, cursor: &mut Cursor, context: &LengthContext) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  effects.offset.clear()
+  let value = match run effect_values.parse(&mut effects.numerics, CssProperty.ClipPath, source, &mut cursor.*, false) {
+    Option<EffectValue>.Some { value } => move value
+    _ => {
+      return
+    }
+  }
+  if !cursor.done(source) {
+    return
+  }
+  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  let colors = ColorContext.make(black, [black; 19])
+  let computed = run effect_values.compute(&value, &mut effects.numerics, context, &colors)
+  match move computed {
+    EffectValue.ClipPath { source: clip } => {
+      match &clip {
+        ClipSource.Shape { .. } => {
+          run effects.offset.append(move clip)
+        }
+        _ => {}
+      }
     }
     EffectValue other => {
       drop other
