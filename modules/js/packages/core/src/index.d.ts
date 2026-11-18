@@ -104,6 +104,10 @@ export class Node {
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;
+  /** As DOM `setPointerCapture`: throws `NotFoundError` for a pointer that is not down. */
+  setPointerCapture(pointerId: number): void;
+  releasePointerCapture(pointerId: number): void;
+  hasPointerCapture(pointerId: number): boolean;
   scrollTo(x: number, y: number): void;
   scroll(x: number, y: number): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
@@ -262,6 +266,26 @@ export interface PointerEvent extends ModifierEvent {
   readonly clientY: number;
   readonly x: number;
   readonly y: number;
+  /** 1 for the mouse, 2 and up for touches. */
+  readonly pointerId: number;
+  readonly pointerType: "mouse" | "pen" | "touch";
+  readonly isPrimary: boolean;
+  /** -1 for `pointermove`, as on the web. */
+  readonly button: number;
+  readonly buttons: number;
+  /** 0.5 while a button is down, 0 otherwise: no host reports pressure yet. */
+  readonly pressure: number;
+  readonly tangentialPressure: number;
+  readonly tiltX: number;
+  readonly tiltY: number;
+  readonly twist: number;
+  readonly altitudeAngle: number;
+  readonly azimuthAngle: number;
+  readonly width: number;
+  readonly height: number;
+  /** The event itself for `pointermove` (each host move is its own event), empty otherwise. */
+  getCoalescedEvents(): PointerEvent[];
+  getPredictedEvents(): PointerEvent[];
 }
 
 /** `pointerdown`, `pointerup` and `click`. */
@@ -330,6 +354,8 @@ export interface EventMap {
   pointerenter: PointerEvent;
   pointerleave: PointerEvent;
   pointercancel: PointerEvent;
+  pointerover: PointerEvent;
+  pointerout: PointerEvent;
   wheel: WheelEvent;
   keydown: KeyboardEvent;
   keyup: KeyboardEvent;
