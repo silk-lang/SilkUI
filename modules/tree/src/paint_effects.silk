@@ -5,7 +5,7 @@
 import paint { Painter, borderBox, paddingBox, contentBox, device, scaledCorners, snapped, radiiOf }
 import paint_css { Effects, Layers, Clip, TextShadow, ATTACH_FIXED, ATTACH_LOCAL }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ROOT_GROUP, UNBOUNDED }
-import vector.layer { BLEND_NORMAL }
+import vector.layer { BLEND_NORMAL, BLEND_SOURCE_IN, BLEND_SOURCE_OUT, BLEND_XOR }
 import resources { Resource }
 import atlas.atlas { AtlasTile }
 import silk.collections.bytes { Bytes }
@@ -13,6 +13,8 @@ import style { Computed }
 import node { NONE }
 import layout.lib { Fragment }
 import svg_css.effect_values {
+  Composite,
+  MaskMode,
   Filter,
   FilterKind,
   Image,
@@ -612,6 +614,8 @@ pub effect fn paintLayers(
   let mut stops = List<Stop>.make()
   let count = layers.count()
   let mut layer = count
+  // Whether a layer is drawn under the next: the bottom one composites with nothing.
+  let mut composited = false
   while layer > 0 {
     layer = layer - 1
     let image = &layers.images.asSlice()[layer]
@@ -707,76 +711,132 @@ pub effect fn paintLayers(
       run closeFixed(&mut p, opened)
       continue
     }
-    // background-blend-mode: the layer blends with the layers and color under it, in the
-    // isolated group the caller opened.
+    // background-blend-mode blends a layer with the layers and color under it, in the isolated
+    // group the caller opened; mask-composite combines a mask layer with the ones under it.
     let mode = layers.blend(layer)
-    if mode != BLEND_NORMAL {
-      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: mode }, LayerEffects.none())
+    let op = if composited { compositeOp(layers.composite(layer)) } else { BLEND_NORMAL }
+    let blend = if mode != BLEND_NORMAL { mode } else { op }
+    if blend != BLEND_NORMAL {
+      let over = if op != BLEND_NORMAL { mask } else { clip }
+      drop run p.scene.pushEffectLayer(over.bounds, over, Isolation { opacity: 1.0, blend: blend }, LayerEffects.none())
     }
-    match picture {
-      Option<Resource>.Some { value } => {
-        run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest)
-        if mode != BLEND_NORMAL { run p.scene.popLayer() }
-        run closeFixed(&mut p, opened)
-      continue
-      }
-      Option<Resource>.None => {}
-    }
-    let single = nx == 1 && ny == 1
-    let first = Rect<f32>.new(across[0], down[0], across[0] + tw, down[0] + th)
-    if single && sameRect(first, painting) {
-      // Snapped like the background color under it, so their edges agree.
-      run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops)
-      if mode != BLEND_NORMAL { run p.scene.popLayer() }
-      run closeFixed(&mut p, opened)
-      continue
-    }
-    let rounded = hasRadius(paintingRadii)
-    if rounded {
-      drop run p.scene.pushEffectLayer(
-        clip.bounds,
-        clip,
-        Isolation { opacity: 1.0, blend: 0 },
-        LayerEffects.none(),
-      )
+    if layers.mode(layer) == MaskMode.Luminance {
+      // Luminance to alpha on straight color, masked by the image's own alpha: luminance
+      // times alpha, as a luminance mask takes it.
+      let mut luminance = LayerEffects.none()
+      luminance.color = LUMINANCE_TO_ALPHA
+      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: 0 }, luminance)
       drop run p.scene.pushMaskLayer()
-      let mut shape = Quad.fill(device(painting, s), clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
-      shape.cornerRadii = paintingRadii
-      drop run p.scene.quad(shape)
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+      run p.scene.popLayer()
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+      run p.scene.popLayer()
+    } else {
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+    }
+    if blend != BLEND_NORMAL {
       run p.scene.popLayer()
     }
-    let mut drawn: usize = 0
-    let mut j: usize = 0
-    while j < ny && drawn < MAX_TILES {
-      let mut i: usize = 0
-      while i < nx && drawn < MAX_TILES {
-        let x = across[0] + usize.toF32(i) * across[1]
-        let y = down[0] + usize.toF32(j) * down[1]
-        let tile = Rect<f32>.new(x, y, x + tw, y + th)
-        if !isEmpty(intersect(tile, painting)) {
-          // Whole device pixels, so neighbouring tiles share their edges without a seam.
-          let snapped = Rect<f32>.new(
-            f32.round(x * s),
-            f32.round(y * s),
-            f32.round((x + tw) * s),
-            f32.round((y + th) * s),
-          )
-          run paintGradient(&mut p, effects, image, snapped, clip, Corners<f32>.zero(), &mut stops)
-          drawn = drawn + 1
-        }
-        i = i + 1
-      }
-      j = j + 1
-    }
-    if rounded {
-      run p.scene.popLayer()
-    }
-    if mode != BLEND_NORMAL {
-      run p.scene.popLayer()
-    }
+    composited = true
     run closeFixed(&mut p, opened)
   }
 }
+
+/// One image layer's tiles (see [`paintLayers`]): a loaded `url()` picture or a gradient.
+effect fn drawLayerImage(
+  p: &mut Painter<'_, '_>,
+  effects: &Effects,
+  image: &Image,
+  picture: Option<Resource>,
+  across: [f32; 3],
+  down: [f32; 3],
+  nx: usize,
+  ny: usize,
+  tw: f32,
+  th: f32,
+  painting: Rect<f32>,
+  paintingRadii: Corners<f32>,
+  mask: ContentMask,
+  clip: ContentMask,
+  nearest: bool,
+  stops: &mut List<Stop>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  match picture {
+    Option<Resource>.Some { value } => {
+      run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest)
+      return
+    }
+    Option<Resource>.None => {}
+  }
+  let single = nx == 1 && ny == 1
+  let first = Rect<f32>.new(across[0], down[0], across[0] + tw, down[0] + th)
+  if single && sameRect(first, painting) {
+    // Snapped like the background color under it, so their edges agree.
+    run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops.*)
+    return
+  }
+  let rounded = hasRadius(paintingRadii)
+  if rounded {
+    drop run p.scene.pushEffectLayer(
+      clip.bounds,
+      clip,
+      Isolation { opacity: 1.0, blend: 0 },
+      LayerEffects.none(),
+    )
+    drop run p.scene.pushMaskLayer()
+    let mut shape = Quad.fill(device(painting, s), clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
+    shape.cornerRadii = paintingRadii
+    drop run p.scene.quad(shape)
+    run p.scene.popLayer()
+  }
+  let mut drawn: usize = 0
+  let mut j: usize = 0
+  while j < ny && drawn < MAX_TILES {
+    let mut i: usize = 0
+    while i < nx && drawn < MAX_TILES {
+      let x = across[0] + usize.toF32(i) * across[1]
+      let y = down[0] + usize.toF32(j) * down[1]
+      let tile = Rect<f32>.new(x, y, x + tw, y + th)
+      if !isEmpty(intersect(tile, painting)) {
+        // Whole device pixels, so neighbouring tiles share their edges without a seam.
+        let snapped = Rect<f32>.new(
+          f32.round(x * s),
+          f32.round(y * s),
+          f32.round((x + tw) * s),
+          f32.round((y + th) * s),
+        )
+        run paintGradient(&mut p, effects, image, snapped, clip, Corners<f32>.zero(), &mut stops.*)
+        drawn = drawn + 1
+      }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  if rounded {
+    run p.scene.popLayer()
+  }
+}
+
+/// The `vector.layer` mode of a `mask-composite` operator.
+fn compositeOp(composite: Composite) -> u8 {
+  return match composite {
+    Composite.Add => BLEND_NORMAL
+    Composite.Subtract => BLEND_SOURCE_OUT
+    Composite.Intersect => BLEND_SOURCE_IN
+    Composite.Exclude => BLEND_XOR
+  }
+}
+
+/// `luminanceToAlpha` (Rec. 709 weights), with the color channels emptied.
+const LUMINANCE_TO_ALPHA: [f32; 20] = [
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.2125, 0.7154, 0.0721, 0.0, 0.0,
+]
 
 /// Opens the groups a `fixed` layer draws in: each undoes one scroll group open now, innermost
 /// first, and the first is cut to `cut`. Returns how many it opened, for [`closeFixed`].
