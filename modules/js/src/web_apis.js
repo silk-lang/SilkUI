@@ -1,4 +1,4 @@
-// The web APIs a ui-js realm has beyond the prelude's: base64, text encoding, crypto random
+// The web APIs a ui-js realm has beyond the prelude's: Blob, base64, text encoding, crypto random
 // values, events (and unhandledrejection on the global object), matchMedia, user timing, setImmediate, idle callbacks and the console's timers. The
 // prelude evaluates this on the first use of one of them, so realms that use none start as
 // fast as before. It is a function of `__ui` and the prelude's shared console state, and
@@ -424,5 +424,50 @@
     for (const list of watched) list._check();
   };
 
-  return { matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
+  // As the File API's Blob: immutable bytes with a MIME type. No stream().
+  const blobBytes = new WeakMap();
+  const partBytes = (part) => {
+    if (part instanceof Blob) return blobBytes.get(part);
+    if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+    if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+    return new TextEncoder().encode(String(part));
+  };
+  const blobType = (type) => {
+    const value = String(type ?? "");
+    return /^[\x20-\x7e]*$/.test(value) ? value.toLowerCase() : "";
+  };
+  class Blob {
+    constructor(parts = [], options = {}) {
+      if (parts === null || typeof parts !== "object" || typeof parts[Symbol.iterator] !== "function") throw new TypeError("Blob takes a sequence of parts");
+      const chunks = [...parts].map(partBytes);
+      const bytes = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.length, 0));
+      let at = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, at);
+        at += chunk.length;
+      }
+      blobBytes.set(this, bytes);
+      Object.defineProperty(this, "type", { value: blobType(options?.type), enumerable: true });
+    }
+    get size() {
+      return blobBytes.get(this).length;
+    }
+    slice(start = 0, end = this.size, type = "") {
+      const blob = new Blob([], { type });
+      blobBytes.set(blob, blobBytes.get(this).slice(start, end));
+      return blob;
+    }
+    async arrayBuffer() {
+      return blobBytes.get(this).slice().buffer;
+    }
+    async bytes() {
+      return blobBytes.get(this).slice();
+    }
+    async text() {
+      return new TextDecoder().decode(blobBytes.get(this));
+    }
+  }
+  Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: "Blob" });
+
+  return { Blob, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })

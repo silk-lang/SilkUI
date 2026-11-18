@@ -173,13 +173,18 @@ check("abortcontroller", NODE, () => {
 check("accelerometer", false, () => global("Accelerometer"));
 check("ambient-light", false, () => global("AmbientLightSensor"));
 check("async-clipboard", true, () => typeof navigator.clipboard.readText === "function" && typeof navigator.clipboard.writeText === "function");
-check("async-clipboard", false, () => typeof navigator.clipboard.read === "function" || typeof navigator.clipboard.write === "function" || global("ClipboardItem"));
+check("async-clipboard", true, async () => {
+  const item = new ClipboardItem({ "text/html": "<b>Silk</b>", "image/png": new Blob([new Uint8Array([137, 80])], { type: "image/png" }) });
+  return typeof navigator.clipboard.read === "function" && typeof navigator.clipboard.write === "function"
+    && ClipboardItem.supports("text/html") && ClipboardItem.supports("image/png") && !ClipboardItem.supports("text/rtf")
+    && item.types.join() === "text/html,image/png" && (await (await item.getType("text/html")).text()) === "<b>Silk</b>";
+});
 check("atob-btoa", true, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsayBVSQ==") === "Silk UI");
 check("audio-api", false, () => global("AudioContext"));
 // Nodes take listeners of any type, but the tree never sends these.
 check("auxclick", false, () => "onauxclick" in ui.createBox());
 check("battery-status", false, () => typeof navigator.getBattery === "function");
-check("blobbuilder", NODE, async () => {
+check("blobbuilder", true, async () => {
   const blob = new Blob(["Silk", new Uint8Array([32, 85, 73])], { type: "text/plain" });
   return blob.size === 7 && blob.type === "text/plain" && (await blob.text()) === "Silk UI" && (await blob.slice(5).arrayBuffer()).byteLength === 2;
 });

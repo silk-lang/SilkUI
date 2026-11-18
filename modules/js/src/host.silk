@@ -39,7 +39,7 @@ import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
 import bridge { Timer }
-import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, ShellRequest, StartedNative }
+import bridge { Bridge, ModuleSource, LogEntry, Rejected, ClipboardRequest, EncodedItem, ShellRequest, StartedNative }
 import silkjs.js_core_types { HostHook }
 import silkjs.js_proxy_core as core
 import generated_prelude { prelude }
@@ -65,6 +65,18 @@ pub struct JsHost<'m> {
 }
 
 /// A JavaScript string of `value`, or undefined when it is too long to be one.
+/// `bytes` as a string of one code unit per byte (a "binary string").
+effect fn jsLatin1(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let made = run Effect.result(Strings.fromLatin1(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value: bits } => unsafe Value.adoptBits(bits)
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError _ => Value.immediate(ValueBits.Undefined)
+    }
+  }
+}
+
 effect fn jsString(value: string) -> Value ! OutOfMemoryError ? &mut Allocator {
   let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(value)))
   return match move made {
@@ -707,11 +719,24 @@ impl<'m> JsHost<'m> {
     return Intrinsic.replace(self.engine.services.clipboard, List<ClipboardRequest>.make())
   }
 
-  /// Settles clipboard call `call`: a read with the clipboard's `text` (none when it holds
-  /// no text), a write with none.
-  pub effect fn answerClipboard(self: &mut Self, call: u32, text: Option<String>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+  /// Settles clipboard call `call`: a text read with the clipboard's `text` (none when it
+  /// holds no text), an item read with its `item`, a write with neither.
+  pub effect fn answerClipboard(self: &mut Self, call: u32, text: Option<String>, item: Option<EncodedItem>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
     let context = self.context
     let realm = unsafe lendRealm(&context, context)
+    if let Option<EncodedItem>.Some { value: encoded } = move item {
+      let header = run jsString(encoded.header.view())
+      let body = run jsLatin1(encoded.body.asSlice())
+      let arguments = [ValueBits.number(u32.toF64(call)), header.borrow().view(), body.borrow().view()]
+      let called = run Effect.result(callUi(&mut self.engine, realm, b"clipboardItem", &arguments))
+      realm.release(&mut self.engine, move header)
+      realm.release(&mut self.engine, move body)
+      match move called {
+        Result<(), JsException>.Success { .. } => ()
+        Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+      }
+      return ()
+    }
     let value = match move text {
       Option.Some { value } => run jsString(String.view(&value))
       Option.None => Value.immediate(ValueBits.Undefined)

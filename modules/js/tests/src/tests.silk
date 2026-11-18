@@ -4,7 +4,7 @@ import window_frames as _window_frames
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Natives, Reply, Exports, serve }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, runtimeStylesheets, Natives, Reply, Exports, serve }
 import ui_js_calls.natives as natives
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
@@ -20,6 +20,8 @@ import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.io.writer_native { StderrWriter }
 import silk.io.writer { Writer }
 
@@ -295,24 +297,61 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(requests.length() == 2, "two clipboard calls reached the host")
   let write = match requests.remove(0) {
     ClipboardRequest.Write { call, text } => if String.view(&text) == "hi" { call } else { 0 }
-    ClipboardRequest.Read { .. } => 0
+    _ => 0
   }
   let read = match requests.remove(0) {
     ClipboardRequest.Read { call } => call
-    ClipboardRequest.Write { .. } => 0
+    _ => 0
   }
   run Testing.expect(write != 0 && read != 0, "a write of the text, then a read")
-  run host.answerClipboard(write, Option<String>.none())
+  run host.answerClipboard(write, Option<String>.none(), Option<EncodedItem>.None)
   let pasted = run String.copy("from the system")
-  run host.answerClipboard(read, Option<String>.some(move pasted))
+  run host.answerClipboard(read, Option<String>.some(move pasted), Option<EncodedItem>.None)
   let mut again = host.takeClipboard()
   let next = match again.remove(0) {
     ClipboardRequest.Read { call } => call
-    ClipboardRequest.Write { .. } => 0
+    _ => 0
   }
   run Testing.expect(next != 0, "the read's promise job read again")
-  run host.answerClipboard(next, Option<String>.none())
+  run host.answerClipboard(next, Option<String>.none(), Option<EncodedItem>.None)
   run host.evaluate(b"if (copied.join() !== 'wrote undefined,read from the system,empty \"\"') throw new Error('clipboard calls settled as ' + copied.join())", b"test")
+  run clipboardItems(&mut host)
+}
+
+/// `navigator.clipboard.write` and `read` move ClipboardItems through the host, bytes and all.
+effect fn clipboardItems(host: &mut JsHost<'_>) -> () ! OutOfMemoryError | JsError | AssertionError<'static> ? &mut Allocator {
+  run host.evaluate(b"globalThis.settled = []; const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 255, 128]); if (!ClipboardItem.supports('image/png') || ClipboardItem.supports('text/rtf')) throw new Error('supports'); const item = new ClipboardItem({ 'text/plain': 'h\\u00e9', 'text/html': new Blob(['<b>h\\u00e9</b>'], { type: 'text/html' }), 'image/png': Promise.resolve(new Blob([png], { type: 'image/png' })) }); if (item.types.join() !== 'text/plain,text/html,image/png') throw new Error('types ' + item.types); navigator.clipboard.write([item]).then((value) => settled.push('wrote ' + value)); navigator.clipboard.write([new ClipboardItem({ 'text/rtf': 'x' })]).catch((error) => settled.push(error.name)); navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob(['not png']) })]).catch((error) => settled.push(error.name))", b"test")
+  let mut requests = host.takeClipboard()
+  run Testing.expect(requests.length() == 1, "one item write reached the host; the refused ones did not")
+  let wrote = match requests.remove(0) {
+    ClipboardRequest.WriteItem { call, entries } => {
+      let e = entries.asSlice()
+      let ok = e.length == 3 && e[0].mime.view() == "text/plain" && e[0].data.asSlice() == b"h\xc3\xa9"
+        && e[1].mime.view() == "text/html" && e[1].data.asSlice() == b"<b>h\xc3\xa9</b>"
+        && e[2].mime.view() == "image/png" && e[2].data.asSlice() == b"\x89PNG\r\n\x1a\n\x00\xff\x80"
+      if ok { call } else { 0 }
+    }
+    _ => 0
+  }
+  run Testing.expect(wrote != 0, "the item's text as UTF-8, its HTML and its PNG bytes")
+  run host.answerClipboard(wrote, Option<String>.none(), Option<EncodedItem>.None)
+
+  run host.evaluate(b"navigator.clipboard.read().then(async (items) => { const item = items[0]; const html = await (await item.getType('text/html')).text(); const png = new Uint8Array(await (await item.getType('image/png')).arrayBuffer()); settled.push(items.length + ' ' + item.types.join() + ' ' + html + ' ' + png.join('.')); await item.getType('text/rtf').catch((error) => settled.push(error.name)); }); navigator.clipboard.read().then((items) => settled.push('empty ' + items.length))", b"test")
+  let mut reads = host.takeClipboard()
+  run Testing.expect(reads.length() == 2, "two item reads reached the host")
+  let first = match reads.remove(0) { ClipboardRequest.ReadItem { call } => call _ => 0 }
+  let second = match reads.remove(0) { ClipboardRequest.ReadItem { call } => call _ => 0 }
+  let mut entries = List<ClipboardData>.make()
+  run entries.append(ClipboardData { mime: run String.copy("text/html"), data: run Bytes.copy(b"<i>x</i>") })
+  run entries.append(ClipboardData { mime: run String.copy("image/png"), data: run Bytes.copy(b"\x89\x00\xfe") })
+  let encoded = run encodeItem(entries.asSlice())
+  run host.answerClipboard(first, Option<String>.none(), Option<EncodedItem>.some(move encoded))
+  let nothing = List<ClipboardData>.make()
+  let none = run encodeItem(nothing.asSlice())
+  run host.answerClipboard(second, Option<String>.none(), Option<EncodedItem>.some(move none))
+  // The answers' promise jobs run on the next turn, as after any host answer.
+  run host.evaluate(b"0", b"test")
+  run host.evaluate(b"if (settled.join() !== 'NotAllowedError,DataError,wrote undefined,empty 0,1 text/html,image/png <i>x</i> 137.0.254,NotFoundError') throw new Error('clipboard items settled as ' + settled.join())", b"test")
 }
 
 /// `memoryUsage` reads the process's memory from the system, so 64 MB the script fills shows;

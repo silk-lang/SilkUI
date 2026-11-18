@@ -16,6 +16,7 @@ import ui_js.lib { StylesheetCompiler, Natives, Bridge, Outcome, kindCode, numbe
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
 import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
+import ui_js.lib { EncodedItem }
 import ui_js_window.shell { serveShell, shellEventOf, ShellAnswer, ShellEvent }
 import ui_js_window.natives { NativeJobs, Finished }
 import ui_js.lib { Reply }
@@ -274,7 +275,16 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
       if requests.length() == 0 { break }
       let mut answers = run serveClipboard(move requests, &mut platform)
       while answers.length() > 0 {
-        let ClipboardAnswer { call, text: answer } = answers.remove(0)
+        let ClipboardAnswer { call, text: answer, item } = answers.remove(0)
+        if let Option<EncodedItem>.Some { value: encoded } = move item {
+          let header = run text(String.utf8Bytes(encoded.header.view()))
+          let body = run binary(encoded.body.asSlice())
+          let returned = run self.callReporting(b"clipboardItem", &[ValueBits.number(u32.toF64(call)), header.borrow().view(), body.borrow().view()])
+          self.release(move returned)
+          self.release(move header)
+          self.release(move body)
+          continue
+        }
         let value = match move answer {
           Option.Some { value } => run text(String.utf8Bytes(String.view(&value)))
           Option.None => Value.immediate(ValueBits.Undefined)
@@ -462,6 +472,18 @@ impl<'r, 'e, 'm> NodeApp<'r, 'e, 'm> {
 /// A JavaScript string of `bytes`, which are UTF-8.
 effect fn text(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
   let made = run Effect.result(Strings.fromUtf8(bytes))
+  return match move made {
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => unsafe Value.adoptBits(value)
+    Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      StringLengthError _ => Value.immediate(ValueBits.Undefined)
+    }
+  }
+}
+
+/// `bytes` as a string of one code unit per byte.
+effect fn binary(bytes: &[u8]) -> Value ! OutOfMemoryError ? &mut Allocator {
+  let made = run Effect.result(Strings.fromLatin1(bytes))
   return match move made {
     Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => unsafe Value.adoptBits(value)
     Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
