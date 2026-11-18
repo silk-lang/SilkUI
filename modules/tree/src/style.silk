@@ -38,6 +38,7 @@ import silk.collections.bytes { Bytes }
 import silk.core.ownership { Copy }
 import silk.core.equal { Equal }
 import silk.geometry.insets { Insets }
+import silk.geometry.corners { Corners }
 import silk.geometry.rect { Rect }
 import silk.num.f32
 import silk.num.i32
@@ -349,7 +350,7 @@ fn blurInText(css: &[u8], context: &Context) -> Option<f32> {
         return Option<f32>.some(amount * context.fontSize)
       }
       if rest >= 2 && lower(css[i]) == 112 && lower(css[i + 1]) == 120 {
-        return Option<f32>.some(amount)
+        return Option<f32>.some(amount * context.zoom)
       }
       if rest >= 1 && css[i] == 41 && amount == 0.0 {
         return Option<f32>.some(0.0)
@@ -930,6 +931,23 @@ fn setScrollPadding(target: &mut Dimension, value: &Value, context: &Context) ->
   }
 }
 
+/// A `zoom` value: a non-negative number or percentage, `normal` for 1. Zero is 1, as in browsers.
+pub fn zoomOf(value: &Value) -> Option<f32> {
+  if convert.isKeyword(value, Keyword.Normal) { return Option<f32>.some(1.0) }
+  return match &value.* {
+    Value.Unit { value: amount, unit } => {
+      let factor: f32 = if unit == Unit.Number { amount } else if unit == Unit.Percent { amount / 100.0 } else { -1.0 }
+      if factor < 0.0 { Option<f32>.None } else if factor == 0.0 { Option<f32>.some(1.0) } else { Option<f32>.some(factor) }
+    }
+    _ => Option<f32>.None
+  }
+}
+
+fn zoomedEdges(edges: Edges, ratio: f32) -> Edges {
+  return Edges { top: edges.top.zoomed(ratio), right: edges.right.zoomed(ratio),
+    bottom: edges.bottom.zoomed(ratio), left: edges.left.zoomed(ratio) }
+}
+
 fn setPixels(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.length(value, context) {
     Option.Some { value: found } => {
@@ -971,11 +989,11 @@ fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
     Option.Some { value: word } => {
       if word == Keyword.Thin {
-        target.* = 1.0
+        target.* = context.zoom
       } else if word == Keyword.Medium {
-        target.* = 3.0
+        target.* = 3.0 * context.zoom
       } else if word == Keyword.Thick {
-        target.* = 5.0
+        target.* = 5.0 * context.zoom
       }
     }
     Option.None => {
@@ -1044,7 +1062,8 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
         | CssProperty.AnimationDelay | CssProperty.AnimationIterationCount | CssProperty.AnimationDirection
         | CssProperty.AnimationFillMode | CssProperty.AnimationPlayState
         | CssProperty.Transition | CssProperty.TransitionProperty | CssProperty.TransitionDuration
-        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior => { return true }
+        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior
+        | CssProperty.Zoom => { return true }
       _ => {}
     }
     let font = declaration.property == CssProperty.FontSize || declaration.property == CssProperty.LineHeight
@@ -1089,7 +1108,56 @@ impl Computed {
     context.containerHeight = self.containerHeight
     context.containerInlineSize = if context.vertical { self.containerHeight } else { self.containerWidth }
     context.containerBlockSize = if context.vertical { self.containerWidth } else { self.containerHeight }
+    context.zoom = self.text.zoom
+    context.rootFontSize = context.rootFontSize * self.text.zoom
     return context
+  }
+
+  /// Sets the effective zoom to `parentZoom` times the element's own `zoom`. Inherited
+  /// lengths, which the parent computed at its zoom, move to the new one.
+  pub fn setZoom(self: &mut Self, own: f32, parentZoom: f32) -> () {
+    let zoom = parentZoom * own
+    if zoom == self.text.zoom || self.text.zoom <= 0.0 { return () }
+    let ratio = zoom / self.text.zoom
+    self.text.rezoom(zoom)
+    self.layout.borderSpacingX = self.layout.borderSpacingX * ratio
+    self.layout.borderSpacingY = self.layout.borderSpacingY * ratio
+    // Lengths the element's own declarations have not set yet hold initial values.
+    self.outline.width = self.outline.width * ratio
+    self.columnRule.width = self.columnRule.width * ratio
+  }
+
+  /// This style with every length it holds multiplied by `ratio`, for `inherit` across a change
+  /// of zoom.
+  pub fn zoomedBy(self: &Self, ratio: f32) -> Computed {
+    let mut out = self.*
+    if ratio == 1.0 { return out }
+    out.text.rezoom(self.text.zoom * ratio)
+    let l = &mut out.layout
+    l.width = l.width.zoomed(ratio)
+    l.height = l.height.zoomed(ratio)
+    l.minWidth = l.minWidth.zoomed(ratio)
+    l.minHeight = l.minHeight.zoomed(ratio)
+    l.maxWidth = l.maxWidth.zoomed(ratio)
+    l.maxHeight = l.maxHeight.zoomed(ratio)
+    l.flexBasis = l.flexBasis.zoomed(ratio)
+    l.rowGap = l.rowGap.zoomed(ratio)
+    l.columnGap = l.columnGap.zoomed(ratio)
+    l.margin = zoomedEdges(l.margin, ratio)
+    l.padding = zoomedEdges(l.padding, ratio)
+    l.inset = zoomedEdges(l.inset, ratio)
+    l.border = zoomedEdges(l.border, ratio)
+    l.borderSpacingX = l.borderSpacingX * ratio
+    l.borderSpacingY = l.borderSpacingY * ratio
+    if l.columnWidth > 0.0 { l.columnWidth = l.columnWidth * ratio }
+    out.paint.border = Insets<f32> { top: out.paint.border.top * ratio, right: out.paint.border.right * ratio,
+      bottom: out.paint.border.bottom * ratio, left: out.paint.border.left * ratio }
+    out.paint.radii = Corners<f32> { topLeft: out.paint.radii.topLeft * ratio, topRight: out.paint.radii.topRight * ratio,
+      bottomRight: out.paint.radii.bottomRight * ratio, bottomLeft: out.paint.radii.bottomLeft * ratio }
+    out.outline.width = out.outline.width * ratio
+    out.outline.offset = out.outline.offset * ratio
+    out.columnRule.width = out.columnRule.width * ratio
+    return out
   }
   pub fn containerWidthBasis(self: &Self) -> f32 {
     return match self.containerWidth { Option.Some { value } => value _ => self.viewportWidth }
