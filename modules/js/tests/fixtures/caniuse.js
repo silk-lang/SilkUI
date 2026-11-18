@@ -286,7 +286,7 @@ check("intersectionobserver", true, () => global("IntersectionObserver"));
 check("intersectionobserver-v2", true, () => global("IntersectionObserver"));
 check("magnetometer", false, () => global("Magnetometer"));
 check("matchesselector", false, () => typeof ui.createBox().matches === "function");
-check("matchmedia", { engine: true, node: false }, () => typeof globalThis.matchMedia === "function" && typeof matchMedia("(min-width: 1px)").matches === "boolean");
+check("matchmedia", true, () => typeof globalThis.matchMedia === "function" && typeof matchMedia("(min-width: 1px)").matches === "boolean");
 // The tree's inputs have no length limit attribute: setting one throws.
 check("maxlength", false, () => { ui.createInput().setAttribute("maxLength", 3); return true; });
 check("mediacapture-fromelement", false, () => typeof ui.createNode("canvas").captureStream === "function");
