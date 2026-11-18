@@ -233,7 +233,11 @@ pub struct FontState<'a> {
   keys: List<KeyInfo>,
   metrics: List<FontMetrics>,
   instances: List<Instance>,
-  data: List<Option<ShaperData<'a>>>,
+  /// The shaping data of the faces that have shaped text, and for each face of the set its
+  /// place in `data` plus one, or 0: the set lists every face the system has, thousands, and
+  /// an app shapes with a few.
+  data: List<ShaperData<'a>>,
+  dataSlots: List<u32>,
   plans: List<PlanEntry<'a>>,
   buffer: Buffer,
   /// Shaping results by text, instance, range, direction and script. Shaping is a pure
@@ -385,7 +389,8 @@ impl<'a> FontState<'a> {
       keys: List<KeyInfo>.make(),
       metrics: List<FontMetrics>.make(),
       instances: List<Instance>.make(),
-      data: List<Option<ShaperData<'a>>>.make(),
+      data: List<ShaperData<'a>>.make(),
+      dataSlots: List<u32>.make(),
       plans: List<PlanEntry<'a>>.make(),
       buffer: Buffer.new(),
       shapedIndex: HashMap<Word, u32>.make(Hash.seed(0x7368617065)),
@@ -486,17 +491,26 @@ impl<'a> FontState<'a> {
   effect fn loadFace(self: &mut Self, face: usize) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
-    while self.data.length() <= face {
-      run self.data.append(Option<ShaperData<'a>>.None)
+    while self.dataSlots.length() <= face {
+      run self.dataSlots.append(0)
     }
-    if self.data.asSlice()[face].isSome() {
+    if self.dataSlots.get(face) != 0 {
       return true
     }
     if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
-      self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
+      run self.data.append(ShaperData.new(&font))
+      self.dataSlots.set(face, usize.toU32(self.data.length()))
       return true
     }
     return false
+  }
+
+  /// The shaping data of `face`, once [`loadFace`] has made it.
+  fn shaper(self: &Self, face: usize) -> Option<&ShaperData<'a>> {
+    if face >= self.dataSlots.length() || self.dataSlots.get(face) == 0 {
+      return Option<&ShaperData<'a>>.None
+    }
+    return Option<&ShaperData<'a>>.Some { value: &self.data.asSlice()[u32.toUsize(self.dataSlots.get(face)) - 1] }
   }
 
   effect fn instanceFor(self: &mut Self, selection: Selection, size: f32, settings: &Variations) -> usize
@@ -563,7 +577,7 @@ impl<'a> FontState<'a> {
         }
         axis = axis + 1
       }
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[selection.face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(selection.face) {
         unitsPerEm = u16.toF32(data.upem)
         if wanted.length() > 0 {
           let mut shaper = ConfiguredShaper.new(&data)
@@ -796,7 +810,7 @@ impl<'a> FontState<'a> {
       index = index + 1
     }
     if plan == usize.MAX {
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(face) {
         let made = run makePlan(
           &data,
           self.instances.asSlice()[instance].coords.asSlice(),
@@ -818,8 +832,10 @@ impl<'a> FontState<'a> {
         return
       }
     }
-    if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
-      let mut shaper = ConfiguredShaper.new(&data)
+    let slot = if face < self.dataSlots.length() { self.dataSlots.get(face) } else { 0 }
+    if slot != 0 {
+      let data = &self.data.asSlice()[u32.toUsize(slot) - 1]
+      let mut shaper = ConfiguredShaper.new(data)
       run shaper.coords.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
       let shaped = run shape(
         &shaper,
