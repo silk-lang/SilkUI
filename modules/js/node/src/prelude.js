@@ -101,7 +101,30 @@
   const uncaught = (error) => console.error("Uncaught", error);
   native.report = uncaught;
   process.on("uncaughtException", uncaught);
-  process.on("unhandledRejection", (reason) => console.error("Uncaught (in promise)", reason));
+  // As on the web: `unhandledrejection` on the global object first, and a listener that
+  // prevents its default keeps the rejection off the console.
+  class PromiseRejectionEvent extends Event {
+    #promise;
+    #reason;
+    constructor(type, options) {
+      super(type, options);
+      this.#promise = options?.promise;
+      this.#reason = options?.reason;
+    }
+    get promise() { return this.#promise; }
+    get reason() { return this.#reason; }
+  }
+  globalThis.PromiseRejectionEvent ??= PromiseRejectionEvent;
+  if (typeof globalThis.addEventListener !== "function") {
+    const target = new EventTarget();
+    globalThis.addEventListener = target.addEventListener.bind(target);
+    globalThis.removeEventListener = target.removeEventListener.bind(target);
+    globalThis.dispatchEvent = target.dispatchEvent.bind(target);
+  }
+  process.on("unhandledRejection", (reason, promise) => {
+    const event = new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true });
+    if (globalThis.dispatchEvent(event)) console.error("Uncaught (in promise)", reason);
+  });
   globalThis.reportError ??= uncaught;
 
   // Modules the host defines (`@silkui/core`), importable by name from any module.

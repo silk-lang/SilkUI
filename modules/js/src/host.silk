@@ -196,7 +196,12 @@ effect fn reportRejections<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm
   let mut rest = move rejections
   while rest.length() > 0 {
     let Rejected { promise: rejected, reason } = rest.remove(0)
+    let handled = run rejectionHandled(&mut engine, realm, rejected.borrow(), reason.borrow())
     realm.release(&mut engine, move rejected)
+    if handled {
+      realm.release(&mut engine, move reason)
+      continue
+    }
     let JsError { message } = run describe(&mut engine, realm, move reason)
     let mut line = run String.copy("Uncaught (in promise) ")
     run line.append(String.view(&message))
@@ -255,6 +260,49 @@ effect fn dispatchIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   realm.release(&mut engine, move function)
   realm.release(&mut engine, move ui)
   return prevented
+}
+
+/// Asks `__ui.rejected(promise, reason)`, the prelude's `unhandledrejection` event, whether a
+/// listener prevented the default; then the host does not report the rejection. A listener
+/// that throws counts as not preventing it.
+effect fn rejectionHandled<'a, 'v, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, rejected: ValueRef<'v>, reason: ValueRef<'v>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let arguments = [rejected.view(), reason.view()]
+  let called = run Effect.result(callUiValue(&mut engine, realm, b"rejected", &arguments))
+  return match move called {
+    Result<bool, JsException>.Success { value } => value
+    Result<bool, JsException>.Failure { .. } => {
+      let thrown = realm.takeException()
+      realm.release(&mut engine, move thrown)
+      false
+    }
+  }
+}
+
+/// Calls `__ui.<name>(...arguments)` when that is a function, and says whether it returned true.
+effect fn callUiValue<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, name: &[u8], arguments: &[ValueBits]) -> bool ! JsException ? &mut Allocator {
+  let ui = run common.get(&mut engine, realm, realm.globalObject(), b"__ui")
+  let function = run common.get(&mut engine, realm, ui.borrow(), name)
+  let mut answer = false
+  if function.borrow().view().isObject() {
+    let called = run Effect.result(promise.call(&mut engine, realm, function.borrow(), ui.borrow(), arguments))
+    match move called {
+      Result<Value, JsException>.Success { value } => {
+        answer = match value.borrow().view() {
+          ValueBits.Bool { value: flag } => flag
+          _ => false
+        }
+        realm.release(&mut engine, move value)
+      }
+      Result<Value, JsException>.Failure { error } => {
+        realm.release(&mut engine, move function)
+        realm.release(&mut engine, move ui)
+        fail move error
+      }
+    }
+  }
+  realm.release(&mut engine, move function)
+  realm.release(&mut engine, move ui)
+  return answer
 }
 
 /// Calls `__ui.<name>(...arguments)` when that is a function, and drops what it returns.
