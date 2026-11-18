@@ -23,6 +23,10 @@ const TYPES = [
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const CLICK = KIND_OF.get("click");
+const SCROLL = KIND_OF.get("scroll");
+// Beside the kinds in a node's listen flags: the tree sends one scroll record now, with where
+// the node is and how far it can scroll.
+const SCROLL_STATE = 1 << 30;
 // As on the web: these reach the target alone.
 const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
 // The tree has a default action to skip for these.
@@ -374,6 +378,10 @@ export class Node {
   #base = null;
   #looks = null;
   #flags = 0;
+  // Once the node is scrolled from here or its offset is read: [left, top, largest left,
+  // largest top]. Reading the offset makes the tree keep it current (`#watching`).
+  #scroll = null;
+  #watching = false;
   #attributes = null;
   #classList = null;
 
@@ -552,8 +560,9 @@ export class Node {
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
   #want(kind) {
     const list = this.#listeners?.get(TYPES[kind]);
-    const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
-    const flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    const wanted = (list && list.length > 0) || (kind === CLICK && this._href) || (kind === SCROLL && this.#watching);
+    let flags = wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind);
+    if (this.#watching) flags |= SCROLL_STATE;
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
   }
 
@@ -569,8 +578,87 @@ export class Node {
     native.focus(this.nodeId);
   }
 
+  /**
+   * Scrolls the container to (`x`, `y`), or to `{ left, top }` as on the web (an axis left out
+   * stays where it is). The tree clamps the offset at the next frame and then sends a `scroll`
+   * event, as it does for a scroll by wheel or touch. The scroll is immediate: `behavior` is
+   * not read.
+   */
   scrollTo(x, y) {
+    if (typeof x === "object" && x !== null) {
+      const at = this.#offsets();
+      y = x.top === undefined ? at[1] : x.top;
+      x = x.left === undefined ? at[0] : x.left;
+    }
+    x = Number(x) || 0;
+    y = Number(y) || 0;
+    this.#scroll ??= [0, 0, 0, 0];
+    this.#scroll[0] = x;
+    this.#scroll[1] = y;
     native.scrollTo(this.nodeId, x, y);
+  }
+
+  /** As `scrollTo`. */
+  scroll(x, y) {
+    this.scrollTo(x, y);
+  }
+
+  /** Scrolls the container by (`dx`, `dy`), or by `{ left, top }`, from where it is. */
+  scrollBy(dx, dy) {
+    if (typeof dx === "object" && dx !== null) {
+      dy = dx.top;
+      dx = dx.left;
+    }
+    const at = this.#offsets();
+    this.scrollTo(at[0] + (Number(dx) || 0), at[1] + (Number(dy) || 0));
+  }
+
+  /**
+   * The scroll offset, as on the web. The first read starts the tree reporting it, so the
+   * value is current from the next frame on; a write scrolls there.
+   */
+  get scrollLeft() {
+    return this.#offsets()[0];
+  }
+
+  set scrollLeft(value) {
+    this.scrollTo(Number(value) || 0, this.#offsets()[1]);
+  }
+
+  get scrollTop() {
+    return this.#offsets()[1];
+  }
+
+  set scrollTop(value) {
+    this.scrollTo(this.#offsets()[0], Number(value) || 0);
+  }
+
+  /** The largest `scrollLeft` the container can have: its content's width less its own. */
+  get scrollLeftMax() {
+    return this.#offsets()[2];
+  }
+
+  /** The largest `scrollTop` the container can have: its content's height less its own. */
+  get scrollTopMax() {
+    return this.#offsets()[3];
+  }
+
+  #offsets() {
+    this.#scroll ??= [0, 0, 0, 0];
+    if (!this.#watching) {
+      this.#watching = true;
+      this.#want(SCROLL);
+    }
+    return this.#scroll;
+  }
+
+  // The tree's scroll record for this node.
+  _scrolled(left, top, leftMax, topMax) {
+    if (this.#scroll === null) return;
+    this.#scroll[0] = left;
+    this.#scroll[1] = top;
+    this.#scroll[2] = leftMax;
+    this.#scroll[3] = topMax;
   }
 
   /**
@@ -1540,6 +1628,9 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind === 12) {
     event.scrollLeft = a;
     event.scrollTop = b;
+    event.scrollLeftMax = d;
+    event.scrollTopMax = e;
+    event.target._scrolled?.(a, b, d, e);
   } else if (kind === 13) {
     event.bounds = { x: a, y: b, width: d, height: e };
   } else if (kind >= 19 && kind <= 22) {

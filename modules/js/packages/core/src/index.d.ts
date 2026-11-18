@@ -104,7 +104,30 @@ export class Node {
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;
+  /**
+   * Scrolls the container to (`x`, `y`), or to `{ left, top }` as on the web (an axis left out
+   * stays where it is). The tree clamps the offset at the next frame and then sends a `scroll`
+   * event, as it does for a scroll by wheel or touch. The scroll is immediate: `behavior` is
+   * not read.
+   */
   scrollTo(x: number, y: number): void;
+  scrollTo(options: ScrollOptions): void;
+  /** As `scrollTo`. */
+  scroll(x: number, y: number): void;
+  scroll(options: ScrollOptions): void;
+  /** Scrolls the container by (`dx`, `dy`), or by `{ left, top }`, from where it is. */
+  scrollBy(dx: number, dy: number): void;
+  scrollBy(options: ScrollOptions): void;
+  /**
+   * The scroll offset, as on the web. The first read starts the tree reporting it, so the value
+   * is current from the next frame on; a write scrolls there.
+   */
+  scrollLeft: number;
+  scrollTop: number;
+  /** The largest `scrollLeft` the container can have: its content's width less its own. */
+  readonly scrollLeftMax: number;
+  /** The largest `scrollTop` the container can have: its content's height less its own. */
+  readonly scrollTopMax: number;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
 }
@@ -293,9 +316,19 @@ export interface SelectionEvent<T extends Node = Input> extends Event {
   readonly selectionEnd: number;
 }
 
+/** Where `scrollTo`, `scroll` and `scrollBy` go, as on the web. */
+export interface ScrollOptions {
+  left?: number;
+  top?: number;
+}
+
 export interface ScrollEvent extends Event {
   readonly scrollLeft: number;
   readonly scrollTop: number;
+  /** The largest `scrollLeft` the container can have. */
+  readonly scrollLeftMax: number;
+  /** The largest `scrollTop` the container can have. */
+  readonly scrollTopMax: number;
 }
 
 /** Where layout put the node, in window pixels. */

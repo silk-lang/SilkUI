@@ -77,7 +77,10 @@ font size. Elements inside it hear no events: listen on the `Svg`.
 A node has `append`, `appendChild`, `insertBefore`, `removeChild`, `remove`, `contains`,
 `parentNode`, `childNodes`, `firstChild`, `lastChild` and the sibling getters, as in the DOM.
 A removed node keeps its state and can be inserted again. `destroy()` frees a node and its
-subtree for good. `focus()` and `scrollTo(x, y)` do what their names say.
+subtree for good. `focus()` and `scrollTo(x, y)` do what their names say; `scrollBy(dx, dy)` scrolls from where
+the container is, and both take `{ left, top }` as on the web. `scrollTop` and `scrollLeft` read and set the offset as on the web, and
+`scrollTopMax` and `scrollLeftMax` are the largest they can be. A scroll from script sends a
+`scroll` event like any other, after the frame has clamped it.
 
 ### Style and looks
 
@@ -119,7 +122,7 @@ through the tree.
 | `focus`, `blur`, `load`, `error`, `gotpointercapture`, `lostpointercapture` | |
 | `input` | `value`, `inputType`, and `document` on a rich input |
 | `selectionchange` | `selectionStart`, `selectionEnd` |
-| `scroll` | `scrollLeft`, `scrollTop` |
+| `scroll` | `scrollLeft`, `scrollTop`, `scrollLeftMax`, `scrollTopMax` (how far it can scroll) |
 | `layout` | `bounds`: where layout put the node, in window pixels |
 | `transitionrun`, `transitionstart`, `transitionend`, `transitioncancel` | `propertyName`, `elapsedTime` |
 | `animationstart`, `animationiteration`, `animationend`, `animationcancel` | `animationName`, `elapsedTime` |

@@ -207,8 +207,13 @@ check("customevent", { engine: false, node: true }, () => new CustomEvent("ping"
 check("customevent", false, () => { ui.createBox().addEventListener("ping", () => {}); return true; });
 check("deviceorientation", false, () => global("DeviceOrientationEvent"));
 check("dom-range", false, () => global("Range") || typeof globalThis.document?.createRange === "function");
-check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
-check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function" || typeof ui.createBox().scroll === "function");
+check("element-scroll-methods", true, () => {
+  const box = ui.createBox();
+  box.scrollTo(0, 40);
+  box.scrollBy({ top: 2 });
+  box.scroll({ left: 5 });
+  return box.scrollTop === 42 && box.scrollLeft === 5;
+});
 check("eme", false, () => typeof navigator.requestMediaKeySystemAccess === "function");
 check("eventsource", false, () => global("EventSource"));
 check("fetch", NODE, () => typeof fetch === "function" && new Request("http://localhost/x", { method: "POST" }).method === "POST" &&

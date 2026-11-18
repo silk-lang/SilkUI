@@ -22,7 +22,7 @@ import ui_tree.legacy {
   StyleState,
   info
 }
-import ui_tree.mutation { Declaration, Value, Keyword, CssProperty }
+import ui_tree.mutation { Declaration, Value, Keyword, CssProperty, LISTEN_ALL }
 import ui_tree.style { Fill }
 import font_collection.lib { FontCollection }
 import vector.geometry_error { GeometryError }
@@ -177,6 +177,7 @@ effect fn first(events: &List<Event>, kind: EventKind) -> Event
       copy.button = e.button
       copy.detail = e.detail
       copy.deltaY = e.deltaY
+      copy.bounds = e.bounds
       return move copy
     }
     i = i + 1
@@ -687,4 +688,56 @@ test effect fn draggingAScrollbarThumbScrolls() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run thumbBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn scriptedScrollBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  drop run drain(&mut tree)
+
+  // Past the end: one record, with the offset the frame clamped and how far the list scrolls.
+  let mut far = Batch.make()
+  run far.scrollTo(fixtures.INBOX_LIST, 0.0, 5000.0)
+  run tree.apply(run far.take())
+  run tree.frame(viewport())
+  let end = tree.scrollOffset(fixtures.INBOX_LIST).y
+  let events = run drain(&mut tree)
+  let scrolled = run first(&events, EventKind.Scroll)
+  run Testing.expect(
+    end > 0.0 && count(&events, EventKind.Scroll, fixtures.INBOX_LIST) == 1 && scrolled.y == end
+      && scrolled.bounds.yMax == end
+      && scrolled.bounds.xMax == 0.0,
+    "a scroll from a mutation queues one scroll record, clamped, with how far the list scrolls",
+  )
+
+  // Where it already is: nothing to report.
+  let mut same = Batch.make()
+  run same.scrollTo(fixtures.INBOX_LIST, 0.0, end)
+  run tree.apply(run same.take())
+  run tree.frame(viewport())
+  let quiet = run drain(&mut tree)
+  run Testing.expect(
+    count(&quiet, EventKind.Scroll, fixtures.INBOX_LIST) == 0,
+    "a scroll to where the list is queues none",
+  )
+
+  // A node that asks for its scroll state gets one record without scrolling.
+  let mut ask = Batch.make()
+  run ask.listen(fixtures.INBOX_LIST, LISTEN_ALL + 0x40000000)
+  run tree.apply(run ask.take())
+  run tree.frame(viewport())
+  let told = run drain(&mut tree)
+  let state = run first(&told, EventKind.Scroll)
+  run Testing.expect(
+    count(&told, EventKind.Scroll, fixtures.INBOX_LIST) == 1 && state.y == end && state.bounds.yMax == end,
+    "asking for the scroll state queues one record of where the list is",
+  )
+}
+
+test effect fn scrollsFromMutationsAreReported() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scriptedScrollBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

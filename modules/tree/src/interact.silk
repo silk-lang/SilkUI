@@ -1277,7 +1277,10 @@ pub effect fn scrollTo(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> ()
   } else {
     0.0
   }
-  drop run setOffset(&mut tree, slot, sx, sy)
+  if run setOffset(&mut tree, slot, sx, sy) {
+    // Reported as any other scroll is, once the frame has clamped it (see `settleScrolls`).
+    run tree.scrollReports.append(slot)
+  }
 }
 
 /// Takes the scroll offset (`x`, `y`) that something outside the tree already showed, such as
@@ -1300,6 +1303,10 @@ effect fn scrollRecord(tree: &mut UiTree<'_>, slot: u32) -> ()
   let mut event = run record(&tree.*, EventKind.Scroll, slot)
   event.x = tree.node(slot).scrollX
   event.y = tree.node(slot).scrollY
+  // How far the container can scroll, with the offset: `bounds` carries it for this kind.
+  // As far as a scroll can go, so the offset equals it at the end.
+  let range = rangeAt(&tree.*, slot)
+  event.bounds = Rect<f32>.new(0.0, 0.0, f32.max(0.0, range.clampX(1.0e9)), f32.max(0.0, range.clampY(1.0e9)))
   run tree.queueEvent(move event)
 }
 
@@ -1409,7 +1416,8 @@ fn nearest(min: f32, max: f32, portMin: f32, portMax: f32) -> f32 {
 pub effect fn settleScrolls(tree: &mut UiTree<'_>) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  if tree.stats.layoutSkipped && tree.reveal.length() == 0 && !tree.scrolled {
+  if tree.stats.layoutSkipped && tree.reveal.length() == 0 && !tree.scrolled
+    && tree.scrollReports.length() == 0 {
     return false
   }
   let mut changed = false
@@ -1430,6 +1438,7 @@ pub effect fn settleScrolls(tree: &mut UiTree<'_>) -> bool
   }
   // No node holds an offset to clamp.
   if !tree.offsets {
+    run reportScrolls(&mut tree)
     return changed
   }
   // Only the nodes `setOffset` listed can hold one: a long page is not walked for them.
@@ -1467,14 +1476,40 @@ pub effect fn settleScrolls(tree: &mut UiTree<'_>) -> bool
       let x = range.clampX(scrollX)
       let y = range.clampY(scrollY)
       if run setOffset(&mut tree, slot, x, y) {
-        run scrollRecord(&mut tree, slot)
+        run tree.scrollReports.append(slot)
         changed = true
       }
     }
   }
   tree.scrolledSlots.truncate(kept)
   tree.offsets = kept != 0
+  run reportScrolls(&mut tree)
   return changed
+}
+
+/// Queues one scroll record for each node in `scrollReports` that listens: a node scrolled
+/// from script, one this frame clamped, and one that asked for its scroll state. Each carries the
+/// offset as the frame left it and how far the container can scroll.
+effect fn reportScrolls(tree: &mut UiTree<'_>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < tree.scrollReports.length() {
+    let slot = tree.scrollReports.get(at)
+    let mut reported = false
+    let mut before: usize = 0
+    while before < at {
+      if tree.scrollReports.get(before) == slot {
+        reported = true
+      }
+      before = before + 1
+    }
+    if !reported && u32.toUsize(slot) < tree.nodes.length() && tree.node(slot).live {
+      run scrollRecord(&mut tree, slot)
+    }
+    at = at + 1
+  }
+  tree.scrollReports.clear()
 }
 
 // Scrollbar thumbs.
