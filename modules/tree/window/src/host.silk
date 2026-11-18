@@ -440,6 +440,25 @@ pub interface WindowClient<S, E, ? R> {
 }
 
 /// The scale the first window most likely opens at, before there is one to ask.
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn mallocPressureRelief(zone: usize, goal: usize) -> usize as "malloc_zone_pressure_relief"
+}
+
+/// A tree is not watched for memory to hand back until it has held this many nodes.
+const RELIEF_NODES: usize = 2048
+
+/// Frames a tree stays under half its largest size before freed memory is first handed back:
+/// longer than the scenes and the renderer wait before they drop what a larger frame left.
+const RELIEF_FRAMES: u32 = 300
+
+/// Hands the pages of freed memory back to the system. An allocator keeps what a busy screen
+/// freed, to give it out again; under a quiet screen that only counts against the app.
+fn releaseFreed() -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let _released = unsafe mallocPressureRelief(0, 0)
+  }
+}
+
 fn expectedScale() -> f64 {
   static if Intrinsic.targetOperatingSystem() == "darwin" {
     return 2.0
@@ -1129,6 +1148,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // draw, for benchmarks. Frames may tear, and the app takes a whole processor core.
   let uncapped = !check && (run environmentVariable("SILK_UI_UNCAPPED")).isSome()
   let mut timed = FrameTimes.none()
+  // The most nodes the tree has held since freed memory was last handed back, and the frames
+  // in a row it has held under half of that.
+  let mut heldNodes: usize = 0
+  let mut quietFrames: u32 = 0
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
@@ -1658,6 +1681,24 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if tracing {
                 StderrWriter.print("silk-ui: frame {} submitted\n", &.(drawn))
               }
+              let nodes = tree.liveNodes()
+              if nodes >= heldNodes {
+                heldNodes = nodes
+                quietFrames = 0
+              } else if heldNodes >= RELIEF_NODES && nodes * 2 < heldNodes {
+                // More than once: the scenes, the renderer and the script engine each let go
+                // of what the larger tree needed some time after it is gone.
+                quietFrames = quietFrames + 1
+                if quietFrames == RELIEF_FRAMES || quietFrames == RELIEF_FRAMES * 4 {
+                  releaseFreed()
+                } else if quietFrames >= RELIEF_FRAMES * 12 {
+                  releaseFreed()
+                  heldNodes = nodes
+                  quietFrames = 0
+                }
+              } else {
+                quietFrames = 0
+              }
 
               // Check mode and lowest-latency apps wait for each frame on this thread.
               if check || options.lowestLatency || tracing {
@@ -1692,7 +1733,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 if submitted - timed.since >= 1.0 {
                   let n = u64.toF64(timed.frames)
                   StderrWriter.print(
-                    "frame-stats: frames={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={} pool-mb={} page-mb={} blur-mb={} pool-textures={} pages={}\n",
+                    "frame-stats: frames={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={} pool-mb={} page-mb={} blur-mb={} pool-textures={} pages={} nodes={} node-slots={}\n",
                     &(
                       timed.frames,
                       timed.tick * 1000.0 / n,
@@ -1706,7 +1747,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                       report.textures[1] / 1048576,
                       report.textures[2] / 1048576,
                       report.textures[3],
-                      report.textures[4]
+                      report.textures[4],
+                      tree.liveNodes(),
+                      tree.nodes.length()
                     ),
                   )
                   timed = FrameTimes.none()

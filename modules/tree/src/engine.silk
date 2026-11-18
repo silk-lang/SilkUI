@@ -2813,9 +2813,7 @@ impl<'a> UiTree<'a> {
     }
     let mut slot: u32 = 0
     if self.free.length() != 0 {
-      let last = self.free.length() - 1
-      slot = self.free.get(last)
-      self.free.truncate(last)
+      slot = takeLowest(&mut self.free)
       let nodes = self.nodes.asMutSlice()
       nodes[u32.toUsize(slot)] = move node
     } else {
@@ -3006,21 +3004,29 @@ impl<'a> UiTree<'a> {
       let gone = doomed.get(i)
       let node = self.nodeMut(gone)
       node.live = false
-      node.base.clear()
-      node.hover.clear()
-      node.active.clear()
-      node.focus.clear()
-      node.focusVisible.clear()
-      node.starting.clear()
-      node.canvas.clear()
-      node.text.clear()
-      node.label.clear()
-      node.testId.clear()
       let id = node.id
       let nodeCss = node.css
       let inner = node.inner
       let trap = node.focusTrap
       let generated = node.isGenerated()
+      // A slot waits for its next node holding nothing: what this one owned goes now, not
+      // when (or if) the slot is taken again.
+      node.base.clearAndFree()
+      node.hover.clearAndFree()
+      node.active.clearAndFree()
+      node.focus.clearAndFree()
+      node.focusVisible.clearAndFree()
+      node.starting.clearAndFree()
+      node.canvas.clearAndFree()
+      node.text.clearAndFree()
+      node.label.clearAndFree()
+      node.testId.clearAndFree()
+      node.transition.clearAndFree()
+      node.editing = Option<Box<EditState>>.None
+      node.effects = Option<Box<Effects>>.None
+      node.semantics = Option<Box<Semantics>>.None
+      node.resolvedSheet = Option<Frozen<Resolved>>.None
+      node.selectorIdentity = Option<Box<NodeIdentity>>.None
       if node.inert {
         self.inerts = self.inerts - 1
       }
@@ -3037,7 +3043,84 @@ impl<'a> UiTree<'a> {
         self.slotOfCss.set(inner, NONE)
       }
       run self.free.append(gone)
+      let added = self.free.length() - 1
+      siftUp(&mut self.free, added)
       i = i + 1
+    }
+  }
+
+  /// How many nodes the tree holds.
+  pub fn liveNodes(self: &Self) -> usize {
+    return self.nodes.length() - self.free.length()
+  }
+
+  /// Gives back the end of the node table when most of the table is free slots there, as after
+  /// a large subtree is destroyed. A slot something outside the table still names (a capture, a
+  /// focus) stays.
+  effect fn trimNodes(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let length = self.nodes.length()
+    if length < TRIM_NODES || self.free.length() * 2 < length {
+      return
+    }
+    let mut keep: usize = length
+    while keep > 0 && !self.node(usize.toU32(keep - 1)).live {
+      keep = keep - 1
+    }
+    keep = keepSlot(keep, self.root)
+    keep = keepSlot(keep, self.focused)
+    keep = keepSlot(keep, self.capture)
+    keep = keepSlot(keep, self.captureTo)
+    keep = keepSlot(keep, self.pendingTarget)
+    keep = keepSlot(keep, self.thumbSlot)
+    let parked = self.parked.asSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      keep = keepSlot(keep, parked[p].root)
+      keep = keepSlot(keep, parked[p].focused)
+      keep = keepSlot(keep, parked[p].capture)
+      keep = keepSlot(keep, parked[p].captureTo)
+      keep = keepSlot(keep, parked[p].pendingTarget)
+      keep = keepSlot(keep, parked[p].thumbSlot)
+      p = p + 1
+    }
+    drop parked
+    if keep * 2 > length {
+      return
+    }
+    while self.nodes.length() > keep {
+      drop self.nodes.pop()
+    }
+    run self.nodes.shrinkToFit()
+    // What each frame fills for the nodes it paints was sized by the larger tree.
+    run self.paintOrder.shrinkToFit()
+    run self.fragmentHashes.shrinkToFit()
+    run self.fragmentInk.shrinkToFit()
+    run self.fragmentScrollers.shrinkToFit()
+    run self.textInk.shrinkToFit()
+    run self.fragmentOf.shrinkToFit()
+    run self.nextSourceFragment.shrinkToFit()
+    run self.paintIndexOf.shrinkToFit()
+    run self.events.shrinkToFit()
+    run self.styleChanges.shrinkToFit()
+    let mut kept: usize = 0
+    let mut i: usize = 0
+    while i < self.free.length() {
+      let slot = self.free.get(i)
+      if u32.toUsize(slot) < keep {
+        self.free.set(kept, slot)
+        kept = kept + 1
+      }
+      i = i + 1
+    }
+    self.free.truncate(kept)
+    run self.free.shrinkToFit()
+    // Fewer slots, in the order they were: put the lowest first again.
+    let mut at = kept / 2
+    while at > 0 {
+      at = at - 1
+      siftDown(&mut self.free, at)
     }
   }
 
@@ -6452,6 +6535,7 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
+    run self.trimNodes()
     if self.applied || self.paintDirty {
       self.paintCachesStale = true
     }
@@ -7180,6 +7264,71 @@ impl<'a> UiTree<'a> {
 
 effect fn ignoreInvalid(error: InvalidNode) -> () {
   drop error
+}
+
+// The free slots of the node table are a binary heap with the lowest slot first: a new node
+// takes the lowest free slot, so the nodes that stay after many are destroyed sit at the start
+// of the table and its end can be given back (see `UiTree.trimNodes`).
+
+/// Moves the free slot at `at` up to its place in the heap.
+fn siftUp(free: &mut List<u32>, at: usize) -> () {
+  let slots = free.asMutSlice()
+  let mut i = at
+  while i > 0 {
+    let parent = (i - 1) / 2
+    if slots[parent] <= slots[i] {
+      return
+    }
+    let moved = slots[parent]
+    slots[parent] = slots[i]
+    slots[i] = moved
+    i = parent
+  }
+}
+
+/// Moves the free slot at `at` down to its place in the heap.
+fn siftDown(free: &mut List<u32>, at: usize) -> () {
+  let slots = free.asMutSlice()
+  let mut i = at
+  while true {
+    let left = i * 2 + 1
+    if left >= slots.length {
+      return
+    }
+    let right = left + 1
+    let least = if right < slots.length && slots[right] < slots[left] { right } else { left }
+    if slots[i] <= slots[least] {
+      return
+    }
+    let moved = slots[i]
+    slots[i] = slots[least]
+    slots[least] = moved
+    i = least
+  }
+}
+
+/// Takes the lowest free slot. `free` is not empty.
+fn takeLowest(free: &mut List<u32>) -> u32 {
+  let last = free.length() - 1
+  let lowest = free.get(0)
+  let moved = free.get(last)
+  free.set(0, moved)
+  free.truncate(last)
+  if last > 0 {
+    siftDown(&mut free.*, 0)
+  }
+  return lowest
+}
+
+/// The node table is not trimmed below this many slots (see `UiTree.trimNodes`).
+const TRIM_NODES: usize = 1024
+
+/// `keep` slots of the node table, or as many as keep `slot` in it.
+fn keepSlot(keep: usize, slot: u32) -> usize {
+  if slot == NONE || u32.toUsize(slot) < keep {
+    return keep
+  }
+  return u32.toUsize(slot) + 1
 }
 
 fn contains(list: &List<u32>, value: u32) -> bool {
