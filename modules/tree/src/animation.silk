@@ -74,7 +74,8 @@ impl Order for FrameOrder {
   }
 }
 
-/// One animation a node plays.
+/// One animation a node plays. `UiTree.animations` keeps them in slot order, each node's by
+/// their place in its list (see [`rangeOf`]), so a node finds its own without reading the rest.
 pub struct Playing {
   pub slot: u32,
   pub id: u32,
@@ -315,6 +316,79 @@ fn directed(spec: &AnimationSpec, overall: f64) -> f32 {
   }
 }
 
+/// Where the animations of the node at `slot` are in `list`, which is in slot order with each
+/// node's animations by their place in its `animation-name` list: the first and the one past
+/// the last.
+pub fn rangeOf(list: &[Playing], slot: u32) -> [usize; 2] {
+  let mut low: usize = 0
+  let mut high = list.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if list[middle].slot < slot {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  let mut end = low
+  while end < list.length && list[end].slot == slot {
+    end = end + 1
+  }
+  return [low, end]
+}
+
+/// Puts `items` in place of what the node at `slot` plays, keeping the list in slot order.
+pub effect fn replace(tree: &mut UiTree<'_>, slot: u32, items: &[Playing]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let range = rangeOf(tree.animations.asSlice(), slot)
+  let count = range[1] - range[0]
+  if items.length == count {
+    let mut i: usize = 0
+    while i < count {
+      tree.animations.set(range[0] + i, items[i])
+      i = i + 1
+    }
+    return ()
+  }
+  let length = tree.animations.length()
+  let mut from = range[1]
+  let mut to = range[0]
+  while from < length {
+    let moved = tree.animations.get(from)
+    tree.animations.set(to, moved)
+    to = to + 1
+    from = from + 1
+  }
+  tree.animations.truncate(to)
+  run tree.animations.insertSlice(range[0], items)
+}
+
+/// Gives `playing` the timing `spec` at place `index` of its node's list at `now`. Returns
+/// whether it starts in this style change, for its `animationstart`.
+fn retime(playing: &mut Playing, spec: AnimationSpec, index: usize, now: f64) -> bool {
+  // Pausing holds the clock; running again moves the start on by the pause.
+  if spec.paused && !playing.pausing {
+    playing.pausing = true
+    playing.pausedAt = now
+  } else if !spec.paused && playing.pausing {
+    playing.pausing = false
+    playing.start = playing.start + (now - playing.pausedAt)
+  }
+  playing.index = index
+  playing.spec = spec
+  if playing.reported == 2 && local(&playing.*, now) < activeDuration(&spec) {
+    // New timing that runs past now plays the animation on.
+    playing.reported = 1
+  }
+  if playing.reported == 0 && !playing.pausing && local(&playing.*, now) >= 0.0 {
+    // No delay: it starts in this style change, as animationstart says.
+    playing.reported = 1
+    return true
+  }
+  return false
+}
+
 /// Matches the node's `animation-name` list in `computed` to what it plays: names kept in
 /// place keep playing (with the new timing), new ones start now, gone ones are cancelled.
 /// A node that is not rendered plays nothing. Returns the fields its animations set.
@@ -328,18 +402,52 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
   }
   let id = tree.node(slot).id
   let now = tree.input.time
-  // Mark what this node plays as unmatched (index MAX), then claim by name in order.
+  let range = rangeOf(tree.animations.asSlice(), slot)
+  if !has && range[0] == range[1] {
+    return 0
+  }
+
+  // Most restyles leave the list as it is, a frame of the clock above all: each animation
+  // then keeps its place and takes its timing where it stands.
+  if has && range[1] - range[0] == lists.names.count {
+    let mut same = true
+    let mut fields: u64 = 0
+    let mut index: usize = 0
+    while index < lists.names.count {
+      let playing = tree.animations.get(range[0] + index)
+      let spec = lists.spec(index, &tree.easingStops)
+      let rule = named(&tree.*, slot, spec.name)
+      if playing.id != id || playing.name != spec.name || spec.name == 0 || rule.isNone() {
+        same = false
+        break
+      }
+      fields = fields | match rule { Option.Some { value } => value.fields Option.None => 0 }
+      index = index + 1
+    }
+    if same {
+      index = 0
+      while index < lists.names.count {
+        let mut playing = tree.animations.get(range[0] + index)
+        if retime(&mut playing, lists.spec(index, &tree.easingStops), index, now) {
+          run record(&mut tree, EventKind.AnimationStart, &playing, 0.0)
+        }
+        tree.animations.set(range[0] + index, playing)
+        index = index + 1
+      }
+      return u64.bitXor(fields, u64.bitAnd(fields, importantFields(&tree.*, slot)))
+    }
+  }
+
+  // What the node plays; a node that took the slot of another leaves that one's behind.
   let mut kept = List<Playing>.make()
   let mut old = List<Playing>.make()
-  let mut i: usize = 0
-  while i < tree.animations.length() {
-    let item = tree.animations.asSlice()[i]
-    if item.slot == slot && item.id == id {
+  let mut i = range[0]
+  while i < range[1] {
+    let item = tree.animations.get(i)
+    if item.id == id {
       run old.append(item)
-      drop tree.animations.remove(i)
-    } else {
-      i = i + 1
     }
+    i = i + 1
   }
   let mut fields: u64 = 0
   if has {
@@ -380,23 +488,7 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
             iteration: 0.0,
           }
         }
-        // Pausing holds the clock; running again moves the start on by the pause.
-        if spec.paused && !playing.pausing {
-          playing.pausing = true
-          playing.pausedAt = now
-        } else if !spec.paused && playing.pausing {
-          playing.pausing = false
-          playing.start = playing.start + (now - playing.pausedAt)
-        }
-        playing.index = index
-        playing.spec = spec
-        if playing.reported == 2 && local(&playing, now) < activeDuration(&spec) {
-          // New timing that runs past now plays the animation on.
-          playing.reported = 1
-        }
-        if playing.reported == 0 && !playing.pausing && local(&playing, now) >= 0.0 {
-          // No delay: it starts in this style change, as animationstart says.
-          playing.reported = 1
+        if retime(&mut playing, spec, index, now) {
           run record(&mut tree, EventKind.AnimationStart, &playing, 0.0)
         }
         fields = fields | ruleFields
@@ -413,7 +505,7 @@ pub effect fn update(tree: &mut UiTree<'_>, slot: u32, rendered: bool, computed:
     }
     k = k + 1
   }
-  run tree.animations.appendSlice(kept.asSlice())
+  run replace(&mut tree, slot, kept.asSlice())
   return u64.bitXor(fields, u64.bitAnd(fields, importantFields(&tree.*, slot)))
 }
 
@@ -427,11 +519,15 @@ pub effect fn apply(tree: &UiTree<'_>, slot: u32, computed: &mut Computed, units
   }
   let id = tree.node(slot).id
   let now = tree.input.time
-  let blocked = importantFields(tree, slot)
   let list = tree.animations.asSlice()
-  let mut i: usize = 0
-  while i < list.length {
-    if list[i].slot == slot && list[i].id == id {
+  let range = rangeOf(list, slot)
+  if range[0] == range[1] {
+    return ()
+  }
+  let blocked = importantFields(tree, slot)
+  let mut i = range[0]
+  while i < range[1] {
+    if list[i].id == id {
       let base = computed.*
       run applyOne(tree, &list[i], &base, now, blocked, &mut computed, units, fonts)
     }
