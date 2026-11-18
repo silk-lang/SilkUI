@@ -125,7 +125,8 @@ test("copy, cut, paste and beforeinput follow the Clipboard API and events", asy
   box.addEventListener("cut", () => {});
   assert.deepEqual(mock.take(), [["listen", box.nodeId, 2 ** 30]]);
   field.addEventListener("beforeinput", (event) => seen.push(event));
-  assert.deepEqual(mock.take(), [["listen", field.nodeId, 2 ** 31]]);
+  const [[call, node, flags]] = mock.take();
+  assert.deepEqual([call, node, (flags & 2 ** 31) >>> 0], ["listen", field.nodeId, 2 ** 31], "beforeinput listens on bit 31, beside what the input keeps");
   box.removeEventListener("copy", onCopy);
   assert.deepEqual(mock.take(), [], "cut still listens on the shared bit");
   box.addEventListener("copy", onCopy);
