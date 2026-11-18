@@ -15,7 +15,7 @@ npm ci
 npm run fonts      # Noto faces from Google Fonts and Twemoji into fonts/ (not in git)
 npm run build      # dist/app.js
 # from the repository root
-silk run --manifest-path modules/js/demo/silk.toml --profile dev -- \
+silk run --manifest-path modules/js/demo/silk.toml --optimization none -- \
   --fonts modules/js/examples/text-showcase/fonts modules/js/examples/text-showcase/dist/app.js
 # the browser build, from the example
 npm run dev:web
