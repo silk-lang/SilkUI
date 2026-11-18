@@ -19,6 +19,7 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import silk.num.usize
 import silk.text.string { String }
 import silk.io.writer_native { StderrWriter }
 import silk.io.writer { Writer }
@@ -392,7 +393,11 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 5 {
+  let ran = if scenario == 7 {
+    run Effect.result(geometryReads(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 6 {
+    run Effect.result(computedStyles(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 5 {
     run Effect.result(svgMarkup(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 4 {
     run Effect.result(literalAria(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -430,7 +435,13 @@ effect fn withHost(scenario: u32) -> ()
   }
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
-    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => {
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
   }
   match move checked {
     Result<(), OutOfMemoryError | JsError | AssertionError<'static>>.Success { .. } => ()
@@ -520,6 +531,22 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
   run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
   run Testing.expect(bridge.CLEAR_STYLE == bridge.nativeId(b"clearStyle"), "CLEAR_STYLE")
+  run Testing.expect(bridge.COMPUTED == bridge.nativeId(b"computed"), "COMPUTED")
+  run Testing.expect(bridge.SUPPORTS == bridge.nativeId(b"supports"), "SUPPORTS")
+  run Testing.expect(bridge.RECT == bridge.nativeId(b"rect"), "RECT")
+  run Testing.expect(bridge.RECTS == bridge.nativeId(b"rects"), "RECTS")
+  run Testing.expect(bridge.METRICS == bridge.nativeId(b"metrics"), "METRICS")
+  run Testing.expect(bridge.HIT == bridge.nativeId(b"hit"), "HIT")
+  run Testing.expect(bridge.HITS == bridge.nativeId(b"hits"), "HITS")
+  run Testing.expect(bridge.CARET == bridge.nativeId(b"caret"), "CARET")
+  run Testing.expect(bridge.RANGE_RECTS == bridge.nativeId(b"rangeRects"), "RANGE_RECTS")
+  run Testing.expect(bridge.GEOMETRY == bridge.nativeId(b"geometry"), "GEOMETRY")
+  run Testing.expect(bridge.SCROLL_INTO_VIEW == bridge.nativeId(b"scrollIntoView"), "SCROLL_INTO_VIEW")
+  run Testing.expect(bridge.SCROLL == bridge.nativeId(b"scroll"), "SCROLL")
+  run Testing.expect(bridge.OBSERVER == bridge.nativeId(b"observer"), "OBSERVER")
+  run Testing.expect(bridge.THRESHOLD == bridge.nativeId(b"threshold"), "THRESHOLD")
+  run Testing.expect(bridge.OBSERVE == bridge.nativeId(b"observe"), "OBSERVE")
+  run Testing.expect(bridge.UNOBSERVE == bridge.nativeId(b"unobserve"), "UNOBSERVE")
   run Testing.expect(bridge.CLIPBOARD_READ == bridge.nativeId(b"clipboardRead"), "CLIPBOARD_READ")
   run Testing.expect(bridge.CLIPBOARD_WRITE == bridge.nativeId(b"clipboardWrite"), "CLIPBOARD_WRITE")
   run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
@@ -713,4 +740,53 @@ test effect fn inlineSvgMarkupAndDataUrlsReachTheNativeTree() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(5) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn computedStyles(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.evaluate(b"if (__ui.computed(1, 'width') !== undefined) throw new Error('a host with no tree answered')", b"test")
+  host.attach(tree.engineMut())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/computed-style.js")
+  run host.module(source.asSlice(), b"computed-style.js")
+  run host.evaluate(b"if (!globalThis.computedStyleChecked) throw new Error('the checks did not run')", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+}
+
+effect fn geometryReads(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  host.attach(tree.engineMut())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/geometry.js")
+  run host.module(source.asSlice(), b"geometry.js")
+  let steps = [b"geometryAfterFrame(0)", b"geometryAfterFrame(1)", b"geometryAfterFrame(2)"]
+  let mut i: usize = 0
+  while i < 3 {
+    run host.flush(&mut tree)
+    drop run tree.frame(viewport(), usize.toF64(i))
+    run host.observe(tree.engineMut())
+    run host.evaluate(steps[i], b"test")
+    i = i + 1
+  }
+  run host.evaluate(b"if (!globalThis.geometryChecked) throw new Error('the checks did not run')", b"test")
+}
+
+/// Layout reads, scrolling, `CSS.supports` and the observers, through the bridge.
+test effect fn layoutReadsScrollingAndObservers() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(7) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// `getComputedStyle` reads the tree through `__ui.computed`, applying pending mutations first.
+test effect fn getComputedStyleReadsTheTree() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(6) |> Effect.provideMut<Allocator>(&mut allocator)
 }

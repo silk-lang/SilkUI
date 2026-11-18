@@ -729,12 +729,64 @@ export class Node {
     return pointers.get(pointerId)?.capture === this;
   }
 
+  /** `scrollTo(x, y)` or `scrollTo({ left, top, behavior })`; `behavior: "smooth"` animates, and `auto` follows `scroll-behavior`. */
   scrollTo(x, y) {
-    native.scrollTo(this.nodeId, x, y);
+    scrollNode(this.nodeId, x, y, 0);
   }
 
   scroll(x, y) {
-    native.scrollTo(this.nodeId, x, y);
+    scrollNode(this.nodeId, x, y, 0);
+  }
+
+  /** As `scrollTo`, by an amount from where the node is scrolled. */
+  scrollBy(x, y) {
+    scrollNode(this.nodeId, x, y, 4);
+  }
+
+  /** The border box in window coordinates, after any pending layout, as on the web. */
+  getBoundingClientRect() {
+    return readRect(this.nodeId);
+  }
+
+  /** One rectangle per fragment (a wrapped inline box has one per line). */
+  getClientRects() {
+    return readRects(native.rects?.(this.nodeId) ?? 0);
+  }
+
+  get clientLeft() { return metric(this.nodeId, 0); }
+  get clientTop() { return metric(this.nodeId, 1); }
+  get clientWidth() { return metric(this.nodeId, 2); }
+  get clientHeight() { return metric(this.nodeId, 3); }
+  get scrollWidth() { return metric(this.nodeId, 4); }
+  get scrollHeight() { return metric(this.nodeId, 5); }
+  get scrollLeft() { return metric(this.nodeId, 6); }
+  set scrollLeft(value) { scrollNode(this.nodeId, { left: value }, undefined, 0); }
+  get scrollTop() { return metric(this.nodeId, 7); }
+  set scrollTop(value) { scrollNode(this.nodeId, { top: value }, undefined, 0); }
+  get offsetParent() { return nodes.get(metric(this.nodeId, 8)) ?? null; }
+  get offsetLeft() { return metric(this.nodeId, 9); }
+  get offsetTop() { return metric(this.nodeId, 10); }
+  get offsetWidth() { return metric(this.nodeId, 11); }
+  get offsetHeight() { return metric(this.nodeId, 12); }
+
+  /**
+   * Scrolls every scroll container around this node to show it, as on the web: `true` or
+   * nothing aligns to the start, `false` to the end, or `{ block, inline, behavior }`.
+   * `scroll-margin`, `scroll-padding` and `scroll-snap` apply.
+   */
+  scrollIntoView(options = true) {
+    if (options === null || typeof options !== "object") {
+      const top = options !== false;
+      native.scrollIntoView?.(this.nodeId, top ? 0 : 2, 3, 0, 0);
+      return;
+    }
+    native.scrollIntoView?.(this.nodeId, alignment(options.block, 0), alignment(options.inline, 3), BEHAVIORS[options.behavior] ?? 0, 0);
+  }
+
+  /** WebKit's: scrolls only containers that do not already show the node, centering it unless `center` is false. */
+  scrollIntoViewIfNeeded(center = true) {
+    const code = center ? 1 : 3;
+    native.scrollIntoView?.(this.nodeId, code, code, 0, 1);
   }
 
   /**
@@ -1936,6 +1988,15 @@ export class Range extends AbstractRange {
     this.#set(node, offset, false);
   }
 
+  /** One rectangle per line piece of the range, from the tree's last layout (laid out first if something changed). */
+  getClientRects() {
+    return rangeClientRects(this._startNode, this._startOffset, this._endNode, this._endOffset);
+  }
+
+  getBoundingClientRect() {
+    return rangeBoundingClientRect(this._startNode, this._startOffset, this._endNode, this._endOffset);
+  }
+
   setStartBefore(node) {
     this.#set(parentOf(node), indexIn(node), true);
   }
@@ -3020,6 +3081,411 @@ export function memoryUsage() {
   const footprint = native.memoryUsage?.() ?? 0;
   return footprint > 0 ? { footprint, processes: 1 } : null;
 }
+
+// `getComputedStyle`: one native read per property, made when the property is read, so a
+// declaration stays live and costs nothing for the properties nobody asks for.
+const readComputed = native.computed ?? (() => undefined);
+const computedId = Symbol("node");
+// Property names by the name they were asked by, null for the declaration's own members.
+const computedNames = new Map();
+const lowerNames = new Map();
+function computedName(key, target) {
+  let name = computedNames.get(key);
+  if (name === undefined) {
+    name = key in target ? null : key === "cssFloat" ? "float"
+      : key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, "-$1-");
+    computedNames.set(key, name);
+  }
+  return name;
+}
+
+class CSSStyleDeclaration {
+  constructor(id) { Object.defineProperty(this, computedId, { value: id }); }
+  getPropertyValue(name) {
+    let lower = lowerNames.get(name);
+    if (lower === undefined) {
+      lower = String(name).toLowerCase();
+      if (typeof name === "string") lowerNames.set(name, lower);
+    }
+    return readComputed(this[computedId], lower) ?? "";
+  }
+  getPropertyPriority() { return ""; }
+  setProperty() { throw new TypeError("a computed style cannot be changed"); }
+  removeProperty() { throw new TypeError("a computed style cannot be changed"); }
+  get cssText() { return ""; }
+  get length() { return 0; }
+  item() { return ""; }
+}
+
+const computedTraps = {
+  get(target, key, receiver) {
+    if (typeof key === "string") {
+      const name = computedName(key, target);
+      if (name !== null) return readComputed(target[computedId], name) ?? "";
+    }
+    return Reflect.get(target, key, receiver);
+  },
+  set() { throw new TypeError("a computed style cannot be changed"); },
+};
+
+/**
+ * The values the tree resolved for `node` (an @silkui/core node, or an element of a DOM layer
+ * over one): typed and animated properties as they are now, box sizes, margins, padding and
+ * border widths as laid out, the rest as cascaded with lengths in pixels. Each property read
+ * is one call into the tree; it applies pending changes and lays out only when something
+ * changed since the last layout. Shorthands, custom properties and pseudo-elements read "".
+ */
+export function getComputedStyle(node, pseudo) {
+  const id = node?.nodeId ?? node?.node?.nodeId;
+  if (typeof id !== "number") throw new TypeError("getComputedStyle takes a node");
+  return new Proxy(new CSSStyleDeclaration(pseudo ? 0 : id), computedTraps);
+}
+
+globalThis.getComputedStyle ??= getComputedStyle;
+
+// Layout reads. Each lays out first when something changed since the last frame (as a
+// browser forces layout), leaves its numbers in the bridge and answers how many there are.
+const geometry = native.geometry ?? (() => 0);
+const ALIGNMENTS = { start: 0, center: 1, end: 2, nearest: 3 };
+const BEHAVIORS = { auto: 0, instant: 1, smooth: 2 };
+
+function alignment(value, fallback) {
+  if (value === undefined) return fallback;
+  const code = ALIGNMENTS[value];
+  if (code === undefined) throw new TypeError("'" + value + "' is not a valid ScrollLogicalPosition");
+  return code;
+}
+
+/** A read-only rectangle, as `DOMRect` on the web. */
+export class DOMRect {
+  constructor(x = 0, y = 0, width = 0, height = 0) {
+    this.x = x;
+    this.y = y;
+    this.width = width;
+    this.height = height;
+  }
+  get left() { return Math.min(this.x, this.x + this.width); }
+  get top() { return Math.min(this.y, this.y + this.height); }
+  get right() { return Math.max(this.x, this.x + this.width); }
+  get bottom() { return Math.max(this.y, this.y + this.height); }
+  toJSON() {
+    const { x, y, width, height, top, right, bottom, left } = this;
+    return { x, y, width, height, top, right, bottom, left };
+  }
+}
+
+globalThis.DOMRect ??= DOMRect;
+
+function metric(id, index) {
+  if (!native.metrics?.(id)) return 0;
+  return geometry(index);
+}
+
+function readRect(id) {
+  if (!native.rect?.(id)) return new DOMRect();
+  return new DOMRect(geometry(0), geometry(1), geometry(2), geometry(3));
+}
+
+function readRects(count) {
+  const list = [];
+  for (let i = 0; i < count; i++) list.push(new DOMRect(geometry(4 * i), geometry(4 * i + 1), geometry(4 * i + 2), geometry(4 * i + 3)));
+  list.item = (index) => list[index] ?? null;
+  return list;
+}
+
+// `scrollTo`, `scroll` and `scrollBy`: numbers, or `{ left, top, behavior }`. `by` is 4 for scrollBy.
+function scrollNode(id, x, y, by) {
+  let left, top, behavior = 0;
+  if (x !== null && typeof x === "object") {
+    left = x.left;
+    top = x.top;
+    if (x.behavior !== undefined) {
+      behavior = BEHAVIORS[x.behavior];
+      if (behavior === undefined) throw new TypeError("'" + x.behavior + "' is not a valid ScrollBehavior");
+    }
+  } else {
+    left = x;
+    top = y;
+  }
+  // As on the web, a non-finite coordinate counts as 0.
+  const has = (left !== undefined ? 1 : 0) | (top !== undefined ? 2 : 0);
+  const number = (value) => (Number.isFinite(+value) ? +value : 0);
+  if (native.scroll) native.scroll(id, number(left), number(top), behavior, has | by);
+  else if (!by) native.scrollTo(id, number(left), number(top));
+}
+
+// IntersectionObserver and ResizeObserver: the tree computes every observation after each
+// layout and calls `__ui.observed(count)` with only the entries that changed.
+const observersById = new Map();
+let nextObserverId = 0;
+
+function lengths(text, name) {
+  const parts = String(text ?? "0px").trim().split(/\s+/);
+  if (parts.length > 4) throw new SyntaxError("'" + text + "' is not a valid " + name);
+  const values = [], percent = [];
+  for (const part of parts) {
+    const match = /^(-?(?:\d+\.?\d*|\.\d+))(px|%)?$/.exec(part);
+    if (!match || (match[2] === undefined && +match[1] !== 0)) throw new SyntaxError("'" + text + "' is not a valid " + name + ": use px or %");
+    values.push(+match[1]);
+    percent.push(match[2] === "%");
+  }
+  // top, right, bottom, left as in the margin shorthand.
+  const pick = [[0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 1], [0, 1, 2, 3]][values.length - 1];
+  const out = pick.map((i) => values[i]);
+  let bits = 0;
+  pick.forEach((i, side) => { if (percent[i]) bits |= 1 << side; });
+  out.text = pick.map((i) => values[i] + (percent[i] ? "%" : "px")).join(" ");
+  return { values: out, bits };
+}
+
+/** As `IntersectionObserverEntry` on the web. */
+export class IntersectionObserverEntry {
+  constructor(init) { Object.assign(this, init); }
+}
+
+/** As `IntersectionObserver` on the web, with `scrollMargin` from version 2. `root` is a node or null for the window. */
+export class IntersectionObserver {
+  #id = ++nextObserverId;
+  #callback;
+  #targets = new Map();
+  #records = [];
+  #margin;
+  #scroll;
+
+  constructor(callback, options = {}) {
+    if (typeof callback !== "function") throw new TypeError("IntersectionObserver takes a callback");
+    this.#callback = callback;
+    const root = options.root ?? null;
+    if (root !== null && typeof root.nodeId !== "number" && typeof root.node?.nodeId !== "number") throw new TypeError("root must be a node or null");
+    this.root = root;
+    this.#margin = lengths(options.rootMargin, "rootMargin");
+    this.#scroll = lengths(options.scrollMargin, "scrollMargin");
+    let list = options.threshold ?? 0;
+    list = (Array.isArray(list) ? list : [list]).map(Number);
+    for (const value of list) if (!(value >= 0 && value <= 1)) throw new RangeError("Threshold values must be numbers between 0 and 1");
+    list.sort((a, b) => a - b);
+    if (list.length === 0) list.push(0);
+    Object.defineProperties(this, {
+      rootMargin: { value: this.#margin.values.text, enumerable: true },
+      scrollMargin: { value: this.#scroll.values.text, enumerable: true },
+      thresholds: { value: Object.freeze(list), enumerable: true },
+      delay: { value: 0, enumerable: true },
+      trackVisibility: { value: false, enumerable: true },
+    });
+  }
+
+  observe(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (typeof id !== "number") throw new TypeError("observe takes a node");
+    if (this.#targets.has(id)) return;
+    if (this.#targets.size === 0) {
+      const m = this.#margin.values, s = this.#scroll.values;
+      const rootId = this.root ? (this.root.nodeId ?? this.root.node.nodeId) : 0;
+      native.observer?.(this.#id, rootId, m[0], m[1], m[2], m[3], this.#margin.bits | (this.#scroll.bits << 4), s[0], s[1], s[2], s[3]);
+      for (const value of this.thresholds) native.threshold?.(this.#id, value);
+      observersById.set(this.#id, this);
+    }
+    this.#targets.set(id, target);
+    native.observe?.(this.#id, id, 0);
+  }
+
+  unobserve(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (!this.#targets.delete(id)) return;
+    native.unobserve?.(this.#id, id);
+    if (this.#targets.size === 0) observersById.delete(this.#id);
+  }
+
+  disconnect() {
+    if (this.#targets.size === 0) return;
+    this.#targets.clear();
+    native.unobserve?.(this.#id, 0);
+    observersById.delete(this.#id);
+  }
+
+  takeRecords() {
+    const records = this.#records;
+    this.#records = [];
+    return records;
+  }
+
+  // The object `observe` was given: a Foldkit element is its entries' target, not its node.
+  _target(id) { return this.#targets.get(id) ?? null; }
+
+  _queue(entry) { this.#records.push(entry); }
+
+  _deliver() {
+    const records = this.takeRecords();
+    if (records.length === 0) return;
+    try { this.#callback.call(this, records, this); } catch (error) { reportError(error); }
+  }
+}
+
+/** As `ResizeObserverEntry` on the web. */
+export class ResizeObserverEntry {
+  constructor(init) { Object.assign(this, init); }
+}
+
+const BOXES = { "content-box": 1, "border-box": 2, "device-pixel-content-box": 3 };
+
+/** As `ResizeObserver` on the web: entries come after a layout that changed the observed box. */
+export class ResizeObserver {
+  #id = ++nextObserverId;
+  #callback;
+  #targets = new Map();
+  #records = [];
+
+  constructor(callback) {
+    if (typeof callback !== "function") throw new TypeError("ResizeObserver takes a callback");
+    this.#callback = callback;
+  }
+
+  observe(target, options) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (typeof id !== "number") throw new TypeError("observe takes a node");
+    const box = BOXES[options?.box ?? "content-box"];
+    if (box === undefined) throw new TypeError("'" + options.box + "' is not a valid ResizeObserverBoxOptions");
+    this.#targets.set(id, target);
+    observersById.set(this.#id, this);
+    native.observe?.(this.#id, id, box);
+  }
+
+  unobserve(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (!this.#targets.delete(id)) return;
+    native.unobserve?.(this.#id, id);
+    if (this.#targets.size === 0) observersById.delete(this.#id);
+  }
+
+  disconnect() {
+    if (this.#targets.size === 0) return;
+    this.#targets.clear();
+    native.unobserve?.(this.#id, 0);
+    observersById.delete(this.#id);
+  }
+
+  // The object `observe` was given: a Foldkit element is its entries' target, not its node.
+  _target(id) { return this.#targets.get(id) ?? null; }
+
+  _queue(entry) { this.#records.push(entry); }
+
+  _deliver() {
+    const records = this.#records;
+    this.#records = [];
+    if (records.length === 0) return;
+    try { this.#callback.call(this, records, this); } catch (error) { reportError(error); }
+  }
+}
+
+const size = (inlineSize, blockSize) => Object.freeze([Object.freeze({ inlineSize, blockSize })]);
+
+native.observed = function (count) {
+  // Read every entry first: a callback's own layout reads reuse the numbers.
+  const time = performance.now();
+  const touched = [];
+  let at = 0;
+  for (let n = 0; n < count; n++) {
+    const kind = geometry(at);
+    const observer = observersById.get(geometry(at + 1));
+    const target = observer?._target(geometry(at + 2)) ?? null;
+    const read = (i) => geometry(at + i);
+    if (kind === 1) {
+      if (observer && target) {
+        observer._queue(new IntersectionObserverEntry({
+          time,
+          target,
+          isIntersecting: read(3) === 1,
+          isVisible: false,
+          intersectionRatio: read(4),
+          boundingClientRect: new DOMRect(read(5), read(6), read(7), read(8)),
+          intersectionRect: new DOMRect(read(9), read(10), read(11), read(12)),
+          rootBounds: new DOMRect(read(13), read(14), read(15), read(16)),
+        }));
+      }
+      at += 17;
+    } else {
+      if (observer && target) {
+        observer._queue(new ResizeObserverEntry({
+          target,
+          contentRect: new DOMRect(read(3), read(4), read(5), read(6)),
+          borderBoxSize: size(read(7), read(8)),
+          contentBoxSize: size(read(9), read(10)),
+          devicePixelContentBoxSize: size(read(11), read(12)),
+        }));
+      }
+      at += 13;
+    }
+    if (observer && !touched.includes(observer)) touched.push(observer);
+  }
+  // ResizeObserver callbacks first, as browsers run them before intersection updates.
+  for (const observer of touched) if (observer instanceof ResizeObserver) observer._deliver();
+  for (const observer of touched) if (observer instanceof IntersectionObserver) observer._deliver();
+};
+
+globalThis.IntersectionObserver ??= IntersectionObserver;
+globalThis.IntersectionObserverEntry ??= IntersectionObserverEntry;
+globalThis.ResizeObserver ??= ResizeObserver;
+globalThis.ResizeObserverEntry ??= ResizeObserverEntry;
+
+/** The topmost node at window point `x`, `y`, or null. */
+export function elementFromPoint(x, y) {
+  return nodes.get(native.hit?.(Number(x), Number(y)) ?? 0) ?? null;
+}
+
+/** Every node at window point `x`, `y`, topmost first. */
+export function elementsFromPoint(x, y) {
+  const count = native.hits?.(Number(x), Number(y)) ?? 0;
+  const list = [];
+  for (let i = 0; i < count; i++) {
+    const node = nodes.get(geometry(i));
+    if (node) list.push(node);
+  }
+  return list;
+}
+
+/** The text position at window point `x`, `y`: `{ offsetNode, offset, getClientRect() }` (UTF-16 offset), or null. */
+export function caretPositionFromPoint(x, y) {
+  if (!native.caret?.(Number(x), Number(y))) return null;
+  const offsetNode = nodes.get(geometry(0)) ?? null;
+  const offset = geometry(1);
+  const rect = new DOMRect(geometry(2), geometry(3), geometry(4), geometry(5));
+  return { offsetNode, offset, getClientRect: () => rect };
+}
+
+/**
+ * The rectangles of the text from (`startNode`, `startOffset`) to (`endNode`, `endOffset`),
+ * offsets in UTF-16 units as in a DOM `Range`: one per line piece, as `Range.getClientRects`.
+ */
+export function rangeClientRects(startNode, startOffset, endNode, endOffset) {
+  return readRects(native.rangeRects?.(startNode.nodeId, startOffset, endNode.nodeId, endOffset) ?? 0);
+}
+
+/** The union of `rangeClientRects`, as `Range.getBoundingClientRect`. */
+export function rangeBoundingClientRect(startNode, startOffset, endNode, endOffset) {
+  const rects = rangeClientRects(startNode, startOffset, endNode, endOffset);
+  if (rects.length === 0) return new DOMRect();
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+  for (const rect of rects) {
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  return new DOMRect(left, top, right - left, bottom - top);
+}
+
+/**
+ * `CSS.supports(property, value)` and `CSS.supports(conditionText)`, answered by the same parser
+ * and property catalog as the tree's `@supports`, so a check here and an `@supports` block in a
+ * stylesheet always agree. Also installed as `globalThis.CSS.supports`.
+ */
+export function supports(conditionOrProperty, value) {
+  if (!native.supports) return false;
+  return arguments.length > 1 ? native.supports(String(conditionOrProperty), String(value)) : native.supports(String(conditionOrProperty));
+}
+
+if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
+globalThis.CSS.supports ??= supports;
 
 let frameStatsSince = 0;
 

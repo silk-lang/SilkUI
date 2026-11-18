@@ -123,7 +123,30 @@ export class Node {
   releasePointerCapture(pointerId: number): void;
   hasPointerCapture(pointerId: number): boolean;
   scrollTo(x: number, y: number): void;
+  scrollTo(options: ScrollToOptions): void;
   scroll(x: number, y: number): void;
+  scroll(options: ScrollToOptions): void;
+  scrollBy(x: number, y: number): void;
+  scrollBy(options: ScrollToOptions): void;
+  /** `true` or nothing aligns to the start, `false` to the end. */
+  scrollIntoView(options?: boolean | ScrollIntoViewOptions): void;
+  scrollIntoViewIfNeeded(center?: boolean): void;
+  /** Layout reads: each lays out first when something changed, as a browser does. */
+  getBoundingClientRect(): DOMRect;
+  getClientRects(): DOMRect[] & { item(index: number): DOMRect | null };
+  readonly clientLeft: number;
+  readonly clientTop: number;
+  readonly clientWidth: number;
+  readonly clientHeight: number;
+  readonly scrollWidth: number;
+  readonly scrollHeight: number;
+  scrollLeft: number;
+  scrollTop: number;
+  readonly offsetParent: Node | null;
+  readonly offsetLeft: number;
+  readonly offsetTop: number;
+  readonly offsetWidth: number;
+  readonly offsetHeight: number;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   /** The app's own event types, sent with `dispatchEvent`. */
   addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
@@ -212,6 +235,8 @@ export class Range extends AbstractRange {
   insertNode(node: Node): void;
   surroundContents(newParent: Node): void;
   toString(): string;
+  getClientRects(): DOMRect[];
+  getBoundingClientRect(): DOMRect;
 }
 
 /** A new live range, collapsed at the start of the root. */
@@ -692,6 +717,30 @@ export interface MemoryUsage {
  */
 export function memoryUsage(): MemoryUsage | null;
 
+/**
+ * The values the tree resolved for `node`, read one property at a time: typed and animated
+ * properties as they are now, box sizes, margins, padding and border widths as laid out, the
+ * rest as cascaded with lengths in pixels. Shorthands, custom properties and pseudo-elements
+ * read "". Also installed as `globalThis.getComputedStyle`.
+ */
+export function getComputedStyle(node: Node | { node: Node }, pseudo?: string | null): ComputedStyle;
+
+/**
+ * `CSS.supports`, answered as the tree's `@supports` answers. Also installed as
+ * `globalThis.CSS.supports`.
+ */
+export function supports(property: string, value: string): boolean;
+export function supports(conditionText: string): boolean;
+
+/** What `getComputedStyle` returns: read-only, live, a value per camelCase property name. */
+export type ComputedStyle = {
+  getPropertyValue(name: string): string;
+  getPropertyPriority(name: string): string;
+  item(index: number): string;
+  readonly cssText: string;
+  readonly length: number;
+} & { readonly [property: string]: string };
+
 /** What the window put on screen over a stretch of time; see `frameStats`. */
 export interface FrameStats {
   /** Frames presented. */
@@ -713,3 +762,99 @@ export interface FrameStats {
  * `null` in a browser build.
  */
 export function frameStats(): FrameStats | null;
+
+export type ScrollBehavior = "auto" | "instant" | "smooth";
+export type ScrollLogicalPosition = "start" | "center" | "end" | "nearest";
+
+export interface ScrollToOptions {
+  left?: number;
+  top?: number;
+  /** `auto` follows the node's `scroll-behavior`. */
+  behavior?: ScrollBehavior;
+}
+
+export interface ScrollIntoViewOptions {
+  block?: ScrollLogicalPosition;
+  inline?: ScrollLogicalPosition;
+  behavior?: ScrollBehavior;
+}
+
+/** As `DOMRect` on the web. Also installed as `globalThis.DOMRect` when there is none. */
+export class DOMRect {
+  constructor(x?: number, y?: number, width?: number, height?: number);
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+  toJSON(): { x: number; y: number; width: number; height: number; top: number; right: number; bottom: number; left: number };
+}
+
+/** The topmost node at window point `x`, `y`. */
+export function elementFromPoint(x: number, y: number): Node | null;
+/** Every node at window point `x`, `y`, topmost first. */
+export function elementsFromPoint(x: number, y: number): Node[];
+/** The text position at window point `x`, `y`, the offset in UTF-16 units. */
+export function caretPositionFromPoint(x: number, y: number): { offsetNode: Node | null; offset: number; getClientRect(): DOMRect } | null;
+/** `Range.getClientRects` for the text from (`startNode`, `startOffset`) to (`endNode`, `endOffset`), offsets in UTF-16 units. */
+export function rangeClientRects(startNode: Node, startOffset: number, endNode: Node, endOffset: number): DOMRect[];
+/** `Range.getBoundingClientRect` for the same range. */
+export function rangeBoundingClientRect(startNode: Node, startOffset: number, endNode: Node, endOffset: number): DOMRect;
+
+type Observable = Node | { node: Node };
+
+export interface IntersectionObserverInit {
+  /** A node, or null for the window. */
+  root?: Observable | null;
+  rootMargin?: string;
+  scrollMargin?: string;
+  threshold?: number | number[];
+}
+
+export class IntersectionObserverEntry {
+  readonly time: number;
+  readonly target: Observable;
+  readonly isIntersecting: boolean;
+  readonly isVisible: boolean;
+  readonly intersectionRatio: number;
+  readonly boundingClientRect: DOMRect;
+  readonly intersectionRect: DOMRect;
+  readonly rootBounds: DOMRect | null;
+}
+
+/** As on the web. Entries come after a layout or scroll in which a target crossed a threshold. Also installed as `globalThis.IntersectionObserver`. */
+export class IntersectionObserver {
+  constructor(callback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void, options?: IntersectionObserverInit);
+  readonly root: Observable | null;
+  readonly rootMargin: string;
+  readonly scrollMargin: string;
+  readonly thresholds: readonly number[];
+  observe(target: Observable): void;
+  unobserve(target: Observable): void;
+  disconnect(): void;
+  takeRecords(): IntersectionObserverEntry[];
+}
+
+export interface ResizeObserverSize {
+  readonly inlineSize: number;
+  readonly blockSize: number;
+}
+
+export class ResizeObserverEntry {
+  readonly target: Observable;
+  readonly contentRect: DOMRect;
+  readonly borderBoxSize: readonly ResizeObserverSize[];
+  readonly contentBoxSize: readonly ResizeObserverSize[];
+  readonly devicePixelContentBoxSize: readonly ResizeObserverSize[];
+}
+
+/** As on the web. Entries come after a layout that changed an observed box. Also installed as `globalThis.ResizeObserver`. */
+export class ResizeObserver {
+  constructor(callback: (entries: ResizeObserverEntry[], observer: ResizeObserver) => void);
+  observe(target: Observable, options?: { box?: "content-box" | "border-box" | "device-pixel-content-box" }): void;
+  unobserve(target: Observable): void;
+  disconnect(): void;
+}
