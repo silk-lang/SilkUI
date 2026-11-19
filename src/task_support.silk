@@ -267,6 +267,14 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
       run trace("prepared", Path.view(&manifest) |> Option<string>.unwrapOr("?"))
     }
   }
+  static if HOST_OS == "windows" {
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_STDLIB") {
+      run trace("SILK_STDLIB", String.fromUtf8(value.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("?"))
+    }
+    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_COMPILER") {
+      run trace("SILK_COMPILER", String.fromUtf8(value.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("?"))
+    }
+  }
   let mut settings = CompilationSettings.make()
   settings.profile.optimization = Option<String>.some(
     run String.copy(
@@ -287,11 +295,13 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
     manifest: run String.copy(Path.view(&manifest) |> Option<string>.unwrapOr("")),
     name: Option<String>.none(),
     artifact: Option<String>.none(),
-    stdlib: run BuildContext.standardLibrary(),
+    stdlib: run standardLibrary(),
     settings: move settings,
     packages: Dictionary<PackageSettings>.make(),
   }
   run trace("definition", "")
+  let _compiler = run BuildContext.compiler()
+  run trace("compiler", "")
   let compilation = run Compilation.fromDefinition(move definition, run BuildContext.compiler())
   run trace("compilation", "")
   let graph = run (run Build.make()).add(move compilation)
@@ -309,6 +319,27 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
     }
   }
   return run String.copy(pathText(binary))
+}
+
+// The standard library the launching compiler selected. silk sets SILK_STDLIB on Windows in the
+// portable spelling (`/C:/...`), which BuildContext.standardLibrary() rejects as a native path.
+effect fn standardLibrary() -> Option<String>
+  ! FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variableNamed("SILK_STDLIB") {
+    Option<Bytes>.Some { value } => {
+      let bytes = value.asSlice()
+      static if HOST_OS == "windows" {
+        if bytes.length == 0 || bytes[0] != 47 {
+          let native = run WindowsPath.fromNativeBytes(bytes)
+          return Option<String>.some(run String.copy(Path.view(&native) |> Option<string>.unwrapOr("")))
+        }
+      }
+      let path = run Path.fromBytes(bytes)
+      Option<String>.some(run String.copy(Path.view(&path) |> Option<string>.unwrapOr("")))
+    }
+    Option<Bytes>.None => Option<String>.none()
+  }
 }
 
 pub effect fn nativeTask(arguments: &[string]) -> ()
