@@ -170,8 +170,8 @@ import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
 import ui_scene.scene { Scene }
 import ui_scene.primitives { ContentMask }
 import ui_scene.path_cache { PathCache }
+import layout_table { LayoutTable, LayoutView }
 import layout.lib {
-  Tree,
   Fragment,
   NodeId,
   LayoutTree,
@@ -805,7 +805,8 @@ pub struct UiTree<'a> {
   pub virtualLists: List<VirtualList>,
   /// Retained popup placement relationships. Configure them through SetAnchor.
   pub anchors: List<Anchored>,
-  pub layout: Tree,
+  /// The tree css-layout lays out (see `layout_table`).
+  pub layout: LayoutTable,
   pub output: LayoutTree,
   pub containerWatches: List<Watch>,
   pub styleChanges: List<Change>,
@@ -1093,7 +1094,7 @@ impl<'a> UiTree<'a> {
     let mut viewport = CssStyle.make()
     viewport.width = SizeValue.px(0.0)
     viewport.height = SizeValue.px(0.0)
-    let mut layout = run Tree.make(move viewport)
+    let mut layout = run LayoutTable.make(move viewport)
 
     // Scroll and sticky offsets are applied when painting, so scrolling needs no layout.
     layout.stickyDeferred = true
@@ -1523,7 +1524,7 @@ impl<'a> UiTree<'a> {
     let was = node.gridStyled
     let grid = run grid_css.gridOfWith(declarations.asSlice(), &font_units.context(&self, slot, computed, node.fontKey))
     let before = self.layout.revision()
-    run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    run Effect.catchAll(self.layout.installGrid(move grid, NodeId { index: css }), layoutFailed)
     let target = self.nodeMut(slot)
     target.gridStyled = styled
     // The grid the node already had changes nothing to paint.
@@ -1865,14 +1866,14 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     out.clear()
     let css = self.node(slot).css
-    let nodes = self.layout.nodes.asSlice()
-    let mut child = nodes[css].firstChild
+    let nodes = &self.layout
+    let mut child = nodes.firstChild(css)
     while child != NO_INDEX {
       let found = self.slotOfCssNode(child)
       if found != NONE {
         run out.append(found)
       }
-      child = nodes[child].nextSibling
+      child = nodes.nextSibling(child)
     }
   }
 
@@ -2514,7 +2515,7 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let css = self.node(slot).css
         let grid = Box<Grid>.into(move value)
-        run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        run Effect.catchAll(self.layout.installGrid(move grid, NodeId { index: css }), layoutFailed)
         let node = self.nodeMut(slot)
         node.gridStyled = false
         node.gridDeclared = false
@@ -2784,7 +2785,8 @@ impl<'a> UiTree<'a> {
     let mut css: usize = 0
     let mut inner: usize = NO_INDEX
     if kind == NodeKind.Text {
-      let made = run self.layout.createText(String.make())
+      // Its text is the node's own (`Node.text`), read through `slotOfCss`.
+      let made = run self.layout.createBorrowedText()
       css = made.index
     } else {
       let made = run self.layout.create(CssStyle.make())
@@ -3957,11 +3959,12 @@ impl<'a> UiTree<'a> {
     } else {
       fail TreeError.WrongKind { index: index, id: self.node(slot).id }
     }
-    let copy = run String.copy(String.view(&value))
-    run Effect.catchAll(self.layout.setText(NodeId { index: target }, move copy), layoutFailed)
+    let wasBlank = Engine.blank(String.view(&self.node(slot).text))
+    let blank = Engine.blank(String.view(&value))
     let node = self.nodeMut(slot)
     node.text = move value
     node.content = node.content + 1
+    run Effect.catchAll(self.layout.borrowedTextChanged(NodeId { index: target }, wasBlank, blank), layoutFailed)
     if (self.letterUsed || self.letterRulesUsed()) && !self.node(slot).isGenerated() { self.restyleLetterOrigins(slot) }
   }
 
@@ -4551,7 +4554,7 @@ impl<'a> UiTree<'a> {
       || !sameNatural(self.provider.naturals.get(key), natural)
     if changed {
       run self.provider.setNatural(key, natural)
-      run Effect.catchAll(
+      run Effect.catch<InvalidNode>(
         self.layout.setNaturalMeasurement(NodeId { index: css }, key),
         ignoreInvalid,
       )
@@ -5411,10 +5414,10 @@ impl<'a> UiTree<'a> {
           let parentCss = self.node(origin).css
           let boxCss = self.node(slot).css
           let textCss = self.node(child).css
-          let mut first = self.layout.nodes.asSlice()[parentCss].firstChild
+          let mut first = self.layout.firstChild(parentCss)
           // ::before follows the ::marker box, which stays first.
           if let Option.Some { value } = self.node(origin).identity() {
-            if value.marker != NONE && first == self.node(value.marker).css { first = self.layout.nodes.asSlice()[first].nextSibling }
+            if value.marker != NONE && first == self.node(value.marker).css { first = self.layout.nextSibling(first) }
           }
           let before = if target == PseudoTarget.Before && first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
           run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
@@ -5429,7 +5432,7 @@ impl<'a> UiTree<'a> {
         }
         let active = self.nodeMut(slot)
         active.generatedSuppressed = false
-        let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+        let child = self.slotOfCssNode(self.layout.firstChild(self.node(slot).css))
         if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
         if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
       } else if old != NONE && style_change.tracks(&self, origin) {
@@ -5483,7 +5486,7 @@ impl<'a> UiTree<'a> {
       slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.Marker)
       let child = run self.createNode(0, id, NodeKind.Text, origin, PseudoTarget.Marker)
       let parentCss = self.node(origin).css
-      let first = self.layout.nodes.asSlice()[parentCss].firstChild
+      let first = self.layout.firstChild(parentCss)
       let before = if first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
       let boxCss = self.node(slot).css
       let textCss = self.node(child).css
@@ -5590,7 +5593,7 @@ impl<'a> UiTree<'a> {
     let piece = run String.copy(String.slice(full, letter.start, letter.end - letter.start))
     run self.fillGenerated(slot, move piece)
     let targetCss = self.node(target).css
-    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end), layoutFailed)
+    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end, String.view(&self.nodes.asSlice()[u32.toUsize(target)].text)), layoutFailed)
     if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
   }
 
@@ -5734,7 +5737,7 @@ impl<'a> UiTree<'a> {
   /// atomic inline or other content comes first.
   fn letterTarget(self: &Self, origin: u32) -> u32 {
     let top = self.node(origin).css
-    let mut at = self.layout.nodes.asSlice()[top].firstChild
+    let mut at = self.layout.firstChild(top)
     while at != NO_INDEX {
       let slot = self.slotOfCssNode(at)
       let mut descend = false
@@ -5756,14 +5759,14 @@ impl<'a> UiTree<'a> {
           }
         }
       }
-      let links = self.layout.nodes.asSlice()
-      if descend && links[at].firstChild != NO_INDEX {
-        at = links[at].firstChild
+      let links = &self.layout
+      if descend && links.firstChild(at) != NO_INDEX {
+        at = links.firstChild(at)
         continue
       }
-      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      while at != top && links.nextSibling(at) == NO_INDEX { at = links.parent(at) }
       if at == top { break }
-      at = links[at].nextSibling
+      at = links.nextSibling(at)
     }
     return NONE
   }
@@ -5784,7 +5787,7 @@ impl<'a> UiTree<'a> {
         let textIdentity = run textNode.identityMut()
         textIdentity.letterBox = NONE
         let textCss = self.node(text).css
-        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0), layoutFailed)
+        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0, String.view(&self.nodes.asSlice()[u32.toUsize(text)].text)), layoutFailed)
       }
     }
     run self.destroy(0, box)
@@ -5819,7 +5822,7 @@ impl<'a> UiTree<'a> {
   /// Sets the text of generated box `slot` to `text`, when it differs.
   pub effect fn fillGenerated(self: &mut Self, slot: u32, text: String) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
-    let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+    let child = self.slotOfCssNode(self.layout.firstChild(self.node(slot).css))
     if child == NONE || self.node(child).kind != NodeKind.Text { return () }
     if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
   }
@@ -5987,14 +5990,14 @@ impl<'a> UiTree<'a> {
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
-        let layoutNodes = self.layout.nodes.asSlice()
-        let mut child = layoutNodes[css].firstChild
+        let layoutNodes = &self.layout
+        let mut child = layoutNodes.firstChild(css)
         while child != NO_INDEX {
           let found = self.slotOfCssNode(child)
           if found != NONE {
             run stack.append(u64.bitOr(u32.toU64(found), flag))
           }
-          child = layoutNodes[child].nextSibling
+          child = layoutNodes.nextSibling(child)
         }
         let items = stack.asMutSlice()
         let mut a = first
@@ -6038,12 +6041,12 @@ impl<'a> UiTree<'a> {
         let watched = self.nodeMut(slot)
         watched.styleWatch = 0
       }
-      let links = self.layout.nodes.asSlice()
-      if links[at].firstChild != NO_INDEX { at = links[at].firstChild
+      let links = &self.layout
+      if links.firstChild(at) != NO_INDEX { at = links.firstChild(at)
         continue }
-      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      while at != top && links.nextSibling(at) == NO_INDEX { at = links.parent(at) }
       if at == top { break }
-      at = links[at].nextSibling
+      at = links.nextSibling(at)
     }
   }
 
@@ -6845,7 +6848,7 @@ impl<'a> UiTree<'a> {
     while true {
       run Effect.catchAll(
         computeFragmented(
-          &self.layout,
+          &LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() },
           &mut self.output,
           &mut self.provider,
           OptionalSize.none(),
@@ -6992,11 +6995,11 @@ impl<'a> UiTree<'a> {
     let moved = self.layout.revision() == self.laidOutRevision
       && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height
-      && (run Engine.repositionScroll(&self.layout, &mut self.output, viewport))
+      && (run Engine.repositionScroll(&LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() }, &mut self.output, viewport))
     if !moved {
       run Effect.catchAll(
         Engine.compute(
-          &self.layout,
+          &LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() },
           &mut self.output,
           &mut self.provider,
           OptionalSize.definite(self.input.width, self.input.height),
@@ -7089,7 +7092,7 @@ impl<'a> UiTree<'a> {
     self.facesDirty = true
     run buildIndex(
       &self.output,
-      self.layout.nodes.length(),
+      self.layout.nodeCount(),
       &mut self.fragmentOf,
       &mut self.nextSourceFragment,
       &mut self.repair.index,
@@ -7124,7 +7127,7 @@ impl<'a> UiTree<'a> {
       carried = run repairIndex(
         &plan,
         &self.output,
-        self.layout.nodes.length(),
+        self.layout.nodeCount(),
         &mut self.fragmentOf,
         &mut self.nextSourceFragment,
         &mut self.repair.index,
@@ -7301,7 +7304,7 @@ impl<'a> UiTree<'a> {
 
     // The fragments a node's paint inputs reach: its own, and those of the text and the
     // boxes the tree made inside it, which paint with its style (see `styleSlot`).
-    let layoutNodes = self.layout.nodes.asSlice()
+    let layoutNodes = &self.layout
     let mut n: usize = 0
     while n < self.repair.nodes.length() {
       let slot = self.repair.nodes.get(n)
@@ -7315,7 +7318,7 @@ impl<'a> UiTree<'a> {
         let last = stack.length() - 1
         let css = stack.get(last)
         stack.truncate(last)
-        if css >= layoutNodes.length { continue }
+        if css >= layoutNodes.nodeCount() { continue }
         let mut fragment = if css < self.fragmentOf.length() { self.fragmentOf.get(css) } else { NO_INDEX }
         while fragment != NO_INDEX && fragment < count {
           if !marks.get(fragment) {
@@ -7325,13 +7328,13 @@ impl<'a> UiTree<'a> {
           fragment = self.nextSourceFragment.get(fragment)
         }
         if text { continue }
-        let mut child = layoutNodes[css].firstChild
+        let mut child = layoutNodes.firstChild(css)
         while child != NO_INDEX {
           let owner = self.slotOfCssNode(child)
           if owner == NONE || self.node(owner).kind == NodeKind.Text {
             run stack.append(child)
           }
-          child = layoutNodes[child].nextSibling
+          child = layoutNodes.nextSibling(child)
         }
       }
     }
