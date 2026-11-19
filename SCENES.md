@@ -37,5 +37,5 @@ costs when the app does not do that work.
 
 The Silk apps report the tree's node and fragment counts (`silk_first_frame` in the results); on
 `feed` React, Loom and direct all have 61,176 nodes and 67,425 to 67,456 fragments. The Rust apps
-build the same structure in their own elements (LOG.md lists where they cannot). Screenshots for
-checking by eye: `tools/shots.sh` (Electron writes one at first paint with `XB_SHOT=<png>`).
+build the same structure in their own elements (LOG.md lists where they cannot). For checking by eye, Electron writes a
+screenshot at first paint with `XB_SHOT=<png>`.

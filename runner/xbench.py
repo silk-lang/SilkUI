@@ -352,6 +352,22 @@ def versions():
                 out[app] = json.load(open(f))
             except Exception:
                 out[app] = open(f).read().strip()
+    # Apps with no build script record: the framework's own version or commit.
+    try:
+        out.setdefault("electron", {"electron": json.load(open(os.path.join(XB, "apps/electron/node_modules/electron/package.json")))["version"]})
+    except Exception:
+        pass
+    for app, repo in (("rune", "vendor/rune"), ("gpui", "vendor/zed")):
+        rev = git_rev(os.path.join(XB, "apps", app, repo))
+        if rev:
+            out.setdefault(app, {app: rev})
+    try:
+        lock = open(os.path.join(XB, "apps/ferroui/Cargo.lock")).read()
+        m = re.search(r'name = "ferroui-view"\nversion = "([^"]+)"', lock)
+        if m:
+            out.setdefault("ferroui", {"ferroui": m.group(1)})
+    except Exception:
+        pass
     return out
 
 

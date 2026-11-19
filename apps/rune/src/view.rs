@@ -111,7 +111,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
                 .children(m.notes.iter().map(|spans| inline(spans, sans(10.0, 400.0, 13.0), rgb(c::NOTES), false))))
     } else {
         col().key("content").gap(12.0).px(24.0).py(16.0)
-            .on_layout(|s: &mut State, r: [f32; 4]| s.content_h = r[3])
+            .on_layout_tx(|s: &mut State, r: [f32; 4], tx| { s.content_h = r[3]; tx.live_only(); })
             .children(m.items.iter().zip(&m.versions).map(|(i, &v)| memo(format!("i{}", i.id), v, || item(i, &s.pictures))))
     };
     col().w_full().h_full().fill(rgb(c::BG))
@@ -119,6 +119,6 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
             .border_sides([0.0, 0.0, 1.0, 0.0], rgb(c::LINE)).border_layout()
             .child(label(&m.title, sans(13.0, 700.0, 20.0), rgb(c::BAR_TEXT))))
         .child(col().key("scroller").grow(1.0).min_h(0.0).scroll(ScrollSpec { stick_bottom: false })
-            .on_layout(|s: &mut State, r: [f32; 4]| s.view_h = r[3])
+            .on_layout_tx(|s: &mut State, r: [f32; 4], tx| { s.view_h = r[3]; tx.live_only(); })
             .child(content))
 }

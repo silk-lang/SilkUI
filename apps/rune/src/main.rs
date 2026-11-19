@@ -64,10 +64,15 @@ fn windowless() {
     let mut rt = Runtime::with_text(state, view::view, (WIDTH, HEIGHT), Env::new(true, 2.0), text);
     const DT: f64 = 1.0 / 120.0;
     let mut frame: u64 = 0;
+    let mut more = true;
     while !rt.state.scene.done() {
         let now = frame as f64 * DT * 1000.0;
-        rt.update_if(|s, tx| step(s, now, true, tx));
-        rt.frame(if frame == 0 { 0.0 } else { DT });
+        let changed = rt.update_if(|s, tx| step(s, now, true, tx));
+        // As Rune's window host does: a frame only when state changed, the script asks for
+        // frames, or motion is still running. Idle steps draw nothing.
+        if frame < 3 || changed || more || rt.state.scene.wants_frames() {
+            more = rt.frame(if frame == 0 { 0.0 } else { DT });
+        }
         frame += 1;
         if frame > 2_000_000 { break; }
     }
