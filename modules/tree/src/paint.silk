@@ -60,6 +60,7 @@ import depth_sort
 import depth_sort { Polygon }
 import table_borders
 import paint_css { Effects, TextShadow, Clip }
+import paint_css
 import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
 import ui_scene.path_cache { PathCache }
@@ -419,6 +420,23 @@ fn hasBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
   }
 }
 
+/// Whether node `slot` draws a `border-image`.
+fn hasBorderImage(p: &Painter<'_, '_>, slot: u32) -> bool {
+  if slot == NONE {
+    return false
+  }
+  return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+    Option<&Effects>.Some { value } => value.borderImage.drawn()
+    Option<&Effects>.None => false
+  }
+}
+
+/// The border widths of a box with computed style `c`, zero under `border-style: none`.
+pub fn usedBorder(c: &Computed) -> Insets<f32> {
+  if c.paint.borderStyle == StyleBorder.None { return Insets<f32>.zero() }
+  return c.paint.border
+}
+
 /// Whether node `slot` has a `background-blend-mode` layer.
 fn blendsBackgrounds(p: &Painter<'_, '_>, slot: u32) -> bool {
   return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
@@ -483,16 +501,7 @@ effect fn paintTextClip(
   match &taken {
     Option<Box<Effects>>.Some { value } => {
       let effects = &value.get()[0]
-      run paint_effects.paintLayers(
-        &mut p,
-        effects,
-        &effects.backgrounds,
-        f,
-        radii,
-        mask,
-        GeometryBox.Padding,
-        true,
-      )
+      run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, true, c.nearest, backgroundScope(c), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
     }
     Option<Box<Effects>>.None => {}
   }
@@ -516,6 +525,42 @@ effect fn paintGlyphMask(p: &mut Painter<'_, '_>, index: usize, mask: ContentMas
     }
     child = f.nextSibling
   }
+}
+
+/// Which background layers a box paints with its border: a scroll container leaves its `local`
+/// ones to [`paintLocalBackgrounds`].
+fn backgroundScope(c: &Computed) -> u8 {
+  return if layers.scroller(c) { paint_effects.SCOPE_OUTER } else { paint_effects.SCOPE_ALL }
+}
+
+/// The `background-attachment: local` layers of scroll container `slot`, in its scroll group
+/// under its content, placed on its padding box grown to all it scrolls over.
+effect fn paintLocalBackgrounds(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !hasBackgrounds(&p.*, slot) { return }
+  let taken = paint_effects.takeEffects(&mut p, slot)
+  match &taken {
+    Option<Box<Effects>>.Some { value } => {
+      let effects = &value.get()[0]
+      if effects.backgrounds.attached(paint_css.ATTACH_LOCAL) {
+        let port = paddingBox(f)
+        let over = f.scrollableOverflow
+        let ox = f.worldLocation.x + over.x
+        let oy = f.worldLocation.y + over.y
+        let local = Rect<f32>.new(
+          f32.min(port.xMin, ox),
+          f32.min(port.yMin, oy),
+          f32.max(port.xMax, ox + over.width),
+          f32.max(port.yMax, oy + over.height),
+        )
+        let radii = Radii.zero()
+        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest, paint_effects.SCOPE_LOCAL, local)
+      }
+    }
+    Option<Box<Effects>>.None => {}
+  }
+  paint_effects.putEffects(&mut p, slot, move taken)
 }
 
 effect fn decorate(
@@ -565,7 +610,8 @@ effect fn decorate(
     }
   }
   let background = backgroundOf(c.paint.background)
-  let bordered = (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
+  let imageBorder = hasBorderImage(&p.*, slot)
+  let bordered = !imageBorder && (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
     || widths.left > 0.0)
     && c.paint.borderColor.a > 0.0
   let images = hasBackgrounds(&p.*, slot)
@@ -600,16 +646,7 @@ effect fn decorate(
     match &taken {
       Option<Box<Effects>>.Some { value } => {
         let effects = &value.get()[0]
-        run paint_effects.paintLayers(
-          &mut p,
-          effects,
-          &effects.backgrounds,
-          f,
-          radii,
-          mask,
-          GeometryBox.Padding,
-          false,
-        )
+        run paint_effects.paintLayers(&mut p, effects, &effects.backgrounds, f, radii, mask, GeometryBox.Padding, false, c.nearest, backgroundScope(c), Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
       }
       Option<Box<Effects>>.None => {}
     }
@@ -639,6 +676,18 @@ effect fn decorate(
       }
     }
     drop run p.scene.quad(quad)
+  }
+  if imageBorder {
+    // In place of the border's style, over the backgrounds; the widths stay as laid out.
+    let taken = paint_effects.takeEffects(&mut p, slot)
+    match &taken {
+      Option<Box<Effects>>.Some { value } => {
+        let effects = &value.get()[0]
+        run paint_effects.paintImageBorder(&mut p, effects, &effects.borderImage, f, usedBorder(c), mask, c.nearest)
+      }
+      Option<Box<Effects>>.None => {}
+    }
+    paint_effects.putEffects(&mut p, slot, move taken)
   }
   if c.paint.hasShadow && c.paint.shadow.inset && c.paint.shadow.color.a > 0.0 {
     // An inset shadow lies inside the padding box, with its radii.
@@ -1638,7 +1687,7 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
               opacity: 1.0,
               cornerRadii: corners,
               grayscale: false,
-              nearest: false,
+              nearest: c.nearest,
             },
           )
         }
@@ -2032,6 +2081,11 @@ fn ownInk(
   }
   if c.outline.drawn() {
     reach = f32.max(reach, 2.0 + c.outline.offset + c.outline.width)
+  }
+  if let Option<&Effects>.Some { value } = node.paintEffects() {
+    let widths = usedBorder(&c)
+    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.borderImage, widths))
+    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.maskBorder, widths))
   }
   return grow(box, reach)
 }
@@ -2880,6 +2934,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     let saved = p.cull
     if scrolled && open {
       inner = run openScroller(&mut p, slot, &c, &f, inner)
+      if c.text.visible && !f.nonpainting { run paintLocalBackgrounds(&mut p, slot, &c, &f, inner) }
     }
     if !scrolled || open {
       if input {

@@ -34,6 +34,8 @@ import svg_css.effect_values {
   Repeat,
   Composite,
   MaskMode,
+  Border,
+  BorderMeasure,
 }
 import svg_css.transform_values { Position, PositionAxis, Edge }
 import svg_css.dimensions { Dimension, Unit }
@@ -81,6 +83,94 @@ pub fn handles(property: CssProperty) -> bool {
     || property == CssProperty.ShapeMargin
     || isMask(property)
     || isBackgroundLayer(property)
+    || isMaskBorder(property)
+    || maskBorderOf(property) != property
+}
+
+fn isMaskBorder(property: CssProperty) -> bool {
+  return property == CssProperty.MaskBorder || property == CssProperty.MaskBorderSource
+    || property == CssProperty.MaskBorderMode
+    || property == CssProperty.MaskBorderSlice
+    || property == CssProperty.MaskBorderWidth
+    || property == CssProperty.MaskBorderOutset
+    || property == CssProperty.MaskBorderRepeat
+}
+
+/// The `mask-border` property whose grammar a `border-image` one shares, or `property` itself.
+fn maskBorderOf(property: CssProperty) -> CssProperty {
+  return if property == CssProperty.BorderImage {
+    CssProperty.MaskBorder
+  } else if property == CssProperty.BorderImageSource {
+    CssProperty.MaskBorderSource
+  } else if property == CssProperty.BorderImageSlice {
+    CssProperty.MaskBorderSlice
+  } else if property == CssProperty.BorderImageWidth {
+    CssProperty.MaskBorderWidth
+  } else if property == CssProperty.BorderImageOutset {
+    CssProperty.MaskBorderOutset
+  } else if property == CssProperty.BorderImageRepeat {
+    CssProperty.MaskBorderRepeat
+  } else {
+    property
+  }
+}
+
+/// Whether `image` is or holds a `url()` image.
+pub fn usesUrl(image: &Image) -> bool {
+  return match &image.* {
+    Image.Url { .. } => true
+    Image.CrossFade { layers } => {
+      let mut i: usize = 0
+      while i < layers.length() {
+        if usesUrl(&layers.asSlice()[i].image) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    Image.Filtered { source, .. } => source.length() > 0 && usesUrl(&source.asSlice()[0])
+    _ => false
+  }
+}
+
+/// `border-image` or `mask-border`, with its longhands merged: an image cut in nine by `slice`
+/// and drawn over the border area grown by `outset`. `set` is false until one is declared.
+pub struct ImageBorder {
+  pub set: bool,
+  pub image: Image,
+  pub mode: MaskMode,
+  /// Numbers are image pixels, percentages of the image's size.
+  pub slice: [ExprId; 4],
+  pub fill: bool,
+  /// Numbers are multiples of the border width; `auto` takes the slice.
+  pub width: [BorderMeasure; 4],
+  /// Numbers are multiples of the border width.
+  pub outset: [ExprId; 4],
+  pub repeat: RepeatPair,
+}
+
+impl ImageBorder {
+  pub fn make() -> ImageBorder {
+    let z = ExprId { index: 0 }
+    return ImageBorder {
+      set: false,
+      image: Image.None,
+      mode: MaskMode.Alpha,
+      slice: [z; 4],
+      fill: false,
+      width: [BorderMeasure.Auto; 4],
+      outset: [z; 4],
+      repeat: RepeatPair { x: Repeat.Stretch, y: Repeat.Stretch },
+    }
+  }
+
+  /// Whether it has an image to draw.
+  pub fn drawn(self: &Self) -> bool {
+    if !self.set { return false }
+    return match &self.image {
+      Image.None => false
+      _ => true
+    }
+  }
 }
 
 /// Whether `apply` reads `property`: the ones it `handles`, `isolation` and `will-change`
@@ -118,6 +208,7 @@ fn isBackgroundLayer(property: CssProperty) -> bool {
     || property == CssProperty.BackgroundPositionX
     || property == CssProperty.BackgroundPositionY
     || property == CssProperty.BackgroundBlendMode
+    || property == CssProperty.BackgroundAttachment
 }
 
 /// One computed `text-shadow`, in CSS pixels.
@@ -146,7 +237,16 @@ pub struct Layers {
   pub modes: List<MaskMode>,
   /// `background-blend-mode`, one `BLEND_*` a layer.
   pub blends: List<u8>,
+  /// `background-attachment`, one `ATTACH_*` a layer.
+  pub attachments: List<u8>,
 }
+
+/// `background-attachment: scroll`: the layer stays with the box, not its scrolled content.
+pub const ATTACH_SCROLL: u8 = 0
+/// `background-attachment: fixed`: the layer is placed on the viewport and stays there.
+pub const ATTACH_FIXED: u8 = 1
+/// `background-attachment: local`: the layer scrolls with the box's content.
+pub const ATTACH_LOCAL: u8 = 2
 
 impl Layers {
   pub fn make() -> Layers {
@@ -160,6 +260,7 @@ impl Layers {
       composites: List<Composite>.make(),
       modes: List<MaskMode>.make(),
       blends: List<u8>.make(),
+      attachments: List<u8>.make(),
     }
   }
 
@@ -181,6 +282,12 @@ impl Layers {
         Image.Url { .. } => {
           return true
         }
+        Image.CrossFade { .. } => {
+          return true
+        }
+        Image.Filtered { .. } => {
+          return true
+        }
         _ => {}
       }
       i = i + 1
@@ -193,7 +300,7 @@ impl Layers {
     let images = self.images.asSlice()
     let mut i: usize = 0
     while i < images.length {
-      if let Image.Url { .. } = &images[i] {
+      if usesUrl(&images[i]) {
         return true
       }
       i = i + 1
@@ -278,6 +385,26 @@ impl Layers {
     return false
   }
 
+  pub fn mode(self: &Self, layer: usize) -> MaskMode {
+    let n = self.modes.length()
+    return if n == 0 { MaskMode.MatchSource } else { self.modes.get(layer % n) }
+  }
+
+  pub fn attachment(self: &Self, layer: usize) -> u8 {
+    let n = self.attachments.length()
+    return if n == 0 { ATTACH_SCROLL } else { self.attachments.get(layer % n) }
+  }
+
+  /// Whether any layer has `attachment`.
+  pub fn attached(self: &Self, attachment: u8) -> bool {
+    let mut i: usize = 0
+    while i < self.attachments.length() {
+      if self.attachments.get(i) == attachment { return true }
+      i = i + 1
+    }
+    return false
+  }
+
   pub fn composite(self: &Self, layer: usize) -> Composite {
     let n = self.composites.length()
     return if n == 0 { Composite.Add } else { self.composites.get(layer % n) }
@@ -314,6 +441,10 @@ pub struct Effects {
   pub shapeBox: bool,
   /// `shape-margin`, a length or percentage in `numerics`.
   pub shapeMargin: Option<ExprId>,
+  /// `border-image`, drawn in place of the border's style.
+  pub borderImage: ImageBorder,
+  /// `mask-border`, a mask over the border area besides the mask layers.
+  pub maskBorder: ImageBorder,
   /// Zero or one `offset-path` basic shape or `path()`; `transform.Offset` holds the rest.
   pub offset: List<ClipSource>,
   /// Same declarations at the same font size and color hash alike.
@@ -339,6 +470,8 @@ impl Effects {
       shape: List<ClipSource>.make(),
       shapeBox: false,
       shapeMargin: Option<ExprId>.None,
+      borderImage: ImageBorder.make(),
+      maskBorder: ImageBorder.make(),
       offset: List<ClipSource>.make(),
       hash: 0,
     }
@@ -347,6 +480,7 @@ impl Effects {
   /// Whether paint needs an isolated layer for this node's own effects.
   pub fn layered(self: &Self) -> bool {
     return self.filters.length() != 0 || self.clip.length() != 0 || self.masks.painted()
+      || self.maskBorder.drawn()
       || self.blend != BLEND_NORMAL
       || self.isolate
   }
@@ -607,6 +741,19 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     applyWillChange(&mut effects.*, &source, &mut cursor)
     return
   }
+  if property == CssProperty.MaskBorderMode {
+    let luminance = cursor.ident(&source, b"luminance")
+    if (luminance || cursor.ident(&source, b"alpha")) && cursor.done(&source) {
+      if !effects.maskBorder.set {
+        let zero = run dimensions.literal(&mut effects.numerics, 0.0, Unit.Number)
+        effects.maskBorder.set = true
+        effects.maskBorder.slice = [zero; 4]
+        effects.maskBorder.outset = [zero; 4]
+      }
+      effects.maskBorder.mode = if luminance { MaskMode.Luminance } else { MaskMode.Alpha }
+    }
+    return
+  }
   if property == CssProperty.TextShadow {
     run applyShadows(&mut effects.*, &source, &mut cursor, &context, &colorContext)
     return
@@ -617,6 +764,28 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
   }
   if property == CssProperty.BackgroundClip {
     run applyClips(&mut effects.*, &source, &mut cursor)
+    return
+  }
+  if property == CssProperty.BackgroundAttachment {
+    let mut attachments = List<u8>.make()
+    while true {
+      let attachment = if cursor.ident(&source, b"scroll") {
+        ATTACH_SCROLL
+      } else if cursor.ident(&source, b"fixed") {
+        ATTACH_FIXED
+      } else if cursor.ident(&source, b"local") {
+        ATTACH_LOCAL
+      } else {
+        return
+      }
+      run attachments.append(attachment)
+      if !cursor.comma(&source) {
+        break
+      }
+    }
+    if cursor.done(&source) {
+      effects.backgrounds.attachments = move attachments
+    }
     return
   }
   if property == CssProperty.BackgroundBlendMode {
@@ -658,7 +827,7 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
   } else if property == CssProperty.BackgroundOrigin {
     CssProperty.MaskOrigin
   } else {
-    property
+    maskBorderOf(property)
   }
   let value = match run effect_values.parse(&mut effects.numerics, parsed, &source, &mut cursor, false) {
     Option<EffectValue>.Some { value } => move value
@@ -687,16 +856,91 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     }
     EffectValue.Masks { layers, resetBorder } => {
       drop resetBorder
+      // The `mask` shorthand resets `mask-border` too.
+      if property == CssProperty.Mask { effects.maskBorder = ImageBorder.make() }
       if isBackgroundLayer(property) {
         run assignLayers(&mut effects.backgrounds, property, move layers)
       } else {
         run assignLayers(&mut effects.masks, property, move layers)
       }
     }
+    EffectValue.MaskBorder { border } => {
+      run assignBorder(&mut effects.*, property, move border)
+    }
     EffectValue other => {
       drop other
     }
   }
+}
+
+/// Merges `border` (parsed for `property`, a `border-image` or `mask-border` property) into the
+/// one the node keeps: a shorthand sets every part, a longhand its own.
+effect fn assignBorder(effects: &mut Effects, property: CssProperty, border: Border) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let image = maskBorderOf(property) != property
+  let field = maskBorderOf(property)
+  let mut parsed = move border
+  let zero = run dimensions.literal(&mut effects.numerics, 0.0, Unit.Number)
+  let one = run dimensions.literal(&mut effects.numerics, 1.0, Unit.Number)
+  let whole = run dimensions.literal(&mut effects.numerics, 100.0, Unit.Percent)
+  let target = if image { &mut effects.borderImage } else { &mut effects.maskBorder }
+  if !target.set {
+    // The initial values: border-image slices at 100% one border width wide; mask-border at 0.
+    target.set = true
+    target.slice = if image { [whole; 4] } else { [zero; 4] }
+    target.width = if image { [BorderMeasure.Numeric { value: one }; 4] } else { [BorderMeasure.Auto; 4] }
+    target.outset = [zero; 4]
+  }
+  if field == CssProperty.MaskBorder {
+    target.image = Intrinsic.replace(parsed.image, Image.None)
+    target.mode = parsed.mode
+    target.repeat = parsed.repeat
+    target.fill = parsed.fill
+    target.outset = parsed.outset
+    // The shorthand's parser fills what it leaves out with mask-border's initial values.
+    let defaultSlice = allZero(&effects.numerics, &parsed.slice)
+    target.slice = if image && defaultSlice { [whole; 4] } else { parsed.slice }
+    let defaultWidth = allAuto(&parsed.width)
+    target.width = if image && defaultWidth { [BorderMeasure.Numeric { value: one }; 4] } else { parsed.width }
+  } else if field == CssProperty.MaskBorderSource {
+    target.image = Intrinsic.replace(parsed.image, Image.None)
+  } else if field == CssProperty.MaskBorderSlice {
+    target.slice = parsed.slice
+    target.fill = parsed.fill
+  } else if field == CssProperty.MaskBorderWidth {
+    target.width = parsed.width
+  } else if field == CssProperty.MaskBorderOutset {
+    target.outset = parsed.outset
+  } else if field == CssProperty.MaskBorderRepeat {
+    target.repeat = parsed.repeat
+  } else if field == CssProperty.MaskBorderMode {
+    target.mode = parsed.mode
+  }
+}
+
+fn allZero(store: &Store<'_>, values: &[ExprId; 4]) -> bool {
+  let mut i: usize = 0
+  while i < 4 {
+    match dimensions.numberLiteral(store, values[i]) {
+      Option<f64>.Some { value } => { if value != 0.0 { return false } }
+      Option<f64>.None => { return false }
+    }
+    i = i + 1
+  }
+  return true
+}
+
+fn allAuto(values: &[BorderMeasure; 4]) -> bool {
+  let mut i: usize = 0
+  while i < 4 {
+    match &values[i] {
+      BorderMeasure.Auto => {}
+      _ => { return false }
+    }
+    i = i + 1
+  }
+  return true
 }
 
 /// `shape-outside` takes `clip-path`'s shapes and boxes, with the margin box as the default
