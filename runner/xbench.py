@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Runs the xbench scenes and appends one JSON record per run to results/<suite>.jsonl.
+
+  xbench.py run --suite cpu --apps electron,silk-react --scenes feed,wall --runs 3
+  xbench.py start --suite gpu --apps electron,silk-react --runs 10     # start-up only: cold + warm
+  xbench.py run --suite gpu --uncapped ...                             # the GPU suite (a Mac)
+
+What it measures (PROTOCOL.md has the app side, METRICS.md the definitions):
+- start: process spawn to the app's "XB first-paint" line. The first launch of each app after its
+  files were dropped from the page cache is "cold"; the launches after it are "warm".
+- memory at each "XB mark": the app's process tree is stopped (SIGSTOP), measured, continued.
+  macOS: `footprint` (phys_footprint, what Activity Monitor shows) summed over the tree; Linux: PSS
+  summed over the tree, RSS beside it.
+- each driver ("XB begin"/"XB end"): wall time and CPU time (all threads, all processes) of its
+  frames, and the app's own frame intervals when its clock is real.
+- each idle window ("XB idle-begin"/"XB idle-end"): CPU use, in percent of one core.
+"""
+import argparse, datetime, json, os, platform, re, signal, socket, statistics, subprocess, sys, threading, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from apps import APP_TABLE, XB, MAC  # noqa: E402
+
+TICK = os.sysconf("SC_CLK_TCK") if not MAC else 100
+
+
+# ---------- process tree, CPU and memory ----------
+
+def children_map():
+    if MAC:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True).stdout
+        pairs = [tuple(map(int, l.split())) for l in out.splitlines() if l.strip()]
+    else:
+        pairs = []
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    with open(f"/proc/{d}/stat") as f:
+                        s = f.read()
+                    pairs.append((int(d), int(s[s.rindex(")") + 2:].split()[1])))
+                except OSError:
+                    pass
+    kids = {}
+    for pid, ppid in pairs:
+        kids.setdefault(ppid, []).append(pid)
+    return kids
+
+
+def tree(root):
+    kids = children_map()
+    out, todo = [], [root]
+    while todo:
+        p = todo.pop()
+        out.append(p)
+        todo += kids.get(p, [])
+    return out
+
+
+def cpu_seconds(pids):
+    """User + system CPU seconds of the processes (all their threads)."""
+    total = 0.0
+    if MAC:
+        out = subprocess.run(["ps", "-o", "time=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
+        for t in out.split():
+            parts = [float(x) for x in t.replace("-", ":").split(":")]
+            secs = 0.0
+            for x in parts:
+                secs = secs * 60 + x
+            total += secs
+        return total
+    for p in pids:
+        try:
+            with open(f"/proc/{p}/stat") as f:
+                s = f.read()
+            fields = s[s.rindex(")") + 2:].split()
+            total += (int(fields[11]) + int(fields[12])) / TICK
+        except OSError:
+            pass
+    return total
+
+
+def memory(pids):
+    """Memory of the tree in bytes: footprint on macOS, PSS (and RSS) on Linux."""
+    if MAC:
+        args = ["footprint", "-f", "bytes", "-j", "/dev/stdout"]
+        for p in pids:
+            args += ["-p", str(p)]
+        r = subprocess.run(args, capture_output=True, text=True)
+        try:
+            j = json.loads(r.stdout)
+            return {"footprint": j.get("total footprint"), "processes": len(j.get("processes", []))}
+        except Exception:
+            rss = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
+            return {"rss": sum(int(x) for x in rss.split()) * 1024, "processes": len(pids)}
+    pss = rss = n = 0
+    for p in pids:
+        try:
+            with open(f"/proc/{p}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith("Pss:"):
+                        pss += int(line.split()[1]) * 1024
+                    elif line.startswith("Rss:"):
+                        rss += int(line.split()[1]) * 1024
+            n += 1
+        except OSError:
+            pass
+    return {"pss": pss, "rss": rss, "processes": n}
+
+
+def app_pids(root, launch):
+    """The app's processes: the tree under the spawned process, without the X server or the
+    xvfb-run shell (they are the display's, not the app's)."""
+    pids = tree(root)
+    out = []
+    for p in pids:
+        try:
+            comm = open(f"/proc/{p}/comm").read().strip() if not MAC else ""
+        except OSError:
+            continue
+        if comm in ("Xvfb", "xvfb-run", "xauth", "sh", "bash"):
+            continue
+        out.append(p)
+    return out
+
+
+def signal_tree(pids, sig):
+    for p in pids:
+        try:
+            os.kill(p, sig)
+        except OSError:
+            pass
+
+
+# ---------- cold start ----------
+
+def evict(paths):
+    """Drops the app's files from the page cache (Linux), so the next launch reads them from disk.
+    macOS has no unprivileged way: `sudo -n purge` if allowed, else the launch is not cold."""
+    if MAC:
+        return subprocess.run(["sudo", "-n", "purge"], capture_output=True).returncode == 0
+    files = []
+    for root in paths:
+        if os.path.isdir(root):
+            for d, _, names in os.walk(root):
+                files += [os.path.join(d, n) for n in names]
+        elif os.path.isfile(root):
+            files.append(root)
+    done = 0
+    for path in files:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(fd)
+            done += 1
+        except OSError:
+            pass
+    return done > 0
+
+
+def mapped_files(pids):
+    """Every file the processes map (shared libraries, fonts, the binary): evicted for cold runs."""
+    found = set()
+    if MAC:
+        return found
+    for p in pids:
+        try:
+            for line in open(f"/proc/{p}/maps"):
+                parts = line.split(None, 5)
+                if len(parts) == 6 and parts[5].startswith("/") and not parts[5].startswith(("/dev", "/proc", "/memfd")):
+                    found.add(parts[5].strip().split(" (deleted)")[0])
+        except OSError:
+            pass
+    return found
+
+
+# ---------- one run ----------
+
+def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files):
+    launch = APP_TABLE[app](scene, suite, uncapped)
+    env = dict(os.environ)
+    for k in ("SILK_UI_UNCAPPED", "XB_UNCAPPED", "XB_WINDOWLESS", "SILK_UI_BENCH", "SILK_UI_HEADLESS", "NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
+        env.pop(k, None)
+    env.update(launch.env)
+    if kind == "cold":
+        cold_ok = evict(list(launch.files) + sorted(extra_files))
+    else:
+        cold_ok = None
+    lines = []
+    record = {
+        "app": app, "scene": scene, "suite": suite, "uncapped": uncapped, "kind": kind,
+        "cache_dropped": cold_ok, "marks": {}, "drivers": {}, "idle": {}, "notes": [],
+    }
+    t0 = time.monotonic()
+    proc = subprocess.Popen(launch.cmd, cwd=launch.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    events = []
+    lock = threading.Condition()
+
+    def reader(stream, name):
+        for raw in iter(stream.readline, b""):
+            now = time.monotonic()
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            with lock:
+                events.append((now, name, line))
+                lock.notify()
+
+    threads = [threading.Thread(target=reader, args=(proc.stdout, "out"), daemon=True),
+               threading.Thread(target=reader, args=(proc.stderr, "err"), daemon=True)]
+    for t in threads:
+        t.start()
+    state = {"begin": {}, "idle": {}}
+    seen = 0
+    deadline = t0 + timeout
+    files_seen = set()
+    done = False
+    while not done:
+        with lock:
+            while seen >= len(events) and proc.poll() is None and time.monotonic() < deadline:
+                lock.wait(0.2)
+            batch = events[seen:]
+            seen = len(events)
+        if not batch and (proc.poll() is not None or time.monotonic() >= deadline):
+            if proc.poll() is None:
+                record["notes"].append("timeout")
+            else:
+                record["notes"].append(f"exited {proc.returncode} before done")
+            break
+        for now, stream, line in batch:
+            lines.append(line)
+            at = line.find("XB ")
+            if at < 0:
+                bench = re.search(r"bench: first frame start-to-layout-ms=([\d.e-]+) layout-ms=([\d.e-]+) paint-ms=([\d.e-]+) nodes=(\d+) fragments=(\d+)", line)
+                if bench:
+                    record["silk_first_frame"] = {"start_to_layout_ms": float(bench.group(1)), "layout_ms": float(bench.group(2)),
+                                                  "paint_ms": float(bench.group(3)), "nodes": int(bench.group(4)), "fragments": int(bench.group(5))}
+                continue
+            words = line[at + 3:].split(" ")
+            ev = words[0]
+            if ev == "first-paint":
+                record["first_paint_ms"] = (now - t0) * 1000
+                pids = app_pids(proc.pid, launch)
+                files_seen |= mapped_files(pids)
+                if start_only:
+                    record["marks"]["first-paint"] = measure(pids)
+                    done = True
+                    break
+            elif ev == "mark":
+                pids = app_pids(proc.pid, launch)
+                signal_tree(pids, signal.SIGSTOP)
+                try:
+                    record["marks"][words[1]] = measure(pids)
+                finally:
+                    signal_tree(pids, signal.SIGCONT)
+            elif ev == "begin":
+                state["begin"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)))
+            elif ev == "end":
+                name, frames = words[1], int(words[2])
+                b = state["begin"].pop(name, None)
+                if b:
+                    wall = (now - b[0]) * 1000
+                    cpu = (cpu_seconds(app_pids(proc.pid, launch)) - b[1]) * 1000
+                    record["drivers"].setdefault(name, {}).update({
+                        "frames": frames, "wall_ms": wall, "cpu_ms": cpu,
+                        "frame_ms": wall / max(frames, 1), "cpu_ms_per_frame": cpu / max(frames, 1),
+                    })
+            elif ev == "frames":
+                if not launch.fake_clock and len(words) > 2 and words[2]:
+                    gaps = [float(x) for x in words[2].split(",") if x]
+                    record["drivers"].setdefault(words[1], {})["intervals"] = summarize(gaps)
+            elif ev == "idle-begin":
+                state["idle"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)))
+            elif ev == "idle-end":
+                b = state["idle"].pop(words[1], None)
+                if b:
+                    secs = now - b[0]
+                    cpu = cpu_seconds(app_pids(proc.pid, launch)) - b[1]
+                    record["idle"][words[1]] = {"seconds": secs, "cpu_pct": 100 * cpu / secs if secs > 0 else None,
+                                                "meaningful": not launch.fake_clock}
+            elif ev == "done":
+                done = True
+                break
+    record["wall_s"] = time.monotonic() - t0
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait()
+    errors = [l for l in lines if "XB " not in l and re.search(r"error|panic|failed|exception", l, re.I) and "dbus" not in l]
+    if errors:
+        record["notes"] += errors[:5]
+    return record, files_seen
+
+
+def measure(pids):
+    m = memory(pids)
+    m["mb"] = round((m.get("footprint") or m.get("pss") or m.get("rss") or 0) / 1048576, 1)
+    return m
+
+
+def summarize(gaps):
+    if not gaps:
+        return None
+    s = sorted(gaps)
+    pick = lambda q: s[min(len(s) - 1, int(q * len(s)))]
+    return {"n": len(s), "mean": statistics.fmean(s), "p50": pick(0.5), "p95": pick(0.95), "p99": pick(0.99), "max": s[-1],
+            "over_8_3": sum(1 for g in s if g > 8.34), "over_16_7": sum(1 for g in s if g > 16.7)}
+
+
+# ---------- provenance ----------
+
+def git_rev(path):
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() or None
+
+
+def machine():
+    name = socket.gethostname().split(".")[0]
+    if MAC:
+        chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
+    else:
+        chip = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.machine())
+    return {"host": os.environ.get("XB_MACHINE", name), "os": platform.platform(), "cpu": chip, "cores": os.cpu_count()}
+
+
+def versions():
+    """What each app was built from: apps/<app>/out/VERSION (written by its build script)."""
+    out = {}
+    for app in APP_TABLE:
+        f = os.path.join(XB, "apps", app, "VERSION")
+        if os.path.exists(f):
+            try:
+                out[app] = json.load(open(f))
+            except Exception:
+                out[app] = open(f).read().strip()
+    return out
+
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("what", choices=["run", "start"])
+    ap.add_argument("--suite", choices=["cpu", "gpu"], required=True)
+    ap.add_argument("--apps", default=",".join(APP_TABLE))
+    ap.add_argument("--scenes", default="feed,wall,stream,churn")
+    ap.add_argument("--runs", type=int, default=1)
+    ap.add_argument("--uncapped", action="store_true", help="gpu suite: no vsync (the cpu suite never has one)")
+    ap.add_argument("--cold", type=int, default=1, help="how many of the first runs start cold")
+    ap.add_argument("--timeout", type=float, default=600)
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--label", default="", help="free text stored with every record (what changed)")
+    a = ap.parse_args()
+    apps = [x for x in a.apps.split(",") if x]
+    scenes = ["feed"] if a.what == "start" and a.scenes == "feed,wall,stream,churn" else a.scenes.split(",")
+    out = a.out or os.path.join(XB, "results", f"{a.suite}.jsonl")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    session = {
+        "session": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "machine": machine(), "xbench": git_rev(XB), "versions": versions(), "label": a.label,
+    }
+    # The files each app mapped in earlier runs (libraries, fonts): evicted too for cold starts.
+    os.makedirs(os.path.join(XB, "results"), exist_ok=True)
+    cache = os.path.join(XB, "results", "mapped-files.json")
+    try:
+        extra = {k: set(v) for k, v in json.load(open(cache)).items()}
+    except Exception:
+        extra = {}
+    for scene in scenes:
+        for r in range(a.runs):
+            # Interleaved: every app once per round, so drift (thermal, other load) hits all alike.
+            order = apps if r % 2 == 0 else apps[::-1]
+            for app in order:
+                kind = "cold" if r < a.cold else "warm"
+                rec, files = run_once(app, scene, a.suite, a.uncapped or a.suite == "cpu", kind, a.timeout,
+                                      a.what == "start", extra.get(app, set()))
+                extra.setdefault(app, set()).update(files)
+                json.dump({k: sorted(v) for k, v in extra.items()}, open(cache, "w"))
+                rec.update(session)
+                rec["run"] = r
+                rec["mode"] = a.what
+                with open(out, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                fp = rec.get("first_paint_ms")
+                drv = " ".join(f"{k}={v.get('frame_ms', 0):.2f}ms/f" for k, v in rec["drivers"].items())
+                mem = " ".join(f"{k}={v['mb']}" for k, v in rec["marks"].items())
+                print(f"{app:12s} {scene:8s} {kind} first-paint={fp and round(fp)}ms {drv} mem[{mem}] {' '.join(rec['notes'])[:120]}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
