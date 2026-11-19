@@ -21,7 +21,7 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest, milliseconds }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, milliseconds, imageLoadable, imageBuild, engineBuild }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
@@ -63,6 +63,8 @@ pub struct JsApp<'m> {
   modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The entry compiled when the program was built ([`JsApp.entryImage`]), or empty.
+  image: &'static [u8],
   /// The system programs started for `window.open`.
   openers: Openers,
   /// Measurement scaffolding: the JavaScript side of the first frame (see [`Startup`]).
@@ -73,6 +75,8 @@ pub struct JsApp<'m> {
 /// `SILK_UI_BENCH` or `SILK_UI_TRACE_JS` prints it once, as the first layout starts.
 struct Startup {
   on: bool,
+  /// `SILK_UI_TRACE_JS`: say what the entry starts from.
+  traced: bool,
   reported: bool,
   /// Timers, animation frames and their promise jobs after the entry ran: with the entry's
   /// own jobs, React's first render.
@@ -143,9 +147,10 @@ impl<'m> JsApp<'m> {
     // back to the system allocator, as the silkjs command line does.
     own.enablePooling()
     let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
-    let timed = (run environmentVariable("SILK_UI_BENCH")).isSome() || (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
+    let traced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
+    let timed = traced || (run environmentVariable("SILK_UI_BENCH")).isSome()
     return JsApp {
-      startup: Startup { on: timed, reported: false, callbacks: 0.0, apply: 0.0 },
+      startup: Startup { on: timed, traced: traced, reported: false, callbacks: 0.0, apply: 0.0 },
       host: move host,
       allocator: move own,
       memory: memory,
@@ -153,6 +158,7 @@ impl<'m> JsApp<'m> {
       modules: List<Defined>.make(),
       name: List<u8>.make(),
       source: List<u8>.make(),
+      image: b"",
       openers: Openers.make(),
     }
   }
@@ -175,9 +181,20 @@ impl<'m> JsApp<'m> {
     run self.source.appendSlice(source)
   }
 
-  /// Replaces the entry's source, keeping its name; [`JsApp.startEntry`] runs it.
+  /// The entry's bytecode image: what the app's build compiled its source into
+  /// (`JsHost.writeImage`, through `silkui_window.image`), embedded in the program. The
+  /// window then starts the entry from it with nothing parsed, when the engine build that
+  /// wrote it is the one linked here; otherwise it says so and runs the source given to
+  /// [`JsApp.entry`], which a host always gives as well.
+  pub fn entryImage(self: &mut Self, image: &'static [u8]) -> () {
+    self.image = image
+  }
+
+  /// Replaces the entry's source, keeping its name; [`JsApp.startEntry`] runs it. The new
+  /// source has no image: a reload runs what it was given.
   pub fn replaceEntry(self: &mut Self, source: List<u8>) -> () {
     self.source = move source
+    self.image = b""
   }
 
   /// The JavaScript host, for tools that talk to it directly.
@@ -193,11 +210,35 @@ impl<'m> JsApp<'m> {
   /// Runs the entry module and applies what it built.
   pub effect fn startEntry(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
-    let ran = run Effect.result(self.host.module(self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    self.sayEntry()
+    let started = run Effect.result(self.host.moduleFrom(self.image, self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let ran = match move started {
+      Result<bool, OutOfMemoryError | JsError>.Success { .. } => Result<(), OutOfMemoryError | JsError>.Success { value: () }
+      Result<bool, OutOfMemoryError | JsError>.Failure { error } => Result<(), OutOfMemoryError | JsError>.Failure { error: move error }
+    }
     run self.settle(move ran)
     let before = milliseconds()
     run self.host.flushRaw(&mut tree)
     self.startup.apply = self.startup.apply + (milliseconds() - before)
+  }
+
+  /// Says what the entry starts from. An image this engine build cannot load is never
+  /// silent: the program was built with a stale one, and pays for parsing at every launch.
+  /// `SILK_UI_TRACE_JS` says it for the image and for plain source too.
+  fn sayEntry(self: &Self) -> () {
+    if self.image.length != 0 && !imageLoadable(self.image) {
+      StderrWriter.print(
+        "silkui: the bytecode image of the app's JavaScript was written by another engine build ({} here, {} in the image): running from source. Build the app again.\n",
+        &(engineBuild(), imageBuild(self.image)),
+      )
+      return ()
+    }
+    if !self.startup.traced { return () }
+    if self.image.length != 0 {
+      StderrWriter.print("silkui: JavaScript starts from its bytecode image ({} bytes, engine build {})\n", &(self.image.length, engineBuild()))
+    } else {
+      StderrWriter.print("silkui: JavaScript starts from source ({} bytes): the program has no bytecode image\n", &(self.source.length(),))
+    }
   }
 
   /// Measurement scaffolding: prints the JavaScript side of the first frame, once.

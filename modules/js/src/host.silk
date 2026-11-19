@@ -38,6 +38,8 @@ import silkjs.js_native_functions as functions
 import silkjs.js_object_allocate as objects
 import silkjs.js_intl_common as common
 import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
+import silkjs.byte_buffer { readU64 }
 import silkjs.js_promise as promise
 import silkjs.native_stack as stack
 import bridge
@@ -251,6 +253,37 @@ effect fn evaluateIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   return run evaluation.evaluate(&mut engine, memory, realm, source, name, mode)
 }
 
+/// Whether `bytes` is a bytecode image the engine linked into this program can load: one
+/// its own build wrote ([`JsHost.writeImage`]). An image from another engine build is not,
+/// and its source runs instead.
+pub fn imageLoadable(bytes: &[u8]) -> bool {
+  return image.loadable(bytes)
+}
+
+/// The engine build an image was written by, as its header says (0 for bytes too short to
+/// have one), and the one this program links: equal for an image that loads.
+pub fn imageBuild(bytes: &[u8]) -> u64 {
+  if bytes.length < 16 { return 0 }
+  return readU64(bytes, 8)
+}
+
+pub fn engineBuild() -> u64 {
+  return image.identity()
+}
+
+/// The compiled module of an image this engine build wrote, with nothing parsed.
+///
+/// Safety: the engine reads each function's code from `bytes` when it is first called, until
+/// the runtime is destroyed.
+unsafe effect fn loadImage<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, bytes: &[u8]) -> Value ! JsException ? &mut Allocator {
+  return run unsafe image.load(&mut engine, realm, Pointer.fromRef<u8>(&bytes[0]), bytes.length)
+}
+
+effect fn writeImageIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, source: &[u8], name: &[u8]) -> List<u8> ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  return run image.write(&mut engine, memory, realm, source, name, flags.TYPE_MODULE)
+}
+
 /// Runs what a compile-only evaluate returned.
 effect fn runCompiled<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, compiled: Value) -> Value ! JsException ? &mut Allocator {
   let memory = engine.memory
@@ -461,11 +494,37 @@ impl<'m> JsHost<'m> {
   /// modules, then the promise jobs it queued. A module that throws while it evaluates fails
   /// with what it threw; one still waiting on a top-level `await` is left to finish later.
   pub effect fn module(self: &mut Self, source: &[u8], name: &[u8]) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    drop run self.moduleFrom(b"", source, name)
+  }
+
+  /// [`JsHost.module`] for a module that was also compiled when the program was built:
+  /// `compiledImage` is what [`JsHost.writeImage`] returned for `source` and `name`, embedded in the
+  /// program (the engine reads it for as long as the realm lives, so it is `'static`). When
+  /// this engine build wrote the image, the module starts from it and nothing is parsed;
+  /// an image another build wrote ([`imageLoadable`] says no), or an empty one, is left
+  /// alone and `source` is compiled as [`JsHost.module`] does. Says which one ran.
+  pub effect fn moduleFrom(self: &mut Self, compiledImage: &'static [u8], source: &[u8], name: &[u8]) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
+    return run unsafe self.moduleFromHeld(compiledImage, source, name)
+  }
+
+  /// [`JsHost.moduleFrom`] for an image that is not part of the program: a file the caller
+  /// mapped or read.
+  ///
+  /// Safety: the engine reads each function's code from `compiledImage` when it is first
+  /// called, so the bytes stay readable and unchanged until [`JsHost.close`]. They are an
+  /// image the caller's own build wrote: an image is trusted, not checked.
+  pub unsafe effect fn moduleFromHeld(self: &mut Self, compiledImage: &[u8], source: &[u8], name: &[u8]) -> bool ! OutOfMemoryError | JsError ? &mut Allocator {
     let context = self.context
     let realm = unsafe lendRealm(&context, context)
-    // Compiled, then run: what one evaluate of the source does, with a clock between the two.
+    let imaged = compiledImage.length != 0 && imageLoadable(compiledImage)
+    // Compiled (or loaded), then run: what one evaluate of the source does, with a clock
+    // between the two.
     let before = milliseconds()
-    let prepared = run Effect.result(evaluateIn(&mut self.engine, realm, source, name, flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY))
+    let prepared = if imaged {
+      run Effect.result(unsafe loadImage(&mut self.engine, realm, compiledImage))
+    } else {
+      run Effect.result(evaluateIn(&mut self.engine, realm, source, name, flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY))
+    }
     let compiled = match move prepared {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
@@ -473,7 +532,7 @@ impl<'m> JsHost<'m> {
     let loaded = milliseconds()
     let ran = run Effect.result(runCompiled(&mut self.engine, realm, move compiled))
     let evaluated = milliseconds()
-    self.entry = EntryTimes { image: false, load: loaded - before, evaluate: evaluated - loaded, jobs: 0.0 }
+    self.entry = EntryTimes { image: imaged, load: loaded - before, evaluate: evaluated - loaded, jobs: 0.0 }
     let completion = match move ran {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
@@ -495,6 +554,22 @@ impl<'m> JsHost<'m> {
     }
     if rejected { fail run describe(&mut self.engine, realm, move reason) }
     realm.release(&mut self.engine, move reason)
+    return imaged
+  }
+
+  /// Compiles the ES module `source` named `name` into a bytecode image without running
+  /// it: every function's bytecode, for [`JsHost.moduleFrom`] to start from in a program
+  /// that links this same engine build. Its imports must be defined ([`JsHost.define`]).
+  /// A build step's call (`silkui_window.image`); the image is trusted input at launch, so
+  /// only the app's own build writes it.
+  pub effect fn writeImage(self: &mut Self, source: &[u8], name: &[u8]) -> List<u8> ! OutOfMemoryError | JsError ? &mut Allocator {
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let written = run Effect.result(writeImageIn(&mut self.engine, realm, source, name))
+    return match move written {
+      Result<List<u8>, JsException>.Success { value } => move value
+      Result<List<u8>, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
   }
 
   /// Measurement scaffolding: where the last [`JsHost.module`] spent its time.
