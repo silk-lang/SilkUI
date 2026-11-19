@@ -63,8 +63,12 @@ pub struct EntryTimes {
   pub image: bool,
   /// Parsing and compiling the source, or loading the image.
   pub load: f64,
-  /// The module's top-level code.
+  /// The module's top-level code, until the app starts building nodes.
   pub evaluate: f64,
+  /// From the first node created to the end of the module's evaluation: with a framework
+  /// that renders when its root is given something, its first render (React's is
+  /// synchronous here), with what that render made the tree take along the way.
+  pub render: f64,
   /// The promise jobs it queued.
   pub jobs: f64,
 }
@@ -83,9 +87,13 @@ impl Copy for GcTimes {}
 /// Measurement scaffolding: milliseconds on the engine's tick counter, from an arbitrary
 /// start; 0 where the CPU has none.
 pub fn milliseconds() -> f64 {
+  return millisecondsAt(unsafe engineMemory.ticks())
+}
+
+fn millisecondsAt(ticks: usize) -> f64 {
   let perMicrosecond = unsafe engineMemory.ticksPerMicrosecond()
   if perMicrosecond == 0 { return 0.0 }
-  return usize.toF64(unsafe engineMemory.ticks()) / usize.toF64(perMicrosecond) / 1000.0
+  return usize.toF64(ticks) / usize.toF64(perMicrosecond) / 1000.0
 }
 
 /// A JavaScript realm bound to a UI tree's client side.
@@ -402,7 +410,7 @@ impl<'m> JsHost<'m> {
     }
     unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.REJECTION }), opaque: Pointer.null<u8>() })
     unsafe loader.setLoader(rt, Option<NativeFunctionId>.none(), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.MODULE_LOAD }), Pointer.null<u8>())
-    let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false, entry: EntryTimes { image: false, load: 0.0, evaluate: 0.0, jobs: 0.0 } }
+    let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false, entry: EntryTimes { image: false, load: 0.0, evaluate: 0.0, render: 0.0, jobs: 0.0 } }
     let installed = run Effect.result(install(&mut host.engine, unsafe lendRealm(&context, context)))
     match move installed {
       Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
@@ -471,9 +479,13 @@ impl<'m> JsHost<'m> {
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
     }
     let loaded = milliseconds()
+    self.engine.services.firstCreate = 0
     let ran = run Effect.result(runCompiled(&mut self.engine, realm, move compiled))
     let evaluated = milliseconds()
-    self.entry = EntryTimes { image: false, load: loaded - before, evaluate: evaluated - loaded, jobs: 0.0 }
+    // The top level ends where the app starts building nodes.
+    let created = millisecondsAt(self.engine.services.firstCreate)
+    let building = if self.engine.services.firstCreate != 0 && created >= loaded && created <= evaluated { created } else { evaluated }
+    self.entry = EntryTimes { image: false, load: loaded - before, evaluate: building - loaded, render: evaluated - building, jobs: 0.0 }
     let completion = match move ran {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
