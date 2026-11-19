@@ -65,6 +65,8 @@ struct Item {
   glyphEnd: usize,
   // How the glyphs' clusters run: 1 never falling, -1 never rising, 0 neither.
   order: i8,
+  // The script the item was shaped as.
+  script: u32,
 }
 
 impl Copy for Item {}
@@ -98,6 +100,31 @@ impl Copy for Choice {}
 
 const CHOICES: usize = 512
 
+// A segment shaped before, kept so that a segment cut from its text (a line of the paragraph)
+// or one that continues it (text being appended to) takes its glyphs instead of shaping again.
+struct Source {
+  text: String,
+  fontKey: usize,
+  rtl: bool,
+  // The font set generation the faces were chosen at.
+  generation: u64,
+  // Whether text cut from the segment may take its glyphs: no item has an AAT face.
+  cuts: bool,
+  scripts: List<ScriptRun>,
+  items: List<Item>,
+  raw: List<RawGlyph>,
+  // The pieces the segment was made of, in order: where each token's text is in `text`.
+  pieces: List<Piece>,
+}
+
+// The segments kept. A paragraph has a few (one per font and direction), and its lines follow
+// it at once, so a handful is enough; the oldest is replaced.
+const SOURCES: usize = 8
+
+// Shorter segments are not kept: a label that fits its line is shaped once, and keeping it
+// would cost more than the rare short text that wraps saves.
+const SOURCE_BYTES: usize = 32
+
 /// Reusable storage for [`shapeLine`].
 pub struct Shaping {
   pieces: List<Piece>,
@@ -116,6 +143,19 @@ pub struct Shaping {
   // Faces chosen before, in a direct-mapped table keyed by style, script and character. The
   // choice is a pure function of the three, and text asks for the same few over and over.
   choices: List<Choice>,
+  sources: List<Source>,
+  // The source to replace next.
+  oldest: usize,
+  // The items and glyphs of a segment's new end while they are joined to a source's.
+  tailItems: List<Item>,
+  tailRaw: List<RawGlyph>,
+  /// Take glyphs from segments shaped before where that gives what shaping would. Off, every
+  /// segment is shaped, for checking that the two agree.
+  pub reuse: bool,
+  /// Segments that took their glyphs from a segment shaped before: whole or cut from it, and
+  /// continuing it.
+  pub taken: usize,
+  pub continued: usize,
 }
 
 impl Shaping {
@@ -133,6 +173,13 @@ impl Shaping {
       glyphs: List<PositionedGlyph>.make(),
       opportunities: List<bool>.make(),
       choices: List<Choice>.make(),
+      sources: List<Source>.make(),
+      oldest: 0,
+      tailItems: List<Item>.make(),
+      tailRaw: List<RawGlyph>.make(),
+      reuse: true,
+      taken: 0,
+      continued: 0,
     }
   }
 }
@@ -375,6 +422,11 @@ effect fn collectPieces(
   }
 }
 
+// The text of `segment` from byte `from` on.
+fn textFrom(segment: &String, from: usize) -> string {
+  return String.slice(segment.view(), from, String.byteLength(segment.view()) - from)
+}
+
 effect fn itemize<'a>(
   state: &mut Shaping,
   fonts: &mut FontState<'a>,
@@ -382,6 +434,7 @@ effect fn itemize<'a>(
   rtl: bool,
   mode: WritingMode,
   orientation: TextOrientation,
+  from: usize,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -391,11 +444,13 @@ effect fn itemize<'a>(
   state.orientations.clear()
   let sideways = mode == WritingMode.VerticalRl || mode == WritingMode.VerticalLr
 
+  // The segment from `from` on is itemized and shaped as a text of its own.
+
   // Only vertical text asks which characters stand upright.
   if sideways {
-    run vertical_text.orientations(state.segment.view(), &mut state.orientations)
+    run vertical_text.orientations(textFrom(&state.segment, from), &mut state.orientations)
   }
-  run script_itemization.scripts(state.segment.view(), &mut state.scripts)
+  run script_itemization.scripts(textFrom(&state.segment, from), &mut state.scripts)
   if fonts.key(styleKey).instance == usize.MAX {
     return
   }
@@ -424,7 +479,7 @@ effect fn itemize<'a>(
     let mut orientationIndex: usize = 0
     let mut selection = primary
     while at < scriptRun.end {
-      let decoded = utf8_scan.decode(String.utf8Bytes(state.segment.view()), at)
+      let decoded = utf8_scan.decode(String.utf8Bytes(textFrom(&state.segment, from)), at)
       while orientationIndex + 1 < state.orientations.length()
         && state.orientations.get(orientationIndex).end <= at {
         orientationIndex = orientationIndex + 1
@@ -476,6 +531,7 @@ effect fn itemize<'a>(
             &mut fonts,
             style,
             selection,
+            from,
             itemStart,
             at,
             rtl,
@@ -496,6 +552,7 @@ effect fn itemize<'a>(
         &mut fonts,
         style,
         selection,
+        from,
         itemStart,
         scriptRun.end,
         rtl,
@@ -512,6 +569,7 @@ effect fn shapeItem<'a>(
   fonts: &mut FontState<'a>,
   style: usize,
   selection: Selection,
+  from: usize,
   start: usize,
   end: usize,
   rtl: bool,
@@ -524,24 +582,69 @@ effect fn shapeItem<'a>(
   let glyphStart = state.raw.length()
   let instance = fonts.instanceOf(key)
   let features = fonts.treatment(key).features
-  run fonts.shapeTextOriented(
-    instance,
-    state.segment.view(),
-    start,
-    end,
-    rtl,
-    script,
-    upright,
-    &features,
-    &mut state.raw,
-  )
+
+  // The shaper reads the text around an item only to join letters to their neighbours. An
+  // item that has none to join is shaped as a text of its own, which the next line or
+  // paragraph with the same word then finds already shaped.
+  let mut shift = from
+  if alone(String.utf8Bytes(textFrom(&state.segment, from)), start, end, script.value) {
+    shift = from + start
+    run fonts.shapeTextOriented(
+      instance,
+      String.slice(state.segment.view(), from + start, end - start),
+      0,
+      end - start,
+      rtl,
+      script,
+      upright,
+      &features,
+      &mut state.raw,
+    )
+  } else {
+    run fonts.shapeTextOriented(
+      instance,
+      textFrom(&state.segment, from),
+      start,
+      end,
+      rtl,
+      script,
+      upright,
+      &features,
+      &mut state.raw,
+    )
+  }
   let glyphEnd = state.raw.length()
+  if shift != 0 {
+    let mut index = glyphStart
+    while index < glyphEnd {
+      let mut glyph = state.raw.get(index)
+      glyph.cluster = glyph.cluster + usize.toU32(shift)
+      state.raw.set(index, glyph)
+      index = index + 1
+    }
+  }
+  run state.items.append(
+    Item {
+      upright: upright,
+      start: from + start,
+      end: from + end,
+      key: key,
+      glyphStart: glyphStart,
+      glyphEnd: glyphEnd,
+      order: orderOf(state.raw.asSlice(), glyphStart, glyphEnd),
+      script: script.value,
+    },
+  )
+}
+
+// How the clusters of `raw[start..end)` run: 1 never falling, -1 never rising, 0 neither.
+fn orderOf(raw: &[RawGlyph], start: usize, end: usize) -> i8 {
   let mut rising = true
   let mut falling = true
-  let mut index = glyphStart + 1
-  while index < glyphEnd {
-    let before = state.raw.get(index - 1).cluster
-    let cluster = state.raw.get(index).cluster
+  let mut index = start + 1
+  while index < end {
+    let before = raw[index - 1].cluster
+    let cluster = raw[index].cluster
     if cluster < before {
       rising = false
     }
@@ -550,33 +653,23 @@ effect fn shapeItem<'a>(
     }
     index = index + 1
   }
-  let mut order: i8 = 0
   if rising {
-    order = 1
-  } else if falling {
-    order = -1
+    return 1
   }
-  run state.items.append(
-    Item {
-      upright: upright,
-      start: start,
-      end: end,
-      key: key,
-      glyphStart: glyphStart,
-      glyphEnd: glyphEnd,
-      order: order,
-    },
-  )
+  if falling {
+    return -1
+  }
+  return 0
 }
 
-// The first glyph of `item` whose cluster is at or past `cluster` in the item's cluster order
-// (at or before it when the clusters fall). Needs `item.order != 0`.
-fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
+// The first glyph of `item` in `raw` whose cluster is at or past `cluster` in the item's
+// cluster order (at or before it when the clusters fall). Needs `item.order != 0`.
+fn firstAt(raw: &[RawGlyph], item: Item, cluster: usize) -> usize {
   let mut low = item.glyphStart
   let mut high = item.glyphEnd
   while low < high {
     let middle = low + (high - low) / 2
-    let at = u32.toUsize(state.raw.get(middle).cluster)
+    let at = u32.toUsize(raw[middle].cluster)
     let mut earlier = at < cluster
     if item.order < 0 {
       earlier = at > cluster
@@ -588,6 +681,476 @@ fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
     }
   }
   return low
+}
+
+fn sameBytes(text: &[u8], at: usize, part: &[u8]) -> bool {
+  if at > text.length || part.length > text.length - at {
+    return false
+  }
+  let mut index: usize = 0
+  while index < part.length {
+    if text[at + index] != part[index] {
+      return false
+    }
+    index = index + 1
+  }
+  return true
+}
+
+// Scripts whose shaper reads the text around an item (font-shape's `arabic.usesScript`: the
+// joining forms at the item's ends depend on the neighbouring characters).
+fn joins(script: u32) -> bool {
+  return script == 0x41726162 || script == 0x53797263 || script == 0x4d6f6e67
+    || script == 0x4e6b6f6f
+    || script == 0x50686167
+    || script == 0x4d616e64
+    || script == 0x4d616e69
+    || script == 0x50686c70
+    || script == 0x41646c6d
+    || script == 0x526f6867
+    || script == 0x536f6764
+    || script == 0x4f756772
+}
+
+// Whether the item `bytes[start..end)` shapes the same with and without the text around it:
+// its script does not join, or at each end either the item's own character or the one next
+// to it joins nothing (a space between two words, a word between two spaces).
+fn alone(bytes: &[u8], start: usize, end: usize, script: u32) -> bool {
+  if !joins(script) || start >= end {
+    return true
+  }
+  return (start == 0 || inertBefore(bytes, start) || inert(utf8_scan.decode(bytes, start).scalar))
+    && (end >= bytes.length || inert(utf8_scan.decode(bytes, end).scalar)
+      || inertBefore(bytes, end))
+}
+
+// Whether the character before `at` joins nothing and is not skipped when looking for a
+// neighbour, so an item next to it shapes as it does at the edge of a text. Basic Latin and
+// its supplements up to U+02FF qualify, but for the soft hyphen.
+fn inertBefore(bytes: &[u8], at: usize) -> bool {
+  let mut start = at
+  while start > 0 {
+    start = start - 1
+    if (bytes[start] & 0xc0) != 0x80 {
+      break
+    }
+  }
+  return inert(utf8_scan.decode(bytes, start).scalar)
+}
+
+fn inert(scalar: u32) -> bool {
+  return scalar < 0x300 && scalar != 0xad
+}
+
+fn asciiLetter(bytes: &[u8]) -> bool {
+  let mut index: usize = 0
+  while index < bytes.length {
+    let byte = bytes[index] | 0x20
+    if byte >= 0x61 && byte <= 0x7a {
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Whether `raw` has a glyph of `item` whose cluster starts at `cluster` and is safe to cut at.
+fn cuttable(raw: &[RawGlyph], item: Item, cluster: usize) -> bool {
+  if item.order == 0 {
+    return false
+  }
+  let at = firstAt(raw, item, cluster)
+  return at < item.glyphEnd && u32.toUsize(raw[at].cluster) == cluster && raw[at].safe
+}
+
+// Fills the items and glyphs of the segment from source `index`, whose text has the segment's
+// at `start`. False, with nothing to keep, when shaping the segment could give other glyphs.
+effect fn takeCut(state: &mut Shaping, index: usize, start: usize) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  state.items.clear()
+  state.raw.clear()
+  let source = &state.sources.asSlice()[index]
+  let bytes = String.utf8Bytes(state.segment.view())
+  let all = String.utf8Bytes(source.text.view())
+  let end = start + bytes.length
+  let whole = start == 0 && end == all.length
+  let raw = source.raw.asSlice()
+  if !whole {
+    if !source.cuts || bytes.length == 0 {
+      return false
+    }
+
+    // The segment must itemize as it did inside the source: the same script runs, and no
+    // first character that would have taken its face from the one before it.
+    let first = utf8_scan.decode(bytes, 0).scalar
+    if first >= 0x300 && continuesCluster(first) {
+      return false
+    }
+    let latin = source.scripts.length() == 1 && source.scripts.get(0).script.value == 0x4c61746e
+    if !latin || !asciiLetter(bytes) {
+      state.scripts.clear()
+      run script_itemization.scripts(state.segment.view(), &mut state.scripts)
+      let mut matched: usize = 0
+      let mut runIndex: usize = 0
+      while runIndex < source.scripts.length() {
+        let scriptRun = source.scripts.get(runIndex)
+        runIndex = runIndex + 1
+        if scriptRun.end <= start || scriptRun.start >= end {
+          continue
+        }
+        let mut low = scriptRun.start
+        if low < start {
+          low = start
+        }
+        let mut high = scriptRun.end
+        if high > end {
+          high = end
+        }
+        if matched >= state.scripts.length() {
+          return false
+        }
+        let own = state.scripts.get(matched)
+        if own.start != low - start || own.end != high - start
+          || own.script.value != scriptRun.script.value {
+          return false
+        }
+        matched = matched + 1
+      }
+      if matched != state.scripts.length() {
+        return false
+      }
+    }
+  }
+  let mut at: usize = 0
+  while at < source.items.length() {
+    let item = source.items.get(at)
+    at = at + 1
+    if item.end <= start || item.start >= end {
+      continue
+    }
+    let mut low = item.start
+    if low < start {
+      low = start
+    }
+    let mut high = item.end
+    if high > end {
+      high = end
+    }
+    let mut glyphStart = item.glyphStart
+    let mut glyphEnd = item.glyphEnd
+    if !whole {
+      if item.upright {
+        return false
+      }
+      if low != item.start {
+        if !cuttable(raw, item, low) {
+          return false
+        }
+      } else if joins(item.script) && low > 0 && !inertBefore(all, low) {
+        return false
+      }
+      if high != item.end {
+        if !cuttable(raw, item, high) {
+          return false
+        }
+      } else if joins(item.script) && high < all.length
+        && !inert(utf8_scan.decode(all, high).scalar) {
+        return false
+      }
+      if low != item.start || high != item.end {
+        if item.order > 0 {
+          glyphStart = firstAt(raw, item, low)
+          glyphEnd = firstAt(raw, item, high)
+        } else {
+          glyphStart = firstAt(raw, item, high - 1)
+          if low > 0 {
+            glyphEnd = firstAt(raw, item, low - 1)
+          }
+        }
+      }
+    }
+    let first = state.raw.length()
+    let mut glyph = glyphStart
+    while glyph < glyphEnd {
+      let mut value = raw[glyph]
+      value.cluster = value.cluster - usize.toU32(start)
+      run state.raw.append(value)
+      glyph = glyph + 1
+    }
+    run state.items.append(
+      Item {
+        upright: item.upright,
+        start: low - start,
+        end: high - start,
+        key: item.key,
+        glyphStart: first,
+        glyphEnd: state.raw.length(),
+        order: item.order,
+        script: item.script,
+      },
+    )
+  }
+  return true
+}
+
+// Where byte `offset` of token `unit` is in the text of the segment made of `pieces`, or
+// usize.MAX when the segment has no piece there.
+fn startIn(pieces: &[Piece], unit: usize, offset: usize) -> usize {
+  let mut low: usize = 0
+  let mut high = pieces.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if pieces[middle].unit < unit || (pieces[middle].unit == unit && pieces[middle].end <= offset) {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  if low < pieces.length && pieces[low].unit == unit && pieces[low].start <= offset {
+    return pieces[low].segmentStart + offset - pieces[low].start
+  }
+  return usize.MAX
+}
+
+// Finds a source the segment can take its glyphs from, and takes them. The segment starts at
+// byte `offset` of token `unit`.
+effect fn take(
+  state: &mut Shaping,
+  generation: u64,
+  fontKey: usize,
+  rtl: bool,
+  unit: usize,
+  offset: usize,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let length = String.byteLength(state.segment.view())
+  let mut index: usize = 0
+  while index < state.sources.length() {
+    let source = &state.sources.asSlice()[index]
+    let all = String.utf8Bytes(source.text.view())
+    if source.fontKey != fontKey || source.rtl != rtl || source.generation != generation
+      || all.length < length {
+      index = index + 1
+      continue
+    }
+
+    // A line starts in one of the paragraph's tokens: the piece of that token says where.
+    // Text that is not from the same tokens can still be the source's own text.
+    let bytes = String.utf8Bytes(state.segment.view())
+    let mut found = startIn(source.pieces.asSlice(), unit, offset)
+    if found == usize.MAX || !sameBytes(all, found, bytes) {
+      found = usize.MAX
+      if all.length == length && sameBytes(all, 0, bytes) {
+        found = 0
+      }
+    }
+    if found != usize.MAX && run takeCut(&mut state, index, found) {
+      state.taken = state.taken + 1
+      return true
+    }
+    index = index + 1
+  }
+  return false
+}
+
+// Where the glyphs of `source` end that stay when text is added after it: its last safe cut
+// before its last word, which may still change with what follows it. 0 when there is none.
+fn tailCut(source: &Source) -> usize {
+  let all = String.utf8Bytes(source.text.view())
+
+  // One script, read left to right, by a shaper that does not look past an item's ends.
+  if !source.cuts || source.rtl || source.scripts.length() != 1 || source.items.length() == 0 {
+    return 0
+  }
+  let last = source.items.get(source.items.length() - 1)
+  if joins(source.scripts.get(0).script.value) || last.order != 1 || last.upright
+    || last.end != all.length {
+    return 0
+  }
+  let mut limit = all.length
+  while limit > 0 && all[limit - 1] != 32 {
+    limit = limit - 1
+  }
+  let raw = source.raw.asSlice()
+  let mut glyph = last.glyphEnd
+  while glyph > last.glyphStart {
+    glyph = glyph - 1
+    let cluster = u32.toUsize(raw[glyph].cluster)
+    if cluster <= limit && cluster > last.start && raw[glyph].safe {
+      return cluster
+    }
+  }
+  return 0
+}
+
+// Whether `bytes` starts with the text of `source` and goes on, in the same font and direction.
+fn continues(source: &Source, bytes: &[u8], fontKey: usize, rtl: bool, generation: u64) -> bool {
+  let all = String.utf8Bytes(source.text.view())
+  return source.fontKey == fontKey && source.rtl == rtl && source.generation == generation
+    && all.length < bytes.length
+    && all.length != 0
+    && sameBytes(bytes, 0, all)
+}
+
+// Shapes only the end of a segment that continues source `index`: the source's glyphs up to
+// its last safe cut before its last word stay, and the text from there on is shaped and
+// joined to them. False when that cannot be shown to give what shaping the whole would; the
+// items and glyphs are then to be made again.
+effect fn takeTail<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  index: usize,
+  styleKey: usize,
+  mode: WritingMode,
+  orientation: TextOrientation,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let cut = tailCut(&state.sources.asSlice()[index])
+  if cut == 0 {
+    return false
+  }
+  let script = state.sources.asSlice()[index].scripts.get(0).script.value
+  let key = state.sources.asSlice()[index].items.get(
+    state.sources.asSlice()[index].items.length() - 1,
+  ).key
+  run itemize(&mut state, &mut fonts, styleKey, false, mode, orientation, cut)
+  if state.scripts.length() != 1 || state.scripts.get(0).script.value != script
+    || state.items.length() == 0 {
+    return false
+  }
+  let first = state.items.get(0)
+  if first.start != cut || first.key != key || first.upright {
+    return false
+  }
+  state.tailItems.clear()
+  run state.tailItems.appendSlice(state.items.asSlice())
+  state.tailRaw.clear()
+  run state.tailRaw.appendSlice(state.raw.asSlice())
+  state.items.clear()
+  state.raw.clear()
+  let source = &state.sources.asSlice()[index]
+  let raw = source.raw.asSlice()
+  let last = source.items.get(source.items.length() - 1)
+  let kept = firstAt(raw, last, cut)
+  run state.raw.appendSlice(Slice.view(raw, 0, kept))
+  run state.items.appendSlice(Slice.view(source.items.asSlice(), 0, source.items.length() - 1))
+  let shift = kept - first.glyphStart
+  run state.raw.appendSlice(state.tailRaw.asSlice())
+  let mut item: usize = 0
+  while item < state.tailItems.length() {
+    let mut value = state.tailItems.get(item)
+    value.glyphStart = value.glyphStart + shift
+    value.glyphEnd = value.glyphEnd + shift
+    if item == 0 {
+      // The source's last item and the first of the new end are one item of the whole.
+      value.start = last.start
+      value.glyphStart = last.glyphStart
+      if value.order != 1 {
+        value.order = 0
+      }
+    }
+    run state.items.append(value)
+    item = item + 1
+  }
+  return true
+}
+
+// Looks for a source the segment's text starts with, and shapes only what follows it.
+effect fn continueSource<'a>(
+  state: &mut Shaping,
+  fonts: &mut FontState<'a>,
+  styleKey: usize,
+  rtl: bool,
+  mode: WritingMode,
+  orientation: TextOrientation,
+) -> usize
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let generation = fonts.set.generation
+  let mut index: usize = 0
+  while index < state.sources.length() {
+    let fits = continues(
+      &state.sources.asSlice()[index],
+      String.utf8Bytes(state.segment.view()),
+      styleKey,
+      rtl,
+      generation,
+    )
+    if fits {
+      if run takeTail(&mut state, &mut fonts, index, styleKey, mode, orientation) {
+        state.continued = state.continued + 1
+        return index
+      }
+      return usize.MAX
+    }
+    index = index + 1
+  }
+  return usize.MAX
+}
+
+// Keeps the segment just shaped as a source, in slot `slot` or in place of the oldest.
+effect fn keep<'a>(
+  state: &mut Shaping,
+  fonts: &FontState<'a>,
+  fontKey: usize,
+  rtl: bool,
+  slot: usize,
+  firstPiece: usize,
+  pieceCount: usize,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = slot
+  if at == usize.MAX {
+    at = state.oldest
+    state.oldest = (state.oldest + 1) % SOURCES
+    if at >= state.sources.length() {
+      at = state.sources.length()
+      run state.sources.append(
+        Source {
+          text: String.make(),
+          fontKey: 0,
+          rtl: false,
+          generation: 0,
+          cuts: false,
+          scripts: List<ScriptRun>.make(),
+          items: List<Item>.make(),
+          raw: List<RawGlyph>.make(),
+          pieces: List<Piece>.make(),
+        },
+      )
+    }
+  }
+  let mut cuts = true
+  let mut item: usize = 0
+  while item < state.items.length() {
+    if !fonts.sliceable(state.items.get(item).key) {
+      cuts = false
+    }
+    item = item + 1
+  }
+  let mut source = &mut state.sources.asMutSlice()[at]
+  source.text.clear()
+  run source.text.append(state.segment.view())
+  source.fontKey = fontKey
+  source.rtl = rtl
+  source.generation = fonts.set.generation
+  source.cuts = cuts
+  source.scripts.clear()
+  run source.scripts.appendSlice(state.scripts.asSlice())
+  source.items.clear()
+  run source.items.appendSlice(state.items.asSlice())
+  source.raw.clear()
+  run source.raw.appendSlice(state.raw.asSlice())
+  source.pieces.clear()
+  run source.pieces.appendSlice(Slice.view(state.pieces.asSlice(), firstPiece, pieceCount))
+}
+
+fn firstGlyphAt(state: &Shaping, item: Item, cluster: usize) -> usize {
+  return firstAt(state.raw.asSlice(), item, cluster)
 }
 
 // The letter-spacing and word-spacing after raw glyph `index`: letter-spacing follows the last
@@ -668,7 +1231,8 @@ effect fn emit<'a>(
       run state.glyphs.append(
         PositionedGlyph {
           glyph: raw.glyph,
-          cluster: token.sourceStart + offset,
+          // From the start of the run's own text, so that equal words share one run.
+          cluster: cluster - low,
           upright: item.upright,
           x: pen
             + i32.toF32(
@@ -780,14 +1344,39 @@ effect fn shapeSegments<'a>(
       }
       last = last + 1
     }
-    run itemize(
+    let rtl = piece.level % 2 == 1
+    let mode = tokens[piece.unit].writingMode
+    let orientation = tokens[piece.unit].textOrientation
+
+    // Vertical text is always shaped: which characters stand upright depends on the whole.
+    let reuse = state.reuse && mode != WritingMode.VerticalRl && mode != WritingMode.VerticalLr
+    if !reuse {
+      run itemize(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation, 0)
+    } else if !run take(
       &mut state,
-      &mut fonts,
+      fonts.set.generation,
       piece.fontKey,
-      piece.level % 2 == 1,
-      tokens[piece.unit].writingMode,
-      tokens[piece.unit].textOrientation,
-    )
+      rtl,
+      piece.unit,
+      piece.start,
+    ) {
+      let slot = run continueSource(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation)
+      if slot == usize.MAX {
+        run itemize(&mut state, &mut fonts, piece.fontKey, rtl, mode, orientation, 0)
+      } else {
+        // The scripts of the whole: one run, as the source had.
+        let whole = ScriptRun {
+          start: 0,
+          end: String.byteLength(state.segment.view()),
+          script: state.scripts.get(0).script,
+        }
+        state.scripts.clear()
+        run state.scripts.append(whole)
+      }
+      if String.byteLength(state.segment.view()) >= SOURCE_BYTES {
+        run keep(&mut state, &fonts, piece.fontKey, rtl, slot, index, last - index)
+      }
+    }
     let mut member = index
     while member < last {
       let current = state.pieces.get(member)

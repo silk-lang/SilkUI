@@ -5,6 +5,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.num.f64
 import silk.num.u64
+import silk.core.ownership { Copy }
 
 /// What a generated host runs.
 pub enum Kind {
@@ -45,6 +46,57 @@ pub struct Plan {
   pub natives: bool,
   /// Show the Metal Performance HUD over the window (macOS).
   pub metalHud: bool,
+  /// For a JavaScript app on the SilkJS runtime: what it may reach beyond the light set.
+  pub allows: Allows,
+}
+
+/// What a JavaScript app on the SilkJS runtime may reach beyond the light set every app gets
+/// (the web platform's APIs, `fetch` and sockets, Web Crypto and TLS, compression streams, and
+/// the files the user picks). See [`App.allow`].
+pub struct Allows {
+  /// The whole file system, through `node:fs`; without it, only files the user picks.
+  pub files: bool,
+  /// `node:child_process`.
+  pub processes: bool,
+  /// `WebAssembly`.
+  pub wasm: bool,
+  /// `node:sqlite`.
+  pub database: bool,
+  /// Native Node addons (`process.dlopen`).
+  pub addons: bool,
+}
+
+impl Copy for Allows {}
+
+impl Allows {
+  pub fn none() -> Allows {
+    return Allows { files: false, processes: false, wasm: false, database: false, addons: false }
+  }
+}
+
+/// The `Capabilities` a runtime host composes, and the names it imports for them.
+effect fn capabilities(out: &mut String, allows: Allows) -> () ! OutOfMemoryError ? &mut Allocator {
+  run String.append(&mut out.*, "Capabilities { platform: OsPlatform {}, modules: MemoryModules.make(&MODULES), files: ")
+  run String.append(&mut out.*, if allows.files { "OsFiles {}" } else { "files" })
+  run String.append(&mut out.*, ", compression: SilkCompression.make(), http2: EmptyHttp2 {}, crypto: SilkCrypto.make(), tls: SilkTls.make(), database: ")
+  run String.append(&mut out.*, if allows.database { "SqliteDatabase.make()" } else { "EmptyDatabase {}" })
+  run String.append(&mut out.*, ", addons: ")
+  run String.append(&mut out.*, if allows.addons { "DlopenAddons.make()" } else { "EmptyAddons {}" })
+  run String.append(&mut out.*, ", processes: ")
+  run String.append(&mut out.*, if allows.processes { "OsProcesses {}" } else { "EmptyProcesses {}" })
+  run String.append(&mut out.*, ", network: OsNetwork {}, http: SilkHttp.make(), systemInfo: OsSystemInfo {}, typeStripping: EmptyTypeStripping {}, workers: EmptyWorkers {}, inspector: EmptyInspector {}, wasm: ")
+  run String.append(&mut out.*, if allows.wasm { "WamrWasm.make()" } else { "EmptyWasm {}" })
+  run String.append(&mut out.*, ", hostApi: api }")
+}
+
+effect fn capabilityImports(out: &mut String, allows: Allows) -> () ! OutOfMemoryError ? &mut Allocator {
+  run String.append(&mut out.*, "import silkui_window_node.node { UiApi, failed, Capabilities, MemoryModules, MemoryModule, OsPlatform, SilkCompression, EmptyHttp2, SilkCrypto, SilkTls, OsNetwork, SilkHttp, OsSystemInfo, EmptyTypeStripping, EmptyWorkers, EmptyInspector")
+  run String.append(&mut out.*, if allows.files { ", OsFiles" } else { ", GrantedFiles" })
+  run String.append(&mut out.*, if allows.database { ", SqliteDatabase" } else { ", EmptyDatabase" })
+  run String.append(&mut out.*, if allows.addons { ", DlopenAddons" } else { ", EmptyAddons" })
+  run String.append(&mut out.*, if allows.processes { ", OsProcesses" } else { ", EmptyProcesses" })
+  run String.append(&mut out.*, if allows.wasm { ", WamrWasm" } else { ", EmptyWasm" })
+  run String.append(&mut out.*, " }\nimport silk.mem.allocator { Allocator, OutOfMemoryError }\nimport silk.core.effect { Effect }\n")
 }
 
 /// `text` as the body of a Silk or TOML string literal.
@@ -260,13 +312,18 @@ pub effect fn main(plan: &Plan) -> String ! OutOfMemoryError ? &mut Allocator {
       run String.append(&mut out, if plan.natives { "import natives as exported\n" } else { "import silkui_window_node.node { Natives }\n" })
       run String.append(&mut out, if plan.metalHud { "import silkui_window_node.node { showMetalHud, TitleBar, " } else { "import silkui_window_node.node { TitleBar, " })
       run String.append(&mut out, if plan.dev { if plan.stylesheets == 0 { "Settings, develop }\n" } else { "Settings, developWithSheetUpdates as develop }\n" } } else { if plan.runtimeCss { "Settings, releaseWithRuntimeSheets as release }\n" } else if plan.stylesheets == 0 { "Settings, release }\n" } else { "Settings, releaseWithSheets as release }\n" } })
-      run String.append(&mut out, "import silk.system.host_input { HostInput }\n\npub effect fn main() -> i32 ? &mut HostInput {\n")
+      run capabilityImports(&mut out, plan.allows)
+      run String.append(&mut out, "import silk.system.host_input { HostInput }\n\nconst MODULES: [MemoryModule; 0] = []\n\npub effect fn main() -> i32 ? &mut HostInput {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  return run Effect.catchAll(started(), failed) |> Effect.provideMut<Allocator>(&mut allocator)\n}\n\neffect fn started() -> i32 ! OutOfMemoryError ? &mut Allocator | &mut HostInput {\n")
       run hudCall(&mut out, plan)
+      run String.append(&mut out, "  let api = run UiApi.make()\n")
+      if !plan.allows.files { run String.append(&mut out, "  let files = run GrantedFiles.make()\n") }
       run String.append(&mut out, "  return run ")
       run String.append(&mut out, if plan.dev { "develop(" } else { "release(" })
       run settings(&mut out, plan)
       if !plan.dev { run String.append(&mut out, ", app_bundle.data") }
       run sheetArguments(&mut out, plan)
+      run String.append(&mut out, ", api, ")
+      run capabilities(&mut out, plan.allows)
       run String.append(&mut out, ")\n}\n")
     }
   }

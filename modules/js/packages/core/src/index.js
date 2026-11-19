@@ -19,7 +19,8 @@ const TYPES = [
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
-  "animationcancel", "selectionchange", "pointerover", "pointerout",
+  "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
+  "touchend", "touchcancel",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
@@ -35,10 +36,31 @@ function eachLiveRange(update) {
 }
 
 const CLICK = KIND_OF.get("click");
+const SELECTION_CHANGE = KIND_OF.get("selectionchange");
+const TOUCH_START = KIND_OF.get("touchstart");
+// The tree has one listener flag for the four touch kinds.
+const TOUCH_FLAG = 1 << 30;
+// Compatibility mouse events, as the web fires them after pointer events: each listens
+// through the pointer kind it follows.
+const MOUSE_OF = new Map([
+  ["pointerdown", "mousedown"], ["pointerup", "mouseup"], ["pointermove", "mousemove"],
+  ["pointerover", "mouseover"], ["pointerout", "mouseout"], ["pointerenter", "mouseenter"],
+  ["pointerleave", "mouseleave"],
+]);
+const POINTER_OF = new Map([...MOUSE_OF].map(([pointer, mouse]) => [mouse, pointer]));
+// Types the tree reports through another kind's records: `selectstart` comes as a
+// `SelectionChange` record at the node pressed.
+const LISTENS_AS = new Map([...POINTER_OF, ["selectstart", "selectionchange"]]);
 // As on the web: these reach the target alone.
-const NO_BUBBLE = new Set(["pointerenter", "pointerleave", "focus", "blur", "scroll", "layout", "load", "error"]);
-// The tree has a default action to skip for these.
-const CANCELABLE = new Set(["pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop"]);
+const NO_BUBBLE = new Set([
+  "pointerenter", "pointerleave", "mouseenter", "mouseleave", "focus", "blur", "scroll", "layout", "load",
+  "error",
+]);
+// The tree has a default action to skip for these. Touch records say for themselves.
+const CANCELABLE = new Set([
+  "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
+  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart",
+]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
 
@@ -654,20 +676,28 @@ export class Node {
 
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
   #want(kind) {
-    const list = this.#listeners?.get(TYPES[kind]);
-    const wanted = (list && list.length > 0) || (kind === CLICK && this._href);
-    const flags = (wanted ? this.#flags | (1 << kind) : this.#flags & ~(1 << kind)) | this.#kept | (this._extra ?? 0);
+    const [wanted, bit] = this.#wanted(kind);
+    const flags = (wanted ? this.#flags | bit : this.#flags & ~bit) | this.#kept | (this._extra ?? 0);
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+  }
+
+  // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
+  #wanted(kind) {
+    const has = (type) => (this.#listeners?.get(type)?.length ?? 0) > 0;
+    if (kind >= TOUCH_START) return [TYPES.slice(TOUCH_START).some(has), TOUCH_FLAG];
+    const type = TYPES[kind];
+    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
+      || (kind === SELECTION_CHANGE && has("selectstart"));
+    return [wanted, 1 << kind];
   }
 
   /** Listens again for every kind its listeners, kept kinds and `_extra` flags ask for. */
   _relisten() {
     let flags = this.#kept | (this._extra ?? 0);
-    for (const [type, list] of this.#listeners ?? []) {
-      const kind = KIND_OF.get(type);
-      if (kind !== undefined && list.length > 0) flags |= 1 << kind;
+    for (let kind = 0; kind <= TOUCH_START; kind++) {
+      const [wanted, bit] = this.#wanted(kind);
+      if (wanted) flags |= bit;
     }
-    if (this._href) flags |= 1 << CLICK;
     if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
   }
 
@@ -713,12 +743,89 @@ export class Node {
     return pointers.get(pointerId)?.capture === this;
   }
 
+  /** `scrollTo(x, y)` or `scrollTo({ left, top, behavior })`; `behavior: "smooth"` animates, and `auto` follows `scroll-behavior`. */
   scrollTo(x, y) {
-    native.scrollTo(this.nodeId, x, y);
+    scrollNode(this.nodeId, x, y, 0);
   }
 
   scroll(x, y) {
-    native.scrollTo(this.nodeId, x, y);
+    scrollNode(this.nodeId, x, y, 0);
+  }
+
+  /** As `scrollTo`, by an amount from where the node is scrolled. */
+  scrollBy(x, y) {
+    scrollNode(this.nodeId, x, y, 4);
+  }
+
+  /** The border box in window coordinates, after any pending layout, as on the web. */
+  getBoundingClientRect() {
+    return readRect(this.nodeId);
+  }
+
+  /** One rectangle per fragment (a wrapped inline box has one per line). */
+  getClientRects() {
+    return readRects(native.rects?.(this.nodeId) ?? 0);
+  }
+
+  get clientLeft() { return metric(this.nodeId, 0); }
+  get clientTop() { return metric(this.nodeId, 1); }
+  get clientWidth() { return metric(this.nodeId, 2); }
+  get clientHeight() { return metric(this.nodeId, 3); }
+  get scrollWidth() { return metric(this.nodeId, 4); }
+  get scrollHeight() { return metric(this.nodeId, 5); }
+  get scrollLeft() { return metric(this.nodeId, 6); }
+  set scrollLeft(value) { scrollNode(this.nodeId, { left: value }, undefined, 0); }
+  get scrollTop() { return metric(this.nodeId, 7); }
+  set scrollTop(value) { scrollNode(this.nodeId, { top: value }, undefined, 0); }
+  get offsetParent() { return nodes.get(metric(this.nodeId, 8)) ?? null; }
+  get offsetLeft() { return metric(this.nodeId, 9); }
+  get offsetTop() { return metric(this.nodeId, 10); }
+  get offsetWidth() { return metric(this.nodeId, 11); }
+  get offsetHeight() { return metric(this.nodeId, 12); }
+
+  /**
+   * Scrolls every scroll container around this node to show it, as on the web: `true` or
+   * nothing aligns to the start, `false` to the end, or `{ block, inline, behavior }`.
+   * `scroll-margin`, `scroll-padding` and `scroll-snap` apply.
+   */
+  scrollIntoView(options = true) {
+    if (options === null || typeof options !== "object") {
+      const top = options !== false;
+      native.scrollIntoView?.(this.nodeId, top ? 0 : 2, 3, 0, 0);
+      return;
+    }
+    native.scrollIntoView?.(this.nodeId, alignment(options.block, 0), alignment(options.inline, 3), BEHAVIORS[options.behavior] ?? 0, 0);
+  }
+
+  /** WebKit's: scrolls only containers that do not already show the node, centering it unless `center` is false. */
+  scrollIntoViewIfNeeded(center = true) {
+    const code = center ? 1 : 3;
+    native.scrollIntoView?.(this.nodeId, code, code, 0, 1);
+  }
+
+  /** Whether this node matches CSS `selector`, by the same matcher as stylesheets. */
+  matches(selector) {
+    return queried(0, this, selector) === 1;
+  }
+
+  webkitMatchesSelector(selector) {
+    return this.matches(selector);
+  }
+
+  /** This node or its nearest ancestor that matches `selector`, or null. */
+  closest(selector) {
+    return nodes.get(queried(1, this, selector)) ?? null;
+  }
+
+  /** The first descendant, in tree order, that matches `selector`, or null. */
+  querySelector(selector) {
+    return nodes.get(queried(2, this, selector)) ?? null;
+  }
+
+  /** Every descendant that matches `selector`, in tree order: a static list. */
+  querySelectorAll(selector) {
+    const ids = queried(3, this, selector);
+    return typeof ids === "string" && ids !== "" ? ids.split(",").map((id) => nodes.get(Number(id))).filter(Boolean) : [];
   }
 
   /**
@@ -727,8 +834,9 @@ export class Node {
    * app's own, sent with `dispatchEvent`.
    */
   addEventListener(type, listener, options) {
-    if (listener == null) return;
-    const kind = KIND_OF.get(type);
+    const signal = options?.signal;
+    if (listener == null || signal?.aborted) return;
+    const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     const capture = options === true || !!options?.capture;
     this.#listeners ??= new Map();
     let list = this.#listeners.get(type);
@@ -736,6 +844,7 @@ export class Node {
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
     if (kind !== undefined) this.#want(kind);
+    signal?.addEventListener("abort", () => this.removeEventListener(type, listener, capture), { once: true });
   }
 
   removeEventListener(type, listener, options) {
@@ -745,7 +854,7 @@ export class Node {
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
     if (index < 0) return;
     list.splice(index, 1);
-    const kind = KIND_OF.get(type);
+    const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     if (kind !== undefined) this.#want(kind);
   }
 
@@ -2317,6 +2426,15 @@ export class Range extends AbstractRange {
     this.#set(node, offset, false);
   }
 
+  /** One rectangle per line piece of the range, from the tree's last layout (laid out first if something changed). */
+  getClientRects() {
+    return rangeClientRects(this._startNode, this._startOffset, this._endNode, this._endOffset);
+  }
+
+  getBoundingClientRect() {
+    return rangeBoundingClientRect(this._startNode, this._startOffset, this._endNode, this._endOffset);
+  }
+
   setStartBefore(node) {
     this.#set(parentOf(node), indexIn(node), true);
   }
@@ -2591,11 +2709,14 @@ export class Range extends AbstractRange {
   // The DOM Standard's live range steps, run by the nodes as they change.
 
   _inserted(parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === parent && this._startOffset > index) this._startOffset++;
     if (this._endNode === parent && this._endOffset > index) this._endOffset++;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _removing(child, parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (isInclusiveAncestor(child, this._startNode)) {
       this._startNode = parent;
       this._startOffset = index;
@@ -2606,9 +2727,11 @@ export class Range extends AbstractRange {
     }
     if (this._startNode === parent && this._startOffset > index) this._startOffset--;
     if (this._endNode === parent && this._endOffset > index) this._endOffset--;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _replaced(node, offset, count, added) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === node) {
       if (this._startOffset > offset + count) this._startOffset += added - count;
       else if (this._startOffset > offset) this._startOffset = offset;
@@ -2617,9 +2740,11 @@ export class Range extends AbstractRange {
       if (this._endOffset > offset + count) this._endOffset += added - count;
       else if (this._endOffset > offset) this._endOffset = offset;
     }
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _split(node, rest, offset, parent, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === node && this._startOffset > offset) {
       this._startNode = rest;
       this._startOffset -= offset;
@@ -2630,9 +2755,11 @@ export class Range extends AbstractRange {
     }
     if (this._startNode === parent && this._startOffset === index + 1) this._startOffset++;
     if (this._endNode === parent && this._endOffset === index + 1) this._endOffset++;
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 
   _joined(current, node, length, index) {
+    const a = this._startNode, b = this._startOffset, c = this._endNode, d = this._endOffset;
     if (this._startNode === current) {
       this._startNode = node;
       this._startOffset += length;
@@ -2649,6 +2776,7 @@ export class Range extends AbstractRange {
       this._endNode = node;
       this._endOffset = length;
     }
+    if (a !== this._startNode || b !== this._startOffset || c !== this._endNode || d !== this._endOffset) this._changed();
   }
 }
 
@@ -2665,6 +2793,307 @@ function parentOf(node) {
 /** A new live range, collapsed at the start of the root. */
 export function createRange() {
   return new Range();
+}
+
+// The document's selection. The tree keeps it (presses, drags, keys, select all) and paints
+// it; the one `Selection` reads it from there and tells the tree what scripts change. Its
+// ranges are live Ranges in tree order, one per stretch: a selection across children that
+// layout reorders (flex order, placed grid cells, positioned boxes) has one per piece seen.
+const SELECTION = Symbol("selection");
+let theSelection = null;
+
+function checkOffset(node, offset) {
+  offset = offset >>> 0;
+  if (offset > nodeLength(node)) throw domError("IndexSizeError", "the offset is past the end of the node");
+  return offset;
+}
+
+function inDocument(node) {
+  return rootNode !== null && rootOf(node) === rootNode;
+}
+
+/** The document's selection, as `getSelection()` answers it. */
+export class Selection {
+  #anchor = null;
+  #anchorOffset = 0;
+  #focus = null;
+  #focusOffset = 0;
+  #ranges = [];
+  #backward = false;
+  // Changed by a script and not yet told to the tree.
+  #pending = false;
+
+  constructor(token) {
+    if (token !== SELECTION) throw new TypeError("Illegal constructor");
+  }
+
+  // Reads what the tree has, after telling it what a script changed.
+  #sync() {
+    if (this.#pending) this.#flush();
+    const count = native.selection?.() ?? 0;
+    const anchor = count ? nodes.get(geometry(0)) : null;
+    const focus = count ? nodes.get(geometry(2)) : null;
+    if (!anchor || !focus) {
+      if (this.#anchor) this.#forget();
+      return;
+    }
+    const stretches = [];
+    for (let i = 0; i < count; i++) {
+      const at = 4 + 4 * i;
+      const start = nodes.get(geometry(at));
+      const end = nodes.get(geometry(at + 2));
+      if (start && end) stretches.push([start, geometry(at + 1), end, geometry(at + 3)]);
+    }
+    const same = anchor === this.#anchor && geometry(1) === this.#anchorOffset && focus === this.#focus
+      && geometry(3) === this.#focusOffset && stretches.length === this.#ranges.length
+      && stretches.every(([a, b, c, d], i) => {
+        const range = this.#ranges[i];
+        return range._startNode === a && range._startOffset === b && range._endNode === c && range._endOffset === d;
+      });
+    if (same) return;
+    this.#unhook();
+    this.#anchor = anchor;
+    this.#anchorOffset = geometry(1);
+    this.#focus = focus;
+    this.#focusOffset = geometry(3);
+    this.#backward = comparePoints(anchor, this.#anchorOffset, focus, this.#focusOffset) > 0;
+    this.#ranges = stretches.map(([a, b, c, d]) => {
+      const range = new Range();
+      range._startNode = a;
+      range._startOffset = b;
+      range._endNode = c;
+      range._endOffset = d;
+      return this.#hook(range);
+    });
+  }
+
+  #flush() {
+    this.#pending = false;
+    if (!this.#anchor) native.setSelection?.(0, 0, 0, 0);
+    else native.setSelection?.(this.#anchor.nodeId, this.#anchorOffset, this.#focus.nodeId, this.#focusOffset);
+  }
+
+  #schedule() {
+    if (this.#pending) return;
+    this.#pending = true;
+    queueMicrotask(() => {
+      if (this.#pending) this.#flush();
+    });
+  }
+
+  #hook(range) {
+    range._changed = () => this.#moved(range);
+    return range;
+  }
+
+  #unhook() {
+    for (const range of this.#ranges) delete range._changed;
+  }
+
+  #forget() {
+    this.#unhook();
+    this.#anchor = this.#focus = null;
+    this.#anchorOffset = this.#focusOffset = 0;
+    this.#ranges = [];
+    this.#backward = false;
+  }
+
+  // A script or a mutation moved one of the ranges: the selection becomes that range.
+  #moved(range) {
+    const backward = this.#backward;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = backward ? range._endNode : range._startNode;
+    this.#anchorOffset = backward ? range._endOffset : range._startOffset;
+    this.#focus = backward ? range._startNode : range._endNode;
+    this.#focusOffset = backward ? range._startOffset : range._endOffset;
+    this.#schedule();
+  }
+
+  #set(anchor, anchorOffset, focus, focusOffset) {
+    const range = new Range();
+    const forward = comparePoints(anchor, anchorOffset, focus, focusOffset) <= 0;
+    range._startNode = forward ? anchor : focus;
+    range._startOffset = forward ? anchorOffset : focusOffset;
+    range._endNode = forward ? focus : anchor;
+    range._endOffset = forward ? focusOffset : anchorOffset;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = anchor;
+    this.#anchorOffset = anchorOffset;
+    this.#focus = focus;
+    this.#focusOffset = focusOffset;
+    this.#backward = !forward;
+    this.#schedule();
+  }
+
+  get anchorNode() { this.#sync(); return this.#anchor; }
+  get anchorOffset() { this.#sync(); return this.#anchorOffset; }
+  get focusNode() { this.#sync(); return this.#focus; }
+  get focusOffset() { this.#sync(); return this.#focusOffset; }
+
+  get isCollapsed() {
+    this.#sync();
+    return this.#anchor === this.#focus && this.#anchorOffset === this.#focusOffset;
+  }
+
+  get rangeCount() { this.#sync(); return this.#ranges.length; }
+
+  /** "None", "Caret" (collapsed) or "Range". */
+  get type() {
+    this.#sync();
+    return !this.#anchor ? "None" : this.isCollapsed ? "Caret" : "Range";
+  }
+
+  /** "forward" when the focus comes after the anchor, "backward" before it, "none" when collapsed. */
+  get direction() {
+    this.#sync();
+    if (!this.#anchor || this.isCollapsed) return "none";
+    return this.#backward ? "backward" : "forward";
+  }
+
+  getRangeAt(index) {
+    this.#sync();
+    index = index >>> 0;
+    if (index >= this.#ranges.length) throw domError("IndexSizeError", "the selection has no range " + index);
+    return this.#ranges[index];
+  }
+
+  /** Selects `range`, which then is the selection's own: changing it changes the selection. Does nothing while something is selected. */
+  addRange(range) {
+    if (!(range instanceof Range)) throw new TypeError("addRange takes a Range");
+    this.#sync();
+    if (this.#ranges.length || !inDocument(range._startNode)) return;
+    this.#unhook();
+    this.#ranges = [this.#hook(range)];
+    this.#anchor = range._startNode;
+    this.#anchorOffset = range._startOffset;
+    this.#focus = range._endNode;
+    this.#focusOffset = range._endOffset;
+    this.#backward = false;
+    this.#schedule();
+  }
+
+  removeRange(range) {
+    this.#sync();
+    if (!this.#ranges.includes(range)) throw domError("NotFoundError", "the range is not in the selection");
+    this.removeAllRanges();
+  }
+
+  removeAllRanges() {
+    if (!this.#anchor && !this.#pending && !this.#ranges.length) {
+      this.#sync();
+      if (!this.#anchor) return;
+    }
+    this.#forget();
+    this.#schedule();
+  }
+
+  empty() { this.removeAllRanges(); }
+
+  /** Puts a caret at (`node`, `offset`); `null` removes the selection. */
+  collapse(node, offset = 0) {
+    if (node === null) return this.removeAllRanges();
+    checkNode(node, "the node");
+    offset = checkOffset(node, offset);
+    if (inDocument(node)) this.#set(node, offset, node, offset);
+  }
+
+  setPosition(node, offset = 0) { return this.collapse(node, offset); }
+
+  collapseToStart() {
+    this.#sync();
+    if (!this.#ranges.length) throw domError("InvalidStateError", "nothing is selected");
+    const first = this.#ranges[0];
+    this.#set(first._startNode, first._startOffset, first._startNode, first._startOffset);
+  }
+
+  collapseToEnd() {
+    this.#sync();
+    if (!this.#ranges.length) throw domError("InvalidStateError", "nothing is selected");
+    const last = this.#ranges[this.#ranges.length - 1];
+    this.#set(last._endNode, last._endOffset, last._endNode, last._endOffset);
+  }
+
+  /** Moves the focus to (`node`, `offset`); the anchor stays. */
+  extend(node, offset = 0) {
+    checkNode(node, "the node");
+    this.#sync();
+    if (!this.#anchor) throw domError("InvalidStateError", "nothing is selected");
+    offset = checkOffset(node, offset);
+    if (inDocument(node)) this.#set(this.#anchor, this.#anchorOffset, node, offset);
+  }
+
+  setBaseAndExtent(anchorNode, anchorOffset, focusNode, focusOffset) {
+    checkNode(anchorNode, "the anchor node");
+    checkNode(focusNode, "the focus node");
+    anchorOffset = checkOffset(anchorNode, anchorOffset);
+    focusOffset = checkOffset(focusNode, focusOffset);
+    if (inDocument(anchorNode) && inDocument(focusNode)) this.#set(anchorNode, anchorOffset, focusNode, focusOffset);
+  }
+
+  selectAllChildren(node) {
+    checkNode(node, "the node");
+    if (inDocument(node)) this.#set(node, 0, node, node.childNodes.length);
+  }
+
+  deleteFromDocument() {
+    this.#sync();
+    for (const range of [...this.#ranges]) range.deleteContents();
+  }
+
+  /** Whether the selection holds all of `node`, or any of it with `allowPartialContainment`. */
+  containsNode(node, allowPartialContainment = false) {
+    checkNode(node, "the node");
+    this.#sync();
+    if (!this.#ranges.length || !inDocument(node)) return false;
+    const parent = node.parentNode;
+    const startNode = parent ?? node;
+    const start = parent ? indexIn(node) : 0;
+    const endNode = parent ?? node;
+    const end = parent ? start + 1 : nodeLength(node);
+    return this.#ranges.some((range) => allowPartialContainment
+      ? comparePoints(startNode, start, range._endNode, range._endOffset) < 0 && comparePoints(endNode, end, range._startNode, range._startOffset) > 0
+      : comparePoints(range._startNode, range._startOffset, startNode, start) <= 0 && comparePoints(endNode, end, range._endNode, range._endOffset) <= 0);
+  }
+
+  getComposedRanges() {
+    this.#sync();
+    return this.#ranges.map((range) => new StaticRange({
+      startContainer: range._startNode, startOffset: range._startOffset, endContainer: range._endNode, endOffset: range._endOffset,
+    }));
+  }
+
+  /** The selected text as copying gives it: rendered white space, line breaks between blocks. */
+  toString() {
+    this.#sync();
+    if (!this.#ranges.length) return "";
+    return native.selectionText?.() ?? this.#ranges.map((range) => range.toString()).join("");
+  }
+}
+
+/** The document's selection: what the user selected, which scripts can read and change. */
+export function getSelection() {
+  return (theSelection ??= new Selection(SELECTION));
+}
+
+globalThis.Selection ??= Selection;
+globalThis.getSelection ??= getSelection;
+
+// A `SelectionChange` record at a node that is not an input: `selectstart` where a press
+// started a selection (its `selectionStart` is 1), else the document's `selectionchange` at
+// the root.
+function selectionRecord(target, start) {
+  const event = new Event(start === 1 ? "selectstart" : "selectionchange", target);
+  if (start !== 1) event.bubbles = false;
+  dispatchEvent(event);
+  if (event.defaultPrevented) {
+    const selection = getSelection();
+    selection.removeAllRanges();
+    // Read back at once, so the tree stops the press before the pointer moves on.
+    void selection.rangeCount;
+  }
+  return false;
 }
 
 let rootNode = null;
@@ -2846,6 +3275,43 @@ function isPointerKind(kind) {
   return kind <= 5 || kind === 14 || kind === 28 || kind === 29;
 }
 
+// The fingers down, by `identifier`: the `Touch` each last reported.
+const touches = new Map();
+
+function touchList(list) {
+  list.item = (index) => list[index] ?? null;
+  return list;
+}
+
+// A touch record as DOM `TouchEvent`: the finger it is about is `changedTouches[0]`, and it
+// goes to the node the finger went down on. No host reports contact size or force: a touch is
+// 1 by 1 pixel, as its pointer is, with force 0.
+function fillTouch(event, kind, a, b, bits, d) {
+  const identifier = Math.floor(bits / 256) % 16777216;
+  const touch = {
+    identifier,
+    target: event.target,
+    clientX: a,
+    clientY: b,
+    pageX: a,
+    pageY: b,
+    screenX: a,
+    screenY: b,
+    radiusX: 0.5,
+    radiusY: 0.5,
+    rotationAngle: 0,
+    force: 0,
+  };
+  const start = touches.get(identifier);
+  if (start) touch.target = start.target;
+  if (kind === TOUCH_START || kind === TOUCH_START + 1) touches.set(identifier, touch);
+  else touches.delete(identifier);
+  event.cancelable = d === 1;
+  event.changedTouches = touchList([touch]);
+  event.touches = touchList([...touches.values()]);
+  event.targetTouches = touchList([...touches.values()].filter((t) => t.target === event.target));
+}
+
 // The members of DOM `PointerEvent` the record carries (see ui-js-calls `pointerBits`), and the
 // spec defaults for what no host reports: pressure 0.5 while a button is down, 0 otherwise, and
 // a contact of 1 by 1 pixel with no tilt.
@@ -2856,8 +3322,9 @@ function fillPointer(event, kind, bits, d) {
   const isPrimary = Math.floor(bits / 64) % 2 === 1;
   let pointer = pointers.get(pointerId);
   if (!pointer) {
-    pointer = { buttons: 0, capture: null, primary: isPrimary };
-    pointers.set(pointerId, pointer);
+    pointer = { buttons: 0, capture: null, primary: isPrimary, mute: false };
+    // A click comes after its pointer lifted: it leaves no pointer behind.
+    if (kind !== 2) pointers.set(pointerId, pointer);
   }
   if (kind === 0) pointer.buttons |= BUTTON_BITS[d] ?? 0;
   else if (kind === 1) pointer.buttons &= ~(BUTTON_BITS[d] ?? 0);
@@ -2886,6 +3353,14 @@ function fillPointer(event, kind, bits, d) {
 }
 
 function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
+  if (kind >= TOUCH_START) {
+    fillTouch(event, kind, a, b, modifiers, d);
+    event.shiftKey = (modifiers & 1) !== 0;
+    event.ctrlKey = (modifiers & 2) !== 0;
+    event.altKey = (modifiers & 4) !== 0;
+    event.metaKey = (modifiers & 8) !== 0;
+    return;
+  }
   if (kind <= 6 || kind === 14 || kind === 28 || kind === 29) {
     event.clientX = event.x = a;
     event.clientY = event.y = b;
@@ -2986,20 +3461,68 @@ function adopt(event, target) {
   return event;
 }
 
+// The compatibility mouse event of `type` that follows pointer event `from`.
+function mouseEvent(type, from, target) {
+  const event = new Event(type, target);
+  for (const name of ["clientX", "clientY", "x", "y", "button", "buttons", "detail", "shiftKey", "ctrlKey", "altKey", "metaKey"]) {
+    event[name] = from[name];
+  }
+  if (type === "mousemove") event.button = 0;
+  return event;
+}
+
+// Mouse events after a pointer event of a mouse or pen, as the web sends them: a prevented
+// `pointerdown` mutes `mousedown`, `mousemove` and `mouseup` until the pointer lifts.
+function compatMouse(kind, event, target) {
+  const type = MOUSE_OF.get(event.type);
+  if (!type) return;
+  const pointer = pointers.get(event.pointerId);
+  if (kind === 0 && event.defaultPrevented && pointer) pointer.mute = true;
+  const muted = pointer?.mute && (kind === 0 || kind === 1 || kind === 3);
+  if (kind === 1 && pointer) pointer.mute = false;
+  if (!muted && event.isPrimary) dispatchEvent(mouseEvent(type, event, target));
+}
+
+// The finger whose prevented `pointerdown` mutes its tap's mouse events.
+let mutedTap = null;
+
+// A tap's mouse events come just before its click, as on the web.
+function compatTap(click, target) {
+  if (mutedTap === click.pointerId) return;
+  for (const type of ["mousemove", "mousedown", "mouseup"]) {
+    const event = mouseEvent(type, click, target);
+    event.buttons = type === "mousedown" ? 1 : 0;
+    dispatchEvent(event);
+  }
+}
+
 // The host calls this for every event record, before the tree runs the default action.
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
-  if (target instanceof Svg && target._live && isPointerKind(kind)) {
-    const prevented = target._pointer(event);
-    if (kind === CLICK && !prevented) follow(target);
-    return prevented;
+  const live = target instanceof Svg && target._live && isPointerKind(kind);
+  if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
+  // A live svg sends pointer records on to the element under the pointer.
+  let prevented;
+  if (live) prevented = target._pointer(event);
+  else {
+    dispatchEvent(event);
+    prevented = event.defaultPrevented;
   }
-  dispatchEvent(event);
-  if (kind === CLICK && !event.defaultPrevented) follow(target);
-  return event.defaultPrevented;
+  if (kind === CLICK && !prevented) follow(target);
+  if (kind !== CLICK && isPointerKind(kind)) {
+    if (event.pointerType !== "touch") compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target);
+    // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
+    // pointer events, as on the web.
+    else {
+      if (kind === 0 && event.isPrimary) mutedTap = prevented ? event.pointerId : null;
+      return false;
+    }
+  }
+  return prevented;
 };
 
 // The default action of a click: the nearest link around the target opens.
@@ -3316,6 +3839,422 @@ export function memoryUsage() {
   const footprint = native.memoryUsage?.() ?? 0;
   return footprint > 0 ? { footprint, processes: 1 } : null;
 }
+
+// Selector queries run in the host on its tree (`__ui.query`); a host without one (the web
+// canvas build) answers undefined, which reads as no match.
+function queried(mode, node, selector) {
+  const answer = native.query?.(mode, node.nodeId, String(selector));
+  if (answer === -1) {
+    const message = "'" + selector + "' is not a valid selector";
+    throw typeof DOMException === "function" ? new DOMException(message, "SyntaxError") : new SyntaxError(message);
+  }
+  return answer;
+}
+
+// `getComputedStyle`: one native read per property, made when the property is read, so a
+// declaration stays live and costs nothing for the properties nobody asks for.
+const readComputed = native.computed ?? (() => undefined);
+const computedId = Symbol("node");
+// Property names by the name they were asked by, null for the declaration's own members.
+const computedNames = new Map();
+const lowerNames = new Map();
+function computedName(key, target) {
+  let name = computedNames.get(key);
+  if (name === undefined) {
+    name = key in target ? null : key === "cssFloat" ? "float"
+      : key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^(webkit|moz|ms)-/, "-$1-");
+    computedNames.set(key, name);
+  }
+  return name;
+}
+
+class CSSStyleDeclaration {
+  constructor(id) { Object.defineProperty(this, computedId, { value: id }); }
+  getPropertyValue(name) {
+    let lower = lowerNames.get(name);
+    if (lower === undefined) {
+      lower = String(name).toLowerCase();
+      if (typeof name === "string") lowerNames.set(name, lower);
+    }
+    return readComputed(this[computedId], lower) ?? "";
+  }
+  getPropertyPriority() { return ""; }
+  setProperty() { throw new TypeError("a computed style cannot be changed"); }
+  removeProperty() { throw new TypeError("a computed style cannot be changed"); }
+  get cssText() { return ""; }
+  get length() { return 0; }
+  item() { return ""; }
+}
+
+const computedTraps = {
+  get(target, key, receiver) {
+    if (typeof key === "string") {
+      const name = computedName(key, target);
+      if (name !== null) return readComputed(target[computedId], name) ?? "";
+    }
+    return Reflect.get(target, key, receiver);
+  },
+  set() { throw new TypeError("a computed style cannot be changed"); },
+};
+
+/**
+ * The values the tree resolved for `node` (an @silkui/core node, or an element of a DOM layer
+ * over one): typed and animated properties as they are now, box sizes, margins, padding and
+ * border widths as laid out, the rest as cascaded with lengths in pixels. Each property read
+ * is one call into the tree; it applies pending changes and lays out only when something
+ * changed since the last layout. Shorthands, custom properties and pseudo-elements read "".
+ */
+export function getComputedStyle(node, pseudo) {
+  const id = node?.nodeId ?? node?.node?.nodeId;
+  if (typeof id !== "number") throw new TypeError("getComputedStyle takes a node");
+  return new Proxy(new CSSStyleDeclaration(pseudo ? 0 : id), computedTraps);
+}
+
+globalThis.getComputedStyle ??= getComputedStyle;
+
+// Layout reads. Each lays out first when something changed since the last frame (as a
+// browser forces layout), leaves its numbers in the bridge and answers how many there are.
+const geometry = native.geometry ?? (() => 0);
+const ALIGNMENTS = { start: 0, center: 1, end: 2, nearest: 3 };
+const BEHAVIORS = { auto: 0, instant: 1, smooth: 2 };
+
+function alignment(value, fallback) {
+  if (value === undefined) return fallback;
+  const code = ALIGNMENTS[value];
+  if (code === undefined) throw new TypeError("'" + value + "' is not a valid ScrollLogicalPosition");
+  return code;
+}
+
+/** A read-only rectangle, as `DOMRect` on the web. */
+export class DOMRect {
+  constructor(x = 0, y = 0, width = 0, height = 0) {
+    this.x = x;
+    this.y = y;
+    this.width = width;
+    this.height = height;
+  }
+  get left() { return Math.min(this.x, this.x + this.width); }
+  get top() { return Math.min(this.y, this.y + this.height); }
+  get right() { return Math.max(this.x, this.x + this.width); }
+  get bottom() { return Math.max(this.y, this.y + this.height); }
+  toJSON() {
+    const { x, y, width, height, top, right, bottom, left } = this;
+    return { x, y, width, height, top, right, bottom, left };
+  }
+}
+
+globalThis.DOMRect ??= DOMRect;
+
+function metric(id, index) {
+  if (!native.metrics?.(id)) return 0;
+  return geometry(index);
+}
+
+function readRect(id) {
+  if (!native.rect?.(id)) return new DOMRect();
+  return new DOMRect(geometry(0), geometry(1), geometry(2), geometry(3));
+}
+
+function readRects(count) {
+  const list = [];
+  for (let i = 0; i < count; i++) list.push(new DOMRect(geometry(4 * i), geometry(4 * i + 1), geometry(4 * i + 2), geometry(4 * i + 3)));
+  list.item = (index) => list[index] ?? null;
+  return list;
+}
+
+// `scrollTo`, `scroll` and `scrollBy`: numbers, or `{ left, top, behavior }`. `by` is 4 for scrollBy.
+function scrollNode(id, x, y, by) {
+  let left, top, behavior = 0;
+  if (x !== null && typeof x === "object") {
+    left = x.left;
+    top = x.top;
+    if (x.behavior !== undefined) {
+      behavior = BEHAVIORS[x.behavior];
+      if (behavior === undefined) throw new TypeError("'" + x.behavior + "' is not a valid ScrollBehavior");
+    }
+  } else {
+    left = x;
+    top = y;
+  }
+  // As on the web, a non-finite coordinate counts as 0.
+  const has = (left !== undefined ? 1 : 0) | (top !== undefined ? 2 : 0);
+  const number = (value) => (Number.isFinite(+value) ? +value : 0);
+  if (native.scroll) native.scroll(id, number(left), number(top), behavior, has | by);
+  else if (!by) native.scrollTo(id, number(left), number(top));
+}
+
+// IntersectionObserver and ResizeObserver: the tree computes every observation after each
+// layout and calls `__ui.observed(count)` with only the entries that changed.
+const observersById = new Map();
+let nextObserverId = 0;
+
+function lengths(text, name) {
+  const parts = String(text ?? "0px").trim().split(/\s+/);
+  if (parts.length > 4) throw new SyntaxError("'" + text + "' is not a valid " + name);
+  const values = [], percent = [];
+  for (const part of parts) {
+    const match = /^(-?(?:\d+\.?\d*|\.\d+))(px|%)?$/.exec(part);
+    if (!match || (match[2] === undefined && +match[1] !== 0)) throw new SyntaxError("'" + text + "' is not a valid " + name + ": use px or %");
+    values.push(+match[1]);
+    percent.push(match[2] === "%");
+  }
+  // top, right, bottom, left as in the margin shorthand.
+  const pick = [[0, 0, 0, 0], [0, 1, 0, 1], [0, 1, 2, 1], [0, 1, 2, 3]][values.length - 1];
+  const out = pick.map((i) => values[i]);
+  let bits = 0;
+  pick.forEach((i, side) => { if (percent[i]) bits |= 1 << side; });
+  out.text = pick.map((i) => values[i] + (percent[i] ? "%" : "px")).join(" ");
+  return { values: out, bits };
+}
+
+/** As `IntersectionObserverEntry` on the web. */
+export class IntersectionObserverEntry {
+  constructor(init) { Object.assign(this, init); }
+}
+
+/** As `IntersectionObserver` on the web, with `scrollMargin` from version 2. `root` is a node or null for the window. */
+export class IntersectionObserver {
+  #id = ++nextObserverId;
+  #callback;
+  #targets = new Map();
+  #records = [];
+  #margin;
+  #scroll;
+
+  constructor(callback, options = {}) {
+    if (typeof callback !== "function") throw new TypeError("IntersectionObserver takes a callback");
+    this.#callback = callback;
+    const root = options.root ?? null;
+    if (root !== null && typeof root.nodeId !== "number" && typeof root.node?.nodeId !== "number") throw new TypeError("root must be a node or null");
+    this.root = root;
+    this.#margin = lengths(options.rootMargin, "rootMargin");
+    this.#scroll = lengths(options.scrollMargin, "scrollMargin");
+    let list = options.threshold ?? 0;
+    list = (Array.isArray(list) ? list : [list]).map(Number);
+    for (const value of list) if (!(value >= 0 && value <= 1)) throw new RangeError("Threshold values must be numbers between 0 and 1");
+    list.sort((a, b) => a - b);
+    if (list.length === 0) list.push(0);
+    Object.defineProperties(this, {
+      rootMargin: { value: this.#margin.values.text, enumerable: true },
+      scrollMargin: { value: this.#scroll.values.text, enumerable: true },
+      thresholds: { value: Object.freeze(list), enumerable: true },
+      delay: { value: 0, enumerable: true },
+      trackVisibility: { value: false, enumerable: true },
+    });
+  }
+
+  observe(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (typeof id !== "number") throw new TypeError("observe takes a node");
+    if (this.#targets.has(id)) return;
+    if (this.#targets.size === 0) {
+      const m = this.#margin.values, s = this.#scroll.values;
+      const rootId = this.root ? (this.root.nodeId ?? this.root.node.nodeId) : 0;
+      native.observer?.(this.#id, rootId, m[0], m[1], m[2], m[3], this.#margin.bits | (this.#scroll.bits << 4), s[0], s[1], s[2], s[3]);
+      for (const value of this.thresholds) native.threshold?.(this.#id, value);
+      observersById.set(this.#id, this);
+    }
+    this.#targets.set(id, target);
+    native.observe?.(this.#id, id, 0);
+  }
+
+  unobserve(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (!this.#targets.delete(id)) return;
+    native.unobserve?.(this.#id, id);
+    if (this.#targets.size === 0) observersById.delete(this.#id);
+  }
+
+  disconnect() {
+    if (this.#targets.size === 0) return;
+    this.#targets.clear();
+    native.unobserve?.(this.#id, 0);
+    observersById.delete(this.#id);
+  }
+
+  takeRecords() {
+    const records = this.#records;
+    this.#records = [];
+    return records;
+  }
+
+  // The object `observe` was given: a Foldkit element is its entries' target, not its node.
+  _target(id) { return this.#targets.get(id) ?? null; }
+
+  _queue(entry) { this.#records.push(entry); }
+
+  _deliver() {
+    const records = this.takeRecords();
+    if (records.length === 0) return;
+    try { this.#callback.call(this, records, this); } catch (error) { reportError(error); }
+  }
+}
+
+/** As `ResizeObserverEntry` on the web. */
+export class ResizeObserverEntry {
+  constructor(init) { Object.assign(this, init); }
+}
+
+const BOXES = { "content-box": 1, "border-box": 2, "device-pixel-content-box": 3 };
+
+/** As `ResizeObserver` on the web: entries come after a layout that changed the observed box. */
+export class ResizeObserver {
+  #id = ++nextObserverId;
+  #callback;
+  #targets = new Map();
+  #records = [];
+
+  constructor(callback) {
+    if (typeof callback !== "function") throw new TypeError("ResizeObserver takes a callback");
+    this.#callback = callback;
+  }
+
+  observe(target, options) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (typeof id !== "number") throw new TypeError("observe takes a node");
+    const box = BOXES[options?.box ?? "content-box"];
+    if (box === undefined) throw new TypeError("'" + options.box + "' is not a valid ResizeObserverBoxOptions");
+    this.#targets.set(id, target);
+    observersById.set(this.#id, this);
+    native.observe?.(this.#id, id, box);
+  }
+
+  unobserve(target) {
+    const id = target?.nodeId ?? target?.node?.nodeId;
+    if (!this.#targets.delete(id)) return;
+    native.unobserve?.(this.#id, id);
+    if (this.#targets.size === 0) observersById.delete(this.#id);
+  }
+
+  disconnect() {
+    if (this.#targets.size === 0) return;
+    this.#targets.clear();
+    native.unobserve?.(this.#id, 0);
+    observersById.delete(this.#id);
+  }
+
+  // The object `observe` was given: a Foldkit element is its entries' target, not its node.
+  _target(id) { return this.#targets.get(id) ?? null; }
+
+  _queue(entry) { this.#records.push(entry); }
+
+  _deliver() {
+    const records = this.#records;
+    this.#records = [];
+    if (records.length === 0) return;
+    try { this.#callback.call(this, records, this); } catch (error) { reportError(error); }
+  }
+}
+
+const size = (inlineSize, blockSize) => Object.freeze([Object.freeze({ inlineSize, blockSize })]);
+
+native.observed = function (count) {
+  // Read every entry first: a callback's own layout reads reuse the numbers.
+  const time = performance.now();
+  const touched = [];
+  let at = 0;
+  for (let n = 0; n < count; n++) {
+    const kind = geometry(at);
+    const observer = observersById.get(geometry(at + 1));
+    const target = observer?._target(geometry(at + 2)) ?? null;
+    const read = (i) => geometry(at + i);
+    if (kind === 1) {
+      if (observer && target) {
+        observer._queue(new IntersectionObserverEntry({
+          time,
+          target,
+          isIntersecting: read(3) === 1,
+          isVisible: false,
+          intersectionRatio: read(4),
+          boundingClientRect: new DOMRect(read(5), read(6), read(7), read(8)),
+          intersectionRect: new DOMRect(read(9), read(10), read(11), read(12)),
+          rootBounds: new DOMRect(read(13), read(14), read(15), read(16)),
+        }));
+      }
+      at += 17;
+    } else {
+      if (observer && target) {
+        observer._queue(new ResizeObserverEntry({
+          target,
+          contentRect: new DOMRect(read(3), read(4), read(5), read(6)),
+          borderBoxSize: size(read(7), read(8)),
+          contentBoxSize: size(read(9), read(10)),
+          devicePixelContentBoxSize: size(read(11), read(12)),
+        }));
+      }
+      at += 13;
+    }
+    if (observer && !touched.includes(observer)) touched.push(observer);
+  }
+  // ResizeObserver callbacks first, as browsers run them before intersection updates.
+  for (const observer of touched) if (observer instanceof ResizeObserver) observer._deliver();
+  for (const observer of touched) if (observer instanceof IntersectionObserver) observer._deliver();
+};
+
+globalThis.IntersectionObserver ??= IntersectionObserver;
+globalThis.IntersectionObserverEntry ??= IntersectionObserverEntry;
+globalThis.ResizeObserver ??= ResizeObserver;
+globalThis.ResizeObserverEntry ??= ResizeObserverEntry;
+
+/** The topmost node at window point `x`, `y`, or null. */
+export function elementFromPoint(x, y) {
+  return nodes.get(native.hit?.(Number(x), Number(y)) ?? 0) ?? null;
+}
+
+/** Every node at window point `x`, `y`, topmost first. */
+export function elementsFromPoint(x, y) {
+  const count = native.hits?.(Number(x), Number(y)) ?? 0;
+  const list = [];
+  for (let i = 0; i < count; i++) {
+    const node = nodes.get(geometry(i));
+    if (node) list.push(node);
+  }
+  return list;
+}
+
+/** The text position at window point `x`, `y`: `{ offsetNode, offset, getClientRect() }` (UTF-16 offset), or null. */
+export function caretPositionFromPoint(x, y) {
+  if (!native.caret?.(Number(x), Number(y))) return null;
+  const offsetNode = nodes.get(geometry(0)) ?? null;
+  const offset = geometry(1);
+  const rect = new DOMRect(geometry(2), geometry(3), geometry(4), geometry(5));
+  return { offsetNode, offset, getClientRect: () => rect };
+}
+
+/**
+ * The rectangles of the text from (`startNode`, `startOffset`) to (`endNode`, `endOffset`),
+ * offsets in UTF-16 units as in a DOM `Range`: one per line piece, as `Range.getClientRects`.
+ */
+export function rangeClientRects(startNode, startOffset, endNode, endOffset) {
+  return readRects(native.rangeRects?.(startNode.nodeId, startOffset, endNode.nodeId, endOffset) ?? 0);
+}
+
+/** The union of `rangeClientRects`, as `Range.getBoundingClientRect`. */
+export function rangeBoundingClientRect(startNode, startOffset, endNode, endOffset) {
+  const rects = rangeClientRects(startNode, startOffset, endNode, endOffset);
+  if (rects.length === 0) return new DOMRect();
+  let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+  for (const rect of rects) {
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  return new DOMRect(left, top, right - left, bottom - top);
+}
+
+/**
+ * `CSS.supports(property, value)` and `CSS.supports(conditionText)`, answered by the same parser
+ * and property catalog as the tree's `@supports`, so a check here and an `@supports` block in a
+ * stylesheet always agree. Also installed as `globalThis.CSS.supports`.
+ */
+export function supports(conditionOrProperty, value) {
+  if (!native.supports) return false;
+  return arguments.length > 1 ? native.supports(String(conditionOrProperty), String(value)) : native.supports(String(conditionOrProperty));
+}
+
+if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
+globalThis.CSS.supports ??= supports;
 
 let frameStatsSince = 0;
 

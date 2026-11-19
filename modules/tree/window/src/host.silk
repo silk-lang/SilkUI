@@ -17,7 +17,7 @@
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
-import lib { toInputAt, windowCursor, HostState, serve, coalesce }
+import lib { toInputAt, showCursor, HostState, serve, coalesce }
 import adapter { fastScrollOf, reportWindow, reportWindowOf }
 import browser { stylePreferences }
 import ui_tree.style_media { Preferences }
@@ -841,7 +841,8 @@ effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         theirs,
         time,
       )
-      platform.setCursor(shown.window, windowCursor(tree.cursor()))
+      let cursorScale = platform.scaleFactor(shown.window)
+      run showCursor(&mut platform, shown.window, &mut tree, cursorScale)
     }
     Event.Resized { size, scaleFactor, .. } => {
       shown.width = size.width
@@ -911,7 +912,8 @@ effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           time,
         )
         drop run tree.useRoot(root)
-        platform.setCursor(shown.window, windowCursor(tree.cursor()))
+        let cursorScale = platform.scaleFactor(shown.window)
+        run showCursor(&mut platform, shown.window, &mut tree, cursorScale)
       } else {
         match &event.* {
           Event.Focused { .. } => run pumpOwner(
@@ -1143,6 +1145,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     Option.None => run prepareGpu(check)
   }
   let mut tree = run UiTree.make(collection)
+  // Ctrl/Cmd + and - zoom the page; a browser zooms a canvas page on its own.
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    tree.zoomKeys = true
+  }
 
   // A window per root. In the browser a window is a canvas, and the renderer knows the
   // canvases of four.
@@ -1301,6 +1307,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           deadline = f64.max(0.0, value)
         }
       }
+      let fontWake = tree.fontWake()
+      if fontWake >= 0.0 {
+        let due = f64.max(0.0, fontWake - now)
+        if deadline < 0.0 || due < deadline {
+          deadline = due
+        }
+      }
       if let Option<f64>.Some { value } = companion.nextDeadline() {
         let due = f64.max(0.0, value - now)
         if deadline < 0.0 || due < deadline {
@@ -1401,7 +1414,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     let mut redraw = backgroundChanged
     if !check {
       run content.tick(&mut state, &mut tree, time, false)
-      redraw = content.needsFrame(&state.*, &tree)
+      redraw = content.needsFrame(&state.*, &tree) || tree.fontWakeDue(time)
       let dropped = run renderer.takePresented(&mut intervals)
       if intervals.length() != 0 || dropped != 0 {
         run content.presented(&mut state, intervals.asSlice(), dropped)
@@ -1427,7 +1440,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           break
         }
       }
-      platform.setCursor(owner, windowCursor(tree.cursor()))
+      let cursorScale = platform.scaleFactor(owner)
+      run showCursor(&mut platform, owner, &mut tree, cursorScale)
       redraw = true
     }
     let about = match &next {
@@ -1714,7 +1728,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 break
               }
               run content.pump(&mut state, &mut tree)
-              platform.setCursor(owner, windowCursor(tree.cursor()))
+              let cursorScale = platform.scaleFactor(owner)
+              run showCursor(&mut platform, owner, &mut tree, cursorScale)
             }
             redraw = check || content.wantsFrames(&state.*) || content.needsFrame(&state.*, &tree)
               || dock.isSome() && tree.needsFrameOf(dockRoot(&dock))
@@ -1808,7 +1823,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   run serve(&mut platform, owner, &mut tree, &mut host)
                   drop run companion.pump(&mut tree, &mut inspector, time)
                   drop run tree.useRoot(into)
-                  platform.setCursor(owner, windowCursor(tree.cursor()))
+                  let cursorScale = platform.scaleFactor(owner)
+                  run showCursor(&mut platform, owner, &mut tree, cursorScale)
                   redraw = tree.needsFrameOf(into) || (serves && inspector.wantsFrame())
                   drop run tree.useRoot(FIRST_ROOT)
                 } else {
@@ -1821,7 +1837,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   if handling >= 0.0 {
                     waiting.handled = waiting.handled + (run seconds(&mut clock)) - handling
                   }
-                  platform.setCursor(owner, windowCursor(tree.cursor()))
+                  let cursorScale = platform.scaleFactor(owner)
+                  run showCursor(&mut platform, owner, &mut tree, cursorScale)
                   redraw = content.needsFrame(&state.*, &tree)
                 }
               }
@@ -1923,6 +1940,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 static if Intrinsic.targetArchitecture() != "wasm32" {
   import headless
   import headless { Script, Turn, FRAME, Desktop }
+  import input_overlay { InputOverlay, INPUT_ROOT }
 
   /// Runs `content` with no display, no GPU and no window, as the script at `path` says (see
   /// `headless.silk`): every turn of the loop serves the script's requests, lets one frame of
@@ -1953,6 +1971,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     inspector.deferInput()
     let mut tree = run UiTree.make(collection)
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
+    tree.zoomKeys = true
     run content.setup(&mut state, &mut tree)
     run tree.apply(move resources)
     let mut script = match move run Script.load(path, &mut inspector) {
@@ -1978,6 +1997,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     run content.resize(&mut state, &mut tree, f64.toF32(width), f64.toF32(height))
     drop tree.setStylePreferences(Preferences.desktop(false))
     let mut snapshot = CpuSnapshot.make()
+    let mut overlay = run InputOverlay.make()
+    let mut recorded = Scene.make()
     let mut time: f64 = 0.0
     let mut status: i32 = 0
     while true {
@@ -1998,6 +2019,11 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       if local || remote || inspector.hasInput() {
         while true {
           if run inspector.beginNext(&mut tree) {
+            if script.showsInput() {
+              if let Option<&Input>.Some { value } = inspector.begun() {
+                run overlay.note(value, time)
+              }
+            }
             run inspector.observe(&tree)
             let prevented = run content.decide(&mut state, &mut tree)
             run inspector.finishNext(&mut tree, prevented)
@@ -2028,9 +2054,20 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run serve(&mut platform, owner, &mut tree, &mut host)
       run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
       run snapshot.copyUploads(&tree)
-      if script.isRecording() {
+      if script.showsInput() {
+        run overlay.frame(&mut tree, &mut inspector, viewport)
+        recorded.clear()
+        run recorded.replay(content.scene(&state.*, &tree), 0, usize.MAX)
+        run recorded.replay(tree.sceneOf(INPUT_ROOT), 0, usize.MAX)
+        run recorded.finish()
+        run snapshot.copyUploads(&tree)
+        let pixels = run snapshot.renderSceneOver(&tree, &recorded, color.white())
+        run script.frame(&pixels)
+      } else if script.isRecording() {
         let pixels = run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
         run script.frame(&pixels)
+      } else {
+        run overlay.tear(&mut tree, &mut inspector)
       }
       tree.clearUploads()
       run content.pump(&mut state, &mut tree)

@@ -3,6 +3,7 @@
 //! client hears about comes out as `Event` records; nothing calls back into it.
 import engine { UiTree }
 import input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, POINTER_TOUCH }
+import mutation { Overflow }
 import mutation {
   NodeKind,
   StyleState,
@@ -36,15 +37,15 @@ import text_selection
 import scroll_snap
 import touch
 import scroll_anchor
-import paint { styleSlot, borderBox, paddingBox, overflowClip, contentBox }
+import paint { styleSlot, borderBox, paddingBox, overflowClip, nodeRadii, insideRounded, rounds, contentBox }
 import live_svg
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
-import layout.lib { FragmentKind, InvalidNode }
+import layout.lib { Fragment, FragmentKind, InvalidNode }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import silk.geometry.point { Point2 }
+import silk.geometry.point { Point2, Point3 }
 import transform
 import silk.geometry.rect { Rect }
 import layers
@@ -122,12 +123,12 @@ fn inside(rect: Rect<f32>, x: f32, y: f32) -> bool {
 /// transform flattens it, the point maps behind the viewer, or it shows a hidden back face.
 fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f32>> {
   let point = Point2<f32> { x: x, y: y }
-  match layers.transformOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+  if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+    return Option<Point2<f32>>.None
+  }
+  match layers.flatOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
     Option.Some { value } => {
-      if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
-        return Option<Point2<f32>>.None
-      }
-      return match transform.flatten(value).inverse() {
+      return match value.inverse() {
         Option.Some { value: inverse } => transform.map(&inverse, x, y)
         Option.None => Option<Point2<f32>>.None
       }
@@ -167,13 +168,61 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool, 
   if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
   }
+  // A plane of a 3D rendering context is hit through the context's root, by depth.
+  if tree.preserveUsed {
+    if layers.planeParent(&tree.output, &tree.slotOfCss, &tree.nodes, index) != NO_INDEX {
+      return NONE
+    }
+    if layers.establishes(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+      return hitContext(tree, index, px, py, &mut landing.*)
+    }
+  }
   let local = intoLocal(tree, index, px, py)
   if local.isNone() {
     return NONE
   }
   let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
-  let x = point.x
-  let y = point.y
+  return hitPlane(tree, index, point.x, point.y, pruned, &mut landing.*)
+}
+
+/// The frontmost target under (`px`, `py`), in the space around fragment `root`, among the
+/// planes of the 3D rendering context `root` establishes: each plane's own content is hit
+/// where the point meets it, and the nearest plane hit wins (the later one in tree order
+/// between coplanar ones), as in Chromium.
+fn hitContext(tree: &UiTree<'_>, root: usize, px: f32, py: f32, landing: &mut Landing) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let mut best = NONE
+  let mut bestDepth: f32 = 0.0
+  let end = values[root].nextSibling
+  let mut at = root
+  while at != NO_INDEX && at != end {
+    if layers.contextOf(&tree.output, &tree.slotOfCss, &tree.nodes, at) == root
+      && !layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, at) {
+      let m = layers.accumulated(&tree.output, &tree.slotOfCss, &tree.nodes, at)
+      if let Option.Some { value: inverse } = transform.flatten(m).inverse() {
+        if let Option.Some { value: local } = transform.map(&inverse, px, py) {
+          let h = m.transformHomogeneous(Point3<f32> { x: local.x, y: local.y, z: 0.0 })
+          let depth: f32 = if h[3] != 0.0 { h[2] / h[3] } else { 0.0 }
+          if best == NONE || depth >= bestDepth - 0.05 {
+            let mut planeLanding = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+            let found = hitPlane(tree, at, local.x, local.y, false, &mut planeLanding)
+            if found != NONE {
+              best = found
+              landing.* = planeLanding
+              bestDepth = depth
+            }
+          }
+        }
+      }
+    }
+    at = layers.nextInTree(&tree.output, at, root)
+  }
+  return best
+}
+
+/// The topmost target under (`x`, `y`), in fragment `index`'s own layout space, in it and its
+/// descendants.
+fn hitPlane(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
     return hitInside(tree, index, x, y, pruned, &mut landing.*)
@@ -195,19 +244,43 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool, 
     return hitInside(tree, index, x, y, pruned, &mut landing.*)
   }
   let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
-  if !clips || inside(overflowClip(&tree.node(slot).computed, &f), x, y) {
+  if !clips || insideClip(tree, slot, &f, x, y) {
     let below = hitInside(tree, index, x, y, pruned, &mut landing.*)
     if below != NONE {
       return below
     }
   }
-  if inside(borderBox(&f), x, y) && targetable(tree, slot) {
+  if insideBorder(tree, slot, &f, x, y) && targetable(tree, slot) {
     landing.fragment = index
     landing.x = x
     landing.y = y
     return slot
   }
   return NONE
+}
+
+/// Whether (`x`, `y`) is inside box fragment `f` of node `slot`, whose rounded corners cut
+/// what is hit as they cut what is painted.
+fn insideBorder(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let border = borderBox(f)
+  let c = &tree.node(slot).computed
+  if !rounds(c) {
+    return inside(border, x, y)
+  }
+  return insideRounded(border, nodeRadii(tree.node(slot), c, f.size.width, f.size.height), x, y)
+}
+
+/// Whether (`x`, `y`) is inside the overflow clip of box fragment `f` of node `slot`: its
+/// padding box's rounded corners clip when both axes clip, as paint's `clipMask` does.
+fn insideClip(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let c = &tree.node(slot).computed
+  let clip = overflowClip(c, f)
+  let both = usedOverflow(c, true) != Overflow.Visible && usedOverflow(c, false) != Overflow.Visible
+  if !rounds(c) || !(both || c.contain.paint()) {
+    return inside(clip, x, y)
+  }
+  let radii = nodeRadii(tree.node(slot), c, f.size.width, f.size.height).insetTo(borderBox(f), clip)
+  return insideRounded(clip, radii, x, y)
 }
 
 /// Whether the stacking flags describe the last layout.
@@ -293,8 +366,7 @@ fn insideBetween(
     if clipsAt(tree, at) {
       let f = values[at]
       let slot = slotIn(&tree.slotOfCss, f.source)
-      let clip = overflowClip(&tree.node(slot).computed, &f)
-      if !inside(clip, x - (total.x - below.x), y - (total.y - below.y)) {
+      if !insideClip(tree, slot, &f, x - (total.x - below.x), y - (total.y - below.y)) {
         return false
       }
     }
@@ -524,6 +596,19 @@ effect fn hitsChildren(
 
 /// The cursor of the hovered node.
 pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
+  return cursorFrom(tree).cursor
+}
+
+/// What decides the hovered node's cursor: the cursor, and the slot whose CSS `cursor` lists
+/// images first (NONE when none does).
+pub struct CursorFrom {
+  pub cursor: Cursor,
+  pub images: u32,
+}
+
+impl Copy for CursorFrom {}
+
+pub fn cursorFrom(tree: &UiTree<'_>) -> CursorFrom {
   let chain = tree.hoverChain.asSlice()
   let mut i: usize = 0
   while i < chain.length {
@@ -531,21 +616,21 @@ pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
     if alive(tree, slot, pairId(chain[i])) {
       let node = tree.node(slot)
       if node.cursor != Cursor.Default {
-        return node.cursor
+        return CursorFrom { cursor: node.cursor, images: NONE }
       }
       match node.computed.cursor {
         Option.Some { value } => {
-          return value
+          return CursorFrom { cursor: value, images: if node.computed.cursorUrl { slot } else { NONE } }
         }
         Option.None => {}
       }
       if node.kind == NodeKind.Input {
-        return Cursor.Text
+        return CursorFrom { cursor: Cursor.Text, images: NONE }
       }
     }
     i = i + 1
   }
-  return Cursor.Default
+  return CursorFrom { cursor: Cursor.Default, images: NONE }
 }
 
 // Records.
@@ -854,7 +939,6 @@ effect fn captureRecord(tree: &mut UiTree<'_>, kind: EventKind, flag: u32, slot:
   event.primary = tree.pointerPrimary
   run tree.queueEvent(move event)
 }
-
 
 /// The node holding the capture of the press, or NONE.
 pub fn captureHolder(tree: &UiTree<'_>) -> u32 {
@@ -1260,6 +1344,31 @@ fn same(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
+// Ctrl (Cmd on macOS) with `=` or `+` zooms in a step, with `-` out, with `0` back to 100%, in
+// the steps browsers take.
+fn zoomKey(tree: &mut UiTree<'_>, key: &[u8], modifiers: u32) -> bool {
+  let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
+  if u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) != primary || key.length != 1 { return false }
+  let steps: [f32; 17] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0]
+  let now = tree.pageZoom()
+  let mut next = now
+  if key[0] == 48 {
+    next = 1.0
+  } else if key[0] == 61 || key[0] == 43 {
+    let mut i: usize = 0
+    while i < steps.length && steps[i] <= now + 0.001 { i = i + 1 }
+    if i < steps.length { next = steps[i] }
+  } else if key[0] == 45 {
+    let mut i: usize = steps.length
+    while i > 0 && steps[i - 1] >= now - 0.001 { i = i - 1 }
+    if i > 0 { next = steps[i - 1] }
+  } else {
+    return false
+  }
+  drop tree.setPageZoom(next)
+  return true
+}
+
 fn enterClicks(kind: Role) -> bool {
   return kind == Role.Button || kind == Role.Link || kind == Role.MenuItem || kind == Role.Tab
     || kind == Role.Option
@@ -1415,7 +1524,7 @@ pub effect fn panChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bo
 /// Scrolls by (`dx`, `dy`) from `slot` outwards: each axis scrolls the nearest container that
 /// can still move that way, and what it cannot take goes to the containers around it. Returns
 /// whether any container moved.
-effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
+pub effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut moved = false
@@ -1859,9 +1968,17 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
 
 /// Ctrl+C, or Cmd+C with the Mac keymap.
 fn copyKey(tree: &UiTree<'_>, key: string, modifiers: u32) -> bool {
+  return commandKey(tree, key, modifiers, "c")
+}
+
+/// Ctrl with letter `lower` (Cmd with the Mac keymap), either case.
+fn commandKey(tree: &UiTree<'_>, key: string, modifiers: u32, lower: string) -> bool {
   let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
   let held = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META)
-  return held == primary && (key == "c" || key == "C")
+  if held != primary { return false }
+  let a = String.utf8Bytes(key)
+  let b = String.utf8Bytes(lower)
+  return a.length == 1 && (a[0] == b[0] || a[0] + 32 == b[0])
 }
 
 /// `finish` for pointer, wheel and key input.
@@ -1989,6 +2106,7 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       drop run scrollChain(&mut tree, if layoutHit != NONE { layoutHit } else { hit }, deltaX, deltaY)
     }
     Input.KeyDown { key, modifiers, repeat, .. } => {
+      if tree.zoomKeys && !prevented && zoomKey(&mut tree, String.utf8Bytes(String.view(&key)), modifiers) { return () }
       let target = keyTarget(&tree.*)
       if target == NONE {
         tree.suppressText = false
@@ -2009,6 +2127,13 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
       if same && copyKey(&tree.*, String.view(&key), modifiers) && run text_selection.copy(&mut tree) {
+        return ()
+      }
+      let editing = tree.focused != NONE && tree.node(tree.focused).kind == NodeKind.Input
+      if same && !editing && commandKey(&tree.*, String.view(&key), modifiers, "a") && run text_selection.selectAll(&mut tree) {
+        return ()
+      }
+      if same && !editing && run text_selection.extend(&mut tree, String.view(&key), modifiers) {
         return ()
       }
       if plain && String.view(&key) == "Tab" {
