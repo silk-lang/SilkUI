@@ -5,7 +5,8 @@
 # Writes out/<scene>/silk-react and VERSION (what it was built from).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); XB=$(cd "$HERE/../.." && pwd); WEB=$XB/apps/react/web
-: "${SILKUI:?set SILKUI to the Silk UI checkout to build against (for example engine-work/silkui)}"
+# The Silk UI checkout to build against: by default the one this suite lives in.
+SILKUI=${SILKUI:-$(cd "$(dirname "$0")/../../.." && pwd)}
 scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(feed wall stream churn)
 VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$SILKUI/modules/silkui/window/silk.toml" | tr -d '"')
 (cd "$WEB" && [[ -d node_modules/vite ]] || npm ci --no-audit --no-fund)
@@ -25,4 +26,4 @@ for scene in "${scenes[@]}"; do
   echo "built silk-react $scene"
 done
 rev() { git -C "$1" rev-parse --short=10 HEAD 2>/dev/null || echo unknown; }
-printf '{"silkui": "%s", "silkui_path": "%s", "silk": "%s", "built": "%s"}\n' "$(rev "$SILKUI")" "$SILKUI" "$VERSION" "$(date -u +%FT%TZ)" > "$HERE/VERSION"
+printf '{"silkui": "%s", "silkui_path": "%s", "silk": "%s", "built": "%s"}\n' "$(rev "$SILKUI")" "${SILKUI/#$HOME/~}" "$VERSION" "$(date -u +%FT%TZ)" > "$HERE/VERSION"

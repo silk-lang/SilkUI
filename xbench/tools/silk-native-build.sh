@@ -8,7 +8,8 @@
 set -euo pipefail
 APP=$(cd "$1" && pwd); shift; NAME=$(basename "$APP")
 XB=$(cd "$(dirname "$0")/.." && pwd); WEB=$XB/apps/react/web
-: "${SILKUI:?set SILKUI to the Silk UI checkout to build against}"
+# The Silk UI checkout to build against: by default the one this suite lives in.
+SILKUI=${SILKUI:-$(cd "$(dirname "$0")/../.." && pwd)}
 scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(feed wall stream churn)
 W=$SILKUI/modules/tree/window/silk.toml
 pin() { grep -m1 -oE "$1\.git\", rev = \"[0-9a-f]{40}\", path = \"$2\"" "$W" | grep -oE '[0-9a-f]{40}'; }
@@ -47,5 +48,5 @@ for scene in "${scenes[@]}"; do
   [[ $(uname) == Darwin ]] && codesign -f -s - "$APP/out/$scene/$NAME" > /dev/null 2>&1 || true
 done
 rev() { git -C "$1" rev-parse --short=10 HEAD 2>/dev/null || echo unknown; }
-printf '{"silkui": "%s", "silkui_path": "%s", "silk": "%s", "loom": "%s", "built": "%s"}\n' "$(rev "$SILKUI")" "$SILKUI" "$VERSION" "${LOOM:+$(rev "$LOOM")}" "$(date -u +%FT%TZ)" > "$APP/VERSION"
+printf '{"silkui": "%s", "silkui_path": "%s", "silk": "%s", "loom": "%s", "built": "%s"}\n' "$(rev "$SILKUI")" "${SILKUI/#$HOME/~}" "$VERSION" "${LOOM:+$(rev "$LOOM")}" "$(date -u +%FT%TZ)" > "$APP/VERSION"
 echo "built $NAME"

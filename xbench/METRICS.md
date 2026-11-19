@@ -32,7 +32,7 @@ metric is the median over runs, with the spread shown in the artifact.
   comparable number. It runs anywhere (the cloud, CI).
 - **gpu** (`--suite gpu`): a real window on a real display, frames presented. It measures what a
   user sees: start time to the first painted frame, frame times with the GPU in the loop, idle
-  CPU, and memory with GPU resources. It needs a machine with a display and a GPU (Julia's Mac).
+  CPU, and memory with GPU resources. It needs a machine with a display and a GPU (a Mac).
 
 ## Capped or uncapped frames
 

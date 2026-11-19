@@ -1,5 +1,8 @@
 # xbench
 
+In the Silk UI repository since 2026-11-19. It started in another repository; the merge keeps
+its commits.
+
 A benchmark of UI frameworks on the same content: Silk UI + React, Silk UI + Loom, Silk UI with
 a hand-built tree, Electron, GPUI, Rune and FerroUI.
 
@@ -18,7 +21,7 @@ a hand-built tree, Electron, GPUI, Rune and FerroUI.
 
 ## Build
 
-Everything builds from `xbench/`. Linux needs `xvfb` for Electron, and the GPUI build needs
+Everything builds from `xbench/`, the folder this README is in. Linux needs `xvfb` for Electron, and the GPUI build needs
 `libxkbcommon-x11-dev`, `libxcb1-dev` and `libfreetype-dev`.
 
 ```sh
@@ -27,7 +30,8 @@ Everything builds from `xbench/`. Linux needs `xvfb` for Electron, and the GPUI 
 for s in feed wall stream churn; do (cd apps/react/web && VITE_XB_SCENE=$s npx vite build --config vite.web.config.js); done
 (cd apps/electron && npm ci)
 
-# Silk UI apps (SILKUI is the Silk UI checkout; LOOM the Loom checkout for silk-loom)
+# Silk UI apps. SILKUI is the Silk UI checkout to measure: by default this one, the repository
+# the suite lives in. LOOM is the Loom checkout for silk-loom.
 SILKUI=... apps/silk-react/build.sh
 SILKUI=... tools/silk-native-build.sh apps/silk-direct
 SILKUI=... LOOM=... tools/silk-native-build.sh apps/silk-loom

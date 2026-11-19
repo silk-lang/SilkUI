@@ -9,7 +9,7 @@ and whether it is on the critical path to the first frame (solid) or runs beside
 
 - Silk UI apps: the windowless bench's own lines ("bench: first frame ...", "bench: startup ...",
   "silkui: ..."). With a Silk UI build that has the start-up trace points (SILK_UI_TRACE_FRAMES,
-  SILK_UI_TRACE_JS, the windowed path), the main, UI and render threads as in Julia's start-up
+  SILK_UI_TRACE_JS, the windowed path), the main, UI and render threads as in the start-up
   report of 2026-11-19.
 - Electron: Chromium's startup trace (browser, GPU and renderer processes, raster workers), read
   the way that report read it.
@@ -48,7 +48,7 @@ def num(line, key):
 
 
 def silk_segments(lines, first_paint):
-    """Silk UI, from the trace points (windowed, Julia's report) or the windowless bench's lines."""
+    """Silk UI, from the trace points (windowed, the start-up report) or the windowless bench's lines."""
     t = first_times(lines)
     g = t.get
     S = Segs()
@@ -173,7 +173,7 @@ def span_segments(lines, first_paint):
 
 
 def electron_segments(d):
-    """Chromium's startup trace, phase for phase as in Julia's start-up report."""
+    """Chromium's startup trace, phase for phase as in the start-up report."""
     ev = d["trace"]["traceEvents"]
     t0 = d["t0_us"]
     names = {e["pid"]: e["args"]["name"] for e in ev if e.get("ph") == "M" and e["name"] == "process_name"}

@@ -187,7 +187,7 @@ def mapped_files(pids):
 
 # ---------- one run ----------
 
-# Chromium's startup trace for Electron in timeline runs: the categories Julia's startup report used.
+# Chromium's startup trace for Electron in timeline runs: the categories the startup report used.
 ELECTRON_TRACE_CATS = ",".join(["toplevel", "startup", "navigation", "loading", "blink", "blink.user_timing", "v8", "v8.execute",
                                 "devtools.timeline", "disabled-by-default-devtools.timeline", "viz", "gpu", "cc", "benchmark",
                                 "electron", "browser", "content", "renderer_host", "ui", "latencyInfo"])
@@ -385,6 +385,9 @@ def machine():
         chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
     else:
         chip = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.machine())
+    if MAC:
+        # Not the host name (it is usually the owner's name): the chip, as "mac-m1-max".
+        name = "mac-" + re.sub(r"[^a-z0-9]+", "-", chip.lower().replace("apple", "")).strip("-")
     info = {"host": os.environ.get("XB_MACHINE", name), "os": platform.platform(), "cpu": chip, "cores": os.cpu_count()}
     if MAC:
         # Dark mode costs Silk UI a second layout before its first frame (its early layout assumes

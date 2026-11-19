@@ -14,7 +14,7 @@ each one is driven. Read it before comparing two numbers.
 - First paint in a window: two `requestAnimationFrame` callbacks and the host's frame counter
   past zero.
 - On macOS in dark mode, Silk lays the page out a second time before its first frame. Its early
-  layout assumes the light appearance, and the first real frame restyles. Julia's startup report
+  layout assumes the light appearance, and the first real frame restyles. the startup report
   (2026-11-19) measured 67 ms on 1,000 messages. Results record the appearance.
 
 ## Silk UI + Loom (`silk-loom`)

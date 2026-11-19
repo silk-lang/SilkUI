@@ -24,7 +24,7 @@ An app prints lines that start with `XB ` on standard output or standard error. 
   - Electron's page waits for two `requestAnimationFrame` callbacks after its first render.
   - Loom, GPUI and Rune pass on no presentation, so they say it at their second frame callback.
   - Electron's line can be checked against Chromium's own first contentful paint, which it stamps
-    with the frame's presentation time: launch with `--trace-startup` and read the trace (Julia's
+    with the frame's presentation time: launch with `--trace-startup` and read the trace (the
     startup report of 2026-11-19 did this). Tracing
     costs Electron some start time, so the runner does not trace by default.
   - Windowed runs need the Mac unlocked, awake (the runner keeps it awake with `caffeinate`) and
