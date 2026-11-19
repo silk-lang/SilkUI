@@ -81,6 +81,7 @@ pub fn handles(property: CssProperty) -> bool {
     || property == CssProperty.TextShadow
     || property == CssProperty.ShapeOutside
     || property == CssProperty.ShapeMargin
+    || property == CssProperty.ShapeImageThreshold
     || isMask(property)
     || isBackgroundLayer(property)
     || isMaskBorder(property)
@@ -441,6 +442,10 @@ pub struct Effects {
   pub shapeBox: bool,
   /// `shape-margin`, a length or percentage in `numerics`.
   pub shapeMargin: Option<ExprId>,
+  /// Zero or one `shape-outside` image (`url()` or a gradient), in place of `shape`.
+  pub shapeImage: List<Image>,
+  /// `shape-image-threshold`, the alpha an image's pixels must pass to be in the shape.
+  pub shapeThreshold: f32,
   /// `border-image`, drawn in place of the border's style.
   pub borderImage: ImageBorder,
   /// `mask-border`, a mask over the border area besides the mask layers.
@@ -470,6 +475,8 @@ impl Effects {
       shape: List<ClipSource>.make(),
       shapeBox: false,
       shapeMargin: Option<ExprId>.None,
+      shapeImage: List<Image>.make(),
+      shapeThreshold: 0.0,
       borderImage: ImageBorder.make(),
       maskBorder: ImageBorder.make(),
       offset: List<ClipSource>.make(),
@@ -809,7 +816,8 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     run applyOffsetPath(&mut effects.*, &source, &mut cursor, &context)
     return
   }
-  if property == CssProperty.ShapeOutside || property == CssProperty.ShapeMargin {
+  if property == CssProperty.ShapeOutside || property == CssProperty.ShapeMargin
+    || property == CssProperty.ShapeImageThreshold {
     run applyShape(&mut effects.*, property, css, &source, &mut cursor, &context)
     return
   }
@@ -944,7 +952,8 @@ fn allAuto(values: &[BorderMeasure; 4]) -> bool {
 }
 
 /// `shape-outside` takes `clip-path`'s shapes and boxes, with the margin box as the default
-/// reference; images are not read. `shape-margin` is one nonnegative length or percentage.
+/// reference, or an image. `shape-margin` is one nonnegative length or percentage, and
+/// `shape-image-threshold` one alpha value, clamped to 0 to 1.
 effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], source: &Input<'_>, cursor: &mut Cursor, context: &LengthContext) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -959,12 +968,42 @@ effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], s
     }
     return
   }
-  if cursor.ident(source, b"none") {
-    if cursor.done(source) {
-      effects.shape.clear()
+  if property == CssProperty.ShapeImageThreshold {
+    match run dimensions.parse(&mut effects.numerics, source, &mut cursor.*, Dimension.NumberPercentage, false) {
+      Option<ExprId>.Some { value } => {
+        if cursor.done(source) {
+          let id = run dimensions.compute(&mut effects.numerics, value, context)
+          effects.shapeThreshold = f32.min(1.0, f32.max(0.0, effects.number(id)))
+        }
+      }
+      _ => {}
     }
     return
   }
+  if cursor.ident(source, b"none") {
+    if cursor.done(source) {
+      effects.shape.clear()
+      effects.shapeImage.clear()
+    }
+    return
+  }
+  // Colors only matter for their alpha, so `currentColor` computes as opaque black.
+  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
+  let colors = ColorContext.make(black, [black; 19])
+  let start = cursor.*
+  match run effect_values.parseImage(&mut effects.numerics, source, &mut cursor.*) {
+    Option<Image>.Some { value } => {
+      if cursor.done(source) {
+        let image = run effect_values.computeImage(&value, &mut effects.numerics, context, &colors)
+        effects.shape.clear()
+        effects.shapeImage.clear()
+        run effects.shapeImage.append(move image)
+        return
+      }
+    }
+    _ => {}
+  }
+  cursor.* = start
   let named = namesBox(css)
   let value = match run effect_values.parse(&mut effects.numerics, CssProperty.ClipPath, source, &mut cursor.*, false) {
     Option<EffectValue>.Some { value } => move value
@@ -975,8 +1014,6 @@ effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], s
   if !cursor.done(source) {
     return
   }
-  let black = Color.srgb(0.0, 0.0, 0.0, 1.0)
-  let colors = ColorContext.make(black, [black; 19])
   let computed = run effect_values.compute(&value, &mut effects.numerics, context, &colors)
   match move computed {
     EffectValue.ClipPath { source: clip } => {
@@ -987,6 +1024,7 @@ effect fn applyShape(effects: &mut Effects, property: CssProperty, css: &[u8], s
         _ => {}
       }
       effects.shape.clear()
+      effects.shapeImage.clear()
       run effects.shape.append(move clip)
       effects.shapeBox = named
     }
