@@ -35,7 +35,7 @@ import harfrust.lib {
 }
 import read_fonts.lib { FontRef }
 import read_fonts.model.metrics { Metrics, LineBox }
-import font_types.lib { F2Dot14, F48Dot16, Tag }
+import font_types.lib { F2Dot14, F48Dot16, Fixed, Tag }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
@@ -227,6 +227,11 @@ struct Instance {
   settings: Variations,
   coords: List<F2Dot14>,
   unitsPerEm: f32,
+  /// HVAR's region scalars and every glyph's advance at `coords`, worked out by the first shaping
+  /// call at this instance and lent to each later one (empty at the default location).
+  scalars: List<Fixed>,
+  advances: List<F48Dot16>,
+  gdefScalars: List<Fixed>,
 }
 
 /// What a font key stands for: a style, and the face instance drawing it.
@@ -291,8 +296,12 @@ pub struct FontState<'a> {
   keys: List<KeyInfo>,
   metrics: List<FontMetrics>,
   instances: List<Instance>,
-  data: List<Option<ShaperData<'a>>>,
-  /// Per face in `data`: whether it shapes with AAT tables (morx, mort, kerx).
+  /// The shaping data of the faces that have shaped text, and for each face of the set its
+  /// place in `data` plus one, or 0: the set lists every face the system has, thousands, and
+  /// an app shapes with a few.
+  data: List<ShaperData<'a>>,
+  dataSlots: List<u32>,
+  /// Per entry of `data`: whether the face shapes with AAT tables (morx, mort, kerx).
   aat: List<bool>,
   plans: List<PlanEntry<'a>>,
   buffer: Buffer,
@@ -474,7 +483,8 @@ impl<'a> FontState<'a> {
       keys: List<KeyInfo>.make(),
       metrics: List<FontMetrics>.make(),
       instances: List<Instance>.make(),
-      data: List<Option<ShaperData<'a>>>.make(),
+      data: List<ShaperData<'a>>.make(),
+      dataSlots: List<u32>.make(),
       aat: List<bool>.make(),
       plans: List<PlanEntry<'a>>.make(),
       buffer: Buffer.new(),
@@ -649,7 +659,7 @@ impl<'a> FontState<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut chain = List<Link>.make()
-    run self.set.chain(style.families.asSlice(), style.request, &mut chain)
+    run self.set.cachedChain(style.families.asSlice(), style.request, &mut chain)
     let families = move style.families
     let mut primary = self.set.primary(chain.asSlice())
     if primary.isNone() {
@@ -688,24 +698,31 @@ impl<'a> FontState<'a> {
   effect fn loadFace(self: &mut Self, face: usize) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
-    while self.data.length() <= face {
-      run self.data.append(Option<ShaperData<'a>>.None)
-      run self.aat.append(false)
+    while self.dataSlots.length() <= face {
+      run self.dataSlots.append(0)
     }
-    if self.data.asSlice()[face].isSome() {
+    if self.dataSlots.get(face) != 0 {
       return true
     }
     if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
-      self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
-      self.aat.set(
-        face,
+      run self.data.append(ShaperData.new(&font))
+      run self.aat.append(
         font.tableData(Tag.fromU32(0x6d6f7278)).isSome()
           || font.tableData(Tag.fromU32(0x6d6f7274)).isSome()
           || font.tableData(Tag.fromU32(0x6b657278)).isSome(),
       )
+      self.dataSlots.set(face, usize.toU32(self.data.length()))
       return true
     }
     return false
+  }
+
+  /// The shaping data of `face`, once [`loadFace`] has made it.
+  fn shaper(self: &Self, face: usize) -> Option<&ShaperData<'a>> {
+    if face >= self.dataSlots.length() || self.dataSlots.get(face) == 0 {
+      return Option<&ShaperData<'a>>.None
+    }
+    return Option<&ShaperData<'a>>.Some { value: &self.data.asSlice()[u32.toUsize(self.dataSlots.get(face)) - 1] }
   }
 
   effect fn instanceFor(self: &mut Self, selection: Selection, size: f32, settings: &Variations) -> usize
@@ -772,7 +789,7 @@ impl<'a> FontState<'a> {
         }
         axis = axis + 1
       }
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[selection.face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(selection.face) {
         unitsPerEm = u16.toF32(data.upem)
         if wanted.length() > 0 {
           let mut shaper = ConfiguredShaper.new(&data)
@@ -789,6 +806,9 @@ impl<'a> FontState<'a> {
         settings: settings.*,
         coords: move coords,
         unitsPerEm: unitsPerEm,
+        scalars: List<Fixed>.make(),
+        advances: List<F48Dot16>.make(),
+        gdefScalars: List<Fixed>.make(),
       },
     )
     return self.instances.length() - 1
@@ -1006,7 +1026,7 @@ impl<'a> FontState<'a> {
       index = index + 1
     }
     if plan == usize.MAX {
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(face) {
         let made = run makePlan(
           &data,
           self.instances.asSlice()[instance].coords.asSlice(),
@@ -1028,14 +1048,28 @@ impl<'a> FontState<'a> {
         return
       }
     }
-    if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
-      let mut shaper = ConfiguredShaper.new(&data)
+    let slot = if face < self.dataSlots.length() { self.dataSlots.get(face) } else { 0 }
+    if slot != 0 {
+      let data = &self.data.asSlice()[u32.toUsize(slot) - 1]
+      let mut shaper = ConfiguredShaper.new(data)
       run shaper.coords.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let held = &mut self.instances.asMutSlice()[instance]
+      shaper.hvarScalars = Intrinsic.replace(held.scalars, List<Fixed>.make())
+      shaper.hvarAdvances = Intrinsic.replace(held.advances, List<F48Dot16>.make())
+      shaper.gdefScalars = Intrinsic.replace(held.gdefScalars, List<Fixed>.make())
+      if held.coords.length() != 0 && shaper.hvarAdvances.length() == 0 {
+        run shaper.setNormalizedCoords(held.coords.asSlice())
+        run shaper.prepareAdvances()
+      }
       let shaped = run shape(
         &shaper,
         &mut self.buffer,
         ShapeOptions.forPlan(&self.plans.asSlice()[plan].plan, wanted.asSlice()),
       )
+      let back = &mut self.instances.asMutSlice()[instance]
+      back.scalars = Intrinsic.replace(shaper.hvarScalars, List<Fixed>.make())
+      back.advances = Intrinsic.replace(shaper.hvarAdvances, List<F48Dot16>.make())
+      back.gdefScalars = Intrinsic.replace(shaper.gdefScalars, List<Fixed>.make())
       if let Result<(), ShapeError>.Failure { error: _ } = move shaped {
         return
       }
@@ -1081,7 +1115,8 @@ impl<'a> FontState<'a> {
       return false
     }
     let face = self.instances.asSlice()[info.instance].face
-    return face < self.aat.length() && !self.aat.get(face)
+    let slot = if face < self.dataSlots.length() { self.dataSlots.get(face) } else { 0 }
+    return slot != 0 && !self.aat.get(u32.toUsize(slot) - 1)
   }
 
   /// CSS pixels per font unit for key `key`.

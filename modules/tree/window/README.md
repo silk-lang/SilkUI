@@ -95,6 +95,22 @@ Script lines are `ui-inspect-cli` commands served through a local inspector sess
 
     SILK_UI_HEADLESS=script.txt build/x86_64-unknown-linux-gnu/dev/ui-tree-window-demo
 
+With `SILK_UI_BENCH=<frames>` (release builds too) `runWindow` runs the client for that many
+frames with no window system, GPU or script (`runBench`) and prints on standard error what the
+UI thread spent: the first frame from process start to layout, its layout and its paint, then
+for every 120 frames the mean milliseconds of the app's tick, of layout (and the slowest) and
+of paint, with the layout passes and boxes laid out. The clock moves 1/120 s a frame.
+
+- `SILK_UI_BENCH_X`, `SILK_UI_BENCH_Y`: the pointer moves to that point (CSS pixels) halfway
+  through, so one run has frames with the pointer outside and inside.
+- `SILK_UI_BENCH_PAUSE=<ms>`: spins that long before the clock starts, for a sampler that
+  attaches as the process starts.
+- `SILK_UI_BENCH_DIGEST=1`: digests of the first frame's layout (every box, every glyph where
+  it draws, every text run), to check that two builds lay out the same; `dump` adds a line for
+  each text fragment.
+
+    SILK_UI_BENCH=2400 SILK_UI_BENCH_X=520 SILK_UI_BENCH_Y=400 dist/window/my-app
+
 The check dispatches a click and Tab through the real input path, verifies the
 updated text, and compares GPU output with the CPU reference. `--debug` builds a
 development binary; `--build-only` compiles without opening a window.

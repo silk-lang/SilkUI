@@ -2,6 +2,7 @@
 //! coverage, line breaking with real advances, glyph runs behind fragments, run sharing and
 //! hyphenation. `silk task browser chrome-text` checks positions in Chrome.
 import system { TextSystem }
+import analysis { Analyzer, analyze }
 import fonts { TextStyle, Treatment }
 import properties.computed { TextTransform, WordBreak, OverflowWrap }
 import set { FaceRule, FaceState, UnicodeRange }
@@ -17,7 +18,8 @@ import layout.lib {
   TextError,
   FragmentationError,
   FragmentKind,
-  TextFragment
+  PlacedText,
+  TextToken, TextTokenKind, Direction, UnicodeBidi, WritingMode, TextOrientation, WhiteSpaceCollapse, TextJustify, TextContext, TextBreak
 }
 
 static if Intrinsic.targetOperatingSystem() == "windows" {
@@ -124,8 +126,8 @@ effect fn layout(system: &mut TextSystem<'_>, key: usize, width: f32, text: stri
   return move output
 }
 
-/// The text fragments of `output`, with their y positions.
-effect fn texts(output: &LayoutTree, out: &mut List<TextFragment>, ys: &mut List<f32>) -> ()
+/// The runs of text of `output`, with their y positions.
+effect fn texts(output: &LayoutTree, out: &mut List<PlacedText>, ys: &mut List<f32>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   out.clear()
@@ -135,8 +137,11 @@ effect fn texts(output: &LayoutTree, out: &mut List<TextFragment>, ys: &mut List
   while index < fragments.length {
     let fragment = &fragments[index]
     if fragment.kind == FragmentKind.Text && fragment.textData != usize.MAX {
-      run out.append(output.fragments.texts.get(fragment.textData))
-      run ys.append(fragment.worldLocation.y)
+      let mut runs = output.fragments.textRuns(index)
+      while runs.next() {
+        run out.append(runs.current)
+        run ys.append(runs.current.location.y)
+      }
     }
     index = index + 1
   }
@@ -175,7 +180,7 @@ effect fn latinTextWrapsAtWordBoundariesBody() -> ()
   let mut system = TextSystem.make(&collection)
   let key = run system.addStyle(run sans(16.0))
   let wide = run layout(&mut system, key, 1000.0, "The quick brown fox jumps")
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&wide, &mut found, &mut ys)
   run Testing.expect(found.length() > 1, "fragments split at word boundaries")
@@ -224,7 +229,7 @@ effect fn thaiTextWrapsAtDictionaryWordsBody() -> ()
   let mut words = List<usize>.make()
   run IcuDictionary.make().wordBreaks(text, &mut words)
   let narrow = run layout(&mut system, key, 1.0, text)
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&narrow, &mut found, &mut ys)
   let mut lines: usize = 1
@@ -260,7 +265,7 @@ effect fn fallbackPicksTheFaceThatHasTheCharactersBody() -> ()
   let mut system = TextSystem.make(&collection)
   let key = run system.addStyle(run sans(20.0))
   let output = run layout(&mut system, key, 1000.0, "Hi مرحبا 漢字")
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&output, &mut found, &mut ys)
   let mut arabic = false
@@ -307,23 +312,26 @@ effect fn glyphRunsMatchTheirFragmentsBody() -> ()
   while index < fragments.length {
     let fragment = &fragments[index]
     if fragment.kind == FragmentKind.Text && fragment.textData != usize.MAX {
-      let data = output.fragments.texts.get(fragment.textData)
-      let glyphRun = system.glyphRun(data.shapeKey)
-      let glyphs = system.runGlyphs(data.shapeKey)
-      run Testing.expect(glyphs.length > 0, "the run has glyphs")
-      run Testing.expect(
-        near(glyphRun.advance, fragment.size.width),
-        "the run advance is the fragment width",
-      )
-      run Testing.expect(glyphRun.size == 16.0, "the run keeps the font size")
-      let mut pen: f32 = 0.0
-      let mut at: usize = 0
-      while at < glyphs.length {
-        run Testing.expect(near(glyphs[at].x, pen), "glyphs sit at the running pen position")
-        pen = pen + glyphs[at].advance
-        at = at + 1
+      let mut runs = output.fragments.textRuns(index)
+      while runs.next() {
+        let data = runs.current
+        let glyphRun = system.glyphRun(data.shapeKey)
+        let glyphs = system.runGlyphs(data.shapeKey)
+        run Testing.expect(glyphs.length > 0, "the run has glyphs")
+        run Testing.expect(
+          near(glyphRun.advance, data.size.width),
+          "the run advance is the run's width",
+        )
+        run Testing.expect(glyphRun.size == 16.0, "the run keeps the font size")
+        let mut pen: f32 = 0.0
+        let mut at: usize = 0
+        while at < glyphs.length {
+          run Testing.expect(near(glyphs[at].x, pen), "glyphs sit at the running pen position")
+          pen = pen + glyphs[at].advance
+          at = at + 1
+        }
+        checked = checked + 1
       }
-      checked = checked + 1
     }
     index = index + 1
   }
@@ -346,8 +354,8 @@ effect fn identicalRunsShareAShapeKeyBody() -> ()
   let count = system.glyphs.length()
   let second = run layout(&mut system, key, 80.0, "same words here")
   run Testing.expect(system.glyphs.length() == count, "laying out the same text again adds no runs")
-  let mut a = List<TextFragment>.make()
-  let mut b = List<TextFragment>.make()
+  let mut a = List<PlacedText>.make()
+  let mut b = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&first, &mut a, &mut ys)
   run texts(&second, &mut b, &mut ys)
@@ -387,7 +395,7 @@ effect fn softHyphensBreakAndShowAHyphenBody() -> ()
 
   // "extra\u{AD}ordinary": a block too narrow for the word breaks at the soft hyphen.
   let output = run layout(&mut system, key, 50.0, "extra\u{AD}ordinary")
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&output, &mut found, &mut ys)
   run Testing.expect(found.length() == 2, "the word breaks once")
@@ -403,6 +411,46 @@ test effect fn fontMetricsComeFromTheFace() -> ()
   ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run fontMetricsComeFromTheFaceBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn plainBreaksBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let words = ["A", " ", "file.", " ", "Yes?", " ", "office"]
+  let mut tokens = List<TextToken<'static>>.make()
+  let mut analyzer = Analyzer.make()
+  let mut index: usize = 0
+  while index < words.length {
+    run tokens.append(TextToken { kind: if index % 2 == 0 { TextTokenKind.Text } else { TextTokenKind.Space },
+      text: words[index], source: 0, sourceStart: 0, sourceEnd: String.byteLength(words[index]), fontKey: key,
+      direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal, replacedInline: false,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed,
+      whiteSpaceCollapse: WhiteSpaceCollapse.Collapse, textJustify: TextJustify.Auto, shapingBarrier: false })
+    let mut context = TextContext { tokens: tokens.asSlice(), direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed, textJustify: TextJustify.Auto }
+    let mut direct = List<TextBreak>.make()
+    let mut reference = List<TextBreak>.make()
+    let actual = run analyze(&mut analyzer, context, &system.fonts, &mut direct)
+    context.unicodeBidi = UnicodeBidi.Plaintext
+    let expected = run analyze(&mut analyzer, context, &system.fonts, &mut reference)
+    run Testing.expect(actual.paragraph.hasStrong == expected.paragraph.hasStrong && actual.level == expected.level
+      && actual.paragraph.end.equal(expected.paragraph.end) && direct.length() == reference.length(), "ordinary Latin agrees with Unicode paragraph analysis")
+    let mut boundary: usize = 0
+    while boundary < reference.length() {
+      let value = direct.get(boundary)
+      run Testing.expect(value.at.equal(reference.get(boundary).at) && value.kind == reference.get(boundary).kind, "identical break opportunity")
+      boundary = boundary + 1
+    }
+    index = index + 1
+  }
+}
+
+test effect fn simpleParagraphBreaksMatchUnicodeAnalysis() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run plainBreaksBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn latinTextWrapsAtWordBoundaries() -> ()
@@ -514,7 +562,7 @@ effect fn opticalSizingBody() -> ()
   i = 0
   while i < 2 {
     let output = run layout(&mut system, keys.get(i), 2000.0, "Hamburgefonts")
-    let mut found = List<TextFragment>.make()
+    let mut found = List<PlacedText>.make()
     let mut ys = List<f32>.make()
     run texts(&output, &mut found, &mut ys)
     let advance = system.glyphRun(found.get(0).shapeKey).advance / sizes[i]
@@ -545,7 +593,7 @@ effect fn opticalSizingBody() -> ()
     }
     let key = run system.addStyle(move style)
     let output = run layout(&mut system, key, 2000.0, "Hamburgefonts")
-    let mut found = List<TextFragment>.make()
+    let mut found = List<PlacedText>.make()
     let mut ys = List<f32>.make()
     run texts(&output, &mut found, &mut ys)
     run flexAdvances.append(system.glyphRun(found.get(0).shapeKey).advance)
@@ -592,7 +640,7 @@ effect fn families(names: &[string], size: f32) -> TextStyle
 effect fn runFaces(system: &TextSystem<'_>, output: &LayoutTree, out: &mut List<usize>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&output, &mut found, &mut ys)
   let mut i: usize = 0
@@ -753,7 +801,7 @@ test effect fn unicodeRangeSplitsAFamily() -> ()
 effect fn extent(system: &TextSystem<'_>, output: &LayoutTree, lines: &mut usize) -> f32
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut found = List<TextFragment>.make()
+  let mut found = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   run texts(&output, &mut found, &mut ys)
   let mut total: f32 = 0.0
@@ -898,8 +946,8 @@ effect fn sameShaping(
 ) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut a = List<TextFragment>.make()
-  let mut b = List<TextFragment>.make()
+  let mut a = List<PlacedText>.make()
+  let mut b = List<PlacedText>.make()
   let mut ys = List<f32>.make()
   let mut otherYs = List<f32>.make()
   run texts(leftOutput, &mut a, &mut ys)

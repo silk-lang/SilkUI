@@ -31,12 +31,17 @@ import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
 
-/// One layout fragment of a node, in CSS pixels of the viewport.
+/// One layout fragment of a node, in CSS pixels of the viewport. Text comes as one entry for
+/// each run (a word, a space) of each of its text fragments.
 pub struct FragmentInfo {
   pub kind: FragmentKind,
-  /// The fragment's index in the layout output, and its parent's (a line box for text).
+  /// The fragment's index in the layout output (the same for the runs of one text fragment),
+  /// and its parent's.
   pub index: usize,
   pub parent: usize,
+  /// For a run of text: what tells the line box it sits on from every other (equal for the
+  /// runs of one line, and nothing else: not a fragment index). NO_INDEX otherwise.
+  pub line: usize,
   pub border: Rect<f32>,
   pub padding: Rect<f32>,
   pub content: Rect<f32>,
@@ -102,16 +107,30 @@ pub effect fn fragmentsOf(tree: &UiTree<'_>, slot: u32, out: &mut List<FragmentI
     }
     let moved = tree.visualFragment(i)
     let f = &moved
-    run out.append(
-      FragmentInfo {
-        kind: f.kind,
-        index: i,
-        parent: f.parent,
-        border: borderBox(f),
-        padding: paddingBox(f),
-        content: contentBox(f),
-      },
-    )
+    if f.kind == FragmentKind.Text {
+      let shift = tree.shiftOf(i)
+      let mut runs = tree.output.fragments.textRuns(i)
+      while runs.next() {
+        let x = runs.current.location.x + shift.x
+        let y = runs.current.location.y + shift.y
+        let box = Rect<f32>.new(x, y, x + runs.current.size.width, y + runs.current.size.height)
+        run out.append(
+          FragmentInfo { kind: f.kind, index: i, parent: f.parent, line: runs.current.line, border: box, padding: box, content: box },
+        )
+      }
+    } else {
+      run out.append(
+        FragmentInfo {
+          kind: f.kind,
+          index: i,
+          parent: f.parent,
+          line: NO_INDEX,
+          border: borderBox(f),
+          padding: paddingBox(f),
+          content: contentBox(f),
+        },
+      )
+    }
     if i == own {
       own = tree.nextSourceFragment.get(i)
     } else {
@@ -142,7 +161,7 @@ pub effect fn infoSlot(tree: &UiTree<'_>, slot: u32) -> Option<NodeInfo>
     if source < tree.fragmentOf.length() && (pass == 0 || source != node.css) {
       let mut fragment = tree.fragmentOf.get(source)
       while fragment != NO_INDEX {
-        let border = borderBox(&tree.visualFragment(fragment))
+        let border = tree.visualBounds(fragment)
         bounds = if laidOut {
           merge(bounds, border)
         } else {
@@ -221,7 +240,7 @@ pub effect fn findAll(tree: &UiTree<'_>, value: string, out: &mut List<u32>) -> 
     stack.truncate(last)
     let node = tree.node(slot)
     if node.isGenerated() { continue }
-    if same(String.view(&node.testId), value) || same(String.view(&node.label), value)
+    if same(node.testId(), value) || same(String.view(&node.label), value)
       || same(String.view(&node.text), value) {
       run out.append(node.id)
     }
@@ -567,9 +586,9 @@ effect fn describeNode(
     run out.append(" label=")
     run quoted(&mut out, String.view(&node.label))
   }
-  if String.ownedByteLength(&node.testId) != 0 {
+  if String.utf8Bytes(node.testId()).length != 0 {
     run out.append(" testId=")
-    run quoted(&mut out, String.view(&node.testId))
+    run quoted(&mut out, node.testId())
   }
   if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
     run out.append(" ")
@@ -599,10 +618,10 @@ effect fn describeNode(
     // Text: one rectangle per line box it occupies.
     let mut j: usize = 0
     while j < fragments.length() {
-      let line = fragments.get(j).parent
+      let line = fragments.get(j).line
       let mut rect = fragments.get(j).border
       j = j + 1
-      while j < fragments.length() && fragments.get(j).parent == line {
+      while j < fragments.length() && fragments.get(j).line == line {
         rect = merge(rect, fragments.get(j).border)
         j = j + 1
       }
@@ -646,9 +665,9 @@ effect fn describeNode(
     let parent = if node.parent == NONE {
       TextStyle.initial()
     } else {
-      tree.node(node.parent).computed.text
+      tree.node(node.parent).computed().text
     }
-    run describeStyles(&mut out, &node.computed, parent, node.kind)
+    run describeStyles(&mut out, &node.computed().*, parent, node.kind)
     if let Option<&Effects>.Some { value } = node.paintEffects() {
       run describeEffects(&mut out, value)
     }
@@ -707,11 +726,11 @@ fn pickFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> u32 {
   let slot = tree.slotOfCssNode(f.source)
   let box = borderBox(&f)
   let opaque = !f.positioningShell && f.kind != FragmentKind.Line && slot != NONE
-  if opaque && f.kind == FragmentKind.Box && tree.node(slot).computed.clips() {
+  if opaque && f.kind == FragmentKind.Box && tree.node(slot).computed().clips() {
     let p = paddingBox(&f)
     if !inside(p.xMin, p.yMin, p.xMax, p.yMax, x, y) {
       if inside(box.xMin, box.yMin, box.xMax, box.yMax, x, y)
-        && tree.node(slot).computed.text.visible {
+        && tree.node(slot).computed().text.visible {
         return slot
       }
       return NONE
@@ -725,8 +744,12 @@ fn pickFragment(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> u32 {
     }
     child = values[child].previousSibling
   }
-  if opaque && inside(box.xMin, box.yMin, box.xMax, box.yMax, x, y)
-    && tree.node(slot).computed.text.visible {
+  let within = if f.kind == FragmentKind.Text {
+    tree.textContains(index, x, y)
+  } else {
+    inside(box.xMin, box.yMin, box.xMax, box.yMax, x, y)
+  }
+  if opaque && within && tree.node(slot).computed().text.visible {
     return slot
   }
   return NONE
