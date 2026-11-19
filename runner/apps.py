@@ -61,6 +61,8 @@ def electron(scene, suite, uncapped):
     base = os.path.join(APPS, "electron")
     exe = (os.path.join(base, "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron") if MAC
            else os.path.join(base, "node_modules/electron/dist/electron"))
+    if not os.path.exists(exe):
+        raise SystemExit(f"electron: no binary at {exe}. After npm ci, run node node_modules/electron/install.js in apps/electron.")
     env = {"XB_SCENE": scene}
     if uncapped:
         env["XB_UNCAPPED"] = "1"

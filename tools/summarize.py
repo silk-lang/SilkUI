@@ -25,7 +25,7 @@ def version_of(rec):
 def main():
     groups = defaultdict(list)
     for name in sorted(os.listdir(RESULTS)):
-        if not name.endswith(".jsonl"):
+        if not name.endswith(".jsonl") or name.endswith("-timeline.jsonl"):
             continue
         for line in open(os.path.join(RESULTS, name)):
             line = line.strip()

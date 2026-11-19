@@ -40,6 +40,18 @@ apps/gpui/fetch.sh && (cd apps/gpui && cargo build --release)
 
 The Rust apps pin their toolchain with `rust-toolchain.toml`, so rustup installs it on first build.
 
+Gotchas:
+
+- `silk-loom`: Loom pins Silk UI by revision. `silk-native-build.sh` links that revision in the
+  Silk home's git cache (`$SILK_HOME/git/<rev>`) to `$SILKUI`, so all three Silk apps build against
+  the same Silk UI. Check the Silk UI revision in `apps/*/VERSION` before comparing runs.
+- Electron: if `npm ci` skipped the download (`ignore-scripts`, or a cache), the binary is missing;
+  run `node node_modules/electron/install.js` in `apps/electron`.
+- GPUI on macOS compiles Metal shaders: it needs Xcode's Metal toolchain
+  (`xcodebuild -downloadComponent MetalToolchain`).
+- App names for `--apps`: `silk-direct`, `silk-loom`, `silk-react`, `electron`, `rune`, `gpui`,
+  `ferroui`.
+
 ## Run
 
 ```sh

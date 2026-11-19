@@ -14,6 +14,18 @@ W=$SILKUI/modules/tree/window/silk.toml
 pin() { grep -m1 -oE "$1\.git\", rev = \"[0-9a-f]{40}\", path = \"$2\"" "$W" | grep -oE '[0-9a-f]{40}'; }
 # Loom pins Silk UI by revision: the one its window module names (mapped to $SILKUI in the Silk home).
 LOOM_SILKUI=$([[ -n "${LOOM:-}" ]] && grep -m1 -oE 'silkui.git", rev = "[0-9a-f]{40}' "$LOOM/modules/loom/window/silk.toml" | grep -oE '[0-9a-f]{40}' || true)
+# Point the Silk home's git cache for that revision at $SILKUI, so Loom builds against the same
+# Silk UI as the other apps (and without fetching Loom's pin).
+if [[ -n "$LOOM_SILKUI" ]]; then
+  CACHE=${SILK_HOME:-$HOME/.silk}/git
+  mkdir -p "$CACHE"
+  if [[ ! -e "$CACHE/$LOOM_SILKUI" || -L "$CACHE/$LOOM_SILKUI" ]]; then
+    ln -sfn "$SILKUI" "$CACHE/$LOOM_SILKUI"
+    printf 'https://github.com/silk-lang/silkui.git\n%s\n' "$LOOM_SILKUI" > "$CACHE/$LOOM_SILKUI.fetched"
+  else
+    echo "note: $CACHE/$LOOM_SILKUI is a real checkout, not \$SILKUI; Loom builds against it" >&2
+  fi
+fi
 VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$W" | tr -d '"')
 sed -e "s#@SILKUI@#$SILKUI#g" -e "s#@SILK_VERSION@#$VERSION#g" \
     -e "s#@LIB_FONTS@#$(pin lib-fonts modules/collection)#g" -e "s#@LIB_GRAPHICS@#$(pin lib-graphics modules/atlas)#g" \
