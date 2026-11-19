@@ -47,6 +47,19 @@ import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.text.string { String }
 import silk.num.f64
 
+/// How often the window looks at the JavaScript memory the engine holds idle, in seconds.
+const RELEASE_INTERVAL: f64 = 2.0
+/// Idle memory under this is left with the engine, which takes it straight back.
+const RELEASE_IDLE_BYTES: usize = 8388608
+/// What a release leaves idle beyond what turned idle since the last look.
+const RELEASE_RESERVE_BYTES: usize = 2097152
+
+/// The JavaScript memory the engine held idle at the last look, and when the next one is.
+struct IdleMemory {
+  at: f64,
+  bytes: usize,
+}
+
 /// A module given to [`JsApp.define`], kept to define it again after a reload.
 struct Defined {
   name: List<u8>,
@@ -71,6 +84,7 @@ pub struct JsApp<'m> {
   openers: Openers,
   /// Measurement scaffolding: the JavaScript side of the first frame (see [`Startup`]).
   startup: Startup,
+  idle: IdleMemory,
 }
 
 /// Measurement scaffolding: what JavaScript cost before the first layout, in milliseconds.
@@ -153,6 +167,7 @@ impl<'m> JsApp<'m> {
     let timed = traced || (run environmentVariable("SILK_UI_BENCH")).isSome()
     return JsApp {
       startup: Startup { on: timed, traced: traced, reported: false, callbacks: 0.0, apply: 0.0 },
+      idle: IdleMemory { at: 0.0, bytes: 0 },
       host: move host,
       allocator: move own,
       memory: memory,
@@ -228,6 +243,33 @@ impl<'m> JsApp<'m> {
     let before = milliseconds()
     run self.host.flushRaw(&mut tree)
     self.startup.apply = self.startup.apply + (milliseconds() - before)
+  }
+
+  /// Hands the JavaScript memory the app stopped using back to the system, looking every
+  /// [`RELEASE_INTERVAL`] of the window's clock `time`. A first render or a long reply
+  /// leaves the engine holding what it freed, which counts against the app for as long as
+  /// it runs. Only memory that was idle at two looks in a row goes, so what a busy app
+  /// frees and takes again each frame stays with the engine.
+  fn releaseIdle(self: &mut Self, time: f64) -> () {
+    if time < self.idle.at { return () }
+    self.idle.at = time + RELEASE_INTERVAL
+    let idle = self.host.idleBytes()
+    let settled = if idle < self.idle.bytes { idle } else { self.idle.bytes }
+    self.idle.bytes = idle
+    if settled < RELEASE_IDLE_BYTES {
+      if self.startup.traced { StderrWriter.print("silkui: JavaScript memory at {} s: {} bytes idle, kept\n", &(time, idle)) }
+      return ()
+    }
+    let released = self.host.releaseIdle(idle - settled + RELEASE_RESERVE_BYTES)
+    self.idle.bytes = self.host.idleBytes()
+    if self.startup.traced {
+      StderrWriter.print("silkui: JavaScript memory at {} s: {} bytes idle, {} handed back, {} idle now\n", &(time, idle, released, self.idle.bytes))
+    }
+  }
+
+  /// Whether idle memory may be due back at the next look: the window wakes for it.
+  fn releaseDue(self: &Self) -> bool {
+    return self.idle.bytes >= RELEASE_IDLE_BYTES
   }
 
   /// Says what the entry starts from. An image this engine build cannot load is never
@@ -602,11 +644,19 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let loaded = run self.loader.serve(&mut tree)
     if loaded { drop run state.handle(&mut tree) }
     let natives = run state.natives(&mut self.jobs, &mut tree)
+    state.releaseIdle(time)
     return styled || polled || loaded || natives
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
-    let wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(self.tools.wakeAfter()))
+    let mut wanted = self.loader.watchAfter(self.stylesheetUpdates.wakeAfter(self.tools.wakeAfter()))
+    // An app that went quiet after a burst is woken once more to hand its idle memory back.
+    if state.releaseDue() {
+      wanted = match wanted {
+        Option<f64>.Some { value } => Option<f64>.some(f64.min(value, RELEASE_INTERVAL))
+        Option<f64>.None => Option<f64>.some(RELEASE_INTERVAL)
+      }
+    }
     if !self.loader.pending() && !self.jobs.pending() { return wanted }
     // Collect running loads and Silk calls about once a frame.
     return match wanted {
