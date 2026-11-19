@@ -21,7 +21,7 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, milliseconds }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
@@ -29,7 +29,7 @@ import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
 import ui_tree.legacy { UiTree, TreeError }
-import ui_tree_window.host { WindowClient }
+import ui_tree_window.host { WindowClient, environmentVariable }
 import ui_tree_window.loader { Loader }
 import ui_tree_window.platform_thread { HostPlatform }
 import ui_tree_window.console { StderrWriter }
@@ -65,6 +65,20 @@ pub struct JsApp<'m> {
   source: List<u8>,
   /// The system programs started for `window.open`.
   openers: Openers,
+  /// Measurement scaffolding: the JavaScript side of the first frame (see [`Startup`]).
+  startup: Startup,
+}
+
+/// Measurement scaffolding: what JavaScript cost before the first layout, in milliseconds.
+/// `SILK_UI_BENCH` or `SILK_UI_TRACE_JS` prints it once, as the first layout starts.
+struct Startup {
+  on: bool,
+  reported: bool,
+  /// Timers, animation frames and their promise jobs after the entry ran: with the entry's
+  /// own rendering and jobs, the app's first render.
+  callbacks: f64,
+  /// Handing what JavaScript built to the tree.
+  apply: f64,
 }
 
 effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
@@ -129,7 +143,9 @@ impl<'m> JsApp<'m> {
     // back to the system allocator, as the silkjs command line does.
     own.enablePooling()
     let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
+    let timed = (run environmentVariable("SILK_UI_BENCH")).isSome() || (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
     return JsApp {
+      startup: Startup { on: timed, reported: false, callbacks: 0.0, apply: 0.0 },
       host: move host,
       allocator: move own,
       memory: memory,
@@ -179,7 +195,21 @@ impl<'m> JsApp<'m> {
     self.host.attach(&mut tree)
     let ran = run Effect.result(self.host.module(self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move ran)
+    let before = milliseconds()
     run self.host.flushRaw(&mut tree)
+    self.startup.apply = self.startup.apply + (milliseconds() - before)
+  }
+
+  /// Measurement scaffolding: prints the JavaScript side of the first frame, once.
+  fn reportStartup(self: &mut Self) -> () {
+    if !self.startup.on || self.startup.reported { return () }
+    self.startup.reported = true
+    let entry = self.host.entryTimes()
+    let gc = self.host.gcTimes()
+    StderrWriter.print(
+      "bench: js entry={} load-ms={} evaluate-ms={} render-ms={} apply-ms={} gc-ms={} gc-full={} gc-young={}\n",
+      &(if entry.image { "image" } else { "source" }, entry.load, entry.evaluate, entry.render + entry.jobs + self.startup.callbacks, self.startup.apply, gc.milliseconds, gc.full, gc.young),
+    )
   }
 
   /// Runs `source` as a script named `name`, prints what it wrote and threw, and applies
@@ -440,6 +470,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
 
   effect fn layout(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
+    state.reportStartup()
     let media = tree.mediaState(input)
     if state.host.mediaChanges(&media) {
       let told = run Effect.result(state.host.setMedia(media)) |> Effect.provideMut<Allocator>(&mut state.allocator)
@@ -558,9 +589,15 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     state.host.attach(&mut tree)
+    let before = milliseconds()
     let ran = run Effect.result(state.host.tick(time, animation)) |> Effect.provideMut<Allocator>(&mut state.allocator)
+    let called = milliseconds()
     run state.settle(move ran)
     run state.host.flushRaw(&mut tree)
+    if !state.startup.reported {
+      state.startup.callbacks = state.startup.callbacks + (called - before)
+      state.startup.apply = state.startup.apply + (milliseconds() - called)
+    }
     run self.load(&mut state, &mut tree)
   }
 
