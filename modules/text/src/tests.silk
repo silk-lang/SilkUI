@@ -28,6 +28,10 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.native.host_input { NativeHostInput }
 }
 
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  import silk.system.filesystem_machine { MachineFileSystem }
+}
+
 import silk.system.host_input { HostInputError }
 import silk.system.filesystem { Path, FileSystem, FileError }
 import silk.system.filesystem_native { OsFileSystem }
@@ -1005,4 +1009,98 @@ test effect fn linesTakeTheGlyphsOfTheirParagraph() -> ()
     | FragmentationError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run linesTakeTheGlyphsOfTheirParagraphBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  /// Reads a font that macOS installs.
+  effect fn systemFont(name: string) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let path = run Path.fromBytes(String.utf8Bytes(name))
+    let mut files = run MachineFileSystem.make()
+    return run FileSystem.readFile(&path) |> Effect.provideMut<FileSystem>(&mut files)
+  }
+
+  // Faces shaped with Apple's tables (morx ligatures, kern pairs, a contextual subtable that
+  // runs against the text in Geneva): lines and appended text take glyphs as other faces do.
+  effect fn appleFacesTakeTheGlyphsOfTheirParagraphBody() -> ()
+    ! AssertionError<'static>
+      | FileError
+      | HostInputError
+      | OutOfMemoryError
+      | InvalidNode
+      | TextError
+      | FragmentationError
+    ? &mut Allocator {
+    let mut collection = FontCollection.make()
+    drop run collection.add(run systemFont("/System/Library/Fonts/Helvetica.ttc"))
+    drop run collection.add(run systemFont("/System/Library/Fonts/Menlo.ttc"))
+    drop run collection.add(run systemFont("/System/Library/Fonts/Geneva.ttf"))
+    let names: [string; 3] = ["Helvetica", "Menlo", "Geneva"]
+    let paragraphs: [string; 2] = [
+      "AVATAR Wave To: Yo. office affluent Tea, We AVA. Wave fjord Ty. AVATAR Wave To: Yo. office affluent Tea",
+      "The office staff shuffled offline files: fifty-five fluffy waffles, a baffling affidavit and an efficient coffee filter (v1.17.1).",
+    ]
+    let words: [string; 8] = ["Wave", "To:", "AVATAR", "office", "Yo.", "affluent", "Tea,", "fjord"]
+    let mut name: usize = 0
+    while name < names.length {
+      let mut taking = TextSystem.make(&collection)
+      let mut shaping = TextSystem.make(&collection)
+      shaping.shaping.reuse = false
+      let mut families = List<Family>.make()
+      run families.append(run Family.named(String.utf8Bytes(names[name])))
+      let key = run taking.addStyle(TextStyle.make(move families, 16.0))
+      let mut others = List<Family>.make()
+      run others.append(run Family.named(String.utf8Bytes(names[name])))
+      drop run shaping.addStyle(TextStyle.make(move others, 16.0))
+      let mut index: usize = 0
+      while index < paragraphs.length {
+        let one = run layout(&mut taking, key, 150.0, paragraphs[index])
+        let other = run layout(&mut shaping, key, 150.0, paragraphs[index])
+        run Testing.expect(
+          run sameShaping(&taking, &one, &shaping, &other),
+          "lines cut from a paragraph in an Apple face have the glyphs shaping them gives",
+        )
+        index = index + 1
+      }
+      run Testing.expect(taking.shaping.taken > 0, "lines in an Apple face took glyphs from their paragraph")
+      run Testing.expect(
+        taking.fonts.shaperCalls < shaping.fonts.shaperCalls,
+        "taking glyphs saves shaper calls in an Apple face",
+      )
+      let mut text = String.make()
+      let mut word: usize = 0
+      while word < 40 {
+        if word > 0 {
+          run text.append(" ")
+        }
+        run text.append(words[(word * 5 + word / 3) % words.length])
+        let one = run layout(&mut taking, key, 150.0, text.view())
+        let other = run layout(&mut shaping, key, 150.0, text.view())
+        run Testing.expect(
+          run sameShaping(&taking, &one, &shaping, &other),
+          "text that grew in an Apple face has the glyphs shaping all of it gives",
+        )
+        word = word + 1
+      }
+      // Geneva's backwards subtable makes every text lean on what follows its start, so its
+      // appended text is shaped whole.
+      if name < 2 {
+        run Testing.expect(taking.shaping.continued > 0, "appended text in an Apple face shaped only its end")
+      }
+      name = name + 1
+    }
+  }
+
+  test effect fn appleFacesTakeTheGlyphsOfTheirParagraph() -> ()
+    ! AssertionError<'static>
+      | FileError
+      | HostInputError
+      | OutOfMemoryError
+      | InvalidNode
+      | TextError
+      | FragmentationError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    run appleFacesTakeTheGlyphsOfTheirParagraphBody() |> Effect.provideMut<Allocator>(&mut allocator)
+  }
 }
