@@ -81,6 +81,10 @@ each one is driven. Read it before comparing two numbers.
 - Text runs have no per-run font size, so inline `code` has the paragraph's size, not 12.5 px.
 - Tables are flex rows with relative widths. The wall is `grid_cols(16)`.
 - Windowed: frames at the display's pace (no uncapped mode). First paint at the second frame.
+- Start-up timeline (TIMELINE.md): in the cpu suite GPUI draws the whole window five or six times
+  before the scene's second frame, each a full layout of about 300 ms. The redraws come inside one
+  `run_until_parked`, most likely as the pictures land (GPUI decodes images in the background and
+  redraws when one is ready). This is not confirmed.
 
 ## FerroUI (`ferroui`)
 

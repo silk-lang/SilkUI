@@ -8,6 +8,7 @@ a hand-built tree, Electron, GPUI, Rune and FerroUI.
 - METRICS.md: what is measured, how, and why the GPU suite runs uncapped.
 - PROTOCOL.md: the `XB ...` lines an app prints and what the runner does with them.
 - LOG.md: what each app does differently. Read it before comparing numbers.
+- TIMELINE.md: the start-up of each app as phases on its threads, and how it is traced.
 
 ## Two suites
 
@@ -46,6 +47,8 @@ runner/xbench.py run --suite cpu --runs 5                    # every app, every 
 runner/xbench.py run --suite cpu --apps rune,silk-direct --scenes feed
 runner/xbench.py start --suite gpu --runs 10                 # start-up only: 1 cold, then warm
 runner/xbench.py run --suite gpu --uncapped --runs 3         # the full GPU suite (macOS)
+runner/xbench.py timeline --suite cpu --scenes feed,wall --runs 5   # start-up phases (TIMELINE.md)
+tools/summarize.py && tools/timeline.py                      # results/summary.json, results/timeline.json
 ```
 
 - `--cold N`: how many of the first runs start cold (default 1).

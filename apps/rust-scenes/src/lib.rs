@@ -34,6 +34,44 @@ pub fn say(line: &str) {
     let _ = out.flush();
 }
 
+/// Timeline runs (XB_TRACE): the start and end of a phase of start-up on one thread (lane), of
+/// one kind (start, fonts, js, style, layout, paint, gpu, present, wait), for TIMELINE.md.
+/// The runner stamps each line as it arrives.
+pub fn span_begin(lane: &str, kind: &str, label: &str) {
+    if tracing() { say(&format!("span begin {lane} {kind} {label}")); }
+}
+
+pub fn span_end(lane: &str, kind: &str, label: &str) {
+    if tracing() { say(&format!("span end {lane} {kind} {label}")); }
+}
+
+/// A span that ends when dropped.
+pub struct Phase { lane: &'static str, kind: &'static str, label: String }
+
+impl Phase {
+    pub fn new(lane: &'static str, kind: &'static str, label: &str) -> Phase {
+        span_begin(lane, kind, label);
+        Phase { lane, kind, label: label.to_string() }
+    }
+}
+
+impl Drop for Phase {
+    fn drop(&mut self) { span_end(self.lane, self.kind, &self.label); }
+}
+
+/// Runs `f` as one span.
+pub fn span<R>(lane: &str, kind: &str, label: &str, f: impl FnOnce() -> R) -> R {
+    span_begin(lane, kind, label);
+    let r = f();
+    span_end(lane, kind, label);
+    r
+}
+
+pub fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XB_TRACE").is_some())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind { Feed, Wall, Stream, Churn }
 

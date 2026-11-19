@@ -187,12 +187,30 @@ def mapped_files(pids):
 
 # ---------- one run ----------
 
-def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files):
+# Chromium's startup trace for Electron in timeline runs: the categories Julia's startup report used.
+ELECTRON_TRACE_CATS = ",".join(["toplevel", "startup", "navigation", "loading", "blink", "blink.user_timing", "v8", "v8.execute",
+                                "devtools.timeline", "disabled-by-default-devtools.timeline", "viz", "gpu", "cc", "benchmark",
+                                "electron", "browser", "content", "renderer_host", "ui", "latencyInfo"])
+
+
+def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files, timeline=None):
+    """timeline: a path to write this launch's trace to (every output line with its arrival time,
+    and Chromium's startup trace for Electron); the launch then ends shortly after first paint."""
     launch = APP_TABLE[app](scene, suite, uncapped)
     env = dict(os.environ)
     for k in ("SILK_UI_UNCAPPED", "XB_UNCAPPED", "XB_WINDOWLESS", "SILK_UI_BENCH", "SILK_UI_HEADLESS", "NODE_OPTIONS", "ELECTRON_RUN_AS_NODE"):
         env.pop(k, None)
     env.update(launch.env)
+    trace_file = None
+    if timeline:
+        start_only = True
+        # Silk UI's startup trace points (on a checkout that has them) and the apps' own spans.
+        env.update({"SILK_UI_TRACE_FRAMES": "1", "SILK_UI_TRACE_JS": "1", "XB_TRACE": "1"})
+        if app == "electron":
+            trace_file = timeline + ".chrome.json"
+            at = next(i for i, c in enumerate(launch.cmd) if os.path.basename(c).lower() == "electron")
+            launch.cmd[at + 1:at + 1] = [f"--trace-startup={ELECTRON_TRACE_CATS}", f"--trace-startup-file={trace_file}",
+                                         "--trace-startup-duration=4", "--trace-startup-format=json"]
     if kind == "cold":
         for d in launch.caches:
             shutil.rmtree(d, ignore_errors=True)
@@ -204,6 +222,7 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
         "app": app, "scene": scene, "suite": suite, "uncapped": uncapped, "kind": kind,
         "cache_dropped": cold_ok, "marks": {}, "drivers": {}, "idle": {}, "notes": [],
     }
+    traced = []
     t0 = time.monotonic()
     proc = subprocess.Popen(launch.cmd, cwd=launch.cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
@@ -234,13 +253,17 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
             batch = events[seen:]
             seen = len(events)
         if not batch and (proc.poll() is not None or time.monotonic() >= deadline):
-            if proc.poll() is None:
+            if timeline and record.get("first_paint_ms") is not None:
+                pass  # a timeline launch ends a little after first paint
+            elif proc.poll() is None:
                 record["notes"].append("timeout")
             else:
                 record["notes"].append(f"exited {proc.returncode} before done")
             break
         for now, stream, line in batch:
             lines.append(line)
+            if timeline:
+                traced.append((round((now - t0) * 1000, 2), stream, line))
             at = line.find("XB ")
             if at < 0:
                 bench = re.search(r"bench: first frame start-to-layout-ms=([\d.e-]+) layout-ms=([\d.e-]+) paint-ms=([\d.e-]+) nodes=(\d+) fragments=(\d+)", line)
@@ -256,8 +279,11 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 files_seen |= mapped_files(pids)
                 if start_only:
                     record["marks"]["first-paint"] = measure(pids)
-                    done = True
-                    break
+                    if not timeline:
+                        done = True
+                        break
+                    # A trace also wants the frames right after first paint, and Electron's trace file.
+                    deadline = min(deadline, now + (6.0 if trace_file else 0.6))
             elif ev == "mark":
                 pids = app_pids(proc.pid, launch)
                 signal_tree(pids, signal.SIGSTOP)
@@ -294,6 +320,32 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 done = True
                 break
     record["wall_s"] = time.monotonic() - t0
+    if trace_file:
+        # Chromium writes the trace when its duration ends: wait for it.
+        for _ in range(60):
+            if os.path.exists(trace_file) and os.path.getsize(trace_file) > 0:
+                time.sleep(0.5)
+                break
+            time.sleep(0.1)
+    if timeline:
+        out = {"t0_us": t0 * 1e6, "lines": traced, "first_paint_ms": record.get("first_paint_ms")}
+        if trace_file:
+            try:
+                with open(trace_file, errors="replace") as f:
+                    trace = json.load(f)
+                # Keep launch to first paint plus 300 ms: the analysis needs nothing later.
+                end = t0 * 1e6 + ((record.get("first_paint_ms") or 4000) + 300) * 1000
+                events = trace.get("traceEvents", trace) if isinstance(trace, dict) else trace
+                out["trace"] = {"traceEvents": [e for e in events if e.get("ph") == "M" or (e.get("ts") or 0) <= end]}
+            except Exception as error:
+                out["trace_error"] = repr(error)
+            try:
+                os.remove(trace_file)
+            except OSError:
+                pass
+        with open(timeline, "w") as f:
+            json.dump(out, f)
+        record["timeline"] = os.path.relpath(timeline, XB)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except OSError:
@@ -375,7 +427,8 @@ def versions():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["run", "start"])
+    ap.add_argument("what", choices=["run", "start", "timeline"],
+                    help="run: the whole scene; start: start-up only; timeline: start-up with a trace of every thread (TIMELINE.md)")
     ap.add_argument("--suite", choices=["cpu", "gpu"], required=True)
     ap.add_argument("--apps", default=",".join(APP_TABLE))
     ap.add_argument("--scenes", default="feed,wall,stream,churn")
@@ -389,8 +442,8 @@ def main():
     ap.add_argument("--label", default="", help="free text stored with every record (what changed)")
     a = ap.parse_args()
     apps = [x for x in a.apps.split(",") if x]
-    scenes = ["feed"] if a.what == "start" and a.scenes == "feed,wall,stream,churn" else a.scenes.split(",")
-    out = a.out or os.path.join(XB, "results", f"{a.suite}.jsonl")
+    scenes = ["feed"] if a.what in ("start", "timeline") and a.scenes == "feed,wall,stream,churn" else a.scenes.split(",")
+    out = a.out or os.path.join(XB, "results", f"{a.suite}{'-timeline' if a.what == 'timeline' else ''}.jsonl")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     session = {
         "session": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -415,8 +468,13 @@ def main():
             order = apps if r % 2 == 0 else apps[::-1]
             for app in order:
                 kind = "cold" if r < a.cold else "warm"
+                trace = None
+                if a.what == "timeline":
+                    tdir = os.path.join(XB, "results", "timelines", session["session"].replace(":", ""))
+                    os.makedirs(tdir, exist_ok=True)
+                    trace = os.path.join(tdir, f"{app}-{scene}-{kind}-{r}.json")
                 rec, files = run_once(app, scene, a.suite, a.uncapped or a.suite == "cpu", kind, a.timeout,
-                                      a.what == "start", extra.get(app, set()))
+                                      a.what == "start", extra.get(app, set()), timeline=trace)
                 extra.setdefault(app, set()).update(files)
                 json.dump({k: sorted(v) for k, v in extra.items()}, open(cache, "w"))
                 rec.update(session)

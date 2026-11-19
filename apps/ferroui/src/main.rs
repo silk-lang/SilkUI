@@ -28,7 +28,7 @@ use ferroui_headless::{FerroHeadlessPlatform, FerroHeadlessPlatformExtensions, F
 use ferroui_skia::SkiaApplicationExtensions;
 use ferroui_themes_fluent::FluentTheme;
 use ferroui_view::prelude::*;
-use xbench_scenes::{Block, END, HEIGHT, INTER_BOLD, INTER_ITALIC, INTER_REGULAR, Item, Kind, MONO, Mark, PICTURES, Scene, Span, WIDTH, colors as c};
+use xbench_scenes::{span, Block, END, HEIGHT, INTER_BOLD, INTER_ITALIC, INTER_REGULAR, Item, Kind, MONO, Mark, PICTURES, Scene, Span, WIDTH, colors as c};
 
 const SANS: &str = "fonts:XBench#Inter";
 const MONO_FAMILY: &str = "fonts:XBench#JetBrains Mono";
@@ -273,26 +273,37 @@ fn root(tick: Signal<u64>, scroller: NodeRef<ScrollViewer>) -> Element {
 }
 
 fn windowless() {
-    fonts_and_pictures(AppBuilder::configure::<Application>().use_skia().use_headless(FerroHeadlessPlatformOptions {
-        use_headless_drawing: false,
-        ..FerroHeadlessPlatformOptions::default()
-    }))
-    .setup_without_starting();
-    Application::current().expect("app").styles().add(FluentTheme::new().as_style());
-    load_pictures();
+    span("main", "start", "platform, Skia, fonts setup", || {
+        fonts_and_pictures(AppBuilder::configure::<Application>().use_skia().use_headless(FerroHeadlessPlatformOptions {
+            use_headless_drawing: false,
+            ..FerroHeadlessPlatformOptions::default()
+        }))
+        .setup_without_starting()
+    });
+    span("main", "style", "Fluent theme", || Application::current().expect("app").styles().add(FluentTheme::new().as_style()));
+    span("main", "paint", "decode pictures", load_pictures);
     let tick = signal(0u64);
     let scroller = NodeRef::<ScrollViewer>::new();
-    let window: Ref<Window> = mount_window(|| root(tick, scroller));
-    window.show();
-    Dispatcher::ui_thread().run_jobs(None);
+    let window: Ref<Window> = span("main", "js", "build components", || mount_window(|| root(tick, scroller)));
+    span("main", "layout", "show: style, measure, arrange", || {
+        window.show();
+        Dispatcher::ui_thread().run_jobs(None);
+    });
     let mut driver = Driver { tick, scroller, n: 0 };
     let mut frame: u64 = 1;
     loop {
         let now = frame as f64 * 1000.0 / 120.0;
-        driver.step(now, true);
-        Dispatcher::ui_thread().run_jobs(None);
-        FerroHeadlessPlatform::force_render_timer_tick(1);
-        Dispatcher::ui_thread().run_jobs(None);
+        let traced = frame <= 8 && !with_scene(|s| s.painted());
+        let mut script = || {
+            driver.step(now, true);
+            Dispatcher::ui_thread().run_jobs(None);
+        };
+        if traced { span("main", "layout", &format!("frame {frame}: script, rerender, layout"), script) } else { script() }
+        let render = || {
+            FerroHeadlessPlatform::force_render_timer_tick(1);
+            Dispatcher::ui_thread().run_jobs(None);
+        };
+        if traced { span("main", "paint", &format!("frame {frame}: render, Skia raster"), render) } else { render() }
         if with_scene(|s| s.done()) { break; }
         frame += 1;
     }
@@ -301,13 +312,15 @@ fn windowless() {
 
 fn windowed() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    xbench_scenes::span_begin("main", "start", "platform setup");
     fonts_and_pictures(AppBuilder::configure::<Application>().use_platform_detect()).start(
         |app, _| {
-            app.styles().add(FluentTheme::new().as_style());
-            load_pictures();
+            xbench_scenes::span_end("main", "start", "platform setup");
+            span("main", "style", "Fluent theme", || app.styles().add(FluentTheme::new().as_style()));
+            span("main", "paint", "decode pictures", load_pictures);
             let tick = signal(0u64);
             let scroller = NodeRef::<ScrollViewer>::new();
-            let window: Ref<Window> = mount_window(|| root(tick, scroller));
+            let window: Ref<Window> = span("main", "js", "build components", || mount_window(|| root(tick, scroller)));
             let driver = Rc::new(RefCell::new(Driver { tick, scroller, n: 0 }));
             let start = std::time::Instant::now();
             fn next(window: Ref<Window>, driver: Rc<RefCell<Driver>>, start: std::time::Instant, frames: u32) {
@@ -340,6 +353,6 @@ fn windowed() {
 }
 
 fn main() {
-    SCENE.with(|s| *s.borrow_mut() = Some(Scene::new(&xbench_scenes::scene_arg())));
+    span("main", "start", "parse corpus, set up scene", || SCENE.with(|s| *s.borrow_mut() = Some(Scene::new(&xbench_scenes::scene_arg()))));
     if xbench_scenes::windowless() { windowless() } else { windowed() }
 }

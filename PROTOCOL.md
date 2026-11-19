@@ -12,6 +12,7 @@ An app prints lines that start with `XB ` on standard output or standard error. 
 | `XB end NAME F` | The driver made F frames | Wall time and CPU time over the driver, per frame |
 | `XB frames NAME g1,g2,...` | After `end` | The app's own intervals between the driver's frames, ms (ignored when the app runs on a fake clock) |
 | `XB done` | The script is over | Kills the process tree |
+| `XB span begin LANE KIND LABEL` / `XB span end LANE KIND LABEL` | A start-up phase starts / ends (only with `XB_TRACE=1`, timeline runs) | Kept with the line's arrival time for `tools/timeline.py` (TIMELINE.md) |
 
 ## First paint
 

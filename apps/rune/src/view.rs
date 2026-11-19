@@ -101,7 +101,16 @@ fn cell(index: usize, value: u32) -> El {
         .child(label(&value.to_string(), sans(12.0, 700.0, 16.0), rgb(c::TEXT)))
 }
 
-pub fn view(s: &State, _: &mut Cx<State>) -> El {
+static VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    let n = VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if s.scene.painted() || n > 8 { return build(s, cx); }
+    let label = format!("view {n}: build elements");
+    xbench_scenes::span("main", "js", &label, || build(s, cx))
+}
+
+fn build(s: &State, _: &mut Cx<State>) -> El {
     let m = &s.scene.model;
     let content = if m.kind == Kind::Wall {
         row().gap(8.0).padding(8.0)

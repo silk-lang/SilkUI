@@ -21,7 +21,7 @@ use gpui::{
     IntoElement, ParentElement, Pixels, Render, ScrollHandle, SharedString, StyledText, TextRun, Window, WindowBounds,
     WindowOptions, div, font, img, point, prelude::*, px, relative, rgb, size,
 };
-use xbench_scenes::{Block, END, HEIGHT, INTER_BOLD, INTER_ITALIC, INTER_REGULAR, Item, Kind, MONO, Mark, PICTURES, Scene, Span, WIDTH, colors as c};
+use xbench_scenes::{span, span_begin, span_end, Block, END, HEIGHT, INTER_BOLD, INTER_ITALIC, INTER_REGULAR, Item, Kind, MONO, Mark, PICTURES, Scene, Span, WIDTH, colors as c};
 
 const SANS: &str = "Inter";
 const MONO_FAMILY: &str = "JetBrains Mono";
@@ -36,6 +36,7 @@ struct Bench {
     start: Instant,
     frames: u32,
     timer: Option<gpui::Task<()>>,
+    renders: u32,
 }
 
 /// Inline text with its marks, as one text with runs.
@@ -119,6 +120,12 @@ fn item(i: &Item, pictures: &[Arc<Image>]) -> AnyElement {
 
 impl Render for Bench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders += 1;
+        // The first frames as start-up phases (XB_TRACE): build the elements here, then GPUI lays
+        // them out, prepaints and paints. A canvas as the last child marks the ends of those.
+        let traced = !self.scene.painted() && self.renders <= 8;
+        let n = self.renders;
+        if traced { span_begin("main", "js", &format!("frame {n}: build elements")); }
         if !self.windowless {
             self.frames += 1;
             // The second frame: the first one is on screen.
@@ -153,19 +160,30 @@ impl Render for Bench {
                 .children(m.items.iter().map(|i| item(i, &self.pictures)))
                 .into_any_element()
         };
-        div().flex().flex_col().size_full().bg(color(c::BG)).text_color(color(c::TEXT)).font_family(SANS).text_size(px(14.)).line_height(px(20.))
+        let root = div().flex().flex_col().size_full().bg(color(c::BG)).text_color(color(c::TEXT)).font_family(SANS).text_size(px(14.)).line_height(px(20.))
             .child(div().flex().flex_row().items_center().h(px(40.)).flex_shrink_0().pl(px(84.)).pr(px(16.)).border_b_1().border_color(color(c::LINE))
                 .text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(color(c::BAR_TEXT)).child(m.title.clone()))
-            .child(div().id("scroller").flex_grow(1.).min_h_0().overflow_y_scroll().overflow_x_hidden().track_scroll(&self.scroll).child(content))
+            .child(div().id("scroller").flex_grow(1.).min_h_0().overflow_y_scroll().overflow_x_hidden().track_scroll(&self.scroll).child(content));
+        if !traced { return root; }
+        span_end("main", "js", &format!("frame {n}: build elements"));
+        span_begin("main", "layout", &format!("frame {n}: layout, prepaint"));
+        root.child(gpui::canvas(
+            move |_, _, _| {
+                span_end("main", "layout", &format!("frame {n}: layout, prepaint"));
+                span_begin("main", "paint", &format!("frame {n}: paint"));
+            },
+            move |_, _, _, _| span_end("main", "paint", &format!("frame {n}: paint")),
+        ).absolute().size_0())
     }
 }
 
 impl Bench {
     fn new(windowless: bool) -> Bench {
+        let scene = span("main", "start", "parse corpus, set up scene", || Scene::new(&xbench_scenes::scene_arg()));
         let pictures = PICTURES.iter().map(|b| Arc::new(Image::from_bytes(ImageFormat::Png, b.to_vec()))).collect();
         Bench {
-            scene: Scene::new(&xbench_scenes::scene_arg()), scroll: ScrollHandle::new(), pictures, windowless,
-            start: Instant::now(), frames: 0, timer: None,
+            scene, scroll: ScrollHandle::new(), pictures, windowless,
+            start: Instant::now(), frames: 0, timer: None, renders: 0,
         }
     }
 
@@ -192,10 +210,12 @@ fn add_fonts(cx: &mut App) {
 }
 
 fn windowless() {
-    let text_system = gpui_platform::current_platform(true).text_system();
-    let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), || Ok(None));
-    cx.update(add_fonts);
-    let handle = cx.open_window(size(px(WIDTH), px(HEIGHT)), |_, cx| cx.new(|_| Bench::new(true))).expect("open_window");
+    let text_system = span("main", "start", "platform text system", || gpui_platform::current_platform(true).text_system());
+    let mut cx = span("main", "start", "app context", || HeadlessAppContext::with_platform(text_system, Arc::new(()), || Ok(None)));
+    span("main", "fonts", "load fonts", || cx.update(add_fonts));
+    let handle = span("main", "start", "open window", || {
+        cx.open_window(size(px(WIDTH), px(HEIGHT)), |_, cx| cx.new(|_| Bench::new(true))).expect("open_window")
+    });
     const DT: f64 = 1000.0 / 120.0;
     let mut frame: u64 = 1;
     loop {
@@ -222,8 +242,9 @@ fn main() {
         windowless();
         return;
     }
-    gpui_platform::application().run(|cx: &mut App| {
-        add_fonts(cx);
+    let app = span("main", "start", "platform, application", gpui_platform::application);
+    app.run(|cx: &mut App| {
+        span("main", "fonts", "load fonts", || add_fonts(cx));
         let bounds = Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx);
         cx.open_window(
             WindowOptions { window_bounds: Some(WindowBounds::Windowed(bounds)), is_resizable: false, ..Default::default() },
