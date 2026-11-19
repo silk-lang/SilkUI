@@ -7,6 +7,8 @@ import silk.build.definition {
 }
 import silk.build.context as BuildContext
 import silk.build.step { Deferred }
+import silk.crypto.sha2 { Sha256 }
+import silk.system.executable as Executable
 import silk.schema.schema { Dictionary }
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
@@ -304,7 +306,7 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
   let compilation = run Compilation.fromDefinition(move definition, run compiler())
   run trace("fromDefinition", "")
   run trace("compilation", "")
-  let graph = run (run Build.make()).add(move compilation)
+  let graph = run (run newBuild()).add(move compilation)
   run trace("graph", "")
   let built = run graph.compile()
   let binary = &built.artifacts.asSlice()[0].path
@@ -359,6 +361,28 @@ effect fn compiler() -> Deferred<Path>
     return run Deferred<Path>.external(Path.view(&path) |> Option<string>.unwrapOr(""))
   }
   return run BuildContext.compiler()
+}
+
+// A build graph rooted at this task's project. On Windows Build.make() reads SILK_PROJECT_ROOT
+// through the same native-only path reader as BuildContext, so root the graph at Task.root() and
+// key it by the content of this task's program, as Build.make() would.
+effect fn newBuild() -> Build
+  ! BuildError | TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  static if HOST_OS == "windows" {
+    let root = run Task.root()
+    if let Option<Bytes>.Some { value: program } = move run HostInput.argument(0) {
+      if let Option<Path>.Some { value: path } = move run Executable.findBytes(program.asSlice()) {
+        let contents = run FileSystem.readFile(&path)
+        let mut hash = Sha256.make()
+        hash.update(Bytes.asSlice(&contents))
+        let digest = hash.finish()
+        return run Build.at(move root, &digest)
+      }
+    }
+    run Task.abort("cannot locate the program constructing this build")
+  }
+  return run Build.make()
 }
 
 pub effect fn nativeTask(arguments: &[string]) -> ()
