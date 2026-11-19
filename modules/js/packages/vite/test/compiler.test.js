@@ -67,16 +67,14 @@ test('compiles tree part targets and reports unavailable pseudo-elements', () =>
 });
 
 
-test('ships typed font faces and diagnoses unsupported display timing', () => {
+test('ships typed font faces with their display periods', () => {
   const css = `@layer fonts { @media (width > 300px) { @font-face { font-family: "Brand Face"; src: local("Brand Full"), url("fonts/brand.woff2") format("woff2"); font-weight: 100 900; font-width: 75% 125%; font-style: oblique -10deg 20deg; unicode-range: U+0-FF, U+4??; font-display: swap; } } }`;
   const { bytes, diagnostics } = compileStylesheet(css, { strict: true });
   assert.equal(new DataView(bytes.buffer).getUint32(8, true), 9);
   assert.deepEqual(diagnostics, []);
   assert.deepEqual(compileStylesheet(css).bytes, bytes);
   assert.equal(new TextDecoder().decode(bytes).includes(css), false);
-  const unsupported = '@font-face{font-family:Brand;src:url(font.ttf);font-display:block}';
-  assert.deepEqual(compileStylesheet(unsupported).diagnostics, [{ kind: 'feature', feature: 'font-face font-display timing', count: 1 }]);
-  assert.throws(() => compileStylesheet(unsupported, { strict: true }));
+  assert.deepEqual(compileStylesheet('@font-face{font-family:Brand;src:url(font.ttf);font-display:block}', { strict: true }).diagnostics, []);
 });
 
 

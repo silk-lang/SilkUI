@@ -1,4 +1,5 @@
 import { useState } from "react";
+import "./showcase.css";
 import { accent, arabic, display, hairline, hebrew, ink, jp, mono, muted, paper, sans, serif } from "./theme.js";
 
 const row = { display: "flex", flexDirection: "row" };
@@ -159,11 +160,11 @@ function Vertical() {
           <box style={{ writingMode: "vertical-rl", fontFamily: jp, fontSize: 18, lineHeight: 1.85, color: ink, height: 470 }}>
             日本語の文章は、昔から縦に書かれてきた。行は上から下へ進み、右から左へと重なっていく。新聞や小説、詩集の多くは、今も縦組みで印刷されている。2026年の今、Silk UIはこの組み方を画面の上で再現する。漢字と仮名は正立し、ラテン文字は横に倒れて流れる。句読点は行の中で位置を変え、読む目は自然に次の行へ移る。
           </box>
-          <box style={{ writingMode: "vertical-rl", fontFamily: jp, fontWeight: 700, fontSize: 38, lineHeight: 1.2, color: accent, height: 470 }}>
+          <box className="emphasis" style={{ writingMode: "vertical-rl", fontFamily: jp, fontWeight: 700, fontSize: 38, lineHeight: 1.2, color: accent, height: 470 }}>
             縦書きの美しさ
           </box>
         </box>
-        <Tag>vertical-rl · lines flow right to left · Latin turns sideways</Tag>
+        <Tag>vertical-rl · Latin turns sideways · text-emphasis: sesame</Tag>
       </box>
       <box style={{ ...column, gap: 12, justifyContent: "center", alignItems: "center" }}>
         <box style={{ writingMode: "vertical-rl", textOrientation: "upright", fontFamily: display, fontWeight: 700, fontSize: 30, lineHeight: 1, color: ink, height: 300 }}>
@@ -176,7 +177,7 @@ function Vertical() {
 }
 
 const article =
-  "ext does not have to sit in a rectangle. A float pulls a figure to one side and the lines beside it grow shorter to make room, then return to the full measure once they pass beneath it. Editors have used the effect for centuries: an initial letter cut deep into the first lines, a portrait set into a column, a seal stamped in the margin with the paragraph wrapping around its edge. The browser learned these tricks one property at a time, and a layout engine that wants to look at home on the web has to learn them too.";
+  "Text does not have to sit in a rectangle. A float pulls a figure to one side and the lines beside it grow shorter to make room, then return to the full measure once they pass beneath it. Editors have used the effect for centuries: an initial letter cut deep into the first lines, a portrait set into a column, a seal stamped in the margin with the paragraph wrapping around its edge. The browser learned these tricks one property at a time, and a layout engine that wants to look at home on the web has to learn them too.";
 
 const columns =
   "Columns let a long passage be read in short lines without leaving the page. The text fills the first column, breaks, and continues at the top of the next, with a rule between them. Magazines lean on it for sidebars and briefs like this one, where a single measure across the whole page would make the eye travel too far. The same text, set in one column, would simply run on.";
@@ -189,8 +190,7 @@ function Shapes() {
       </Headline>
       <box style={{ ...row, gap: 32, flexGrow: 1 }}>
         <box style={{ ...column, gap: 12, flexGrow: 3, flexBasis: 0 }}>
-          <box style={{ ...body, textAlign: "justify" }}>
-            <box style={{ float: "left", fontFamily: display, fontWeight: 700, fontSize: 92, lineHeight: 0.8, color: accent, marginTop: 6, marginRight: 10 }}>T</box>
+          <box className="drop-cap" style={{ ...body, textAlign: "justify" }}>
             <box
               style={{
                 float: "right",
@@ -211,7 +211,7 @@ function Shapes() {
             {article}
           </box>
           <box style={{ ...row, gap: 8 }}>
-            <Tag>float: left · drop cap</Tag>
+            <Tag>::first-letter · initial-letter: 3</Tag>
             <Tag>float: right · shape-outside: circle()</Tag>
             <Tag>text-align: justify</Tag>
           </box>

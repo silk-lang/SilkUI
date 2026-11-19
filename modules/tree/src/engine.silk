@@ -22,7 +22,7 @@ import properties.catalog
 import svg_css.written as css_written
 import properties.keywords { Keyword }
 import properties.values { Value }
-import layout.lib { Fragmentainers, computeFragmented }
+import layout.lib { Fragmentainers, computeFragmented, FontRequest, LineHeight }
 import virtual_list { VirtualList, VirtualRange }
 import virtual_list as virtual
 import anchoring
@@ -32,6 +32,8 @@ import cssom_view
 import cssom_view { ScrollAnimation }
 import scroll_snap
 import css_anchor
+import css_cursor
+import css_cursor { CursorImage }
 import scroll_snap { SnapWait }
 import scroll_anchor
 import scroll_anchor { ScrollAnchor }
@@ -45,6 +47,8 @@ import float_shapes
 import expand
 import font_features
 import font_features { VariationTable }
+import font_rules
+import font_rules { FontRules }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -85,11 +89,14 @@ import edit
 import rich
 import edit { EditState, HostRequest, Keymap, ImeArea, NATIVE_KEYMAP }
 import text_selection
+import text_selection { SelectionOrder }
 import text_selection { TextSelection }
 import style { Computed, TextStyle, NO_SHADOW, ListStyle, LIST_NONE, usedUserSelect, SELECT_TEXT }
 import lists
+import first_letter
 import lists { Scope }
 import paint_css { Effects }
+import offset_path
 import paint_css
 import font_units
 import font_units { Source as FontSource }
@@ -101,7 +108,7 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
@@ -142,10 +149,12 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import svg_css.effect_values { Image }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
+import ui_text.fonts as text_fonts
 import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
@@ -166,7 +175,8 @@ import layout.lib {
   NaturalDimensions,
   Style as CssStyle,
   SizeValue,
-  FloatShape
+  FloatShape,
+  FragmentKind
 }
 import layout.lib as Engine
 import silk.collections.bytes { Bytes }
@@ -432,6 +442,10 @@ effect fn layoutFailed<E>(error: E) -> never
   fail TreeError.Layout
 }
 
+effect fn noShape(error: TreeError) -> () {
+  drop error
+}
+
 effect fn viewFailed(error: CssomError) -> never
   ! TreeError {
   fail TreeError.View { error: error }
@@ -655,6 +669,9 @@ pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaratio
   let text = run values.cssText(&declaration.value)
   let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
+  if which == transform.OFFSET_PATH_PROPERTY && computed.transform.offset.path == transform.PATH_SHAPE {
+    computed.effects.declared = true
+  }
   if !computed.usesViewport && style.viewportDependent(declaration) {
     computed.usesViewport = true
   }
@@ -676,6 +693,12 @@ fn transformProperty(property: CssProperty) -> u32 {
     CssProperty.Perspective => transform.PERSPECTIVE_PROPERTY
     CssProperty.PerspectiveOrigin => transform.PERSPECTIVE_ORIGIN_PROPERTY
     CssProperty.BackfaceVisibility => transform.BACKFACE_PROPERTY
+    CssProperty.OffsetPath => transform.OFFSET_PATH_PROPERTY
+    CssProperty.OffsetDistance => transform.OFFSET_DISTANCE_PROPERTY
+    CssProperty.OffsetRotate => transform.OFFSET_ROTATE_PROPERTY
+    CssProperty.OffsetAnchor => transform.OFFSET_ANCHOR_PROPERTY
+    CssProperty.OffsetPosition => transform.OFFSET_POSITION_PROPERTY
+    CssProperty.TransformStyle => transform.TRANSFORM_STYLE_PROPERTY
     _ => NONE
   }
 }
@@ -792,6 +815,10 @@ pub struct UiTree<'a> {
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
   pub sheetFaces: SheetFaces,
+  /// `@font-palette-values` and `@font-feature-values` rules, and font property handles.
+  pub fontRules: FontRules,
+  /// When the next `font-display` block or swap period ends, or negative.
+  fontBlockEnd: f64,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -813,10 +840,23 @@ pub struct UiTree<'a> {
   /// Some node is a list item or changes counters, or generated content names one: each
   /// style pass ends with the counters pass (`lists.update`).
   pub listsUsed: bool,
+  /// Some node has had a `::first-letter` box: edits under one may move its letter.
+  pub letterUsed: bool,
+  /// Blocks whose `::first-letter` the style pass syncs once their subtrees are styled: the
+  /// letter's text is found by its descendants' computed floats and displays.
+  letterPending: List<u32>,
+  /// Blocks with a `::first-line` style, and the first line box of each from the last layout.
+  pub lineOrigins: List<u32>,
+  pub firstLines: List<first_letter.FirstLine>,
   /// Whether any node is a scroll snap container (see `scroll_snap`).
   pub snapUsed: bool,
   /// A style used anchor positioning (`anchor-name` or an anchored box).
   pub cssAnchorUsed: bool,
+  /// A style used `offset-path` (see `offset_path.settle`).
+  pub offsetUsed: bool,
+  /// Whether some style ever set `transform-style: preserve-3d`: until then paint and hit
+  /// testing skip the 3D rendering context checks.
+  pub preserveUsed: bool,
   pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
@@ -842,6 +882,12 @@ pub struct UiTree<'a> {
   /// The viewport the styles' viewport units last resolved against.
   unitsWidth: f32,
   unitsHeight: f32,
+  /// The page zoom: the root's effective zoom before its own `zoom`. Media queries and viewport
+  /// units see the viewport divided by it, so a zoomed page reflows as a browser's does.
+  pageZoomFactor: f32,
+  /// Whether Ctrl (Cmd on macOS) with `=`, `-` and `0` changes the page zoom. Hosts whose
+  /// platform zooms on its own, a browser, leave it off.
+  pub zoomKeys: bool,
   /// The frame the current root last painted at: its subtrees cached then can be replayed.
   paintedAt: u64,
   pub stats: FrameStats,
@@ -934,6 +980,8 @@ pub struct UiTree<'a> {
   pub requests: List<HostRequest>,
   /// The modifier keys editing shortcuts use; the compilation target's by default.
   pub keymap: Keymap,
+  /// Whether text selections follow what is seen or the tree where layout reorders children.
+  pub selectionOrder: SelectionOrder,
   /// The id of the current root, and whether it is open. Before any root opens, the current
   /// root is the first one, closed.
   pub current: u32,
@@ -973,6 +1021,8 @@ pub struct UiTree<'a> {
   /// The viewport `tickBases` were built in: its size is in every one of them.
   tickWidth: f32,
   tickHeight: f32,
+  /// What the host last showed for a cursor image (`cursorShown`), 0 for a keyword.
+  pub cursorShown: u64,
 }
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
@@ -1034,6 +1084,8 @@ impl<'a> UiTree<'a> {
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
       sheetFaces: SheetFaces.make(),
+      fontRules: FontRules.make(),
+      fontBlockEnd: -1.0,
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -1048,8 +1100,14 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       listsUsed: false,
+      letterUsed: false,
+      letterPending: List<u32>.make(),
+      lineOrigins: List<u32>.make(),
+      firstLines: List<first_letter.FirstLine>.make(),
       snapUsed: false,
       cssAnchorUsed: false,
+      offsetUsed: false,
+      preserveUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
       scrollAnchors: List<ScrollAnchor>.make(),
@@ -1066,6 +1124,8 @@ impl<'a> UiTree<'a> {
       styledViewport: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       unitsWidth: 0.0,
       unitsHeight: 0.0,
+      pageZoomFactor: 1.0,
+      zoomKeys: false,
       paintedAt: 0,
       stats: FrameStats.zero(),
       events: List<Event>.make(),
@@ -1117,6 +1177,7 @@ impl<'a> UiTree<'a> {
       paintDirty: false,
       requests: List<HostRequest>.make(),
       keymap: NATIVE_KEYMAP,
+      selectionOrder: SelectionOrder.Visual,
       current: FIRST_ROOT,
       currentOpen: false,
       currentOptions: RootOptions.default(),
@@ -1136,6 +1197,7 @@ impl<'a> UiTree<'a> {
       tickPlaces: List<u32>.make(),
       tickWidth: 0.0,
       tickHeight: 0.0,
+      cursorShown: 0,
     }
   }
 
@@ -1149,6 +1211,19 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     if self.resources.settleCssImage(resource, ok) {
       self.paintCachesStale = true
+      // Floats whose `shape-outside` is a stylesheet image wrap around it once it loads.
+      let mut i: usize = 0
+      while i < self.nodes.length() {
+        let node = &self.nodes.asSlice()[i]
+        let imaged = node.live && node.kind != NodeKind.Text && match node.paintEffects() {
+          Option<&Effects>.Some { value } => value.shapeImage.length() != 0
+          Option<&Effects>.None => false
+        }
+        if imaged {
+          run Effect.catch<TreeError>(self.updateShape(usize.toU32(i)), noShape)
+        }
+        i = i + 1
+      }
       return ()
     }
     let at = u32.toUsize(resource)
@@ -1168,6 +1243,30 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+  }
+
+  /// Gives css-layout the `shape-outside` of element `slot`, asking for its image first.
+  effect fn updateShape(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut url = Bytes.make()
+    if let Option<&Effects>.Some { value } = self.node(slot).paintEffects() {
+      if value.shapeImage.length() != 0 {
+        if let Image.Url { url: named } = &value.shapeImage.asSlice()[0] {
+          run url.append(Bytes.asSlice(&named))
+        }
+      }
+    }
+    if url.length() != 0 {
+      drop run self.resources.cssImage(Bytes.asSlice(&url))
+    }
+    let node = self.node(slot)
+    let css = node.css
+    let shape = match node.paintEffects() {
+      Option<&Effects>.Some { value } => run float_shapes.of(value, node.computed.paint.radii, node.computed.effects.radiusShare, &self.resources, float_shapes.contentSize(&node.computed.layout))
+      Option<&Effects>.None => FloatShape.make()
+    }
+    run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
   }
 
   fn sourceState(self: &Self, resource: u32) -> u8 {
@@ -1264,7 +1363,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) || writtenHandle(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1295,6 +1394,26 @@ impl<'a> UiTree<'a> {
           run out.append(Declaration {
             property: CssProperty.FontVariationSettings,
             value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
+        }
+      } else if writtenHandle(&declared[i]) {
+        // A negative number: font_features.apply reads -(handle + 1). Values that do not
+        // parse are dropped.
+        let text = run values.cssText(&declared[i].value)
+        let css = Bytes.asSlice(&text)
+        let property = declared[i].property
+        let handle = if property == CssProperty.FontPalette {
+          run self.fontRules.paletteHandle(css)
+        } else if property == CssProperty.FontVariantAlternates {
+          run self.fontRules.alternatesHandle(css)
+        } else {
+          run self.fontRules.adjustHandle(css)
+        }
+        if let Option.Some { value: id } = handle {
+          run out.append(Declaration {
+            property: property,
+            value: values.number(-u32.toF32(id) - 1.0),
             important: declared[i].important,
           })
         }
@@ -1710,6 +1829,7 @@ impl<'a> UiTree<'a> {
     }
     run self.applyAll(move batch)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
     if self.current != before && self.rootOpen(before) {
       drop run self.useRoot(before)
     }
@@ -2252,6 +2372,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.CloseRoot { root } => {
         run sheet_faces.close(&mut self, root)
+        font_rules.close(&mut self.fontRules, root)
         run self.closeRoot(index, root)
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
@@ -2624,6 +2745,7 @@ impl<'a> UiTree<'a> {
       content: 1,
       editing: move editing,
       effects: Option<Box<Effects>>.None,
+      offsetPlaced: Option<transform.Placement>.None,
       semantics: Option<Box<Semantics>>.None,
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -2724,6 +2846,7 @@ impl<'a> UiTree<'a> {
     )
     let moved = self.nodeMut(childSlot)
     moved.parent = parentSlot
+    if self.letterUsed || self.letterRulesUsed() { self.restyleLetterOrigins(parentSlot) }
     match self.sheetReads() {
       Option<u32>.Some { value: reads } => {
         let text = self.node(childSlot).kind == NodeKind.Text
@@ -2749,6 +2872,7 @@ impl<'a> UiTree<'a> {
     if parent == NONE && slot != self.root {
       return ()
     }
+    if self.letterUsed && parent != NONE && !self.node(slot).isGenerated() { run self.detachLetters(slot, parent) }
     let before = if parent == NONE { NONE } else { self.elementBeside(slot, true) }
     let after = if parent == NONE { NONE } else { self.elementBeside(slot, false) }
     run Effect.catchAll(self.layout.remove(NodeId { index: css }), layoutFailed)
@@ -3604,6 +3728,12 @@ impl<'a> UiTree<'a> {
     let node = self.nodeMut(slot)
     node.text = move value
     node.content = node.content + 1
+    if (self.letterUsed || self.letterRulesUsed()) && !self.node(slot).isGenerated() { self.restyleLetterOrigins(slot) }
+  }
+
+  fn letterRulesUsed(self: &Self) -> bool {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter
   }
 
   /// Where focus goes when `focused` leaves the tree with the subtree at `removed`: the node
@@ -3771,6 +3901,7 @@ impl<'a> UiTree<'a> {
     run interact.begin(&mut self, &input)
     run interact.finish(&mut self, move input, false)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
   }
 
   /// The first half of `dispatch`: hit testing, hover, and the record of the input itself
@@ -3807,6 +3938,7 @@ impl<'a> UiTree<'a> {
     drop run self.useRoot(started)
     run interact.finish(&mut self, move input, prevented)
     run edit.reportSelection(&mut self)
+    run text_selection.report(&mut self)
   }
 
   /// The id of the node a pointer at (`x`, `y`) would target in the last frame, or NONE.
@@ -3822,6 +3954,66 @@ impl<'a> UiTree<'a> {
   /// its path.
   pub fn cursor(self: &Self) -> Cursor {
     return interact.cursorOf(self)
+  }
+
+  /// The image CSS `cursor: url(...)` shows over the hovered node: the first of its images that
+  /// loaded, skipping those that failed. None while there is none, or while an earlier one
+  /// still loads; `cursor()` is the keyword to show then. Images not asked for yet are asked
+  /// for in the next `takeLoads`.
+  pub effect fn cursorImage(self: &mut Self) -> Option<CursorImage>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let from = interact.cursorFrom(&self.*)
+    if from.images == NONE {
+      return Option<CursorImage>.None
+    }
+    let node = self.node(from.images)
+    let declarations = match node.sheetStyle() {
+      Option.Some { value } => value.declarations.asSlice()
+      _ => node.base.asSlice()
+    }
+    let mut css = Bytes.make()
+    let mut i = declarations.length
+    while i > 0 {
+      i = i - 1
+      if declarations[i].property == CssProperty.Cursor {
+        css = run values.cssText(&declarations[i].value)
+        break
+      }
+    }
+    let urls = run css_cursor.urlsOf(css.asSlice())
+    let list = urls.asSlice()
+    let mut ids = List<u32>.make()
+    let mut k: usize = 0
+    while k < list.length {
+      run ids.append(run self.resources.cssImage(list[k].url.asSlice()))
+      k = k + 1
+    }
+    k = 0
+    while k < list.length {
+      let resource = ids.asSlice()[k]
+      match self.resources.cssImages.asSlice()[u32.toUsize(resource - CSS_IMAGE_BASE)].state {
+        CssImageState.Loaded => {
+          return Option<CursorImage>.Some {
+            value: CursorImage { resource: resource, hotX: list[k].hotX, hotY: list[k].hotY, hot: list[k].hot },
+          }
+        }
+        CssImageState.Failed => {}
+        _ => {
+          return Option<CursorImage>.None
+        }
+      }
+      k = k + 1
+    }
+    return Option<CursorImage>.None
+  }
+
+  /// The pixels of cursor `image` for a display of `scale` pixels per CSS pixel, None when the
+  /// image cannot be a cursor (a side past 256 pixels).
+  pub effect fn cursorPixels(self: &mut Self, image: CursorImage, scale: f32) -> Option<CursorPixels>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run self.resources.cursorPixels(image.resource, scale)
   }
 
   /// The scroll offset of node `id`, (0, 0) when it does not scroll or does not exist.
@@ -3894,6 +4086,27 @@ impl<'a> UiTree<'a> {
   /// on demand ask for a frame at that time.
   pub fn nextBlink(self: &Self) -> f64 {
     return edit.nextBlink(self)
+  }
+
+  /// When a `font-display` block or swap period ends, in frame time, or negative: text
+  /// waiting for its face shows the fallback then, so the host draws a frame.
+  pub fn fontWake(self: &Self) -> f64 {
+    return self.fontBlockEnd
+  }
+
+  /// Whether a block or swap period ended by frame time `time` and no frame saw it yet.
+  pub fn fontWakeDue(self: &Self, time: f64) -> bool {
+    return self.fontBlockEnd >= 0.0 && time >= self.fontBlockEnd
+  }
+
+  /// When the tree next wants a frame without new input, in frame time: a caret blink, or the
+  /// end of a `font-display` block period. Negative when it does not.
+  pub fn nextWake(self: &Self) -> f64 {
+    let blink = edit.nextBlink(self)
+    if blink < 0.0 || self.fontBlockEnd >= 0.0 && self.fontBlockEnd < blink {
+      return self.fontBlockEnd
+    }
+    return blink
   }
 
   /// The selection of input `id` as (anchor, focus) UTF-8 byte offsets into its value, or
@@ -4020,6 +4233,7 @@ impl<'a> UiTree<'a> {
       while at < self.nodes.length() {
         let uses = match self.nodes.asSlice()[at].paintEffects() {
           Option<&Effects>.Some { value } => value.backgrounds.hasUrl() || value.masks.hasUrl()
+            || paint_css.usesUrl(&value.borderImage.image) || paint_css.usesUrl(&value.maskBorder.image)
           Option<&Effects>.None => false
         }
         if uses && self.nodes.asSlice()[at].live {
@@ -4057,6 +4271,8 @@ impl<'a> UiTree<'a> {
     let kind = self.node(slot).kind
     let resource = self.node(slot).resource
     let fontSize = self.node(slot).computed.text.size
+    // Natural sizes scale with `zoom`, as replaced elements do in browsers.
+    let zoom = self.node(slot).computed.text.zoom
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
     if kind != NodeKind.Image && kind != NodeKind.Icon {
@@ -4066,7 +4282,7 @@ impl<'a> UiTree<'a> {
     if let Option<Resource>.Some { value } = shown {
       match value {
         Resource.Image { width, height, .. } => {
-          natural.size = OptionalSize.definite(u32.toF32(width), u32.toF32(height))
+          natural.size = OptionalSize.definite(u32.toF32(width) * zoom, u32.toF32(height) * zoom)
           if height != 0 {
             natural.aspectRatio = u32.toF32(width) / u32.toF32(height)
           }
@@ -4077,7 +4293,7 @@ impl<'a> UiTree<'a> {
           let width = self.resources.iconWidth(icon)
           let height = self.resources.iconHeight(icon)
           if width > 0.0 && height > 0.0 {
-            natural.size = OptionalSize.definite(f64.toF32(width), f64.toF32(height))
+            natural.size = OptionalSize.definite(f64.toF32(width) * zoom, f64.toF32(height) * zoom)
             natural.aspectRatio = f64.toF32(width / height)
           } else {
             natural.size = OptionalSize.definite(fontSize, fontSize)
@@ -4108,7 +4324,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
-    let treatment = Treatment {
+    let mut treatment = Treatment {
       letterSpacing: text.letterSpacing,
       wordSpacing: text.wordSpacing,
       transform: text.textTransform,
@@ -4118,6 +4334,8 @@ impl<'a> UiTree<'a> {
       hyphens: text.hyphens,
       features: text.features,
     }
+    // Palette and smoothing are paint's: keys do not differ by them.
+    treatment.features.extras = text_fonts.withExtrasField(text_fonts.withExtrasField(text.features.extras, text_fonts.EXTRAS_PALETTE, 0), text_fonts.EXTRAS_SMOOTH, 0)
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
@@ -4131,6 +4349,16 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    let mut named = List<Bytes>.make()
+    if text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES) != 0 {
+      let mut f: usize = 0
+      while f < families.length() {
+        if let Family.Named { name } = &families.asSlice()[f] {
+          run named.append(run Bytes.copy(Bytes.asSlice(&name)))
+        }
+        f = f + 1
+      }
+    }
     run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
@@ -4144,6 +4372,15 @@ impl<'a> UiTree<'a> {
     }
     request.treatment = treatment
     request.variations = self.variations.axes(text.features.variations)
+    request.sizeAdjust = self.fontRules.adjust(text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_SIZE_ADJUST))
+    let alternates = text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES)
+    if alternates != 0 {
+      let mut pairs = List<u32>.make()
+      run self.fontRules.alternates(self.current, alternates, named.asSlice(), &mut pairs)
+      let defined = if pairs.length() == 0 { Option<u32>.None } else { run self.provider.text.fonts.defineFeatures(pairs.asSlice()) }
+      let resolved = match defined { Option.Some { value } => value _ => 0 }
+      request.treatment.features.extras = text_fonts.withExtrasField(request.treatment.features.extras, text_fonts.EXTRAS_ALTERNATES, resolved)
+    }
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4158,6 +4395,22 @@ impl<'a> UiTree<'a> {
       },
     )
     return key
+  }
+
+  /// The root's `@font-feature-values` changed: its styles get new font keys.
+  fn fontRulesChanged(self: &mut Self) -> () {
+    let entries = self.fontKeys.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].root == self.current { entries[i].family = NONE }
+      i = i + 1
+    }
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
   }
 
   // Font faces added at run time.
@@ -4296,6 +4549,7 @@ impl<'a> UiTree<'a> {
   pub fn hostFontFaceFailed(self: &Self, id: u32) -> bool {
     let index = self.fontFaceIndex(id)
     return index != usize.MAX && self.provider.text.fonts.set.state(index) == FaceState.Failed
+      && !self.provider.text.fonts.set.expired(index)
   }
 
   pub effect fn setHostFontFaceActive(self: &mut Self, id: u32, active: bool, order: usize) ! OutOfMemoryError ? &mut Allocator {
@@ -4355,6 +4609,40 @@ impl<'a> UiTree<'a> {
   }
 
   /// Restyles the nodes whose declarations use viewport units, after the viewport changed.
+  /// The page zoom (see `setPageZoom`).
+  pub fn pageZoom(self: &Self) -> f32 { return self.pageZoomFactor }
+
+  /// Zooms the whole page, as a browser's Ctrl/Cmd + and - do: every length multiplies by
+  /// `zoom` (from 0.25 to 5), text is laid out at the larger size and the page reflows against
+  /// a viewport `zoom` times smaller. Returns whether the zoom changed.
+  pub fn setPageZoom(self: &mut Self, zoom: f32) -> bool {
+    let wanted: f32 = f32.max(MIN_PAGE_ZOOM, f32.min(MAX_PAGE_ZOOM, zoom))
+    if wanted == self.pageZoomFactor { return false }
+    self.pageZoomFactor = wanted
+    self.stylesDirty = true
+    let count = self.nodes.length()
+    let mut slot: usize = 0
+    while slot < count {
+      if self.nodes.asSlice()[slot].live { self.restyle(usize.toU32(slot)) }
+      slot = slot + 1
+    }
+    return true
+  }
+
+  /// The viewport width in CSS pixels, which media queries and viewport units read.
+  pub fn cssWidth(self: &Self) -> f32 { return self.input.width / self.pageZoomFactor }
+  pub fn cssHeight(self: &Self) -> f32 { return self.input.height / self.pageZoomFactor }
+
+  /// The text the root inherits: the initial values at the page zoom.
+  pub fn rootText(self: &Self) -> TextStyle {
+    let mut text = TextStyle.initial()
+    text.rezoom(self.pageZoomFactor)
+    return text
+  }
+
+  /// The style the root inherits from.
+  pub fn rootParent(self: &Self) -> Computed { return Computed.inheriting(self.rootText()) }
+
   fn restyleViewportUnits(self: &mut Self) -> () {
     let count = self.nodes.length()
     let mut slot: usize = 0
@@ -4746,7 +5034,7 @@ impl<'a> UiTree<'a> {
     }
     if !same { return NONE }
     let values = &other.computed
-    if values.viewportWidth != self.input.width || values.viewportHeight != self.input.height || values.usesContainer { return NONE }
+    if values.viewportWidth != self.cssWidth() || values.viewportHeight != self.cssHeight() || values.usesContainer { return NONE }
     let none = usize.MAX
     if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
       || values.transition.easings.start != none || values.transition.discrete.start != none || values.animation.names.start != none { return NONE }
@@ -4802,7 +5090,7 @@ impl<'a> UiTree<'a> {
 
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
     if lender != NONE { return self.node(lender).computed }
-    return Computed.inViewport(inherited, self.input.width, self.input.height)
+    return Computed.inViewport(inherited, self.cssWidth(), self.cssHeight())
   }
 
   effect fn syncGenerated(self: &mut Self, origin: u32) -> ()
@@ -4927,6 +5215,315 @@ impl<'a> UiTree<'a> {
     if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
   }
 
+  /// Keeps the `::first-letter` box of block container `origin` (CSS Pseudo 4 §2.5): an inline
+  /// box before the text the letter comes from, under that text's parent, holding the letter;
+  /// css-layout reads that text from after the letter.
+  @inlineNever
+  /// Whether `syncFirstLetter` has anything to do at `slot`.
+  fn letterCandidate(self: &Self, slot: u32) -> bool {
+    let node = self.node(slot)
+    if node.kind != NodeKind.Box || node.isGenerated() { return false }
+    let held = match node.identity() { Option.Some { value } => value.letterBox != NONE || value.letterRules _ => false }
+    if held { return true }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter
+  }
+
+  effect fn syncFirstLetter(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let node = self.node(origin)
+    if node.kind != NodeKind.Box || node.isGenerated() { return () }
+    let old = match node.identity() { Option.Some { value } => value.letterBox _ => NONE }
+    let ruled = match node.identity() { Option.Some { value } => value.letterRules _ => false }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter && node.rendered && first_letter.blockContainer(&node.computed)
+    if !enabled && old == NONE && !ruled { return () }
+    let mut prepared = Option<Resolved>.None
+    let mut wanted = false
+    if enabled {
+      let rendered = old != NONE && style_change.rendered(&self, old)
+      let value = run self.resolveGeneratedStyle(origin, PseudoTarget.FirstLetter, StateBits.empty(), rendered)
+      wanted = value.declarations.length() != 0
+      prepared = Option<Resolved>.some(move value)
+    }
+    if wanted || ruled {
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.letterRules = wanted
+    }
+    let target = if wanted { self.letterTarget(origin) } else { NONE }
+    let mut letter = first_letter.Letter { start: 0, end: 0 }
+    if target != NONE {
+      let holder = self.node(target).parent
+      let collapse = if holder == NONE { WhiteSpaceCollapse.Collapse } else { self.node(holder).computed.text.whiteSpaceCollapse }
+      letter = first_letter.letterOf(String.utf8Bytes(String.view(&self.node(target).text)), collapse != WhiteSpaceCollapse.Preserve && collapse != WhiteSpaceCollapse.BreakSpaces && collapse != WhiteSpaceCollapse.PreserveSpaces)
+    }
+    // An inner block's own ::first-letter takes the letter its ancestors would.
+    if letter.end != 0 {
+      let held = match self.node(target).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      let other = if held == NONE { NONE } else { self.node(held).generatedOrigin() }
+      if other != NONE && other != origin {
+        if self.within(other, origin) { letter.end = 0 }
+        else { run self.releaseFirstLetter(other) }
+      }
+    }
+    let mut slot = old
+    if slot != NONE && (letter.end == 0 || self.letterTextOf(slot) != target) {
+      run self.releaseFirstLetter(origin)
+      slot = NONE
+    }
+    if letter.end == 0 { return () }
+    if slot == NONE {
+      let id = self.node(origin).id
+      let holder = self.node(target).parent
+      slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.FirstLetter)
+      let child = run self.createNode(0, id, NodeKind.Text, origin, PseudoTarget.FirstLetter)
+      let boxCss = self.node(slot).css
+      let holderCss = self.node(holder).css
+      let targetCss = self.node(target).css
+      let childCss = self.node(child).css
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: holderCss }, NodeId { index: boxCss }, Option<NodeId>.some(NodeId { index: targetCss })), layoutFailed)
+      run Effect.catchAll(self.layout.insertBefore(NodeId { index: boxCss }, NodeId { index: childCss }, Option<NodeId>.None), layoutFailed)
+      let boxNode = self.nodeMut(slot)
+      boxNode.parent = holder
+      let boxIdentity = run boxNode.identityMut()
+      boxIdentity.letterText = target
+      let textNode = self.nodeMut(child)
+      textNode.parent = slot
+      let targetNode = self.nodeMut(target)
+      let targetIdentity = run targetNode.identityMut()
+      targetIdentity.letterBox = slot
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.letterBox = slot
+      self.letterUsed = true
+      // Its parent's walk may already be past: the pass reaches it through its ancestors.
+      self.restyleLocal(slot)
+    }
+    let full = String.view(&self.node(target).text)
+    let piece = run String.copy(String.slice(full, letter.start, letter.end - letter.start))
+    run self.fillGenerated(slot, move piece)
+    let targetCss = self.node(target).css
+    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end), layoutFailed)
+    if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+  }
+
+  /// `initial-letter` on the `::first-letter` box `slot`: sizes and places it against its
+  /// origin's first available font (see `first_letter.dropCap`).
+  effect fn dropCap(self: &mut Self, slot: u32, computed: &mut Computed) -> () ! OutOfMemoryError ? &mut Allocator {
+    let origin = self.node(slot).generatedOrigin()
+    let first = match self.node(slot).identity() { Option.Some { value } => value.generatedTarget == PseudoTarget.FirstLetter _ => false }
+    if !first || origin == NONE { return () }
+    let letter = match self.node(slot).sheetStyle() { Option.Some { value } => first_letter.initialLetter(value.declarations.asSlice()) _ => first_letter.InitialLetter { size: 0.0, sink: 0 } }
+    if letter.size < 1.0 { return () }
+    let paragraph = self.faceOf(self.node(origin).computed.text, self.node(origin).fontKey)
+    let key = run self.fontKeyOf(computed.text)
+    let own = self.faceOf(computed.text, key)
+    first_letter.dropCap(&mut computed.*, letter, paragraph, own)
+  }
+
+  fn faceOf(self: &Self, text: TextStyle, key: usize) -> first_letter.Face {
+    let measured = self.provider.text.font(FontRequest { key: key,
+      writingMode: text.writingMode, textOrientation: text.textOrientation, direction: text.direction })
+    let known = measured.fontSize > 0.0
+    let ascent = if known { measured.ascent } else { text.size * 0.8 }
+    let descent = if known { measured.descent } else { text.size * 0.2 }
+    let lineHeight = match text.lineHeight {
+      LineHeight.Number { value } => text.size * value
+      LineHeight.Length { value } => value
+      LineHeight.Normal => if known { measured.ascent + measured.descent + measured.lineGap } else { text.size }
+    }
+    return first_letter.Face { size: text.size, ascent: ascent, descent: descent,
+      capHeight: if known { measured.capHeight } else { text.size * 0.7 }, lineHeight: lineHeight }
+  }
+
+  /// Keeps the `::first-line` style of block container `origin` (CSS Pseudo 4 §2.4) in a node
+  /// outside layout, whose values paint the text of the block's first line box.
+  @inlineNever
+  effect fn syncFirstLine(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let node = self.node(origin)
+    if node.kind != NodeKind.Box || node.isGenerated() { return () }
+    let old = match node.identity() { Option.Some { value } => value.lineBox _ => NONE }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLine && node.rendered && first_letter.blockContainer(&node.computed)
+    if !enabled && old == NONE { return () }
+    let mut prepared = Option<Resolved>.None
+    if enabled {
+      let value = run self.resolveGeneratedStyle(origin, PseudoTarget.FirstLine, StateBits.empty(), false)
+      if value.declarations.length() != 0 { prepared = Option<Resolved>.some(move value) }
+    }
+    if prepared.isNone() {
+      if old != NONE {
+        let originNode = self.nodeMut(origin)
+        let identity = run originNode.identityMut()
+        identity.lineBox = NONE
+        run self.destroy(0, old)
+        self.paintDirty = true
+      }
+      return ()
+    }
+    let mut slot = old
+    if slot == NONE {
+      let id = self.node(origin).id
+      slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.FirstLine)
+      let lineNode = self.nodeMut(slot)
+      lineNode.parent = origin
+      let originNode = self.nodeMut(origin)
+      let identity = run originNode.identityMut()
+      identity.lineBox = slot
+      run self.lineOrigins.append(origin)
+    }
+    if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
+    drop run self.resolve(slot, false)
+    self.paintDirty = true
+  }
+
+  /// Finds the first line box of each block with a `::first-line` style, after layout.
+  effect fn indexFirstLines(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.firstLines.clear()
+    let mut kept: usize = 0
+    let mut i: usize = 0
+    while i < self.lineOrigins.length() {
+      let origin = self.lineOrigins.get(i)
+      i = i + 1
+      let box = if self.node(origin).live { match self.node(origin).identity() { Option.Some { value } => value.lineBox _ => NONE } } else { NONE }
+      if box == NONE || self.lineOriginSeen(origin, kept) { continue }
+      self.lineOrigins.set(kept, origin)
+      kept = kept + 1
+      let line = self.firstLineOf(self.node(origin).css)
+      if line != NO_INDEX { run self.firstLines.append(first_letter.FirstLine { line: line, slot: box, origin: origin }) }
+    }
+    self.lineOrigins.truncate(kept)
+  }
+
+  fn lineOriginSeen(self: &Self, origin: u32, kept: usize) -> bool {
+    let mut j: usize = 0
+    while j < kept {
+      if self.lineOrigins.get(j) == origin { return true }
+      j = j + 1
+    }
+    return false
+  }
+
+  /// The first line box in the first fragment of css node `css`, through in-flow blocks.
+  fn firstLineOf(self: &Self, css: usize) -> usize {
+    if css >= self.fragmentOf.length() { return NO_INDEX }
+    let top = self.fragmentOf.get(css)
+    if top == NO_INDEX { return NO_INDEX }
+    let values = self.output.fragments.values.asSlice()
+    let mut at = values[top].firstChild
+    while at != NO_INDEX {
+      if values[at].kind == FragmentKind.Line { return at }
+      let mut descend = values[at].kind == FragmentKind.Box
+      let slot = if values[at].source == NO_INDEX { NONE } else { self.slotOfCssNode(values[at].source) }
+      if descend && slot != NONE {
+        let layout = &self.node(slot).computed.layout
+        descend = layout.float == Float.None && layout.position != Position.Absolute && layout.position != Position.Fixed
+          && layout.display.insideIs(DisplayInside.Flow)
+      }
+      if descend && values[at].firstChild != NO_INDEX {
+        at = values[at].firstChild
+        continue
+      }
+      while at != top && values[at].nextSibling == NO_INDEX { at = values[at].parent }
+      if at == top { break }
+      at = values[at].nextSibling
+    }
+    return NO_INDEX
+  }
+
+  fn letterTextOf(self: &Self, box: u32) -> u32 {
+    return match self.node(box).identity() { Option.Some { value } => value.letterText _ => NONE }
+  }
+
+  /// The text the first letter of block container `origin` comes from: the first text of its
+  /// first formatted line, through inline and block descendants in flow, or NONE when an
+  /// atomic inline or other content comes first.
+  fn letterTarget(self: &Self, origin: u32) -> u32 {
+    let top = self.node(origin).css
+    let mut at = self.layout.nodes.asSlice()[top].firstChild
+    while at != NO_INDEX {
+      let slot = self.slotOfCssNode(at)
+      let mut descend = false
+      if slot != NONE {
+        let node = self.node(slot)
+        if node.kind == NodeKind.Text {
+          if !blankText(String.utf8Bytes(String.view(&node.text))) { return slot }
+        } else if node.kind != NodeKind.Box {
+          return NONE
+        } else {
+          let target = match node.identity() { Option.Some { value } => value.generatedTarget _ => PseudoTarget.None }
+          let layout = &node.computed.layout
+          if target == PseudoTarget.Marker || target == PseudoTarget.FirstLetter || layout.display.isNone() {
+          } else if layout.float != Float.None || layout.position == Position.Absolute || layout.position == Position.Fixed {
+          } else if layout.display.isContents() || layout.display.insideIs(DisplayInside.Flow) {
+            descend = true
+          } else {
+            return NONE
+          }
+        }
+      }
+      let links = self.layout.nodes.asSlice()
+      if descend && links[at].firstChild != NO_INDEX {
+        at = links[at].firstChild
+        continue
+      }
+      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      if at == top { break }
+      at = links[at].nextSibling
+    }
+    return NONE
+  }
+
+  /// Takes the `::first-letter` box of `origin` away and gives its text the letter back.
+  effect fn releaseFirstLetter(self: &mut Self, origin: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let box = match self.node(origin).identity() { Option.Some { value } => value.letterBox _ => NONE }
+    if box == NONE { return () }
+    let originNode = self.nodeMut(origin)
+    let identity = run originNode.identityMut()
+    identity.letterBox = NONE
+    let text = self.letterTextOf(box)
+    if text != NONE && self.node(text).live && self.node(text).kind == NodeKind.Text {
+      let held = match self.node(text).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      if held == box {
+        let textNode = self.nodeMut(text)
+        let textIdentity = run textNode.identityMut()
+        textIdentity.letterBox = NONE
+        let textCss = self.node(text).css
+        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0), layoutFailed)
+      }
+    }
+    run self.destroy(0, box)
+  }
+
+  /// An edit at `from` can change the first letter of a block above it: those that have or
+  /// want one restyle, which places it again.
+  fn restyleLetterOrigins(self: &mut Self, from: u32) -> () {
+    let mut at = from
+    while at != NONE {
+      let marked = match self.node(at).identity() { Option.Some { value } => value.letterRules || value.letterBox != NONE _ => false }
+      if marked && !self.node(at).isGenerated() { self.restyleLocal(at) }
+      at = self.node(at).parent
+    }
+  }
+
+  /// Before `slot` leaves its parent: a letter box it holds whose origin stays behind, or the
+  /// letter of the text it is, goes back to its text.
+  effect fn detachLetters(self: &mut Self, slot: u32, parent: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut at = parent
+    while at != NONE {
+      let box = match self.node(at).identity() { Option.Some { value } => value.letterBox _ => NONE }
+      if box != NONE && !self.node(at).isGenerated() && (self.letterTextOf(box) == slot || self.within(box, slot)) {
+        run self.releaseFirstLetter(at)
+      }
+      at = self.node(at).parent
+    }
+    self.restyleLetterOrigins(parent)
+  }
+
   /// Sets the text of generated box `slot` to `text`, when it differs.
   pub effect fn fillGenerated(self: &mut Self, slot: u32, text: String) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -4938,18 +5535,21 @@ impl<'a> UiTree<'a> {
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
-    if self.input.width != self.unitsWidth || self.input.height != self.unitsHeight {
-      self.unitsWidth = self.input.width
-      self.unitsHeight = self.input.height
+    if self.cssWidth() != self.unitsWidth || self.cssHeight() != self.unitsHeight {
+      self.unitsWidth = self.cssWidth()
+      self.unitsHeight = self.cssHeight()
       self.restyleViewportUnits()
     }
     let conditionIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if conditionIndex != usize.MAX {
+      let cssWidth = self.cssWidth()
+      let cssHeight = self.cssHeight()
+      let pageZoom = self.pageZoomFactor
       let roots = self.styleSheets.asMutSlice()
       let mut environment = roots[conditionIndex].environment
-      environment.initial.viewportWidth = f32.toF64(self.input.width)
-      environment.initial.viewportHeight = f32.toF64(self.input.height)
-      environment.resolutionDppx = f32.toF64(self.input.scale)
+      environment.initial.viewportWidth = f32.toF64(cssWidth)
+      environment.initial.viewportHeight = f32.toF64(cssHeight)
+      environment.resolutionDppx = f32.toF64(self.input.scale * pageZoom)
       let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
       roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
       match move updated {
@@ -4977,7 +5577,10 @@ impl<'a> UiTree<'a> {
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
-    if self.stylesDirty { run sheet_faces.sync(&mut self) }
+    if self.stylesDirty {
+      run sheet_faces.sync(&mut self)
+      if run font_rules.sync(&mut self) { self.fontRulesChanged() }
+    }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       let roots = self.styleSheets.asMutSlice()
@@ -4991,6 +5594,8 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
+        roots[sheetIndex].hasFirstLetter = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLetter)
+        roots[sheetIndex].hasFirstLine = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLine)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasScrollbars = scrollbar_parts.present(&roots[sheetIndex].sheets)
@@ -5030,6 +5635,7 @@ impl<'a> UiTree<'a> {
         let before = node.computed.text
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
+        let nearest = node.computed.nearest
         let selects = node.computed.userSelect
         let barColors = node.computed.scroll.colors
         let listStyle = node.computed.list
@@ -5044,11 +5650,13 @@ impl<'a> UiTree<'a> {
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
         run self.syncGenerated(slot)
         if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
+        if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
+        if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
         let after = &self.node(slot).computed
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list
+          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -5083,6 +5691,17 @@ impl<'a> UiTree<'a> {
           a = a + 1
         }
       }
+    }
+    if self.letterPending.length() != 0 {
+      let mut i: usize = 0
+      while i < self.letterPending.length() {
+        let origin = self.letterPending.get(i)
+        run self.syncFirstLetter(origin)
+        i = i + 1
+      }
+      self.letterPending.clear()
+      // A new or moved letter box asked for its own style.
+      if self.stylesPending { run self.resolveStyles() }
     }
     if self.listsUsed { run lists.update(&mut self) }
   }
@@ -5181,10 +5800,7 @@ impl<'a> UiTree<'a> {
       self.tickHeight = self.input.height
     }
     let parent = self.node(slot).parent
-    let mut inherited = TextStyle.initial()
-    if parent != NONE {
-      inherited = self.node(parent).computed.text
-    }
+    let inherited = if parent != NONE { self.node(parent).computed.text } else { self.rootText() }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
@@ -5194,9 +5810,10 @@ impl<'a> UiTree<'a> {
     let lender = if based != usize.MAX || simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
     let mut computed = if based != usize.MAX { self.tickBases.asSlice()[based].computed } else { self.valuesToStartFrom(lender, inherited) }
     if based == usize.MAX {
-    // border-collapse, border-spacing and caption-side inherit.
+    // border-collapse, border-spacing, caption-side and empty-cells inherit.
     if lender == NONE && parent != NONE {
       inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
+      computed.emptyCellsHide = self.node(parent).computed.emptyCellsHide
       computed.list = ListStyle.inherited(self.node(parent).computed.list)
     }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
@@ -5212,6 +5829,7 @@ impl<'a> UiTree<'a> {
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
       computed.scroll.colors = self.node(parent).computed.scroll.colors
+      computed.nearest = self.node(parent).computed.nearest
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -5234,13 +5852,13 @@ impl<'a> UiTree<'a> {
     // `outline: none` or another outline in any of them replaces it, as in a browser.
     if self.focused == slot && initialNode.kind != NodeKind.Text && (self.focusVisible || initialNode.kind == NodeKind.Input) {
       computed.outline.auto = true
-      computed.outline.width = FOCUS_RING_WIDTH
+      computed.outline.width = FOCUS_RING_WIDTH * computed.text.zoom
     }
     if simpleStyles {
       self.applyPixelStyles(slot, &mut computed)
     } else {
       let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
-      let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+      let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
     }
@@ -5248,6 +5866,8 @@ impl<'a> UiTree<'a> {
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
+    if computed.transform.offset.path != transform.PATH_NONE { self.offsetUsed = true }
+    if computed.transform.preserve3d { self.preserveUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     if computed.anchor.name != 0 || computed.anchor.anchored() {
@@ -5283,7 +5903,7 @@ impl<'a> UiTree<'a> {
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
       if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
         before = computed
-        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
         let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
         run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
         if sheetStarting {
@@ -5309,7 +5929,7 @@ impl<'a> UiTree<'a> {
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
-        let parentStyle = if parent == NONE { Computed.inheriting(TextStyle.initial()) } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
         let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
         let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
         run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
@@ -5369,8 +5989,10 @@ impl<'a> UiTree<'a> {
       }
       self.easingStops = move finalStops
     }
+    if self.letterUsed && kind == NodeKind.Box && self.node(slot).isGenerated() { run self.dropCap(slot, &mut computed) }
     let css = self.node(slot).css
     let sizeChanged = self.node(slot).computed.text.size != computed.text.size
+    let zoomChanged = self.node(slot).computed.text.zoom != computed.text.zoom
     if parent != NONE {
       let above = self.node(parent).computed.effects
       computed.effects.shadowFrom = above.shadowFrom
@@ -5396,11 +6018,7 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
       run self.resolveGrid(slot, &computed)
-      let shape = match self.node(slot).paintEffects() {
-        Option<&Effects>.Some { value } => run float_shapes.of(value, computed.paint.radii)
-        Option<&Effects>.None => FloatShape.make()
-      }
-      run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
+      run self.updateShape(slot)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
@@ -5412,7 +6030,7 @@ impl<'a> UiTree<'a> {
         identity.containerNames = move names
       }
     }
-    if kind == NodeKind.Icon && sizeChanged {
+    if (kind == NodeKind.Icon && sizeChanged) || (kind == NodeKind.Image && zoomChanged) {
       run self.updateNatural(slot)
     }
     if kind == NodeKind.Input && self.node(slot).edit().runs.length() != 0 {
@@ -5747,6 +6365,7 @@ impl<'a> UiTree<'a> {
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
       || cssom_view.scrollAnimating(self)
+      || self.textSelection.scrolling
       || scroll_snap.waiting(self)
       || touch.animating(self)
       || motion.animating(self)
@@ -5775,6 +6394,12 @@ impl<'a> UiTree<'a> {
     }
     self.applied = false
     self.input = input
+    self.provider.text.fonts.set.now = input.time
+    drop self.provider.text.fonts.set.expireLate()
+    if self.fontBlockEnd >= 0.0 && input.time >= self.fontBlockEnd {
+      // Text waiting for a face shows its fallback now.
+      self.invalidatePaint()
+    }
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
@@ -5787,6 +6412,9 @@ impl<'a> UiTree<'a> {
     run virtual.prepare(&mut self)
     run self.layoutFrame()
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
+    if run text_selection.autoscroll(&mut self) {
+      run self.layoutFrame()
+    }
     run touch.advance(&mut self)
     run scroll_snap.settle(&mut self)
     if run scroll_snap.resnap(&mut self) {
@@ -5809,6 +6437,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     run self.notifyLayout()
     if self.laidOutCurrent() {
@@ -5817,6 +6446,7 @@ impl<'a> UiTree<'a> {
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
     run self.paintFrame()
+    self.fontBlockEnd = self.provider.text.fonts.set.nextDeadline()
     self.scrolled = false
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
@@ -5964,6 +6594,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     if self.laidOutCurrent() {
       run scroll_anchor.select(&mut self)
@@ -6125,6 +6756,7 @@ impl<'a> UiTree<'a> {
         self.fragmentOf.set(source, i)
       }
     }
+    if self.lineOrigins.length() != 0 { run self.indexFirstLines() }
   }
 
   /// Loads the raster face of every font key the layout's text fragments use.
@@ -6259,9 +6891,13 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
+        firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneB,
@@ -6286,6 +6922,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6300,9 +6937,13 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
+        firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
         scene: &mut self.sceneA,
@@ -6327,6 +6968,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6370,9 +7012,13 @@ impl<'a> UiTree<'a> {
       output: &self.output,
       text: &self.provider.text,
       faces: &self.faces,
+      fontRules: &self.fontRules,
+      sheetFaces: &self.sheetFaces,
+      root: self.current,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
       textInk: &mut self.textInk,
+      firstLines: &self.firstLines,
       resources: &mut self.resources,
       paths: &mut self.paths,
       scene: &mut scene,
@@ -6397,6 +7043,7 @@ impl<'a> UiTree<'a> {
       seed: self.seed,
       only: slot,
       inside: false,
+      planes: self.preserveUsed,
     }
     run paintRoots(&mut painter, window)
     drop painter
@@ -6522,6 +7169,8 @@ effect fn resourceFailed(error: ResourceError) -> bool {
 /// restyle.
 fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
   return left.writingMode == right.writingMode && left.textOrientation == right.textOrientation
+    && &left.textBoxEdge == &right.textBoxEdge
+    && &left.emphasis == &right.emphasis
     && left.textAlignLast == right.textAlignLast
     && left.textWrap == right.textWrap
     && left.whiteSpaceCollapse == right.whiteSpaceCollapse
@@ -6568,6 +7217,19 @@ fn writtenVariations(declaration: &Declaration) -> bool {
     && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
+// A `font-palette`, `font-variant-alternates` or `font-size-adjust` not yet a handle.
+fn writtenHandle(declaration: &Declaration) -> bool {
+  if font_features.extrasShift(declaration.property) == 0xFFFFFFFF { return false }
+  if let Option.Some { value } = convert.number(&declaration.value) {
+    if value < 0.0 { return false }
+  }
+  return !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
+}
+
 // A `font-family` written as CSS text rather than as a family list id.
 fn writtenFamily(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
@@ -6580,6 +7242,8 @@ fn writtenFamily(declaration: &Declaration) -> bool {
 
 /// The width of the default focus ring, as Chromium draws `outline: auto`.
 const FOCUS_RING_WIDTH: f32 = 2.0
+const MIN_PAGE_ZOOM: f32 = 0.25
+const MAX_PAGE_ZOOM: f32 = 5.0
 
 /// A focus trap and the node focus returns to when the trap is removed (see `returnSlot`).
 struct FocusReturn {
@@ -6723,4 +7387,14 @@ pub fn isSvgUrl(url: &[u8]) -> bool {
     return true
   }
   return false
+}
+
+fn blankText(text: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < text.length {
+    let c = text[i]
+    if c != 32 && c != 9 && c != 10 && c != 12 && c != 13 { return false }
+    i = i + 1
+  }
+  return true
 }

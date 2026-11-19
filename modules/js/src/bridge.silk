@@ -6,6 +6,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
 import silk.core.option { Option }
@@ -22,8 +23,22 @@ import silk.system.system_info { SystemInfo, SystemInfoError }
 import silk.system.system_info_native { OsSystemInfo }
 import ui_tree.process_memory
 import ui_tree.style_media { MediaState }
+import ui_tree.battery
+import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
-import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom }
+import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
+import ui_tree.computed_style
+import ui_tree.cssom_view
+import ui_tree.text_selection
+import ui_tree.cssom_view { BoundaryPoint, Range }
+import ui_tree.node { NONE }
+import ui_tree.observers { Observers, Margin }
+import svg_css.cssom_view { ScrollToOptions, ScrollIntoViewOptions, ScrollLogicalPosition, ScrollBehavior }
+import svg_css.cssom_view_window { ScrollRequest }
+import svg_css.cssom_geometry { DOMRect }
+import svg_css.cssom_error { CssomError }
+import ui_tree.query { Query }
+import silk.mem.pointer { Pointer }
 import silkjs.js_engine { Engine }
 import silkjs.js_engine_host { EngineServices }
 import silkjs.js_value { ValueBits }
@@ -36,11 +51,13 @@ import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
 import silkjs.js_heap { CellRef }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
+import ui_js_calls.supports as supports
 import ui_js_calls.natives { Natives, NativeCall, Reply }
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
@@ -121,11 +138,73 @@ pub const FRAME_STATS: u32 = 687480 // nativeId(b"frameStats")
 pub const RANDOM: u32 = 264774 // nativeId(b"random")
 /// `__ui.cpus()`: how many threads can run at once, for `navigator.hardwareConcurrency`.
 pub const CPUS: u32 = 1029073 // nativeId(b"cpus")
+/// `__ui.computed(id, name)`: the computed value of longhand `name` of node `id`, as
+/// `getComputedStyle` gives it, or undefined when there is none or the host attached no tree.
+/// The pending batch reaches the tree first, and a pending layout runs.
+pub const COMPUTED: u32 = 383089 // nativeId(b"computed")
 /// `__ui.scale()`: device pixels per CSS pixel in the window's last frame, for
 /// `devicePixelRatio`.
 pub const SCALE: u32 = 264834 // nativeId(b"scale")
 /// `__ui.matchMedia(query)`: whether the media query list matches the last frame's media.
 pub const MATCH_MEDIA: u32 = 629931 // nativeId(b"matchMedia")
+/// `__ui.battery(field)`: 0 reads the battery and answers 1, or 0 when there is none to read;
+/// 1 to 4 answer the reading's charging (0 or 1), level, seconds to full and seconds to empty.
+pub const BATTERY: u32 = 432729 // nativeId(b"battery")
+/// `__ui.supports(conditionText)` and `__ui.supports(property, value)`: `CSS.supports`, as the
+/// tree's `@supports` evaluates it.
+pub const SUPPORTS: u32 = 870406 // nativeId(b"supports")
+/// Layout reads for CSSOM View. Each applies the pending batch to the attached tree, lays out
+/// when something is pending, and leaves its numbers for `__ui.geometry(index)`:
+/// `rect(id)` x, y, width, height and answers 4; `rects(id)` 4 a fragment and answers how many
+/// rectangles; `metrics(id)` client left, top, width, height, scroll width, height, left, top,
+/// offset parent (0 for none), offset left, top, width, height and answers 13; `hit(x, y)`
+/// answers the topmost node there (0 for none); `hits(x, y)` leaves the ids, topmost first, and
+/// answers how many; `caret(x, y)` leaves node, UTF-16 offset, x, y, width, height and answers 1,
+/// or 0 when no text is there; `rangeRects(startId, startOffset, endId, endOffset)` as `rects`.
+/// Without an attached tree each answers 0.
+pub const RECT: u32 = 416237 // nativeId(b"rect")
+pub const RECTS: u32 = 451652 // nativeId(b"rects")
+pub const METRICS: u32 = 924528 // nativeId(b"metrics")
+pub const HIT: u32 = 168851 // nativeId(b"hit")
+pub const HITS: u32 = 122697 // nativeId(b"hits")
+pub const CARET: u32 = 125073 // nativeId(b"caret")
+pub const RANGE_RECTS: u32 = 444035 // nativeId(b"rangeRects")
+/// The document's text selection. `selection()` applies the pending batch and leaves anchor
+/// id, offset, focus id, offset, then each stretch's start id, offset, end id, offset (see
+/// `text_selection.stretches`) for `__ui.geometry`, and answers how many stretches (0 for none).
+/// Offsets are DOM offsets: UTF-16 units in text. `setSelection(anchorId, anchorOffset, focusId,
+/// focusOffset)` selects (id 0 clears) and answers whether both nodes were found.
+/// `selectionText()` is the selection's text as copying gives it.
+pub const SELECTION: u32 = 1110422 // nativeId(b"selection")
+pub const SET_SELECTION: u32 = 975202 // nativeId(b"setSelection")
+pub const SELECTION_TEXT: u32 = 266335 // nativeId(b"selectionText")
+/// `__ui.geometry(index)`: number `index` of the last layout read.
+pub const GEOMETRY: u32 = 576810 // nativeId(b"geometry")
+/// `__ui.scrollIntoView(id, block, inline, behavior, ifNeeded)`: scrolls every scroll container
+/// around node `id` to show it, honoring `scroll-margin`, `scroll-padding` and snapping.
+/// `block` and `inline` are 0 start, 1 center, 2 end, 3 nearest; `behavior` 0 auto, 1 instant,
+/// 2 smooth. With `ifNeeded` a container that already shows the node stays.
+pub const SCROLL_INTO_VIEW: u32 = 305994 // nativeId(b"scrollIntoView")
+/// `__ui.scroll(id, left, top, behavior, flags)`: scrolls node `id` to (`left`, `top`), or by
+/// them with flag 4. Flag 1 says `left` is given and 2 `top`; an axis not given stays.
+/// `behavior` as for `scrollIntoView`; `auto` follows the node's `scroll-behavior`.
+pub const SCROLL: u32 = 461991 // nativeId(b"scroll")
+/// `__ui.observer(id, root, top, right, bottom, left, percent, scrollTop, scrollRight,
+/// scrollBottom, scrollLeft... )`: sets IntersectionObserver `id`'s root (0 the viewport),
+/// `rootMargin` and `scrollMargin`; percent bits 1-8 the root margin's, 16-128 the scroll
+/// margin's. `__ui.threshold(id, value)` then adds its thresholds in ascending order.
+pub const OBSERVER: u32 = 104149 // nativeId(b"observer")
+pub const THRESHOLD: u32 = 226919 // nativeId(b"threshold")
+/// `__ui.observe(observer, target, kind)`: kind 0 intersection, 1 to 3 a resize of the
+/// content, border or device pixel content box. `__ui.unobserve(observer, target)`, target 0
+/// for all. Changes reach JavaScript after each layout as `__ui.observed(count)`.
+pub const OBSERVE: u32 = 540327 // nativeId(b"observe")
+pub const UNOBSERVE: u32 = 571481 // nativeId(b"unobserve")
+/// `__ui.query(mode, id, selector)`: the selector matcher of stylesheets on the attached tree,
+/// after the pending batch. Mode 0 answers whether node `id` matches (1 or 0), 1 its closest
+/// match (an id, 0 when none), 2 its first matching descendant (an id or 0) and 3 all of
+/// them (ids joined by commas). -1 is an invalid selector; undefined means no tree.
+pub const QUERY: u32 = 1055226 // nativeId(b"query")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
@@ -200,6 +279,10 @@ pub const MODULE_LOAD: u32 = 100
 pub struct ModuleSource {
   pub name: List<u8>,
   pub source: List<u8>,
+  /// `source` compiled into a bytecode image when the program was built
+  /// (`JsHost.defineImaged`), or empty: the first import starts from it when this engine
+  /// build wrote it.
+  pub image: &'static [u8],
 }
 
 /// A timer JavaScript asked for: `__ui.fire(id)` is due at `due`, in the host clock's
@@ -255,8 +338,17 @@ pub struct Bridge {
   /// What `__ui.frameStats(0)` took, sorted, and its replaced frames.
   pub taken: List<f64>,
   pub takenDropped: u64,
+  /// The `UiTree` the host attached for `__ui.computed`, null when none: JavaScript runs only
+  /// inside host calls, and the host attaches its tree before each.
+  pub tree: ?*mut u8,
   /// The media of the window's last frame, for `__ui.scale` and `__ui.matchMedia`.
   pub media: MediaState,
+  /// The last `__ui.battery(0)` reading.
+  pub battery: BatteryState,
+  /// The numbers of the last layout read, for `__ui.geometry`.
+  pub geometry: List<f64>,
+  /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
+  pub observers: Observers,
 }
 
 /// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
@@ -315,8 +407,19 @@ impl Bridge {
       dropped: 0,
       taken: List<f64>.make(),
       takenDropped: 0,
+      tree: Pointer.null<u8>(),
       media: MediaState.initial(expectedScale()),
+      battery: BatteryState.full(),
+      geometry: List<f64>.make(),
+      observers: Observers.make(),
     }
+  }
+
+  /// Lets `__ui.computed` read `tree`, which must stay where it is while JavaScript runs.
+  pub fn attach<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () {
+    self.tree = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(
+      unsafe Intrinsic.pointerReinterpret<*mut UiTree<'t>, *mut u8>(Pointer.fromMutRef<UiTree<'t>>(&mut tree.*)),
+    )
   }
 
   /// Adds frames the window presented: the milliseconds between presents, and how many
@@ -409,7 +512,9 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"append", arity: 2 },
     Native { name: b"atomStyle", arity: 3 },
     Native { name: b"attribute", arity: 3 },
+    Native { name: b"battery", arity: 1 },
     Native { name: b"cancelTimer", arity: 1 },
+    Native { name: b"computed", arity: 2 },
     Native { name: b"capture", arity: 1 },
     Native { name: b"clearStyle", arity: 2 },
     Native { name: b"clipboardRead", arity: 1 },
@@ -438,6 +543,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"nativeStart", arity: 2 },
     Native { name: b"now", arity: 0 },
     Native { name: b"open", arity: 1 },
+    Native { name: b"query", arity: 3 },
     Native { name: b"random", arity: 0 },
     Native { name: b"release", arity: 1 },
     Native { name: b"remove", arity: 1 },
@@ -451,11 +557,29 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"shell", arity: 3 },
     Native { name: b"source", arity: 2 },
     Native { name: b"style", arity: 3 },
+    Native { name: b"caret", arity: 2 },
+    Native { name: b"geometry", arity: 1 },
+    Native { name: b"hit", arity: 2 },
+    Native { name: b"hits", arity: 2 },
+    Native { name: b"metrics", arity: 1 },
+    Native { name: b"rangeRects", arity: 4 },
+    Native { name: b"rect", arity: 1 },
+    Native { name: b"rects", arity: 1 },
+    Native { name: b"scrollIntoView", arity: 5 },
+    Native { name: b"supports", arity: 2 },
+    Native { name: b"scroll", arity: 5 },
+    Native { name: b"observer", arity: 11 },
+    Native { name: b"threshold", arity: 2 },
+    Native { name: b"observe", arity: 3 },
+    Native { name: b"unobserve", arity: 2 },
     Native { name: b"styleSheet", arity: 3 },
     Native { name: b"compileStyleSheet", arity: 1 },
     Native { name: b"cpus", arity: 0 },
     Native { name: b"timer", arity: 2 },
     Native { name: b"webApis", arity: 0 },
+    Native { name: b"selection", arity: 0 },
+    Native { name: b"setSelection", arity: 4 },
+    Native { name: b"selectionText", arity: 0 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
   return Option<Native>.none()
@@ -662,12 +786,70 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run Random.fillBytes(&mut bytes) |> Effect.provideMut<Random>(&mut source)
     let bits = u8.toU32(bytes[0]) + u8.toU32(bytes[1]) * 256 + u8.toU32(bytes[2]) * 65536 + u8.toU32(bytes[3]) * 16777216
     return Outcome.Returned { value: ValueBits.number(u32.toF64(bits)) }
+  } else if function == BATTERY {
+    if first == 0 {
+      return match battery.read() {
+        Option<BatteryState>.Some { value } => {
+          bridge.battery = value
+          Outcome.Returned { value: ValueBits.number(1.0) }
+        }
+        Option<BatteryState>.None => Outcome.Returned { value: ValueBits.number(0.0) }
+      }
+    }
+    let reading = bridge.battery
+    let value = if first == 1 { if reading.charging { 1.0 } else { 0.0 } } else if first == 2 { reading.level } else if first == 3 { reading.chargingTime } else { reading.dischargingTime }
+    return Outcome.Returned { value: ValueBits.number(value) }
+  } else if function == COMPUTED {
+    return run computed(&mut bridge.*, first, argv.get(1))
   } else if function == SCALE {
     return Outcome.Returned { value: ValueBits.number(bridge.media.scale()) }
   } else if function == MATCH_MEDIA {
     let query = run text(argv.get(0))
     let media = bridge.media
     return Outcome.Returned { value: ValueBits.Bool { value: run media.matches(String.utf8Bytes(String.view(&query))) } }
+  } else if function == GEOMETRY {
+    let at = f64.toUsize(number(argv.get(0).view()))
+    let value = if at < bridge.geometry.length() { bridge.geometry.get(at) } else { 0.0 }
+    return Outcome.Returned { value: ValueBits.number(value) }
+  } else if function == OBSERVER {
+    let mut values: [f64; 11] = [0.0; 11]
+    let mut i: usize = 0
+    while i < 11 {
+      values[i] = if i < argv.length() { number(argv.get(i).view()) } else { 0.0 }
+      i = i + 1
+    }
+    let bits = f64.toU32(values[6])
+    let root = Margin { top: values[2], right: values[3], bottom: values[4], left: values[5], percent: bits & 15 }
+    let scroll = Margin { top: values[7], right: values[8], bottom: values[9], left: values[10], percent: (bits / 16) & 15 }
+    run bridge.observers.configure(idOf(values[0]), idOf(values[1]), root, scroll)
+    return Outcome.Returned { value: ValueBits.Undefined }
+  } else if function == THRESHOLD {
+    run bridge.observers.threshold(idOf(number(argv.get(0).view())), number(argv.get(1).view()))
+    return Outcome.Returned { value: ValueBits.Undefined }
+  } else if function == OBSERVE {
+    run bridge.observers.observe(idOf(number(argv.get(0).view())), idOf(number(argv.get(1).view())), f64.toU32(number(argv.get(2).view())))
+    return Outcome.Returned { value: ValueBits.Undefined }
+  } else if function == UNOBSERVE {
+    bridge.observers.unobserve(idOf(number(argv.get(0).view())), idOf(number(argv.get(1).view())))
+    return Outcome.Returned { value: ValueBits.Undefined }
+  } else if function == RECT || function == RECTS || function == METRICS || function == HIT || function == HITS
+    || function == CARET || function == RANGE_RECTS || function == SCROLL_INTO_VIEW || function == SCROLL
+    || function == SELECTION || function == SET_SELECTION {
+    return run geometry(&mut bridge.*, function, argv)
+  } else if function == SELECTION_TEXT {
+    return run selectionText(&mut bridge.*)
+  } else if function == SUPPORTS {
+    let condition = run text(argv.get(0))
+    let declared = argv.length() > 1 && argv.get(1).view().isString()
+    let answer = if declared {
+      let value = run text(argv.get(1))
+      run supports.declaration(String.utf8Bytes(String.view(&condition)), String.utf8Bytes(String.view(&value)))
+    } else {
+      run supports.condition(String.utf8Bytes(String.view(&condition)))
+    }
+    return Outcome.Returned { value: ValueBits.Bool { value: answer } }
+  } else if function == QUERY {
+    return run query(&mut bridge.*, first, id(argv.get(1).view()), argv.get(2))
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {
@@ -782,6 +964,324 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   return Outcome.Returned { value: ValueBits.Undefined }
 }
 
+/// The layout reads (see [`RECT`]) and `scrollIntoView`, on the attached tree.
+effect fn geometry<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  bridge.geometry.clear()
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.number(0.0) } }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  let args = [number(argv.get(0).view()), number(argv.get(1).view()), number(argv.get(2).view()), number(argv.get(3).view()), number(argv.get(4).view())]
+  let read = run Effect.result(measured(&mut bridge.batch, &mut tree, function, args, &mut bridge.geometry))
+  return match move read {
+    Result<f64, TreeError | CssomError | OutOfMemoryError>.Success { value } => Outcome.Returned { value: ValueBits.number(value) }
+    Result<f64, TreeError | CssomError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      _ => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree could not lay out for a layout read")
+        Outcome.TypeError { message: move message }
+      }
+    }
+  }
+}
+
+fn idOf(value: f64) -> u32 { return if value > 0.0 { f64.toU32(value) } else { 0 } }
+
+fn position(code: f64) -> ScrollLogicalPosition {
+  return if code == 1.0 { ScrollLogicalPosition.Center } else if code == 2.0 { ScrollLogicalPosition.End }
+    else if code == 3.0 { ScrollLogicalPosition.Nearest } else { ScrollLogicalPosition.Start }
+}
+
+effect fn rectsInto(out: &mut List<f64>, rects: &List<DOMRect>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let items = rects.asSlice()
+  let mut i: usize = 0
+  while i < items.length {
+    run out.append(items[i].x)
+    run out.append(items[i].y)
+    run out.append(items[i].width)
+    run out.append(items[i].height)
+    i = i + 1
+  }
+}
+
+effect fn measured(batch: &mut Batch, tree: &mut UiTree<'_>, function: u32, args: [f64; 5], out: &mut List<f64>) -> f64
+  ! TreeError | CssomError | OutOfMemoryError
+  ? &mut Allocator {
+  if batch.length() != 0 { run tree.apply(run batch.take()) }
+  if tree.layoutPending() { run tree.layoutNow() }
+  if function == SELECTION {
+    run text_selection.refresh(&mut tree.*)
+    let anchor = tree.textSelection.anchor
+    let focus = tree.textSelection.focus
+    if !anchor.exists() || !focus.exists() { return 0.0 }
+    run out.append(u32.toF64(anchor.id))
+    run out.append(usize.toF64(text_selection.domOffset(&tree.*, anchor)))
+    run out.append(u32.toF64(focus.id))
+    run out.append(usize.toF64(text_selection.domOffset(&tree.*, focus)))
+    let mut parts = List<text_selection.Stretch>.make()
+    run text_selection.stretches(&tree.*, &mut parts)
+    let items = parts.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run out.append(u32.toF64(items[i].start.id))
+      run out.append(usize.toF64(text_selection.domOffset(&tree.*, items[i].start)))
+      run out.append(u32.toF64(items[i].end.id))
+      run out.append(usize.toF64(text_selection.domOffset(&tree.*, items[i].end)))
+      i = i + 1
+    }
+    return usize.toF64(items.length)
+  }
+  if function == SET_SELECTION {
+    let anchorId = idOf(args[0])
+    if anchorId == 0 {
+      run text_selection.clear(&mut tree.*)
+      return 1.0
+    }
+    let anchor = text_selection.fromDom(&tree.*, anchorId, f64.toUsize(args[1]))
+    let focus = text_selection.fromDom(&tree.*, idOf(args[2]), f64.toUsize(args[3]))
+    if !anchor.exists() || !focus.exists() { return 0.0 }
+    tree.textSelection.unit = text_selection.UNIT_NONE
+    run text_selection.select(&mut tree.*, anchor, focus)
+    return 1.0
+  }
+  if function == RECT {
+    let rect = run cssom_view.getBoundingClientRect(&tree.*, idOf(args[0]))
+    run out.append(rect.x)
+    run out.append(rect.y)
+    run out.append(rect.width)
+    run out.append(rect.height)
+    return 4.0
+  }
+  if function == RECTS || function == RANGE_RECTS {
+    let mut rects = List<DOMRect>.make()
+    if function == RECTS {
+      run cssom_view.getClientRects(&tree.*, idOf(args[0]), &mut rects)
+    } else {
+      let range = Range {
+        start: BoundaryPoint { node: idOf(args[0]), offset: f64.toUsize(args[1]) },
+        end: BoundaryPoint { node: idOf(args[2]), offset: f64.toUsize(args[3]) },
+      }
+      run cssom_view.rangeClientRects(&tree.*, range, &mut rects)
+    }
+    run rectsInto(&mut out.*, &rects)
+    return usize.toF64(rects.length())
+  }
+  if function == METRICS {
+    let m = cssom_view.metrics(&tree.*, idOf(args[0]))
+    let parent = if m.offsetParent == NONE { 0.0 } else { u32.toF64(m.offsetParent) }
+    let values = [m.clientLeft, m.clientTop, m.clientWidth, m.clientHeight, m.scrollWidth, m.scrollHeight, m.scrollLeft, m.scrollTop,
+      parent, m.offsetLeft, m.offsetTop, m.offsetWidth, m.offsetHeight]
+    let mut i: usize = 0
+    while i < values.length {
+      run out.append(values[i])
+      i = i + 1
+    }
+    return 13.0
+  }
+  if function == HIT {
+    let found = cssom_view.elementFromPoint(&tree.*, args[0], args[1])
+    return if found == NONE { 0.0 } else { u32.toF64(found) }
+  }
+  if function == HITS {
+    let mut ids = List<u32>.make()
+    run cssom_view.elementsFromPoint(&tree.*, args[0], args[1], &mut ids)
+    let items = ids.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      run out.append(u32.toF64(items[i]))
+      i = i + 1
+    }
+    return usize.toF64(items.length)
+  }
+  if function == CARET {
+    return match run cssom_view.caretPositionFromPoint(&tree.*, args[0], args[1]) {
+      Option.Some { value } => {
+        run out.append(u32.toF64(value.offsetNode))
+        run out.append(usize.toF64(value.offset))
+        run out.append(value.rect.x)
+        run out.append(value.rect.y)
+        run out.append(value.rect.width)
+        run out.append(value.rect.height)
+        1.0
+      }
+      _ => 0.0
+    }
+  }
+  if function == SCROLL {
+    let flags = f64.toU32(args[4])
+    let behavior = if args[3] == 1.0 { ScrollBehavior.Instant } else if args[3] == 2.0 { ScrollBehavior.Smooth } else { ScrollBehavior.Auto }
+    let id = idOf(args[0])
+    if tree.slotOf(id) == NONE { return 0.0 }
+    if flags & 4 != 0 {
+      let x = if flags & 1 != 0 { args[1] } else { 0.0 }
+      let y = if flags & 2 != 0 { args[2] } else { 0.0 }
+      drop run cssom_view.scrollBy(&mut tree.*, id, x, y, behavior, false, true)
+    } else {
+      let mut to = ScrollToOptions.make()
+      if flags & 1 != 0 { to.left = Option<f64>.Some { value: args[1] } }
+      if flags & 2 != 0 { to.top = Option<f64>.Some { value: args[2] } }
+      to.behavior = behavior
+      drop run cssom_view.scroll(&mut tree.*, id, to, false, true)
+    }
+    return 1.0
+  }
+  let mut options = ScrollIntoViewOptions.make()
+  options.block = position(args[1])
+  options.inline = position(args[2])
+  options.behavior = if args[3] == 1.0 { ScrollBehavior.Instant } else if args[3] == 2.0 { ScrollBehavior.Smooth } else { ScrollBehavior.Auto }
+  let mut requests = List<ScrollRequest>.make()
+  if args[4] != 0.0 {
+    run cssom_view.scrollIntoViewIfNeeded(&mut tree.*, idOf(args[0]), options, false, true, &mut requests)
+  } else {
+    run cssom_view.scrollIntoView(&mut tree.*, idOf(args[0]), options, false, true, &mut requests)
+  }
+  return usize.toF64(requests.length())
+}
+
+/// `__ui.computed`: applies the pending batch to the attached tree, then reads the value.
+effect fn computed<'v>(bridge: &mut Bridge, id: u32, name: ValueRef<'v>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) || !name.view().isString() { return Outcome.Returned { value: ValueBits.Undefined } }
+  let property = run Strings.toUtf8(name.view(), false)
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  let mut out = Bytes.make()
+  let read = run Effect.result(applyAndRead(&mut bridge.batch, &mut tree, id, property.asSlice(), &mut out))
+  let found = match move read {
+    Result<bool, TreeError | OutOfMemoryError>.Success { value } => value
+    Result<bool, TreeError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      TreeError invalid => {
+        drop invalid
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree refused a mutation before getComputedStyle")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  }
+  if !found { return Outcome.Returned { value: ValueBits.Undefined } }
+  let made = run Effect.result(Strings.fromUtf8(out.asSlice()))
+  return match move made {
+    Result.Success { value: text } => Outcome.Returned { value: text }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+/// `__ui.selectionText`: the document selection's text as copying gives it.
+effect fn selectionText(bridge: &mut Bridge) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.Undefined } }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  let read = run Effect.result(selectedText(&mut bridge.batch, &mut tree))
+  let text = match move read {
+    Result<String, TreeError | OutOfMemoryError>.Success { value } => move value
+    Result<String, TreeError | OutOfMemoryError>.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      TreeError invalid => {
+        drop invalid
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"the tree refused a mutation before reading the selection")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  }
+  let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&text))))
+  return match move made {
+    Result.Success { value } => Outcome.Returned { value: value }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+effect fn selectedText(batch: &mut Batch, tree: &mut UiTree<'_>) -> String
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  if batch.length() != 0 { run tree.apply(run batch.take()) }
+  if tree.layoutPending() { run tree.layoutNow() }
+  run text_selection.refresh(&mut tree.*)
+  return run text_selection.text(&tree.*)
+}
+
+/// `__ui.query`: applies the pending batch to the attached tree, then runs the query.
+effect fn query<'v>(bridge: &mut Bridge, mode: u32, id: u32, selector: ValueRef<'v>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.Undefined } }
+  let text = run Strings.toUtf8(selector.view(), false)
+  let parsed = run Query.parse(text.asSlice())
+  let compiled = match move parsed {
+    Option<Query>.Some { value } => move value
+    Option<Query>.None => { return Outcome.Returned { value: ValueBits.number(-1.0) } }
+  }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  if bridge.batch.length() != 0 {
+    let applied = run Effect.result(tree.apply(run bridge.batch.take()))
+    match move applied {
+      Result<(), TreeError | OutOfMemoryError>.Success { .. } => ()
+      Result<(), TreeError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        TreeError invalid => {
+          drop invalid
+          let mut message = List<u8>.make()
+          run message.appendSlice(b"the tree refused a mutation before a selector query")
+          return Outcome.TypeError { message: move message }
+        }
+      }
+    }
+  }
+  if mode == 0 { return Outcome.Returned { value: ValueBits.number(if run compiled.matches(&tree.*, id) { 1.0 } else { 0.0 }) } }
+  if mode == 1 { return Outcome.Returned { value: ValueBits.number(u32.toF64(run compiled.closest(&tree.*, id))) } }
+  let mut found = List<u32>.make()
+  run compiled.select(&tree.*, id, mode == 3, &mut found)
+  if mode == 2 {
+    return Outcome.Returned { value: ValueBits.number(if found.length() == 0 { 0.0 } else { u32.toF64(found.asSlice()[0]) }) }
+  }
+  let mut out = Bytes.make()
+  let mut at: usize = 0
+  while at < found.length() {
+    if at > 0 { run out.append(b",") }
+    run writeDecimal(&mut out, found.asSlice()[at])
+    at = at + 1
+  }
+  let made = run Effect.result(Strings.fromUtf8(out.asSlice()))
+  return match move made {
+    Result.Success { value: ids } => Outcome.Returned { value: ids }
+    Result.Failure { .. } => { fail OutOfMemoryError {} }
+  }
+}
+
+effect fn writeDecimal(out: &mut Bytes, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 10] = [0; 10]
+  let mut count: usize = 0
+  let mut rest = value
+  while true {
+    digits[count] = u32.toU8(rest % 10) + 48
+    count = count + 1
+    rest = rest / 10
+    if rest == 0 { break }
+  }
+  while count > 0 {
+    count = count - 1
+    run out.append(Slice.view<u8>(&digits, count, 1))
+  }
+}
+
+effect fn applyAndRead(batch: &mut Batch, tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  if batch.length() != 0 { run tree.apply(run batch.take()) }
+  return run computed_style.write(&mut tree.*, id, name, &mut out.*)
+}
+
 impl EngineServices for Bridge {
   /// A realm here has ECMAScript without ECMA-402 or Temporal (the prelude installs neither),
   /// so their code and CLDR tables stay out of the program.
@@ -834,6 +1334,16 @@ impl EngineServices for Bridge {
     callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: ValueRef<'v>) -> CellRef<ModuleDef> ! OutOfMemoryError | JsException ? &mut Allocator {
     let source = match engine.services.find(name) {
       Option<usize>.Some { value: index } => {
+        // Compiled when the program was built: nothing is parsed. The image is part of the
+        // program, so the engine can read it for as long as the realm lives.
+        let compiledImage = engine.services.modules.asSlice()[index].image
+        if compiledImage.length != 0 && image.loadable(compiledImage) {
+          let loaded = run unsafe image.load(&mut engine, realm, Pointer.fromRef<u8>(&compiledImage[0]), compiledImage.length)
+          return match loaded.view() {
+            ValueBits.Module { reference } => unsafe CellRef<ModuleDef>.of(reference)
+            _ => Intrinsic.trap("the module image held something else")
+          }
+        }
         let mut copy = List<u8>.make()
         run copy.appendSlice(engine.services.modules.asSlice()[index].source.asSlice())
         move copy
