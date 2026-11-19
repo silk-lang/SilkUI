@@ -77,6 +77,43 @@ inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptim
 `silk build` makes it. Development builds optimize the renderer, inspector server and runtime
 packages while keeping the application unoptimized.
 
+### What a built JavaScript app starts from
+
+`App.build` compiles a JavaScript app's bundle before it compiles the host, into a bytecode
+image: every function of the bundle as the engine's bytecode, and the `@silkui/core` module
+the bundle imports with it. The window host embeds both images beside the bundle's text and
+starts from them, so a launch parses and compiles nothing. The build says so:
+
+```text
+silkui compiling the bundle into a bytecode image with the host's engine...
+silkui ✓ wrote the bytecode images the window host starts from in 35.0s
+  build/steps/78e37d42…/app.bin  2.3 MB
+  build/steps/78e37d42…/core.bin  270.6 kB
+```
+
+(A 1 MB bundle here. The first build compiles the program that writes the images, about
+half a minute; after that the step runs again only when the bundle or the engine changes.)
+
+An image only loads in the engine build that wrote it. That is why the app's own build
+writes it, with a small program compiled from the app's manifest like the host (so both link
+the engine the manifest pins), and why nothing else should: when the engine pin moves, the
+next build writes the images again. A host that still finds another build's image does not
+fail and does not stay quiet: it says so on standard error at launch and runs the bundle's
+text, which every host carries as well.
+
+```sh
+SILK_UI_TRACE_JS=1 dist/window/my-app
+# silkui: JavaScript starts from its bytecode image (2299196 bytes, engine build 7816585738683590938)
+```
+
+- `App.dev` writes no image: a development window runs what Vite sends, and a reload runs
+  the new source.
+- A host built for another machine (`--target`) starts from the bundle's text, since the
+  image is written by a program that runs on the build machine. The build says so.
+- An app on the SilkJS runtime (`Runtime.Node`) starts from the bundle's text: it has no
+  image yet.
+- A custom host (`App.customHost`) gets neither bundle nor image, as before.
+
 ## The definition
 
 | Setting | Choices | Notes |
@@ -84,7 +121,8 @@ packages while keeping the application unoptimized.
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react(".")`, `Framework.foldkit(".")`, `Framework.js(".")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project's directory (`.` for the project root), whose config has `@silkui/vite`; silkui has it bundle into `.silk/bundle/` |
 | `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
-| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the full SilkJS runtime with Node's APIs. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
+| `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the composable SilkJS runtime: web APIs, `fetch` and sockets, Web Crypto, TLS, compression streams and the files the user picks. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
+| `App.allow` | `Access.Files`, `Access.Processes`, `Access.Wasm`, `Access.Database`, `Access.Addons` | Repeatable, on `Runtime.node()`: the whole file system through `node:fs`, `node:child_process`, `WebAssembly`, `node:sqlite`, native addons. Each adds binary size and start time |
 | `App.target` | `Target.window(Window { title, width, height })`, `Target.webCanvas(Page { title })`, `Target.webDom(Page { title })` | One or more; `dev` launches the first. The web targets build Loom apps; for a JavaScript app they fail with one line naming the framework and target |
 | `Target.titleBar` | `TitleBar.standard()` (default), `TitleBar.transparent(height)`, `.buttons(left, top)` | On a window target. `buttons` moves the window buttons' top-left corner (0 keeps it centred). Transparent: on macOS the app fills the window under the controls and draws its own bar in the top `height` pixels, where a press moves the window and the app gets no clicks. Other systems keep their bar |
 | `Target.metalHud` | `true` or `false` (default) | On a window target. Shows the Metal Performance HUD over the window on macOS 13 and later: frames presented per second, frame times and GPU time. Other systems show nothing. `SILK_UI_METAL_HUD=1` does the same for one run |

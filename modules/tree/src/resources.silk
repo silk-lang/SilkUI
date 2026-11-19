@@ -12,6 +12,11 @@ import svg_css.media_features { Environment as MediaEnvironment }
 import svg_css.tokens { Limits }
 import svg_fonts.database { FontDatabase }
 import codec.image { Image }
+import ui_scene.effects { LayerEffects }
+import vector.filter { BlurPlan, Region }
+import vector.filter as filtering
+import silk.collections.hash { Hash }
+import silk.num.u64
 import codec.decode
 import font_collection.lib { Family, Generic }
 import silk.collections.list { List }
@@ -409,9 +414,22 @@ pub struct CssImage {
   pub state: CssImageState,
 }
 
+/// The first resource id of the images `filter()` makes from loaded images.
+pub const FILTERED_IMAGE_BASE: u32 = 0x7E000000
+
+/// A `filter()` image: `source` filtered by the effects that hash to `key`, as resource `id`.
+struct Filtered {
+  source: u32,
+  key: u64,
+  id: u32,
+}
+
+impl Copy for Filtered {}
+
 /// Images and icons by client resource id.
 pub struct Resources {
   entries: List<Entry>,
+  filtered: List<Filtered>,
   /// Images stylesheets name, in the order paint first met them.
   pub cssImages: List<CssImage>,
   pub images: ImageStore,
@@ -427,6 +445,7 @@ impl Resources {
     let base = run Effect.catch<UrlError>(Url.fromFilePath(b"/ui/icons/icon.svg"), badUrl)
     return Resources {
       entries: List<Entry>.make(),
+      filtered: List<Filtered>.make(),
       cssImages: List<CssImage>.make(),
       images: ImageStore.make(),
       icons: IconCache.make(IconOptions.default()),
@@ -464,6 +483,25 @@ impl Resources {
     let images = self.cssImages.asMutSlice()
     images[u32.toUsize(id - CSS_IMAGE_BASE)].state = if ok { CssImageState.Loaded } else { CssImageState.Failed }
     return true
+  }
+
+  /// The decoded samples of stylesheet image `url`, once it loaded as a raster image.
+  pub fn cssImageNamed(self: &Self, url: &[u8]) -> Option<&Image> {
+    let images = self.cssImages.asSlice()
+    let mut i: usize = 0
+    while i < images.length {
+      if sameBytes(String.utf8Bytes(String.view(&images[i].url)), url) {
+        return match self.get(CSS_IMAGE_BASE + usize.toU32(i)) {
+          Option<Resource>.Some { value } => match value {
+            Resource.Image { image, .. } => self.images.image(image)
+            _ => Option<&Image>.None
+          }
+          Option<Resource>.None => Option<&Image>.None
+        }
+      }
+      i = i + 1
+    }
+    return Option<&Image>.None
   }
 
   /// The resource defined as `id`.
@@ -658,6 +696,50 @@ impl Resources {
   }
 
   /// The tile of `image`, or None when it cannot be placed.
+  /// Image resource `source` with `groups` applied in order (in its own pixels, clipped to its
+  /// size), made the first time and kept: a `filter()` image filters once, not every frame.
+  /// None while `source` is not a loaded bitmap.
+  pub effect fn filteredImage(self: &mut Self, atlas: &mut Atlas, source: u32, groups: &[LayerEffects]) -> Option<Resource>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let key = effectsKey(groups)
+    let made = self.filtered.asSlice()
+    let mut i: usize = 0
+    while i < made.length {
+      if made[i].source == source && made[i].key == key { return self.get(made[i].id) }
+      i = i + 1
+    }
+    let stored = match self.get(source) {
+      Option<Resource>.Some { value } => match value {
+        Resource.Image { image, .. } => image
+        _ => { return Option<Resource>.None }
+      }
+      Option<Resource>.None => { return Option<Resource>.None }
+    }
+    let original = match self.images.image(stored) {
+      Option<&Image>.Some { value } => value
+      Option<&Image>.None => { return Option<Resource>.None }
+    }
+    let width = original.width()
+    let height = original.height()
+    let mut bytes = List<u8>.make()
+    run bytes.appendBytes(original.data())
+    let mut pixels = Pixmap.fromBytes(width, height, move bytes)
+    run applyGroups(&mut pixels, groups)
+    let mut result = run original.copy()
+    let out = result.dataMut()
+    let filteredBytes = pixels.data()
+    let mut b: usize = 0
+    while b < out.length {
+      out[b] = filteredBytes[b]
+      b = b + 1
+    }
+    let id = FILTERED_IMAGE_BASE + usize.toU32(self.filtered.length())
+    run self.defineDecoded(&mut atlas, id, move result)
+    run self.filtered.append(Filtered { source: source, key: key, id: id })
+    return self.get(id)
+  }
+
   pub effect fn imageTile(self: &mut Self, atlas: &mut Atlas, image: ImageId) -> Option<AtlasTile>
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -677,4 +759,67 @@ fn sameBytes(a: &[u8], b: &[u8]) -> bool {
     i = i + 1
   }
   return true
+}
+
+fn effectsKey(groups: &[LayerEffects]) -> u64 {
+  let seed = Hash.seed(0x6a09e667f3bcc908)
+  let mut h = Hash.mix(&seed, usize.toU64(groups.length))
+  let mut g: usize = 0
+  while g < groups.length {
+    let e = groups[g]
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.blur)))
+    let mut i: usize = 0
+    while i < 20 {
+      h = Hash.combine(h, u32.toU64(f32.toBits(e.color[i])))
+      i = i + 1
+    }
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.x)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.y)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.sigma)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.color.r)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.color.g)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.color.b)))
+    h = Hash.combine(h, u32.toU64(f32.toBits(e.shadow.color.a)))
+    g = g + 1
+  }
+  return h
+}
+
+/// The CPU renderer's filter steps (blur, color matrix, drop shadow) for each group in order.
+effect fn applyGroups(pixels: &mut Pixmap, groups: &[LayerEffects]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let width = pixels.width()
+  let height = pixels.height()
+  let region = Region.make(0, 0, width, height)
+  let mut g: usize = 0
+  while g < groups.length {
+    let effects = groups[g]
+    if effects.blur > 0.0 {
+      let plan = run BlurPlan.make(f32.toF64(effects.blur))
+      let mut out = run Pixmap.make(width, height)
+      run filtering.gaussianBlur(&mut out, &pixels.*, &plan, &plan, region)
+      pixels.* = move out
+    }
+    if effects.hasColor() {
+      let mut out = run Pixmap.make(width, height)
+      filtering.colorMatrix(&mut out, &pixels.*, effects.matrix(), region)
+      pixels.* = move out
+    }
+    if effects.hasShadow() {
+      let mut shadow = run Pixmap.make(width, height)
+      let mut moved = run Pixmap.make(width, height)
+      if effects.shadow.sigma > 0.0 {
+        let plan = run BlurPlan.make(f32.toF64(effects.shadow.sigma))
+        run filtering.gaussianBlur(&mut moved, &pixels.*, &plan, &plan, region)
+        filtering.colorMatrix(&mut shadow, &moved, effects.shadowMatrix(), region)
+      } else {
+        filtering.colorMatrix(&mut shadow, &pixels.*, effects.shadowMatrix(), region)
+      }
+      filtering.offset(&mut moved, &shadow, f32.toI32(f32.round(effects.shadow.x)), f32.toI32(f32.round(effects.shadow.y)), region)
+      filtering.mergeOver(&mut moved, &pixels.*, region)
+      pixels.* = move moved
+    }
+    g = g + 1
+  }
 }

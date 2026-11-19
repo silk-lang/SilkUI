@@ -47,6 +47,8 @@ import float_shapes
 import expand
 import font_features
 import font_features { VariationTable }
+import font_rules
+import font_rules { FontRules }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -94,6 +96,7 @@ import lists
 import first_letter
 import lists { Scope }
 import paint_css { Effects }
+import offset_path
 import paint_css
 import font_units
 import font_units { Source as FontSource }
@@ -147,9 +150,11 @@ import node {
 import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import svg_css.effect_values { Image }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
+import ui_text.fonts as text_fonts
 import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
@@ -437,6 +442,10 @@ effect fn layoutFailed<E>(error: E) -> never
   fail TreeError.Layout
 }
 
+effect fn noShape(error: TreeError) -> () {
+  drop error
+}
+
 effect fn viewFailed(error: CssomError) -> never
   ! TreeError {
   fail TreeError.View { error: error }
@@ -660,6 +669,9 @@ pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaratio
   let text = run values.cssText(&declaration.value)
   let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
+  if which == transform.OFFSET_PATH_PROPERTY && computed.transform.offset.path == transform.PATH_SHAPE {
+    computed.effects.declared = true
+  }
   if !computed.usesViewport && style.viewportDependent(declaration) {
     computed.usesViewport = true
   }
@@ -681,6 +693,12 @@ fn transformProperty(property: CssProperty) -> u32 {
     CssProperty.Perspective => transform.PERSPECTIVE_PROPERTY
     CssProperty.PerspectiveOrigin => transform.PERSPECTIVE_ORIGIN_PROPERTY
     CssProperty.BackfaceVisibility => transform.BACKFACE_PROPERTY
+    CssProperty.OffsetPath => transform.OFFSET_PATH_PROPERTY
+    CssProperty.OffsetDistance => transform.OFFSET_DISTANCE_PROPERTY
+    CssProperty.OffsetRotate => transform.OFFSET_ROTATE_PROPERTY
+    CssProperty.OffsetAnchor => transform.OFFSET_ANCHOR_PROPERTY
+    CssProperty.OffsetPosition => transform.OFFSET_POSITION_PROPERTY
+    CssProperty.TransformStyle => transform.TRANSFORM_STYLE_PROPERTY
     _ => NONE
   }
 }
@@ -797,6 +815,10 @@ pub struct UiTree<'a> {
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
   pub sheetFaces: SheetFaces,
+  /// `@font-palette-values` and `@font-feature-values` rules, and font property handles.
+  pub fontRules: FontRules,
+  /// When the next `font-display` block or swap period ends, or negative.
+  fontBlockEnd: f64,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -830,6 +852,11 @@ pub struct UiTree<'a> {
   pub snapUsed: bool,
   /// A style used anchor positioning (`anchor-name` or an anchored box).
   pub cssAnchorUsed: bool,
+  /// A style used `offset-path` (see `offset_path.settle`).
+  pub offsetUsed: bool,
+  /// Whether some style ever set `transform-style: preserve-3d`: until then paint and hit
+  /// testing skip the 3D rendering context checks.
+  pub preserveUsed: bool,
   pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
@@ -1057,6 +1084,8 @@ impl<'a> UiTree<'a> {
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
       sheetFaces: SheetFaces.make(),
+      fontRules: FontRules.make(),
+      fontBlockEnd: -1.0,
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -1077,6 +1106,8 @@ impl<'a> UiTree<'a> {
       firstLines: List<first_letter.FirstLine>.make(),
       snapUsed: false,
       cssAnchorUsed: false,
+      offsetUsed: false,
+      preserveUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
       scrollAnchors: List<ScrollAnchor>.make(),
@@ -1180,6 +1211,19 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     if self.resources.settleCssImage(resource, ok) {
       self.paintCachesStale = true
+      // Floats whose `shape-outside` is a stylesheet image wrap around it once it loads.
+      let mut i: usize = 0
+      while i < self.nodes.length() {
+        let node = &self.nodes.asSlice()[i]
+        let imaged = node.live && node.kind != NodeKind.Text && match node.paintEffects() {
+          Option<&Effects>.Some { value } => value.shapeImage.length() != 0
+          Option<&Effects>.None => false
+        }
+        if imaged {
+          run Effect.catch<TreeError>(self.updateShape(usize.toU32(i)), noShape)
+        }
+        i = i + 1
+      }
       return ()
     }
     let at = u32.toUsize(resource)
@@ -1199,6 +1243,30 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+  }
+
+  /// Gives css-layout the `shape-outside` of element `slot`, asking for its image first.
+  effect fn updateShape(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut url = Bytes.make()
+    if let Option<&Effects>.Some { value } = self.node(slot).paintEffects() {
+      if value.shapeImage.length() != 0 {
+        if let Image.Url { url: named } = &value.shapeImage.asSlice()[0] {
+          run url.append(Bytes.asSlice(&named))
+        }
+      }
+    }
+    if url.length() != 0 {
+      drop run self.resources.cssImage(Bytes.asSlice(&url))
+    }
+    let node = self.node(slot)
+    let css = node.css
+    let shape = match node.paintEffects() {
+      Option<&Effects>.Some { value } => run float_shapes.of(value, node.computed.paint.radii, node.computed.effects.radiusShare, &self.resources, float_shapes.contentSize(&node.computed.layout))
+      Option<&Effects>.None => FloatShape.make()
+    }
+    run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
   }
 
   fn sourceState(self: &Self, resource: u32) -> u8 {
@@ -1295,7 +1363,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) || writtenHandle(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1326,6 +1394,26 @@ impl<'a> UiTree<'a> {
           run out.append(Declaration {
             property: CssProperty.FontVariationSettings,
             value: values.number(u32.toF32(id)),
+            important: declared[i].important,
+          })
+        }
+      } else if writtenHandle(&declared[i]) {
+        // A negative number: font_features.apply reads -(handle + 1). Values that do not
+        // parse are dropped.
+        let text = run values.cssText(&declared[i].value)
+        let css = Bytes.asSlice(&text)
+        let property = declared[i].property
+        let handle = if property == CssProperty.FontPalette {
+          run self.fontRules.paletteHandle(css)
+        } else if property == CssProperty.FontVariantAlternates {
+          run self.fontRules.alternatesHandle(css)
+        } else {
+          run self.fontRules.adjustHandle(css)
+        }
+        if let Option.Some { value: id } = handle {
+          run out.append(Declaration {
+            property: property,
+            value: values.number(-u32.toF32(id) - 1.0),
             important: declared[i].important,
           })
         }
@@ -2284,6 +2372,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.CloseRoot { root } => {
         run sheet_faces.close(&mut self, root)
+        font_rules.close(&mut self.fontRules, root)
         run self.closeRoot(index, root)
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
@@ -2656,6 +2745,7 @@ impl<'a> UiTree<'a> {
       content: 1,
       editing: move editing,
       effects: Option<Box<Effects>>.None,
+      offsetPlaced: Option<transform.Placement>.None,
       semantics: Option<Box<Semantics>>.None,
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -3998,6 +4088,27 @@ impl<'a> UiTree<'a> {
     return edit.nextBlink(self)
   }
 
+  /// When a `font-display` block or swap period ends, in frame time, or negative: text
+  /// waiting for its face shows the fallback then, so the host draws a frame.
+  pub fn fontWake(self: &Self) -> f64 {
+    return self.fontBlockEnd
+  }
+
+  /// Whether a block or swap period ended by frame time `time` and no frame saw it yet.
+  pub fn fontWakeDue(self: &Self, time: f64) -> bool {
+    return self.fontBlockEnd >= 0.0 && time >= self.fontBlockEnd
+  }
+
+  /// When the tree next wants a frame without new input, in frame time: a caret blink, or the
+  /// end of a `font-display` block period. Negative when it does not.
+  pub fn nextWake(self: &Self) -> f64 {
+    let blink = edit.nextBlink(self)
+    if blink < 0.0 || self.fontBlockEnd >= 0.0 && self.fontBlockEnd < blink {
+      return self.fontBlockEnd
+    }
+    return blink
+  }
+
   /// The selection of input `id` as (anchor, focus) UTF-8 byte offsets into its value, or
   /// (0, 0) when it is not an input.
   pub fn selection(self: &Self, id: u32) -> Vector2<usize> {
@@ -4122,6 +4233,7 @@ impl<'a> UiTree<'a> {
       while at < self.nodes.length() {
         let uses = match self.nodes.asSlice()[at].paintEffects() {
           Option<&Effects>.Some { value } => value.backgrounds.hasUrl() || value.masks.hasUrl()
+            || paint_css.usesUrl(&value.borderImage.image) || paint_css.usesUrl(&value.maskBorder.image)
           Option<&Effects>.None => false
         }
         if uses && self.nodes.asSlice()[at].live {
@@ -4212,7 +4324,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
-    let treatment = Treatment {
+    let mut treatment = Treatment {
       letterSpacing: text.letterSpacing,
       wordSpacing: text.wordSpacing,
       transform: text.textTransform,
@@ -4222,6 +4334,8 @@ impl<'a> UiTree<'a> {
       hyphens: text.hyphens,
       features: text.features,
     }
+    // Palette and smoothing are paint's: keys do not differ by them.
+    treatment.features.extras = text_fonts.withExtrasField(text_fonts.withExtrasField(text.features.extras, text_fonts.EXTRAS_PALETTE, 0), text_fonts.EXTRAS_SMOOTH, 0)
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
@@ -4235,6 +4349,16 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    let mut named = List<Bytes>.make()
+    if text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES) != 0 {
+      let mut f: usize = 0
+      while f < families.length() {
+        if let Family.Named { name } = &families.asSlice()[f] {
+          run named.append(run Bytes.copy(Bytes.asSlice(&name)))
+        }
+        f = f + 1
+      }
+    }
     run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
@@ -4248,6 +4372,15 @@ impl<'a> UiTree<'a> {
     }
     request.treatment = treatment
     request.variations = self.variations.axes(text.features.variations)
+    request.sizeAdjust = self.fontRules.adjust(text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_SIZE_ADJUST))
+    let alternates = text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES)
+    if alternates != 0 {
+      let mut pairs = List<u32>.make()
+      run self.fontRules.alternates(self.current, alternates, named.asSlice(), &mut pairs)
+      let defined = if pairs.length() == 0 { Option<u32>.None } else { run self.provider.text.fonts.defineFeatures(pairs.asSlice()) }
+      let resolved = match defined { Option.Some { value } => value _ => 0 }
+      request.treatment.features.extras = text_fonts.withExtrasField(request.treatment.features.extras, text_fonts.EXTRAS_ALTERNATES, resolved)
+    }
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4262,6 +4395,22 @@ impl<'a> UiTree<'a> {
       },
     )
     return key
+  }
+
+  /// The root's `@font-feature-values` changed: its styles get new font keys.
+  fn fontRulesChanged(self: &mut Self) -> () {
+    let entries = self.fontKeys.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].root == self.current { entries[i].family = NONE }
+      i = i + 1
+    }
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
   }
 
   // Font faces added at run time.
@@ -4400,6 +4549,7 @@ impl<'a> UiTree<'a> {
   pub fn hostFontFaceFailed(self: &Self, id: u32) -> bool {
     let index = self.fontFaceIndex(id)
     return index != usize.MAX && self.provider.text.fonts.set.state(index) == FaceState.Failed
+      && !self.provider.text.fonts.set.expired(index)
   }
 
   pub effect fn setHostFontFaceActive(self: &mut Self, id: u32, active: bool, order: usize) ! OutOfMemoryError ? &mut Allocator {
@@ -5427,7 +5577,10 @@ impl<'a> UiTree<'a> {
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
-    if self.stylesDirty { run sheet_faces.sync(&mut self) }
+    if self.stylesDirty {
+      run sheet_faces.sync(&mut self)
+      if run font_rules.sync(&mut self) { self.fontRulesChanged() }
+    }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       let roots = self.styleSheets.asMutSlice()
@@ -5482,6 +5635,7 @@ impl<'a> UiTree<'a> {
         let before = node.computed.text
         let beforeFont = node.fontKey
         let events = node.computed.paint.pointerEvents
+        let nearest = node.computed.nearest
         let selects = node.computed.userSelect
         let barColors = node.computed.scroll.colors
         let listStyle = node.computed.list
@@ -5502,7 +5656,7 @@ impl<'a> UiTree<'a> {
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list
+          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -5675,6 +5829,7 @@ impl<'a> UiTree<'a> {
     if parent != NONE {
       computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
       computed.scroll.colors = self.node(parent).computed.scroll.colors
+      computed.nearest = self.node(parent).computed.nearest
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -5711,6 +5866,8 @@ impl<'a> UiTree<'a> {
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
+    if computed.transform.offset.path != transform.PATH_NONE { self.offsetUsed = true }
+    if computed.transform.preserve3d { self.preserveUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     if computed.anchor.name != 0 || computed.anchor.anchored() {
@@ -5861,11 +6018,7 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
       run self.resolveGrid(slot, &computed)
-      let shape = match self.node(slot).paintEffects() {
-        Option<&Effects>.Some { value } => run float_shapes.of(value, computed.paint.radii)
-        Option<&Effects>.None => FloatShape.make()
-      }
-      run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
+      run self.updateShape(slot)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
@@ -6241,6 +6394,12 @@ impl<'a> UiTree<'a> {
     }
     self.applied = false
     self.input = input
+    self.provider.text.fonts.set.now = input.time
+    drop self.provider.text.fonts.set.expireLate()
+    if self.fontBlockEnd >= 0.0 && input.time >= self.fontBlockEnd {
+      // Text waiting for a face shows its fallback now.
+      self.invalidatePaint()
+    }
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
@@ -6278,6 +6437,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     run self.notifyLayout()
     if self.laidOutCurrent() {
@@ -6286,6 +6446,7 @@ impl<'a> UiTree<'a> {
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
     run self.paintFrame()
+    self.fontBlockEnd = self.provider.text.fonts.set.nextDeadline()
     self.scrolled = false
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
@@ -6433,6 +6594,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     if self.laidOutCurrent() {
       run scroll_anchor.select(&mut self)
@@ -6729,6 +6891,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6757,6 +6922,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6771,6 +6937,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6799,6 +6968,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6842,6 +7012,9 @@ impl<'a> UiTree<'a> {
       output: &self.output,
       text: &self.provider.text,
       faces: &self.faces,
+      fontRules: &self.fontRules,
+      sheetFaces: &self.sheetFaces,
+      root: self.current,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
       textInk: &mut self.textInk,
@@ -6870,6 +7043,7 @@ impl<'a> UiTree<'a> {
       seed: self.seed,
       only: slot,
       inside: false,
+      planes: self.preserveUsed,
     }
     run paintRoots(&mut painter, window)
     drop painter
@@ -7037,6 +7211,19 @@ fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
 fn writtenVariations(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontVariationSettings && convert.number(&declaration.value).isNone()
     && !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
+}
+
+// A `font-palette`, `font-variant-alternates` or `font-size-adjust` not yet a handle.
+fn writtenHandle(declaration: &Declaration) -> bool {
+  if font_features.extrasShift(declaration.property) == 0xFFFFFFFF { return false }
+  if let Option.Some { value } = convert.number(&declaration.value) {
+    if value < 0.0 { return false }
+  }
+  return !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
     && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
