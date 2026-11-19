@@ -6,9 +6,6 @@ import silk.build.definition {
   Package as PackageSettings
 }
 import silk.build.context as BuildContext
-import silk.build.step { Deferred }
-import silk.crypto.sha2 { Sha256 }
-import silk.system.executable as Executable
 import silk.schema.schema { Dictionary }
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
@@ -16,8 +13,7 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
-import silk.io.writer { Writer, WriterError }
-import silk.io.writer_native { StderrWriter }
+import silk.io.writer { WriterError }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.mem.box { Box }
 import silk.platform.windows.path { WindowsPath }
@@ -31,16 +27,6 @@ import silk.num.u8
 import silk.num.usize
 
 const HOST_OS: string = Intrinsic.targetOperatingSystem()
-
-// TEMPORARY: locate the Windows build-tools path failure.
-effect fn trace(label: string, value: string) -> () ! WriterError {
-  let mut output = StderrWriter.make()
-  run Writer.writeAll(b"[build-trace] ") |> Effect.provideMut<Writer>(&mut output)
-  run Writer.writeAll(String.utf8Bytes(label)) |> Effect.provideMut<Writer>(&mut output)
-  run Writer.writeAll(b" ") |> Effect.provideMut<Writer>(&mut output)
-  run Writer.writeAll(String.utf8Bytes(value)) |> Effect.provideMut<Writer>(&mut output)
-  run Writer.writeAll(b"\n") |> Effect.provideMut<Writer>(&mut output)
-}
 
 const HOST_ARCH: string = Intrinsic.targetArchitecture()
 
@@ -267,15 +253,6 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
     if !wasm {
       run Task.silk(&["check", "--no-server", "--manifest-path", pathText(&manifest)])
       run nativeTask(&["prepare-windows"])
-      run trace("prepared", Path.view(&manifest) |> Option<string>.unwrapOr("?"))
-    }
-  }
-  static if HOST_OS == "windows" {
-    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_STDLIB") {
-      run trace("SILK_STDLIB", String.fromUtf8(value.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("?"))
-    }
-    if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_COMPILER") {
-      run trace("SILK_COMPILER", String.fromUtf8(value.asSlice()) |> Result<string, InvalidUtf8>.unwrapOr("?"))
     }
   }
   let mut settings = CompilationSettings.make()
@@ -294,95 +271,25 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
     settings.profile.stackSize = Option<u64>.some(8388608)
   }
   let definition = CompilationDefinition {
-    // The build graph takes the portable spelling (`/D:/...` on Windows), not the host's.
-    manifest: run String.copy(Path.view(&manifest) |> Option<string>.unwrapOr("")),
+    manifest: run String.copy(pathText(&manifest)),
     name: Option<String>.none(),
     artifact: Option<String>.none(),
-    stdlib: run standardLibrary(),
+    stdlib: run BuildContext.standardLibrary(),
     settings: move settings,
     packages: Dictionary<PackageSettings>.make(),
   }
-  run trace("definition", "")
-  let compilation = run Compilation.fromDefinition(move definition, run compiler())
-  run trace("fromDefinition", "")
-  run trace("compilation", "")
-  let graph = run (run newBuild()).add(move compilation)
-  run trace("graph", "")
+  let compilation = run Compilation.fromDefinition(move definition, run BuildContext.compiler())
+  let graph = run (run Build.make()).add(move compilation)
   let built = run graph.compile()
   let binary = &built.artifacts.asSlice()[0].path
-  run trace("built", Path.view(binary) |> Option<string>.unwrapOr("?"))
   static if Intrinsic.targetOperatingSystem() == "windows" {
     if !wasm {
       if let Option<Path>.Some { value: directory } = move run Path.parent(binary) {
-        run trace("runtime", pathText(&directory))
         run nativeTask(&["prepare-windows", "--runtime-directory", pathText(&directory)])
-        run trace("runtime done", "")
       }
     }
   }
   return run String.copy(pathText(binary))
-}
-
-// The standard library the launching compiler selected. silk sets SILK_STDLIB on Windows in the
-// portable spelling (`/C:/...`), which BuildContext.standardLibrary() rejects as a native path.
-effect fn standardLibrary() -> Option<String>
-  ! FileError | HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator {
-  return match move run HostInput.variableNamed("SILK_STDLIB") {
-    Option<Bytes>.Some { value } => {
-      let bytes = value.asSlice()
-      static if HOST_OS == "windows" {
-        if bytes.length == 0 || bytes[0] != 47 {
-          let native = run WindowsPath.fromNativeBytes(bytes)
-          return Option<String>.some(run String.copy(Path.view(&native) |> Option<string>.unwrapOr("")))
-        }
-      }
-      let path = run Path.fromBytes(bytes)
-      Option<String>.some(run String.copy(Path.view(&path) |> Option<string>.unwrapOr("")))
-    }
-    Option<Bytes>.None => Option<String>.none()
-  }
-}
-
-// The compiler that launched this task, as a deferred executable input. silk sets
-// SILK_COMPILER in the portable spelling too, which BuildContext.compiler() rejects on Windows.
-effect fn compiler() -> Deferred<Path>
-  ! BuildError | FileError | HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator | &mut FileSystem {
-  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_COMPILER") {
-    let bytes = value.asSlice()
-    static if HOST_OS == "windows" {
-      if bytes.length == 0 || bytes[0] != 47 {
-        let native = run WindowsPath.fromNativeBytes(bytes)
-        return run Deferred<Path>.external(Path.view(&native) |> Option<string>.unwrapOr(""))
-      }
-    }
-    let path = run Path.fromBytes(bytes)
-    return run Deferred<Path>.external(Path.view(&path) |> Option<string>.unwrapOr(""))
-  }
-  return run BuildContext.compiler()
-}
-
-// A build graph rooted at this task's project. On Windows Build.make() reads SILK_PROJECT_ROOT
-// through the same native-only path reader as BuildContext, so root the graph at Task.root() and
-// key it by the content of this task's program, as Build.make() would.
-effect fn newBuild() -> Build
-  ! BuildError | TaskError | FileError | HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator | &mut FileSystem {
-  static if HOST_OS == "windows" {
-    let root = run Task.root()
-    if let Option<Bytes>.Some { value: program } = move run HostInput.argument(0) {
-      if let Option<Path>.Some { value: path } = move run Executable.findBytes(program.asSlice()) {
-        let contents = run FileSystem.readFile(&path)
-        let mut hash = Sha256.make()
-        hash.update(Bytes.asSlice(&contents))
-        let digest = hash.finish()
-        return run Build.at(move root, &digest)
-      }
-    }
-    run Task.abort("cannot locate the program constructing this build")
-  }
-  return run Build.make()
 }
 
 pub effect fn nativeTask(arguments: &[string]) -> ()
