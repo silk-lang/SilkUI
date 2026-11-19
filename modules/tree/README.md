@@ -391,7 +391,11 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
 `frame` resolves styles, lays out, and paints:
 
 - **Layout** is incremental. Style changes reach css-layout only when they change a layout
-  input, and an unchanged tree at an unchanged size skips `compute`.
+  input, and an unchanged tree at an unchanged size skips `compute`. css-layout reads the
+  tree through its `LayoutSource` interface (`src/layout_table.silk`). It does not use a copy
+  in its own `Tree`. Each layout node is a row of links and a style index, 29 bytes. Elements
+  with equal layout styles share one style entry. A text node reads its text from its UI
+  node.
 - **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid, or
   linear, radial and conic gradients, and `url()` images the host loads), border (solid or dashed, per side, with radii), outer and inset shadow,
   opacity (an isolated layer) and `overflow: hidden` clip. Text is drawn from css-layout's text

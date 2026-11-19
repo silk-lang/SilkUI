@@ -84,7 +84,7 @@ fn at(time: f64) -> FrameInput {
 }
 
 fn opacityOf(tree: &UiTree<'_>, id: u32) -> f32 {
-  return tree.node(tree.slotOf(id)).computed.paint.opacity
+  return tree.node(tree.slotOf(id)).computed().paint.opacity
 }
 
 fn near(a: f32, b: f32) -> bool {
@@ -252,17 +252,17 @@ effect fn hoverBody() -> ()
   run tree.dispatch(Input.PointerMove { x: 10.0, y: 10.0, modifiers: 0 })
   run tree.frame(at(1.0))
   run tree.frame(at(1.05))
-  let own = tree.node(tree.slotOf(2)).computed.text.color
-  let inherited = tree.node(tree.slotOf(3)).computed.text.color
+  let own = tree.node(tree.slotOf(2)).computed().text.color
+  let inherited = tree.node(tree.slotOf(3)).computed().text.color
   run Testing.expect(near(own.r, 0.5) && near(own.b, 0.5), "hovering eases to the hover color")
   run Testing.expect(near(inherited.r, 0.5) && near(inherited.b, 0.5), "the text inherits the eased color")
   run tree.dispatch(Input.PointerMove { x: 300.0, y: 200.0, modifiers: 0 })
   run tree.frame(at(1.05))
   run tree.frame(at(1.075))
-  let back = tree.node(tree.slotOf(2)).computed.text.color
+  let back = tree.node(tree.slotOf(2)).computed().text.color
   run Testing.expect(near(back.r, 0.75), "leaving reverses from where it was, in half the time")
   run tree.frame(at(1.1))
-  run Testing.expect(tree.node(tree.slotOf(3)).computed.text.color.r == 1.0, "and ends on the base color")
+  run Testing.expect(tree.node(tree.slotOf(3)).computed().text.color.r == 1.0, "and ends on the base color")
 }
 
 test effect fn hoverTransitionsAndInheritance() -> ()
@@ -480,4 +480,50 @@ test effect fn inspectorOverridesWinAfterMotionWithAndWithoutSheets() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run inspectorAfterMotion(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run inspectorAfterMotion(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The four border colors share one value, and so do `color` and the decoration color that
+// follows it: a transition that writes it must not restart the others each frame.
+effect fn sharedFieldsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(100.0)),
+    css.height(px(100.0)),
+    css.color(rgb(1.0, 0.0, 0.0)),
+    css.borderColor(rgb(1.0, 0.0, 0.0)),
+    css.declare(Property.Transition, run css.text(b"all 100ms linear")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  drop run records(&mut tree)
+  let mut change = Batch.make()
+  run change.style(2, &[css.color(rgb(0.0, 0.0, 1.0)), css.borderColor(rgb(0.0, 0.0, 1.0))])
+  run tree.apply(run change.take())
+  run tree.frame(at(1.0))
+  let started = run records(&mut tree)
+  run Testing.expect(String.byteLength(String.view(&started)) != 0, "the colors start to transition")
+  run tree.frame(at(1.025))
+  run tree.frame(at(1.05))
+  let between = run records(&mut tree)
+  run Testing.expect(String.view(&between) == "", "nothing restarts while the colors run")
+  let border = tree.node(tree.slotOf(2)).computed().paint.borderColor
+  run Testing.expect(near(border.r, 0.5) && near(border.b, 0.5), "the border color is half way")
+  run tree.frame(at(1.1))
+  let ended = run records(&mut tree)
+  run Testing.expect(!String.contains(String.view(&ended), "cancel"), "they end without a cancel")
+  run tree.frame(at(1.2))
+  run Testing.expect(!tree.needsFrame(), "nothing runs after they end")
+}
+
+test effect fn sharedFieldsTransitionOnce() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sharedFieldsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

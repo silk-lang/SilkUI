@@ -61,6 +61,40 @@ It compiles JSX with this package's runtime, fixes a quadratic sibling walk in
 `react-reconciler` for long lists, and adds React Fast Refresh under the dev server.
 `react({ refresh: false })` turns Fast Refresh off.
 
+### Try local renderer sources
+
+To try an unpublished renderer in an app that already has its dependencies installed,
+add this `vite.local.config.mjs` beside the app's `vite.config.js`. Point `SILK_PACKAGES`
+at the checkout's `modules/js/packages` directory. Alias both packages, including the
+JSX runtime, so the app and renderer use the same core node registry. The app keeps its
+installed build plugins, React and reconciler; use versions compatible with the checkout.
+
+```js
+import { resolve } from "node:path";
+import { mergeConfig } from "vite";
+import app from "./vite.config.js";
+
+const source = (file) => resolve(process.env.SILK_PACKAGES, file);
+export default mergeConfig(app, {
+  resolve: {
+    alias: [
+      { find: /^@silkui\/core$/, replacement: source("core/src/index.js") },
+      { find: /^@silkui\/react$/, replacement: source("react/src/index.js") },
+      { find: /^@silkui\/react\/jsx-(?:dev-)?runtime$/, replacement: source("react/src/jsx-runtime.js") },
+    ],
+    dedupe: ["react", "react-reconciler", "scheduler"],
+  },
+});
+```
+
+From the app's web directory, build into a fresh directory. This builds the JS bundle
+and stylesheet only, without launching the app, installing packages or editing the lockfile.
+
+```sh
+SILK_PACKAGES=/absolute/path/to/SilkUI/modules/js/packages \
+  ./node_modules/.bin/vite build --configLoader runner --config vite.local.config.mjs --outDir "$(mktemp -d)"
+```
+
 ## API
 
 | Export | What it does |

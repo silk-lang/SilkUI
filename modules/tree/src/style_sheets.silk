@@ -3,7 +3,7 @@ import style_load { Status }
 import sheet_cache { Cache, Pending, Inherited, Substituted }
 import silk.mem.frozen { Frozen }
 import svg_css.adopted { Candidate }
-import style_invalidation { States }
+import style_invalidation { States, StartingSubjects }
 import animation { Rule }
 import animation
 import timing { AnimationLists, EasingStops }
@@ -65,6 +65,7 @@ pub struct RootSheets {
   pub root: u32,
   pub inlineVariables: bool,
   pub hasStarting: bool,
+  pub startingSubjects: StartingSubjects,
   pub hasGenerated: bool,
   /// Some rule styles `::marker`.
   pub hasMarker: bool,
@@ -88,7 +89,7 @@ pub struct RootSheets {
 impl RootSheets {
   pub fn make(root: u32) -> RootSheets {
     return RootSheets { states: States.make(), cache: Cache.make(), loads: List<Status>.make(), root: root, inlineVariables: false, hasStarting: false, hasGenerated: false, hasMarker: false, hasFirstLetter: false, hasFirstLine: false, hasSelection: false, hasPlaceholder: false, hasScrollbars: false, reads: 0, watchAll: false, siblingAnchors: false, sharing: Sharing.none(), sheets: StyleSheets.make(), environment: Environment.headless(0.0, 0.0),
-      systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
+      startingSubjects: StartingSubjects.make(), systemColors: [Color.srgb(0.0, 0.0, 0.0, 1.0); 19] }
   }
 }
 pub struct Resolved {
@@ -142,7 +143,7 @@ effect fn inlineValues(out: &mut List<Declaration>, source: &[Declaration], tree
 
 pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool, tree: &UiTree<'_>, slot: u32, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
-  let enters = !style_change.rendered(tree, slot) && (hasStarting || tree.node(slot).starting.length() != 0)
+  let enters = !style_change.rendered(tree, slot) && (hasStarting || tree.node(slot).starting().length != 0)
   let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, slot, false, PseudoTarget.None, StateBits.empty(), !enters)
   if resolved.hit.isSome() { return move resolved }
   if enters {
@@ -197,13 +198,13 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   let mut inline = List<Declaration>.make()
   if target == PseudoTarget.None {
     run inlineValues(&mut inline, node.base.asSlice(), tree, node.id, StyleState.Base)
-    if node.hovered { run inlineValues(&mut inline, node.hover.asSlice(), tree, node.id, StyleState.Hover) }
-    if node.pressed { run inlineValues(&mut inline, node.active.asSlice(), tree, node.id, StyleState.Active) }
+    if node.hovered { run inlineValues(&mut inline, node.hover(), tree, node.id, StyleState.Hover) }
+    if node.pressed { run inlineValues(&mut inline, node.active(), tree, node.id, StyleState.Active) }
     if tree.focused == slot {
-      run inlineValues(&mut inline, node.focus.asSlice(), tree, node.id, StyleState.Focus)
-      if tree.focusVisible || node.kind == NodeKind.Input { run inlineValues(&mut inline, node.focusVisible.asSlice(), tree, node.id, StyleState.FocusVisible) }
+      run inlineValues(&mut inline, node.focus(), tree, node.id, StyleState.Focus)
+      if tree.focusVisible || node.kind == NodeKind.Input { run inlineValues(&mut inline, node.focusVisible(), tree, node.id, StyleState.FocusVisible) }
     }
-    if starting { run inlineValues(&mut inline, node.starting.asSlice(), tree, node.id, StyleState.Starting) }
+    if starting { run inlineValues(&mut inline, node.starting(), tree, node.id, StyleState.Starting) }
   }
   let mut priorities = List<Priority>.make()
   let mut i: usize = 0
@@ -238,8 +239,8 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
         let state = states[stateIndex]
         if active(tree, slot, state) || (starting && state == StyleState.Starting) {
           let mut at: usize = 0
-          while at < identity.custom.length() {
-            let item = &identity.custom.asSlice()[at]
+          while at < identity.custom().length {
+            let item = &identity.custom()[at]
             if item.state == state {
               let mut priority = Priority.make(Origin.Author, custom.length())
               priority.important = item.important
@@ -524,7 +525,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
   let mut foreground = match baseColor { Option.Some { value } => value Option.None => inheritedColor }
   if highlight {
     let origin = tree.node(parent)
-    let mut color = origin.computed.text.color
+    let mut color = origin.computed().text.color
     if origin.parent != NONE {
       if let Option.Some { value } = selection.color(selection.of(tree.node(origin.parent)).foreground, color) { color = value }
     }
@@ -537,7 +538,7 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
       if !highlight || !convert.isKeyword(&items[i].value, Keyword.Currentcolor) {
         resolveColor(&mut items[i].value, expressions.asSlice(), i, inheritedColor, system)
       } else {
-        let origin = tree.node(parent).computed.text.color
+        let origin = tree.node(parent).computed().text.color
         foreground = Color.srgb(f32.toF64(origin.r), f32.toF64(origin.g), f32.toF64(origin.b), f32.toF64(origin.a))
       }
       if let Option<Rgba<f32>>.Some { value } = convert.color(&items[i].value) {
@@ -571,12 +572,12 @@ pub fn parentStyle(tree: &UiTree<'_>, slot: u32) -> Computed {
 
 fn parentColor(tree: &UiTree<'_>, parent: u32) -> Rgba<f32> {
   if parent == NONE { return TextStyle.initial().color }
-  return tree.node(parent).computed.text.color
+  return tree.node(parent).computed().text.color
 }
 
 fn parentComputed(tree: &UiTree<'_>, parent: u32) -> Computed {
   if parent == NONE { return tree.rootParent() }
-  return tree.node(parent).computed
+  return tree.node(parent).computed().*
 }
 
 fn resolveColor(value: &mut Value, expressions: &[Expression], index: usize, current: Color, system: [Color; 19]) -> () {

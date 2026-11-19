@@ -45,9 +45,9 @@ function eventOf(name) {
   return { type, capture };
 }
 
-function listen(node, name, type, capture) {
+function listen(node, name, type, capture, props) {
   let bound = bindings.get(node);
-  if (!bound) bindings.set(node, (bound = { props: {}, names: new Set() }));
+  if (!bound) bindings.set(node, (bound = { props, names: new Set() }));
   if (bound.names.has(name)) return;
   bound.names.add(name);
   node.addEventListener(
@@ -139,21 +139,7 @@ function diffStyle(look, previous, next) {
   if (any) look.set(changes);
 }
 
-function applyProps(node, previous, next) {
-  for (const name of Object.keys(next)) {
-    const value = next[name];
-    if (SKIP.has(name) || previous[name] === value) continue;
-    if (name in LOOKS) {
-      diffStyle(node.look(LOOKS[name]), previous[name], value);
-      continue;
-    }
-    const event = eventOf(name);
-    if (event) {
-      if (typeof value === "function") listen(node, name, event.type, event.capture);
-      continue;
-    }
-    node.setAttribute(name, value);
-  }
+function removeMissingProps(node, previous, next) {
   for (const name of Object.keys(previous)) {
     if (name in next || SKIP.has(name)) continue;
     if (name in LOOKS) diffStyle(node.look(LOOKS[name]), previous[name], null);
@@ -162,12 +148,37 @@ function applyProps(node, previous, next) {
       else node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
     }
   }
+}
+
+function applyProps(node, previous, next) {
+  const names = Object.keys(next);
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const value = next[name];
+    if (name === "children" || previous[name] === value) continue;
+    if (name === "className") {
+      node.setAttribute(name, value);
+      continue;
+    }
+    if (SKIP.has(name)) continue;
+    if (name in LOOKS) {
+      diffStyle(node.look(LOOKS[name]), previous[name], value);
+      continue;
+    }
+    const event = eventOf(name);
+    if (event) {
+      if (typeof value === "function") listen(node, name, event.type, event.capture, next);
+      continue;
+    }
+    node.setAttribute(name, value);
+  }
+  if (previous !== EMPTY) removeMissingProps(node, previous, next);
   if (node instanceof RichInput) {
     defineLooks(previous.marks, next.marks, (name, style) => node.defineMark(name, style));
     defineLooks(previous.atoms, next.atoms, (kind, style) => node.defineAtom(kind, style));
     if (next.document !== undefined) {
       if (!sameDocument(next.document, node.document)) node.document = next.document;
-      listen(node, "onInput", "input", false);
+      listen(node, "onInput", "input", false, next);
     } else if (previous === EMPTY && next.defaultDocument !== undefined) {
       node.document = next.defaultDocument;
     }
@@ -176,14 +187,15 @@ function applyProps(node, previous, next) {
       if (String(next.value) !== node.value) node.value = next.value;
       // Typing reaches the tree first, so a controlled input needs the input event to put
       // its value back when the application does not accept the change.
-      listen(node, "onInput", "input", false);
+      listen(node, "onInput", "input", false, next);
     } else if (previous === EMPTY && next.defaultValue !== undefined) {
       node.value = next.defaultValue;
     }
   }
-  let bound = bindings.get(node);
-  if (bound) bound.props = next;
-  else if (next.value !== undefined || next.document !== undefined) bindings.set(node, { props: next, names: new Set() });
+  if (previous !== EMPTY) {
+    const bound = bindings.get(node);
+    if (bound) bound.props = next;
+  }
 }
 
 const EMPTY = {};
