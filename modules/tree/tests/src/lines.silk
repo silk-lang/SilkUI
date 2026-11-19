@@ -334,6 +334,90 @@ test effect fn mixedFontLinesHitAndCaret() -> ()
   run mixedBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+/// Two text nodes side by side in one paragraph, on lines shorter than the text is tall: the
+/// line where the first ends and the second begins is one line box in two text fragments
+/// (css-layout's `TEXT_LINE_CONTINUED`), and each line carries the overflow of its runs
+/// (`TEXT_LINE_OVERFLOW`).
+effect fn sharedBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run paragraph(&fonts, &[css.lineHeight(px(10.0))], "alpha beta gamma delta epsilon zeta eta ")
+  let mut batch = Batch.make()
+  run batch.text(PARAGRAPH, TAIL, "theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+
+  // Both kinds of record are there: this test is about them.
+  let records = tree.output.fragments.texts.asSlice()
+  let mut continued: usize = 0
+  let mut overflowing: usize = 0
+  let mut lines: usize = 0
+  let mut r: usize = 0
+  while r < records.length {
+    if records[r].part == 1 { lines = lines + 1 }
+    if records[r].part == 2 { continued = continued + 1 }
+    if records[r].part == 3 { overflowing = overflowing + 1 }
+    r = r + 1
+  }
+  run Testing.expect(lines >= 3, "the paragraph's lines are records")
+  run Testing.expect(continued == 1, "the line the two texts share is in both their fragments")
+  run Testing.expect(overflowing == lines, "every line holds text taller than it is")
+
+  let mut head = List<caret.Piece>.make()
+  let mut tail = List<caret.Piece>.make()
+  run view.textPieces(&tree, tree.slotOf(TEXT), &mut head)
+  run view.textPieces(&tree, tree.slotOf(TAIL), &mut tail)
+  run Testing.expect((run lineCount(&head)) >= 2, "the head wraps")
+  run Testing.expect((run lineCount(&tail)) >= 2, "the tail wraps")
+  let a = head.asSlice()
+  let b = tail.asSlice()
+  let last = a[a.length - 1]
+  run Testing.expect(last.line == b[0].line, "the head's last line is the tail's first")
+  run Testing.expect(last.lineTop == b[0].lineTop && last.lineBottom == b[0].lineBottom, "one line box")
+  run Testing.expect(f32.abs(b[0].x0 - last.x1) < 0.01, "the tail follows the head on it")
+  run Testing.expect(b[b.length - 1].line != b[0].line, "and goes on below")
+  run Testing.expect(f32.abs((last.lineBottom - last.lineTop) - 10.0) < 0.01, "a line is as tall as its line height")
+  run Testing.expect(last.bottom - last.top > 12.0, "its text is taller")
+
+  // The paragraph is as tall as its lines; the text of its last line reaches below it, into
+  // its scrollable overflow.
+  let box = tree.output.fragments.values.asSlice()[tree.fragmentOf.get(tree.node(tree.slotOf(PARAGRAPH)).css)]
+  let bottom = b[b.length - 1].bottom
+  run Testing.expect(f32.abs(box.size.height - usize.toF32(lines) * 10.0) < 0.01, "the paragraph is its lines tall")
+  run Testing.expect(bottom > box.worldLocation.y + box.size.height, "the last line's text reaches below the paragraph")
+  run Testing.expect(
+    f32.abs(box.scrollableOverflow.y + box.scrollableOverflow.height - (bottom - box.worldLocation.y)) < 0.01,
+    "the paragraph's scrollable overflow reaches the bottom of that text",
+  )
+
+  // With lines as tall as their text, where no run lies over another line's: every offset of
+  // both texts round-trips, on the shared line as on the others.
+  let mut plain = run paragraph(&fonts, &[], "alpha beta gamma delta epsilon zeta eta ")
+  run batch.text(PARAGRAPH, TAIL, "theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon")
+  run plain.apply(run batch.take())
+  run plain.frame(viewport())
+  let plainRecords = plain.output.fragments.texts.asSlice()
+  continued = 0
+  overflowing = 0
+  r = 0
+  while r < plainRecords.length {
+    if plainRecords[r].part == 2 { continued = continued + 1 }
+    if plainRecords[r].part == 3 { overflowing = overflowing + 1 }
+    r = r + 1
+  }
+  run Testing.expect(continued == 1 && overflowing == 0, "one shared line, and no text outside its line")
+  let first = run roundTrips(&plain, TEXT, PARAGRAPH)
+  let second = run roundTrips(&plain, TAIL, PARAGRAPH)
+  run Testing.expect(first > 25 && second > 40, "offsets of both texts were checked")
+}
+
+test effect fn linesSharedByTextsAndOverflowingText() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sharedBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 effect fn selectionBody() -> ()
   ! AssertionError<'static> | TreeError | CssomError | OutOfMemoryError
   ? &mut Allocator {
