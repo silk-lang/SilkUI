@@ -247,6 +247,9 @@ pub struct FontState<'a> {
   shaped: List<Shaped>,
   shapedText: List<u8>,
   shapedGlyphs: List<RawGlyph>,
+  paragraph: String,
+  paragraphEntry: usize,
+  paragraphCuts: List<usize>,
   /// Shaper calls the cache did not answer, for tests and benchmarks.
   pub shaperCalls: usize,
   /// Round ascent, descent and line gap to whole pixels, as Blink does on every platform.
@@ -397,6 +400,9 @@ impl<'a> FontState<'a> {
       shaped: List<Shaped>.make(),
       shapedText: List<u8>.make(),
       shapedGlyphs: List<RawGlyph>.make(),
+      paragraph: String.make(),
+      paragraphEntry: usize.MAX,
+      paragraphCuts: List<usize>.make(),
       shaperCalls: 0,
       roundMetrics: true,
     }
@@ -462,7 +468,7 @@ impl<'a> FontState<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut chain = List<Link>.make()
-    run self.set.chain(style.families.asSlice(), style.request, &mut chain)
+    run self.set.cachedChain(style.families.asSlice(), style.request, &mut chain)
     let mut primary = self.set.primary(chain.asSlice())
     if primary.isNone() {
       // No requested family has a face yet: the fallbacks decide, starting with the first
@@ -729,6 +735,28 @@ impl<'a> FontState<'a> {
         return
       }
     }
+    let length = String.byteLength(text)
+    let eligible = start == 0 && end == length && !rtl && !vertical && script.value == 0x4c61746e
+    if eligible && self.paragraphEntry != usize.MAX && length < String.byteLength(self.paragraph.view()) {
+      let saved = &self.shaped.asSlice()[self.paragraphEntry]
+      if length != 0 && saved.instance == instance && saved.features.same(features) {
+        if let Option<usize>.Some { value: offset } = String.find(self.paragraph.view(), text) {
+          let low = self.paragraphCuts.get(offset)
+          let high = self.paragraphCuts.get(offset + length)
+          if low != usize.MAX && high != usize.MAX {
+            let glyphs = self.shapedGlyphs.asSlice()
+            let mut index = low
+            while index < high {
+              let mut glyph = glyphs[saved.glyphStart + index]
+              glyph.cluster = glyph.cluster - usize.toU32(offset)
+              run out.append(glyph)
+              index = index + 1
+            }
+            return
+          }
+        }
+      }
+    }
     let first = out.length()
     run self.shapeUncached(instance, text, start, end, rtl, script, vertical, features, &mut out)
     if self.shapedGlyphs.length() + (out.length() - first) > SHAPED_GLYPHS {
@@ -736,6 +764,7 @@ impl<'a> FontState<'a> {
       self.shaped.clear()
       self.shapedText.clear()
       self.shapedGlyphs.clear()
+      self.paragraphEntry = usize.MAX
     }
     let entry = Shaped {
       hash: hash,
@@ -756,6 +785,54 @@ impl<'a> FontState<'a> {
     let index = usize.toU32(self.shaped.length())
     run self.shaped.append(entry)
     drop run self.shapedIndex.insert(Hash.word(hash), index)
+    if eligible && length >= 48 && length <= 4096 && out.length() > first {
+      run self.rememberCuts(text, u32.toUsize(index), out.length() - first)
+    }
+  }
+
+  effect fn rememberCuts(self: &mut Self, text: string, entry: usize, count: usize) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let bytes = String.utf8Bytes(text)
+    let mut at: usize = 0
+    while at < bytes.length {
+      if bytes[at] < 32 || bytes[at] >= 127 { return }
+      at = at + 1
+    }
+    let infos = self.buffer.glyphInfos()
+    if infos.len() != count { return }
+    self.paragraphEntry = usize.MAX
+    self.paragraphCuts.clear()
+    run self.paragraphCuts.reserveExact(bytes.length + 1)
+    while self.paragraphCuts.length() <= bytes.length { run self.paragraphCuts.append(usize.MAX) }
+    let cuts = self.paragraphCuts.asMutSlice()
+    let mut previous = usize.MAX
+    let mut index: usize = 0
+    while index < count {
+      let info = match infos.get(index) { Option.Some { value } => value Option.None => { return } }
+      let cluster = u32.toUsize(info.cluster)
+      if cluster >= bytes.length || (index == 0 && cluster != 0) || (index != 0 && cluster < previous) { return }
+      if cluster != previous { cuts[cluster] = index }
+      if info.unsafeToBreak() { cuts[cluster] = usize.MAX }
+      previous = cluster
+      index = index + 1
+    }
+    cuts[0] = 0
+    cuts[bytes.length] = count
+    self.paragraph.clear()
+    run self.paragraph.append(text)
+    self.paragraphEntry = entry
+  }
+
+  pub fn hasParagraph(self: &Self, key: usize, text: string) -> bool {
+    if self.paragraphEntry == usize.MAX { return false }
+    let entry = self.shaped.get(self.paragraphEntry)
+    let treatment = self.treatment(key)
+    return entry.instance == self.instanceOf(key) && entry.features.same(&treatment.features)
+      && self.paragraph.view() == text
+  }
+
+  pub fn safeParagraphCut(self: &Self, offset: usize) -> bool {
+    return offset < self.paragraphCuts.length() && self.paragraphCuts.get(offset) != usize.MAX
   }
 
   /// Shapes as `shapeTextOriented` does, without the cache.

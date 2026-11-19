@@ -5,6 +5,8 @@
 //! returned for a request of plain horizontal text, keyed by everything the shaping read, so a
 //! repeated request copies its runs.
 import glyphs { GlyphStore }
+import fonts { FontState }
+import properties.computed { TextTransform }
 import analysis { tokenLength }
 import layout.lib { TextShapeRequest, TextRun, TextTokenKind, WritingMode }
 import silk.collections.list { List }
@@ -55,6 +57,7 @@ pub struct LineCache {
   hash: u64,
   // The glyph store generation the kept shape keys belong to.
   epoch: usize,
+  generation: u64,
 }
 
 fn mix(hash: u64, value: u64) -> u64 {
@@ -77,12 +80,11 @@ fn partner(index: usize) -> usize {
 
 effect fn number(key: &mut List<u8>, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut rest = value
-  let mut count: usize = 0
-  while count < 8 {
-    run key.append(usize.toU8(rest % 256))
-    rest = rest / 256
-    count = count + 1
+  while rest >= 128 {
+    run key.append(usize.toU8(128 + rest % 128))
+    rest = rest / 128
   }
+  run key.append(usize.toU8(rest))
 }
 
 impl LineCache {
@@ -94,6 +96,7 @@ impl LineCache {
       key: List<u8>.make(),
       hash: 0,
       epoch: 0,
+      generation: 0,
     }
   }
 
@@ -118,7 +121,7 @@ impl LineCache {
   /// Writes `request`'s key and returns whether its line can be kept: unjustified,
   /// unhyphenated horizontal text and collapsed spaces at one bidi level. The key holds
   /// everything `shapeLine` reads for such a request.
-  effect fn describe(self: &mut Self, request: &TextShapeRequest<'_, '_>) -> bool
+  effect fn describe<'a>(self: &mut Self, fonts: &FontState<'a>, request: &TextShapeRequest<'_, '_>) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
     let analysis = request.analysis
@@ -134,6 +137,7 @@ impl LineCache {
     run number(&mut self.key, request.start.offset)
     run number(&mut self.key, u8.toUsize(analysis.level) * 2 + u8.toUsize(analysis.paragraph.level))
     let mut unit = request.start.unit
+    let mut priorFont = usize.MAX
     while unit < tokens.length && unit <= request.end.unit {
       let token = &tokens[unit]
       let mut start: usize = 0
@@ -151,17 +155,23 @@ impl LineCache {
         } else if token.kind != TextTokenKind.Text {
           return false
         }
-        if token.writingMode != WritingMode.HorizontalTb {
+        if token.writingMode != WritingMode.HorizontalTb || token.textOrientation != tokens[request.start.unit].textOrientation {
           return false
+        }
+        if token.fontKey != priorFont {
+          if fonts.treatment(token.fontKey).transform != TextTransform.None { return false }
+          priorFont = token.fontKey
         }
         let bytes = String.utf8Bytes(token.text)
         if end > bytes.length {
           return false
         }
         run number(&mut self.key, token.fontKey * 4 + kind)
+        run number(&mut self.key, token.sourceStart)
         run number(&mut self.key, end - start)
         run self.key.appendSlice(Slice.view(bytes, start, end - start))
       } else {
+        if token.kind != TextTokenKind.Text && token.kind != TextTokenKind.Space { return false }
         // An empty unit keeps its place, so that kept units count the same.
         run number(&mut self.key, 0)
       }
@@ -198,8 +208,9 @@ impl LineCache {
   /// Appends the runs kept for `request` to `output` and returns true, or returns false
   /// after writing the request's key for [`LineCache.keep`]. `kept` tells whether the
   /// request can be kept at all.
-  pub effect fn find(
+  pub effect fn find<'a>(
     self: &mut Self,
+    fonts: &FontState<'a>,
     store: &GlyphStore,
     request: &TextShapeRequest<'_, '_>,
     output: &mut List<TextRun>,
@@ -207,13 +218,14 @@ impl LineCache {
   ) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
-    kept.* = run self.describe(request)
+    kept.* = run self.describe(fonts, request)
     if !kept.* {
       return false
     }
-    if self.epoch != store.epoch() {
+    if self.epoch != store.epoch() || self.generation != fonts.set.generation {
       self.clear()
       self.epoch = store.epoch()
+      self.generation = fonts.set.generation
     }
     if self.slots.length() == 0 {
       return false

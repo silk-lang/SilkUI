@@ -96,7 +96,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach, Extent }
+import style_invalidation { Reach, Extent, StartingSubjects }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
 import svg_css.element { PseudoTarget, StateBits, ElementTree }
@@ -105,6 +105,8 @@ import style_share
 import selector_tree { SelectorTree }
 import sheet_cache { Pending as PendingStyle }
 import silk.mem.frozen { Frozen }
+import silk.mem.pointer { Pointer }
+import silk.mem.layout { Layout }
 import svg_css.adopted { AdoptionError }
 import svg_css.sheet { Sheet }
 import svg_css.sheet_binary { DecodeError }
@@ -1704,27 +1706,11 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut mutations = move batch
-    let mut reversed = List<Mutation>.make()
-    while true {
-      match mutations.pop() {
-        Option<Mutation>.Some { value } => {
-          run reversed.append(move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
-    }
+    let entries = mutations.asMutSlice()
     let mut index: usize = 0
-    while true {
-      match reversed.pop() {
-        Option<Mutation>.Some { value } => {
-          run self.applyOne(index, move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
+    while index < entries.length {
+      let value = Intrinsic.replace(entries[index], Mutation.Blur)
+      run self.applyOne(index, move value)
       index = index + 1
     }
   }
@@ -2543,6 +2529,7 @@ impl<'a> UiTree<'a> {
     if kind == NodeKind.Input {
       editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
     }
+    let ownStyle = run Frozen<Computed>.make(computed)
     let node = Node {
       id: id,
       kind: kind,
@@ -2556,7 +2543,7 @@ impl<'a> UiTree<'a> {
       focus: List<Declaration>.make(),
       focusVisible: List<Declaration>.make(),
       starting: List<Declaration>.make(),
-      computed: computed,
+      computed: move ownStyle,
       fontKey: 0,
       paintHash: 0,
       text: String.make(),
@@ -2768,7 +2755,7 @@ impl<'a> UiTree<'a> {
     while v < doomed.length() {
       let gone = doomed.get(v)
       if self.node(gone).isGenerated() {
-        let computed = self.node(gone).computed
+        let computed = self.node(gone).computed.get().*
         drop run animation.update(&mut self, gone, false, &computed)
         run motion.cancelAll(&mut self, gone)
       }
@@ -4144,7 +4131,7 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     let kind = self.node(slot).kind
     let resource = self.node(slot).resource
-    let fontSize = self.node(slot).computed.text.size
+    let fontSize = self.node(slot).computed.get().*.text.size
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
     if kind != NodeKind.Image && kind != NodeKind.Icon {
@@ -4448,7 +4435,7 @@ impl<'a> UiTree<'a> {
     let mut slot: usize = 0
     while slot < count {
       let node = &self.nodes.asSlice()[slot]
-      if node.live && (node.computed.usesViewport || placeholder.usesViewport(node) || scrollbar_parts.usesViewport(node)) {
+      if node.live && (node.computed.get().*.usesViewport || placeholder.usesViewport(node) || scrollbar_parts.usesViewport(node)) {
         self.restyle(usize.toU32(slot))
       }
       slot = slot + 1
@@ -4713,7 +4700,9 @@ impl<'a> UiTree<'a> {
       return ()
     }
     let reads = self.styleSheets.asSlice()[at].reads
-    if !self.styleSheets.asSlice()[at].hasStarting {
+    let sheets = &self.styleSheets.asSlice()[at]
+    let sheetStarting = sheets.hasStarting && (self.overrides.length() != 0 || sheets.startingSubjects.mayMatch(self.node(slot)))
+    if !sheetStarting {
       let twin = style_share.twin(&self, slot, reads, self.styleSheets.asSlice()[at].sharing)
       if twin != NONE {
         let shared = match &self.node(twin).resolvedSheet {
@@ -4741,7 +4730,7 @@ impl<'a> UiTree<'a> {
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
-    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, entries[at].hasStarting, &self, slot, &mut stops))
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, sheetStarting, &self, slot, &mut stops))
     self.easingStops = move stops
     self.styleSheets = move roots
     match move resolved {
@@ -4817,7 +4806,7 @@ impl<'a> UiTree<'a> {
       _ => false
     }
     if !same { return NONE }
-    let values = &other.computed
+    let values = other.computed.get()
     if values.viewportWidth != self.input.width || values.viewportHeight != self.input.height || values.usesContainer { return NONE }
     let none = usize.MAX
     if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
@@ -4873,7 +4862,7 @@ impl<'a> UiTree<'a> {
   }
 
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
-    if lender != NONE { return self.node(lender).computed }
+    if lender != NONE { return self.node(lender).computed.get().* }
     return Computed.inViewport(inherited, self.input.width, self.input.height)
   }
 
@@ -4952,7 +4941,7 @@ impl<'a> UiTree<'a> {
     let node = self.node(origin)
     if node.kind != NodeKind.Box || node.isGenerated() { return () }
     let old = match node.identity() { Option.Some { value } => value.marker _ => NONE }
-    let list = node.computed.list
+    let list = node.computed.get().*.list
     if !list.item() && old == NONE { return () }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     let styled = list.item() && at != usize.MAX && self.styleSheets.asSlice()[at].hasMarker
@@ -5061,6 +5050,9 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
+        roots[sheetIndex].startingSubjects = if roots[sheetIndex].hasStarting {
+          run StartingSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
+        } else { StartingSubjects.make() }
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
@@ -5099,23 +5091,23 @@ impl<'a> UiTree<'a> {
       let below = node.subtreeDirty
       let mut changed = full
       if own {
-        let before = node.computed.text
+        let before = node.computed.get().*.text
         let beforeFont = node.fontKey
-        let events = node.computed.paint.pointerEvents
-        let barColors = node.computed.scroll.colors
-        let listStyle = node.computed.list
-        let shadow = node.computed.effects
+        let events = node.computed.get().*.paint.pointerEvents
+        let barColors = node.computed.get().*.scroll.colors
+        let listStyle = node.computed.get().*.list
+        let shadow = node.computed.get().*.effects
         let wasRendered = node.rendered
-        let containment = node.computed.contain.query()
-        let skips = node.computed.contain.hidden()
+        let containment = node.computed.get().*.contain.query()
+        let skips = node.computed.get().*.contain.hidden()
         let namesChanged = run self.resolve(slot, tick)
         self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
         run self.syncGenerated(slot)
-        if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
-        let after = &self.node(slot).computed
+        if listStyle.item() || self.node(slot).computed.get().*.list.item() { run self.syncMarker(slot) }
+        let after = self.node(slot).computed.get()
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
@@ -5254,7 +5246,7 @@ impl<'a> UiTree<'a> {
     let parent = self.node(slot).parent
     let mut inherited = TextStyle.initial()
     if parent != NONE {
-      inherited = self.node(parent).computed.text
+      inherited = self.node(parent).computed.get().*.text
     }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
@@ -5267,8 +5259,8 @@ impl<'a> UiTree<'a> {
     if based == usize.MAX {
     // border-collapse, border-spacing and caption-side inherit.
     if lender == NONE && parent != NONE {
-      inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
-      computed.list = ListStyle.inherited(self.node(parent).computed.list)
+      inheritTable(&mut computed.layout, &self.node(parent).computed.get().*.layout)
+      computed.list = ListStyle.inherited(self.node(parent).computed.get().*.list)
     }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
@@ -5281,8 +5273,8 @@ impl<'a> UiTree<'a> {
     if lender == NONE {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
-      computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
-      computed.scroll.colors = self.node(parent).computed.scroll.colors
+      computed.paint.pointerEvents = self.node(parent).computed.get().*.paint.pointerEvents
+      computed.scroll.colors = self.node(parent).computed.get().*.scroll.colors
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -5316,7 +5308,7 @@ impl<'a> UiTree<'a> {
     }
     }
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
-    if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
+    if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.get().*.list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
@@ -5332,7 +5324,7 @@ impl<'a> UiTree<'a> {
     let node = self.node(slot)
     let kind = node.kind
     // `content-visibility: hidden` skips its contents the way `display: none` does.
-    if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
+    if node.generatedSuppressed || parent != NONE && self.node(parent).computed.get().*.contain.hidden() { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
@@ -5431,9 +5423,9 @@ impl<'a> UiTree<'a> {
       self.easingStops = move finalStops
     }
     let css = self.node(slot).css
-    let sizeChanged = self.node(slot).computed.text.size != computed.text.size
+    let sizeChanged = self.node(slot).computed.get().*.text.size != computed.text.size
     if parent != NONE {
-      let above = self.node(parent).computed.effects
+      let above = self.node(parent).computed.get().*.effects
       computed.effects.shadowFrom = above.shadowFrom
       computed.effects.shadowHash = above.shadowHash
     }
@@ -5443,8 +5435,15 @@ impl<'a> UiTree<'a> {
     let paintHash = computed.paintHash(&self.seed)
     let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
     if lender == NONE { self.computedStamps = stamp }
+    // A node styled as its lender shares the lender's style when nothing of its own (an
+    // effect, a shadow it takes from another parent) made it differ.
+    let shared = if lender != NONE && sameComputed(self.node(lender).computed.get(), &computed) {
+      self.node(lender).computed.clone()
+    } else {
+      run Frozen<Computed>.make(computed)
+    }
     let target = self.nodeMut(slot)
-    target.computed = computed
+    target.computed = move shared
     target.computedStamp = stamp
     target.rendered = rendered
     target.fontKey = fontKey
@@ -5616,7 +5615,7 @@ impl<'a> UiTree<'a> {
         } else if properties_convert.isKeyword(&value.value, Keyword.Initial) {
           return ()
         } else {
-          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed, node.fontKey))
+          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed.get().*, node.fontKey))
           return ()
         }
       }
@@ -6557,6 +6556,29 @@ fn takeLowest(free: &mut List<u32>) -> u32 {
 /// with where it is and how far it can scroll, as well as those that follow each scroll. A
 /// host sets it for a node whose scroll offset is read before anything scrolled it.
 const LISTEN_SCROLL_STATE: u32 = 0x40000000
+
+/// Whether two computed styles are the same bytes. A style a node takes from its lender starts
+/// as a copy of it, so one that was not changed afterwards compares equal.
+fn sameComputed(a: &Computed, b: &Computed) -> bool {
+  let bytes = Layout.of<Computed>().bytes
+  unsafe {
+    let left = Pointer.nonNullMany<u8>(Pointer.bytes<Computed>(Pointer.fromRef<Computed>(a)))
+    let right = Pointer.nonNullMany<u8>(Pointer.bytes<Computed>(Pointer.fromRef<Computed>(b)))
+    if let Option<[*]const u8>.Some { value: x } = left {
+      if let Option<[*]const u8>.Some { value: y } = right {
+        let mut i: usize = 0
+        while i < bytes {
+          if Pointer.read<u8>(Pointer.at<u8>(x, i)) != Pointer.read<u8>(Pointer.at<u8>(y, i)) {
+            return false
+          }
+          i = i + 1
+        }
+        return true
+      }
+    }
+  }
+  return false
+}
 
 /// A tree gives back what a larger one left only after it has held this many nodes
 /// (see `UiTree.releaseSlack`).

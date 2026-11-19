@@ -2,7 +2,9 @@
 //! coverage, line breaking with real advances, glyph runs behind fragments, run sharing and
 //! hyphenation. `silk task browser chrome-text` checks positions in Chrome.
 import system { TextSystem }
-import fonts { TextStyle, Treatment }
+import analysis { Analyzer, analyze }
+import fonts { RawGlyph, TextStyle, Treatment }
+import silk.text.unicode_script { Script }
 import properties.computed { TextTransform, WordBreak, OverflowWrap }
 import set { FaceRule, FaceState, UnicodeRange }
 import font_collection.lib { FontCollection, Family, Range }
@@ -17,7 +19,8 @@ import layout.lib {
   TextError,
   FragmentationError,
   FragmentKind,
-  TextFragment
+  TextFragment,
+  TextToken, TextTokenKind, Direction, UnicodeBidi, WritingMode, TextOrientation, WhiteSpaceCollapse, TextJustify, TextContext, TextBreak
 }
 
 static if Intrinsic.targetOperatingSystem() == "windows" {
@@ -403,6 +406,133 @@ test effect fn fontMetricsComeFromTheFace() -> ()
   ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run fontMetricsComeFromTheFaceBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn paragraphCutsMatchShapingBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let collection = run fonts()
+  let mut subject = TextSystem.make(&collection)
+  let mut reference = TextSystem.make(&collection)
+  let key = run subject.addStyle(run sans(16.0))
+  let other = run reference.addStyle(run sans(16.0))
+  let paragraph = "A quick office visit: AVATAR, office work and coffee for two."
+  let latin = Script.of(65)
+  let instance = subject.fonts.instanceOf(key)
+  let otherInstance = reference.fonts.instanceOf(other)
+  let mut got = List<RawGlyph>.make()
+  let mut wanted = List<RawGlyph>.make()
+  run subject.fonts.shapeText(instance, paragraph, 0, String.byteLength(paragraph), false, latin, &mut got)
+  let calls = subject.fonts.shaperCalls
+  let mut reused = false
+  let mut start: usize = 0
+  while start < 30 {
+    let mut length: usize = 1
+    while length <= 11 {
+      let part = String.slice(paragraph, start, length)
+      got.clear()
+      wanted.clear()
+      let before = subject.fonts.shaperCalls
+      run subject.fonts.shapeText(instance, part, 0, length, false, latin, &mut got)
+      run reference.fonts.shapeText(otherInstance, part, 0, length, false, latin, &mut wanted)
+      if before == calls && before == subject.fonts.shaperCalls { reused = true }
+      run Testing.expect(got.length() == wanted.length(), "a cut keeps exactly the standalone glyphs")
+      let mut index: usize = 0
+      while index < got.length() {
+        let actual = got.get(index)
+        let expected = wanted.get(index)
+        run Testing.expect(actual.glyph == expected.glyph && actual.cluster == expected.cluster && actual.xAdvance == expected.xAdvance && actual.yAdvance == expected.yAdvance && actual.xOffset == expected.xOffset && actual.yOffset == expected.yOffset, "a cut matches independent shaping, including kerning and ligatures")
+        index = index + 1
+      }
+      length = length + 1
+    }
+    start = start + 1
+  }
+  run Testing.expect(reused, "a safe substring reuses paragraph glyphs")
+}
+
+effect fn plainBreaksBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let words = ["A", " ", "file.", " ", "Yes?", " ", "office"]
+  let mut tokens = List<TextToken<'static>>.make()
+  let mut analyzer = Analyzer.make()
+  let mut index: usize = 0
+  while index < words.length {
+    run tokens.append(TextToken { kind: if index % 2 == 0 { TextTokenKind.Text } else { TextTokenKind.Space },
+      text: words[index], source: 0, sourceStart: 0, sourceEnd: String.byteLength(words[index]), fontKey: key,
+      direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal, replacedInline: false,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed,
+      whiteSpaceCollapse: WhiteSpaceCollapse.Collapse, textJustify: TextJustify.Auto, shapingBarrier: false })
+    let mut context = TextContext { tokens: tokens.asSlice(), direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed, textJustify: TextJustify.Auto }
+    let mut direct = List<TextBreak>.make()
+    let mut reference = List<TextBreak>.make()
+    let actual = run analyze(&mut analyzer, context, &system.fonts, &mut direct)
+    context.unicodeBidi = UnicodeBidi.Plaintext
+    let expected = run analyze(&mut analyzer, context, &system.fonts, &mut reference)
+    run Testing.expect(actual.paragraph.hasStrong == expected.paragraph.hasStrong && actual.level == expected.level
+      && actual.paragraph.end.equal(expected.paragraph.end) && direct.length() == reference.length(), "ordinary Latin agrees with Unicode paragraph analysis")
+    let mut boundary: usize = 0
+    while boundary < reference.length() {
+      let value = direct.get(boundary)
+      run Testing.expect(value.at.equal(reference.get(boundary).at) && value.kind == reference.get(boundary).kind, "identical break opportunity")
+      boundary = boundary + 1
+    }
+    index = index + 1
+  }
+}
+
+test effect fn simpleParagraphBreaksMatchUnicodeAnalysis() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run plainBreaksBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn wrappedClustersBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | InvalidNode | TextError | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let paragraphs = ["office staff file a note. office staff file a note. office staff file a note.",
+    "new office staff file a note. office staff file a note. office staff file a note."]
+  let mut paragraph: usize = 0
+  while paragraph < paragraphs.length {
+    let text = paragraphs[paragraph]
+    let output = run layout(&mut system, key, 89.0, text)
+    let mut fragments = List<TextFragment>.make()
+    let mut ys = List<f32>.make()
+    run texts(&output, &mut fragments, &mut ys)
+    run Testing.expect(fragments.length() > 4, "the paragraph wraps")
+    let mut index: usize = 0
+    while index < fragments.length() {
+      let fragment = fragments.get(index)
+      let glyphs = system.runGlyphs(fragment.shapeKey)
+      let mut position: usize = 0
+      while position < glyphs.length {
+        let glyph = glyphs[position]
+        run Testing.expect(glyph.cluster >= fragment.sourceStart && glyph.cluster < fragment.sourceEnd, "glyph clusters refer to this fragment")
+        position = position + 1
+      }
+      index = index + 1
+    }
+    paragraph = paragraph + 1
+  }
+  run Testing.expect(system.copiedWordLines > 0, "wrapped lines reuse certified word runs")
+}
+
+test effect fn wrappedLinesKeepTheirSourceClusters() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | InvalidNode | TextError | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run wrappedClustersBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn paragraphCutsMatchShaping() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run paragraphCutsMatchShapingBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn latinTextWrapsAtWordBoundaries() -> ()
