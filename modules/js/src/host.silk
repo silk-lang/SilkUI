@@ -4,6 +4,7 @@ import ui_js_calls.natives { Natives, Reply }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
+import silk.core.ownership { Copy }
 import silk.text.string { String }
 import silk.num.u32
 import ui_tree.lib { Tree, ProtocolError, Input, EventRecord, Event, Motion }
@@ -25,9 +26,11 @@ import silkjs.js_eval_compile as flags
 import silk.core.option { Option }
 import silk.collections.list { List }
 import silk.num.usize
+import silk.num.f64
 import silk.mem.pointer { Pointer }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { AllocationObserver }
+import silkjs.runtime_memory as engineMemory
 import silkjs.js_runtime as runtime
 import silkjs.js_gc as gc
 import silkjs.js_intrinsic_install as intrinsics
@@ -53,6 +56,38 @@ pub struct JsError {
   pub message: String,
 }
 
+/// Measurement scaffolding: where the entry module's time went, in milliseconds. The window
+/// client prints it with the first frame under `SILK_UI_BENCH` or `SILK_UI_TRACE_JS`.
+pub struct EntryTimes {
+  /// The entry came from a bytecode image, not from its source.
+  pub image: bool,
+  /// Parsing and compiling the source, or loading the image.
+  pub load: f64,
+  /// The module's top-level code.
+  pub evaluate: f64,
+  /// The promise jobs it queued.
+  pub jobs: f64,
+}
+
+impl Copy for EntryTimes {}
+
+/// Measurement scaffolding: the collections a runtime ran and what they took.
+pub struct GcTimes {
+  pub full: u32,
+  pub young: u32,
+  pub milliseconds: f64,
+}
+
+impl Copy for GcTimes {}
+
+/// Measurement scaffolding: milliseconds on the engine's tick counter, from an arbitrary
+/// start; 0 where the CPU has none.
+pub fn milliseconds() -> f64 {
+  let perMicrosecond = unsafe engineMemory.ticksPerMicrosecond()
+  if perMicrosecond == 0 { return 0.0 }
+  return usize.toF64(unsafe engineMemory.ticks()) / usize.toF64(perMicrosecond) / 1000.0
+}
+
 /// A JavaScript realm bound to a UI tree's client side.
 ///
 /// Every effect here allocates JavaScript memory, so provide the `RuntimeAllocator` that
@@ -62,6 +97,7 @@ pub struct JsHost<'m> {
   runtime: *mut HeapHeader,
   context: *mut HeapHeader,
   closed: bool,
+  entry: EntryTimes,
 }
 
 /// A JavaScript string of `value`, or undefined when it is too long to be one.
@@ -215,6 +251,12 @@ effect fn evaluateIn<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, 
   return run evaluation.evaluate(&mut engine, memory, realm, source, name, mode)
 }
 
+/// Runs what a compile-only evaluate returned.
+effect fn runCompiled<'a, 'm>(engine: &mut Engine<'m, Bridge>, realm: Realm<'a>, compiled: Value) -> Value ! JsException ? &mut Allocator {
+  let memory = engine.memory
+  return run evaluation.evaluateFunction(&mut engine, memory, realm, move compiled)
+}
+
 /// Calls `__ui.dispatch(kind, target, a, b, modifiers, d, e, first, second, third, fourth)`
 /// (the last two are a rich input's packed marks and atoms) when the
 /// application installed one (see `numbersOf` for the numbers and `firstString` for the
@@ -360,7 +402,7 @@ impl<'m> JsHost<'m> {
     }
     unsafe runtime.setPromiseRejectionTracker(rt, HostHook { callback: Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.REJECTION }), opaque: Pointer.null<u8>() })
     unsafe loader.setLoader(rt, Option<NativeFunctionId>.none(), Option<NativeFunctionId>.some(NativeFunctionId.Host { id: bridge.MODULE_LOAD }), Pointer.null<u8>())
-    let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false }
+    let mut host = JsHost { engine: move engine, runtime: rt, context: context, closed: false, entry: EntryTimes { image: false, load: 0.0, evaluate: 0.0, jobs: 0.0 } }
     let installed = run Effect.result(install(&mut host.engine, unsafe lendRealm(&context, context)))
     match move installed {
       Result<(), OutOfMemoryError | JsException>.Success { .. } => ()
@@ -421,12 +463,23 @@ impl<'m> JsHost<'m> {
   pub effect fn module(self: &mut Self, source: &[u8], name: &[u8]) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
     let context = self.context
     let realm = unsafe lendRealm(&context, context)
-    let ran = run Effect.result(evaluateIn(&mut self.engine, realm, source, name, flags.TYPE_MODULE))
+    // Compiled, then run: what one evaluate of the source does, with a clock between the two.
+    let before = milliseconds()
+    let prepared = run Effect.result(evaluateIn(&mut self.engine, realm, source, name, flags.TYPE_MODULE | flags.FLAG_COMPILE_ONLY))
+    let compiled = match move prepared {
+      Result<Value, JsException>.Success { value } => move value
+      Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    let loaded = milliseconds()
+    let ran = run Effect.result(runCompiled(&mut self.engine, realm, move compiled))
+    let evaluated = milliseconds()
+    self.entry = EntryTimes { image: false, load: loaded - before, evaluate: evaluated - loaded, jobs: 0.0 }
     let completion = match move ran {
       Result<Value, JsException>.Success { value } => move value
       Result<Value, JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
     }
     let drained = run Effect.result(runJobs(&mut self.engine, realm))
+    self.entry.jobs = milliseconds() - evaluated
     // The module's own failure is this call's failure, not an unhandled rejection.
     forget(&mut self.engine, realm, completion.borrow())
     run reportRejections(&mut self.engine, realm)
@@ -442,6 +495,18 @@ impl<'m> JsHost<'m> {
     }
     if rejected { fail run describe(&mut self.engine, realm, move reason) }
     realm.release(&mut self.engine, move reason)
+  }
+
+  /// Measurement scaffolding: where the last [`JsHost.module`] spent its time.
+  pub fn entryTimes(self: &Self) -> EntryTimes { return self.entry }
+
+  /// Measurement scaffolding: the collections the runtime has run and what they took.
+  pub fn gcTimes(self: &Self) -> GcTimes {
+    if self.closed { return GcTimes { full: 0, young: 0, milliseconds: 0.0 } }
+    let counts = unsafe runtime.gcCounts(self.runtime)
+    let perMicrosecond = unsafe engineMemory.ticksPerMicrosecond()
+    let spent = if perMicrosecond == 0 { 0.0 } else { usize.toF64(counts.ticks) / usize.toF64(perMicrosecond) / 1000.0 }
+    return GcTimes { full: counts.full, young: counts.young, milliseconds: spent }
   }
 
   /// Runs the promise jobs queued since the last script, module or event.
