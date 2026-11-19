@@ -888,3 +888,121 @@ test effect fn declaredFacesCanDeactivateReorderAndReuseLoadedData() ! Assertion
   let mut allocator = Allocator.systemAllocatorProvider()
   run activatedFacesBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+/// Whether two layouts have the same text fragments with the same glyphs.
+effect fn sameShaping(
+  left: &TextSystem<'_>,
+  leftOutput: &LayoutTree,
+  right: &TextSystem<'_>,
+  rightOutput: &LayoutTree,
+) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut a = List<TextFragment>.make()
+  let mut b = List<TextFragment>.make()
+  let mut ys = List<f32>.make()
+  let mut otherYs = List<f32>.make()
+  run texts(leftOutput, &mut a, &mut ys)
+  run texts(rightOutput, &mut b, &mut otherYs)
+  if a.length() != b.length() || a.length() == 0 {
+    return false
+  }
+  let mut index: usize = 0
+  while index < a.length() {
+    let one = a.get(index)
+    let other = b.get(index)
+    if one.sourceStart != other.sourceStart || one.sourceEnd != other.sourceEnd
+      || ys.get(index) != otherYs.get(index) {
+      return false
+    }
+    let glyphs = left.runGlyphs(one.shapeKey)
+    let others = right.runGlyphs(other.shapeKey)
+    if glyphs.length != others.length
+      || left.glyphRun(one.shapeKey).face != right.glyphRun(other.shapeKey).face {
+      return false
+    }
+    let mut at: usize = 0
+    while at < glyphs.length {
+      if glyphs[at].glyph != others[at].glyph || glyphs[at].cluster != others[at].cluster
+        || glyphs[at].x != others[at].x
+        || glyphs[at].y != others[at].y
+        || glyphs[at].advance != others[at].advance {
+        return false
+      }
+      at = at + 1
+    }
+    index = index + 1
+  }
+  return true
+}
+
+effect fn linesTakeTheGlyphsOfTheirParagraphBody() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError
+  ? &mut Allocator {
+  let collection = run fonts()
+  let mut taking = TextSystem.make(&collection)
+  let mut shaping = TextSystem.make(&collection)
+  shaping.shaping.reuse = false
+  let key = run taking.addStyle(run sans(16.0))
+  drop run shaping.addStyle(run sans(16.0))
+
+  // Kerned pairs and ligatures across the line breaks, fallback faces, and a joining script.
+  let paragraphs: [string; 4] = [
+    "AVATAR Wave To: Yo. office affluent Tea, We AVA. Wave fjord Ty. AVATAR Wave To: Yo. office affluent Tea",
+    "The quick brown fox \u{65e5}\u{672c}\u{8a9e}\u{306e}\u{6587}\u{7ae0} jumps over \u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064a}\u{0629} the lazy dog again and again",
+    "\u{0647}\u{0630}\u{0627} \u{0646}\u{0635} \u{0639}\u{0631}\u{0628}\u{064a} \u{0637}\u{0648}\u{064a}\u{0644} \u{064a}\u{0644}\u{062a}\u{0641} \u{0639}\u{0644}\u{0649} \u{0639}\u{062f}\u{0629} \u{0623}\u{0633}\u{0637}\u{0631} \u{0641}\u{064a} \u{0627}\u{0644}\u{0635}\u{0641}\u{062d}\u{0629}",
+    "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{6587}\u{7ae0}\u{306f}\u{5358}\u{8a9e}\u{306e}\u{9593}\u{306b}\u{7a7a}\u{767d}\u{304c}\u{306a}\u{304f}\u{3066}\u{3082}\u{6539}\u{884c}\u{3067}\u{304d}\u{307e}\u{3059}\u{3002}\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{6587}\u{7ae0}",
+  ]
+  let mut index: usize = 0
+  while index < paragraphs.length {
+    let one = run layout(&mut taking, key, 150.0, paragraphs[index])
+    let other = run layout(&mut shaping, key, 150.0, paragraphs[index])
+    run Testing.expect(
+      run sameShaping(&taking, &one, &shaping, &other),
+      "lines cut from a shaped paragraph have the glyphs shaping them gives",
+    )
+    index = index + 1
+  }
+  run Testing.expect(taking.shaping.taken > 0, "lines took glyphs from their paragraph")
+  run Testing.expect(
+    taking.fonts.shaperCalls < shaping.fonts.shaperCalls,
+    "taking glyphs saves shaper calls",
+  )
+
+  // Text that grows a word at a time, as a streamed answer does.
+  let words: [string; 8] = ["Wave", "To:", "AVATAR", "office", "Yo.", "affluent", "Tea,", "fjord"]
+  let mut text = String.make()
+  let mut word: usize = 0
+  while word < 40 {
+    if word > 0 {
+      run text.append(" ")
+    }
+    run text.append(words[(word * 5 + word / 3) % words.length])
+    let one = run layout(&mut taking, key, 150.0, text.view())
+    let other = run layout(&mut shaping, key, 150.0, text.view())
+    run Testing.expect(
+      run sameShaping(&taking, &one, &shaping, &other),
+      "text that grew has the glyphs shaping all of it gives",
+    )
+    word = word + 1
+  }
+  run Testing.expect(taking.shaping.continued > 0, "appended text shaped only its end")
+}
+
+test effect fn linesTakeTheGlyphsOfTheirParagraph() -> ()
+  ! AssertionError<'static>
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+    | InvalidNode
+    | TextError
+    | FragmentationError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run linesTakeTheGlyphsOfTheirParagraphBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}

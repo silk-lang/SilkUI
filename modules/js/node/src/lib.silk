@@ -25,8 +25,9 @@ import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
-import ui_tree_window.host { WindowClient, RunOptions, runWindow }
+import ui_tree_window.host { WindowClient, RunOptions, runWindow, environmentVariable }
 import ui_tree_window.loader { Loader }
+import ui_tree_window.console { StderrWriter }
 import ui_tree_window.platform_thread { HostPlatform, AlsoWake }
 import ui_inspect_server.lib { Inspector }
 import font_collection.lib { FontCollection }
@@ -44,6 +45,7 @@ import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_string_types { StringLengthError }
 import silkjs.js_atomics_native { SynchronizationError }
+import silk.collections.bytes { Bytes }
 import silkjs.js_native_functions as functions
 import silkjs.js_object_allocate as objects
 import silkjs.js_intl_common as common
@@ -717,6 +719,8 @@ pub struct NodeWindow<'f> {
   source: List<u8>,
   /// The runtime's `HostApi`, set by `start`.
   api: Option<UiApi>,
+  /// Whether the process ends with the runtime, which then starts from the program's heap image.
+  ownsProcess: bool,
   /// What failed in the window host, kept until `run` returns.
   failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>,
 }
@@ -731,6 +735,7 @@ impl<'f> NodeWindow<'f> {
       name: List<u8>.make(),
       source: List<u8>.make(),
       api: Option<UiApi>.None,
+      ownsProcess: false,
       failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None,
     }
   }
@@ -742,6 +747,13 @@ impl<'f> NodeWindow<'f> {
     let mut sourceCopy = List<u8>.make()
     run sourceCopy.appendSlice(source)
     run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy })
+  }
+
+  /// The process ends when the window's runtime does, and the runtime starts from the heap image
+  /// appended to the program ([`writeHeapImage`]) when it has one, skipping its bootstrap. A
+  /// release host's choice: nothing runs after `start` then.
+  pub fn ownProcess(self: &mut Self) -> () {
+    self.ownsProcess = true
   }
 
   /// The ES module the window runs, named by an absolute path or a URL.
@@ -759,7 +771,8 @@ impl<'f> NodeWindow<'f> {
   pub effect fn start<C: Composition>(self: &mut Self, executable: &[u8], api: UiApi, capabilities: C) -> i32
     ! WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError
     ? &mut Allocator {
-    let options = run Options.make(executable)
+    let mut options = run Options.make(executable)
+    options.ownsProcess = self.ownsProcess
     self.api = Option<UiApi>.some(api)
     let status = run embed.start(move options, &mut self.*, move capabilities)
     let failure = Intrinsic.replace(self.failure, Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None)
@@ -771,10 +784,36 @@ impl<'f> NodeWindow<'f> {
   }
 }
 
+/// Writes the heap image of a runtime with `capabilities` to `path` and ends the process: what a
+/// program that starts its windows with [`NodeWindow.ownProcess`] runs when its first argument
+/// is `--silk-write-heap-image`. Appended to the program, the image holds the runtime as its
+/// bootstrap leaves it, so it must have the capabilities the windows start with.
+pub effect fn writeHeapImage<C: Composition>(executable: &[u8], path: &[u8], capabilities: C) -> i32
+  ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
+  let mut options = run Options.make(executable)
+  options.ownsProcess = true
+  run options.arguments.append(run Bytes.copy(b"--silk-write-heap-image"))
+  run options.arguments.append(run Bytes.copy(path))
+  let mut host = Imaging {}
+  return run embed.start(move options, &mut host, move capabilities)
+}
+
+/// The runtime ends the process when its image is written, before any host runs.
+struct Imaging {}
+
+impl Host for Imaging {
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    return 1
+  }
+}
+
 impl<'f> Host for NodeWindow<'f> {
   effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
+    if tracing { StderrWriter.print("silkui: runtime open\n", &()) }
     let api = match self.api { Option<UiApi>.Some { value } => value Option<UiApi>.None => { return 1 } }
     let mut app = run NodeApp.make(&mut runtime.*, api)
+    if tracing { StderrWriter.print("silkui: ui installed\n", &()) }
     app.bridge.stylesheetCompiler = self.client.stylesheetCompiler
     app.bridge.natives = self.client.natives
     let items = self.modules.asSlice()
@@ -786,6 +825,7 @@ impl<'f> Host for NodeWindow<'f> {
     run app.entry(self.name.asSlice(), self.source.asSlice())
     // The entry's first turn: its imports and top-level code run before the first frame.
     run app.turn(0.0)
+    if tracing { StderrWriter.print("silkui: bundle ready\n", &()) }
     let options = match Intrinsic.replace(self.options, Option<RunOptions>.None) {
       Option<RunOptions>.Some { value } => move value
       Option<RunOptions>.None => { return 1 }
@@ -803,6 +843,8 @@ impl<'f> Host for NodeWindow<'f> {
         GeometryError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
       }
     }
+    // A process the runtime owns ends with it, so `start` never sees the failure.
+    if self.ownsProcess && self.failure.isSome() { StderrWriter.print("silkui: the JavaScript window host failed\n", &()) }
     return match app.exitStatus() {
       Option<i32>.Some { value } => value
       Option<i32>.None => status
