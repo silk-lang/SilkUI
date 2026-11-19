@@ -2,6 +2,7 @@
 //! coverage, line breaking with real advances, glyph runs behind fragments, run sharing and
 //! hyphenation. `silk task browser chrome-text` checks positions in Chrome.
 import system { TextSystem }
+import analysis { Analyzer, analyze }
 import fonts { TextStyle, Treatment }
 import properties.computed { TextTransform, WordBreak, OverflowWrap }
 import set { FaceRule, FaceState, UnicodeRange }
@@ -17,7 +18,8 @@ import layout.lib {
   TextError,
   FragmentationError,
   FragmentKind,
-  TextFragment
+  TextFragment,
+  TextToken, TextTokenKind, Direction, UnicodeBidi, WritingMode, TextOrientation, WhiteSpaceCollapse, TextJustify, TextContext, TextBreak
 }
 
 static if Intrinsic.targetOperatingSystem() == "windows" {
@@ -403,6 +405,46 @@ test effect fn fontMetricsComeFromTheFace() -> ()
   ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run fontMetricsComeFromTheFaceBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn plainBreaksBody() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError ? &mut Allocator {
+  let collection = run fonts()
+  let mut system = TextSystem.make(&collection)
+  let key = run system.addStyle(run sans(16.0))
+  let words = ["A", " ", "file.", " ", "Yes?", " ", "office"]
+  let mut tokens = List<TextToken<'static>>.make()
+  let mut analyzer = Analyzer.make()
+  let mut index: usize = 0
+  while index < words.length {
+    run tokens.append(TextToken { kind: if index % 2 == 0 { TextTokenKind.Text } else { TextTokenKind.Space },
+      text: words[index], source: 0, sourceStart: 0, sourceEnd: String.byteLength(words[index]), fontKey: key,
+      direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal, replacedInline: false,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed,
+      whiteSpaceCollapse: WhiteSpaceCollapse.Collapse, textJustify: TextJustify.Auto, shapingBarrier: false })
+    let mut context = TextContext { tokens: tokens.asSlice(), direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal,
+      writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed, textJustify: TextJustify.Auto }
+    let mut direct = List<TextBreak>.make()
+    let mut reference = List<TextBreak>.make()
+    let actual = run analyze(&mut analyzer, context, &system.fonts, &mut direct)
+    context.unicodeBidi = UnicodeBidi.Plaintext
+    let expected = run analyze(&mut analyzer, context, &system.fonts, &mut reference)
+    run Testing.expect(actual.paragraph.hasStrong == expected.paragraph.hasStrong && actual.level == expected.level
+      && actual.paragraph.end.equal(expected.paragraph.end) && direct.length() == reference.length(), "ordinary Latin agrees with Unicode paragraph analysis")
+    let mut boundary: usize = 0
+    while boundary < reference.length() {
+      let value = direct.get(boundary)
+      run Testing.expect(value.at.equal(reference.get(boundary).at) && value.kind == reference.get(boundary).kind, "identical break opportunity")
+      boundary = boundary + 1
+    }
+    index = index + 1
+  }
+}
+
+test effect fn simpleParagraphBreaksMatchUnicodeAnalysis() -> ()
+  ! AssertionError<'static> | FileError | HostInputError | OutOfMemoryError | TextError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run plainBreaksBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn latinTextWrapsAtWordBoundaries() -> ()
