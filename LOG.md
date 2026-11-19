@@ -33,6 +33,11 @@ each one is driven. Read it before comparing two numbers.
 - No JavaScript, no framework and no diff: the app makes every node itself and sends only the
   mutations each frame needs. It is the floor under the other two Silk apps.
 - First paint: the host's `presented` callback.
+- Until 2026-11-19 16:30 UTC the app served its resource loader only while a load was already
+  running, so the `@font-face` loads that layout asks for were never taken: it drew with the
+  installed fallback fonts, not Inter and JetBrains Mono (on the Mac, 385 fallback queries a frame
+  in churn and an empty font set). It now serves the loader on every poll, as Loom's host does.
+  Sessions before that are not comparable with Loom or React on text.
 
 ## Electron (`electron`)
 
