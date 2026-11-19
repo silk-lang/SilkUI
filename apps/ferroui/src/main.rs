@@ -249,6 +249,7 @@ impl Driver {
     /// One frame of the script at `now_ms`.
     fn step(&mut self, now_ms: f64, windowless: bool) {
         let max = self.max_scroll();
+        if std::env::var_os("XB_DEBUG").is_some() { eprintln!("max_scroll {max}"); }
         let frame = SCENE.with(|s| s.borrow_mut().as_mut().unwrap().frame(now_ms, max, windowless));
         if frame.changed {
             self.n += 1;
