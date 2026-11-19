@@ -673,7 +673,8 @@ fn imaged(app: &App, options: &Options, dev: bool) -> bool {
   return app.writtenIn.dir() != "" && !dev && app.custom == "" && app.runsOn != Runtime.Node && options.target.length() == 0
 }
 
-/// The step that compiles the app's bundle into a bytecode image (`app.bin`): a small
+/// The step that compiles the app's bundle into a bytecode image (`app.bin`, and
+/// `@silkui/core`, which the bundle imports, into `core.bin`): a small
 /// program around `silkui_window.image`, compiled here from the app's manifest and so with
 /// the engine the host links, run on the bundle. An image only loads in the engine build
 /// that wrote it, and the program is one of the step's inputs: a build after the engine
@@ -692,7 +693,7 @@ effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   let configured = run rooted.unsandboxedTools(options.unsandboxedTools)
   let tool = run configured.artifact()
   let reads = run Run.artifact(move tool).inputFile(run bundle.output("bundle/app.js"))
-  let writes = run reads.outputFile("app.bin")
+  let writes = run (run reads.outputFile("app.bin")).outputFile("core.bin")
   return run writes.register()
 }
 
@@ -980,7 +981,8 @@ impl App {
           // Embedded, the image's bytes are part of the program for as long as it runs,
           // which is how long the engine reads them.
           let written = run image(self, &project, options)
-          run texted.embed("app_image", run written.output("app.bin"))
+          let imaged = run texted.embed("app_image", run written.output("app.bin"))
+          run imaged.embed("core_image", run written.output("core.bin"))
         } else {
           move texted
         }
@@ -1131,11 +1133,17 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
     run say("compiling the bundle into a bytecode image with the host's engine...")
     let started = now()
     let writer = run image(&app, &project, options)
-    let graph = run (run Build.make()).addStep(move writer, "app.bin")
+    let library = writer.copy()
+    let graph = run (run (run Build.make()).addStep(move writer, "app.bin")).addStep(move library, "core.bin")
     let built = run graph.compile()
-    let path = run Context.text(&built.artifacts.asSlice()[0].path)
-    done("wrote the bytecode image the window host starts from", started)
-    listArtifact(relative(String.view(&project.root), path.view()), run sizeOf(path.view()))
+    done("wrote the bytecode images the window host starts from", started)
+    let written = built.artifacts.asSlice()
+    let mut at: usize = 0
+    while at < written.length {
+      let path = run Context.text(&written[at].path)
+      listArtifact(relative(String.view(&project.root), path.view()), run sizeOf(path.view()))
+      at = at + 1
+    }
   } else if bundles && options.target.length() != 0 && app.runsOn != Runtime.Node {
     run say("no bytecode image: a host built for another target starts from the bundle's text")
   }
