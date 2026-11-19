@@ -77,6 +77,43 @@ inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptim
 `silk build` makes it. Development builds optimize the renderer, inspector server and runtime
 packages while keeping the application unoptimized.
 
+### What a built JavaScript app starts from
+
+`App.build` compiles a JavaScript app's bundle before it compiles the host, into a bytecode
+image: every function of the bundle as the engine's bytecode, and the `@silkui/core` module
+the bundle imports with it. The window host embeds both images beside the bundle's text and
+starts from them, so a launch parses and compiles nothing. The build says so:
+
+```text
+silkui compiling the bundle into a bytecode image with the host's engine...
+silkui ✓ wrote the bytecode images the window host starts from in 35.0s
+  build/steps/78e37d42…/app.bin  2.3 MB
+  build/steps/78e37d42…/core.bin  270.6 kB
+```
+
+(A 1 MB bundle here. The first build compiles the program that writes the images, about
+half a minute; after that the step runs again only when the bundle or the engine changes.)
+
+An image only loads in the engine build that wrote it. That is why the app's own build
+writes it, with a small program compiled from the app's manifest like the host (so both link
+the engine the manifest pins), and why nothing else should: when the engine pin moves, the
+next build writes the images again. A host that still finds another build's image does not
+fail and does not stay quiet: it says so on standard error at launch and runs the bundle's
+text, which every host carries as well.
+
+```sh
+SILK_UI_TRACE_JS=1 dist/window/my-app
+# silkui: JavaScript starts from its bytecode image (2299196 bytes, engine build 7816585738683590938)
+```
+
+- `App.dev` writes no image: a development window runs what Vite sends, and a reload runs
+  the new source.
+- A host built for another machine (`--target`) starts from the bundle's text, since the
+  image is written by a program that runs on the build machine. The build says so.
+- An app on the SilkJS runtime (`Runtime.Node`) starts from the bundle's text: it has no
+  image yet.
+- A custom host (`App.customHost`) gets neither bundle nor image, as before.
+
 ## The definition
 
 | Setting | Choices | Notes |
