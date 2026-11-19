@@ -42,7 +42,7 @@ if [[ ! -f "$WEB/dist-silk/feed/app.sheet" ]]; then
 fi
 cp "$WEB/dist-silk/feed/app.sheet" "$APP/assets/app.sheet"
 (cd "$APP" && silk build --release --progress plain > "$APP/build.log" 2>&1) || { grep -a -A6 -E "error|warning" "$APP/build.log" | head -80; exit 1; }
-bin=$(ls "$APP"/build/llvm/*/release/"$NAME")
+bin=$(ls "$APP"/build/*/release/"$NAME")
 for scene in "${scenes[@]}"; do
   mkdir -p "$APP/out/$scene"; cp "$bin" "$APP/out/$scene/$NAME"
   [[ $(uname) == Darwin ]] && codesign -f -s - "$APP/out/$scene/$NAME" > /dev/null 2>&1 || true
