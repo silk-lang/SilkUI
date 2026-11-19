@@ -65,6 +65,28 @@ pub fn showMetalHud(on: bool) -> () {
   hostShowMetalHud(on)
 }
 
+/// The app's JavaScript as a release host carries it: the bundle's text, and the bytecode
+/// image the app's build compiled it into with the engine the host links (`image.silk`),
+/// or an empty image for none. A launch starts from the image and parses nothing; the
+/// text is what runs when the image was written by another engine build, which the host
+/// says on standard error.
+pub struct Bundle {
+  pub source: &'static [u8],
+  pub image: &'static [u8],
+  /// The image of `@silkui/core`, which the bundle imports and the host defines: written by
+  /// the same build step, or empty.
+  pub library: &'static [u8],
+}
+
+impl Copy for Bundle {}
+
+impl Bundle {
+  /// A bundle with no image: every launch parses and compiles `source`.
+  pub fn text(source: &'static [u8]) -> Bundle {
+    return Bundle { source: source, image: b"", library: b"" }
+  }
+}
+
 /// Runs the bundle `source` (or, when it is empty, the file at `entry`) in a window with
 /// `tools`, until the window closes. Answers the exit code.
 pub effect fn program<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>) -> i32
@@ -89,6 +111,15 @@ pub effect fn programWithSheetUpdates<T: JsTools>(settings: Settings, entry: &[u
 pub effect fn programWithStylesheetCompiler<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], tools: T, inspector: Inspector, launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
+  return run programWithImages(settings, entry, source, b"", b"", move tools, move inspector, move launched, move sheets, move updates, compiler)
+}
+
+/// [`programWithStylesheetCompiler`] for a bundle that also has bytecode images
+/// ([`Bundle`]): `image` is the bundle's and `library` is `@silkui/core`'s; an empty one is
+/// none.
+pub effect fn programWithImages<T: JsTools>(settings: Settings, entry: &[u8], source: &[u8], image: &'static [u8], library: &'static [u8], tools: T, inspector: Inspector, launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler) -> i32
+  ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError
+  ? &mut Allocator {
   // The GPU first: it takes longer than the fonts, the script and the realm together.
   let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
   if tracing { StderrWriter.print("silkui: program started\n", &()) }
@@ -103,9 +134,10 @@ pub effect fn programWithStylesheetCompiler<T: JsTools>(settings: Settings, entr
   if tracing { StderrWriter.print("silkui: engine open\n", &()) }
   app.javascript().setStylesheetCompiler(compiler)
   app.javascript().setNatives(settings.natives)
-  run app.define(b"@silkui/core", uiPackage())
+  run app.defineImaged(b"@silkui/core", uiPackage(), library)
   if source.length != 0 {
     run app.entry(b"app.js", source)
+    app.entryImage(image)
   } else {
     let read = run Effect.catchAll(platform.readFile(entry), unreadable)
     run app.entry(b"app.js", read.asSlice())
@@ -175,9 +207,9 @@ pub effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
-fn released(settings: Settings, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, compiler: StylesheetCompiler) -> i32 {
+fn released(settings: Settings, bundle: Bundle, launched: Option<Launched>, sheets: StyleAssets, compiler: StylesheetCompiler) -> i32 {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(programWithStylesheetCompiler(settings, b"", source, NoTools {}, Inspector.off(), move launched, move sheets, SheetWatch.make(), compiler), failed)
+  return run Effect.catchAll(programWithImages(settings, b"", bundle.source, bundle.image, bundle.library, NoTools {}, Inspector.off(), move launched, move sheets, SheetWatch.make(), compiler), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
@@ -187,27 +219,38 @@ pub effect fn release(settings: Settings, source: &'static [u8]) -> i32 ? &mut H
   return run releaseWithSheets(settings, source, &[])
 }
 
-effect fn launchReleased(settings: Settings, source: &'static [u8], sources: &[&[u8]], compiler: StylesheetCompiler) -> i32
+effect fn launchReleased(settings: Settings, bundle: Bundle, sources: &[&[u8]], compiler: StylesheetCompiler) -> i32
   ! OutOfMemoryError ? &mut Allocator {
   let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
   if tracing { StderrWriter.print("silkui: main\n", &()) }
   let sheets = run StyleAssets.from(sources)
   if tracing { StderrWriter.print("silkui: sheets ready\n", &()) }
   return run launch(|launched: Option<Launched>| -> i32 {
-    return released(settings, source, move launched, move sheets, compiler)
+    return released(settings, bundle, move launched, move sheets, compiler)
   })
 }
 
 /// Release entry with build-compiled stylesheets, in adoption order.
 pub effect fn releaseWithSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
-  let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(launchReleased(settings, source, sheets, StylesheetCompiler.off()), failed)
-    |> Effect.provideMut<Allocator>(&mut allocator)
+  return run releaseBundle(settings, Bundle.text(source), sheets)
 }
 
 /// Release entry that opts into parsing CSS text at runtime.
 pub effect fn releaseWithRuntimeSheets(settings: Settings, source: &'static [u8], sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+  return run releaseBundleWithRuntimeSheets(settings, Bundle.text(source), sheets)
+}
+
+/// The release entry silkui generates: the bundle with the bytecode image the app's build
+/// wrote ([`Bundle`]) and its build-compiled stylesheets, in adoption order.
+pub effect fn releaseBundle(settings: Settings, bundle: Bundle, sheets: &[&[u8]]) -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
-  return run Effect.catchAll(launchReleased(settings, source, sheets, runtimeStylesheets()), failed)
+  return run Effect.catchAll(launchReleased(settings, bundle, sheets, StylesheetCompiler.off()), failed)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// [`releaseBundle`] that opts into parsing CSS text at runtime.
+pub effect fn releaseBundleWithRuntimeSheets(settings: Settings, bundle: Bundle, sheets: &[&[u8]]) -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(launchReleased(settings, bundle, sheets, runtimeStylesheets()), failed)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }

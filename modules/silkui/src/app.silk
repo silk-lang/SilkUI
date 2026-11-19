@@ -33,7 +33,7 @@
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
 import stylesheets
-import host { Kind, Plan, Allows, main as hostMain, page as hostPage, webgpuExports, libm }
+import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import bundle as Bundles
 import web { Server, site }
@@ -49,6 +49,7 @@ import silk.build.graph {
   Optimize
 }
 import silk.build.context as Context
+import silk.build.run { Run }
 import silk.build.step { StepHandle }
 import silk.build.definition { Definition, Settings as Values, Package as PackageSettings }
 import silk.schema.schema { Dictionary }
@@ -580,6 +581,7 @@ effect fn hostPlan(app: &App, project: &Project, target: Target, dev: bool) -> P
     stylesheets: app.sheetCount(),
     runtimeCss: app.runtimeCss,
     natives: kind != Kind.Loom && app.custom == "" && run exists(String.view(&run nativesFile(project))),
+    image: false,
     metalHud: hud,
     allows: app.allows,
   }
@@ -660,6 +662,39 @@ effect fn bundle(app: &App, project: &Project) -> StepHandle
   ? &mut Allocator | &mut HostInput | &mut FileSystem {
   let web = run fromRoot(project, app.writtenIn.dir())
   return run Bundles.register(&run Path.make(web.view()))
+}
+
+/// Whether a build of `app` writes a bytecode image of its bundle for the window host: a
+/// JavaScript app on the SilkJS engine with a generated host, in a build that bundles
+/// (not `dev`, which runs what the development server sends). An image is written by a
+/// program built for this machine, so a host built for another target starts from the
+/// bundle's text; so does an app on the SilkJS runtime, which has no image yet.
+fn imaged(app: &App, options: &Options, dev: bool) -> bool {
+  return app.writtenIn.dir() != "" && !dev && app.custom == "" && app.runsOn != Runtime.Node && options.target.length() == 0
+}
+
+/// The step that compiles the app's bundle into a bytecode image (`app.bin`, and
+/// `@silkui/core`, which the bundle imports, into `core.bin`): a small
+/// program around `silkui_window.image`, compiled here from the app's manifest and so with
+/// the engine the host links, run on the bundle. An image only loads in the engine build
+/// that wrote it, and the program is one of the step's inputs: a build after the engine
+/// pin moved writes the image again.
+effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
+  ! BuildError | TaskError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  let bundle = run bundle(app, project)
+  let source = run imageWriter()
+  let files = run WriteFiles.make().text("main.silk", source.view())
+  let generated = run files.register()
+  let mut name = run String.copy(app.named)
+  run name.append("-image")
+  let writer = run Compilation.executable(name.view(), "src/main.silk")
+  let rooted = run writer.root(run generated.output("main.silk"))
+  let configured = run rooted.unsandboxedTools(options.unsandboxedTools)
+  let tool = run configured.artifact()
+  let reads = run Run.artifact(move tool).inputFile(run bundle.output("bundle/app.js"))
+  let writes = run (run reads.outputFile("app.bin")).outputFile("core.bin")
+  return run writes.register()
 }
 
 // --- App: the definition ---
@@ -849,7 +884,8 @@ impl App {
     let mut at: usize = 0
     while at < targets.length {
       let target = targets[at]
-      let plan = run hostPlan(self, &project, target, dev)
+      let mut plan = run hostPlan(self, &project, target, dev)
+      plan.image = target.id() == "window" && imaged(self, options, dev)
       let mut name = run String.copy(self.named)
       // A generated host is not named like the runtime packages it depends on.
       run name.append(if self.custom == "" { "-host-" } else { "-" })
@@ -940,7 +976,16 @@ impl App {
       }
       let bundled = if self.custom == "" && plan.kind != Kind.Loom && !plan.dev {
         let bundle = run bundle(self, &project)
-        run platform.embed("app_bundle", run bundle.output("bundle/app.js"))
+        let texted = run platform.embed("app_bundle", run bundle.output("bundle/app.js"))
+        if plan.image {
+          // Embedded, the image's bytes are part of the program for as long as it runs,
+          // which is how long the engine reads them.
+          let written = run image(self, &project, options)
+          let withBundle = run texted.embed("app_image", run written.output("app.bin"))
+          run withBundle.embed("core_image", run written.output("core.bin"))
+        } else {
+          move texted
+        }
       } else {
         move platform
       }
@@ -1082,6 +1127,27 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
       app.compiledSheet = move sheet
     }
   }
+  if imaged(&app, options, dev) {
+    // Written before the hosts compile, and said: what a release starts from is not left
+    // to be guessed. The step is cached, so the hosts below embed this same image.
+    run say("compiling the bundle into a bytecode image with the host's engine...")
+    let started = now()
+    let writer = run image(&app, &project, options)
+    let library = writer.copy()
+    let graph = run (run (run Build.make()).addStep(move writer, "app.bin")).addStep(move library, "core.bin")
+    let built = run graph.compile()
+    done("wrote the bytecode images the window host starts from", started)
+    // The two images, then the program that wrote them.
+    let written = built.artifacts.asSlice()
+    let mut at: usize = 0
+    while at < written.length && at < 2 {
+      let path = run Context.text(&written[at].path)
+      listArtifact(relative(String.view(&project.root), path.view()), run sizeOf(path.view()))
+      at = at + 1
+    }
+  } else if bundles && options.target.length() != 0 && app.runsOn != Runtime.Node {
+    run say("no bytecode image: a host built for another target starts from the bundle's text")
+  }
   let graph = run app.graph(options, dev)
   let mut what = String.make()
   let listed = app.places.asSlice()
@@ -1107,10 +1173,12 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   let started = now()
   let built = run graph.compile()
   let mut artifacts = List<Artifact>.make()
+  // One artifact for each target, in order; then the programs the build ran on the way
+  // (the image writer), which are not the app's.
   let outputs = built.artifacts.asSlice()
   let targets = app.places.asSlice()
   let mut at: usize = 0
-  while at < outputs.length {
+  while at < outputs.length && at < targets.length {
     let path = run Context.text(&outputs[at].path)
     let bytes = run sizeOf(path.view())
     let target = targets[at]
