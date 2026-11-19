@@ -18,12 +18,18 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
+import silk.num.u8
+import silk.num.u32
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.filesystem { FileSystem, FileError, Path }
 import silk.system.filesystem_machine { MachineFileSystem }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String, InvalidUtf8 }
+import codec.png
+import codec.png { PngError }
+import codec.image { Image, ImageError }
+import ui_tree.inspect { writeInt }
 
 static if Intrinsic.targetOperatingSystem() == "windows" {
   import silk.platform.windows.host_input { WindowsHostInput }
@@ -148,6 +154,8 @@ const TREE: string = "ui-inspect-headless-test-tree.txt"
 
 const SHOT: string = "ui-inspect-headless-test.png"
 
+const FRAMES: string = "ui-inspect-headless-frames"
+
 effect fn placed(name: string) -> Path
   ! FileError | HostInputError | OutOfMemoryError
   ? &mut Allocator {
@@ -218,7 +226,7 @@ effect fn runCounter(script: string) -> Ran
 }
 
 effect fn headlessBody() -> ()
-  ! AssertionError<'static> | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
+  ! AssertionError<'static> | PngError | ImageError | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
     | GeometryError
     | OutOfMemoryError
   ? &mut Allocator {
@@ -244,10 +252,70 @@ effect fn headlessBody() -> ()
   run FileSystem.removeFile(&(run placed(SCRIPT))) |> Effect.provideMut<FileSystem>(&mut files)
   run FileSystem.removeFile(&(run placed(TREE))) |> Effect.provideMut<FileSystem>(&mut files)
   run FileSystem.removeFile(&place) |> Effect.provideMut<FileSystem>(&mut files)
+
+  // A recording that shows its input: a ring where the pointer went down, the keys at the
+  // bottom. The frames are kept as PNGs, which needs no ffmpeg.
+  let mut recording = run String.copy("record ")
+  run recording.append(FRAMES)
+  run recording.append("/ --show-input\nclick --test-id counter\nwait 100ms\npress Enter\nwait 200ms\nstop\n")
+  let recorded = run runCounter(String.view(&recording))
+  run Testing.expect(recorded.status == 0 && recorded.clicks == 1, "the recorded script ran")
+  let mut ringed = false
+  let mut captioned = false
+  let mut frame: u64 = 1
+  while true {
+    let mut name = run String.copy(FRAMES)
+    run name.append("/")
+    let mut digits = String.make()
+    run writeInt(&mut digits, frame)
+    let mut pad = String.byteLength(String.view(&digits))
+    while pad < 6 {
+      run name.append("0")
+      pad = pad + 1
+    }
+    run name.append(String.view(&digits))
+    run name.append(".png")
+    let read = run Effect.result(FileSystem.readFile(&(run placed(String.view(&name)))))
+      |> Effect.provideMut<FileSystem>(&mut files)
+    let bytes = match move read {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        drop error
+        break
+      }
+    }
+    let image = run png.decode(bytes.asSlice())
+    // The counter is 120 by 40 at the top left: the ring is centred on its middle.
+    if bluish(&image, 60, 20) { ringed = true }
+    // The caption sits at the bottom, in the middle.
+    if dark(&image, 100, 70) { captioned = true }
+    frame = frame + 1
+  }
+  run Testing.expect(frame > 10, "the recording kept its frames")
+  run Testing.expect(ringed, "a frame shows the ring where the click went down")
+  run Testing.expect(captioned, "a frame shows the key pressed")
+  run FileSystem.removeDirectoryRecursively(&(run placed(FRAMES))) |> Effect.provideMut<FileSystem>(&mut files)
+  run FileSystem.removeFile(&(run placed(SCRIPT))) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+fn pixelAt(image: &Image, x: u32, y: u32) -> usize {
+  return u32.toUsize((y * image.width() + x) * 4)
+}
+
+fn bluish(image: &Image, x: u32, y: u32) -> bool {
+  let at = pixelAt(image, x, y)
+  let data = image.data()
+  return u8.toU32(data[at + 2]) > u8.toU32(data[at]) + 20
+}
+
+fn dark(image: &Image, x: u32, y: u32) -> bool {
+  let at = pixelAt(image, x, y)
+  let data = image.data()
+  return u8.toU32(data[at]) < 60 && u8.toU32(data[at + 1]) < 60
 }
 
 test effect fn aHeadlessRunFollowsItsScript() -> ()
-  ! AssertionError<'static> | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
+  ! AssertionError<'static> | PngError | ImageError | FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError
     | GeometryError
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
