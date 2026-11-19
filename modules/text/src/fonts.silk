@@ -35,7 +35,7 @@ import harfrust.lib {
 }
 import read_fonts.lib { FontRef }
 import read_fonts.model.metrics { Metrics, LineBox }
-import font_types.lib { F2Dot14, F48Dot16, Tag }
+import font_types.lib { F2Dot14, F48Dot16, Fixed, Tag }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
@@ -227,6 +227,10 @@ struct Instance {
   settings: Variations,
   coords: List<F2Dot14>,
   unitsPerEm: f32,
+  /// HVAR's region scalars and every glyph's advance at `coords`, worked out by the first shaping
+  /// call at this instance and lent to each later one (empty at the default location).
+  scalars: List<Fixed>,
+  advances: List<F48Dot16>,
 }
 
 /// What a font key stands for: a style, and the face instance drawing it.
@@ -801,6 +805,8 @@ impl<'a> FontState<'a> {
         settings: settings.*,
         coords: move coords,
         unitsPerEm: unitsPerEm,
+        scalars: List<Fixed>.make(),
+        advances: List<F48Dot16>.make(),
       },
     )
     return self.instances.length() - 1
@@ -1044,13 +1050,22 @@ impl<'a> FontState<'a> {
     if slot != 0 {
       let data = &self.data.asSlice()[u32.toUsize(slot) - 1]
       let mut shaper = ConfiguredShaper.new(data)
-      // Through the setter, which also works out HVAR's region scalars once for the call.
-      run shaper.setNormalizedCoords(self.instances.asSlice()[instance].coords.asSlice())
+      run shaper.coords.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let held = &mut self.instances.asMutSlice()[instance]
+      shaper.hvarScalars = Intrinsic.replace(held.scalars, List<Fixed>.make())
+      shaper.hvarAdvances = Intrinsic.replace(held.advances, List<F48Dot16>.make())
+      if held.coords.length() != 0 && shaper.hvarAdvances.length() == 0 {
+        run shaper.setNormalizedCoords(held.coords.asSlice())
+        run shaper.prepareAdvances()
+      }
       let shaped = run shape(
         &shaper,
         &mut self.buffer,
         ShapeOptions.forPlan(&self.plans.asSlice()[plan].plan, wanted.asSlice()),
       )
+      let back = &mut self.instances.asMutSlice()[instance]
+      back.scalars = Intrinsic.replace(shaper.hvarScalars, List<Fixed>.make())
+      back.advances = Intrinsic.replace(shaper.hvarAdvances, List<F48Dot16>.make())
       if let Result<(), ShapeError>.Failure { error: _ } = move shaped {
         return
       }
