@@ -6,6 +6,7 @@ import silk.build.definition {
   Package as PackageSettings
 }
 import silk.build.context as BuildContext
+import silk.build.step { Deferred }
 import silk.schema.schema { Dictionary }
 import silk.cli.task { Task, TaskError }
 import silk.collections.bytes { Bytes }
@@ -300,9 +301,8 @@ pub effect fn build(packagePath: string, release: bool, wasm: bool) -> String
     packages: Dictionary<PackageSettings>.make(),
   }
   run trace("definition", "")
-  let _compiler = run BuildContext.compiler()
-  run trace("compiler", "")
-  let compilation = run Compilation.fromDefinition(move definition, run BuildContext.compiler())
+  let compilation = run Compilation.fromDefinition(move definition, run compiler())
+  run trace("fromDefinition", "")
   run trace("compilation", "")
   let graph = run (run Build.make()).add(move compilation)
   run trace("graph", "")
@@ -340,6 +340,25 @@ effect fn standardLibrary() -> Option<String>
     }
     Option<Bytes>.None => Option<String>.none()
   }
+}
+
+// The compiler that launched this task, as a deferred executable input. silk sets
+// SILK_COMPILER in the portable spelling too, which BuildContext.compiler() rejects on Windows.
+effect fn compiler() -> Deferred<Path>
+  ! BuildError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator | &mut FileSystem {
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SILK_COMPILER") {
+    let bytes = value.asSlice()
+    static if HOST_OS == "windows" {
+      if bytes.length == 0 || bytes[0] != 47 {
+        let native = run WindowsPath.fromNativeBytes(bytes)
+        return run Deferred<Path>.external(Path.view(&native) |> Option<string>.unwrapOr(""))
+      }
+    }
+    let path = run Path.fromBytes(bytes)
+    return run Deferred<Path>.external(Path.view(&path) |> Option<string>.unwrapOr(""))
+  }
+  return run BuildContext.compiler()
 }
 
 pub effect fn nativeTask(arguments: &[string]) -> ()
