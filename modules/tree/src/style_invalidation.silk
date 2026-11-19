@@ -1,10 +1,70 @@
 import svg_css.adopted { StyleSheets }
-import svg_css.sheet { Sheet, Declaration }
-import svg_css.selectors { DependencyKind, Sharing }
+import svg_css.sheet { Sheet, Declaration, ConditionKind, NONE }
+import svg_css.selectors { DependencyKind, Sharing, SubjectKind }
+import svg_css.element { PseudoTarget }
 import svg_css.tokens { equal, insensitive, TokenRange }
 import style_identity { Atoms }
+import node { Node }
+import mutation { StyleState }
+import silk.collections.hash { Hash }
+import silk.collections.hash_set { HashSet }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
 import silk.core.ownership { Copy }
+
+pub struct StartingSubjects { all: bool, classes: HashSet<usize> }
+
+impl StartingSubjects {
+  pub fn make() -> Self { return StartingSubjects { all: true, classes: HashSet<usize>.make(Hash.seed(5413)) } }
+
+  pub effect fn collect(sheets: &StyleSheets, atoms: &mut Atoms) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut result = StartingSubjects.make()
+    let mut index: usize = 0
+    while index < sheets.sheets().length {
+      let sheet = &sheets.sheets()[index].sheet
+      let mut rule: usize = 0
+      while rule < sheet.ruleConditions.length() {
+        let mut condition = sheet.ruleConditions.asSlice()[rule]
+        while condition != NONE && sheet.conditions.asSlice()[condition].kind != ConditionKind.Starting {
+          condition = sheet.conditions.asSlice()[condition].parent
+        }
+        if condition != NONE {
+          let entry = &sheet.resolver.rules()[rule]
+          let mut keys = entry.selectors.subjectKeys()
+          while let Option.Some { value } = keys.next() {
+            if value.target != PseudoTarget.None || value.kind == SubjectKind.Never { continue }
+            if value.kind != SubjectKind.Class { return move result }
+            let atom = run atoms.intern(sheet.buffers.asSlice()[entry.buffer].text(value.text))
+            drop run result.classes.insert(atom)
+          }
+        }
+        rule = rule + 1
+      }
+      index = index + 1
+    }
+    result.all = false
+    return move result
+  }
+
+  pub fn mayMatch(self: &Self, node: &Node) -> bool {
+    if self.all { return true }
+    if let Option.Some { value } = node.identity() {
+      let classes = value.classAtoms.asSlice()
+      let mut index: usize = 0
+      while index < classes.length {
+        if self.classes.contains(classes[index]) { return true }
+        index = index + 1
+      }
+      index = 0
+      while index < value.custom.length() {
+        if value.custom.asSlice()[index].state == StyleState.Starting { return true }
+        index = index + 1
+      }
+    }
+    return false
+  }
+}
 
 /// State bits by how far a change of that state reaches beyond the element itself, and what
 /// else the adopted rules depend on. `has` states are read by a rule with `:has()`: they reach
