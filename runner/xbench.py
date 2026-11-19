@@ -15,7 +15,7 @@ What it measures (PROTOCOL.md has the app side, METRICS.md the definitions):
   frames, and the app's own frame intervals when its clock is real.
 - each idle window ("XB idle-begin"/"XB idle-end"): CPU use, in percent of one core.
 """
-import argparse, datetime, json, os, platform, re, signal, socket, statistics, subprocess, sys, threading, time
+import shutil, argparse, datetime, json, os, platform, re, signal, socket, statistics, subprocess, sys, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from apps import APP_TABLE, XB, MAC  # noqa: E402
@@ -132,11 +132,24 @@ def signal_tree(pids, sig):
 
 # ---------- cold start ----------
 
+def purge_mac():
+    """`sudo purge`: with the password from the file XB_PURGE_SECRET names when set, else `sudo -n`
+    (works when sudoers allows purge without a password). False when neither works."""
+    secret = os.environ.get("XB_PURGE_SECRET")
+    if secret:
+        with open(secret) as f:
+            ok = subprocess.run(["sudo", "-S", "-p", "", "purge"], stdin=f, capture_output=True).returncode == 0
+    else:
+        ok = subprocess.run(["sudo", "-n", "purge"], capture_output=True).returncode == 0
+    time.sleep(1.0)  # let the system settle after purge
+    return ok
+
+
 def evict(paths):
-    """Drops the app's files from the page cache (Linux), so the next launch reads them from disk.
-    macOS has no unprivileged way: `sudo -n purge` if allowed, else the launch is not cold."""
+    """Drops the app's files from the page cache, so the next launch reads them from disk.
+    Linux: posix_fadvise on every file. macOS: `sudo purge` (purge_mac), else the launch is not cold."""
     if MAC:
-        return subprocess.run(["sudo", "-n", "purge"], capture_output=True).returncode == 0
+        return purge_mac()
     files = []
     for root in paths:
         if os.path.isdir(root):
@@ -181,6 +194,8 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
         env.pop(k, None)
     env.update(launch.env)
     if kind == "cold":
+        for d in launch.caches:
+            shutil.rmtree(d, ignore_errors=True)
         cold_ok = evict(list(launch.files) + sorted(extra_files))
     else:
         cold_ok = None
@@ -318,7 +333,13 @@ def machine():
         chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
     else:
         chip = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), platform.machine())
-    return {"host": os.environ.get("XB_MACHINE", name), "os": platform.platform(), "cpu": chip, "cores": os.cpu_count()}
+    info = {"host": os.environ.get("XB_MACHINE", name), "os": platform.platform(), "cpu": chip, "cores": os.cpu_count()}
+    if MAC:
+        # Dark mode costs Silk UI a second layout before its first frame (its early layout assumes
+        # light): record the appearance so start times from the two can be told apart.
+        dark = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"], capture_output=True, text=True).stdout.strip()
+        info["appearance"] = "dark" if dark == "Dark" else "light"
+    return info
 
 
 def versions():
@@ -347,6 +368,8 @@ def main():
     ap.add_argument("--cold", type=int, default=1, help="how many of the first runs start cold")
     ap.add_argument("--timeout", type=float, default=600)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--prime", type=int, default=1 if MAC else 0,
+                    help="discarded launches per app before measuring (macOS checks a newly built binary on its first launch, about 950 ms)")
     ap.add_argument("--label", default="", help="free text stored with every record (what changed)")
     a = ap.parse_args()
     apps = [x for x in a.apps.split(",") if x]
@@ -364,6 +387,12 @@ def main():
         extra = {k: set(v) for k, v in json.load(open(cache)).items()}
     except Exception:
         extra = {}
+    if MAC and a.suite == "gpu":
+        # Keep the display awake for the whole series.
+        subprocess.Popen(["caffeinate", "-dimsu", "-w", str(os.getpid())])
+    for app in apps:
+        for _ in range(a.prime):
+            run_once(app, scenes[0], a.suite, a.uncapped or a.suite == "cpu", "warm", a.timeout, True, set())
     for scene in scenes:
         for r in range(a.runs):
             # Interleaved: every app once per round, so drift (thermal, other load) hits all alike.

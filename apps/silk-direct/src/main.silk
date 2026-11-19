@@ -210,7 +210,7 @@ impl Build {
   }
 
   /// Inline text with its marks (*bold*, _italic_, `code`, [link]) into `parent`.
-  effect fn inline(self: &mut Self, tree: &mut UiTree<'_>, parent: u32, value: string<'static>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+  effect fn inline(self: &mut Self, tree: &mut UiTree<'_>, parent: u32, value: string) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
     let bytes = String.utf8Bytes(value)
     let mut plain: usize = 0
     let mut at: usize = 0
@@ -261,6 +261,52 @@ impl Build {
     run self.close(&mut tree, parent, node)
   }
 
+  /// An item's header row from its `#` line, last in `item`.
+  effect fn head(self: &mut Self, tree: &mut UiTree<'_>, item: u32, line: string<'static>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let head = run self.open(&mut tree, NodeKind.Box, "head")
+    let author = field(String.slice(line, 1, String.byteLength(line) - 1), 1)
+    let mut avatar = run String.copy("avatar c")
+    run appendNumber(&mut avatar, hash(author) % 8)
+    let mut initials = String.make()
+    let a = String.utf8Bytes(author)
+    run initials.append(String.slice(author, 0, 1))
+    let mut s = a.length
+    while s > 0 && a[s - 1] != 32 {
+      s = s - 1
+    }
+    run initials.append(String.slice(author, s, 1))
+    drop run self.label(&mut tree, head, String.view(&avatar), String.view(&initials))
+    let who = run self.open(&mut tree, NodeKind.Box, "who")
+    drop run self.label(&mut tree, who, "name", author)
+    drop run self.label(&mut tree, who, "time", field(line, 2))
+    run self.close(&mut tree, head, who)
+    let tags = run self.open(&mut tree, NodeKind.Box, "tags")
+    let mut each = String.split(field(line, 3), ",")
+    while true {
+      match each.next() {
+        Option.Some { value } => { drop run self.label(&mut tree, tags, "tag", value) }
+        Option.None => { break }
+      }
+    }
+    run self.close(&mut tree, head, tags)
+    run self.close(&mut tree, item, head)
+  }
+
+  /// An item's footer from its counts (`replies,likes`), last in `item`. Returns its box.
+  effect fn foot(self: &mut Self, tree: &mut UiTree<'_>, item: u32, counts: string) -> u32 ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let row = run self.open(&mut tree, NodeKind.Box, "foot")
+    let mut split = String.split(counts, ",")
+    let mut reply = run String.copy("Reply ")
+    run reply.append(split.next() |> Option<string>.unwrapOr("0"))
+    let mut like = run String.copy("Like ")
+    run like.append(split.next() |> Option<string>.unwrapOr("0"))
+    drop run self.label(&mut tree, row, "act", String.view(&reply))
+    drop run self.label(&mut tree, row, "act", String.view(&like))
+    drop run self.label(&mut tree, row, "act", "Share")
+    run self.close(&mut tree, item, row)
+    return row
+  }
+
   /// Item `lines` (one item of the corpus) as the scenes show it, last in `parent`. Returns the
   /// item's box and its last paragraph's box.
   effect fn item(self: &mut Self, tree: &mut UiTree<'_>, parent: u32, lines: string<'static>) -> u32 ! TreeError | OutOfMemoryError ? &mut Allocator {
@@ -295,33 +341,7 @@ impl Build {
         table = 0
       }
       if kind == 35 {
-        let head = run self.open(&mut tree, NodeKind.Box, "head")
-        let author = field(String.slice(line, 1, bytes.length - 1), 1)
-        let mut avatar = run String.copy("avatar c")
-        run appendNumber(&mut avatar, hash(author) % 8)
-        let mut initials = String.make()
-        let a = String.utf8Bytes(author)
-        run initials.append(String.slice(author, 0, 1))
-        let mut s = a.length
-        while s > 0 && a[s - 1] != 32 {
-          s = s - 1
-        }
-        run initials.append(String.slice(author, s, 1))
-        drop run self.label(&mut tree, head, String.view(&avatar), String.view(&initials))
-        let who = run self.open(&mut tree, NodeKind.Box, "who")
-        drop run self.label(&mut tree, who, "name", author)
-        drop run self.label(&mut tree, who, "time", field(line, 2))
-        run self.close(&mut tree, head, who)
-        let tags = run self.open(&mut tree, NodeKind.Box, "tags")
-        let mut each = String.split(field(line, 3), ",")
-        while true {
-          match each.next() {
-            Option.Some { value } => { drop run self.label(&mut tree, tags, "tag", value) }
-            Option.None => { break }
-          }
-        }
-        run self.close(&mut tree, head, tags)
-        run self.close(&mut tree, item, head)
+        run self.head(&mut tree, item, line)
         run foot.append(field(line, 4))
         continue
       }
@@ -331,7 +351,9 @@ impl Build {
         run self.inline(&mut tree, p, rest)
         run self.close(&mut tree, item, p)
       } else if kind == 72 {
-        drop run self.label(&mut tree, item, "h", rest)
+        let h = run self.open(&mut tree, NodeKind.Box, "h")
+        run self.inline(&mut tree, h, rest)
+        run self.close(&mut tree, item, h)
       } else if kind == 76 {
         if list == 0 {
           list = run self.open(&mut tree, NodeKind.Box, "ul")
@@ -389,16 +411,7 @@ impl Build {
     if table != 0 {
       run self.close(&mut tree, item, table)
     }
-    let row = run self.open(&mut tree, NodeKind.Box, "foot")
-    let mut counts = String.split(String.view(&foot), ",")
-    let mut reply = run String.copy("Reply ")
-    run reply.append(counts.next() |> Option<string>.unwrapOr("0"))
-    let mut like = run String.copy("Like ")
-    run like.append(counts.next() |> Option<string>.unwrapOr("0"))
-    drop run self.label(&mut tree, row, "act", String.view(&reply))
-    drop run self.label(&mut tree, row, "act", String.view(&like))
-    drop run self.label(&mut tree, row, "act", "Share")
-    run self.close(&mut tree, item, row)
+    drop run self.foot(&mut tree, item, String.view(&foot))
     run self.close(&mut tree, parent, item)
     return item
   }
@@ -434,6 +447,7 @@ struct Scene {
   paragraph: String,
   body: u32,
   writing: u32,
+  footer: u32,
   // churn: the items now in the feed
   shown: List<u32>,
   // the script
@@ -535,7 +549,7 @@ impl Scene {
       kind: kind, size: size, corpus: run Corpus.make(), build: Build { next: 1, pictures: [0; 4] },
       scroller: 0, content: 0, viewHeight: 0.0, contentHeight: 0.0,
       cellBoxes: List<u32>.make(), cellTexts: List<u32>.make(),
-      words: List<string<'static>>.make(), nextWord: 0, written: 0, made: 0, paragraph: String.make(), body: 0, writing: 0,
+      words: List<string<'static>>.make(), nextWord: 0, written: 0, made: 0, paragraph: String.make(), body: 0, writing: 0, footer: 0,
       shown: List<u32>.make(),
       step: 0, stepFrame: 0, stepStart: 0.0, frames: 0, lastTime: -1.0, top: 0.0, swept: false, times: List<f64>.make(),
       started: false, painted: false, windowless: windowless, done: false,
@@ -729,43 +743,23 @@ impl Scene {
   }
 
   /// One frame of the stream: three more words; a new paragraph every 60, a new item every 240.
+  /// The paragraph being written is made again each frame with its marks (as React renders
+  /// `spans(paragraph)`), before the item's footer.
   effect fn stream(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
     let b = &mut self.build
     if self.written % 240 == 0 {
-      // A new item: the next author's header, an empty body for its paragraphs.
-      let lines = self.corpus.item((self.size + self.made) % self.corpus.count())
-      let header = match String.split(lines, "\n").next() { Option.Some { value } => value Option.None => "" }
+      // A new item: the next author's header and footer, no blocks yet.
+      let header = match String.split(self.corpus.item(self.size + self.made % 50), "\n").next() { Option.Some { value } => value Option.None => "" }
       let item = run b.open(&mut tree, NodeKind.Box, "item")
-      let mut owned = run String.copy(header)
-      run owned.append("\n")
-      drop owned
-      // The header row as `item` makes it, without the item's blocks.
-      let head = run b.open(&mut tree, NodeKind.Box, "head")
-      let author = field(String.slice(header, 1, String.byteLength(header) - 1), 1)
-      let mut avatar = run String.copy("avatar c")
-      run appendNumber(&mut avatar, hash(author) % 8)
-      let a = String.utf8Bytes(author)
-      let mut s = a.length
-      while s > 0 && a[s - 1] != 32 {
-        s = s - 1
-      }
-      let mut initials = run String.copy(String.slice(author, 0, 1))
-      run initials.append(String.slice(author, s, 1))
-      drop run b.label(&mut tree, head, String.view(&avatar), String.view(&initials))
-      let who = run b.open(&mut tree, NodeKind.Box, "who")
-      drop run b.label(&mut tree, who, "name", author)
-      drop run b.label(&mut tree, who, "time", field(header, 2))
-      run b.close(&mut tree, head, who)
-      run b.close(&mut tree, item, head)
+      run b.head(&mut tree, item, header)
+      self.footer = run b.foot(&mut tree, item, field(header, 4))
       run b.close(&mut tree, self.content, item)
       self.body = item
       self.made = self.made + 1
     }
     if self.written % 60 == 0 {
       self.paragraph.clear()
-      let p = run b.open(&mut tree, NodeKind.Box, "p")
-      self.writing = run b.text(&mut tree, p, "")
-      run b.close(&mut tree, self.body, p)
+      self.writing = 0
     }
     let mut k: u32 = 0
     while k < 3 {
@@ -778,7 +772,13 @@ impl Scene {
       k = k + 1
     }
     self.written = self.written + 3
-    run b.emit(&mut tree, Mutation.SetText { id: self.writing, value: run String.copy(String.view(&self.paragraph)) })
+    if self.writing != 0 {
+      run b.emit(&mut tree, Mutation.Destroy { id: self.writing })
+    }
+    let p = run b.open(&mut tree, NodeKind.Box, "p")
+    run b.inline(&mut tree, p, String.view(&self.paragraph))
+    run b.emit(&mut tree, Mutation.InsertBefore { parent: self.body, child: p, before: Option<u32>.Some { value: self.footer } })
+    self.writing = p
     run b.emit(&mut tree, Mutation.ScrollTo { id: self.scroller, x: 0.0, y: 100000000.0 })
   }
 

@@ -26,6 +26,18 @@ class Launch:
     # The app's own per-frame timestamps follow a fake clock (Silk's windowless bench advances
     # 1/120 s a frame): only the runner's wall clock times its frames.
     fake_clock: bool = False
+    # Directories deleted before a cold start: the app's GPU, shader and code caches, so a cold
+    # launch rebuilds its pipelines the way a first launch does.
+    caches: list = field(default_factory=list)
+
+
+HOME = os.path.expanduser("~")
+SILK_GPU_CACHE = (os.path.join(HOME, "Library/Caches/silk-ui/gpu") if MAC
+                  else os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "silk-ui/gpu"))
+ELECTRON_USER_DATA = (os.path.join(HOME, "Library/Application Support/xbench-electron") if MAC
+                      else os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "xbench-electron"))
+ELECTRON_CACHES = [os.path.join(ELECTRON_USER_DATA, d) for d in
+                   ("GPUCache", "Code Cache", "DawnGraphiteCache", "DawnWebGPUCache", "GrShaderCache", "ShaderCache", "Cache")]
 
 
 def silk_build(name, scene):
@@ -42,7 +54,7 @@ def silk_launch(name, scene, suite, uncapped):
         env = {"SILK_UI_HEADLESS": "1", "SILK_UI_BENCH": "1000000"}
         return Launch([binary, scene], env, cwd=os.path.dirname(binary), files=[os.path.dirname(binary)], fake_clock=True)
     env = {"SILK_UI_UNCAPPED": "1"} if uncapped else {}
-    return Launch([binary, scene], env, cwd=os.path.dirname(binary), files=[os.path.dirname(binary)])
+    return Launch([binary, scene], env, cwd=os.path.dirname(binary), files=[os.path.dirname(binary)], caches=[SILK_GPU_CACHE])
 
 
 def electron(scene, suite, uncapped):
@@ -63,7 +75,7 @@ def electron(scene, suite, uncapped):
     if not MAC:
         cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x800x24"] + cmd
     files = [os.path.dirname(exe), os.path.join(APPS, "react", "web", "dist-web", scene)]
-    return Launch(cmd, env, cwd=base, files=files)
+    return Launch(cmd, env, cwd=base, files=files, caches=ELECTRON_CACHES)
 
 
 def rust(name, binary):
@@ -75,7 +87,9 @@ def rust(name, binary):
         cmd = [exe, scene]
         if suite == "gpu" and not MAC:
             cmd = ["xvfb-run", "-a", "-s", "-screen 0 1280x800x24"] + cmd
-        return Launch(cmd, env, cwd=os.path.join(APPS, name), files=[exe])
+        # The cpu suite runs frames back to back on a clock that moves 1/120 s a frame, as Silk
+        # UI's windowless bench does: only the runner's wall clock times its frames.
+        return Launch(cmd, env, cwd=os.path.join(APPS, name), files=[exe], fake_clock=suite == "cpu")
     return launch
 
 

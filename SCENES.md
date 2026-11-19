@@ -1,0 +1,41 @@
+# Scenes
+
+Four scenes, one window of 1040 x 720 CSS px, the same content in every app. The content is
+`content/corpus.txt` (3,000 items, made by `content/gen.py` with a fixed seed): each item is an
+author header (avatar, name, time, tags), then a mix of blocks, then a footer of three buttons.
+The blocks are paragraphs with inline marks (bold, italic, code, link), headings, bullet lists,
+code blocks, tables of 3 or 4 columns, quotes, and pictures with captions (four PNGs at twice
+their CSS size). The style is `style/bench.css`: plain CSS, no hover, no transitions, no shadows.
+
+Every scene is a script of steps (apps/react/web/src/App.tsx is the reference; the Silk and Rust
+apps follow it step for step):
+
+- **idle N**: no input, no frames requested, for N ms. The runner reads CPU use over it.
+- **mark NAME**: the app holds still for 400 ms; the runner stops the process tree and reads its
+  memory.
+- **driver NAME**: one change per frame for a number of frames (or until the driver is done).
+  The runner reads wall time and CPU time over it; the app reports its frame intervals.
+
+| Scene | What is on screen | Script | What it is for |
+| --- | --- | --- | --- |
+| `feed` (feed-1000) | 1,000 items in one scroller, about 61,000 nodes, a screen of them visible | idle 3 s, mark `loaded`, `scroll` (600 frames of 24 px), `sweep` (720 px a frame to the end, then back to the top), idle 3 s, mark `swept` | Many elements, few visible. Cold layout of a long document, scrolling cost with a mostly offscreen tree, memory after every part has been on screen once (glyphs, pictures, paint caches): `swept` minus `loaded` |
+| `wall` | 544 cells of a 16-column grid plus 24 notes, everything visible at once | idle 3 s, mark `loaded`, `update` (600 frames, 32 cells change text and colour each frame), `pan` (600 frames, 1 px a frame down 300 px and back), mark `end` | Many elements, all visible. Per-frame cost when the visible content itself changes, and when the whole screen moves |
+| `stream` (stream-300) | 300 items, then a reply that grows | idle 3 s, mark `loaded`, `stream` (900 frames: 3 words a frame, a new paragraph every 60 words, a new item every 240, pinned to the end), idle 3 s, mark `streamed` | Growth: text appended at the end of a long document, re-laid out and scrolled to every frame (the chat case) |
+| `churn` (churn-1000) | an empty feed, then 1,000 items added 25 a frame, then cleared; three times, with other items each time | idle 1 s, mark `base`; three times: `grow-k` (40 frames), idle 1 s, mark `full-k`, `clear-k` (1 frame), idle 1.5 s, mark `empty-k` | Memory growth and eviction: `full-k` against `base`, `empty-k` against `base` (what is not given back), and whether `empty-3` creeps above `empty-1` (a leak) |
+
+A size after a dash changes the item count: `feed-3000`, `stream-1000`, `churn-2000`.
+
+Idle memory is the mark after each idle (`loaded`, `swept`, `streamed`, `base`, `empty-k`).
+
+## Nothing is virtualized
+
+Every app keeps every item in its tree. A list that only builds the visible rows would win every
+scene, and that is a property of the app, not of the framework. The scenes ask what a framework
+costs when the app does not do that work.
+
+## Parity
+
+The Silk apps report the tree's node and fragment counts (`silk_first_frame` in the results); on
+`feed` React, Loom and direct all have 61,176 nodes and 67,425 to 67,456 fragments. The Rust apps
+build the same structure in their own elements (LOG.md lists where they cannot). Screenshots for
+checking by eye: `tools/shots.sh` (Electron writes one at first paint with `XB_SHOT=<png>`).
