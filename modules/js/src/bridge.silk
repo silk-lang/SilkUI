@@ -51,6 +51,7 @@ import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
 import silkjs.js_heap { CellRef }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
@@ -278,6 +279,10 @@ pub const MODULE_LOAD: u32 = 100
 pub struct ModuleSource {
   pub name: List<u8>,
   pub source: List<u8>,
+  /// `source` compiled into a bytecode image when the program was built
+  /// (`JsHost.defineImaged`), or empty: the first import starts from it when this engine
+  /// build wrote it.
+  pub image: &'static [u8],
 }
 
 /// A timer JavaScript asked for: `__ui.fire(id)` is due at `due`, in the host clock's
@@ -1329,6 +1334,16 @@ impl EngineServices for Bridge {
     callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: ValueRef<'v>) -> CellRef<ModuleDef> ! OutOfMemoryError | JsException ? &mut Allocator {
     let source = match engine.services.find(name) {
       Option<usize>.Some { value: index } => {
+        // Compiled when the program was built: nothing is parsed. The image is part of the
+        // program, so the engine can read it for as long as the realm lives.
+        let compiledImage = engine.services.modules.asSlice()[index].image
+        if compiledImage.length != 0 && image.loadable(compiledImage) {
+          let loaded = run unsafe image.load(&mut engine, realm, Pointer.fromRef<u8>(&compiledImage[0]), compiledImage.length)
+          return match loaded.view() {
+            ValueBits.Module { reference } => unsafe CellRef<ModuleDef>.of(reference)
+            _ => Intrinsic.trap("the module image held something else")
+          }
+        }
         let mut copy = List<u8>.make()
         run copy.appendSlice(engine.services.modules.asSlice()[index].source.asSlice())
         move copy
