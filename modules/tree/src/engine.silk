@@ -96,7 +96,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach, Extent }
+import style_invalidation { Reach, Extent, StartingSubjects }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
 import svg_css.element { PseudoTarget, StateBits, ElementTree }
@@ -131,7 +131,7 @@ import node {
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
+import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState }
 import provider { Provider }
@@ -1704,27 +1704,11 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut mutations = move batch
-    let mut reversed = List<Mutation>.make()
-    while true {
-      match mutations.pop() {
-        Option<Mutation>.Some { value } => {
-          run reversed.append(move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
-    }
+    let entries = mutations.asMutSlice()
     let mut index: usize = 0
-    while true {
-      match reversed.pop() {
-        Option<Mutation>.Some { value } => {
-          run self.applyOne(index, move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
+    while index < entries.length {
+      let value = Intrinsic.replace(entries[index], Mutation.Blur)
+      run self.applyOne(index, move value)
       index = index + 1
     }
   }
@@ -4713,7 +4697,9 @@ impl<'a> UiTree<'a> {
       return ()
     }
     let reads = self.styleSheets.asSlice()[at].reads
-    if !self.styleSheets.asSlice()[at].hasStarting {
+    let sheets = &self.styleSheets.asSlice()[at]
+    let sheetStarting = sheets.hasStarting && (self.overrides.length() != 0 || sheets.startingSubjects.mayMatch(self.node(slot)))
+    if !sheetStarting {
       let twin = style_share.twin(&self, slot, reads, self.styleSheets.asSlice()[at].sharing)
       if twin != NONE {
         let shared = match &self.node(twin).resolvedSheet {
@@ -4741,7 +4727,7 @@ impl<'a> UiTree<'a> {
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
-    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, entries[at].hasStarting, &self, slot, &mut stops))
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, sheetStarting, &self, slot, &mut stops))
     self.easingStops = move stops
     self.styleSheets = move roots
     match move resolved {
@@ -5061,6 +5047,9 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
+        roots[sheetIndex].startingSubjects = if roots[sheetIndex].hasStarting {
+          run StartingSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
+        } else { StartingSubjects.make() }
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
@@ -6192,23 +6181,10 @@ impl<'a> UiTree<'a> {
       && self.fragmentInk.length() == count && self.fragmentStacking.covers(count) {
       return ()
     }
-    run hashFragments(
-      &self.seed,
-      &self.output,
-      &self.slotOfCss,
-      &self.layout,
-      &self.nodes,
-      &mut self.fragmentHashes,
-    )
-    run inkFragments(
-      &self.output,
-      &self.slotOfCss,
-      &self.layout,
-      &self.nodes,
-      self.input.width,
-      self.input.height,
-      &mut self.fragmentInk,
-      &mut self.fragmentScrollers,
+    run cacheFragments(
+      &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+      self.input.width, self.input.height,
+      &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
     )
     run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
     run foldLiftedRoots(

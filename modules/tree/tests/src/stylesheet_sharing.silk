@@ -1,12 +1,13 @@
 //! Rows that match through `+`, `~`, an index or `:has()` still hold the right styles when
 //! equal rows take each other's match, and keep them through inserts, removals and changes.
-import ui_tree.legacy { Mutation, UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.legacy { Mutation, UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, StyleState }
 import font_collection.lib { FontCollection }
 import svg_css.compile { Options, CompileError }
 import svg_css.compile
 import svg_css.tokens { CssError }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
@@ -266,4 +267,36 @@ test effect fn cellsShareMatchesAcrossRows() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run cousinRules() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn startingSubjects() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let mut id: u32 = 2
+  while id <= 65 {
+    run box(&mut batch, id, 1, 0, if id == 65 { "row enter:w" } else { "row" })
+    id = id + 1
+  }
+  run box(&mut batch, 66, 1, 0, "custom")
+  run batch.customProperty(66, StyleState.Starting, "--w", Option<string>.some("7px"), false)
+  let sheet = run compile.compile(b".row{width:25px}.custom{width:var(--w,25px)}.custom,.enter\\:w{transition:width 1s linear}@media(width>600px){@starting-style{.unused,.row + .enter\\:w{width:5px}}}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame(0.0))
+  run Testing.expect(wide(&tree, 2) && wide(&tree, 64) && tree.node(tree.slotOf(65)).computed.layout.width.value == 5.0, "only the eligible row enters at its starting width")
+  run Testing.expect(shared(&tree, 2, 64), "an unrelated starting rule does not prevent equal rows from sharing their match")
+  run Testing.expect(tree.node(tree.slotOf(66)).computed.layout.width.value == 7.0, "an inline starting variable still feeds the starting cascade")
+  run tree.frame(frame(1.0))
+  run Testing.expect(wide(&tree, 65) && wide(&tree, 66), "both entry transitions finish at the normal width")
+}
+
+test effect fn startingRulesOnlyIsolateCandidateRows() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run startingSubjects() |> Effect.provideMut<Allocator>(&mut allocator)
 }

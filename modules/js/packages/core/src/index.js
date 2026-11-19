@@ -383,6 +383,7 @@ export class Node {
   #scroll = null;
   #watching = false;
   #attributes = null;
+  #className = null;
   #classList = null;
 
   constructor(kind) {
@@ -512,9 +513,9 @@ export class Node {
 
   getAttribute(name) {
     name = String(name);
+    if (name === "className" || name === "class") return this.#className;
     const aria = ariaName(name);
-    name = aria === null ? name === "className" ? "class" : name : "aria-" + aria;
-    return this.#attributes?.get(name) ?? null;
+    return this.#attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
@@ -522,9 +523,14 @@ export class Node {
 
   setAttribute(name, value) {
     name = String(name);
-    const aria = ariaName(name);
-    name = aria === null ? name === "className" ? "class" : name : "aria-" + aria;
     const text = value == null ? null : String(value);
+    if (name === "className" || name === "class") {
+      native.attribute(this.nodeId, "class", text);
+      this.#className = text;
+      return;
+    }
+    const aria = ariaName(name);
+    if (aria !== null) name = "aria-" + aria;
     if (name === "role") {
       if (!native.attribute(this.nodeId, "role", text ?? "")) warnOnce("the tree has no role '" + text + "': it is ignored");
     } else if (name === "id") {
@@ -543,7 +549,7 @@ export class Node {
         this.#want(KIND_OF.get("click"));
       }
       native.attribute(this.nodeId, name,
-        name === "class" || name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
+        name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
     }
     if (text === null) this.#attributes?.delete(name);
     else (this.#attributes ??= new Map()).set(name, text);

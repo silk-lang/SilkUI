@@ -1512,8 +1512,7 @@ fn unite(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
 /// overhanging glyphs, and a shadow its offset, spread and twice its blur.
 fn ownInk(
   output: &LayoutTree,
-  slots: &List<u32>,
-  css: &Tree,
+  slot: u32,
   nodes: &List<Node>,
   index: usize,
 ) -> Rect<f32> {
@@ -1521,9 +1520,8 @@ fn ownInk(
   let box = borderBox(&f)
   if f.kind == FragmentKind.Text {
     let mut reach = f32.max(f.size.height, 16.0)
-    let owner = styleSlot(slots, css, nodes, f.source)
-    if owner != NONE {
-      let from = nodes.asSlice()[u32.toUsize(owner)].computed.effects.shadowFrom
+    if slot != NONE {
+      let from = nodes.asSlice()[u32.toUsize(slot)].computed.effects.shadowFrom
       if from != NONE && u32.toUsize(from) < nodes.length() {
         if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(from)].paintEffects() {
           reach = reach + paint_effects.shadowReach(value.shadows.asSlice())
@@ -1532,7 +1530,6 @@ fn ownInk(
     }
     return grow(box, reach)
   }
-  let slot = styleSlot(slots, css, nodes, f.source)
   if slot == NONE {
     return grow(box, 2.0)
   }
@@ -1540,7 +1537,7 @@ fn ownInk(
   if node.kind == NodeKind.Canvas {
     return unboundedInk()
   }
-  let c = node.computed
+  let c = &node.computed
   let mut reach: f32 = 2.0
   if c.paint.hasShadow && !c.paint.shadow.inset {
     let offset = f32.max(f32.abs(c.paint.shadow.offsetX), f32.abs(c.paint.shadow.offsetY))
@@ -1580,81 +1577,89 @@ pub effect fn inkFragments(
   let mut index = count
   while index > 0 {
     index = index - 1
-    let f = &output.fragments.values.asSlice()[index]
-    let own = ownInk(output, slots, css, nodes, index)
-    let below = out.get(index)
-    let mut clips = false
-    let mut clippedBelow = below
-    let mut sticky = false
-    if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
-      let slot = slotIn(slots, f.source)
-      if slot != NONE {
-        let c = &nodes.asSlice()[u32.toUsize(slot)].computed
-        clips = f.kind == FragmentKind.Box && c.clips()
-        if clips {
-          let clip = overflowClip(c, f)
-          clippedBelow = Rect<f32>.new(
-            f32.max(below.xMin, clip.xMin),
-            f32.max(below.yMin, clip.yMin),
-            f32.min(below.xMax, clip.xMax),
-            f32.min(below.yMax, clip.yMax),
-          )
-        }
-        sticky = c.layout.position == Position.Sticky
-        if f.kind == FragmentKind.Box && layers.scroller(c) {
-          scrollers.set(index, true)
-        }
-      }
-    }
-    let mut total = if clippedBelow.xMax > clippedBelow.xMin
-      && clippedBelow.yMax > clippedBelow.yMin {
-      unite(own, clippedBelow)
-    } else {
-      own
-    }
-    match layers.flatOf(output, slots, nodes, index) {
-      Option.Some { value } => {
-        total = transform.mapRect(&value, total)
-      }
-      Option.None => {}
-    }
-    if sticky {
-      if let Option<Sticky>.Some { value } = layers.stickyOf(
-        output,
-        slots,
-        css,
-        nodes,
-        index,
-        width,
-        height,
-      ) {
-        let reach = value.reach()
-        total = Rect<f32>.new(
-          total.xMin + reach.xMin,
-          total.yMin + reach.yMin,
-          total.xMax + reach.xMax,
-          total.yMax + reach.yMax,
+    let owner = styleSlot(slots, css, nodes, output.fragments.values.asSlice()[index].source)
+    foldInkAt(output, slots, css, nodes, width, height, &mut out, &mut scrollers, index, owner)
+  }
+}
+
+fn foldInkAt(
+  output: &LayoutTree, slots: &List<u32>, css: &Tree, nodes: &List<Node>, width: f32, height: f32,
+  out: &mut List<Rect<f32>>, scrollers: &mut List<bool>, index: usize, owner: u32,
+) -> () {
+  let f = &output.fragments.values.asSlice()[index]
+  let own = ownInk(output, owner, nodes, index)
+  let below = out.get(index)
+  let mut clips = false
+  let mut clippedBelow = below
+  let mut sticky = false
+  if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
+    let slot = slotIn(slots, f.source)
+    if slot != NONE {
+      let c = &nodes.asSlice()[u32.toUsize(slot)].computed
+      clips = f.kind == FragmentKind.Box && c.clips()
+      if clips {
+        let clip = overflowClip(c, f)
+        clippedBelow = Rect<f32>.new(
+          f32.max(below.xMin, clip.xMin),
+          f32.max(below.yMin, clip.yMin),
+          f32.min(below.xMax, clip.xMax),
+          f32.min(below.yMax, clip.yMax),
         )
       }
+      sticky = c.layout.position == Position.Sticky
+      if f.kind == FragmentKind.Box && layers.scroller(c) {
+        scrollers.set(index, true)
+      }
     }
-    if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
-      let slot = slotIn(slots, f.source)
-      if slot != NONE {
-        if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
-          if value.filters.length() != 0 {
-            total = grow(total, paint_effects.filterReach(value))
-          }
+  }
+  let mut total = if clippedBelow.xMax > clippedBelow.xMin
+    && clippedBelow.yMax > clippedBelow.yMin {
+    unite(own, clippedBelow)
+  } else {
+    own
+  }
+  match layers.flatOf(output, slots, nodes, index) {
+    Option.Some { value } => {
+      total = transform.mapRect(&value, total)
+    }
+    Option.None => {}
+  }
+  if sticky {
+    if let Option<Sticky>.Some { value } = layers.stickyOf(
+      output,
+      slots,
+      css,
+      nodes,
+      index,
+      width,
+      height,
+    ) {
+      let reach = value.reach()
+      total = Rect<f32>.new(
+        total.xMin + reach.xMin,
+        total.yMin + reach.yMin,
+        total.xMax + reach.xMax,
+        total.yMax + reach.yMax,
+      )
+    }
+  }
+  if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
+    let slot = slotIn(slots, f.source)
+    if slot != NONE {
+      if let Option<&Effects>.Some { value } = nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
+        if value.filters.length() != 0 {
+          total = grow(total, paint_effects.filterReach(value))
         }
       }
     }
-    out.set(index, total)
-    let parent = f.parent
-    if parent != NO_INDEX {
-      let above = out.get(parent)
-      out.set(parent, unite(above, total))
-      if scrollers.get(index) {
-        scrollers.set(parent, true)
-      }
+  }
+  out.set(index, total)
+  let parent = f.parent
+  if parent != NO_INDEX {
+    let above = out.get(parent)
+    out.set(parent, unite(above, total))
+    if scrollers.get(index) {
+      scrollers.set(parent, true)
     }
   }
 }
@@ -1670,30 +1675,23 @@ pub effect fn foldLiftedRoots(
   ! OutOfMemoryError
   ? &mut Allocator {
   let count = hashes.length()
-  let mut lifted = List<usize>.make()
-  let mut index: usize = 0
-  while index < count {
-    if stacking.rootContext(index) != NO_INDEX {
-      run lifted.append(index)
-    }
-    index = index + 1
-  }
-  if lifted.length() == 0 {
+  let lifted = stacking.lifted.asSlice()
+  if lifted.length == 0 {
     return ()
   }
   // Read every subtree before folding any, since lifted roots can nest.
   let mut ownHashes = List<u64>.make()
   let mut ownInks = List<Rect<f32>>.make()
   let mut i: usize = 0
-  while i < lifted.length() {
-    run ownHashes.append(hashes.get(lifted.get(i)))
-    run ownInks.append(ink.get(lifted.get(i)))
+  while i < lifted.length {
+    run ownHashes.append(hashes.get(lifted[i].fragment))
+    run ownInks.append(ink.get(lifted[i].fragment))
     i = i + 1
   }
   i = 0
-  while i < lifted.length() {
-    let root = lifted.get(i)
-    let mut at = stacking.rootContext(root)
+  while i < lifted.length {
+    let root = lifted[i].fragment
+    let mut at = lifted[i].context
     let mut steps: usize = 0
     while at != NO_INDEX && at < count && steps < count {
       let hash = Hash.combine(hashes.get(at), ownHashes.get(i))
@@ -1782,7 +1780,8 @@ pub effect fn paintFragment(p: &mut Painter<'_, '_>, index: usize, mask: Content
 /// transform: `p.ink` holds it mapped.
 fn localInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
   let values = p.output.fragments.values.asSlice()
-  let mut total = ownInk(p.output, p.slotOfCss, p.css, &p.nodes.*, index)
+  let owner = styleSlot(p.slotOfCss, p.css, &p.nodes.*, values[index].source)
+  let mut total = ownInk(p.output, owner, &p.nodes.*, index)
   let mut below = Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK)
   let mut child = values[index].firstChild
   while child != NO_INDEX {
@@ -2451,8 +2450,7 @@ fn kindIndex(kind: FragmentKind) -> u64 {
 fn ownHash(
   seed: &HashSeed,
   output: &LayoutTree,
-  slots: &List<u32>,
-  css: &Tree,
+  slot: u32,
   nodes: &List<Node>,
   index: usize,
 ) -> u64 {
@@ -2492,7 +2490,6 @@ fn ownHash(
     h = Hash.combine(h, usize.toU64(t.sourceEnd))
     h = Hash.combine(h, u8.toU64(t.bidiLevel))
   }
-  let slot = styleSlot(slots, css, nodes, f.source)
   if slot != NONE {
     let node = &nodes.asSlice()[u32.toUsize(slot)]
     h = selection.hash(node, Hash.combine(h, node.paintHash))
@@ -2524,23 +2521,53 @@ pub effect fn hashFragments(
   let mut index = count
   while index > 0 {
     index = index - 1
-    let own = ownHash(seed, output, slots, css, nodes, index)
-    let below = out.get(index)
-    let combined = Hash.combine(own, below)
-    out.set(index, combined)
-    let f = output.fragments.values.asSlice()[index]
-    let mut placed = combined
-    if f.kind == FragmentKind.Box {
-      let slot = slotIn(slots, f.source)
-      if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed.transform.any() {
-        placed = transform.placementHash(&nodes.asSlice()[u32.toUsize(slot)].computed.transform, combined)
-      }
+    let owner = styleSlot(slots, css, nodes, output.fragments.values.asSlice()[index].source)
+    foldHashAt(seed, output, slots, nodes, &mut out, index, owner)
+  }
+}
+
+fn foldHashAt(
+  seed: &HashSeed, output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>,
+  out: &mut List<u64>, index: usize, owner: u32,
+) -> () {
+  let own = ownHash(seed, output, owner, nodes, index)
+  let below = out.get(index)
+  let combined = Hash.combine(own, below)
+  out.set(index, combined)
+  let f = output.fragments.values.asSlice()[index]
+  let mut placed = combined
+  if f.kind == FragmentKind.Box {
+    let slot = slotIn(slots, f.source)
+    if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed.transform.any() {
+      placed = transform.placementHash(&nodes.asSlice()[u32.toUsize(slot)].computed.transform, combined)
     }
-    let parent = f.parent
-    if parent != NO_INDEX {
-      let previous = out.get(parent)
-      out.set(parent, Hash.combine(previous, placed))
-    }
+  }
+  let parent = f.parent
+  if parent != NO_INDEX {
+    let previous = out.get(parent)
+    out.set(parent, Hash.combine(previous, placed))
+  }
+}
+
+pub effect fn cacheFragments(
+  seed: &HashSeed, output: &LayoutTree, slots: &List<u32>, css: &Tree, nodes: &List<Node>,
+  width: f32, height: f32, hashes: &mut List<u64>, ink: &mut List<Rect<f32>>, scrollers: &mut List<bool>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let count = output.fragments.values.length()
+  hashes.clear()
+  ink.clear()
+  scrollers.clear()
+  run hashes.appendRepeated(0, count)
+  run ink.appendRepeated(Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK), count)
+  run scrollers.appendRepeated(false, count)
+  let mut index = count
+  while index > 0 {
+    index = index - 1
+    let owner = styleSlot(slots, css, nodes, output.fragments.values.asSlice()[index].source)
+    foldHashAt(seed, output, slots, nodes, &mut hashes, index, owner)
+    foldInkAt(output, slots, css, nodes, width, height, &mut ink, &mut scrollers, index, owner)
   }
 }
 

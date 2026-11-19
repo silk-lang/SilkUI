@@ -25,7 +25,8 @@ import font_collection.lib {
   Range,
   ignoredForFallback
 }
-import faces.database { FontDatabase, FaceStyle }
+import faces.database { FontDatabase, FaceStyle, Fonts }
+import faces.matching
 import faces.names { same as sameName }
 import read_fonts.lib { FontRef, ReadError }
 import read_fonts.model.charmap { Charmap }
@@ -121,10 +122,26 @@ pub struct Link {
 
 impl Copy for Link {}
 
+struct FamilyFaces { family: Family, faces: List<usize> }
+
+fn sameFamily(left: &Family, right: &Family) -> bool {
+  return match &left.* {
+    Family.Named { name: wanted } => match &right.* {
+      Family.Named { name: found } => sameName(wanted.asSlice(), found.asSlice())
+      _ => false
+    }
+    Family.Generic { generic: wanted } => match &right.* {
+      Family.Generic { generic: found } => wanted == found
+      _ => false
+    }
+  }
+}
+
 /// Installed faces of a borrowed collection plus faces added at run time.
 pub struct FontSet<'a> {
   base: &'a FontCollection,
   installed: FontMatcher<'a>,
+  families: List<FamilyFaces>,
   /// Faces added at run time. Their font files are never changed or removed while the set
   /// lives, so borrows of them can carry `'a` (see `font`).
   local: FontDatabase,
@@ -284,6 +301,7 @@ impl<'a> FontSet<'a> {
     return FontSet {
       base: base,
       installed: FontMatcher.make(base),
+      families: List<FamilyFaces>.make(),
       local: FontDatabase.make(),
       charmaps: List<Option<Charmap<'a>>>.make(),
       loaded: List<bool>.make(),
@@ -655,6 +673,26 @@ impl<'a> FontSet<'a> {
     }
   }
 
+  effect fn installedMatch(self: &Self, cache: &mut List<FamilyFaces>, family: &Family, request: Request) -> Option<Selection>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut index: usize = 0
+    while index < cache.length() {
+      if sameFamily(&cache.asSlice()[index].family, family) { break }
+      index = index + 1
+    }
+    if index == cache.length() {
+      let mut faces = List<usize>.make()
+      run self.base.familyFaces(family, &mut faces)
+      if index == 64 {
+        cache.clear()
+        index = 0
+      }
+      run cache.append(FamilyFaces { family: run family.copy(), faces: move faces })
+    }
+    let view = Fonts.make(&self.base.database)
+    return run matching.select(&view, cache.asSlice()[index].faces.asSlice(), request)
+  }
+
   /// The faces to try for text asking for `families`: per family, the members of an added
   /// family, or one CSS-matched installed face, without repeats.
   pub effect fn chain(
@@ -662,6 +700,25 @@ impl<'a> FontSet<'a> {
     families: &[Family],
     request: Request,
     out: &mut List<Link>,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut cache = List<FamilyFaces>.make()
+    run self.chainWith(families, request, &mut out, &mut cache)
+  }
+
+  pub effect fn cachedChain(
+    self: &mut Self, families: &[Family], request: Request, out: &mut List<Link>,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut cache = Intrinsic.replace(self.families, List<FamilyFaces>.make())
+    run self.chainWith(families, request, &mut out, &mut cache)
+    self.families = move cache
+  }
+
+  effect fn chainWith(
+    self: &Self,
+    families: &[Family],
+    request: Request,
+    out: &mut List<Link>,
+    cache: &mut List<FamilyFaces>,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -675,7 +732,8 @@ impl<'a> FontSet<'a> {
         }
       }
       if !added {
-        if let Option<Selection>.Some { value } = run self.base.matchFamily(
+        if let Option<Selection>.Some { value } = run self.installedMatch(
+          &mut cache,
           &families[index],
           request,
         ) {

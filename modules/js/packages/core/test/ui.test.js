@@ -22,6 +22,24 @@ test("nodes queue their mutations", () => {
   assert.equal(nodeById(box.nodeId), box);
 });
 
+test("class aliases distinguish absent and empty alongside other attributes", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("className", "");
+  assert.equal(box.hasAttribute("class"), true);
+  box.setAttribute("data-mode", "on");
+  box.setAttribute("class", 42);
+  assert.equal(box.getAttribute("className"), "42");
+  box.removeAttribute("className");
+  assert.equal(box.className, "");
+  assert.equal(box.hasAttribute("class"), false);
+  assert.equal(box.getAttribute("data-mode"), "on");
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.nodeId, "class", ""], ["attribute", box.nodeId, "data-mode", "on"],
+    ["attribute", box.nodeId, "class", "42"], ["attribute", box.nodeId, "class", null],
+  ]);
+});
+
 test("a style sends what changed, and removal restarts the look", () => {
   const box = createBox({ width: 10, height: 20 });
   mock.take();

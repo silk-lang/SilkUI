@@ -98,6 +98,19 @@ impl Copy for Choice {}
 
 const CHOICES: usize = 512
 
+struct WordRun {
+  shaped: TextRun,
+  offset: usize,
+  length: usize,
+  sourceStart: usize,
+  kind: TextTokenKind,
+  letter: bool,
+  safeStart: bool,
+  safeEnd: bool,
+}
+
+impl Copy for WordRun {}
+
 /// Reusable storage for [`shapeLine`].
 pub struct Shaping {
   pieces: List<Piece>,
@@ -116,6 +129,13 @@ pub struct Shaping {
   // Faces chosen before, in a direct-mapped table keyed by style, script and character. The
   // choice is a pure function of the three, and text asks for the same few over and over.
   choices: List<Choice>,
+  words: List<WordRun>,
+  wordsText: String,
+  wordsBase: usize,
+  wordsEpoch: usize,
+  wordsGeneration: u64,
+  wordsKey: usize,
+  wordsOrientation: TextOrientation,
 }
 
 impl Shaping {
@@ -133,6 +153,10 @@ impl Shaping {
       glyphs: List<PositionedGlyph>.make(),
       opportunities: List<bool>.make(),
       choices: List<Choice>.make(),
+      words: List<WordRun>.make(),
+      wordsText: String.make(),
+      wordsBase: 0, wordsEpoch: 0, wordsGeneration: 0, wordsKey: 0,
+      wordsOrientation: TextOrientation.Mixed,
     }
   }
 }
@@ -317,25 +341,25 @@ effect fn collectPieces(
           if boundary.unit == unit && boundary.offset < limit && boundary.offset > start {
             limit = boundary.offset
           }
-          let first = utf8_scan.decode(bytes, start)
           let base = analysis.unwrappedLevelAt(at)
           let mut level = base
-          if separatorClass(first.scalar) || (!at.before(trailing) && resettable(first.scalar)) {
-            level = local.level
-          }
-          let mut stop = first.next
-          while stop < limit {
-            let decoded = utf8_scan.decode(bytes, stop)
-            let position = TextCursor { unit: unit, offset: stop }
-            let mut resolved = base
-            if separatorClass(decoded.scalar)
-              || (!position.before(trailing) && resettable(decoded.scalar)) {
-              resolved = local.level
+          let mut stop = limit
+          if base != local.level {
+            let first = utf8_scan.decode(bytes, start)
+            if separatorClass(first.scalar) || (!at.before(trailing) && resettable(first.scalar)) {
+              level = local.level
             }
-            if resolved != level {
-              break
+            stop = first.next
+            while stop < limit {
+              let decoded = utf8_scan.decode(bytes, stop)
+              let position = TextCursor { unit: unit, offset: stop }
+              let mut resolved = base
+              if separatorClass(decoded.scalar) || (!position.before(trailing) && resettable(decoded.scalar)) {
+                resolved = local.level
+              }
+              if resolved != level { break }
+              stop = decoded.next
             }
-            stop = decoded.next
           }
           if stop > limit {
             stop = limit
@@ -690,17 +714,19 @@ effect fn emit<'a>(
           advance: advance,
         },
       )
-      let cursor = TextCursor { unit: piece.unit, offset: offset }
-      let mut widen = false
-      if raw.cluster != previous && cursor.before(trailing) && !hanging(request, cursor) {
-        let character = utf8_scan.decode(bytes, cluster).scalar
-        if characterJustify || token.textJustify == TextJustify.InterCharacter {
-          widen = !continuesCluster(character)
-        } else if wordMethod(token.textJustify) {
-          widen = wordSeparator(character)
+      if request.justificationSpace > 0.0 {
+        let cursor = TextCursor { unit: piece.unit, offset: offset }
+        let mut widen = false
+        if raw.cluster != previous && cursor.before(trailing) && !hanging(request, cursor) {
+          let character = utf8_scan.decode(bytes, cluster).scalar
+          if characterJustify || token.textJustify == TextJustify.InterCharacter {
+            widen = !continuesCluster(character)
+          } else if wordMethod(token.textJustify) {
+            widen = wordSeparator(character)
+          }
         }
+        run state.opportunities.append(widen)
       }
-      run state.opportunities.append(widen)
       previous = raw.cluster
       pen = pen + advance
     }
@@ -938,6 +964,91 @@ effect fn appendMark<'a>(state: &mut Shaping, fonts: &mut FontState<'a>, mark: s
 }
 
 /// Shapes the candidate line of `request` and appends its runs to `output`.
+fn plainRange(request: &TextShapeRequest<'_, '_>) -> bool {
+  let analysis = request.analysis
+  return !request.hyphenated && !request.ellipsis && request.justificationSpace == 0.0
+    && request.hangingRanges.length == 0 && analysis.level == 0 && analysis.paragraph.level == 0
+    && analysis.levels.length() == 0 && analysis.paragraphs.length() == 0
+    && !analysis.paragraph.end.before(request.end) && request.start.offset == 0
+}
+
+pub effect fn copyWords<'a>(state: &Shaping, fonts: &FontState<'a>, store: &GlyphStore,
+  request: &TextShapeRequest<'_, '_>, output: &mut List<TextRun>) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+  if state.words.length() == 0 || state.wordsEpoch != store.epoch() || state.wordsGeneration != fonts.set.generation
+    || !plainRange(request) || request.start.unit < state.wordsBase { return false }
+  let first = request.start.unit - state.wordsBase
+  let mut end = request.end.unit
+  if request.end.offset != 0 { end = end + 1 }
+  if end <= request.start.unit || end > request.context.tokens.length || end - state.wordsBase > state.words.length() { return false }
+  if request.end.offset != 0 && request.end.offset != tokenLength(&request.context.tokens[end - 1]) { return false }
+  let last = end - state.wordsBase
+  if !state.words.get(first).safeStart || !state.words.get(last - 1).safeEnd { return false }
+  let mut index = first
+  let mut latin = false
+  while index < last {
+    let word = state.words.get(index)
+    let token = &request.context.tokens[state.wordsBase + index]
+    if token.kind != word.kind || token.fontKey != state.wordsKey || token.sourceStart != word.sourceStart
+      || token.writingMode != WritingMode.HorizontalTb || token.textOrientation != state.wordsOrientation
+      || token.text != String.slice(state.wordsText.view(), word.offset, word.length) { return false }
+    latin = latin || word.letter
+    index = index + 1
+  }
+  if !latin { return false }
+  index = first
+  while index < last {
+    run output.append(state.words.get(index).shaped)
+    index = index + 1
+  }
+  return true
+}
+
+effect fn rememberWords<'a>(state: &mut Shaping, fonts: &FontState<'a>, store: &GlyphStore,
+  request: &TextShapeRequest<'_, '_>, runs: &[TextRun]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let length = String.byteLength(state.segment.view())
+  if length < 48 || length > 4096 || !plainRange(request) || runs.length == 0 || runs.length != state.pieces.length()
+    || state.items.length() != 1 || state.scripts.length() != 1 || state.scripts.get(0).script.value != 0x4c61746e { return }
+  let item = state.items.get(0)
+  let first = state.pieces.get(0)
+  if item.key != first.fontKey || first.unit != request.start.unit || first.segment != state.pieces.get(runs.length - 1).segment
+    || fonts.treatment(first.fontKey).transform != TextTransform.None || !fonts.hasParagraph(item.key, state.segment.view()) { return }
+  state.words.clear()
+  let mut index: usize = 0
+  while index < runs.length {
+    let piece = state.pieces.get(index)
+    let token = &request.context.tokens[piece.unit]
+    if piece.unit != first.unit + index || piece.start != 0 || piece.end != String.byteLength(token.text)
+      || token.writingMode != WritingMode.HorizontalTb || (token.kind != TextTokenKind.Space && token.kind != TextTokenKind.Text) {
+      state.words.clear()
+      return
+    }
+    let bytes = String.utf8Bytes(token.text)
+    let mut at: usize = 0
+    let mut letter = false
+    while at < bytes.length {
+      let value = bytes[at]
+      if (value >= 65 && value <= 90) || (value >= 97 && value <= 122) { letter = true }
+      else if value != 32 && value != 46 && value != 63 {
+        state.words.clear()
+        return
+      }
+      at = at + 1
+    }
+    run state.words.append(WordRun { shaped: runs[index], offset: piece.segmentStart, length: bytes.length,
+      sourceStart: token.sourceStart, kind: token.kind, letter: letter,
+      safeStart: fonts.safeParagraphCut(piece.segmentStart), safeEnd: fonts.safeParagraphCut(piece.segmentStart + bytes.length) })
+    index = index + 1
+  }
+  state.wordsBase = first.unit
+  state.wordsKey = first.fontKey
+  state.wordsOrientation = request.context.tokens[first.unit].textOrientation
+  state.wordsGeneration = fonts.set.generation
+  state.wordsEpoch = store.epoch()
+  state.wordsText.clear()
+  run state.wordsText.append(state.segment.view())
+}
+
 pub effect fn shapeLine<'a>(
   state: &mut Shaping,
   fonts: &mut FontState<'a>,
@@ -950,7 +1061,9 @@ pub effect fn shapeLine<'a>(
   if request.end.before(request.start) {
     fail TextError { source: usize.MAX, message: "ui-text: the shape range is reversed" }
   }
-  let trailing = trailingOf(&request)
+  let analysis = request.analysis
+  let firstRun = output.length()
+  let trailing = if request.justificationSpace > 0.0 || analysis.levels.length() != 0 || analysis.paragraphs.length() != 0 || analysis.level != analysis.paragraph.level { trailingOf(&request) } else { request.end }
   let mut characterJustify = false
   if request.justificationSpace > 0.0 {
     characterJustify = request.context.textJustify == TextJustify.InterCharacter
@@ -1009,4 +1122,5 @@ pub effect fn shapeLine<'a>(
     }
     index = index + 1
   }
+  run rememberWords(&mut state, &fonts, &store, &request, Slice.view(output.asSlice(), firstRun, output.length() - firstRun))
 }
