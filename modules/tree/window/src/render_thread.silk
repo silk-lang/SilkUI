@@ -1237,12 +1237,13 @@ effect fn drawOthers<'w>(
   surfaces: &mut List<ExtraSurface<'w>>,
   format: u32,
   alphaMode: u32,
-) -> ()
+) -> bool
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
   let mut guard = shared.get().lock()
   let mut jobs = Intrinsic.replace(guard.getMut().extraJobs, List<ExtraJob>.make())
   drop guard
+  let mut drew = false
   while jobs.length() != 0 {
     let job = jobs.remove(0)
     let mut at = usize.MAX
@@ -1281,7 +1282,9 @@ effect fn drawOthers<'w>(
     )
     run target.surface.present()
     run device.checkErrors()
+    drew = true
   }
+  return drew
 }
 
 /// Makes `job` the frame the compositor scrolls: its groups and offsets, and the offsets it
@@ -1553,6 +1556,10 @@ effect fn renderLoop(
   let mut previousPresented = 0.0
   let mut current = Option<FrameJob>.None
   let mut newer = List<ScrollPosition>.make()
+  // Whether the renderer's instances on the GPU are those of `current`'s scene: its last draw
+  // was this window's frame. A frame drawn again then, because a canvas presented or the
+  // compositor scrolled, keeps them instead of packing the whole scene again.
+  let mut held = false
   while true {
     let work = nextWork(shared, parker, canvases)
 
@@ -1570,7 +1577,7 @@ effect fn renderLoop(
       run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
       run writeUploads(shared, &device, &queue, &mut textures)
       run serveCanvases(canvases, &device, &queue, &mut renderer, &mut canvasTextures)
-      run drawOthers(
+      let drewOthers = run drawOthers(
         shared,
         &device,
         &queue,
@@ -1580,6 +1587,9 @@ effect fn renderLoop(
         format,
         alphaMode,
       )
+      if drewOthers {
+        held = false
+      }
     }
     let fresh = match move work {
       Work.Job { job } => {
@@ -1631,6 +1641,10 @@ effect fn renderLoop(
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run seconds(&mut clock)
     run renderer.setScrolls(newer.asSlice())
+    if held && !fresh {
+      renderer.reuseInstances()
+    }
+    held = true
     if canCopy {
       run renderer.drawReadable(
         &device,
