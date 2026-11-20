@@ -389,6 +389,15 @@ pub interface WindowClient<S, E, ? R> {
     return false
   }
 
+  /// The window has been quiet for a moment ([`QUIET_SECONDS`]): no input, no layout, no
+  /// animation frame asked for. A client hands back memory the work before it left, as a
+  /// script engine's garbage and idle arenas. `shed` says the tree lost many nodes
+  /// ([`SHED_NODES`]) since the last call. The host calls it once in each quiet spell, between
+  /// frames, never in a frame that has work.
+  effect fn quiet(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>, shed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
+
   /// Hears the frames the window presented since the last call: the milliseconds between
   /// presents, oldest first, and how many painted frames a newer one replaced before the GPU
   /// drew them.
@@ -471,6 +480,56 @@ const RELIEF_NODES: usize = 2048
 /// A frame that lays out this many boxes in full leaves freed memory to hand back: what
 /// preparing that much text took.
 const RELIEF_BOXES: usize = 4096
+
+/// How long a window stays quiet (no input, no layout, no animation frame) before its client
+/// hands back memory (`WindowClient.quiet`): past a pause in typing, before a reader moves on.
+pub const QUIET_SECONDS: f64 = 0.75
+
+/// A tree that lost this many nodes since the last quiet call has freed a large subtree.
+pub const SHED_NODES: usize = 1000
+
+/// Watches for the quiet moments in which a client hands back memory (`WindowClient.quiet`).
+struct QuietWatch {
+  /// When work last happened, on the loop's clock.
+  since: f64,
+  /// Whether this quiet spell had its call.
+  told: bool,
+  /// The most nodes the tree held since the last call.
+  peak: usize,
+}
+
+impl QuietWatch {
+  fn make() -> QuietWatch {
+    return QuietWatch { since: 0.0, told: false, peak: 0 }
+  }
+
+  /// Work happened at `now` with `nodes` in the tree: a new quiet spell starts after it.
+  fn busy(self: &mut Self, now: f64, nodes: usize) -> () {
+    self.since = now
+    self.told = false
+    if nodes > self.peak {
+      self.peak = nodes
+    }
+  }
+
+  /// When this spell's call is due, or a negative number when it had it.
+  fn dueAt(self: &Self) -> f64 {
+    return if self.told { -1.0 } else { self.since + QUIET_SECONDS }
+  }
+
+  fn due(self: &Self, now: f64) -> bool {
+    return !self.told && now >= self.since + QUIET_SECONDS
+  }
+
+  /// Takes this spell's call with `nodes` in the tree: answers whether the tree shed a large
+  /// subtree since the last.
+  fn take(self: &mut Self, nodes: usize) -> bool {
+    self.told = true
+    let shed = self.peak >= nodes + SHED_NODES
+    self.peak = nodes
+    return shed
+  }
+}
 
 /// Hands the pages of freed memory back to the system. An allocator keeps what a busy screen
 /// freed, to give it out again; under a quiet screen that only counts against the app.
@@ -1212,6 +1271,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let mut releaseWanted = false
   let mut releaseAt: f64 = -1.0
   let mut releaseLeft: u32 = 0
+  let mut quiet = QuietWatch.make()
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
@@ -1385,6 +1445,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       releaseLeft = releaseLeft - 1
       releaseAt = if releaseLeft == 0 { -1.0 } else if releaseLeft == 2 { now + 4.0 } else { now + 12.0 }
     }
+    if !check && quiet.due(now) && !content.wantsFrames(&state.*) && !content.needsFrame(&state.*, &tree) {
+      let shed = quiet.take(tree.liveNodes())
+      run content.quiet(&mut state, &mut tree, shed)
+    }
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
     if backgroundChanged {
       platform.requestFrame(owner)
@@ -1428,6 +1492,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         if deadline < 0.0 || due < deadline {
           deadline = due
         }
+      }
+      // A spell already due waits for the frame that is coming instead of spinning.
+      let quietAt = quiet.dueAt()
+      if quietAt > now && (deadline < 0.0 || quietAt - now < deadline) {
+        deadline = quietAt - now
       }
       match if serves { inspector.pollInterval() } else { Option<f64>.None } {
         Option<f64>.Some { value } => Wait.Seconds {
@@ -1583,6 +1652,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         redraw = redraw || content.needsFrame(&state.*, &tree)
       }
     } else if let Option<Event>.Some { value } = &next {
+      if let Event.RequestFrame { .. } = &value {} else {
+        quiet.busy(time, tree.liveNodes())
+      }
       let mut resized = false
       let keyed = tree.keyRoot
       run reportWindow(&mut tree, &value)
@@ -1770,6 +1842,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               // A tree under half its largest size, or a frame that laid out a great many
               // boxes, leaves freed memory behind (see `releaseFreed`).
               let nodes = tree.liveNodes()
+              if !tree.stats.layoutSkipped || content.wantsFrames(&state.*) {
+                quiet.busy(time, nodes)
+              }
               if nodes >= heldNodes {
                 heldNodes = nodes
               } else if heldNodes >= RELIEF_NODES && nodes * 2 < heldNodes {
@@ -2310,8 +2385,11 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut paintSum: f64 = 0.0
     let mut passes: u64 = 0
     let mut laidOut: u64 = 0
+    let mut quiet = QuietWatch.make()
     while frame < frames {
       let time = u32.toF64(frame) / 120.0
+      // Work this frame: what the tree or the client asked for before it, and its layout.
+      let mut worked = content.needsFrame(&state.*, &tree) || content.wantsFrames(&state.*)
       let tickStart = run seconds(&mut clock)
       drop run content.poll(&mut state, &mut tree, time)
       if content.waitsItself(&state.*) {
@@ -2324,6 +2402,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       if frame == frames / 2 && pointerX >= 0.0 && pointerY >= 0.0 {
         run tree.dispatch(Input.PointerMove { x: f64.toF32(pointerX), y: f64.toF32(pointerY), modifiers: 0 })
         run content.pump(&mut state, &mut tree)
+        worked = true
         StderrWriter.print("bench: pointer moved in\n", &())
       }
       if run content.update(&mut state, &mut tree, &mut platform, owner) {}
@@ -2340,6 +2419,13 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run serve(&mut platform, owner, &mut tree, &mut host)
       tree.clearUploads()
       run content.pump(&mut state, &mut tree)
+      // As the window does between frames: a quiet spell's call (`WindowClient.quiet`).
+      if worked || !tree.stats.layoutSkipped || content.wantsFrames(&state.*) {
+        quiet.busy(time, tree.liveNodes())
+      } else if quiet.due(time) && !content.needsFrame(&state.*, &tree) {
+        let shed = quiet.take(tree.liveNodes())
+        run content.quiet(&mut state, &mut tree, shed)
+      }
       if frame == 0 {
         StderrWriter.print(
           "bench: first frame start-to-layout-ms={} layout-ms={} paint-ms={} nodes={} fragments={}\n",
