@@ -14,6 +14,7 @@ import layout.lib {
   TextAnalysis,
   TextShapeRequest,
   TextRun,
+  TextCursor,
   TextError,
   FontRequest,
   FontMetrics,
@@ -54,6 +55,13 @@ pub struct TextSystem<'a> {
   /// For the bench census: lines the line cache answered, and the tokens of every line asked.
   pub lineHits: usize,
   pub shapeTokens: usize,
+  /// For the bench: after shaping a whole paragraph, shape lines cut where its runs say a cut is
+  /// safe, without taking glyphs from it, and count the lines whose runs differ.
+  pub verifyCuts: bool,
+  pub cutsChecked: usize,
+  pub cutsWrong: usize,
+  pub cutsSafe: usize,
+  pub cutsUnsafe: usize,
 }
 
 impl<'a> TextSystem<'a> {
@@ -80,6 +88,11 @@ impl<'a> TextSystem<'a> {
       shapeCalls: 0,
       lineHits: 0,
       shapeTokens: 0,
+      verifyCuts: false,
+      cutsChecked: 0,
+      cutsWrong: 0,
+      cutsSafe: 0,
+      cutsUnsafe: 0,
     }
   }
 
@@ -150,6 +163,10 @@ impl<'a> TextMeasure for TextSystem<'a> {
     return true
   }
 
+  fn reportsBreakSafety(provider: &Self) -> bool {
+    return true
+  }
+
   effect fn analyze(
     provider: &mut Self,
     context: TextContext<'_, '_>,
@@ -187,7 +204,84 @@ impl<'a> TextMeasure for TextSystem<'a> {
     if kept {
       run provider.lines.keep(base, Slice.view(output.asSlice(), first, output.length() - first))
     }
+    if provider.verifyCuts && request.start.unit == 0 && request.start.offset == 0
+      && !request.end.before(request.analysis.paragraph.end) && !request.hyphenated && !request.ellipsis
+      && request.justificationSpace == 0.0 {
+      run verifyCuts(&mut provider, request, Slice.view(output.asSlice(), first, output.length() - first))
+    }
   }
+}
+
+fn sameRun(left: TextRun, right: TextRun) -> bool {
+  if let TextRun.Text { unit, start, end, advance, fontKey, bidiLevel, shapeKey, .. } = left {
+    if let TextRun.Text { unit: otherUnit, start: otherStart, end: otherEnd, advance: otherAdvance,
+      fontKey: otherKey, bidiLevel: otherLevel, shapeKey: otherShape, .. } = right {
+      return unit == otherUnit && start == otherStart && end == otherEnd && advance == otherAdvance
+        && fontKey == otherKey && bidiLevel == otherLevel && shapeKey == otherShape
+    }
+  }
+  return false
+}
+
+fn lineStart(value: TextRun) -> usize {
+  if let TextRun.Text { unit, start, .. } = value {
+    if start == 0 { return unit }
+  }
+  return usize.MAX
+}
+
+// Shapes the lines of a whole paragraph's `runs` that start at a cut its runs call safe, ending
+// at one of the next few such cuts or at its end, and counts those whose runs differ.
+effect fn verifyCuts<'a>(provider: &mut TextSystem<'a>, request: TextShapeRequest<'_, '_>, runs: &[TextRun]) -> ()
+  ! OutOfMemoryError | TextError
+  ? &mut Allocator {
+  let mut whole = List<TextRun>.make()
+  run whole.appendSlice(runs)
+  let mut flags = List<bool>.make()
+  run flags.appendSlice(provider.shaping.unsafeRuns.asSlice())
+  if flags.length() != whole.length() { return }
+  let mut starts = List<usize>.make()
+  let mut index: usize = 1
+  while index < whole.length() {
+    if lineStart(whole.get(index)) != usize.MAX {
+      if flags.get(index) {
+        provider.cutsUnsafe = provider.cutsUnsafe + 1
+      } else {
+        provider.cutsSafe = provider.cutsSafe + 1
+        run starts.append(index)
+      }
+    }
+    index = index + 1
+  }
+  let reuse = provider.shaping.reuse
+  provider.shaping.reuse = false
+  let mut line = List<TextRun>.make()
+  let mut from: usize = 0
+  while from < starts.length() {
+    let mut to = from + 1
+    while to <= from + 3 && to <= starts.length() {
+      let low = starts.get(from)
+      let high = if to < starts.length() { starts.get(to) } else { whole.length() }
+      let mut sub = request
+      sub.start = TextCursor { unit: lineStart(whole.get(low)), offset: 0 }
+      if to < starts.length() {
+        sub.end = TextCursor { unit: lineStart(whole.get(high)), offset: 0 }
+      }
+      line.clear()
+      run shapeLine(&mut provider.shaping, &mut provider.fonts, &mut provider.glyphs, sub, &mut line)
+      provider.cutsChecked = provider.cutsChecked + 1
+      let mut same = line.length() == high - low
+      let mut at: usize = 0
+      while same && at < line.length() {
+        same = sameRun(line.get(at), whole.get(low + at))
+        at = at + 1
+      }
+      if !same { provider.cutsWrong = provider.cutsWrong + 1 }
+      to = to + 1
+    }
+    from = from + 1
+  }
+  provider.shaping.reuse = reuse
 }
 
 /// A `Measure` for trees whose only content is text: fonts come from the system, and there
