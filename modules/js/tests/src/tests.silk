@@ -4,7 +4,7 @@ import window_frames as _window_frames
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Natives, Reply, Exports, serve }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Natives, Reply, Exports, serve, imageLoadable, imageBuild, engineBuild }
 import ui_js_calls.natives as natives
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
@@ -16,6 +16,8 @@ import silkjs.runtime_memory { RuntimeAllocator }
 import silkjs.js_libc_platform as platform
 import silk.core.effect { Effect }
 import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
@@ -457,6 +459,84 @@ effect fn withHost(scenario: u32) -> ()
   }
 }
 
+/// Starts the counter module in a new realm on an empty tree from `image` (with `source`
+/// beside it, as a release host has both), checks what it built, and says whether the image
+/// was what ran.
+effect fn startedFrom(image: &[u8], package: &[u8], source: &[u8]) -> bool
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  let domain = run WaiterDomain.make()
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run host.define(b"@silkui/core", package) |> Effect.provideMut<Allocator>(&mut allocator)
+  // `image` outlives the realm: the host is closed below, before this returns.
+  let ran = run Effect.result(unsafe host.moduleFromHeld(image, source, b"app.js")) |> Effect.provideMut<Allocator>(&mut allocator)
+  let flushed = run Effect.result(host.flush(&mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop run Effect.result(tree.frame(viewport(), 0.0))
+  let focused = focusIs(&tree, 2)
+  let labelled = run labelIs(&tree, "Click me")
+  // A function the module's top level never called runs from where its code was left: the
+  // click handler, compiled into the image and read from it only now.
+  let clicked = run Effect.result(click(&mut host, &mut tree, 10.0, 50.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let counted = run labelIs(&tree, "Clicked 1")
+  run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  drop flushed
+  drop clicked
+  run Testing.expect(focused && labelled, "the entry built the counter")
+  run Testing.expect(counted, "a handler first called after the start ran")
+  return match move ran {
+    Result<bool, OutOfMemoryError | JsError>.Success { value } => value
+    Result<bool, OutOfMemoryError | JsError>.Failure { error } => { fail move error }
+  }
+}
+
+/// A build compiles the entry into a bytecode image and a launch starts from it; an image
+/// another engine build wrote is turned away and the entry runs from its source, building
+/// the same thing.
+test effect fn bytecodeImageStartsTheEntryAndAnotherBuildsImageFallsBackToSource() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut system = Allocator.systemAllocatorProvider()
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js") |> Effect.provideMut<Allocator>(&mut system)
+  let source = run platform.readFile(b"modules/js/tests/fixtures/app.js") |> Effect.provideMut<Allocator>(&mut system)
+  // The build step: the module is compiled in a realm that defines its imports, not run.
+  let domain = run WaiterDomain.make() |> Effect.provideMut<Allocator>(&mut system)
+  let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run allocator.observe()
+  let mut writer = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run writer.define(b"@silkui/core", package.asSlice()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let written = run Effect.result(writer.writeImage(source.asSlice(), b"app.js")) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(writer.pending() == 0, "writing an image runs nothing")
+  run writer.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  let image = match move written {
+    Result<List<u8>, OutOfMemoryError | JsError>.Success { value } => move value
+    Result<List<u8>, OutOfMemoryError | JsError>.Failure { error } => { fail move error }
+  }
+  run Testing.expect(imageLoadable(image.asSlice()) && imageBuild(image.asSlice()) == engineBuild(), "an image loads in the engine build that wrote it")
+  run Testing.expect(!imageLoadable(source.asSlice()) && !imageLoadable(b""), "source text and nothing are not images")
+
+  let fromImage = run startedFrom(image.asSlice(), package.asSlice(), source.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run Testing.expect(fromImage, "the entry started from its image")
+  let fromSource = run startedFrom(b"", package.asSlice(), source.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run Testing.expect(!fromSource, "an entry with no image starts from its source")
+
+  // Another engine build's image: the same bytes under the build number of an engine whose
+  // opcodes or atoms differ, which is all a host can tell of it.
+  let mut stale = List<u8>.make()
+  run stale.appendSlice(image.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  let flipped = stale.get(8) ^ 1
+  stale.set(8, flipped)
+  run Testing.expect(!imageLoadable(stale.asSlice()) && imageBuild(stale.asSlice()) != engineBuild(), "an image of another engine build does not load")
+  let fromStale = run startedFrom(stale.asSlice(), package.asSlice(), source.asSlice()) |> Effect.provideMut<Allocator>(&mut system)
+  run Testing.expect(!fromStale, "another build's image is turned away and the source runs")
+
+  // A truncated image is not this build's either (its header gives its length).
+  let short = image.asSlice()
+  run Testing.expect(!imageLoadable(Slice.view(short, 0, short.length - 1)), "a cut image does not load")
+}
+
 test effect fn javascriptCounterHandlesEventsSynchronously() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -556,6 +636,10 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.CLIPBOARD_WRITE == bridge.nativeId(b"clipboardWrite"), "CLIPBOARD_WRITE")
   run Testing.expect(bridge.CREATE == bridge.nativeId(b"create"), "CREATE")
   run Testing.expect(bridge.DEFINE_ICON == bridge.nativeId(b"defineIcon"), "DEFINE_ICON")
+  run Testing.expect(bridge.SVG_INSERT == bridge.nativeId(b"svgInsert"), "SVG_INSERT")
+  run Testing.expect(bridge.SVG_REMOVE == bridge.nativeId(b"svgRemove"), "SVG_REMOVE")
+  run Testing.expect(bridge.SVG_MEASURE == bridge.nativeId(b"svgMeasure"), "SVG_MEASURE")
+  run Testing.expect(bridge.SVG_ATTRIBUTE == bridge.nativeId(b"svgAttribute"), "SVG_ATTRIBUTE")
   run Testing.expect(bridge.DESTROY == bridge.nativeId(b"destroy"), "DESTROY")
   run Testing.expect(bridge.LOAD == bridge.nativeId(b"load"), "LOAD")
   run Testing.expect(bridge.DEV_RELOAD == bridge.nativeId(b"devReload"), "DEV_RELOAD")
@@ -673,7 +757,7 @@ effect fn literalAria(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   let mut name = String.make()
   run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)
   run Testing.expect(String.view(&name) == "Title", "JavaScript literal relations reach native accessibility")
-  run Testing.expect(tree.engine().node(tree.engine().slotOf(3)).computed.layout.width.value == 123.0, "CSS selectors see the literal ARIA attribute, not translated node numbers")
+  run Testing.expect(tree.engine().node(tree.engine().slotOf(3)).computed().layout.width.value == 123.0, "CSS selectors see the literal ARIA attribute, not translated node numbers")
   run host.evaluate(b"title.id = 'renamed'", b"test")
   run host.flush(&mut tree)
   run accessibleName(tree.engine(), tree.engine().slotOf(3), &mut name)

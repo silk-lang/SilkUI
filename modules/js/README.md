@@ -431,6 +431,36 @@ demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 
 the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
 the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
+### Bytecode images
+
+A production host need not parse its bundle at every launch. `JsHost.writeImage(source,
+name)` compiles a module into a bytecode image without running it (its imports must be
+defined), and `JsHost.moduleFrom(image, source, name)` starts the module from that image
+when the engine build linked into the program is the one that wrote it, and from `source`
+otherwise. `JsHost.defineImaged` does the same for a module the entry imports, such as
+`@silkui/core`. The engine reads each function's code from the image when the function is
+first called, so the image must live as long as the realm: `moduleFrom` and `defineImaged`
+take bytes embedded in the program (`&'static`), and `moduleFromHeld` is the unsafe form
+for bytes the caller keeps alive itself.
+
+```silk
+// build time, in a program that links the same engine as the host
+run host.define(b"@silkui/core", uiPackage())
+let image = run host.writeImage(source, b"app.js")
+
+// launch
+let fromImage = run host.moduleFrom(app_image.data, app_bundle.data, b"app.js")
+```
+
+An image is tied to the engine build: `imageLoadable(bytes)` says whether this build can
+load it, and `imageBuild(bytes)` and `engineBuild()` give the two build numbers. Images are
+trusted input, so only the app's own build should write them. `silkui` does all of this for
+a generated host (`silkui_window.image` is the build step; see
+[silkui's README](../silkui/README.md)). In a window, `JsApp.entryImage` and
+`JsApp.defineImaged` hand the images over, a reload goes back to source, and
+`SILK_UI_TRACE_JS=1` says on standard error what the entry started from. An image from
+another engine build is always reported there, traced or not.
+
 ## On the web canvas
 
 [web](web) (`ui-js-web`) runs the same bundle in a browser: the tree compiled to WebAssembly

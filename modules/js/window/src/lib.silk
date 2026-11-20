@@ -21,15 +21,16 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, imageLoadable, imageBuild, engineBuild }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
+import ui_tree.census { Census }
 import ui_tree.legacy { UiTree, TreeError }
-import ui_tree_window.host { WindowClient }
+import ui_tree_window.host { WindowClient, environmentVariable }
 import ui_tree_window.loader { Loader }
 import ui_tree_window.platform_thread { HostPlatform }
 import ui_tree_window.console { StderrWriter }
@@ -51,6 +52,8 @@ import silk.num.f64
 struct Defined {
   name: List<u8>,
   source: List<u8>,
+  /// The module compiled when the program was built ([`JsApp.defineImaged`]), or empty.
+  image: &'static [u8],
 }
 
 /// A JavaScript application and what it runs on.
@@ -63,8 +66,12 @@ pub struct JsApp<'m> {
   modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The entry compiled when the program was built ([`JsApp.entryImage`]), or empty.
+  image: &'static [u8],
   /// The system programs started for `window.open`.
   openers: Openers,
+  /// `SILK_UI_TRACE_JS`: say what the entry starts from.
+  traced: bool,
 }
 
 effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
@@ -129,7 +136,9 @@ impl<'m> JsApp<'m> {
     // back to the system allocator, as the silkjs command line does.
     own.enablePooling()
     let host = run JsHost.open(memory, domain) |> Effect.provideMut<Allocator>(&mut own)
+    let traced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
     return JsApp {
+      traced: traced,
       host: move host,
       allocator: move own,
       memory: memory,
@@ -137,18 +146,25 @@ impl<'m> JsApp<'m> {
       modules: List<Defined>.make(),
       name: List<u8>.make(),
       source: List<u8>.make(),
+      image: b"",
       openers: Openers.make(),
     }
   }
 
   /// Makes `source` importable as `name` (see `JsHost.define`).
   pub effect fn define(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.host.define(name, source) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    run self.defineImaged(name, source, b"")
+  }
+
+  /// [`JsApp.define`] with the module's bytecode image, written when the program was built
+  /// and embedded in it (see `JsHost.defineImaged`); an empty image is none.
+  pub effect fn defineImaged(self: &mut Self, name: &[u8], source: &[u8], image: &'static [u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.host.defineImaged(name, source, image) |> Effect.provideMut<Allocator>(&mut self.allocator)
     let mut nameCopy = List<u8>.make()
     run nameCopy.appendSlice(name)
     let mut sourceCopy = List<u8>.make()
     run sourceCopy.appendSlice(source)
-    run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy })
+    run self.modules.append(Defined { name: move nameCopy, source: move sourceCopy, image: image })
   }
 
   /// The ES module the window runs when it starts.
@@ -159,12 +175,36 @@ impl<'m> JsApp<'m> {
     run self.source.appendSlice(source)
   }
 
-  /// Replaces the entry's source, keeping its name; [`JsApp.startEntry`] runs it.
+  /// The entry's bytecode image: what the app's build compiled its source into
+  /// (`JsHost.writeImage`, through `silkui_window.image`), embedded in the program. The
+  /// window then starts the entry from it with nothing parsed, when the engine build that
+  /// wrote it is the one linked here; otherwise it says so and runs the source given to
+  /// [`JsApp.entry`], which a host always gives as well.
+  pub fn entryImage(self: &mut Self, image: &'static [u8]) -> () {
+    self.image = image
+  }
+
+  /// Replaces the entry's source, keeping its name; [`JsApp.startEntry`] runs it. The new
+  /// source has no image: a reload runs what it was given.
   pub fn replaceEntry(self: &mut Self, source: List<u8>) -> () {
     self.source = move source
+    self.image = b""
   }
 
   /// The JavaScript host, for tools that talk to it directly.
+  /// What the app's JavaScript side holds, for the bench census: the engine's rows, and the
+  /// source texts the app keeps beside the engine's own.
+  pub effect fn census(self: &mut Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.host.census(&mut out)
+    let mut bytes: usize = self.source.capacity()
+    let mut at: usize = 0
+    while at < self.modules.length() {
+      bytes = bytes + self.modules.asSlice()[at].source.capacity()
+      at = at + 1
+    }
+    run out.bytes("js.app.source-texts(entry and modules kept by the app)", bytes, bytes)
+  }
+
   pub fn javascript(self: &mut Self) -> &mut JsHost<'m> {
     return &mut self.host
   }
@@ -177,9 +217,33 @@ impl<'m> JsApp<'m> {
   /// Runs the entry module and applies what it built.
   pub effect fn startEntry(self: &mut Self, tree: &mut UiTree<'_>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
-    let ran = run Effect.result(self.host.module(self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    self.sayEntry()
+    let started = run Effect.result(self.host.moduleFrom(self.image, self.source.asSlice(), self.name.asSlice())) |> Effect.provideMut<Allocator>(&mut self.allocator)
+    let ran = match move started {
+      Result<bool, OutOfMemoryError | JsError>.Success { .. } => Result<(), OutOfMemoryError | JsError>.Success { value: () }
+      Result<bool, OutOfMemoryError | JsError>.Failure { error } => Result<(), OutOfMemoryError | JsError>.Failure { error: move error }
+    }
     run self.settle(move ran)
     run self.host.flushRaw(&mut tree)
+  }
+
+  /// Says what the entry starts from. An image this engine build cannot load is never
+  /// silent: the program was built with a stale one, and pays for parsing at every launch.
+  /// `SILK_UI_TRACE_JS` says it for the image and for plain source too.
+  fn sayEntry(self: &Self) -> () {
+    if self.image.length != 0 && !imageLoadable(self.image) {
+      StderrWriter.print(
+        "silkui: the bytecode image of the app's JavaScript was written by another engine build ({} here, {} in the image): running from source. Build the app again.\n",
+        &(engineBuild(), imageBuild(self.image)),
+      )
+      return ()
+    }
+    if !self.traced { return () }
+    if self.image.length != 0 {
+      StderrWriter.print("silkui: JavaScript starts from its bytecode image ({} bytes, engine build {})\n", &(self.image.length, engineBuild()))
+    } else {
+      StderrWriter.print("silkui: JavaScript starts from source ({} bytes): the program has no bytecode image\n", &.(self.source.length()))
+    }
   }
 
   /// Runs `source` as a script named `name`, prints what it wrote and threw, and applies
@@ -228,7 +292,7 @@ impl<'m> JsApp<'m> {
     let items = self.modules.asSlice()
     let mut i: usize = 0
     while i < items.length {
-      run self.host.define(items[i].name.asSlice(), items[i].source.asSlice()) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.host.defineImaged(items[i].name.asSlice(), items[i].source.asSlice(), items[i].image) |> Effect.provideMut<Allocator>(&mut self.allocator)
       i = i + 1
     }
     return true
@@ -544,6 +608,12 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ? &mut Allocator {
     drop run state.handle(&mut tree)
     run self.load(&mut state, &mut tree)
+  }
+
+  effect fn census(self: &mut Self, state: &mut JsApp<'m>, out: &mut Census) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.census(&mut out)
   }
 
   effect fn decide(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> bool

@@ -3,6 +3,7 @@
 //! A text style (family list, size, weight, width, style) gets a font key for css-layout's
 //! `Style.fontKey`. When fallback draws some characters with another face, that face at the
 //! style's size gets a key of its own, so `Measure.font` can give its metrics too.
+import properties.census { Census }
 import set { FontSet, Link }
 import font_collection.lib {
   FontCollection,
@@ -35,7 +36,7 @@ import harfrust.lib {
 }
 import read_fonts.lib { FontRef }
 import read_fonts.model.metrics { Metrics, LineBox }
-import font_types.lib { F2Dot14, F48Dot16, Tag }
+import font_types.lib { F2Dot14, F48Dot16, Fixed, Tag }
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
@@ -227,6 +228,11 @@ struct Instance {
   settings: Variations,
   coords: List<F2Dot14>,
   unitsPerEm: f32,
+  /// HVAR's region scalars and every glyph's advance at `coords`, worked out by the first shaping
+  /// call at this instance and lent to each later one (empty at the default location).
+  scalars: List<Fixed>,
+  advances: List<F48Dot16>,
+  gdefScalars: List<Fixed>,
 }
 
 /// What a font key stands for: a style, and the face instance drawing it.
@@ -294,7 +300,11 @@ pub struct FontState<'a> {
   keys: List<KeyInfo>,
   metrics: List<FontMetrics>,
   instances: List<Instance>,
-  data: List<Option<ShaperData<'a>>>,
+  /// The shaping data of the faces that have shaped text, and for each face of the set its
+  /// place in `data` plus one, or 0: the set lists every face the system has, thousands, and
+  /// an app shapes with a few.
+  data: List<ShaperData<'a>>,
+  dataSlots: List<u32>,
   plans: List<PlanEntry<'a>>,
   buffer: Buffer,
   /// Shaping results by text, instance, range, direction and script. Shaping is a pure
@@ -307,7 +317,15 @@ pub struct FontState<'a> {
   /// Shaper calls the cache did not answer, and the bytes of text they shaped, for tests and
   /// benchmarks.
   pub shaperCalls: usize,
+  /// For the bench census: `shapeTextOriented` calls and the bytes of text they hashed, the
+  /// calls the cache answered, those cut from the last paragraph, and the bytes the shaper
+  /// itself took.
+  pub shapeTextCalls: usize,
+  pub shapeTextBytes: usize,
+  pub shapeCacheHits: usize,
+  pub shapeSliceHits: usize,
   pub shaperBytes: usize,
+  pub cacheFlushes: usize,
   /// Of the text shaped last (`shapeText`, `shapeTextOriented`): whether its glyphs may differ
   /// when it is the end of a longer text, even one cut at a `RawGlyph.safe` cluster. A state
   /// machine of an Apple font (morx, kerx, kern) then acted on something it remembered from
@@ -473,6 +491,29 @@ effect fn shaperFeatures(features: &FontFeatures, defined: &[List<u32>]) -> List
 }
 
 impl<'a> FontState<'a> {
+  /// What the font state holds and the shaping it did, for the bench census.
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run out.held("text.fonts.styles", self.styles.length(), self.styles.capacity(), Intrinsic.layoutOf<StyleEntry>().bytes)
+    run out.held("text.fonts.keys", self.keys.length(), self.keys.capacity(), Intrinsic.layoutOf<KeyInfo>().bytes)
+    run out.held("text.fonts.metrics", self.metrics.length(), self.metrics.capacity(), Intrinsic.layoutOf<FontMetrics>().bytes)
+    run out.held("text.fonts.instances", self.instances.length(), self.instances.capacity(), Intrinsic.layoutOf<Instance>().bytes)
+    run out.held("text.fonts.shaper-data", self.data.length(), self.data.capacity(), Intrinsic.layoutOf<ShaperData<'a>>().bytes)
+    run out.held("text.fonts.data-slots(one per installed face)", self.dataSlots.length(), self.dataSlots.capacity(), 4)
+    run out.held("text.fonts.plans", self.plans.length(), self.plans.capacity(), Intrinsic.layoutOf<PlanEntry<'a>>().bytes)
+    run out.held("text.shape-cache.index", self.shapedIndex.length(), self.shapedIndex.bucketCount(), 25)
+    run out.held("text.shape-cache.entries", self.shaped.length(), self.shaped.capacity(), Intrinsic.layoutOf<Shaped>().bytes)
+    run out.held("text.shape-cache.text-bytes", self.shapedText.length(), self.shapedText.capacity(), 1)
+    run out.held("text.shape-cache.glyphs(RawGlyph)", self.shapedGlyphs.length(), self.shapedGlyphs.capacity(), Intrinsic.layoutOf<RawGlyph>().bytes)
+    run self.set.census(&mut out)
+    run out.work("text.shape-text.calls", self.shapeTextCalls)
+    run out.work("text.shape-text.bytes-hashed", self.shapeTextBytes)
+    run out.work("text.shape-text.cache-hits", self.shapeCacheHits)
+    run out.work("text.shape-text.paragraph-slice-hits", self.shapeSliceHits)
+    run out.work("text.shaper.calls", self.shaperCalls)
+    run out.work("text.shaper.bytes", self.shaperBytes)
+    run out.work("text.shape-cache.flushes", self.cacheFlushes)
+  }
+
   pub fn make(collection: &'a FontCollection) -> FontState<'a> {
     return FontState {
       set: FontSet.make(collection),
@@ -480,7 +521,8 @@ impl<'a> FontState<'a> {
       keys: List<KeyInfo>.make(),
       metrics: List<FontMetrics>.make(),
       instances: List<Instance>.make(),
-      data: List<Option<ShaperData<'a>>>.make(),
+      data: List<ShaperData<'a>>.make(),
+      dataSlots: List<u32>.make(),
       plans: List<PlanEntry<'a>>.make(),
       buffer: Buffer.new(),
       shapedIndex: HashMap<Word, u32>.make(Hash.seed(0x7368617065)),
@@ -489,7 +531,7 @@ impl<'a> FontState<'a> {
       shapedGlyphs: List<RawGlyph>.make(),
       leans: false,
       shaperCalls: 0,
-      shaperBytes: 0,
+      shapeTextCalls: 0, shapeTextBytes: 0, shapeCacheHits: 0, shapeSliceHits: 0, shaperBytes: 0, cacheFlushes: 0,
       roundMetrics: true,
       defined: List<List<u32>>.make(),
     }
@@ -655,7 +697,7 @@ impl<'a> FontState<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let mut chain = List<Link>.make()
-    run self.set.chain(style.families.asSlice(), style.request, &mut chain)
+    run self.set.cachedChain(style.families.asSlice(), style.request, &mut chain)
     let families = move style.families
     let mut primary = self.set.primary(chain.asSlice())
     if primary.isNone() {
@@ -694,17 +736,26 @@ impl<'a> FontState<'a> {
   effect fn loadFace(self: &mut Self, face: usize) -> bool
     ! OutOfMemoryError
     ? &mut Allocator {
-    while self.data.length() <= face {
-      run self.data.append(Option<ShaperData<'a>>.None)
+    while self.dataSlots.length() <= face {
+      run self.dataSlots.append(0)
     }
-    if self.data.asSlice()[face].isSome() {
+    if self.dataSlots.get(face) != 0 {
       return true
     }
     if let Option<FontRef<'a>>.Some { value: font } = self.set.font(face) {
-      self.data.set(face, Option<ShaperData<'a>>.Some { value: ShaperData.new(&font) })
+      run self.data.append(ShaperData.new(&font))
+      self.dataSlots.set(face, usize.toU32(self.data.length()))
       return true
     }
     return false
+  }
+
+  /// The shaping data of `face`, once [`loadFace`] has made it.
+  fn shaper(self: &Self, face: usize) -> Option<&ShaperData<'a>> {
+    if face >= self.dataSlots.length() || self.dataSlots.get(face) == 0 {
+      return Option<&ShaperData<'a>>.None
+    }
+    return Option<&ShaperData<'a>>.Some { value: &self.data.asSlice()[u32.toUsize(self.dataSlots.get(face)) - 1] }
   }
 
   effect fn instanceFor(self: &mut Self, selection: Selection, size: f32, settings: &Variations) -> usize
@@ -771,7 +822,7 @@ impl<'a> FontState<'a> {
         }
         axis = axis + 1
       }
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[selection.face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(selection.face) {
         unitsPerEm = u16.toF32(data.upem)
         if wanted.length() > 0 {
           let mut shaper = ConfiguredShaper.new(&data)
@@ -788,6 +839,9 @@ impl<'a> FontState<'a> {
         settings: settings.*,
         coords: move coords,
         unitsPerEm: unitsPerEm,
+        scalars: List<Fixed>.make(),
+        advances: List<F48Dot16>.make(),
+        gdefScalars: List<Fixed>.make(),
       },
     )
     return self.instances.length() - 1
@@ -907,6 +961,8 @@ impl<'a> FontState<'a> {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.shapeTextCalls = self.shapeTextCalls + 1
+    self.shapeTextBytes = self.shapeTextBytes + String.byteLength(text)
     let hash = shapeHash(instance, text, start, end, rtl, script.value, vertical, features)
     if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
       let entry = self.shaped.get(u32.toUsize(at))
@@ -920,6 +976,7 @@ impl<'a> FontState<'a> {
         run out.appendSlice(
           Slice.view(self.shapedGlyphs.asSlice(), entry.glyphStart, entry.glyphCount),
         )
+        self.shapeCacheHits = self.shapeCacheHits + 1
         self.leans = entry.leans
         return
       }
@@ -927,6 +984,7 @@ impl<'a> FontState<'a> {
     let first = out.length()
     run self.shapeUncached(instance, text, start, end, rtl, script, vertical, features, &mut out)
     if self.shapedGlyphs.length() + (out.length() - first) > SHAPED_GLYPHS {
+      self.cacheFlushes = self.cacheFlushes + 1
       self.shapedIndex.clear()
       self.shaped.clear()
       self.shapedText.clear()
@@ -1008,7 +1066,7 @@ impl<'a> FontState<'a> {
       index = index + 1
     }
     if plan == usize.MAX {
-      if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
+      if let Option<&ShaperData<'a>>.Some { value: data } = self.shaper(face) {
         let made = run makePlan(
           &data,
           self.instances.asSlice()[instance].coords.asSlice(),
@@ -1030,14 +1088,28 @@ impl<'a> FontState<'a> {
         return
       }
     }
-    if let Option<ShaperData<'a>>.Some { value: data } = &self.data.asSlice()[face] {
-      let mut shaper = ConfiguredShaper.new(&data)
+    let slot = if face < self.dataSlots.length() { self.dataSlots.get(face) } else { 0 }
+    if slot != 0 {
+      let data = &self.data.asSlice()[u32.toUsize(slot) - 1]
+      let mut shaper = ConfiguredShaper.new(data)
       run shaper.coords.appendSlice(self.instances.asSlice()[instance].coords.asSlice())
+      let held = &mut self.instances.asMutSlice()[instance]
+      shaper.hvarScalars = Intrinsic.replace(held.scalars, List<Fixed>.make())
+      shaper.hvarAdvances = Intrinsic.replace(held.advances, List<F48Dot16>.make())
+      shaper.gdefScalars = Intrinsic.replace(held.gdefScalars, List<Fixed>.make())
+      if held.coords.length() != 0 && shaper.hvarAdvances.length() == 0 {
+        run shaper.setNormalizedCoords(held.coords.asSlice())
+        run shaper.prepareAdvances()
+      }
       let shaped = run shape(
         &shaper,
         &mut self.buffer,
         ShapeOptions.forPlan(&self.plans.asSlice()[plan].plan, wanted.asSlice()),
       )
+      let back = &mut self.instances.asMutSlice()[instance]
+      back.scalars = Intrinsic.replace(shaper.hvarScalars, List<Fixed>.make())
+      back.advances = Intrinsic.replace(shaper.hvarAdvances, List<F48Dot16>.make())
+      back.gdefScalars = Intrinsic.replace(shaper.gdefScalars, List<Fixed>.make())
       if let Result<(), ShapeError>.Failure { error: _ } = move shaped {
         return
       }
@@ -1080,7 +1152,13 @@ impl<'a> FontState<'a> {
   /// tables (morx, mort, kerx, kern) are cut like the others; font-shape flags every cluster
   /// their state machines carry something across.
   pub fn sliceable(self: &Self, key: usize) -> bool {
-    return self.keys.get(key).instance != usize.MAX
+    let info = self.keys.get(key)
+    if info.instance == usize.MAX {
+      return false
+    }
+    let face = self.instances.asSlice()[info.instance].face
+    let slot = if face < self.dataSlots.length() { self.dataSlots.get(face) } else { 0 }
+    return slot != 0
   }
 
   /// CSS pixels per font unit for key `key`.

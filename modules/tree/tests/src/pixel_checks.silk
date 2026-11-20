@@ -9,6 +9,7 @@ import svg_css.compile
 import svg_css.written
 import svg_css.tokens { CssError }
 import vector.geometry_error { GeometryError }
+import vector.pixmap { Pixmap }
 import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
@@ -105,6 +106,206 @@ effect fn objectFit() ! TreeError | CssError | GeometryError | OutOfMemoryError 
 test effect fn pixelObjectFitPlacesTheImage() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run objectFit() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Whether row `y` of `snapshot` (400 pixels wide) has a run of one pixel between two others of
+/// different colors.
+fn hasLonePixel(snapshot: &Pixmap, y: u32) -> bool {
+  let mut x: u32 = 1
+  while x + 1 < 400 {
+    let p = snapshot.pixel(x - 1, y)
+    let q = snapshot.pixel(x, y)
+    let r = snapshot.pixel(x + 1, y)
+    if (p.r != q.r || p.g != q.g || p.b != q.b) && (q.r != r.r || q.g != r.g || q.b != r.b) { return true }
+    x = x + 1
+  }
+  return false
+}
+
+effect fn imageRendering() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut smooth = run photo(&fonts, b"display:block;width:400px;height:300px")
+  let mut pixelated = run photo(&fonts, b"display:block;width:400px;height:300px;image-rendering:pixelated")
+  let mut a = CpuSnapshot.make()
+  run a.sync(&mut smooth)
+  let smoothed = run a.render(&smooth)
+  let mut b = CpuSnapshot.make()
+  run b.sync(&mut pixelated)
+  let blocky = run b.render(&pixelated)
+  // The 160 pixel wide photo at 2.5x: each texel covers two or three pixels unless smoothed.
+  run Testing.expect(hasLonePixel(&smoothed, 150), "smooth blends between texels")
+  run Testing.expect(!hasLonePixel(&blocky, 150) && !hasLonePixel(&blocky, 151), "pixelated repeats each texel")
+}
+
+test effect fn pixelImageRenderingPixelated() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run imageRendering() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A scroll container styled `outer` (see `PORT`) in the 400 by 300 root, holding a box styled
+/// `inner` (see `TALL`), scrolled down by `scrolled` and painted.
+// The 100 by 100 scroll container 120px down, and the 300 tall box in it.
+// PORT: display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none
+// TALL: display:block;width:100px;height:300px
+effect fn scroller(fonts: &FontCollection, outer: &[u8], inner: &[u8], scrolled: f32) -> Pixmap ! TreeError | CssError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let port = run written.declarations(outer)
+  run batch.style(2, port.asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  let tall = run written.declarations(inner)
+  run batch.style(3, tall.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  if scrolled > 0.0 {
+    let mut scroll = Batch.make()
+    run scroll.scrollTo(2, 0.0, scrolled)
+    run tree.apply(run scroll.take())
+    run tree.frame(viewport())
+  }
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+fn reddish(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.r > 200 && p.b < 60
+}
+
+fn bluish(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.b > 200 && p.r < 60
+}
+
+effect fn backgroundAttachment() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let scroll = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;background-image:linear-gradient(red 50%, blue 50%)", b"display:block;width:100px;height:300px;", 200.0)
+  run Testing.expect(reddish(&scroll, 10, 130) && bluish(&scroll, 10, 210), "scroll stays with the box")
+  let local = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;background-image:linear-gradient(red 50%, blue 50%);background-attachment:local", b"display:block;width:100px;height:300px;", 0.0)
+  run Testing.expect(reddish(&local, 10, 130) && reddish(&local, 10, 210), "local spans what the box scrolls over")
+  let localScrolled = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;background-image:linear-gradient(red 50%, blue 50%);background-attachment:local", b"display:block;width:100px;height:300px;", 200.0)
+  run Testing.expect(bluish(&localScrolled, 10, 130) && bluish(&localScrolled, 10, 210), "local scrolls with the content")
+  let fixed = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;", b"display:block;width:100px;height:300px;background-image:linear-gradient(red 50%, blue 50%);background-attachment:fixed", 0.0)
+  run Testing.expect(reddish(&fixed, 10, 130) && bluish(&fixed, 10, 210), "fixed is placed on the viewport")
+  let fixedScrolled = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;", b"display:block;width:100px;height:300px;background-image:linear-gradient(red 50%, blue 50%);background-attachment:fixed", 150.0)
+  run Testing.expect(reddish(&fixedScrolled, 10, 130) && bluish(&fixedScrolled, 10, 210), "fixed stays put as its box scrolls")
+  let fixedPast = run scroller(&fonts, b"display:block;margin-top:120px;width:100px;height:100px;overflow:auto;scrollbar-width:none;", b"display:block;width:100px;height:300px;background-image:linear-gradient(red 50%, blue 50%);background-attachment:fixed;height:150px;margin-bottom:150px", 100.0)
+  let after = fixedPast.pixel(10, 210)
+  run Testing.expect(white(after.r, after.g, after.b), "fixed is cut to its box, which scrolls")
+}
+
+test effect fn pixelBackgroundAttachmentFixedAndLocal() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backgroundAttachment() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A red 100 by 100 box at the origin of the white 400 by 300 root, styled `masks` as well.
+effect fn masked(fonts: &FontCollection, masks: &[u8]) -> Pixmap ! TreeError | CssError | GeometryError | OutOfMemoryError ? &mut Allocator {
+  let mut tree = run UiTree.make(fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  let own = run written.declarations(masks)
+  run batch.style(2, own.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+fn shown(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.r > 200 && p.g < 60
+}
+
+fn hidden(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return white(p.r, p.g, p.b)
+}
+
+effect fn maskModesAndComposites() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  // Top half and left half, as two layers: the first listed is on top.
+  let add = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(black 50%, transparent 50%), linear-gradient(90deg, black 50%, transparent 50%)")
+  run Testing.expect(shown(&add, 75, 25) && shown(&add, 25, 75) && hidden(&add, 75, 75), "add keeps either half")
+  let intersect = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(black 50%, transparent 50%), linear-gradient(90deg, black 50%, transparent 50%);mask-composite:intersect")
+  run Testing.expect(shown(&intersect, 25, 25) && hidden(&intersect, 75, 25) && hidden(&intersect, 25, 75), "intersect keeps where both are")
+  let subtract = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(black 50%, transparent 50%), linear-gradient(90deg, black 50%, transparent 50%);mask-composite:subtract")
+  run Testing.expect(shown(&subtract, 75, 25) && hidden(&subtract, 25, 25) && hidden(&subtract, 25, 75), "subtract keeps the top half outside the left half")
+  let exclude = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(black 50%, transparent 50%), linear-gradient(90deg, black 50%, transparent 50%);mask-composite:exclude")
+  run Testing.expect(shown(&exclude, 75, 25) && shown(&exclude, 25, 75) && hidden(&exclude, 25, 25) && hidden(&exclude, 75, 75), "exclude keeps where one is")
+  let bright = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(white 50%, black 50%);mask-mode:luminance")
+  run Testing.expect(shown(&bright, 50, 25) && hidden(&bright, 50, 75), "luminance shows under white and hides under black")
+}
+
+test effect fn pixelMaskModeAndComposite() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run maskModesAndComposites() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn blue(image: &Pixmap, x: u32, y: u32) -> bool {
+  let p = image.pixel(x, y)
+  return p.b > 200 && p.r < 60
+}
+
+effect fn imageBorders() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let plain = run masked(&fonts, b"display:block;width:100px;height:100px;box-sizing:border-box;border:20px solid green;background-color:white;border-image:linear-gradient(red, red) 30")
+  run Testing.expect(shown(&plain, 5, 50) && shown(&plain, 50, 5), "the border image draws in place of the border")
+  run Testing.expect(hidden(&plain, 50, 50), "the middle stays empty without fill")
+  let filled = run masked(&fonts, b"display:block;width:100px;height:100px;box-sizing:border-box;border:20px solid green;background-color:white;border-image:linear-gradient(red, red) 30 fill")
+  run Testing.expect(shown(&filled, 50, 50), "fill draws the middle")
+  // Slices of half the image: the corners show its quadrants and the edges get nothing.
+  let halves = run masked(&fonts, b"display:block;width:100px;height:100px;box-sizing:border-box;border:20px solid green;background-color:white;border-image-source:linear-gradient(90deg, red 50%, blue 50%);border-image-slice:50%")
+  run Testing.expect(shown(&halves, 5, 5) && blue(&halves, 95, 5), "each corner takes its own slice")
+  run Testing.expect(hidden(&halves, 50, 5), "an empty edge slice draws nothing")
+  let outset = run masked(&fonts, b"display:block;width:100px;height:100px;box-sizing:border-box;border:20px solid green;background-color:white;border-image:linear-gradient(red, red) 30 / 1 / 10px")
+  run Testing.expect(shown(&outset, 105, 50) && hidden(&outset, 115, 50), "the outset grows the border image area")
+  let frame = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-border:linear-gradient(black, black) 30 / 20px")
+  run Testing.expect(shown(&frame, 5, 50) && hidden(&frame, 50, 50), "a mask border shows the border area only")
+  let both = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-image:linear-gradient(black 50%, transparent 50%);mask-border:linear-gradient(black, black) 30 / 20px")
+  run Testing.expect(shown(&both, 5, 25) && hidden(&both, 5, 75) && hidden(&both, 50, 25), "a mask border multiplies with the mask layers")
+  let bright = run masked(&fonts, b"display:block;width:100px;height:100px;background-color:red;mask-border:linear-gradient(white 50%, black 50%) 30 fill / 20px;mask-border-mode:luminance")
+  run Testing.expect(shown(&bright, 50, 25) && hidden(&bright, 50, 75), "a luminance mask border hides under black")
+}
+
+effect fn imageFunctions() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let half = run masked(&fonts, b"display:block;width:100px;height:100px;background-image:cross-fade(linear-gradient(red, red) 50%, linear-gradient(blue, blue))")
+  let a = half.pixel(50, 50)
+  run Testing.expect(a.r > 110 && a.r < 145 && a.b > 110 && a.b < 145, "cross-fade() mixes half and half")
+  let legacy = run masked(&fonts, b"display:block;width:100px;height:100px;background-image:-webkit-cross-fade(linear-gradient(red, red), linear-gradient(blue, blue), 25%)")
+  let b = legacy.pixel(50, 50)
+  run Testing.expect(b.r > 175 && b.b > 50 && b.b < 80, "-webkit-cross-fade() weighs the second image by its percentage")
+  let gray = run masked(&fonts, b"display:block;width:100px;height:100px;background-image:filter(linear-gradient(red, red), grayscale(1))")
+  let c = gray.pixel(50, 50)
+  run Testing.expect(c.r == c.g && c.g == c.b && c.r > 30 && c.r < 80, "filter() filters a gradient")
+  let framed = run masked(&fonts, b"display:block;width:100px;height:100px;box-sizing:border-box;border:20px solid green;border-image:cross-fade(linear-gradient(red, red) 50%, linear-gradient(blue, blue)) 30")
+  let d = framed.pixel(5, 50)
+  run Testing.expect(d.r > 110 && d.b > 110 && d.g < 10, "a border image takes cross-fade()")
+}
+
+test effect fn pixelCrossFadeAndFilterImages() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run imageFunctions() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn pixelBorderImageAndMaskBorder() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run imageBorders() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// A 100 by 100 box at the origin with `overflow: hidden` and 40px corners over a red child
@@ -577,4 +778,104 @@ effect fn ellipticalRadii() ! TreeError | CssError | GeometryError | OutOfMemory
 test effect fn pixelBorderRadiusMatchesChromium() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run ellipticalRadii() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A collapsed table split across two balanced columns: three rows in the first, two in the
+// second, and no table border where it breaks (box-decoration-break: slice), as in Chromium.
+effect fn splitCollapsedTable() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, (run written.declarations(b"display:block;width:400px;height:300px;background-color:white")).asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.style(2, (run written.declarations(b"display:block;column-count:2;column-gap:10px;width:250px")).asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.style(3, (run written.declarations(b"display:table;border-collapse:collapse;border:4px solid rgb(0, 0, 0)")).asSlice())
+  let mut id: u32 = 10
+  while id < 15 {
+    run batch.create(id, NodeKind.Box)
+    run batch.append(3, id)
+    run batch.style(id, (run written.declarations(b"display:table-row")).asSlice())
+    run batch.create(id + 10, NodeKind.Box)
+    run batch.append(id, id + 10)
+    run batch.style(id + 10, (run written.declarations(b"display:table-cell;width:40px;height:20px;border:2px solid rgb(128, 0, 128);background-color:rgb(255, 192, 203)")).asSlice())
+    id = id + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let top = painted.pixel(20, 0)
+  run Testing.expect(top.r == 0 && top.g == 0 && top.b == 0, "the table's top border opens the first column")
+  let end = painted.pixel(20, 69)
+  run Testing.expect(end.r == 128 && end.g == 0 && end.b == 128, "the first column ends on the third row's cell border, not the table's")
+  let below = painted.pixel(20, 75)
+  run Testing.expect(below.r == 255 && below.g == 255 && below.b == 255, "the fourth row is not in the first column")
+  let next = painted.pixel(150, 1)
+  run Testing.expect(next.r == 128 && next.g == 0 && next.b == 128, "the second column opens on a cell border")
+  let row = painted.pixel(150, 10)
+  run Testing.expect(row.r == 255 && row.g == 192 && row.b == 203, "with the fourth row")
+}
+
+test effect fn pixelTablesSplitAcrossColumns() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run splitCollapsedTable() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A collapsed table whose tall second row splits between two columns: the split cell draws
+// no border on the break, above or below it, as in Chromium.
+effect fn splitCollapsedRow() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, (run written.declarations(b"display:block;width:400px;height:300px;background-color:white")).asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.style(2, (run written.declarations(b"display:block;column-count:3;column-gap:20px;column-fill:auto;height:100px;width:340px")).asSlice())
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run batch.style(3, (run written.declarations(b"display:table;border-collapse:collapse;border:4px solid rgb(0, 0, 0)")).asSlice())
+  let mut id: u32 = 10
+  while id < 12 {
+    run batch.create(id, NodeKind.Box)
+    run batch.append(3, id)
+    run batch.style(id, (run written.declarations(b"display:table-row")).asSlice())
+    run batch.create(id + 10, NodeKind.Box)
+    run batch.append(id, id + 10)
+    run batch.style(id + 10, (run written.declarations(b"display:table-cell;width:40px;border:2px solid rgb(128, 0, 128);background-color:rgb(255, 192, 203)")).asSlice())
+    let mut blocks: u32 = 1
+    if id == 11 { blocks = 5 }
+    let mut block: u32 = 0
+    while block < blocks {
+      let child = 100 + id * 10 + block
+      run batch.create(child, NodeKind.Box)
+      run batch.append(id + 10, child)
+      run batch.style(child, (run written.declarations(b"display:block;height:20px")).asSlice())
+      block = block + 1
+    }
+    id = id + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let end = painted.pixel(20, 98)
+  run Testing.expect(end.r == 255 && end.g == 192 && end.b == 203, "the split cell runs to the first column's end without a border")
+  let side = painted.pixel(1, 98)
+  run Testing.expect(side.r == 0 && side.g == 0 && side.b == 0, "the table's side border runs down with it")
+  let next = painted.pixel(140, 1)
+  run Testing.expect(next.r == 255 && next.g == 192 && next.b == 203, "and goes on at the second column's top without one")
+}
+
+test effect fn pixelTableRowsSplitAcrossColumns() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run splitCollapsedRow() |> Effect.provideMut<Allocator>(&mut allocator)
 }

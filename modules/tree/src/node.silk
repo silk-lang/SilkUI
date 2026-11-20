@@ -7,6 +7,7 @@ import svg_css.variables { ScopeId }
 import silk.mem.frozen { Frozen }
 import style_identity { NodeIdentity }
 import edit { EditState }
+import live_svg { LiveSvg }
 import paint_css { Effects }
 import transform { Placement }
 import font_raster.face { FontFace }
@@ -85,6 +86,75 @@ impl FrameStats {
   }
 }
 
+/// Work the tree did since it was made, for the bench census (`UiTree.census`).
+pub struct Work {
+  pub mutations: usize,
+  pub creates: usize,
+  pub inserts: usize,
+  pub setStyles: usize,
+  pub styleDeclarations: usize,
+  pub setTexts: usize,
+  pub textBytes: usize,
+  pub attributes: usize,
+  pub listens: usize,
+  pub batches: usize,
+  /// `resolve` calls, and those that were a tick of the clock.
+  pub resolves: usize,
+  pub ticks: usize,
+  /// `resolveSheet`: text nodes and sheetless trees skipped, records taken from a twin,
+  /// matches run, and of those the ones the record cache answered.
+  pub sheetSkips: usize,
+  pub sheetTwins: usize,
+  pub sheetMatches: usize,
+  pub sheetCacheHits: usize,
+  /// Computed values copied from a lender instead of built.
+  pub lenders: usize,
+  pub styleShares: usize,
+  pub frames: usize,
+  pub styleFrames: usize,
+  pub layoutFrames: usize,
+  pub paintFrames: usize,
+  pub hoverRefreshes: usize,
+  pub paintedFragments: usize,
+  pub culledSubtrees: usize,
+  pub replayedSubtrees: usize,
+  pub repaintedSubtrees: usize,
+  pub replayedOperations: usize,
+  pub paintedGlyphs: usize,
+  /// css-layout's counters summed over every compute, and the passes that only moved scroll offsets.
+  pub layoutPasses: usize,
+  pub layoutFull: usize,
+  pub layoutProbes: usize,
+  pub layoutCacheHits: usize,
+  pub layoutReused: usize,
+  pub layoutMoves: usize,
+  pub fragmentsResolved: usize,
+  pub inlineLayouts: usize,
+  pub plainLines: usize,
+  pub linesEmitted: usize,
+  pub attributeBytes: usize,
+  /// `resolveStyles` calls, those that went past the early return, and the media conditions
+  /// evaluated and rules walked by the environment update each call makes first.
+  pub styleCalls: usize,
+  pub stylePasses: usize,
+  pub conditionsEvaluated: usize,
+  pub conditionRulesWalked: usize,
+  /// Calls JavaScript made into the host bindings, as the JS host last reported them.
+  pub bridgeCalls: usize,
+}
+
+impl Work {
+  pub fn zero() -> Work {
+    return Work {
+      mutations: 0, creates: 0, inserts: 0, setStyles: 0, styleDeclarations: 0, setTexts: 0, textBytes: 0, attributes: 0, listens: 0, batches: 0,
+      resolves: 0, ticks: 0, sheetSkips: 0, sheetTwins: 0, sheetMatches: 0, sheetCacheHits: 0, lenders: 0, styleShares: 0,
+      frames: 0, styleFrames: 0, layoutFrames: 0, paintFrames: 0, hoverRefreshes: 0,
+      paintedFragments: 0, culledSubtrees: 0, replayedSubtrees: 0, repaintedSubtrees: 0, replayedOperations: 0, paintedGlyphs: 0,
+      layoutPasses: 0, layoutFull: 0, layoutProbes: 0, layoutCacheHits: 0, layoutReused: 0, layoutMoves: 0, fragmentsResolved: 0, inlineLayouts: 0, plainLines: 0, linesEmitted: 0, attributeBytes: 0, bridgeCalls: 0, styleCalls: 0, stylePasses: 0, conditionsEvaluated: 0, conditionRulesWalked: 0,
+    }
+  }
+}
+
 /// The paint cache of a node: the operations its subtree added to the scene of frame `frame`.
 pub struct PaintCache {
   pub hash: u64,
@@ -127,13 +197,16 @@ pub struct Node {
   /// The parent slot, or NONE.
   pub parent: u32,
   pub base: List<Declaration>,
-  pub hover: List<Declaration>,
-  pub active: List<Declaration>,
-  pub focus: List<Declaration>,
-  pub focusVisible: List<Declaration>,
-  /// The `@starting-style` look (see `StyleState.Starting`).
-  pub starting: List<Declaration>,
-  pub computed: Computed,
+  /// The other looks, the transition text, the test id and the canvas commands: what most
+  /// nodes leave empty, on the heap (see `NodeExtras`).
+  pub extras: Option<Box<NodeExtras>>,
+  /// The computed style, shared with every node whose values are the same (see `style_pool`).
+  /// Read it with [`Node.computed`]; `UiTree.setComputed` replaces it.
+  pub styled: Frozen<Computed>,
+  /// The computed style of a node an animation or a transition is moving, in place of
+  /// `styled`: it changes every frame and no other node has it, so the node holds it alone
+  /// and each frame writes it where it is (`UiTree.setMovingComputed`).
+  pub moving: Option<Box<Computed>>,
   pub fontKey: usize,
   pub paintHash: u64,
   pub text: String,
@@ -143,7 +216,6 @@ pub struct Node {
   pub valueMax: f32,
   pub valueNow: f32,
   pub label: String,
-  pub testId: String,
   pub tabIndex: i32,
   pub cursor: Cursor,
   pub disabled: bool,
@@ -177,13 +249,12 @@ pub struct Node {
   /// The node and its ancestors were displayed at its last style resolve: it has a
   /// before-change style for transitions.
   pub rendered: bool,
-  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
-  pub transition: String,
   /// The scroll offset of a scroll container, clamped to its range at the last frame.
   pub scrollX: f32,
   pub scrollY: f32,
   pub resource: u32,
-  pub canvas: List<CanvasCommand>,
+  /// An icon node's live svg (`Mutation.SvgInsert`), on the heap: drawn instead of its resource.
+  pub svg: Option<Box<LiveSvg>>,
   /// Bumped when the text, source or canvas changes, and for inputs when the caret, the
   /// selection or the composition does.
   pub content: u64,
@@ -213,6 +284,38 @@ pub struct Node {
   pub computedStamp: u32,
   pub selectorIdentity: Option<Box<NodeIdentity>>,
   pub cache: PaintCache,
+}
+
+/// What a node may hold and most do not: a node gets one with the first of these it is given.
+/// Each is a list or a text, whose header alone is 64 bytes, and a long document has tens of
+/// thousands of nodes; in the node they were half of it. Read them through the node
+/// (`Node.hover`, `Node.transition`, ...), which gives the empty value for a node without them.
+pub struct NodeExtras {
+  pub hover: List<Declaration>,
+  pub active: List<Declaration>,
+  pub focus: List<Declaration>,
+  pub focusVisible: List<Declaration>,
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub starting: List<Declaration>,
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub transition: String,
+  pub testId: String,
+  pub canvas: List<CanvasCommand>,
+}
+
+impl NodeExtras {
+  pub fn make() -> NodeExtras {
+    return NodeExtras {
+      hover: List<Declaration>.make(),
+      active: List<Declaration>.make(),
+      focus: List<Declaration>.make(),
+      focusVisible: List<Declaration>.make(),
+      starting: List<Declaration>.make(),
+      transition: String.make(),
+      testId: String.make(),
+      canvas: List<CanvasCommand>.make(),
+    }
+  }
 }
 
 /// A node's rarer accessibility attributes, named and valued as their `Attribute`s.
@@ -272,6 +375,89 @@ impl Semantics {
 }
 
 impl Node {
+  /// The node's computed style.
+  @inlineAlways
+  pub fn computed(self: &Self) -> &Computed {
+    return match &self.moving {
+      Option<Box<Computed>>.Some { value } => &value.get()[0]
+      Option<Box<Computed>>.None => self.styled.get()
+    }
+  }
+
+  /// The node's rarer parts, when it was given any (see `NodeExtras`).
+  pub fn extrasOf(self: &Self) -> Option<&NodeExtras> {
+    return match &self.extras {
+      Option<Box<NodeExtras>>.Some { value } => Option<&NodeExtras>.Some { value: &value.get()[0] }
+      Option<Box<NodeExtras>>.None => Option<&NodeExtras>.None
+    }
+  }
+
+  /// The node's rarer parts to change, made on first use.
+  pub effect fn extrasMut(self: &mut Self) -> &mut NodeExtras ! OutOfMemoryError ? &mut Allocator {
+    if self.extras.isNone() {
+      self.extras = Option<Box<NodeExtras>>.Some { value: run Box<NodeExtras>.make(NodeExtras.make()) }
+    }
+    match &mut self.extras {
+      Option<Box<NodeExtras>>.Some { value } => {
+        return &mut value.getMut()[0]
+      }
+      Option<Box<NodeExtras>>.None => {
+        return Intrinsic.trap("ui-tree: the node's extras were just made")
+      }
+    }
+  }
+
+  /// The node's rarer parts to change, when it has them.
+  pub fn extrasHeld(self: &mut Self) -> Option<&mut NodeExtras> {
+    return match &mut self.extras {
+      Option<Box<NodeExtras>>.Some { value } => Option<&mut NodeExtras>.Some { value: &mut value.getMut()[0] }
+      Option<Box<NodeExtras>>.None => Option<&mut NodeExtras>.None
+    }
+  }
+
+  /// The `:hover` look.
+  pub fn hover(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.hover.asSlice() _ => &[] }
+  }
+
+  /// The `:active` look.
+  pub fn active(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.active.asSlice() _ => &[] }
+  }
+
+  /// The `:focus` look.
+  pub fn focus(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focus.asSlice() _ => &[] }
+  }
+
+  /// The `:focus-visible` look.
+  pub fn focusVisible(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focusVisible.asSlice() _ => &[] }
+  }
+
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub fn starting(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.starting.asSlice() _ => &[] }
+  }
+
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub fn transition(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.transition) _ => "" }
+  }
+
+  pub fn hasTransition(self: &Self) -> bool {
+    return match self.extrasOf() { Option.Some { value } => value.transition.ownedByteLength() != 0 _ => false }
+  }
+
+  pub fn testId(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.testId) _ => "" }
+  }
+
+  /// The drawing commands of a canvas node.
+  pub fn canvas(self: &Self) -> &[CanvasCommand] {
+    return match self.extrasOf() { Option.Some { value } => value.canvas.asSlice() _ => &[] }
+  }
+
   pub fn generatedOrigin(self: &Self) -> u32 {
     return match self.identity() { Option.Some { value } => value.generatedOrigin _ => NONE }
   }
@@ -317,6 +503,17 @@ impl Node {
     return match &mut self.selectorIdentity {
       Option<Box<NodeIdentity>>.Some { value } => &mut value.getMut()[0]
       _ => Intrinsic.trap("ui-tree: selector identity was just made")
+    }
+  }
+
+  /// The node's live svg, made empty on first use.
+  pub effect fn liveSvg(self: &mut Self) -> &mut LiveSvg ! OutOfMemoryError ? &mut Allocator {
+    if self.svg.isNone() {
+      self.svg = Option<Box<LiveSvg>>.some(run Box<LiveSvg>.make(run LiveSvg.make()))
+    }
+    return match &mut self.svg {
+      Option<Box<LiveSvg>>.Some { value } => &mut value.getMut()[0]
+      _ => Intrinsic.trap("ui-tree: live svg was just made")
     }
   }
 

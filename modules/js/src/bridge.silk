@@ -22,6 +22,7 @@ import silk.system.random_native { OsRandom }
 import silk.system.system_info { SystemInfo, SystemInfoError }
 import silk.system.system_info_native { OsSystemInfo }
 import ui_tree.process_memory
+import ui_tree.live_svg
 import ui_tree.style_media { MediaState }
 import ui_tree.battery
 import ui_tree.battery { BatteryState }
@@ -48,9 +49,10 @@ import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
-import silkjs.js_heap { CellRef }
+import silkjs.js_heap { CellRef, HeapHeader }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
+import silkjs.js_bytecode_image as image
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
@@ -236,6 +238,18 @@ pub const FONT_FAMILY: u32 = 276542 // nativeId(b"fontFamily")
 pub const OPEN: u32 = 337491 // nativeId(b"open")
 /// `__ui.defineIcon(resource, markup)`: parses SVG markup as icon resource `resource`.
 pub const DEFINE_ICON: u32 = 917712 // nativeId(b"defineIcon")
+/// `__ui.svgInsert(id, element, tag, parent, before)`: makes or moves element `element` of the
+/// live svg of icon node `id` (see `Mutation.SvgInsert`); `before` -1 puts it last.
+pub const SVG_INSERT: u32 = 836345 // nativeId(b"svgInsert")
+/// `__ui.svgRemove(id, element)`: removes an element of a live svg; element 0 ends it.
+pub const SVG_REMOVE: u32 = 457614 // nativeId(b"svgRemove")
+/// `__ui.svgMeasure(op, packed, distance)`: an element's `getBBox()` (op 0, "x y width
+/// height"), `getTotalLength()` (1) or `getPointAtLength(distance)` (2, "x y") from its
+/// markup, packed as `ui_tree.live_svg.measure` reads it. Returns a string.
+pub const SVG_MEASURE: u32 = 250367 // nativeId(b"svgMeasure")
+/// `__ui.svgAttribute(id, element, name, value)`: sets an attribute of a live svg element, or
+/// removes it when `value` is null.
+pub const SVG_ATTRIBUTE: u32 = 599864 // nativeId(b"svgAttribute")
 /// `__ui.source(id, resource)`: points an image or icon node at a resource.
 pub const SOURCE: u32 = 101910 // nativeId(b"source")
 /// `__ui.load(resource, url, icon)`: asks the host to load `url` (`data:`, a file, `http(s):`)
@@ -278,6 +292,10 @@ pub const MODULE_LOAD: u32 = 100
 pub struct ModuleSource {
   pub name: List<u8>,
   pub source: List<u8>,
+  /// `source` compiled into a bytecode image when the program was built
+  /// (`JsHost.defineImaged`), or empty: the first import starts from it when this engine
+  /// build wrote it.
+  pub image: &'static [u8],
 }
 
 /// A timer JavaScript asked for: `__ui.fire(id)` is due at `due`, in the host clock's
@@ -344,6 +362,14 @@ pub struct Bridge {
   pub geometry: List<f64>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
+  /// For the bench census: every `__ui.*` call JavaScript made; and for the collections,
+  /// the allocator's bytes and blocks as each began and the sums of what each freed.
+  pub calls: usize,
+  pub gcBeforeBytes: usize,
+  pub gcBeforeBlocks: usize,
+  pub gcFreedBytes: usize,
+  pub gcFreedBlocks: usize,
+  pub gcScannedBytes: usize,
 }
 
 /// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
@@ -407,6 +433,8 @@ impl Bridge {
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
       observers: Observers.make(),
+      calls: 0,
+      gcBeforeBytes: 0, gcBeforeBlocks: 0, gcFreedBytes: 0, gcFreedBlocks: 0, gcScannedBytes: 0,
     }
   }
 
@@ -568,6 +596,10 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"observe", arity: 3 },
     Native { name: b"unobserve", arity: 2 },
     Native { name: b"styleSheet", arity: 3 },
+    Native { name: b"svgAttribute", arity: 4 },
+    Native { name: b"svgInsert", arity: 5 },
+    Native { name: b"svgMeasure", arity: 3 },
+    Native { name: b"svgRemove", arity: 2 },
     Native { name: b"compileStyleSheet", arity: 1 },
     Native { name: b"cpus", arity: 0 },
     Native { name: b"timer", arity: 2 },
@@ -609,6 +641,11 @@ fn truthy(value: ValueBits) -> bool {
 
 effect fn text<'v>(value: ValueRef<'v>) -> String ! OutOfMemoryError ? &mut Allocator {
   if !value.view().isString() { return String.make() }
+  let flat = Strings.flatView(value.view())
+  if Strings.isFlatAscii(flat) {
+    let bytes = unsafe Strings.flatLatin1(&value, flat)
+    return run String.copy(unsafe String.fromUtf8Unchecked(bytes))
+  }
   let bytes = run Strings.toUtf8(value.view(), false)
   return run String.copy(unsafe String.fromUtf8Unchecked(bytes.asSlice()))
 }
@@ -665,6 +702,7 @@ effect fn replied(reply: Reply) -> Outcome ! OutOfMemoryError ? &mut Allocator {
 /// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
 /// `Bridge` (an embedded runtime's) calls it from its own native dispatch.
 pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  bridge.calls = bridge.calls + 1
   let first = id(argv.get(0).view())
   if function == CREATE {
     run bridge.batch.create(first, nodeKind(id(argv.get(1).view())))
@@ -676,7 +714,7 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.root(first)
   } else if function == SET_TEXT {
     let value = run text(argv.get(1))
-    run bridge.batch.setText(first, String.view(&value))
+    run bridge.batch.push(Mutation.SetText { id: first, value: move value })
   } else if function == LISTEN {
     run bridge.batch.listen(first, id(argv.get(1).view()))
   } else if function == COMPILE_STYLE_SHEET {
@@ -891,14 +929,41 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == DEFINE_ICON {
     let markup = run text(argv.get(1))
     run bridge.batch.icon(first, String.utf8Bytes(String.view(&markup)))
+  } else if function == SVG_INSERT {
+    let tag = run text(argv.get(2))
+    let before = number(argv.get(4).view())
+    let at = if before < 0.0 { Option<u32>.None } else { Option<u32>.some(f64.toU32(before)) }
+    run bridge.batch.svgInsert(first, id(argv.get(1).view()), String.view(&tag), id(argv.get(3).view()), at)
+  } else if function == SVG_REMOVE {
+    run bridge.batch.svgRemove(first, id(argv.get(1).view()))
+  } else if function == SVG_MEASURE {
+    let packed = run text(argv.get(1))
+    let mut out = List<u8>.make()
+    run live_svg.measure(String.utf8Bytes(String.view(&packed)), first, number(argv.get(2).view()), &mut out)
+    let made = run Effect.result(Strings.fromUtf8(out.asSlice()))
+    return match move made {
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Success { value } => Outcome.Returned { value: value }
+      Result<ValueBits, OutOfMemoryError | StringLengthError>.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        StringLengthError _ => Outcome.Returned { value: ValueBits.number(0.0) }
+      }
+    }
+  } else if function == SVG_ATTRIBUTE {
+    let name = run text(argv.get(2))
+    if argv.get(3).view().isString() {
+      let value = run text(argv.get(3))
+      run bridge.batch.svgAttribute(first, id(argv.get(1).view()), String.view(&name), Option<string>.some(String.view(&value)))
+    } else {
+      run bridge.batch.svgAttribute(first, id(argv.get(1).view()), String.view(&name), Option<string<'static>>.None)
+    }
   } else if function == SOURCE {
     run bridge.batch.source(first, id(argv.get(1).view()))
   } else if function == LOAD {
     let url = run text(argv.get(1))
     if truthy(argv.get(2).view()) {
-      run bridge.batch.loadIcon(first, String.view(&url))
+      run bridge.batch.push(Mutation.LoadIcon { resource: first, url: move url })
     } else {
-      run bridge.batch.loadImage(first, String.view(&url))
+      run bridge.batch.push(Mutation.LoadImage { resource: first, url: move url })
     }
   } else if function == RELEASE {
     run bridge.batch.releaseResource(first)
@@ -1282,6 +1347,17 @@ impl EngineServices for Bridge {
   /// so their code and CLDR tables stay out of the program.
   fn includesIntl<'m>(engine: &Engine<'m, Self>) -> bool { return false }
   fn includesTemporal<'m>(engine: &Engine<'m, Self>) -> bool { return false }
+  /// For the bench census: what each collection found live when it began and freed.
+  unsafe fn gcLifecycle<'m>(engine: &mut Engine<'m, Self>, runtime: *mut HeapHeader, event: u32) -> () {
+    // The gate-free reading: a collection may run where the ledger's gate is held.
+    let used = engine.memory.usedBytes()
+    if (event & 1) == 0 {
+      engine.services.gcBeforeBytes = used
+      engine.services.gcScannedBytes = engine.services.gcScannedBytes + used
+    } else if engine.services.gcBeforeBytes > used {
+      engine.services.gcFreedBytes = engine.services.gcFreedBytes + (engine.services.gcBeforeBytes - used)
+    }
+  }
   /// No host globals: a shadow realm has its intrinsics alone.
   effect fn initializeShadowRealm<'r, 's, 'm>(engine: &mut Engine<'m, Self>, caller: Realm<'r>, created: Realm<'s>) -> () ! JsException ? &mut Allocator {}
 
@@ -1329,6 +1405,16 @@ impl EngineServices for Bridge {
     callback: NativeFunctionId, opaque: ?*mut u8, name: &[u8], attributes: ValueRef<'v>) -> CellRef<ModuleDef> ! OutOfMemoryError | JsException ? &mut Allocator {
     let source = match engine.services.find(name) {
       Option<usize>.Some { value: index } => {
+        // Compiled when the program was built: nothing is parsed. The image is part of the
+        // program, so the engine can read it for as long as the realm lives.
+        let compiledImage = engine.services.modules.asSlice()[index].image
+        if compiledImage.length != 0 && image.loadable(compiledImage) {
+          let loaded = run unsafe image.load(&mut engine, realm, Pointer.fromRef<u8>(&compiledImage[0]), compiledImage.length)
+          return match loaded.view() {
+            ValueBits.Module { reference } => unsafe CellRef<ModuleDef>.of(reference)
+            _ => Intrinsic.trap("the module image held something else")
+          }
+        }
         let mut copy = List<u8>.make()
         run copy.appendSlice(engine.services.modules.asSlice()[index].source.asSlice())
         move copy

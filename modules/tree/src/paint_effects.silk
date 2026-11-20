@@ -2,9 +2,10 @@
 //! gradients with any number of stops, sized, positioned and repeated), `text-shadow`, and the isolated layers for
 //! `filter`, `mix-blend-mode`, `clip-path` and `mask`. A run of filter functions that the scene
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
-import paint { Painter, borderBox, paddingBox, contentBox, device, snapped, radiiOf }
-import paint_css { Effects, Layers, Clip, TextShadow }
-import vector.layer { BLEND_NORMAL }
+import paint { Painter, usedBorder, borderBox, paddingBox, contentBox, device, snapped, radiiOf }
+import paint_css { Effects, Layers, Clip, TextShadow, ImageBorder, ATTACH_FIXED, ATTACH_LOCAL }
+import ui_scene.scroll { ScrollAxis, ScrollLink, ROOT_GROUP, UNBOUNDED }
+import vector.layer { BLEND_NORMAL, BLEND_PLUS_LIGHTER, BLEND_SOURCE_IN, BLEND_SOURCE_OUT, BLEND_XOR }
 import resources { Resource }
 import atlas.atlas { AtlasTile }
 import silk.collections.bytes { Bytes }
@@ -12,6 +13,8 @@ import style { Computed }
 import node { NONE }
 import layout.lib { Fragment }
 import svg_css.effect_values {
+  Composite,
+  MaskMode,
   Filter,
   FilterKind,
   Image,
@@ -26,8 +29,10 @@ import svg_css.effect_values {
   RadialSize,
   Extent,
   Corners as ShapeCorners,
+  BorderMeasure,
 }
 import svg_css.dimensions { ExprId }
+import svg_css.dimensions
 import svg_css.transform_values { Position, PositionAxis, Edge }
 import svg_css.colors
 import svg_css.colors { Space as CssSpace, HueMethod, Interpolation as CssInterpolation }
@@ -58,6 +63,7 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.geometry.corners { Corners }
+import silk.geometry.insets { Insets }
 import ui_scene.radii { Radii }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -358,6 +364,134 @@ fn gradientRadii(effects: &Effects, size: RadialSize, circle: bool, cx: f32, cy:
   }
 }
 
+/// The rows of `shape-outside` gradient `image` over a `w` by `h` box, as `FloatShape.rows`
+/// wants them: per sample row, the low and high fraction of the width where the gradient's
+/// alpha passes `threshold` (CSS Shapes 1 §3.1), sampled at up to 128 by 256 points.
+pub effect fn gradientRows(effects: &Effects, image: &Image, w: f32, h: f32, threshold: f32, rows: &mut List<f32>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  rows.clear()
+  if w <= 0.0 || h <= 0.0 {
+    return ()
+  }
+  let mut stops = List<Stop>.make()
+  // 0 linear, 1 radial, 2 conic; `a`, `b` are its angle (radians) and line length, or radii.
+  let mut shape: u32 = 0
+  let mut repeat = false
+  let mut a: f32 = 0.0
+  let mut b: f32 = 0.0
+  let mut center: [f32; 2] = [w * 0.5, h * 0.5]
+  match &image.* {
+    Image.Linear { repeating, direction, stops: list, .. } => {
+      a = angleOf(effects, direction, w, h) * 0.017453292
+      b = f32.abs(w * f32.sin(a)) + f32.abs(h * f32.cos(a))
+      run resolveStops(effects, &list, b, false, &mut stops)
+      repeat = repeating
+    }
+    Image.Radial { repeating, circle, size, position, stops: list, .. } => {
+      center = centerOf(effects, position, w, h)
+      let r = gradientRadii(effects, size, circle, center[0], center[1], w, h)
+      run resolveStops(effects, &list, r[0], false, &mut stops)
+      shape = 1
+      a = r[0]
+      b = r[1]
+      repeat = repeating
+    }
+    Image.Conic { repeating, angle, position, stops: list, .. } => {
+      center = centerOf(effects, position, w, h)
+      run resolveStops(effects, &list, 360.0, false, &mut stops)
+      shape = 2
+      a = effects.number(angle)
+      repeat = repeating
+    }
+    _ => {
+      return ()
+    }
+  }
+  let items = stops.asSlice()
+  if items.length == 0 {
+    return ()
+  }
+  let columns = f32.toU32(f32.min(256.0, f32.max(1.0, f32.ceil(w))))
+  let lines = f32.toU32(f32.min(128.0, f32.max(1.0, f32.ceil(h))))
+  run rows.reserve(u32.toUsize(lines) * 2)
+  let dx = w / u32.toF32(columns)
+  let dy = h / u32.toF32(lines)
+  let mut row: u32 = 0
+  while row < lines {
+    let y = (u32.toF32(row) + 0.5) * dy
+    let mut low = columns
+    let mut high: u32 = 0
+    let mut column: u32 = 0
+    while column < columns {
+      let x = (u32.toF32(column) + 0.5) * dx
+      let t: f32 = if shape == 0 {
+        ((x - w * 0.5) * f32.sin(a) - (y - h * 0.5) * f32.cos(a)) / f32.max(b, 0.0001) + 0.5
+      } else if shape == 1 {
+        if a <= 0.0 || b <= 0.0 {
+          1.0e9
+        } else {
+          let ux = (x - center[0]) / a
+          let uy = (y - center[1]) / b
+          f32.sqrt(ux * ux + uy * uy)
+        }
+      } else {
+        let turn = (f32.atan2(x - center[0], center[1] - y) * 57.29578 - a) / 360.0
+        let whole: f32 = f32.floor(turn)
+        turn - whole
+      }
+      if alphaAt(items, t, repeat) > threshold {
+        if column < low {
+          low = column
+        }
+        high = column + 1
+      }
+      column = column + 1
+    }
+    if high > low {
+      run rows.append(u32.toF32(low) / u32.toF32(columns))
+      run rows.append(u32.toF32(high) / u32.toF32(columns))
+    } else {
+      run rows.append(1.0)
+      run rows.append(0.0)
+    }
+    row = row + 1
+  }
+}
+
+/// The alpha of resolved `stops` at offset `t`, hints left out as paint leaves them out.
+fn alphaAt(stops: &[Stop], t: f32, repeating: bool) -> f32 {
+  let n = stops.length
+  let first = stops[0].offset
+  let last = stops[n - 1].offset
+  let mut at = t
+  if repeating && last > first {
+    let period = last - first
+    let k = (at - first) / period
+    at = first + (k - f32.floor(k)) * period
+  }
+  if at <= first {
+    return stops[0].color.a
+  }
+  if at >= last {
+    return stops[n - 1].color.a
+  }
+  let mut i: usize = 1
+  while i < n {
+    let next = stops[i]
+    if at < next.offset {
+      let prev = stops[i - 1]
+      let span = next.offset - prev.offset
+      if span <= 0.0 {
+        return next.color.a
+      }
+      return prev.color.a + (next.color.a - prev.color.a) * (at - prev.offset) / span
+    }
+    i = i + 1
+  }
+  return stops[n - 1].color.a
+}
+
 /// Paints gradient `image` stretched over `tile` (device pixels) and cut by `clip`.
 /// `radii` rounds the tile when it is exactly the painting area.
 effect fn paintGradient(
@@ -561,8 +695,16 @@ fn tiles(repeat: Repeat, start: f32, size: f32, lo: f32, hi: f32, areaLo: f32, a
   }
 }
 
+/// Every layer: `local` ones as `scroll`, for a box that does not scroll.
+pub const SCOPE_ALL: u8 = 0
+/// The layers of a scroll container outside its scroll group: all but the `local` ones.
+pub const SCOPE_OUTER: u8 = 1
+/// Only the `local` layers, inside the scroll group, placed on `localBox`.
+pub const SCOPE_LOCAL: u8 = 2
+
 /// Paints the image layers of `layers` for fragment `f` (CSS pixels) clipped to `mask`, bottom
-/// layer first. `radii` (device pixels) round the border box; `initialOrigin` is the origin box
+/// layer first. `scope` picks layers by `background-attachment` (see `SCOPE_*`); `fixed` layers
+/// are placed on the viewport and stay there while the scroll containers around them scroll. `radii` (device pixels) round the border box; `initialOrigin` is the origin box
 /// when none is set (padding box for backgrounds, border box for masks). `text` paints only the
 /// `background-clip: text` layers, over the border box, for the caller to mask with the glyphs;
 /// otherwise those layers are left out.
@@ -575,6 +717,9 @@ pub effect fn paintLayers(
   mask: ContentMask,
   initialOrigin: GeometryBox,
   text: bool,
+  nearest: bool,
+  scope: u8,
+  localBox: Rect<f32>,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -583,48 +728,42 @@ pub effect fn paintLayers(
   let mut stops = List<Stop>.make()
   let count = layers.count()
   let mut layer = count
+  // Whether a layer is drawn under the next: the bottom one composites with nothing.
+  let mut composited = false
   while layer > 0 {
     layer = layer - 1
     let image = &layers.images.asSlice()[layer]
-    // A `url()` image, once loaded: its resource, natural size and ratio.
-    let mut picture: Option<Resource> = Option<Resource>.None
-    let mut natural: [f32; 2] = [0.0, 0.0]
-    let mut ratio: f32 = 0.0
-    let drawable = match &image.* {
-      Image.Linear { .. } => true
-      Image.Radial { .. } => true
-      Image.Conic { .. } => true
-      Image.Url { url } => {
-        let id = run p.resources.cssImage(Bytes.asSlice(&url))
-        picture = p.resources.get(id)
-        match picture {
-          Option<Resource>.Some { value } => match value {
-            Resource.Image { width, height, .. } => {
-              natural = [u32.toF32(width), u32.toF32(height)]
-              ratio = if height > 0 { u32.toF32(width) / u32.toF32(height) } else { 0.0 }
-              width > 0 && height > 0
-            }
-            Resource.Icon { icon } => {
-              let r = f64.toF32(p.resources.iconRatio(icon))
-              ratio = if r > 0.0 && f32.isFinite(r) { r } else { 1.0 }
-              let w = p.resources.iconWidth(icon)
-              let h = p.resources.iconHeight(icon)
-              if w > 0.0 && h > 0.0 { natural = [f64.toF32(w), f64.toF32(h)] }
-              true
-            }
-          }
-          Option<Resource>.None => false
-        }
-      }
-      _ => false
-    }
+    let found = run naturalOf(&mut p, image)
+    let picture = found.picture
+    let natural: [f32; 2] = [found.width, found.height]
+    let ratio = found.ratio
+    let drawable = found.drawable
     let clipKind = layers.clip(layer)
     if !drawable || (clipKind == Clip.Text) != text {
       continue
     }
-    let area = boxOf(f, layers.origin(layer, initialOrigin))
-    let painting = clipBox(f, clipKind)
-    let paintingRadii = radii.insetTo(device(border, s), device(painting, s))
+    let attachment = layers.attachment(layer)
+    if (scope == SCOPE_LOCAL) != (attachment == ATTACH_LOCAL) && scope != SCOPE_ALL {
+      continue
+    }
+    let local = scope == SCOPE_LOCAL
+    let fixed = attachment == ATTACH_FIXED && !text
+    let mut area = if local { localBox } else { boxOf(f, layers.origin(layer, initialOrigin)) }
+    let mut painting = if local { localBox } else { clipBox(f, clipKind) }
+    let mut paintingRadii = radii.insetTo(device(border, s), device(painting, s))
+    let mut layerMask = mask
+    let mut opened: u32 = 0
+    if fixed {
+      // Drawn in window space under groups that undo every scroll around the box, cut to the
+      // box's painting area in its own space: scrolling moves the cut, not the image.
+      let cut = mask.intersect(ContentMask.rounded(device(painting, s), paintingRadii))
+      opened = run openFixed(&mut p, cut)
+      area = Rect<f32>.new(0.0, 0.0, p.width, p.height)
+      painting = area
+      paintingRadii = Radii.zero()
+      layerMask = ContentMask.new(device(area, s))
+    }
+    let mask = layerMask
     let size = tileSize(effects, layers.size(layer), area, natural, ratio)
     let repeat = layers.repeat(layer)
     let mut tw = size[0]
@@ -638,6 +777,7 @@ pub effect fn paintLayers(
       th = ah / f32.max(1.0, f32.round(ah / th))
     }
     if tw <= 0.0 || th <= 0.0 {
+      run closeFixed(&mut p, opened)
       continue
     }
     let mut x0 = area.xMin
@@ -655,73 +795,179 @@ pub effect fn paintLayers(
     let nx = f32.toUsize(across[2])
     let ny = f32.toUsize(down[2])
     if nx == 0 || ny == 0 {
+      run closeFixed(&mut p, opened)
       continue
     }
-    // background-blend-mode: the layer blends with the layers and color under it, in the
-    // isolated group the caller opened.
+    // background-blend-mode blends a layer with the layers and color under it, in the isolated
+    // group the caller opened; mask-composite combines a mask layer with the ones under it.
     let mode = layers.blend(layer)
-    if mode != BLEND_NORMAL {
-      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: mode }, LayerEffects.none())
+    let op = if composited { compositeOp(layers.composite(layer)) } else { BLEND_NORMAL }
+    let blend = if mode != BLEND_NORMAL { mode } else { op }
+    if blend != BLEND_NORMAL {
+      let over = if op != BLEND_NORMAL { mask } else { clip }
+      drop run p.scene.pushEffectLayer(over.bounds, over, Isolation { opacity: 1.0, blend: blend }, LayerEffects.none())
     }
-    match picture {
-      Option<Resource>.Some { value } => {
-        run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip)
-        if mode != BLEND_NORMAL { run p.scene.popLayer() }
-        continue
-      }
-      Option<Resource>.None => {}
-    }
-    let single = nx == 1 && ny == 1
-    let first = Rect<f32>.new(across[0], down[0], across[0] + tw, down[0] + th)
-    if single && sameRect(first, painting) {
-      // Snapped like the background color under it, so their edges agree.
-      run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops)
-      if mode != BLEND_NORMAL { run p.scene.popLayer() }
-      continue
-    }
-    let rounded = paintingRadii.isRounded()
-    if rounded {
-      drop run p.scene.pushEffectLayer(
-        clip.bounds,
-        clip,
-        Isolation { opacity: 1.0, blend: 0 },
-        LayerEffects.none(),
-      )
+    if layers.mode(layer) == MaskMode.Luminance {
+      // Luminance to alpha on straight color, masked by the image's own alpha: luminance
+      // times alpha, as a luminance mask takes it.
+      let mut luminance = LayerEffects.none()
+      luminance.color = LUMINANCE_TO_ALPHA
+      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: 0 }, luminance)
       drop run p.scene.pushMaskLayer()
-      let mut shape = Quad.fill(device(painting, s), clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
-      shape.cornerRadii = paintingRadii
-      drop run p.scene.quad(shape)
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+      run p.scene.popLayer()
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+      run p.scene.popLayer()
+    } else {
+      run drawLayerImage(&mut p, effects, image, picture, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest, &mut stops)
+    }
+    if blend != BLEND_NORMAL {
       run p.scene.popLayer()
     }
-    let mut drawn: usize = 0
-    let mut j: usize = 0
-    while j < ny && drawn < MAX_TILES {
-      let mut i: usize = 0
-      while i < nx && drawn < MAX_TILES {
-        let x = across[0] + usize.toF32(i) * across[1]
-        let y = down[0] + usize.toF32(j) * down[1]
-        let tile = Rect<f32>.new(x, y, x + tw, y + th)
-        if !isEmpty(intersect(tile, painting)) {
-          // Whole device pixels, so neighbouring tiles share their edges without a seam.
-          let snapped = Rect<f32>.new(
-            f32.round(x * s),
-            f32.round(y * s),
-            f32.round((x + tw) * s),
-            f32.round((y + th) * s),
-          )
-          run paintGradient(&mut p, effects, image, snapped, clip, Radii.zero(), &mut stops)
-          drawn = drawn + 1
+    composited = true
+    run closeFixed(&mut p, opened)
+  }
+}
+
+/// One image layer's tiles (see [`paintLayers`]): a loaded `url()` picture or a gradient.
+effect fn drawLayerImage(
+  p: &mut Painter<'_, '_>,
+  effects: &Effects,
+  image: &Image,
+  picture: Option<Resource>,
+  across: [f32; 3],
+  down: [f32; 3],
+  nx: usize,
+  ny: usize,
+  tw: f32,
+  th: f32,
+  painting: Rect<f32>,
+  paintingRadii: Radii,
+  mask: ContentMask,
+  clip: ContentMask,
+  nearest: bool,
+  stops: &mut List<Stop>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  match picture {
+    Option<Resource>.Some { value } => {
+      run paintPictures(&mut p, value, across, down, nx, ny, tw, th, painting, paintingRadii, mask, clip, nearest)
+      return
+    }
+    Option<Resource>.None => {}
+  }
+  let single = nx == 1 && ny == 1
+  let first = Rect<f32>.new(across[0], down[0], across[0] + tw, down[0] + th)
+  if single && sameRect(first, painting) && isGradient(image) {
+    // Snapped like the background color under it, so their edges agree.
+    run paintGradient(&mut p, effects, image, snapped(device(first, s)), clip, paintingRadii, &mut stops.*)
+    return
+  }
+  let rounded = paintingRadii.isRounded()
+  if rounded {
+    // The layer is the painting area, not everything the clip lets through.
+    drop run p.scene.pushEffectLayer(
+      snapped(device(painting, s)),
+      clip,
+      Isolation { opacity: 1.0, blend: 0 },
+      LayerEffects.none(),
+    )
+    drop run p.scene.pushMaskLayer()
+    let mut shape = Quad.fill(device(painting, s), clip, Background.solid(Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)))
+    shape.cornerRadii = paintingRadii
+    drop run p.scene.quad(shape)
+    run p.scene.popLayer()
+  }
+  let mut drawn: usize = 0
+  let mut j: usize = 0
+  while j < ny && drawn < MAX_TILES {
+    let mut i: usize = 0
+    while i < nx && drawn < MAX_TILES {
+      let x = across[0] + usize.toF32(i) * across[1]
+      let y = down[0] + usize.toF32(j) * down[1]
+      let tile = Rect<f32>.new(x, y, x + tw, y + th)
+      if !isEmpty(intersect(tile, painting)) {
+        // Whole device pixels, so neighbouring tiles share their edges without a seam.
+        let snapped = Rect<f32>.new(
+          f32.round(x * s),
+          f32.round(y * s),
+          f32.round((x + tw) * s),
+          f32.round((y + th) * s),
+        )
+        if isGradient(image) {
+          run paintGradient(&mut p, effects, image, snapped, clip, Radii.zero(), &mut stops.*)
+        } else {
+          run drawImageIn(&mut p, effects, image, snapped, intersect(snapped, clip.bounds), clip, nearest, &mut stops.*)
         }
-        i = i + 1
+        drawn = drawn + 1
       }
-      j = j + 1
+      i = i + 1
     }
-    if rounded {
-      run p.scene.popLayer()
-    }
-    if mode != BLEND_NORMAL {
-      run p.scene.popLayer()
-    }
+    j = j + 1
+  }
+  if rounded {
+    run p.scene.popLayer()
+  }
+}
+
+/// The `vector.layer` mode of a `mask-composite` operator.
+fn compositeOp(composite: Composite) -> u8 {
+  return match composite {
+    Composite.Add => BLEND_NORMAL
+    Composite.Subtract => BLEND_SOURCE_OUT
+    Composite.Intersect => BLEND_SOURCE_IN
+    Composite.Exclude => BLEND_XOR
+  }
+}
+
+/// `luminanceToAlpha` (Rec. 709 weights), with the color channels emptied.
+const LUMINANCE_TO_ALPHA: [f32; 20] = [
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.0, 0.0, 0.0, 0.0, 0.0,
+  0.2125, 0.7154, 0.0721, 0.0, 0.0,
+]
+
+/// Opens the groups a `fixed` layer draws in: each undoes one scroll group open now, innermost
+/// first, and the first is cut to `cut`. Returns how many it opened, for [`closeFixed`].
+effect fn openFixed(p: &mut Painter<'_, '_>, cut: ContentMask) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut links = List<ScrollLink>.make()
+  let mut g = p.scene.openGroup()
+  while g != ROOT_GROUP {
+    let group = p.scene.scrollGroups()[u32.toUsize(g)]
+    run links.append(ScrollLink { node: group.link.node, x: undone(group.link.x), y: undone(group.link.y) })
+    g = group.parent
+  }
+  if links.length() == 0 {
+    run links.append(ScrollLink { node: NONE, x: ScrollAxis.fixed(), y: ScrollAxis.fixed() })
+  }
+  drop run p.scene.pushRoundedScrollGroup(links.get(0), cut, cut.bounds)
+  let all = Rect<f32>.new(-UNBOUNDED, -UNBOUNDED, UNBOUNDED, UNBOUNDED)
+  let mut i: usize = 1
+  while i < links.length() {
+    drop run p.scene.pushScrollGroup(links.get(i), all, all)
+    i = i + 1
+  }
+  return usize.toU32(links.length())
+}
+
+/// The axis that moves back what `axis` moves. A clamped axis (a sticky box) stays as it is.
+fn undone(axis: ScrollAxis) -> ScrollAxis {
+  if axis.low > -UNBOUNDED || axis.high < UNBOUNDED { return ScrollAxis.fixed() }
+  return ScrollAxis { factor: 0.0 - axis.factor, base: 0.0 - axis.base, low: -UNBOUNDED, high: UNBOUNDED }
+}
+
+effect fn closeFixed(p: &mut Painter<'_, '_>, opened: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < opened {
+    run p.scene.popScrollGroup()
+    i = i + 1
   }
 }
 
@@ -740,6 +986,7 @@ effect fn paintPictures(
   radii: Radii,
   mask: ContentMask,
   clip: ContentMask,
+  nearest: bool,
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -782,7 +1029,7 @@ effect fn paintPictures(
                   opacity: 1.0,
                   cornerRadii: radii,
                   grayscale: false,
-                  nearest: false,
+                  nearest: nearest,
                 },
               )
             }
@@ -862,10 +1109,16 @@ impl Copy for Opened {}
 effect fn filterGroups(effects: &Effects, scale: f32, out: &mut List<LayerEffects>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  run filterGroupsOf(effects, effects.filters.asSlice(), scale, &mut out.*)
+}
+
+/// [`filterGroups`] for filter list `items` (numbers in `effects.numerics`).
+effect fn filterGroupsOf(effects: &Effects, items: &[Filter], scale: f32, out: &mut List<LayerEffects>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   out.clear()
   let mut current = LayerEffects.none()
   let mut stage: u32 = 0
-  let items = effects.filters.asSlice()
   let mut i: usize = 0
   while i < items.length {
     match &items[i] {
@@ -989,7 +1242,7 @@ pub effect fn pushEffects(
       hasEffects = value.layered()
       run filterGroups(value, s, &mut groups)
       blend = value.blend
-      masked = value.clip.length() != 0 || value.masks.painted()
+      masked = value.clip.length() != 0 || value.masks.painted() || value.maskBorder.drawn()
     }
     Option<&Effects>.None => {}
   }
@@ -1060,14 +1313,17 @@ effect fn paintMask(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, radii: Rad
   let taken = takeEffects(&mut p, slot)
   match &taken {
     Option<Box<Effects>>.Some { value } => {
-      run paintMaskOf(&mut p, &value.get()[0], f, radii, mask)
+      let c = p.nodes.asSlice()[u32.toUsize(slot)].computed()
+      let nearest = c.nearest
+      let border = usedBorder(c)
+      run paintMaskOf(&mut p, &value.get()[0], f, radii, mask, nearest, border)
     }
     Option<Box<Effects>>.None => {}
   }
   putEffects(&mut p, slot, move taken)
 }
 
-effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, radii: Radii, mask: ContentMask) -> ()
+effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, radii: Radii, mask: ContentMask, nearest: bool, widths: Insets<f32>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let clipped = effects.clip.length() != 0
@@ -1084,10 +1340,21 @@ effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, 
     run p.scene.popLayer()
   }
   if imaged {
-    run paintLayers(&mut p, effects, &effects.masks, f, radii, mask, GeometryBox.Border, false)
+    run paintLayers(&mut p, effects, &effects.masks, f, radii, mask, GeometryBox.Border, false, nearest, SCOPE_ALL, Rect<f32>.new(0.0, 0.0, 0.0, 0.0))
   }
   if clipped && imaged {
     run p.scene.popLayer()
+  }
+  if effects.maskBorder.drawn() {
+    // A mask border multiplies with the rest of the mask: source-in over what is drawn.
+    let under = clipped || imaged
+    if under {
+      drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: BLEND_SOURCE_IN }, LayerEffects.none())
+    }
+    run paintImageBorder(&mut p, effects, &effects.maskBorder, f, widths, mask, nearest)
+    if under {
+      run p.scene.popLayer()
+    }
   }
   run p.scene.popLayer()
 }
@@ -1284,4 +1551,473 @@ effect fn clipShape(
 effect fn noVector<E>(error: E) -> VectorPath {
   drop error
   return VectorPath.make()
+}
+
+// Border images.
+
+/// A `border-image` or `mask-border` value's number: a plain number times `unit`, or a length
+/// (percentages of `basis`).
+fn borderMeasure(effects: &Effects, id: ExprId, unit: f32, basis: f32) -> f32 {
+  return match dimensions.numberLiteral(&effects.numerics, id) {
+    Option<f64>.Some { value } => f64.toF32(value) * unit
+    Option<f64>.None => effects.pixels(id, basis)
+  }
+}
+
+/// How far `border`'s `outset` reaches past the border box, in CSS pixels.
+pub fn borderImageReach(effects: &Effects, border: &ImageBorder, widths: Insets<f32>) -> f32 {
+  if !border.drawn() { return 0.0 }
+  let w = [widths.top, widths.right, widths.bottom, widths.left]
+  let mut reach: f32 = 0.0
+  let mut i: usize = 0
+  while i < 4 {
+    reach = f32.max(reach, borderMeasure(effects, border.outset[i], w[i], 0.0))
+    i = i + 1
+  }
+  return reach
+}
+
+/// Paints `border` (a `border-image`, or a `mask-border` into a mask layer) for fragment `f`
+/// whose border widths are `widths` (CSS pixels): the image cut in nine by its slices, corners
+/// stretched to their regions and edges and middle stretched, repeated, rounded or spaced.
+/// A luminance `mask-border` draws through the luminance-to-alpha layer the mask layers use.
+pub effect fn paintImageBorder(
+  p: &mut Painter<'_, '_>,
+  effects: &Effects,
+  border: &ImageBorder,
+  f: &Fragment,
+  widths: Insets<f32>,
+  mask: ContentMask,
+  nearest: bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let w = [widths.top, widths.right, widths.bottom, widths.left]
+  let box = borderBox(f)
+  let area = Rect<f32>.new(
+    box.xMin - borderMeasure(effects, border.outset[3], w[3], 0.0),
+    box.yMin - borderMeasure(effects, border.outset[0], w[0], 0.0),
+    box.xMax + borderMeasure(effects, border.outset[1], w[1], 0.0),
+    box.yMax + borderMeasure(effects, border.outset[2], w[2], 0.0),
+  )
+  let aw = area.xMax - area.xMin
+  let ah = area.yMax - area.yMin
+  if aw <= 0.0 || ah <= 0.0 { return }
+  let image = &border.image
+  // Gradients have no size of their own: they take the border image area's.
+  let found = run naturalOf(&mut p, image)
+  if !found.drawable { return }
+  let picture = found.picture
+  let iw = if found.width > 0.0 { found.width } else { aw }
+  let ih = if found.height > 0.0 { found.height } else { ah }
+  if iw <= 0.0 || ih <= 0.0 { return }
+  // Slices in image pixels, top right bottom left.
+  let st = f32.min(ih, f32.max(0.0, borderMeasure(effects, border.slice[0], 1.0, ih)))
+  let sr = f32.min(iw, f32.max(0.0, borderMeasure(effects, border.slice[1], 1.0, iw)))
+  let sb = f32.min(ih, f32.max(0.0, borderMeasure(effects, border.slice[2], 1.0, ih)))
+  let sl = f32.min(iw, f32.max(0.0, borderMeasure(effects, border.slice[3], 1.0, iw)))
+  let slices = [st, sr, sb, sl]
+  let mut d: [f32; 4] = [0.0, 0.0, 0.0, 0.0]
+  let mut i: usize = 0
+  while i < 4 {
+    let basis = if i == 0 || i == 2 { ah } else { aw }
+    d[i] = match border.width[i] {
+      BorderMeasure.Auto => slices[i]
+      BorderMeasure.Numeric { value } => f32.max(0.0, borderMeasure(effects, value, w[i], basis))
+    }
+    i = i + 1
+  }
+  // Opposite widths that overlap shrink together, all four by the same factor.
+  let mut fit: f32 = 1.0
+  if d[1] + d[3] > aw { fit = f32.min(fit, aw / (d[1] + d[3])) }
+  if d[0] + d[2] > ah { fit = f32.min(fit, ah / (d[0] + d[2])) }
+  i = 0
+  while i < 4 {
+    d[i] = d[i] * fit
+    i = i + 1
+  }
+  let dx = [area.xMin, area.xMin + d[3], area.xMax - d[1], area.xMax]
+  let dy = [area.yMin, area.yMin + d[0], area.yMax - d[2], area.yMax]
+  let sx: [f32; 4] = [0.0, sl, iw - sr, iw]
+  let sy: [f32; 4] = [0.0, st, ih - sb, ih]
+  let luminance = border.mode == MaskMode.Luminance
+  let mut pass: usize = 0
+  let passes: usize = if luminance { 2 } else { 1 }
+  if luminance {
+    let mut lum = LayerEffects.none()
+    lum.color = LUMINANCE_TO_ALPHA
+    drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 }, lum)
+    drop run p.scene.pushMaskLayer()
+  }
+  let mut stops = List<Stop>.make()
+  while pass < passes {
+    let mut row: usize = 0
+    while row < 3 {
+      let mut col: usize = 0
+      while col < 3 {
+        let middle = row == 1 && col == 1
+        let sw = sx[col + 1] - sx[col]
+        let sh = sy[row + 1] - sy[row]
+        let region = Rect<f32>.new(dx[col], dy[row], dx[col + 1], dy[row + 1])
+        let rw = region.xMax - region.xMin
+        let rh = region.yMax - region.yMin
+        if (!middle || border.fill) && sw > 0.0 && sh > 0.0 && rw > 0.0 && rh > 0.0 {
+          // Edges keep the slice's shape at the region's thickness; the middle scales like
+          // the top edge across and the left edge down.
+          let mut tw = rw
+          let mut th = rh
+          if col == 1 {
+            let reference = if row == 1 { if st > 0.0 { d[0] / st } else { rh / sh } } else { rh / sh }
+            if border.repeat.x != Repeat.Stretch { tw = sw * reference }
+          }
+          if row == 1 {
+            let reference = if col == 1 { if sl > 0.0 { d[3] / sl } else { rw / sw } } else { rw / sw }
+            if border.repeat.y != Repeat.Stretch { th = sh * reference }
+          }
+          let across = if col == 1 { borderTiles(border.repeat.x, region.xMin, region.xMax, tw) } else { [region.xMin, rw, 1.0] }
+          let down = if row == 1 { borderTiles(border.repeat.y, region.yMin, region.yMax, th) } else { [region.yMin, rh, 1.0] }
+          tw = across[1]
+          th = down[1]
+          let gapX: f32 = if col == 1 && border.repeat.x == Repeat.Space { borderGap(region.xMin, region.xMax, tw, across[2]) } else { 0.0 }
+          let gapY: f32 = if row == 1 && border.repeat.y == Repeat.Space { borderGap(region.yMin, region.yMax, th, down[2]) } else { 0.0 }
+          let nx = f32.toUsize(across[2])
+          let ny = f32.toUsize(down[2])
+          let scaleX = tw / sw
+          let scaleY = th / sh
+          let mut drawn: usize = 0
+          let mut j: usize = 0
+          while j < ny && drawn < MAX_TILES {
+            let mut k: usize = 0
+            while k < nx && drawn < MAX_TILES {
+              let x = across[0] + usize.toF32(k) * (tw + gapX)
+              let y = down[0] + usize.toF32(j) * (th + gapY)
+              let cut = intersect(Rect<f32>.new(x, y, x + tw, y + th), region)
+              if !isEmpty(cut) {
+                let placed = Rect<f32>.new(
+                  x - sx[col] * scaleX,
+                  y - sy[row] * scaleY,
+                  x - sx[col] * scaleX + iw * scaleX,
+                  y - sy[row] * scaleY + ih * scaleY,
+                )
+                run drawBorderPiece(&mut p, effects, image, picture, placed, cut, mask, nearest, &mut stops)
+                drawn = drawn + 1
+              }
+              k = k + 1
+            }
+            j = j + 1
+          }
+        }
+        col = col + 1
+      }
+      row = row + 1
+    }
+    if luminance && pass == 0 {
+      run p.scene.popLayer()
+    }
+    pass = pass + 1
+  }
+  if luminance {
+    run p.scene.popLayer()
+  }
+}
+
+/// Where the tiles of one border image edge start, their size and count, from `lo` to `hi` at
+/// natural size `size` under `repeat`.
+fn borderTiles(repeat: Repeat, lo: f32, hi: f32, size: f32) -> [f32; 3] {
+  let length = hi - lo
+  if repeat == Repeat.Stretch || size <= 0.0 { return [lo, length, 1.0] }
+  if repeat == Repeat.Round {
+    let n = f32.max(1.0, f32.round(length / size))
+    return [lo, length / n, n]
+  }
+  if repeat == Repeat.Space {
+    let n = f32.floor(length / size)
+    if n < 1.0 { return [lo, size, 0.0] }
+    let gap = (length - n * size) / (n + 1.0)
+    return [lo + gap, size, n]
+  }
+  // Repeat: one tile centred, the rest out to both ends.
+  let first = (lo + hi) / 2.0 - size / 2.0
+  let before = f32.ceil((first - lo) / size)
+  let start = first - before * size
+  let n = f32.ceil((hi - start) / size)
+  return [start, size, f32.min(n, usize.toF32(MAX_TILES))]
+}
+
+fn borderGap(lo: f32, hi: f32, size: f32, n: f32) -> f32 {
+  return (hi - lo - n * size) / (n + 1.0)
+}
+
+/// Draws image `image` placed at `placed` (CSS pixels), clipped to `cut`.
+effect fn drawBorderPiece(
+  p: &mut Painter<'_, '_>,
+  effects: &Effects,
+  image: &Image,
+  picture: Option<Resource>,
+  placed: Rect<f32>,
+  cut: Rect<f32>,
+  mask: ContentMask,
+  nearest: bool,
+  stops: &mut List<Stop>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
+  // Whole device pixels at the cut, so neighbouring pieces share their edges without a seam.
+  let clipRect = Rect<f32>.new(f32.round(cut.xMin * s), f32.round(cut.yMin * s), f32.round(cut.xMax * s), f32.round(cut.yMax * s))
+  if isEmpty(clipRect) { return }
+  let bounds = device(placed, s)
+  match picture {
+    Option<Resource>.Some { value } => run drawPicture(&mut p, value, bounds, clipRect, mask, nearest)
+    Option<Resource>.None => run drawImageIn(&mut p, effects, image, bounds, clipRect, mask, nearest, &mut stops.*)
+  }
+}
+
+// Images in general: `url()`, gradients, `cross-fade()` and `filter()`.
+
+fn isGradient(image: &Image) -> bool {
+  return match &image.* {
+    Image.Linear { .. } => true
+    Image.Radial { .. } => true
+    Image.Conic { .. } => true
+    _ => false
+  }
+}
+
+/// What paint needs to place an image: a loaded `url()` resource, its natural size and ratio
+/// (zero when it has none), and whether there is anything to draw yet.
+struct Natural {
+  picture: Option<Resource>,
+  width: f32,
+  height: f32,
+  ratio: f32,
+  drawable: bool,
+}
+
+impl Copy for Natural {}
+
+effect fn naturalOf(p: &mut Painter<'_, '_>, image: &Image) -> Natural
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = Natural { picture: Option<Resource>.None, width: 0.0, height: 0.0, ratio: 0.0, drawable: false }
+  match &image.* {
+    Image.Url { url } => {
+      let id = run p.resources.cssImage(Bytes.asSlice(&url))
+      found.picture = p.resources.get(id)
+      match found.picture {
+        Option<Resource>.Some { value } => match value {
+          Resource.Image { width, height, .. } => {
+            found.width = u32.toF32(width)
+            found.height = u32.toF32(height)
+            found.ratio = if height > 0 { u32.toF32(width) / u32.toF32(height) } else { 0.0 }
+            found.drawable = width > 0 && height > 0
+          }
+          Resource.Icon { icon } => {
+            let r = f64.toF32(p.resources.iconRatio(icon))
+            found.ratio = if r > 0.0 && f32.isFinite(r) { r } else { 1.0 }
+            let w = p.resources.iconWidth(icon)
+            let h = p.resources.iconHeight(icon)
+            if w > 0.0 && h > 0.0 {
+              found.width = f64.toF32(w)
+              found.height = f64.toF32(h)
+            }
+            found.drawable = true
+          }
+        }
+        Option<Resource>.None => {}
+      }
+    }
+    Image.CrossFade { layers } => {
+      // Sized like its first image that has a size; drawn once any of them is.
+      let mut i: usize = 0
+      while i < layers.length() {
+        let inner = run naturalOf(&mut p, &layers.asSlice()[i].image)
+        if inner.drawable { found.drawable = true }
+        if found.width <= 0.0 && inner.width > 0.0 {
+          found.width = inner.width
+          found.height = inner.height
+          found.ratio = inner.ratio
+        }
+        i = i + 1
+      }
+    }
+    Image.Filtered { source, .. } => {
+      if source.length() > 0 {
+        let inner = run naturalOf(&mut p, &source.asSlice()[0])
+        found.width = inner.width
+        found.height = inner.height
+        found.ratio = inner.ratio
+        found.drawable = inner.drawable
+      }
+    }
+    Image.None => {}
+    _ => { found.drawable = true }
+  }
+  return found
+}
+
+/// Draws a loaded `url()` resource over `bounds` (device pixels), clipped to `clipRect`.
+effect fn drawPicture(p: &mut Painter<'_, '_>, picture: Resource, bounds: Rect<f32>, clipRect: Rect<f32>, mask: ContentMask, nearest: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if isEmpty(clipRect) { return }
+  match picture {
+    Resource.Image { image: id, .. } => {
+      let tile = run p.resources.imageTile(&mut p.atlas, id)
+      if let Option<AtlasTile>.Some { value: t } = tile {
+        drop run p.scene.image(
+          ImageSprite {
+            quarterTurns: 0,
+            clipBounds: clipRect,
+            bounds: bounds,
+            mask: mask,
+            tile: t,
+            opacity: 1.0,
+            cornerRadii: Radii.zero(),
+            grayscale: false,
+            nearest: nearest,
+          },
+        )
+      }
+    }
+    Resource.Icon { icon } => {
+      let w = f32.round(bounds.xMax - bounds.xMin)
+      let h = f32.round(bounds.yMax - bounds.yMin)
+      if w >= 1.0 && h >= 1.0 {
+        let black = Rgba<f32>.new(0.0, 0.0, 0.0, 1.0)
+        let tile = run p.resources.iconTile(&mut p.atlas, icon, f32.toU32(w), f32.toU32(h), p.time, black)
+        if let Option<AtlasTile>.Some { value: t } = tile {
+          if p.resources.tinted(icon) {
+            drop run p.scene.glyph(GlyphSprite { bounds: bounds, mask: mask.intersect(ContentMask.new(clipRect)), tile: t, color: black })
+          } else {
+            drop run p.scene.image(
+              ImageSprite {
+                quarterTurns: 0,
+                clipBounds: clipRect,
+                bounds: bounds,
+                mask: mask,
+                tile: t,
+                opacity: 1.0,
+                cornerRadii: Radii.zero(),
+                grayscale: false,
+                nearest: false,
+              },
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Draws `image` stretched over `bounds` (device pixels), clipped to `clipRect` and `mask`.
+/// `cross-fade()` adds its images by weight in an isolated layer (plus-lighter); `filter()`
+/// draws a loaded bitmap filtered once and kept, or anything else through filter layers.
+effect fn drawImageIn(
+  p: &mut Painter<'_, '_>,
+  effects: &Effects,
+  image: &Image,
+  bounds: Rect<f32>,
+  clipRect: Rect<f32>,
+  mask: ContentMask,
+  nearest: bool,
+  stops: &mut List<Stop>,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if isEmpty(clipRect) { return }
+  let clip = mask.intersect(ContentMask.new(clipRect))
+  match &image.* {
+    Image.None => {}
+    Image.Url { .. } => {
+      let found = run naturalOf(&mut p, image)
+      match found.picture {
+        Option<Resource>.Some { value } => run drawPicture(&mut p, value, bounds, clipRect, mask, nearest)
+        Option<Resource>.None => {}
+      }
+    }
+    Image.CrossFade { layers } => {
+      let items = layers.asSlice()
+      let mut given: f32 = 0.0
+      let mut missing: usize = 0
+      let mut i: usize = 0
+      while i < items.length {
+        match items[i].percent {
+          Option<ExprId>.Some { value } => { given = given + f32.min(1.0, f32.max(0.0, effects.number(value))) }
+          Option<ExprId>.None => { missing = missing + 1 }
+        }
+        i = i + 1
+      }
+      let rest: f32 = if missing > 0 { f32.max(0.0, 1.0 - given) / usize.toF32(missing) } else { 0.0 }
+      let total = given + rest * usize.toF32(missing)
+      let shrink: f32 = if total > 1.0 { 1.0 / total } else { 1.0 }
+      drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: 1.0, blend: 0 }, LayerEffects.none())
+      let mut first = true
+      i = 0
+      while i < items.length {
+        let weight = match items[i].percent {
+          Option<ExprId>.Some { value } => f32.min(1.0, f32.max(0.0, effects.number(value)))
+          Option<ExprId>.None => rest
+        } * shrink
+        if weight > 0.0 {
+          let blend = if first { BLEND_NORMAL } else { BLEND_PLUS_LIGHTER }
+          drop run p.scene.pushEffectLayer(clip.bounds, clip, Isolation { opacity: weight, blend: blend }, LayerEffects.none())
+          if isGradient(&items[i].image) {
+            run paintGradient(&mut p, effects, &items[i].image, bounds, clip, Radii.zero(), &mut stops.*)
+          } else {
+            run drawImageIn(&mut p, effects, &items[i].image, bounds, clipRect, mask, nearest, &mut stops.*)
+          }
+          run p.scene.popLayer()
+          first = false
+        }
+        i = i + 1
+      }
+      run p.scene.popLayer()
+    }
+    Image.Filtered { source, filters } => {
+      if source.length() == 0 { return }
+      let inner = &source.asSlice()[0]
+      let found = run naturalOf(&mut p, inner)
+      let mut groups = List<LayerEffects>.make()
+      match found.picture {
+        Option<Resource>.Some { value } => match value {
+          Resource.Image { .. } => {
+            // In the image's own pixels, once: the result is kept with the image.
+            run filterGroupsOf(effects, filters.asSlice(), 1.0, &mut groups)
+            let id = match &inner.* {
+              Image.Url { url } => run p.resources.cssImage(Bytes.asSlice(&url))
+              _ => 0
+            }
+            match run p.resources.filteredImage(&mut p.atlas, id, groups.asSlice()) {
+              Option<Resource>.Some { value: made } => run drawPicture(&mut p, made, bounds, clipRect, mask, nearest)
+              Option<Resource>.None => {}
+            }
+            return
+          }
+          _ => {}
+        }
+        Option<Resource>.None => {}
+      }
+      // Gradients and icons: filter layers in device pixels, cut to the image's own box.
+      let scale = if found.width > 0.0 { (bounds.xMax - bounds.xMin) / found.width } else { p.scale }
+      run filterGroupsOf(effects, filters.asSlice(), scale, &mut groups)
+      let cut = clip.intersect(ContentMask.new(bounds))
+      let mut g = groups.length()
+      while g > 0 {
+        g = g - 1
+        drop run p.scene.pushEffectLayer(cut.bounds, cut, Isolation { opacity: 1.0, blend: 0 }, groups.get(g))
+      }
+      if isGradient(inner) {
+        run paintGradient(&mut p, effects, inner, bounds, cut, Radii.zero(), &mut stops.*)
+      } else {
+        run drawImageIn(&mut p, effects, inner, bounds, intersect(clipRect, bounds), mask, nearest, &mut stops.*)
+      }
+      g = 0
+      while g < groups.length() {
+        run p.scene.popLayer()
+        g = g + 1
+      }
+    }
+    _ => { run paintGradient(&mut p, effects, image, bounds, clip, Radii.zero(), &mut stops.*) }
+  }
 }

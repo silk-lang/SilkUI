@@ -1,5 +1,6 @@
 //! [`TextSystem`]: css-layout's `TextMeasure` over a font collection, plus the font metrics
 //! its `Measure.font` needs and the glyph runs behind each text fragment.
+import properties.census { Census }
 import fonts { FontState, TextStyle, KeyInfo }
 import glyphs { GlyphStore, GlyphRun, PositionedGlyph }
 import analysis { Analyzer, analyze }
@@ -50,9 +51,24 @@ pub struct TextSystem<'a> {
   /// Provider calls, for tests and benchmarks.
   pub analyzeCalls: usize,
   pub shapeCalls: usize,
+  /// For the bench census: lines the line cache answered, and the tokens of every line asked.
+  pub lineHits: usize,
+  pub shapeTokens: usize,
 }
 
 impl<'a> TextSystem<'a> {
+  /// What the text system holds and did, for the bench census.
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.fonts.census(&mut out)
+    run self.glyphs.census(&mut out)
+    run self.shaping.census(&mut out)
+    run self.lines.census(&mut out)
+    run out.work("text.analyze.calls", self.analyzeCalls)
+    run out.work("text.shape.calls(lines asked)", self.shapeCalls)
+    run out.work("text.shape.line-cache-hits", self.lineHits)
+    run out.work("text.shape.tokens-asked", self.shapeTokens)
+  }
+
   pub fn make(collection: &'a FontCollection) -> TextSystem<'a> {
     return TextSystem {
       fonts: FontState.make(collection),
@@ -62,6 +78,8 @@ impl<'a> TextSystem<'a> {
       lines: LineCache.make(),
       analyzeCalls: 0,
       shapeCalls: 0,
+      lineHits: 0,
+      shapeTokens: 0,
     }
   }
 
@@ -86,6 +104,14 @@ impl<'a> TextSystem<'a> {
   }
 
   /// The run behind a fragment's `shapeKey`.
+  /// Forgets every shaped run and line and gives their storage back. The keys handed out
+  /// before become invalid: the layout trees that hold them must be laid out afresh
+  /// (see [`GlyphStore.clear`]).
+  pub fn release(self: &mut Self) -> () {
+    self.glyphs.release()
+    self.lines.release()
+  }
+
   pub fn glyphRun(self: &Self, shapeKey: usize) -> GlyphRun {
     return self.glyphs.glyphRun(shapeKey)
   }
@@ -143,8 +169,10 @@ impl<'a> TextMeasure for TextSystem<'a> {
     ! OutOfMemoryError | TextError
     ? &mut Allocator {
     provider.shapeCalls = provider.shapeCalls + 1
+    provider.shapeTokens = provider.shapeTokens + (request.end.unit - request.start.unit) + 1
     let mut kept = false
     if run provider.lines.find(&provider.glyphs, &request, &mut output, &mut kept) {
+      provider.lineHits = provider.lineHits + 1
       return
     }
     let first = output.length()

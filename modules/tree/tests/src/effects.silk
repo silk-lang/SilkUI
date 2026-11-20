@@ -6,7 +6,9 @@
 import ui_tree.css
 import ui_tree.css { px, Declaration, Property }
 import ui_fixtures.fixtures as fixtures
-import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, Position, Mutation }
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, CpuSnapshot, NodeKind, Position, Mutation, FragmentInfo, fragmentsOf }
+import silk.collections.list { List }
+import properties.computed { Float }
 import codec.image { Image, ImageError }
 import silk.text.string { String }
 import font_collection.lib { FontCollection }
@@ -627,6 +629,11 @@ effect fn urlImagesBody() -> ()
   let tiled = run paintLoaded(&collection, &[run declared(Property.BackgroundImage, b"url(pic.png)")])
   run Testing.expect(at(&tiled, 1, 1, 0, 0, 255), "the image draws from the corner")
   run Testing.expect(at(&tiled, 77, 51, 0, 0, 255), "the image repeats at its own size")
+  let filtered = run paintLoaded(&collection, &[run declared(Property.BackgroundImage, b"filter(url(pic.png), invert(1))")])
+  run Testing.expect(at(&filtered, 1, 1, 255, 255, 0), "filter() draws the image filtered")
+  let faded = run paintLoaded(&collection, &[run declared(Property.BackgroundImage, b"cross-fade(url(pic.png) 50%, url(pic.png))"), run declared(Property.BackgroundSize, b"100px 100px")])
+  // Added, not laid over each other: two halves of one image make the whole image.
+  run Testing.expect(at(&faded, 50, 50, 0, 0, 255), "cross-fade() adds its images by weight")
 
   let placed = run paintLoaded(
     &collection,
@@ -694,4 +701,76 @@ test effect fn urlBackgroundsAndMasks() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | ImageError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run urlImagesBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Where the first line of text node 3 starts.
+effect fn firstLineX(tree: &UiTree<'_>) -> f32 ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<FragmentInfo>.make()
+  run fragmentsOf(tree, tree.slotOf(3), &mut out)
+  return if out.length() == 0 { -1.0 } else { out.get(0).border.xMin }
+}
+
+/// A float's `shape-outside: url()` takes the image's opaque pixels once it loads, and
+/// `shape-image-threshold` picks the alpha that counts (CSS Shapes 1 §3.1).
+effect fn imageShapeBody() -> ()
+  ! AssertionError<'static> | TreeError | ImageError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[css.width(px(100.0)), css.fontSize(px(10.0))])
+  run batch.box(1, 2, &[
+    css.width(px(80.0)),
+    css.height(px(80.0)),
+    css.float(Float.Left),
+    run declared(Property.ShapeOutside, b"url(shape.png)"),
+  ])
+  run batch.text(1, 3, "a b c d e f g h")
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run Testing.expect((run firstLineX(&tree)) >= 80.0, "lines keep off the margin box until the image loads")
+  let loads = run tree.takeLoads()
+  run Testing.expect(loads.length() == 1, "the shape image is asked for")
+  let resource = match &loads.asSlice()[0] {
+    Mutation.LoadImage { resource, .. } => resource
+    _ => { run Testing.expect(false, "an image load") 0 }
+  }
+  // 4 by 4: the first column opaque, the second at alpha 100, the rest transparent.
+  let mut image = run Image.make(4, 4)
+  let pixels = image.dataMut()
+  let mut i: usize = 0
+  while i < pixels.length {
+    let column = (i / 4) % 4
+    pixels[i] = if i % 4 != 3 { 0 } else if column == 0 { 255 } else if column == 1 { 100 } else { 0 }
+    i = i + 1
+  }
+  drop pixels
+  run batch.decodedImage(resource, move image)
+  run tree.apply(run batch.take())
+  run tree.settleSource(resource, true)
+  run tree.frame(viewport())
+  let wrapped = run firstLineX(&tree)
+  run Testing.expect(wrapped >= 40.0 && wrapped < 50.0, "lines wrap around the pixels with any alpha")
+  run batch.style(2, &[run declared(Property.ShapeImageThreshold, b"0.5")])
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let opaque = run firstLineX(&tree)
+  run Testing.expect(opaque >= 20.0 && opaque < 30.0, "a higher threshold leaves the translucent column out")
+  run batch.style(2, &[run declared(Property.ShapeImageThreshold, b"30%")])
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run Testing.expect((run firstLineX(&tree)) == wrapped, "a percentage threshold")
+  run batch.style(2, &[run declared(Property.ShapeOutside, b"linear-gradient(to right, black 25%, transparent 25%)")])
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let gradient = run firstLineX(&tree)
+  run Testing.expect(gradient >= 20.0 && gradient < 30.0, "a gradient's opaque part makes the shape")
+}
+
+test effect fn imageShapes() -> ()
+  ! AssertionError<'static> | TreeError | ImageError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run imageShapeBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
