@@ -85,6 +85,9 @@ struct Pending {
   glyphEnd: usize,
   leftSpacing: f32,
   rightSpacing: f32,
+  // Whether a line that starts where this run starts may not take the runs on either side
+  // of that cut from the shaping of the whole text (`TextRun.Text.unsafeBefore`).
+  unsafeBefore: bool,
 }
 
 impl Copy for Pending {}
@@ -152,6 +155,12 @@ pub struct Shaping {
   tailRaw: List<RawGlyph>,
   // Per item of the segment being emitted: where its last piece's glyphs ended.
   hints: List<usize>,
+  /// Per run the last `shapeLine` appended: its `unsafeBefore`.
+  pub unsafeRuns: List<bool>,
+  // Whether the request being shaped is a whole paragraph, whose cuts are worth judging.
+  wantSafety: bool,
+  // Whether every item of the segment being emitted has a face (`Source.cuts`).
+  segmentCuts: bool,
   /// Take glyphs from segments shaped before where that gives what shaping would. Off, every
   /// segment is shaped, for checking that the two agree.
   pub reuse: bool,
@@ -193,6 +202,9 @@ impl Shaping {
       tailItems: List<Item>.make(),
       tailRaw: List<RawGlyph>.make(),
       hints: List<usize>.make(),
+      unsafeRuns: List<bool>.make(),
+      wantSafety: false,
+      segmentCuts: false,
       reuse: true,
       taken: 0,
       continued: 0,
@@ -1182,6 +1194,100 @@ fn spacing(state: &Shaping, bytes: &[u8], treatment: Treatment, index: usize, en
   return extra
 }
 
+// Whether a token's text has a character of a script of its own, so that a line starting
+// with it itemizes as the whole text did around it.
+fn strong(bytes: &[u8]) -> bool {
+  if asciiLetter(bytes) {
+    return true
+  }
+  let mut at: usize = 0
+  while at < bytes.length {
+    let decoded = utf8_scan.decode(bytes, at)
+    let script = Script.of(decoded.scalar).value
+    if script != Script.common().value && script != Script.inherited().value && script != Script.unknown().value {
+      return true
+    }
+    at = decoded.next
+  }
+  return false
+}
+
+// Whether the word next to byte `at` of `bytes` (after it, or before it with `before`),
+// skipping spaces, has no character of a script of its own. True when there is no such word.
+fn weakWord(bytes: &[u8], at: usize, before: bool) -> bool {
+  let mut low = at
+  let mut high = at
+  if before {
+    while low > 0 && bytes[low - 1] == 32 { low = low - 1 }
+    high = low
+    while low > 0 && bytes[low - 1] != 32 { low = low - 1 }
+  } else {
+    while low < bytes.length && bytes[low] == 32 { low = low + 1 }
+    high = low
+    while high < bytes.length && bytes[high] != 32 { high = high + 1 }
+  }
+  if low == high {
+    return true
+  }
+  return !strong(Slice.view(bytes, low, high - low))
+}
+
+// Whether a line cut at byte `at` of the segment being emitted (a line starting there, or the
+// one ending there) could get other glyphs on either side of the cut than the segment has.
+// The rules are `takeCut`'s, so where this is false a line cut there takes the segment's glyphs
+// unchanged. Segments are shaped apart, so a cut at a segment's start is one of its edges.
+fn unsafeAt<'a>(state: &Shaping, fonts: &FontState<'a>, piece: Piece, at: usize) -> bool {
+  // Right-to-left text and text of several scripts are not cut (not checked yet).
+  if !state.segmentCuts || fonts.treatment(piece.fontKey).transform != TextTransform.None || state.scripts.length() != 1
+    || piece.level % 2 == 1 {
+    return true
+  }
+  let bytes = String.utf8Bytes(state.segment.view())
+  if at >= bytes.length {
+    return false
+  }
+  // Each side of the cut must keep a character of the segment's script, so that the line
+  // itemizes as the segment did: no word without one next to the cut.
+  let script = state.scripts.get(0).script.value
+  if script != Script.common().value && script != Script.inherited().value
+    && (weakWord(bytes, at, false) || (at > 0 && weakWord(bytes, at, true))) {
+    return true
+  }
+  if at == 0 {
+    return false
+  }
+  let first = utf8_scan.decode(bytes, at).scalar
+  if first >= 0x300 && continuesCluster(first) {
+    return true
+  }
+  let raw = state.raw.asSlice()
+  let mut index: usize = 0
+  while index < state.items.length() {
+    let item = state.items.get(index)
+    index = index + 1
+    if item.start > at {
+      break
+    }
+    if item.end < at {
+      continue
+    }
+    if item.start < at && at < item.end {
+      if item.upright || !cuttable(raw, item, at) {
+        return true
+      }
+    } else if item.start == at {
+      if joins(item.script) && !inertBefore(bytes, at) {
+        return true
+      }
+    } else if item.end == at {
+      if joins(item.script) && !inert(first) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
 // The first glyph from `from` on of a rising item whose cluster is at or past `cluster`.
 fn scanTo(raw: &[RawGlyph], from: usize, end: usize, cluster: usize) -> usize {
   let mut index = from
@@ -1245,6 +1351,7 @@ effect fn emit<'a>(
       glyphEnd = firstGlyphAt(&state, item, low - 1)
     }
   }
+  let cutUnsafe = !state.wantSafety || unsafeAt(&state, fonts, piece, low)
   while index < glyphEnd {
     let raw = state.raw.get(index)
     let cluster = u32.toUsize(raw.cluster)
@@ -1316,6 +1423,7 @@ effect fn emit<'a>(
       glyphEnd: state.glyphs.length(),
       leftSpacing: 0.0,
       rightSpacing: 0.0,
+      unsafeBefore: cutUnsafe,
     },
   )
   return glyphEnd
@@ -1351,6 +1459,7 @@ effect fn shapeSegments<'a>(
           glyphEnd: state.glyphs.length(),
           leftSpacing: 0.0,
           rightSpacing: 0.0,
+          unsafeBefore: false,
         },
       )
       index = index + 1
@@ -1412,9 +1521,13 @@ effect fn shapeSegments<'a>(
       }
     }
     state.hints.clear()
+    state.segmentCuts = true
     let mut item: usize = 0
     while item < state.items.length() {
       run state.hints.append(state.items.get(item).glyphStart)
+      if state.wantSafety && !fonts.sliceable(state.items.get(item).key) {
+        state.segmentCuts = false
+      }
       item = item + 1
     }
     let mut member = index
@@ -1582,6 +1695,10 @@ pub effect fn shapeLine<'a>(
     fail TextError { source: usize.MAX, message: "ui-text: the shape range is reversed" }
   }
   let trailing = trailingOf(&request)
+  state.unsafeRuns.clear()
+  // Layout reads the flags of a shaping of a whole paragraph only.
+  state.wantSafety = request.start.unit == 0 && request.start.offset == 0
+    && !request.end.before(request.analysis.paragraph.end)
   let mut characterJustify = false
   if request.justificationSpace > 0.0 {
     characterJustify = request.context.textJustify == TextJustify.InterCharacter
@@ -1600,6 +1717,7 @@ pub effect fn shapeLine<'a>(
   let mut index: usize = 0
   while index < state.pending.length() {
     let pending = state.pending.get(index)
+    run state.unsafeRuns.append(pending.unsafeBefore)
     if pending.kind == PieceKind.Object {
       run output.append(
         TextRun.Object {
@@ -1635,6 +1753,7 @@ pub effect fn shapeLine<'a>(
           fontKey: key,
           bidiLevel: pending.level,
           shapeKey: shapeKey,
+          unsafeBefore: pending.unsafeBefore,
         },
       )
     }
