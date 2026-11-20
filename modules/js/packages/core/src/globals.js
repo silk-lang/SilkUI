@@ -210,7 +210,8 @@ class Document extends OuterTarget {
 
   /** The focused node, else `<body>`, as `document.activeElement` is. */
   get activeElement() {
-    return documentElement.querySelector(":focus") ?? body;
+    const focused = exported("activeElement");
+    return (typeof focused === "function" ? focused() : documentElement.querySelector(":focus")) ?? body;
   }
 
   hasFocus() { return true; }
