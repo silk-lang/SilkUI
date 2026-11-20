@@ -1001,6 +1001,11 @@ pub struct UiTree<'a> {
   /// The layout revision, scroll revision and viewport height `content-visibility: auto`
   /// elements were last reviewed at (see `reviewSkipped`).
   skipReview: [usize; 3],
+  /// How far, in CSS pixels, scroll offsets may move after that review before any
+  /// `content-visibility: auto` element could wake or be skipped, and how far they have moved
+  /// since (see `reviewSkipped`).
+  skipSlack: f32,
+  pub skipTravel: f32,
   /// The css nodes `wakeFor` woke this frame: they stay awake until the next one.
   heldAwake: List<u32>,
   /// Next fragment with the same CSS source, in arena order.
@@ -1530,6 +1535,8 @@ impl<'a> UiTree<'a> {
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
       skipReview: [usize.MAX; 3],
+      skipSlack: 0.0,
+      skipTravel: 0.0,
       heldAwake: List<u32>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
@@ -7439,7 +7446,11 @@ impl<'a> UiTree<'a> {
     // Nothing moved since the last look that found nothing to change.
     let seen = [self.layout.revision(), self.layout.scrollRevision(), f32.toUsize(self.input.height)]
     // Scroll offsets move fragments while painting, without a layout revision: `scrolled`.
-    if !self.scrolled && seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2] { return false }
+    // A scroll moves each element by no more than the offsets moved: while that stays under the
+    // distance the nearest element was from waking or being skipped, none changes, and a
+    // scroll frame does not walk every element.
+    if seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2]
+      && (!self.scrolled || self.skipTravel < self.skipSlack) { return false }
     let mut automatic = List<u32>.make()
     run self.layout.automaticElements(&mut automatic)
     if automatic.length() == 0 { return false }
@@ -7448,6 +7459,7 @@ impl<'a> UiTree<'a> {
     let far = height * SKIP_FAR
     let mut wakes = List<u64>.make()
     let mut changed = false
+    let mut slack: f32 = far
     // Siblings under one parent fragment move by the same offset where the parent's chain only
     // translates them: one walk up for the first, the offset for the rest.
     let mut lastParent = NO_INDEX
@@ -7478,15 +7490,26 @@ impl<'a> UiTree<'a> {
         } else {
           lastParent = NO_INDEX
         }
+        // A scaled element moves farther than the scroll that moves it.
+        if !translated { slack = 0.0 }
       }
       let distance: f32 = if seen.yMax < 0.0 { 0.0 - seen.yMax } else if seen.yMin > height { seen.yMin - height } else { 0.0 }
       if self.layout.skipped(css) {
         if distance <= near {
           run wakes.append(u64.bitOr(u64.shiftLeft(f32.toU64(distance), 32), usize.toU64(css)))
+        } else {
+          slack = f32.min(slack, distance - near)
         }
-      } else if distance > far && !self.held(css) {
-        run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
-        changed = true
+      } else if distance > far {
+        if self.held(css) {
+          // Held awake for this frame only: the next review skips it.
+          slack = 0.0
+        } else {
+          run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
+          changed = true
+        }
+      } else {
+        slack = f32.min(slack, far - distance)
       }
     }
     run wakes.sort()
@@ -7498,6 +7521,8 @@ impl<'a> UiTree<'a> {
       at = at + 1
     }
     self.skipReview = if changed { [usize.MAX; 3] } else { seen }
+    self.skipSlack = if changed { 0.0 } else { slack }
+    self.skipTravel = 0.0
     return changed
   }
 
