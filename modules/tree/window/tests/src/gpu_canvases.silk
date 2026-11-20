@@ -2,8 +2,8 @@
 //! plays the render thread's part (render_thread.serveCanvases) and reads every frame back.
 //! Where both devices share images (macOS), frames cross as shared images with fences, the
 //! swap chain's images come back to the app, and the app never draws into an image the other
-//! device still holds; elsewhere they cross as pixels. A machine with no GPU adapter checks
-//! nothing. RGBA canvases always cross as pixels.
+//! device still holds; elsewhere they cross as pixels. A machine with no GPU adapter, or with
+//! only Dawn's null backend (which accepts every call and draws nothing), checks nothing. RGBA canvases always cross as pixels.
 import ui_tree_window.canvas_frames { CanvasFrame, CanvasPresenter, ReturnedImage, SharedPicture }
 import ui_tree_window.gpu_canvas { CanvasGpu, GpuCanvas, CANVAS_FORMAT, CANVAS_FORMAT_BGRA, sharingFeatures }
 import ui_renderer.readback { copyOut, readbackSize, unpack }
@@ -165,9 +165,33 @@ effect fn rendererDevice() -> Renderer
   return Renderer { instance: move instance, device: move device, queue: move queue }
 }
 
+/// Whether the default adapter draws: false with no adapter, and with any backend that is
+/// not a real GPU API. A machine without a GPU driver gets Dawn's null backend.
+effect fn adapterDraws() -> bool
+  ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let info = run adapter.getInfo()
+  let backend = info.backendType()
+  return backend == flags.WGPUBackendType_Metal || backend == flags.WGPUBackendType_Vulkan
+    || backend == flags.WGPUBackendType_D3D12 || backend == flags.WGPUBackendType_D3D11
+}
+
 effect fn body(format: u32) -> ()
   ! AssertionError<'static> | GpuError | OutOfMemoryError
   ? &mut Allocator {
+  let draws = run Effect.result(adapterDraws())
+  match move draws {
+    Result<bool, GpuError | OutOfMemoryError>.Success { value } => {
+      if !value {
+        return ()
+      }
+    }
+    Result<bool, GpuError | OutOfMemoryError>.Failure { error } => {
+      drop error
+      return ()
+    }
+  }
   let opened = run Effect.result(CanvasGpu.open())
   let app = match move opened {
     Result<CanvasGpu, GpuError | OutOfMemoryError>.Success { value } => move value
