@@ -152,6 +152,8 @@ pub struct Shaping {
   // The items and glyphs of a segment's new end while they are joined to a source's.
   tailItems: List<Item>,
   tailRaw: List<RawGlyph>,
+  // Per item of the segment being emitted: where its last piece's glyphs ended.
+  hints: List<usize>,
   /// Take glyphs from segments shaped before where that gives what shaping would. Off, every
   /// segment is shaped, for checking that the two agree.
   pub reuse: bool,
@@ -192,6 +194,7 @@ impl Shaping {
       oldest: 0,
       tailItems: List<Item>.make(),
       tailRaw: List<RawGlyph>.make(),
+      hints: List<usize>.make(),
       reuse: true,
       taken: 0,
       continued: 0,
@@ -1185,7 +1188,18 @@ fn spacing(state: &Shaping, bytes: &[u8], treatment: Treatment, index: usize, en
   return extra
 }
 
-// Moves the glyphs of `piece` that item `item` shaped into a pending run.
+// The first glyph from `from` on of a rising item whose cluster is at or past `cluster`.
+fn scanTo(raw: &[RawGlyph], from: usize, end: usize, cluster: usize) -> usize {
+  let mut index = from
+  while index < end && u32.toUsize(raw[index].cluster) < cluster {
+    index = index + 1
+  }
+  return index
+}
+
+// Moves the glyphs of `piece` that item `item` shaped into a pending run. `hint` is where the
+// glyphs of the item's previous piece ended (a rising item's pieces come in cluster order), so
+// the piece's glyphs are found by walking on from there; returns where this piece's end.
 effect fn emit<'a>(
   state: &mut Shaping,
   fonts: &FontState<'a>,
@@ -1194,7 +1208,8 @@ effect fn emit<'a>(
   piece: Piece,
   item: Item,
   characterJustify: bool,
-) -> ()
+  hint: usize,
+) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let pieceEnd = piece.segmentStart + piece.end - piece.start
@@ -1207,7 +1222,7 @@ effect fn emit<'a>(
     high = pieceEnd
   }
   if low >= high {
-    return
+    return hint
   }
   let token = &request.context.tokens[piece.unit]
   let scale = fonts.scale(item.key)
@@ -1221,8 +1236,13 @@ effect fn emit<'a>(
   let mut index = item.glyphStart
   let mut glyphEnd = item.glyphEnd
   if item.order > 0 {
-    index = firstGlyphAt(&state, item, low)
-    glyphEnd = firstGlyphAt(&state, item, high)
+    let raw = state.raw.asSlice()
+    let mut from = hint
+    if from < item.glyphStart || from > item.glyphEnd || (from > item.glyphStart && u32.toUsize(raw[from - 1].cluster) >= low) {
+      from = item.glyphStart
+    }
+    index = scanTo(raw, from, item.glyphEnd, low)
+    glyphEnd = scanTo(raw, index, item.glyphEnd, high)
   } else if item.order < 0 {
     // Falling clusters: those below `high` start after the last one at or above it.
     index = firstGlyphAt(&state, item, high - 1)
@@ -1304,6 +1324,7 @@ effect fn emit<'a>(
       rightSpacing: 0.0,
     },
   )
+  return glyphEnd
 }
 
 effect fn shapeSegments<'a>(
@@ -1396,13 +1417,21 @@ effect fn shapeSegments<'a>(
         run keep(&mut state, &fonts, piece.fontKey, rtl, slot, index, last - index)
       }
     }
+    state.hints.clear()
+    let mut item: usize = 0
+    while item < state.items.length() {
+      run state.hints.append(state.items.get(item).glyphStart)
+      item = item + 1
+    }
     let mut member = index
     while member < last {
       let current = state.pieces.get(member)
-      let mut item: usize = 0
+      item = 0
       while item < state.items.length() {
         let shaped = state.items.get(item)
-        run emit(&mut state, &fonts, request, trailing, current, shaped, characterJustify)
+        let hint = state.hints.get(item)
+        let next = run emit(&mut state, &fonts, request, trailing, current, shaped, characterJustify, hint)
+        state.hints.set(item, next)
         item = item + 1
       }
       member = member + 1
