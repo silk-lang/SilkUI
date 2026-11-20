@@ -194,17 +194,14 @@ effect fn replayBody() -> ()
   run Testing.expect(!tree.stats.layoutSkipped, "the first frame lays out")
   let painted = tree.stats.paintedFragments
 
-  // Nothing changed: the root's subtree is copied whole and layout is skipped.
+  // Nothing changed: layout is skipped and so is paint, the last scene is kept.
+  let kept = tree.paintsKept
   let second = run frame(&mut tree, &mut snapshot)
   run Testing.expect(tree.stats.layoutSkipped, "an unchanged frame skips layout")
   run Testing.expect(tree.stats.repaintedSubtrees == 0, "an unchanged frame repaints nothing")
-  // The faded card makes a stacking context, painted from the root context's lists.
-  run Testing.expect(
-    tree.stats.replayedSubtrees == 2,
-    "an unchanged frame replays the root and the faded card",
-  )
-  run Testing.expect(tree.stats.paintedFragments < painted, "replayed fragments are not visited")
-  run Testing.expect(samePixels(&first, &second), "a replayed frame draws the same pixels")
+  run Testing.expect(tree.paintsKept == kept + 1, "an unchanged frame keeps the last scene")
+  run Testing.expect(tree.stats.paintedFragments < painted, "a kept frame visits no fragment")
+  run Testing.expect(samePixels(&first, &second), "a kept frame draws the same pixels")
 
   // One card changes color: the root and that card are painted again, the other cards and
   // the card's own children are replayed.
@@ -240,6 +237,58 @@ test effect fn unchangedSubtreesAreReplayedNotRepainted() -> ()
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run replayBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn keptSceneBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run fixtures.cardList(&mut batch)
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 0, "the first frame paints")
+
+  // Frames asked for by the host alone (requestAnimationFrame, a canvas present) keep it.
+  drop run frame(&mut tree, &mut snapshot)
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 2, "frames with nothing changed keep the scene")
+
+  // A mutation paints again, and the frame after it keeps the new scene.
+  run tree.apply(run background(fixtures.CARD + 10, 0xfee2e2))
+  let changed = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 2, "a mutation paints")
+  let expected = run freshCardList(&collection, run background(fixtures.CARD + 10, 0xfee2e2))
+  run Testing.expect(samePixels(&changed, &expected), "and paints the change")
+  let after = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 3, "the frame after a change keeps its scene")
+  run Testing.expect(samePixels(&after, &expected), "which shows the change")
+
+  // A new viewport size or scale paints.
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(tree.paintsKept == 3, "a resize paints")
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 2.0, time: 0.0 })
+  run Testing.expect(tree.paintsKept == 3, "a scale change paints")
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 2.0, time: 1.0 })
+  run Testing.expect(tree.paintsKept == 4, "a later time alone keeps the scene")
+}
+
+test effect fn framesWithNothingChangedKeepTheLastScene() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keptSceneBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 effect fn textChangeBody() -> ()
