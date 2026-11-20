@@ -8,8 +8,10 @@ the Electron ones are about 17 MB); the records go to `results/<suite>-timeline.
 
 `tools/timeline.py` turns those into `results/timeline.json`: for each session, suite, app, scene
 and cold or warm start, the phases on each thread with the median start and end of each phase over
-the launches. The dashboard draws them as one row of bars per thread, like the start-up report
-of 2026-11-19. Solid bars are the critical path to the first frame. Hatched bars run beside it.
+the launches. The file is a flat table, one row per phase (the dashboard's data runtime does not
+keep nested lists), and the dashboard groups the rows back by app and start kind. It draws one row
+of bars per thread, with the warm and the cold start of each app on one time axis, like the
+start-up report of 2026-11-19. Solid bars are the critical path to the first frame. Hatched bars run beside it.
 
 Tracing costs some start time (Electron's trace most), so timeline numbers are not the start
 times of the `start` mode. Compare phases inside a timeline, and start times from `start` runs.

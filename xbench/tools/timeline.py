@@ -304,7 +304,7 @@ def main():
                 continue
             groups[(rec["session"], rec["suite"], rec["app"], rec["scene"], rec["kind"])].append(rec)
 
-    out = []
+    out, summaries = [], []
     for (session, suite, app, scene, kind), recs in sorted(groups.items()):
         runs = []
         for r in recs:
@@ -341,19 +341,22 @@ def main():
         on = [m["on_screen"] for _, m in runs if m.get("on_screen") is not None]
         fcp = [m["fcp"] for _, m in runs if m.get("fcp") is not None]
         first = recs[0]
-        out.append(dict(
+        head = dict(
             session=session, date=session[:10], suite=suite, app=app, scene=scene, kind=kind, runs=len(runs),
             machine=first["machine"].get("host", ""), cpu=first["machine"].get("cpu", ""), label=first.get("label", ""),
             on_screen=round(statistics.median(on), 1) if on else None,
-            on_screen_range=[round(min(on), 1), round(max(on), 1)] if on else None,
             fcp=round(statistics.median(fcp), 1) if fcp else None,
-            segments=segs,
-        ))
+        )
+        # One flat row per phase: the dashboard's datasets are tables, not nested documents.
+        for i, sg in enumerate(segs):
+            out.append(dict(head, order=i, lane=sg["lane"], lane_name=sg["lane_name"], phase=sg["label"], phase_kind=sg["kind"],
+                            critical=sg["critical"], start=sg["start"], end=sg["end"], dur=sg["dur"], n=sg["n"]))
+        summaries.append(head)
     path = os.path.join(RESULTS, "timeline.json")
     with open(path, "w") as f:
         f.write("[\n" + ",\n".join(json.dumps(r, separators=(",", ":")) for r in out) + "\n]\n")
-    for r in out:
-        print(f"{r['session']} {r['suite']:3} {r['app']:12} {r['scene']:6} {r['kind']:4} n={r['runs']} on-screen={r['on_screen']} phases={len(r['segments'])}")
+    for r in summaries:
+        print(f"{r['session']} {r['suite']:3} {r['app']:12} {r['scene']:6} {r['kind']:4} n={r['runs']} on-screen={r['on_screen']}")
     print(path)
 
 
