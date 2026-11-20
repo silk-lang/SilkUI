@@ -16,3 +16,8 @@ export function createRoot(container?: Node): Root;
 
 /** Runs `callback` and commits the updates it made before returning. */
 export function flushSync<T>(callback: () => T): T;
+
+/** Renders `children` into `container`, a @silkui/core node elsewhere in the tree. */
+export function createPortal(children: ReactNode, container: Node, key?: string | null): ReactNode;
+
+export { createElement } from "react";

@@ -3,6 +3,7 @@
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { transformWithOxc } from "vite";
 import { reconcilerPlugin } from "./reconciler.js";
 
@@ -10,6 +11,11 @@ const require = createRequire(import.meta.url);
 const IMPORT_SOURCE = "@silkui/react";
 const REFRESH = "virtual:silk-refresh";
 const REFRESH_ID = "\0" + REFRESH;
+// The HTML elements' default stylesheet (html.css), first of the app's stylesheets.
+const HTML_CSS = fileURLToPath(new URL("./html.css", import.meta.url));
+const HTML_SHEET = "virtual:silk-html-sheet";
+const HTML_SHEET_ID = "\0" + HTML_SHEET;
+const DOM = fileURLToPath(new URL("./dom.js", import.meta.url));
 
 /** react-refresh's runtime as an ES module that hooks itself up when it loads. */
 function refreshModule() {
@@ -100,14 +106,42 @@ if (import.meta.hot) {
   },
 };
 
+// Under the dev server the sheet loads before the entry, so it is installed first; a build
+// imports it at the top of the entry, which puts its CSS before the app's.
+const htmlSheetPlugin = {
+  name: "silk:html-sheet",
+  enforce: "pre",
+  api: { silkPreload: [HTML_SHEET] },
+  resolveId(id) {
+    if (id === HTML_SHEET) return HTML_SHEET_ID;
+  },
+  load(id) {
+    if (id === HTML_SHEET_ID) return `import ${JSON.stringify(HTML_CSS)};`;
+  },
+  transform(code, id) {
+    if (this.environment?.mode === "dev" || !this.getModuleInfo(id)?.isEntry) return;
+    return { code: `import ${JSON.stringify(HTML_CSS)};\n${code}`, map: null };
+  },
+};
+
 /**
  * @param {object} [options]
  * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
+ * @param {boolean} [options.html] HTML elements' default stylesheet, and `react-dom` pointed at
+ *   this renderer, for apps written for React DOM. Default true.
  */
 export default function react(options = {}) {
   const config = {
     name: "silk:react",
-    config: () => ({ oxc: { jsx: { runtime: "automatic", importSource: IMPORT_SOURCE } } }),
+    config: () => ({
+      oxc: { jsx: { runtime: "automatic", importSource: IMPORT_SOURCE } },
+      resolve: options.html === false ? {} : {
+        alias: [
+          { find: /^react-dom$/, replacement: DOM },
+          { find: /^react-dom\/client$/, replacement: DOM },
+        ],
+      },
+    }),
     // The dev server pre-bundles dependencies before the plugins see them: patch React's
     // reconciler there too.
     configEnvironment(name) {
@@ -115,6 +149,7 @@ export default function react(options = {}) {
     },
   };
   const plugins = [config, reconcilerPlugin()];
+  if (options.html !== false) plugins.push(htmlSheetPlugin);
   if (options.refresh ?? true) plugins.push(refreshPlugin);
   return plugins;
 }
