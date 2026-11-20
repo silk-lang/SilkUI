@@ -107,10 +107,10 @@ test('prefixed aliases compile as their standard property and vendor noise stays
 });
 
 test('warns about keyframes that set a property Silk UI does not animate, without failing strict mode', () => {
-  const css = '@keyframes hue { from { filter: hue-rotate(0deg) } to { filter: hue-rotate(360deg); opacity: 0 } } @keyframes fade { to { opacity: 0 } }';
+  const css = '@keyframes pan { from { background-position: 0 0 } to { background-position: 100% 0; opacity: 0 } } @keyframes hue { to { filter: hue-rotate(360deg); opacity: 0 } }';
   const result = compileStylesheet(css, { strict: true });
-  assert.deepEqual(result.diagnostics, [{ kind: 'animation', feature: 'hue: filter', count: 1 }]);
+  assert.deepEqual(result.diagnostics, [{ kind: 'animation', feature: 'pan: background-position', count: 1 }]);
   const warnings = [];
   reportDropped(message => warnings.push(message), result.diagnostics);
-  assert.deepEqual(warnings, ['@keyframes hue sets filter, which Silk UI does not animate: it keeps its base value']);
+  assert.deepEqual(warnings, ['@keyframes pan sets background-position, which Silk UI does not animate: it keeps its base value']);
 });
