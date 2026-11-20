@@ -260,6 +260,9 @@ struct State {
   /// Present each frame at once instead of at the display's next refresh (see
   /// [`RenderThread.setUncapped`]).
   uncapped: bool,
+  /// The UI thread is making a frame (see [`RenderThread.beginFrame`]): a canvas frame waits
+  /// for it instead of drawing the window on its own.
+  framing: bool,
 }
 
 impl Transferable for State {}
@@ -529,6 +532,26 @@ impl RenderThread {
     state.uncapped = on
   }
 
+  /// The UI thread starts a frame. Until it submits it or calls [`RenderThread.endFrame`], a
+  /// canvas frame presented meanwhile waits, and the window is drawn once for both: a
+  /// `requestAnimationFrame` callback that draws a canvas would otherwise have the window
+  /// drawn for the canvas and again for the frame.
+  pub fn beginFrame(self: &mut Self) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.framing = true
+  }
+
+  /// The UI thread's frame is over, submitted or not: canvas frames that waited for it are
+  /// drawn now if no frame came.
+  pub fn endFrame(self: &mut Self) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.framing = false
+    drop guard
+    self.wake.unpark()
+  }
+
   /// Waits until the render thread has taken the last frame handed over (see
   /// [`RenderThread.pending`]), or has stopped.
   pub fn waitTaken(self: &mut Self) -> () {
@@ -796,6 +819,7 @@ effect fn makeShared() -> Arc<Mutex<State>>
     dropped: 0,
     hud: -1,
     uncapped: false,
+    framing: false,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -866,6 +890,13 @@ fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresen
   return Work.Quit
 }
 
+/// Whether the render thread draws the current frame again with no new frame from the UI
+/// thread: the compositor asked for it (`redraw`), or a canvas presented a frame
+/// (`canvasWaiting`) while the UI thread makes none (`framing`: its frame draws the canvas too).
+pub fn redrawsAlone(redraw: bool, canvasWaiting: bool, framing: bool) -> bool {
+  return redraw || canvasWaiting && !framing
+}
+
 fn takeWork(shared: &Arc<Mutex<State>>, canvases: &CanvasPresenter) -> Option<Work> {
   // A canvas frame shows by drawing the last frame again, as a compositor scroll does.
   let canvasWaiting = canvases.waiting()
@@ -879,7 +910,7 @@ fn takeWork(shared: &Arc<Mutex<State>>, canvases: &CanvasPresenter) -> Option<Wo
       state.redraw = false
       Option<Work>.some(Work.Job { job: move value })
     }
-    Option<FrameJob>.None => if state.redraw || canvasWaiting {
+    Option<FrameJob>.None => if redrawsAlone(state.redraw, canvasWaiting, state.framing) {
       state.redraw = false
       Option<Work>.some(Work.Redraw)
     } else if state.extraJobs.length() != 0 || state.opening.length() != 0
