@@ -25,7 +25,7 @@ import window.types { Appearance }
 import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
 import ui_tree.process_memory
-import render_thread { FastScroll, FastScrolled, RenderSettings }
+import render_thread { FastScroll, FastScrolled, Grab, RenderSettings }
 import canvas_frames { CanvasPresenter }
 import ui_scene.primitives { SURFACE_TEXTURE_BASE, surfaceOfTexture }
 import companion { Companion, Dock, NoCompanion, Paired, dockTarget, pointed }
@@ -1476,6 +1476,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
   let mut renderer = run attachRenderer(move early, raw, owner)
+  // Screenshots copy the frame the render thread drew instead of drawing one on the CPU.
+  let mut grabbing = false
+  if serves {
+    inspector.liveFrames(true)
+  }
   gpuAt = (run seconds(&mut clock)) - started
   if tracing {
     StderrWriter.print("silk-ui: gpu ready\n", &())
@@ -1707,6 +1712,21 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
     if serves && inspector.enabled() {
       run content.report(&mut state, &mut inspector)
+      if grabbing {
+        if let Option<Grab>.Some { value } = renderer.takeGrab() {
+          grabbing = false
+          let grab = move value
+          run inspector.frameCopy(
+            &tree,
+            move grab.rows,
+            grab.stride,
+            grab.width,
+            grab.height,
+            grab.bgra,
+            grab.ok,
+          )
+        }
+      }
     }
     if serves && run inspector.poll(&mut tree) {
       while true {
@@ -1727,6 +1747,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       let cursorScale = platform.scaleFactor(owner)
       run showCursor(&mut platform, owner, &mut tree, cursorScale)
       redraw = true
+    }
+    if serves && !grabbing && inspector.wantsFrameCopy() {
+      // The render thread copies the next frame it draws, the current one again if none comes.
+      renderer.grab()
+      grabbing = true
     }
     let about = match &next {
       Option<Event>.Some { value } => windowOf(&value)

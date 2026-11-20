@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { compileStylesheet } from '../src/compiler.js';
+import { reportDropped } from '../src/report.js';
 
 test('compiles layers, variables, conditions, and modern colors using the shipped wasm', () => {
   const source = '@layer theme, utilities; @layer theme { :root { --gap: 4px } } @layer utilities { .card:hover { padding: calc(var(--gap) * 2); color: color-mix(in oklch, red 30%, blue) } } @media (min-width: 10px) { .card { display: flex } }';
@@ -103,4 +104,13 @@ test('prefixed aliases compile as their standard property and vendor noise stays
   const lines = [];
   reportDropped(line => lines.push(line), compileStylesheet(standardize(noisy)).diagnostics);
   assert.deepEqual(lines, ['skipped 1 CSS feature Silk UI does not draw yet: made-up-property. SILKUI_CSS_REPORT=all lists everything dropped.']);
+});
+
+test('warns about keyframes that set a property Silk UI does not animate, without failing strict mode', () => {
+  const css = '@keyframes hue { from { filter: hue-rotate(0deg) } to { filter: hue-rotate(360deg); opacity: 0 } } @keyframes fade { to { opacity: 0 } }';
+  const result = compileStylesheet(css, { strict: true });
+  assert.deepEqual(result.diagnostics, [{ kind: 'animation', feature: 'hue: filter', count: 1 }]);
+  const warnings = [];
+  reportDropped(message => warnings.push(message), result.diagnostics);
+  assert.deepEqual(warnings, ['@keyframes hue sets filter, which Silk UI does not animate: it keeps its base value']);
 });

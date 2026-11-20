@@ -526,6 +526,10 @@ impl Inspector {
       // Requests wait for an extension, which the loop serves on its next turn.
       return Option<f64>.some(0.0)
     }
+    if self.enabled() && self.protocol.shots.busy() {
+      // Screenshots wait for a frame copy or for the worker that encodes them.
+      return Option<f64>.some(0.005)
+    }
     if !self.enabled() || (self.listener.isNone() && self.acceptor.isNone()) {
       // Off, or serving only clients in this process, which are served on the spot.
       return Option<f64>.None
@@ -572,6 +576,7 @@ impl Inspector {
       run self.begin(NoWake {})
     }
     run self.adopt()
+    run self.deliverShots()
     if self.awaitingFrame {
       return false
     }
@@ -624,6 +629,70 @@ impl Inspector {
     self.release()
     run self.publish(&tree.*)
     return changed
+  }
+
+  /// Sends the screenshots the worker finished to the sessions that asked.
+  effect fn deliverShots(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !run self.protocol.takeShots() {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    self.release()
+  }
+
+  /// Says whether the host can read the frames it draws back from the GPU. When it can,
+  /// screenshots of the window wait for the next frame it draws ([`Inspector.wantsFrameCopy`],
+  /// [`Inspector.frameCopy`]) and are encoded on a worker thread, so taking one does not stop
+  /// the app's loop the way drawing it on the CPU would.
+  pub fn liveFrames(self: &mut Self, on: bool) -> () {
+    self.protocol.liveFrames = on
+  }
+
+  /// Whether a screenshot waits for a copy of the next frame: the host asks its renderer for
+  /// one and hands it to [`Inspector.frameCopy`].
+  pub fn wantsFrameCopy(self: &Self) -> bool {
+    return self.enabled() && self.protocol.shots.wantsFrame()
+  }
+
+  /// Hands the waiting screenshots the frame the host read back: `height` rows of `stride`
+  /// bytes, BGRA when `bgra`. With `ok` false the window cannot be read back, and screenshots
+  /// are drawn on the CPU from then on.
+  pub effect fn frameCopy(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    rows: List<u8>,
+    stride: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    ok: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.frameCopy(tree, move rows, stride, width, height, bgra, ok)
+    run self.deliverShots()
+    if !ok {
+      // The CPU answers went straight to the replies.
+      let mut j: usize = 0
+      while j < self.sessions.length() {
+        let served = &mut self.sessions.asMutSlice()[j]
+        run served.session.deliver(&mut self.protocol)
+          |> Effect.provideMut<Channel>(&mut served.channel)
+        j = j + 1
+      }
+      self.release()
+    }
   }
 
   /// Takes the sessions the accept thread started since the last look.
@@ -894,6 +963,7 @@ impl Inspector {
 
   fn shutdown(self: &mut Self) -> () {
     let was = self.enabled()
+    self.protocol.shots.stop()
     while self.sessions.length() != 0 {
       let mut gone = self.sessions.remove(0)
       gone.channel.close()

@@ -31,7 +31,7 @@ import ui_tree.legacy { Pending }
 import atlas.atlas { Atlas, TextureInfo }
 import ui_renderer.atlas_textures { GpuAtlas }
 import ui_renderer.compare { Tolerance, compare }
-import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
+import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, readbackStride, unpack }
 import ui_renderer.renderer { UiRenderer }
 import ui_renderer.text { TextSettings }
 import canvas_frames { CanvasFrame, CanvasPresenter, ChainImage, ReturnedImage, SharedPicture }
@@ -260,9 +260,28 @@ struct State {
   /// Present each frame at once instead of at the display's next refresh (see
   /// [`RenderThread.setUncapped`]).
   uncapped: bool,
+  /// A copy of the first window's next drawn frame is wanted (see [`RenderThread.grab`]).
+  grabWanted: bool,
+  /// The copy, once drawn and read back.
+  grabbed: Option<Grab>,
 }
 
 impl Transferable for State {}
+
+/// A copy of a frame the render thread drew, read back from the GPU (see
+/// [`RenderThread.grab`]). `rows` holds `height` rows of `stride` bytes each, the first
+/// `width * 4` of them the row's pixels, in BGRA order when `bgra` is set and RGBA otherwise.
+/// `ok` is false, and `rows` empty, when the surface cannot be read back.
+pub struct Grab {
+  pub rows: List<u8>,
+  pub stride: u32,
+  pub width: u32,
+  pub height: u32,
+  pub bgra: bool,
+  pub ok: bool,
+}
+
+impl Transferable for Grab {}
 
 /// The GPU side of one window, running on its own thread.
 pub struct RenderThread {
@@ -527,6 +546,26 @@ impl RenderThread {
     let mut guard = self.shared.get().lock()
     let state = guard.getMut()
     state.uncapped = on
+  }
+
+  /// Asks for a copy of the first window's next frame, read back from the GPU right after it is
+  /// drawn: the frame the UI thread hands over next, or the current one drawn again when none
+  /// comes. The copy shows in [`RenderThread.takeGrab`] a frame or so later. The inspector's
+  /// screenshots use it, so taking one costs the app a GPU copy instead of a CPU render.
+  pub fn grab(self: &mut Self) -> () {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    state.grabWanted = true
+    state.redraw = true
+    drop guard
+    self.wake.unpark()
+  }
+
+  /// The frame copy [`RenderThread.grab`] asked for, once it is drawn, or None until then.
+  pub fn takeGrab(self: &mut Self) -> Option<Grab> {
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    return Intrinsic.replace(state.grabbed, Option<Grab>.None)
   }
 
   /// Waits until the render thread has taken the last frame handed over (see
@@ -796,6 +835,8 @@ effect fn makeShared() -> Arc<Mutex<State>>
     dropped: 0,
     hud: -1,
     uncapped: false,
+    grabWanted: false,
+    grabbed: Option<Grab>.None,
   }
   return run Arc<Mutex<State>>.make(run Mutex<State>.make(move state))
 }
@@ -1682,6 +1723,9 @@ effect fn renderLoop(
         job.height,
       )
     }
+    if grabWanted(shared) {
+      run grabFrame(shared, &device, &queue, &texture.texture, canCopy, isBgra(format), job.width, job.height)
+    }
     run gpuSurface.present()
     run device.checkErrors()
     let presented = run seconds(&mut clock)
@@ -1716,6 +1760,43 @@ effect fn renderLoop(
     drop leaving
   }
   gpuSurface.unconfigure()
+}
+
+fn grabWanted(shared: &Arc<Mutex<State>>) -> bool {
+  let mut guard = shared.get().lock()
+  return guard.getMut().grabWanted
+}
+
+/// Reads the drawn surface back for [`RenderThread.grab`]. Only the copy and the wait for it
+/// happen here; the rows go to the UI thread as they are, so whoever asked unpacks them.
+effect fn grabFrame(
+  shared: &Arc<Mutex<State>>,
+  device: &Device,
+  queue: &Queue,
+  surfaceTexture: &Texture,
+  canCopy: bool,
+  bgra: bool,
+  width: u32,
+  height: u32,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut grab = Grab {
+    rows: List<u8>.make(),
+    stride: readbackStride(width),
+    width: width,
+    height: height,
+    bgra: bgra,
+    ok: canCopy,
+  }
+  if canCopy {
+    let buffer = run copyOut(device, queue, surfaceTexture, width, height)
+    grab.rows = run runtime.mapRead(device, &buffer, 0, readbackSize(width, height))
+  }
+  let mut guard = shared.get().lock()
+  let state = guard.getMut()
+  state.grabWanted = false
+  state.grabbed = Option<Grab>.some(move grab)
 }
 
 /// Compares the drawn surface with the CPU reference of the same frame. Returns 0 within
