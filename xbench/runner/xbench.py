@@ -360,6 +360,9 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
     except OSError:
         pass
     proc.wait()
+    paths = [l.split("silk-ui: ", 1)[1] for l in lines if "silk-ui: canvas frames" in l]
+    if paths:
+        record["canvas_path"] = paths
     errors = [l for l in lines if "XB " not in l and re.search(r"error|panic|failed|exception", l, re.I) and "dbus" not in l]
     if errors:
         record["notes"] += errors[:5]

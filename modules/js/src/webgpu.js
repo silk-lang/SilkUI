@@ -334,8 +334,10 @@
         w.flag(options.forceFallbackAdapter);
       });
     }
+    // As Chrome on desktop systems: BGRA canvases are the ones whose frames reach the window
+    // without a copy where the devices share images (gpu_canvas.silk).
     getPreferredCanvasFormat() {
-      return "rgba8unorm";
+      return "bgra8unorm";
     }
     get wgslLanguageFeatures() {
       return new Set();
