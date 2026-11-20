@@ -137,6 +137,8 @@ class Look {
   #node;
   #state;
   // Plain objects share their shape across nodes: a Map here costs four times the memory.
+  // A number or string is kept as given, which the caller's style object holds too, and
+  // turned into CSS text when it is read: no node keeps a string of its own per value.
   #values = Object.create(null);
 
   constructor(node, state) {
@@ -161,9 +163,9 @@ class Look {
         }
         continue;
       }
+      if (this.#values[name] === value) continue;
       const text = cssValue(name, value);
-      if (this.#values[name] === text) continue;
-      this.#values[name] = text;
+      this.#values[name] = typeof value === "number" || typeof value === "string" ? value : text;
       css += cssName(name) + ":" + text + ";";
     }
     if (removed) {
@@ -183,12 +185,13 @@ class Look {
   }
 
   get(name) {
-    return this.#values[name];
+    const value = this.#values[name];
+    return value === undefined ? undefined : cssValue(name, value);
   }
 
   get cssText() {
     let css = "";
-    for (const name in this.#values) css += cssName(name) + ":" + this.#values[name] + ";";
+    for (const name in this.#values) css += cssName(name) + ":" + cssValue(name, this.#values[name]) + ";";
     return css;
   }
 
@@ -413,27 +416,48 @@ export function updateStyleSheet(id, compiled) {
   }
 }
 
+// What few nodes have, made on first use (see `Node`).
+class NodeState {
+  listeners = null;
+  // The state looks by name.
+  looks = null;
+  flags = 0;
+  // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
+  kept = 0;
+  attributes = null;
+  classList = null;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
-  #listeners = null;
-  // The base look, and the state looks by name: most nodes have the base alone.
+  // A node is a handle on the tree's node: it keeps only what the tree cannot answer at once
+  // (its place among its siblings, its class, its base look), and puts the state few nodes
+  // have (listeners, attributes, state looks) in one record made on first use. Every field
+  // is a slot in every node, and a node of up to eight fits its object's own cell.
+  // The base look: most nodes have the base alone.
   #base = null;
-  #looks = null;
-  #flags = 0;
-  // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
-  #kept = 0;
-  #attributes = null;
   #className = null;
-  #classList = null;
+  #rare = null;
 
   constructor(kind) {
     Object.defineProperty(this, "nodeId", { value: ++nextId, enumerable: true });
-    this.kind = kind;
+    // A text node's kind is its prototype's: one slot fewer in the most numerous node.
+    if (kind !== "text") this.kind = kind;
     this.parentNode = null;
-    // A text leaf has no children: they all share one empty list.
-    this.childNodes = kind === "text" ? NO_CHILDREN : [];
+    // A node with no children shares one empty list, and gets its own at its first child.
+    this.childNodes = NO_CHILDREN;
     nodes.set(this.nodeId, this);
     native.create(this.nodeId, KINDS[kind]);
+  }
+
+  #more() {
+    return (this.#rare ??= new NodeState());
+  }
+
+  // The node's own child list, made on its first child.
+  _ownChildren() {
+    if (this.childNodes === NO_CHILDREN) this.childNodes = [];
+    return this.childNodes;
   }
 
   get adoptedStyleSheets() { return adoptedList(this).proxy; }
@@ -470,8 +494,9 @@ export class Node {
   cloneNode(deep = false) {
     const copy = this._shallowClone();
     if (this.#base) this.#base._copyTo(copy.look("base"));
-    for (const state in this.#looks ?? {}) this.#looks[state]._copyTo(copy.look(state));
-    for (const [name, value] of this.#attributes ?? []) copy.setAttribute(name, value);
+    const looks = this.#rare?.looks;
+    for (const state in looks ?? {}) looks[state]._copyTo(copy.look(state));
+    for (const [name, value] of this.#rare?.attributes ?? []) copy.setAttribute(name, value);
     if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
     return copy;
   }
@@ -543,7 +568,7 @@ export class Node {
       this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
       native.insertBefore(this.nodeId, child.nodeId, before.nodeId);
     } else {
-      this.childNodes.push(child);
+      this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
     return child;
@@ -615,8 +640,9 @@ export class Node {
   look(state) {
     if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
-    this.#looks ??= Object.create(null);
-    return (this.#looks[state] ??= new Look(this, STATES[state]));
+    const rare = this.#more();
+    rare.looks ??= Object.create(null);
+    return (rare.looks[state] ??= new Look(this, STATES[state]));
   }
 
   /**
@@ -632,13 +658,13 @@ export class Node {
   set id(value) { this.setAttribute("id", String(value)); }
   get className() { return this.getAttribute("class") ?? ""; }
   set className(value) { this.setAttribute("class", String(value)); }
-  get classList() { return this.#classList ??= new ClassList(this); }
+  get classList() { return this.#more().classList ??= new ClassList(this); }
 
   getAttribute(name) {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
     const aria = ariaName(name);
-    return this.#attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
+    return this.#rare?.attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
@@ -674,8 +700,8 @@ export class Node {
       native.attribute(this.nodeId, name,
         name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
     }
-    if (text === null) this.#attributes?.delete(name);
-    else (this.#attributes ??= new Map()).set(name, text);
+    if (text === null) this.#rare?.attributes?.delete(name);
+    else (this.#more().attributes ??= new Map()).set(name, text);
   }
 
   // The `id` other nodes' relations name this node by.
@@ -689,13 +715,16 @@ export class Node {
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
   #want(kind) {
     const [wanted, bit] = this.#wanted(kind);
-    const flags = ((wanted ? this.#flags | bit : this.#flags & ~bit) | this.#kept | (this._extra ?? 0)) >>> 0;
-    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+    const rare = this.#rare;
+    const old = rare?.flags ?? 0;
+    const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
+    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
   #wanted(kind) {
-    const has = (type) => (this.#listeners?.get(type)?.length ?? 0) > 0;
+    const listeners = this.#rare?.listeners;
+    const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
     if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
     const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
@@ -705,17 +734,18 @@ export class Node {
 
   /** Listens again for every kind its listeners, kept kinds and `_extra` flags ask for. */
   _relisten() {
-    let flags = this.#kept | (this._extra ?? 0);
+    let flags = (this.#rare?.kept ?? 0) | (this._extra ?? 0);
     for (let kind = 0; kind < TYPES.length; kind++) {
       const [wanted, bit] = this.#wanted(kind);
       if (wanted) flags |= bit;
     }
     flags >>>= 0;
-    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
   }
 
   _keep(...types) {
-    for (const type of types) this.#kept = (this.#kept | (1 << bitOf(KIND_OF.get(type)))) >>> 0;
+    const rare = this.#more();
+    for (const type of types) rare.kept = (rare.kept | (1 << bitOf(KIND_OF.get(type)))) >>> 0;
     this.#want(KIND_OF.get(types[0]));
   }
 
@@ -851,9 +881,9 @@ export class Node {
     if (listener == null || signal?.aborted) return;
     const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     const capture = options === true || !!options?.capture;
-    this.#listeners ??= new Map();
-    let list = this.#listeners.get(type);
-    if (!list) this.#listeners.set(type, (list = []));
+    const listeners = (this.#more().listeners ??= new Map());
+    let list = listeners.get(type);
+    if (!list) listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
     if (kind !== undefined) this.#want(kind);
@@ -861,7 +891,7 @@ export class Node {
   }
 
   removeEventListener(type, listener, options) {
-    const list = this.#listeners?.get(type);
+    const list = this.#rare?.listeners?.get(type);
     if (!list) return;
     const capture = options === true || !!options?.capture;
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
@@ -879,7 +909,7 @@ export class Node {
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
   _run(event, capture) {
-    const list = this.#listeners?.get(event.type);
+    const list = this.#rare?.listeners?.get(event.type);
     if (!list) return;
     for (const entry of list.slice()) {
       if (event._immediate) return;
@@ -989,6 +1019,8 @@ export class Text extends Node {
     return rest;
   }
 }
+
+Object.defineProperty(Text.prototype, "kind", { value: "text", writable: true, configurable: true });
 
 /**
  * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
@@ -1347,7 +1379,7 @@ const svgChildren = {
     }
     child.parentNode = this;
     if (before) this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
-    else this.childNodes.push(child);
+    else (this.childNodes === NO_CHILDREN ? (this.childNodes = []) : this.childNodes).push(child);
     if (child instanceof Text) child._svgText = true;
     liveOwner(this)?._inserted(child, this, before);
     svgChanged(this);
@@ -2211,7 +2243,7 @@ function forget(node) {
     child.parentNode = null;
     forget(child);
   }
-  node.childNodes = [];
+  node.childNodes = NO_CHILDREN;
 }
 
 export function createNode(kind) {
