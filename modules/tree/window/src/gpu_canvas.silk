@@ -23,8 +23,12 @@ import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.usize
 
-/// The format of every canvas texture: premultiplied RGBA.
+/// The format of a canvas texture unless its maker asks for [`CANVAS_FORMAT_BGRA`]:
+/// premultiplied RGBA.
 pub const CANVAS_FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
+
+/// The other format a canvas texture can have: premultiplied BGRA.
+pub const CANVAS_FORMAT_BGRA: u32 = flags.WGPUTextureFormat_BGRA8Unorm
 
 /// The app's own GPU: an instance, a device on the default adapter and its queue.
 pub struct CanvasGpu {
@@ -52,10 +56,11 @@ pub struct GpuCanvas {
   pixelHeight: u32,
   /// Whether presents make every pixel opaque, whatever alpha the app drew.
   pub opaque: bool,
+  pixelFormat: u32,
   target: Texture,
 }
 
-effect fn makeTarget(device: &Device, width: u32, height: u32) -> Texture
+effect fn makeTarget(device: &Device, width: u32, height: u32, format: u32) -> Texture
   ! GpuError {
   let mut size = Extent3D.default()
   size.setWidth(width)
@@ -63,7 +68,7 @@ effect fn makeTarget(device: &Device, width: u32, height: u32) -> Texture
   size.setDepthOrArrayLayers(1)
   let mut descriptor = TextureDescriptor.default().withLabel(b"gpu canvas")
   descriptor.setSize(size)
-  descriptor.setFormat(CANVAS_FORMAT)
+  descriptor.setFormat(format)
   descriptor.setDimension(flags.WGPUTextureDimension_2D)
   descriptor.setMipLevelCount(1)
   descriptor.setSampleCount(1)
@@ -84,16 +89,36 @@ impl GpuCanvas {
     height: u32,
   ) -> GpuCanvas
     ! GpuError {
+    return run GpuCanvas.makeIn(gpu, presenter, width, height, CANVAS_FORMAT)
+  }
+
+  /// As [`GpuCanvas.make`], with a texture in `format`: [`CANVAS_FORMAT`] or
+  /// [`CANVAS_FORMAT_BGRA`] (any other format gives the first).
+  pub effect fn makeIn(
+    gpu: &CanvasGpu,
+    presenter: &CanvasPresenter,
+    width: u32,
+    height: u32,
+    format: u32,
+  ) -> GpuCanvas
+    ! GpuError {
     let w = if width == 0 { 1 } else { width }
     let h = if height == 0 { 1 } else { height }
+    let chosen = if format == CANVAS_FORMAT_BGRA { CANVAS_FORMAT_BGRA } else { CANVAS_FORMAT }
     return GpuCanvas {
       id: presenter.open(),
       presenter: presenter.clone(),
       pixelWidth: w,
       pixelHeight: h,
       opaque: false,
-      target: run makeTarget(&gpu.device, w, h),
+      pixelFormat: chosen,
+      target: run makeTarget(&gpu.device, w, h, chosen),
     }
+  }
+
+  /// The format of [`GpuCanvas.texture`].
+  pub fn format(self: &Self) -> u32 {
+    return self.pixelFormat
   }
 
   /// The number canvas nodes name this canvas by (`Tree.setCanvasSurface`).
@@ -109,7 +134,7 @@ impl GpuCanvas {
     return self.pixelHeight
   }
 
-  /// The texture to draw the next frame into, in [`CANVAS_FORMAT`]. It keeps what was drawn
+  /// The texture to draw the next frame into, in [`GpuCanvas.format`]. It keeps what was drawn
   /// before: clear it in the frame's first pass.
   pub fn texture(self: &Self) -> &Texture {
     return &self.target
@@ -124,7 +149,7 @@ impl GpuCanvas {
     if w == self.pixelWidth && h == self.pixelHeight {
       return ()
     }
-    self.target = run makeTarget(&gpu.device, w, h)
+    self.target = run makeTarget(&gpu.device, w, h, self.pixelFormat)
     self.pixelWidth = w
     self.pixelHeight = h
   }
@@ -137,7 +162,7 @@ impl GpuCanvas {
     let buffer = run copyOut(&gpu.device, &gpu.queue, &self.target, self.pixelWidth, self.pixelHeight)
       |> Effect.provideMut<Allocator>(&mut heap)
     let padded = run runtime.mapRead(&gpu.device, &buffer, 0, readbackSize(self.pixelWidth, self.pixelHeight))
-    let mut pixels = run unpack(padded.asSlice(), self.pixelWidth, self.pixelHeight, false)
+    let mut pixels = run unpack(padded.asSlice(), self.pixelWidth, self.pixelHeight, self.pixelFormat == CANVAS_FORMAT_BGRA)
       |> Effect.provideMut<Allocator>(&mut heap)
     if self.opaque {
       let values = pixels.asMutSlice()

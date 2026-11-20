@@ -368,6 +368,19 @@ export class Image extends Node {
   src: string;
 }
 
+/**
+ * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
+ * drawing's size in pixels and `getContext("webgpu")` gives its `GPUCanvasContext` (the types
+ * of `@webgpu/types` describe it). Drawing runs on a GPU device of the application's own.
+ */
+export class Canvas extends Node {
+  constructor();
+  width: number;
+  height: number;
+  getContext(kind: "webgpu"): unknown | null;
+  getContext(kind: string): unknown | null;
+}
+
 /** Text inside an `<svg>`. */
 export class SvgText {
   constructor(data?: string);
@@ -659,6 +672,7 @@ export function createNode(kind: "text"): Text;
 export function createNode(kind: "input"): Input;
 export function createNode(kind: "richinput"): RichInput;
 export function createNode(kind: "image" | "img"): Image;
+export function createNode(kind: "canvas"): Canvas;
 export function createNode(kind: "svg"): Svg;
 export function createNode(kind: NodeKind): Node;
 

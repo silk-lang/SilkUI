@@ -1,6 +1,7 @@
 //! The host: one engine, one realm, and the loop steps a window host calls.
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.natives { Natives, Reply }
+import ui_js_calls.gpu { GpuReply }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -956,6 +957,32 @@ impl<'m> JsHost<'m> {
     let arguments = [ValueBits.number(u32.toF64(token)), ValueBits.number(kind), value.borrow().view()]
     let called = run Effect.result(callUi(&mut self.engine, realm, b"nativeDone", &arguments))
     realm.release(&mut self.engine, move value)
+    match move called {
+      Result<(), JsException>.Success { .. } => ()
+      Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }
+    }
+    run drainIn(&mut self.engine, realm)
+  }
+
+  /// Has `navigator.gpu` there from now on: the host runs the WebGPU commands it takes with
+  /// [`JsHost.takeGpuCommands`] and answers them with [`JsHost.answerGpu`].
+  pub fn enableGpu(self: &mut Self) -> () { self.engine.services.gpuEnabled = true }
+
+  /// Takes the WebGPU commands JavaScript wrote since the last call (see `webgpu.js`).
+  pub fn takeGpuCommands(self: &mut Self) -> List<u8> {
+    return Intrinsic.replace(self.engine.services.gpuCommands, List<u8>.make())
+  }
+
+  /// Hands JavaScript what the GPU service answered: its promises settle and their jobs run.
+  pub effect fn answerGpu(self: &mut Self, replies: List<GpuReply>) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
+    if replies.length() == 0 { return () }
+    let context = self.context
+    let realm = unsafe lendRealm(&context, context)
+    let count = replies.length()
+    self.engine.services.gpuReplies = move replies
+    let arguments = [ValueBits.number(usize.toF64(count))]
+    let called = run Effect.result(callUi(&mut self.engine, realm, b"gpuReplies", &arguments))
+    self.engine.services.gpuReplies = List<GpuReply>.make()
     match move called {
       Result<(), JsException>.Success { .. } => ()
       Result<(), JsException>.Failure { .. } => { fail run thrown(&mut self.engine, realm) }

@@ -1265,6 +1265,72 @@ export class Image extends Node {
   }
 }
 
+/**
+ * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
+ * size of what is drawn in pixels (300 by 150 at first) and `getContext("webgpu")` gives a
+ * `GPUCanvasContext`. The node lays out as an image of that size does: its style can
+ * stretch it, and `objectFit` says how the drawing fits. Drawing happens on a GPU device of
+ * the application's own, so a canvas that is slow to draw does not slow the rest of the window.
+ */
+export class Canvas extends Node {
+  #width = 300;
+  #height = 150;
+  #context = null;
+
+  constructor() {
+    super("canvas");
+  }
+
+  get width() {
+    return this.#width;
+  }
+
+  set width(value) {
+    value = Math.max(0, Number(value) | 0);
+    if (value === this.#width) return;
+    this.#width = value;
+    this.#context?._resized();
+  }
+
+  get height() {
+    return this.#height;
+  }
+
+  set height(value) {
+    value = Math.max(0, Number(value) | 0);
+    if (value === this.#height) return;
+    this.#height = value;
+    this.#context?._resized();
+  }
+
+  /** The canvas's `GPUCanvasContext` for "webgpu"; null for any other kind of context. */
+  getContext(kind) {
+    if (kind !== "webgpu") return null;
+    if (this.#context) return this.#context;
+    const api = native.gpuLoad?.();
+    return api ? (this.#context = api.context(this)) : null;
+  }
+
+  setAttribute(name, value) {
+    if (name === "width") this.width = value == null ? 300 : value;
+    else if (name === "height") this.height = value == null ? 150 : value;
+    else super.setAttribute(name, value);
+  }
+
+  getAttribute(name) {
+    if (name === "width") return String(this.#width);
+    if (name === "height") return String(this.#height);
+    return super.getAttribute(name);
+  }
+
+  _shallowClone() {
+    const copy = new Canvas();
+    copy.width = this.#width;
+    copy.height = this.#height;
+    return copy;
+  }
+}
+
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
 // SVG attribute names that are camel case in SVG itself. Any other name with a capital letter
@@ -2254,6 +2320,7 @@ export function createNode(kind) {
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
   if (kind === "image") return new Image();
+  if (kind === "canvas") return new Canvas();
   return new Node(kind);
 }
 
