@@ -54,6 +54,10 @@ def silk_launch(name, scene, suite, uncapped):
         env = {"SILK_UI_HEADLESS": "1", "SILK_UI_BENCH": "1000000"}
         return Launch([binary, scene], env, cwd=os.path.dirname(binary), files=[os.path.dirname(binary)], fake_clock=True)
     env = {"SILK_UI_UNCAPPED": "1"} if uncapped else {}
+    if scene.startswith("canvas"):
+        # One line on stderr says whether canvas frames reached the window without a copy
+        # (the record keeps it as canvas_path).
+        env["SILK_UI_TRACE_CANVAS"] = "1"
     return Launch([binary, scene], env, cwd=os.path.dirname(binary), files=[os.path.dirname(binary)], caches=[SILK_GPU_CACHE])
 
 

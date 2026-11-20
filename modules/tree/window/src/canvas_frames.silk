@@ -27,6 +27,7 @@ import silk.num.f32
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import console { StderrWriter }
 import webgpu.shared_texture { SharedFence, SharedImage }
 
 /// One finished frame of surface `surface`, `width` by `height`: premultiplied RGBA8 pixels in
@@ -101,6 +102,11 @@ struct Table {
   returned: List<ReturnedImage>,
   /// Whether the renderer's device imports shared images (`SHARING_*`).
   sharing: u32,
+  /// Whether to say on standard error which way frames go (see [`CanvasPresenter.announce`]).
+  announces: bool,
+  /// Frames presented so far, by kind.
+  sharedFrames: u64,
+  copiedFrames: u64,
 }
 
 impl Transferable for Table {}
@@ -135,6 +141,9 @@ impl CanvasPresenter {
       latest: List<CanvasFrame>.make(),
       returned: List<ReturnedImage>.make(),
       sharing: if hasRenderer { SHARING_UNKNOWN } else { SHARING_NO },
+      announces: false,
+      sharedFrames: 0,
+      copiedFrames: 0,
     }
     return CanvasPresenter {
       table: run Arc<Mutex<Table>>.make(run Mutex<Table>.make(move table)),
@@ -261,6 +270,27 @@ impl CanvasPresenter {
     }) |> Effect.provideMut<Allocator>(&mut heap)
   }
 
+  /// From now on says on standard error, the first time a frame of each kind is presented,
+  /// whether canvas frames reach the renderer without a copy or through the CPU
+  /// (`SILK_UI_TRACE_CANVAS`): a benchmark keeps the line as proof of the path its frames took.
+  pub fn announce(self: &Self) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.announces = true
+  }
+
+  /// How many frames were presented so far as shared images.
+  pub fn sharedFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().sharedFrames
+  }
+
+  /// How many frames were presented so far as pixels copied through the CPU.
+  pub fn copiedFrames(self: &Self) -> u64 {
+    let guard = self.table.get().lock()
+    return guard.get().copiedFrames
+  }
+
   /// Whether the renderer has frames to take or surfaces to forget.
   pub fn waiting(self: &Self) -> bool {
     let guard = self.table.get().lock()
@@ -350,6 +380,17 @@ effect fn store(shared: &Arc<Mutex<Table>>, frame: CanvasFrame) -> ()
   ? &mut Allocator {
   let mut guard = shared.get().lock()
   let table = guard.getMut()
+  if frame.shared.isSome() {
+    if table.sharedFrames == 0 && table.announces {
+      StderrWriter.print("silk-ui: canvas frames reach the window without a copy (shared images)\n", &())
+    }
+    table.sharedFrames = table.sharedFrames + 1
+  } else {
+    if table.copiedFrames == 0 && table.announces {
+      StderrWriter.print("silk-ui: canvas frames reach the window through the CPU (copied)\n", &())
+    }
+    table.copiedFrames = table.copiedFrames + 1
+  }
   if table.keeps && frame.shared.isNone() {
     let mut copy = List<u8>.make()
     run copy.appendSlice(frame.pixels.asSlice())
