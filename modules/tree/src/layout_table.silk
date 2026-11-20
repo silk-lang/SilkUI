@@ -13,6 +13,7 @@
 import layout.lib {
   Style, NodeId, InvalidNode, Measurement, Changes, LayoutSource, GridTemplate, GridError, FloatShape,
   WrapFlow, Point, StyleChange, DisplayInside, validGridName, validGridAreaName,
+  SizeValue, BoxSizing, SizeContainment,
 }
 import layout.lib as Layout
 import node { Node }
@@ -39,6 +40,13 @@ const TEXT: u8 = 2
 const BORROWED: u8 = 4
 const CONTENT: u8 = 8
 const NATURAL: u8 = 16
+/// An element with `content-visibility: auto`.
+const AUTOMATIC: u8 = 32
+/// An automatic element whose contents are skipped: css-layout sees it with no children and the
+/// style in its extra's `skip`, sized to the block size it last had.
+const SKIPPED: u8 = 64
+/// Marks an entry of `automatics` while they are walked, to drop repeats.
+const LISTED: u8 = 128
 
 /// One css-layout node's links, as u32 ids (`NONE` for none).
 struct Links {
@@ -61,6 +69,10 @@ struct Extra {
   textStart: usize,
   measureKey: usize,
   scrollOffset: Point,
+  /// A skipped element's style as css-layout sees it, or NONE.
+  skip: u32,
+  /// The border-box block size a skipped element keeps.
+  skipSize: f32,
 }
 
 fn wide(value: u32) -> usize { return if value == NONE { NO_NODE } else { u32.toUsize(value) } }
@@ -94,6 +106,11 @@ pub struct LayoutTable {
   pub stickyDeferred: bool,
   /// Some style set `wrap-flow` other than auto (see css-layout's exclusions).
   pub exclusionStyles: bool,
+  /// The elements made automatic (`setAutomatic`), with ids freed or reused since among them.
+  automatics: List<u32>,
+  /// The structure revision of the last change to the tree's own structure, which skipping
+  /// and waking do not advance (see `treeRevision`).
+  treeStructure: usize,
 }
 
 impl LayoutTable {
@@ -141,6 +158,7 @@ impl LayoutTable {
       shapes: move shapes, freeShapes: List<usize>.make(),
       changes: run Changes.make(),
       viewportScrollOffset: Point { x: 0.0, y: 0.0 }, stickyDeferred: false, exclusionStyles: false,
+      automatics: List<u32>.make(), treeStructure: 0,
     }
     let mut value = move style
     value.grid = 0
@@ -216,6 +234,9 @@ impl LayoutTable {
   }
   pub fn revision(self: &Self) -> usize { return self.changes.revision() }
   pub fn structureRevision(self: &Self) -> usize { return self.changes.structureRevision() }
+  /// The revision of the last change to which nodes the table holds and how they link, which
+  /// skipping an element's contents is not: it changes only what css-layout sees.
+  pub fn treeRevision(self: &Self) -> usize { return self.treeStructure }
   pub fn scrollRevision(self: &Self) -> usize { return self.changes.scrollRevision() }
   pub fn changedAt(self: &Self, node: usize) -> usize { return self.changes.changedAt(node) }
   pub fn outerChangedAt(self: &Self, node: usize) -> usize { return self.changes.outerChangedAt(node) }
@@ -273,12 +294,14 @@ impl LayoutTable {
       rows[index] = links
       self.flags.set(index, flags)
       run self.changes.created(index)
+      self.treeStructure = self.changes.structureRevision()
       return index
     }
     let index = self.links.length()
     run self.links.append(links)
     run self.flags.append(flags)
     run self.changes.created(index)
+    self.treeStructure = self.changes.structureRevision()
     return index
   }
 
@@ -319,6 +342,7 @@ impl LayoutTable {
     if next == NO_NODE { rows[parent.index].lastChild = narrow(child.index) } else { rows[next].previousSibling = narrow(child.index) }
     if text { rows[child.index].style = style }
     self.changes.inserted(parent.index, child.index)
+    self.treeStructure = self.changes.structureRevision()
   }
 
   /// Takes a node and its subtree out of the tree, keeping them for a later insertBefore.
@@ -328,6 +352,7 @@ impl LayoutTable {
     if parent == NO_NODE { return }
     self.detach(id.index)
     self.changes.removed(id.index, parent)
+    self.treeStructure = self.changes.structureRevision()
   }
 
   fn unlink(self: &mut Self, id: usize) {
@@ -393,8 +418,10 @@ impl LayoutTable {
       }
       let extra = self.links.asSlice()[at].extra
       if extra != NONE {
+        let skip = self.extras.asSlice()[u32.toUsize(extra)].skip
+        if skip != NONE { run self.release(u32.toUsize(skip)) }
         let all = self.extras.asMutSlice()
-        all[u32.toUsize(extra)] = Extra { text: String.make(), textStart: 0, measureKey: 0, scrollOffset: Point { x: 0.0, y: 0.0 } }
+        all[u32.toUsize(extra)] = Extra { text: String.make(), textStart: 0, measureKey: 0, scrollOffset: Point { x: 0.0, y: 0.0 }, skip: NONE, skipSize: 0.0 }
         run self.freeExtras.append(extra)
         let rows = self.links.asMutSlice()
         rows[at].extra = NONE
@@ -403,6 +430,7 @@ impl LayoutTable {
     }
     // Freed rows keep their links until reused; following walks them above.
     self.changes.structureChanged()
+    self.treeStructure = self.changes.structureRevision()
   }
 
   fn following(self: &Self, root: usize, at: usize) -> usize {
@@ -428,9 +456,142 @@ impl LayoutTable {
     let change = self.classify(id.index, &value)
     if change.same { return }
     if value.wrapFlow != WrapFlow.Auto { self.exclusionStyles = true }
+    if self.skipped(id.index) {
+      // css-layout sees the skipped style, made again from the new one.
+      let before = self.seenStyle(id.index).*
+      run self.restyle(id.index, &value)
+      let size = self.extras.asSlice()[self.extraIndex(id.index)].skipSize
+      run self.reskip(id.index, size)
+      let seen = self.classifyFrom(id.index, &before, self.seenStyle(id.index))
+      let parent = self.parent(id.index)
+      self.changes.styleChanged(id.index, parent, seen)
+      return
+    }
     run self.restyle(id.index, &value)
     let parent = self.parent(id.index)
     self.changes.styleChanged(id.index, parent, change)
+  }
+
+  // ---- content-visibility: auto ----
+
+  /// Whether element `node` has `content-visibility: auto`.
+  pub fn automatic(self: &Self, node: usize) -> bool { return u8.bitAnd(self.flags.get(node), AUTOMATIC) != 0 }
+  /// Whether element `node`'s contents are skipped.
+  @inlineAlways
+  pub fn skipped(self: &Self, node: usize) -> bool { return u8.bitAnd(self.flags.get(node), SKIPPED) != 0 }
+  /// The index of the style css-layout sees for `node`: a skipped element's skip style.
+  @inlineAlways
+  pub fn seenStyleIndex(self: &Self, node: usize) -> usize {
+    if !self.skipped(node) { return self.styleIndex(node) }
+    return u32.toUsize(self.extras.asSlice()[self.extraIndex(node)].skip)
+  }
+  pub fn seenStyle(self: &Self, node: usize) -> &Style { return &self.styles.asSlice()[self.seenStyleIndex(node)] }
+  /// The border-box block size skipped element `node` keeps.
+  pub fn skipSize(self: &Self, node: usize) -> f32 { return self.extras.asSlice()[self.extraIndex(node)].skipSize }
+  fn extraIndex(self: &Self, node: usize) -> usize { return u32.toUsize(self.links.asSlice()[node].extra) }
+
+  /// Makes element `id` automatic or not. An element made automatic starts skipped, at block
+  /// size `estimate`; one made not automatic is woken.
+  pub effect fn setAutomatic(self: &mut Self, id: NodeId, automatic: bool, estimate: f32) ! InvalidNode | OutOfMemoryError ? &mut Allocator {
+    if !self.contains(id) || self.isText(id.index) { fail InvalidNode { index: id.index } }
+    if automatic == self.automatic(id.index) { return }
+    if automatic {
+      let flags = self.flags.get(id.index)
+      self.flags.set(id.index, u8.bitOr(flags, AUTOMATIC))
+      run self.automatics.append(narrow(id.index))
+      run self.setSkipped(id, true, estimate)
+    } else {
+      run self.setSkipped(id, false, 0.0)
+      let flags = self.flags.get(id.index)
+      self.flags.set(id.index, u8.bitAnd(flags, 255 - AUTOMATIC))
+    }
+  }
+
+  /// Appends the automatic elements to `result`, once each, and forgets freed ones.
+  pub effect fn automaticElements(self: &mut Self, result: &mut List<u32>) ! OutOfMemoryError ? &mut Allocator {
+    let mut kept: usize = 0
+    let mut at: usize = 0
+    while at < self.automatics.length() {
+      let node = u32.toUsize(self.automatics.get(at))
+      at = at + 1
+      if !self.exists(node) || !self.automatic(node) || u8.bitAnd(self.flags.get(node), LISTED) != 0 { continue }
+      let flags = self.flags.get(node)
+      self.flags.set(node, u8.bitOr(flags, LISTED))
+      self.automatics.set(kept, narrow(node))
+      kept = kept + 1
+    }
+    self.automatics.truncate(kept)
+    at = 0
+    while at < kept {
+      let node = u32.toUsize(self.automatics.get(at))
+      let flags = self.flags.get(node)
+      self.flags.set(node, u8.bitAnd(flags, 255 - LISTED))
+      run result.append(narrow(node))
+      at = at + 1
+    }
+  }
+
+  /// Skips element `id`'s contents, keeping border-box block size `size`, or lays them out
+  /// again. Either way its children generate boxes anew.
+  pub effect fn setSkipped(self: &mut Self, id: NodeId, skipped: bool, size: f32) ! InvalidNode | OutOfMemoryError ? &mut Allocator {
+    if !self.contains(id) || self.isText(id.index) { fail InvalidNode { index: id.index } }
+    let node = id.index
+    if skipped == self.skipped(node) && (!skipped || self.skipSize(node) == size) { return }
+    let before = self.seenStyle(node).*
+    if skipped {
+      run self.reskip(node, size)
+      let flags = self.flags.get(node)
+      self.flags.set(node, u8.bitOr(flags, SKIPPED))
+    } else {
+      let extra = self.extraIndex(node)
+      let skip = self.extras.asSlice()[extra].skip
+      let flags = self.flags.get(node)
+      self.flags.set(node, u8.bitAnd(flags, 255 - SKIPPED))
+      let extras = self.extras.asMutSlice()
+      extras[extra].skip = NONE
+      run self.release(u32.toUsize(skip))
+    }
+    let change = self.classifyFrom(node, &before, self.seenStyle(node))
+    let parent = self.parent(node)
+    self.changes.styleChanged(node, parent, change)
+    // Its children appear or disappear for css-layout.
+    self.changes.unlinked(node)
+    self.changes.structureChanged()
+  }
+
+  // Makes skipped element `node`'s skip style from its own, at block size `size`.
+  effect fn reskip(self: &mut Self, node: usize, size: f32) ! OutOfMemoryError ? &mut Allocator {
+    let mut value = self.style(node).*
+    value.height = SizeValue.px(size)
+    value.boxSizing = BoxSizing.BorderBox
+    value.sizeContainment = SizeContainment.Size
+    value.layoutContainment = true
+    let index = run self.intern(&value)
+    let extra = run self.extraOf(node)
+    let previous = self.extras.asSlice()[extra].skip
+    let extras = self.extras.asMutSlice()
+    extras[extra].skip = index
+    extras[extra].skipSize = size
+    if previous != NONE { run self.release(u32.toUsize(previous)) }
+  }
+
+  // How a change of what css-layout sees of element `node`'s style, from `previous` to `next`,
+  // reaches it and its parent.
+  fn classifyFrom(self: &Self, node: usize, previous: &Style, next: &Style) -> StyleChange {
+    let parent = self.parent(node)
+    let mut flexParent = false
+    let mut gridParent = false
+    if parent != NO_NODE { flexParent = self.style(parent).display.insideIs(DisplayInside.Flex) }
+    let mut generatedParent = parent
+    while generatedParent != NO_NODE {
+      let display = &self.style(generatedParent).display
+      if !display.isContents() {
+        gridParent = display.isGrid()
+        break
+      }
+      generatedParent = self.parent(generatedParent)
+    }
+    return Layout.classify(previous, next, flexParent, gridParent)
   }
 
   // How a change of element `node`'s style to `next` reaches it and its parent, as css-layout's
@@ -599,7 +760,7 @@ impl LayoutTable {
   effect fn extraOf(self: &mut Self, node: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
     let current = self.links.asSlice()[node].extra
     if current != NONE { return u32.toUsize(current) }
-    let fresh = Extra { text: String.make(), textStart: 0, measureKey: 0, scrollOffset: Point { x: 0.0, y: 0.0 } }
+    let fresh = Extra { text: String.make(), textStart: 0, measureKey: 0, scrollOffset: Point { x: 0.0, y: 0.0 }, skip: NONE, skipSize: 0.0 }
     let mut index = self.extras.length()
     if self.freeExtras.length() != 0 {
       let last = self.freeExtras.length() - 1
@@ -783,13 +944,13 @@ impl<'a> LayoutSource for LayoutView<'a> {
   @inlineAlways
   fn parent(self: &Self, node: usize) -> usize { return self.table.parent(node) }
   @inlineAlways
-  fn firstChild(self: &Self, node: usize) -> usize { return self.table.firstChild(node) }
+  fn firstChild(self: &Self, node: usize) -> usize { return if self.table.skipped(node) { NO_NODE } else { self.table.firstChild(node) } }
   @inlineAlways
   fn nextSibling(self: &Self, node: usize) -> usize { return self.table.nextSibling(node) }
   @inlineAlways
   fn styles<'b>(self: &'b Self) -> &'b [Style] { return self.table.styles.asSlice() }
   @inlineAlways
-  fn styleIndex(self: &Self, node: usize) -> usize { return self.table.styleIndex(node) }
+  fn styleIndex(self: &Self, node: usize) -> usize { return self.table.seenStyleIndex(node) }
   @inlineAlways
   fn isText(self: &Self, node: usize) -> bool { return self.table.isText(node) }
   fn text<'b>(self: &'b Self, node: usize) -> Option<string<'b>> { return self.table.textIn(node, self.nodes, self.slots) }

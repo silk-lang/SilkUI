@@ -247,7 +247,14 @@ fn listTypeNamed(name: &[u8]) -> Option<u8> {
 /// `container-type`, `contain` and `content-visibility`, in one byte (the record is copied for
 /// every restyled node). css-layout reads the union of the two size containments, in
 /// `layout.sizeContainment`; container queries read only `query`.
-pub struct Containment { bits: u8 }
+pub struct Containment {
+  bits: u8,
+  /// `content-visibility: auto`: the contents are laid out only near the viewport.
+  autoVisible: bool,
+  /// The block size `contain-intrinsic-size` gives a skipped box before it was laid out, in
+  /// px; negative for none.
+  intrinsic: f32,
+}
 
 impl Copy for Containment {}
 
@@ -270,22 +277,31 @@ fn sizeOfCode(code: u8) -> SizeContainment {
 }
 
 impl Containment {
-  pub fn initial() -> Containment { return Containment { bits: 0 } }
+  pub fn initial() -> Containment { return Containment { bits: 0, autoVisible: false, intrinsic: -1.0 } }
 
   /// The size containment `container-type` asks for.
   pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
 
   /// Paint containment, from `contain` or `content-visibility: hidden`.
-  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
+  pub fn paint(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
 
   /// Layout containment, from `contain` or `content-visibility: hidden`.
-  pub fn layout(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
+  pub fn layout(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
 
   /// Style containment: counters changed inside stay inside.
-  pub fn style(self: &Self) -> bool { return u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
+  pub fn style(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
 
   /// `content-visibility: hidden`: the contents are skipped like `display: none`.
   pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
+
+  /// `content-visibility: auto`: far from the viewport, the contents are skipped and the box
+  /// keeps the size it had (see `skipped` in layout_table.silk).
+  pub fn automatic(self: &Self) -> bool { return self.autoVisible }
+
+  /// The block size a skipped box takes before it was ever laid out, in px.
+  pub fn intrinsicBlock(self: &Self) -> f32 { return if self.intrinsic < 0.0 { 0.0 } else { self.intrinsic } }
+
+  pub fn setIntrinsic(self: &mut Self, value: f32) -> () { self.intrinsic = value }
 
   fn contained(self: &Self) -> Contained {
     return Contained {
@@ -302,7 +318,7 @@ impl Containment {
     if contain.style { bits = u8.bitOr(bits, CONTAIN_STYLE) }
     if hidden { bits = u8.bitOr(bits, HIDDEN) }
     self.bits = bits
-    layout.layoutContainment = hidden || contain.paint || contain.layout
+    layout.layoutContainment = hidden || self.autoVisible || contain.paint || contain.layout
     layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
     } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
@@ -328,6 +344,12 @@ impl Containment {
     let query = self.query()
     let contain = self.contained()
     self.write(query, contain, hidden, &mut layout)
+  }
+
+  /// Sets `content-visibility`: `hidden`, `auto` (`automatic`) or visible (neither).
+  pub fn setVisibility(self: &mut Self, hidden: bool, automatic: bool, layout: &mut CssStyle) -> () {
+    self.autoVisible = automatic && !hidden
+    self.setHidden(hidden, &mut layout)
   }
 
   pub fn inheritContain(self: &mut Self, parent: &Containment, layout: &mut CssStyle) -> () {
@@ -1477,9 +1499,20 @@ impl Computed {
       CssProperty.ContentVisibility => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
           if word == Keyword.Hidden || word == Keyword.Visible || word == Keyword.Auto {
-            self.contain.setHidden(word == Keyword.Hidden, &mut self.layout)
+            self.contain.setVisibility(word == Keyword.Hidden, word == Keyword.Auto, &mut self.layout)
           }
         }
+      }
+      CssProperty.ContainIntrinsicSize | CssProperty.ContainIntrinsicHeight | CssProperty.ContainIntrinsicBlockSize => {
+        // The last length: `auto 300px`, `200px 300px` and `300px` all give a block size of 300.
+        let mut last = value
+        if let Value.Sequence { values, .. } = &value.* {
+          if values.length() != 0 { last = &values.asSlice()[values.length() - 1] }
+        }
+        let mut size = SizeValue.auto()
+        let mut bounds = Bounds.none()
+        setSize(&mut size, &mut bounds, last, &context)
+        self.contain.setIntrinsic(if size.kind == DimensionKind.Length { size.value } else { -1.0 })
       }
       CssProperty.Container => {
         self.contain.setQuery(SizeContainment.None, &mut self.layout)

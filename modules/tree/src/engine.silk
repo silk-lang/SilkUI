@@ -970,6 +970,11 @@ pub struct UiTree<'a> {
   pub uploads: Pending,
   /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
   pub fragmentOf: List<usize>,
+  /// The layout revision, scroll revision and viewport height `content-visibility: auto`
+  /// elements were last reviewed at (see `reviewSkipped`).
+  skipReview: [usize; 3],
+  /// The css nodes `wakeFor` woke this frame: they stay awake until the next one.
+  heldAwake: List<u32>,
   /// Next fragment with the same CSS source, in arena order.
   pub nextSourceFragment: List<usize>,
   /// First paint-order index per node slot, or NONE.
@@ -1481,6 +1486,8 @@ impl<'a> UiTree<'a> {
       facesDirty: true,
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
+      skipReview: [usize.MAX; 3],
+      heldAwake: List<u32>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
       focusVisible: false,
@@ -4355,6 +4362,11 @@ impl<'a> UiTree<'a> {
     if slot == self.focused {
       return ()
     }
+    // A focused element inside skipped contents is laid out, as one that is shown.
+    if slot != NONE && u32.toUsize(slot) < self.nodes.length() {
+      let id = self.node(slot).id
+      run self.wakeFor(id)
+    }
     let before = self.focused
     if note && before != NONE && slot != NONE {
       run self.noteReturns(before, slot)
@@ -6655,6 +6667,12 @@ impl<'a> UiTree<'a> {
         self.layout.setStyle(NodeId { index: css }, computed.layout),
         layoutFailed,
       )
+      if computed.contain.automatic() != self.layout.automatic(css) {
+        run Effect.catchAll(
+          self.layout.setAutomatic(NodeId { index: css }, computed.contain.automatic(), computed.contain.intrinsicBlock()),
+          layoutFailed,
+        )
+      }
       run self.resolveGrid(slot, &computed)
       run self.updateShape(slot)
     }
@@ -7027,6 +7045,7 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
+    self.heldAwake.clear()
     run self.trimNodes()
     self.releaseSlack()
     // A mutation said what it repaints when it was applied (see `repaintsNode`).
@@ -7079,6 +7098,7 @@ impl<'a> UiTree<'a> {
       run self.layoutFrame()
     }
     run self.settleVirtual()
+    run self.settleSkipped()
     run self.settleAnchors()
     run offset_path.settle(&mut self)
     run self.finishStyleChange()
@@ -7103,6 +7123,141 @@ impl<'a> UiTree<'a> {
     self.work.repaintedSubtrees = self.work.repaintedSubtrees + self.stats.repaintedSubtrees
     self.work.replayedOperations = self.work.replayedOperations + self.stats.replayedOperations
     self.work.paintedGlyphs = self.work.paintedGlyphs + self.stats.glyphs
+  }
+
+  /// Wakes the `content-visibility: auto` elements near the viewport, nearest first, and skips
+  /// the contents of those far from it, laying out again until none changes or the frame's
+  /// passes are spent.
+  effect fn settleSkipped(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass < SKIP_PASSES {
+      if !(run self.reviewSkipped()) { break }
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
+  // One look at the automatic elements: wakes up to SKIP_WAKES of the skipped ones within
+  // SKIP_NEAR viewports, nearest first, and skips those beyond SKIP_FAR. Returns whether any
+  // changed.
+  effect fn reviewSkipped(self: &mut Self) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    // Nothing moved since the last look that found nothing to change.
+    let seen = [self.layout.revision(), self.layout.scrollRevision(), f32.toUsize(self.input.height)]
+    // Scroll offsets move fragments while painting, without a layout revision: `scrolled`.
+    if !self.scrolled && seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2] { return false }
+    let mut automatic = List<u32>.make()
+    run self.layout.automaticElements(&mut automatic)
+    if automatic.length() == 0 { return false }
+    let height: f32 = self.input.height
+    let near: f32 = height * SKIP_NEAR
+    let far = height * SKIP_FAR
+    let mut wakes = List<u64>.make()
+    let mut changed = false
+    // Siblings under one parent fragment move by the same offset where the parent's chain only
+    // translates them: one walk up for the first, the offset for the rest.
+    let mut lastParent = NO_INDEX
+    let mut dx: f32 = 0.0
+    let mut dy: f32 = 0.0
+    let mut at: usize = 0
+    while at < automatic.length() {
+      let css = u32.toUsize(automatic.get(at))
+      at = at + 1
+      if css >= self.fragmentOf.length() { continue }
+      let index = self.fragmentOf.get(css)
+      if index == NO_INDEX { continue }
+      let fragment = self.output.fragments.values.asSlice()[index]
+      let box = borderBox(&fragment)
+      let slot = self.slotOfCssNode(css)
+      let plain = slot != NONE && !self.node(slot).computed().transform.any()
+        && self.node(slot).computed().layout.position == Position.Static
+      let mut seen = box
+      if plain && fragment.parent != NO_INDEX && fragment.parent == lastParent {
+        seen = Rect<f32>.new(box.xMin + dx, box.yMin + dy, box.xMax + dx, box.yMax + dy)
+      } else {
+        seen = self.visualRect(index, box)
+        let translated = f32.abs(seen.width() - box.width()) < 0.01 && f32.abs(seen.height() - box.height()) < 0.01
+        if plain && translated {
+          lastParent = fragment.parent
+          dx = seen.xMin - box.xMin
+          dy = seen.yMin - box.yMin
+        } else {
+          lastParent = NO_INDEX
+        }
+      }
+      let distance: f32 = if seen.yMax < 0.0 { 0.0 - seen.yMax } else if seen.yMin > height { seen.yMin - height } else { 0.0 }
+      if self.layout.skipped(css) {
+        if distance <= near {
+          run wakes.append(u64.bitOr(u64.shiftLeft(f32.toU64(distance), 32), usize.toU64(css)))
+        }
+      } else if distance > far && !self.held(css) {
+        run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
+        changed = true
+      }
+    }
+    run wakes.sort()
+    at = 0
+    while at < wakes.length() && at < SKIP_WAKES {
+      let css = u64.wrappingToUsize(u64.bitAnd(wakes.get(at), 4294967295))
+      run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, false, 0.0), layoutFailed)
+      changed = true
+      at = at + 1
+    }
+    self.skipReview = if changed { [usize.MAX; 3] } else { seen }
+    return changed
+  }
+
+  /// Wakes every `content-visibility: auto` element above node `id` whose contents are
+  /// skipped and lays out again, so that what is read of `id` next is its real geometry. They
+  /// stay awake until the next frame.
+  pub effect fn wakeFor(self: &mut Self, id: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE { return () }
+    let mut woke = false
+    let mut at = self.node(slot).parent
+    while at != NONE {
+      let css = self.node(at).css
+      if css < self.layout.nodeCount() && self.layout.automatic(css) {
+        run self.heldAwake.append(usize.toU32(css))
+        if self.layout.skipped(css) {
+          run Effect.catch<TreeError>(self.wake(css), noShape)
+          woke = true
+        }
+      }
+      at = self.node(at).parent
+    }
+    if woke { run Effect.catch<TreeError>(self.layoutFrame(), noShape) }
+  }
+
+  fn held(self: &Self, css: usize) -> bool {
+    let mut at: usize = 0
+    while at < self.heldAwake.length() {
+      if u32.toUsize(self.heldAwake.get(at)) == css { return true }
+      at = at + 1
+    }
+    return false
+  }
+
+  effect fn wake(self: &mut Self, css: usize) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, false, 0.0), layoutFailed)
+  }
+
+  /// Wakes every `content-visibility: auto` element whose contents are skipped, for a check
+  /// of the whole logical result, and holds them awake until the next frame.
+  pub effect fn wakeAll(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut automatic = List<u32>.make()
+    run self.layout.automaticElements(&mut automatic)
+    let mut at: usize = 0
+    while at < automatic.length() {
+      let css = u32.toUsize(automatic.get(at))
+      run self.heldAwake.append(usize.toU32(css))
+      if self.layout.skipped(css) { run Effect.catch<TreeError>(self.wake(css), noShape) }
+      at = at + 1
+    }
+    run Effect.catch<TreeError>(self.layoutFrame(), noShape)
   }
 
   effect fn settleAnchors(self: &mut Self) -> ()
@@ -7245,6 +7400,7 @@ impl<'a> UiTree<'a> {
       run self.layoutFrame()
     }
     run self.settleVirtual()
+    run self.settleSkipped()
     run self.settleAnchors()
     run offset_path.settle(&mut self)
     run self.finishStyleChange()
@@ -8184,6 +8340,13 @@ fn takeLowest(free: &mut List<u32>) -> u32 {
 
 /// A tree gives back what a larger one left only after it has held this many nodes
 /// (see `UiTree.releaseSlack`).
+/// `content-visibility: auto`: skipped elements within this many viewports of the viewport
+/// wake, awake ones beyond SKIP_FAR are skipped, at most SKIP_WAKES a pass and SKIP_PASSES
+/// passes a frame.
+const SKIP_NEAR: f32 = 2.0
+const SKIP_FAR: f32 = 3.0
+const SKIP_WAKES: usize = 8
+const SKIP_PASSES: usize = 8
 const RELEASE_NODES: usize = 4096
 
 /// The node table is not trimmed below this many slots (see `UiTree.trimNodes`).
