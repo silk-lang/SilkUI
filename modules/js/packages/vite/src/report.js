@@ -22,6 +22,13 @@ function quiet(diagnostic) {
  * equivalent of. `SILKUI_CSS_REPORT=all` writes every dropped feature on its own line instead.
  */
 export function reportDropped(warn, diagnostics) {
+  // `@keyframes` that set a property Silk UI does not animate: the property keeps its base value.
+  for (const item of diagnostics) {
+    if (item.kind !== "animation") continue;
+    const [name, property] = item.feature.split(": ");
+    warn(`@keyframes ${name} sets ${property}, which Silk UI does not animate: it keeps its base value`);
+  }
+  diagnostics = diagnostics.filter(item => item.kind !== "animation");
   if (process.env.SILKUI_CSS_REPORT === "all") {
     for (const item of diagnostics) warn(`dropped ${item.count} ${item.kind} occurrence(s): ${item.feature}`);
     return;

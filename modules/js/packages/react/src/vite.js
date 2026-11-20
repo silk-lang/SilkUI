@@ -87,7 +87,10 @@ globalThis.$RefreshReg$ = __silkReg;
 globalThis.$RefreshSig$ = __silkSig;
 if (import.meta.hot) {
   import.meta.hot.accept((next) => {
-    if (next && __silkRefresh.isBoundary(next)) __silkRefresh.enqueue();
+    // No module when the update failed to load, such as after a syntax error: Vite has
+    // printed the error, and the running app is left alone until the next edit.
+    if (!next) return;
+    if (__silkRefresh.isBoundary(next)) __silkRefresh.enqueue();
     else import.meta.hot.invalidate();
   });
 }

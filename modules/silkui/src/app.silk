@@ -33,7 +33,8 @@
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
 import stylesheets
-import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, webgpuExports, libm }
+import inspector_socket
+import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, inspectorWriter, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import bundle as Bundles
 import web { Server, site }
@@ -697,6 +698,22 @@ effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   return run writes.register()
 }
 
+/// The inspector's command line program for a development window host (`<app>-inspect`),
+/// built from the app's manifest so that it always matches the inspector the host serves.
+effect fn inspectorProgram(app: &App, options: &Options) -> Compilation
+  ! BuildError | TaskError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  let source = run inspectorWriter()
+  let files = run WriteFiles.make().text("main.silk", source.view())
+  let generated = run files.register()
+  let mut name = run String.copy(app.named)
+  run name.append("-inspect")
+  let program = run Compilation.executable(name.view(), "src/main.silk")
+  let rooted = run program.root(run generated.output("main.silk"))
+  let debugged = run rooted.debug(run Deferred<bool>.value(options.debugInfo()))
+  return run debugged.unsandboxedTools(options.unsandboxedTools)
+}
+
 // --- App: the definition ---
 
 impl App {
@@ -810,6 +827,18 @@ impl App {
 
   pub fn targets(self: &App) -> &[Target] {
     return self.places.asSlice()
+  }
+
+  fn hasWindow(self: &App) -> bool {
+    let all = self.places.asSlice()
+    let mut at: usize = 0
+    while at < all.length {
+      if all[at].id() == "window" {
+        return true
+      }
+      at = at + 1
+    }
+    return false
   }
 
   fn sheetCount(self: &App) -> usize {
@@ -1019,6 +1048,10 @@ impl App {
       graph = run previousGraph.add(move compilation)
       at = at + 1
     }
+    if dev && self.custom == "" && self.hasWindow() {
+      let previousGraph = move graph
+      graph = run previousGraph.add(run inspectorProgram(self, options))
+    }
     return move graph
   }
 
@@ -1103,8 +1136,16 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   } else {
     Mode.Release
   }
+  // A socket an inspected app left behind when it was killed stops every walk of its
+  // directory, the bundle's and the fingerprints', so it goes before anything lists one.
+  if run inspector_socket.clear(String.view(&project.root)) {
+    tell("removed a stale inspector socket in the project")
+  }
   if app.writtenIn.dir() != "" {
     let web = run fromRoot(&project, app.writtenIn.dir())
+    if run inspector_socket.clear(web.view()) {
+      tell("removed a stale inspector socket in the web project")
+    }
     if mode == Mode.Dev && app.runsOn != Runtime.Node {
       run installed(web.view())
     }
@@ -1202,6 +1243,16 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
       run app.hosts.append(Host { target: target, dir: move directory, generated: true })
     } else {
       run artifacts.append(Artifact { target: target, path: move path, bytes: bytes })
+    }
+    at = at + 1
+  }
+  // The inspector's command line program follows the hosts in a development build.
+  while at < outputs.length {
+    let path = run Context.text(&outputs[at].path)
+    if String.endsWith(path.view(), "-inspect") || String.endsWith(path.view(), "-inspect.exe") {
+      let mut note = run String.copy("inspector command line: ")
+      run String.append(&mut note, relative(String.view(&project.root), path.view()))
+      run say(String.view(&note))
     }
     at = at + 1
   }
