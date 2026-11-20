@@ -40,6 +40,7 @@ import canvas_layer_plan {
   PATH_TO_LAYER,
   PATH_TO_WINDOW,
   firstOf,
+  layerPollDelay,
   layerStateOf,
   pathChange,
   pictureReady,
@@ -900,11 +901,13 @@ union Work {
   Canvas,
   /// Make or release surfaces of windows past the first, or draw their frames.
   Others,
+  /// Look at canvas layers that wait (`serviceLayers`), and nothing else.
+  Poll,
   Quit
 }
 
 /// Waits for the next work.
-fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresenter, polling: bool) -> Work {
+fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresenter, poll: u64) -> Work {
   while true {
     let taken = takeWork(shared, canvases)
     match move taken {
@@ -912,10 +915,12 @@ fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresen
         return move value
       }
       Option<Work>.None => {
-        if polling {
-          // Layers wait for fences or for the window server: look again in a millisecond.
-          drop parker.parkTimeout(1000000)
-          return Work.Others
+        if poll != 0 {
+          // Layers wait for fences or for the window server: look at them alone after `poll`.
+          if !parker.parkTimeout(poll) {
+            return Work.Poll
+          }
+          continue
         }
         parker.park()
       }
@@ -1181,8 +1186,8 @@ effect fn showInWindow(
 
 /// Takes the canvas frames presented since the last call: frames of canvases drawn into the
 /// window go to the renderer's textures (`showInWindow`), frames of canvases shown in a layer of
-/// their own wait in `layered` for their fences (`serviceLayers`). Says whether a canvas drawn
-/// into the window changed, so that the window must be drawn.
+/// their own wait in `layered` for their fences (`serviceLayers`). Answers how many frames of
+/// canvases drawn into the window it took: when not 0, the window must be drawn.
 effect fn serveCanvases(
   canvases: &CanvasPresenter,
   device: &Device,
@@ -1190,13 +1195,13 @@ effect fn serveCanvases(
   renderer: &mut UiRenderer,
   shown: &mut List<CanvasTexture>,
   layered: &mut List<LayeredCanvas>,
-) -> bool
+) -> u64
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
   if !canvases.waiting() {
-    return false
+    return 0
   }
-  let mut window = false
+  let mut window: u64 = 0
   let mut taken = canvases.take()
   let closed = taken.closed.asSlice()
   let mut c: usize = 0
@@ -1206,7 +1211,6 @@ effect fn serveCanvases(
     if at != usize.MAX {
       run endShown(&mut shown.asMutSlice()[at], canvases, false)
       drop shown.remove(at)
-      window = true
     }
     let inLayer = layeredIndex(&layered.*, closed[c])
     if inLayer != usize.MAX {
@@ -1233,7 +1237,7 @@ effect fn serveCanvases(
         drop layered.remove(inLayer)
       }
       run showInWindow(canvases, device, queue, &mut renderer, &mut shown, &frame)
-      window = true
+      window = window + 1
     }
   }
   return window
@@ -1273,12 +1277,12 @@ fn layeredIndex(layered: &List<LayeredCanvas>, surface: u32) -> usize {
 
 /// Shows the pictures of layered canvases whose fences signaled (one transaction for all), and
 /// gives the app back the pictures layers replaced once the window server no longer reads them.
-/// Says whether something still waits: a picture for its fences, or a replaced one in use.
+/// Answers how soon to look again, in nanoseconds (`layerPollDelay`): 0 when nothing waits.
 effect fn serviceLayers(
   canvases: &CanvasPresenter,
   layered: &mut List<LayeredCanvas>,
   retired: &mut List<LayerPicture>,
-) -> bool
+) -> u64
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut waiting = false
@@ -1312,6 +1316,7 @@ effect fn serviceLayers(
           run retired.append(move replaced)
         }
         canvases.layerShown()
+        canvases.noteShown(1)
       }
     }
     i = i + 1
@@ -1328,7 +1333,7 @@ effect fn serviceLayers(
       run canvases.giveBack(ReturnedImage { surface: done.surface, chain: done.chain, index: done.index, fences: List<SharedFence>.make(), values: List<u64>.make() })
     }
   }
-  return waiting || retired.length() != 0
+  return layerPollDelay(waiting, retired.length() != 0)
 }
 
 /// Decides, for a new frame job, which canvases show in a layer of their own
@@ -1902,9 +1907,22 @@ effect fn renderLoop(
   let mut layered = List<LayeredCanvas>.make()
   let mut retiredPictures = List<LayerPicture>.make()
   let mut placements = List<SurfacePlacement>.make()
-  let mut layersWaiting = false
+  let mut layerPoll: u64 = 0
+  // Frames of canvases drawn into the window since the last present, shown by the next one.
+  let mut windowShown: u64 = 0
   while true {
-    let work = nextWork(shared, parker, canvases, layersWaiting)
+    let work = nextWork(shared, parker, canvases, layerPoll)
+    let polling = match &work {
+      Work.Poll => true
+      _ => false
+    }
+    if polling {
+      layerPoll = run serviceLayers(canvases, &mut layered, &mut retiredPictures)
+      if !(run handOverToLayers(canvases, &mut renderer, &mut canvasTextures, &layered)) {
+        continue
+      }
+      // A canvas's layer covers it now: the window is drawn without it, below.
+    }
 
     // Whatever the work, surfaces change and atlas pixels are written first, and the other
     // windows' frames are drawn, so the first window's frame below has every tile too.
@@ -1912,16 +1930,18 @@ effect fn renderLoop(
       Work.Quit => true
       _ => false
     }
-    let mut windowCanvas = false
-    if !quitting {
+    let mut windowCanvas = polling
+    if !quitting && !polling {
       let hud = takeHud(shared)
       if hud >= 0 {
         metalHud(raw, hud == 1)
       }
       run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
       run writeUploads(shared, &device, &queue, &mut textures)
-      windowCanvas = run serveCanvases(canvases, &device, &queue, &mut renderer, &mut canvasTextures, &mut layered)
-      layersWaiting = run serviceLayers(canvases, &mut layered, &mut retiredPictures)
+      let taken = run serveCanvases(canvases, &device, &queue, &mut renderer, &mut canvasTextures, &mut layered)
+      windowCanvas = taken != 0
+      windowShown = windowShown + taken
+      layerPoll = run serviceLayers(canvases, &mut layered, &mut retiredPictures)
       if run handOverToLayers(canvases, &mut renderer, &mut canvasTextures, &layered) {
         // The canvas's layer covers it now: the window is drawn without it.
         windowCanvas = true
@@ -1957,6 +1977,7 @@ effect fn renderLoop(
         true
       }
       Work.Redraw => false
+      Work.Poll => false
       Work.Canvas => {
         if !windowCanvas {
           // Only layered canvases changed: their layers show it, the window is not drawn.
@@ -2043,6 +2064,8 @@ effect fn renderLoop(
       )
     }
     run gpuSurface.present()
+    canvases.noteShown(windowShown)
+    windowShown = 0
     // Layers move with the frame that placed them.
     placeLayers(&mut layered)
     run device.checkErrors()
