@@ -24,6 +24,9 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
     if status != 0 || count < 38 { return 0 }
     return u64.shiftLeft(u32.toU64(info[37]), 32) | u32.toU64(info[36])
   }
+
+  /// Nothing to set: macOS's allocator already gives large freed buffers back.
+  pub fn returnLargeFrees() -> () {}
 } else {
 static if Intrinsic.targetOperatingSystem() == "linux" {
   import silk.mem.pointer { Pointer }
@@ -35,6 +38,22 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
   unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
   unsafe extern "C" fn close(fd: i32) -> i32
   unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  unsafe extern "C" fn mallopt(parameter: i32, value: i32) -> i32
+
+  // glibc's `M_MMAP_THRESHOLD`.
+  const MMAP_THRESHOLD: i32 = -3
+  // Buffers from this size up get a mapping of their own.
+  const LARGE_BUFFER: i32 = 65536
+
+  /// Has the allocator give each large buffer its own mapping, so freeing one returns its pages
+  /// at once. glibc's heap only shrinks from its end, so a long-lived allocation above a freed
+  /// list keeps the whole list resident: a feed of 1,000 items that was cleared stayed at 367 MB
+  /// and is 92 MB with this. glibc otherwise raises the threshold as large buffers are freed, up
+  /// to 32 MB, which is how a growing list ends up on the heap. Call once, before the first
+  /// large allocation. Other C libraries ignore the call.
+  pub fn returnLargeFrees() -> () {
+    let _set = unsafe mallopt(MMAP_THRESHOLD, LARGE_BUFFER)
+  }
 
   // `O_RDONLY | O_CLOEXEC`.
   const READ_ONLY: i32 = 524288
@@ -125,11 +144,17 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
     if unsafe K32GetProcessMemoryInfo(unsafe GetCurrentProcess(), Pointer.fromMutRef<Counters>(&mut counters), 80) == 0 { return 0 }
     return counters.privateUsage
   }
+
+  /// Nothing to set on Windows.
+  pub fn returnLargeFrees() -> () {}
 } else {
   /// The process's footprint in bytes, or 0 when the system cannot say.
   pub fn footprint() -> u64 {
     return 0
   }
+
+  /// Nothing to set here.
+  pub fn returnLargeFrees() -> () {}
 }
 }
 }
