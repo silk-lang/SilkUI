@@ -53,6 +53,7 @@ import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
+  NO_SURFACE,
   FIRST_ROOT,
   FACE_ITALIC,
   FACE_OBLIQUE,
@@ -140,6 +141,7 @@ import live_svg
 import live_svg { LiveSvg }
 import thin { Thin }
 import node {
+  CanvasSurface,
   NodeRare,
   NONE,
   WATCH_OUTSIDE,
@@ -383,6 +385,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetGrid { id, .. } => id
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
+    Mutation.SetCanvasSurface { id, .. } => id
     Mutation.SvgInsert { id, .. } => id
     Mutation.SvgRemove { id, .. } => id
     Mutation.SvgAttribute { id, .. } => id
@@ -2904,6 +2907,23 @@ impl<'a> UiTree<'a> {
         }
         node.content = node.content + 1
       }
+      Mutation.SetCanvasSurface { id, surface, width, height, opaque } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        let node = self.nodeMut(slot)
+        if surface != NO_SURFACE || node.extras.isSome() {
+          let extras = run node.extrasMut()
+          extras.surface = if surface == NO_SURFACE {
+            CanvasSurface.none()
+          } else {
+            CanvasSurface { id: surface, width: width, height: height, opaque: opaque }
+          }
+        }
+        node.content = node.content + 1
+        run self.updateNatural(slot)
+      }
       Mutation.SvgInsert { id, element, tag, parent, before } => {
         let slot = run self.requireSvg(index, id)
         let at = match before {
@@ -4873,8 +4893,20 @@ impl<'a> UiTree<'a> {
     let fontSize = self.node(slot).computed().text.size
     // Natural sizes scale with `zoom`, as replaced elements do in browsers.
     let zoom = self.node(slot).computed().text.zoom
-    let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
+    if kind == NodeKind.Canvas {
+      // A canvas showing a GPU surface is a replaced element of the surface's size, as a
+      // `<canvas>` is. One drawn with commands has no natural size.
+      let surface = self.node(slot).surface()
+      if surface.isSome() {
+        natural.size = OptionalSize.definite(u32.toF32(surface.width) * zoom, u32.toF32(surface.height) * zoom)
+        if surface.height != 0 {
+          natural.aspectRatio = u32.toF32(surface.width) / u32.toF32(surface.height)
+        }
+      }
+      run self.setNatural(slot, natural)
+      return ()
+    }
     if kind != NodeKind.Image && kind != NodeKind.Icon {
       return ()
     }
@@ -4912,6 +4944,14 @@ impl<'a> UiTree<'a> {
       natural.size = OptionalSize.definite(fontSize, fontSize)
       natural.aspectRatio = 1.0
     }
+    run self.setNatural(slot, natural)
+  }
+
+  /// Gives the layout the natural size of `slot` when it changed.
+  effect fn setNatural(self: &mut Self, slot: u32, natural: NaturalDimensions) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let css = self.node(slot).css
     let key = u32.toUsize(slot)
     let changed = key >= self.provider.naturals.length()
       || !sameNatural(self.provider.naturals.get(key), natural)
