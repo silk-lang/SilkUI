@@ -15,7 +15,7 @@ What it measures (PROTOCOL.md has the app side, METRICS.md the definitions):
   frames, and the app's own frame intervals when its clock is real.
 - each idle window ("XB idle-begin"/"XB idle-end"): CPU use, in percent of one core.
 """
-import shutil, argparse, datetime, json, os, platform, re, signal, socket, statistics, subprocess, sys, threading, time
+import shutil, argparse, datetime, json, os, platform, re, signal, socket, statistics, subprocess, sys, tempfile, threading, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from apps import APP_TABLE, XB, MAC  # noqa: E402
@@ -81,16 +81,25 @@ def cpu_seconds(pids):
 def memory(pids):
     """Memory of the tree in bytes: footprint on macOS, PSS (and RSS) on Linux."""
     if MAC:
-        args = ["footprint", "-f", "bytes", "-j", "/dev/stdout"]
-        for p in pids:
-            args += ["-p", str(p)]
-        r = subprocess.run(args, capture_output=True, text=True)
+        # footprint cannot write JSON to /dev/stdout on macOS 27 ("Permission denied"), so it goes
+        # through a file. RSS is kept beside it: it counts freed pages that malloc marked reusable.
+        rss = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
+        out = {"rss": sum(int(x) for x in rss.split()) * 1024, "processes": len(pids)}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
         try:
-            j = json.loads(r.stdout)
-            return {"footprint": j.get("total footprint"), "processes": len(j.get("processes", []))}
+            args = ["footprint", "-f", "bytes", "-j", path]
+            for p in pids:
+                args += ["-p", str(p)]
+            subprocess.run(args, capture_output=True, text=True)
+            with open(path) as f:
+                j = json.load(f)
+            out.update(footprint=j.get("total footprint"), processes=len(j.get("processes", [])))
         except Exception:
-            rss = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(map(str, pids))], capture_output=True, text=True).stdout
-            return {"rss": sum(int(x) for x in rss.split()) * 1024, "processes": len(pids)}
+            pass
+        finally:
+            os.remove(path)
+        return out
     pss = rss = n = 0
     for p in pids:
         try:
