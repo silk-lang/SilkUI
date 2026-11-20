@@ -956,3 +956,42 @@ test("svg elements measure their markup for getBBox and path lengths", () => {
     [2, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 45],
   ]);
 });
+
+test("an empty node shares no list with another, and its looks read back as CSS", () => {
+  const a = createBox();
+  const b = createBox();
+  assert.deepEqual(a.childNodes, []);
+  assert.equal(a.firstChild, null);
+  assert.equal(a.hasChildNodes(), false);
+  const child = createText("x");
+  assert.equal(child.kind, "text");
+  assert.equal(child.cloneNode().kind, "text");
+  assert.equal(a.kind, "box");
+  a.appendChild(child);
+  assert.deepEqual(a.childNodes, [child]);
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, a);
+  a.removeChild(child);
+  assert.deepEqual(a.childNodes, []);
+  b.insertBefore(child);
+  assert.equal(b.firstChild, child);
+  a.style.set({ width: 12, fontWeight: 600, color: "red" });
+  assert.equal(a.style.get("width"), "12px");
+  assert.equal(a.style.get("fontWeight"), "600");
+  assert.equal(a.style.cssText, "width:12px;font-weight:600;color:red;");
+  mock.take();
+  a.style.set({ width: 12 });
+  assert.deepEqual(mock.take(), []);
+  a.look("hover").set({ opacity: 0.5 });
+  a.setAttribute("data-x", "1");
+  let heard = 0;
+  a.addEventListener("click", () => heard++);
+  const copy = a.cloneNode(true);
+  assert.equal(copy.look("hover").get("opacity"), "0.5");
+  assert.equal(copy.getAttribute("data-x"), "1");
+  assert.equal(copy.style.cssText, a.style.cssText);
+  b.destroy();
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, null);
+  assert.equal(heard, 0);
+});
