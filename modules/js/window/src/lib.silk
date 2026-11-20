@@ -72,7 +72,13 @@ pub struct JsApp<'m> {
   openers: Openers,
   /// `SILK_UI_TRACE_JS`: say what the entry starts from.
   traced: bool,
+  /// The bytes JavaScript used after the last [`JsApp.release`].
+  settled: usize,
 }
+
+/// A quiet moment collects garbage when JavaScript's memory moved this much since the last
+/// one: a launch, a screen built or taken down. Smaller changes are the engine's own business.
+const RELEASE_MOVED_BYTES: usize = 4194304
 
 effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
   was.* = run deliverShell(&mut host, tree, event)
@@ -148,6 +154,28 @@ impl<'m> JsApp<'m> {
       source: List<u8>.make(),
       image: b"",
       openers: Openers.make(),
+      settled: 0,
+    }
+  }
+
+  /// Hands back what JavaScript no longer uses, for a window gone quiet
+  /// (`WindowClient.quiet`): a full collection when its memory moved by
+  /// [`RELEASE_MOVED_BYTES`] since the last one or `shed` says a large subtree went (its
+  /// nodes' cycles are garbage only a collection finds), then the pooled arenas left wholly
+  /// idle go back to the system, keeping an eighth of what is in use for what comes next.
+  /// Otherwise it costs a few loads.
+  pub effect fn release(self: &mut Self, shed: bool) -> () ? &mut Allocator {
+    let used = self.memory.usedBytes()
+    let moved = if used > self.settled { used - self.settled } else { self.settled - used }
+    let collected = shed || moved >= RELEASE_MOVED_BYTES
+    if collected {
+      run self.host.collect() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    }
+    let live = self.memory.usedBytes()
+    let released = self.memory.releaseIdle(live / 8)
+    self.settled = live
+    if self.traced && (collected || released != 0) {
+      StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
     }
   }
 
@@ -646,5 +674,11 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run state.host.presented(intervals, dropped) |> Effect.provideMut<Allocator>(&mut state.allocator)
+  }
+
+  effect fn quiet(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, shed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.release(shed)
   }
 }
