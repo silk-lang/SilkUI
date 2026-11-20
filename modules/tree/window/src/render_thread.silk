@@ -89,6 +89,8 @@ pub struct RenderReport {
   pub interval: f64,
   /// Frames the UI thread handed over that a newer frame replaced before they were drawn.
   pub dropped: u64,
+  /// The renderer's layer textures after the last frame (`UiRenderer.textureBytes`).
+  pub textures: [u64; 5],
 }
 
 impl Copy for RenderReport {}
@@ -105,6 +107,7 @@ impl RenderReport {
       present: 0.0,
       interval: 0.0,
       dropped: 0,
+      textures: [0; 5],
     }
   }
 }
@@ -373,7 +376,8 @@ impl RenderThread {
       Option<Scene>.Some { value } => move value
       Option<Scene>.None => Scene.make()
     }
-    run copy.copyFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
+    // Only what the renderer reads: the frame is drawn there, never painted on.
+    run copy.copyDrawnFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
     let mut textures = List<TextureInfo>.make()
     let mut i: usize = 0
     while i < atlas.textureCount() {
@@ -446,7 +450,8 @@ impl RenderThread {
     run raise(&self.shared)
     let mut heap = Allocator.systemAllocatorProvider()
     let mut copy = Scene.make()
-    run copy.copyFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
+    // Only what the renderer reads: the frame is drawn there, never painted on.
+    run copy.copyDrawnFrom(scene) |> Effect.provideMut<Allocator>(&mut heap)
     let mut textures = List<TextureInfo>.make()
     let mut i: usize = 0
     while i < atlas.textureCount() {
@@ -1144,6 +1149,10 @@ effect fn seconds(clock: &mut Clock) -> f64 {
   return run clock.seconds()
 }
 
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn renderThreadQos(class: u32, relative: i32) -> i32 as "pthread_set_qos_class_self_np"
+}
+
 effect fn renderLoop(
   shared: &Arc<Mutex<State>>,
   parker: &Parker,
@@ -1153,6 +1162,10 @@ effect fn renderLoop(
 ) -> ()
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
+  // Frames are presented from here: scheduled as the UI thread is (see host.interactiveThread).
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let _set = unsafe renderThreadQos(0x21, 0)
+  }
   let mut clock = Clock.make()
 
   // The device and the pipelines come first, before the window exists: they take most of the
@@ -1206,13 +1219,18 @@ effect fn renderLoop(
   }
   let mut textures = GpuAtlas.make()
   let mut configuration = SurfaceConfiguration.make(&device, format, 1, 1)
+  // A surface that can be read back takes the frame directly: the renderer copies what is
+  // under a blurred or blended layer from it, instead of drawing the frame into a texture as
+  // large as the window first and copying that out.
+  let canCopy = u64.bitAnd(capabilities.usages(), flags.WGPUTextureUsage_CopySrc) != 0
+  if canCopy {
+    configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  }
   if settings.check {
-    let canCopy = u64.bitAnd(capabilities.usages(), flags.WGPUTextureUsage_CopySrc) != 0
     if !canCopy {
       StderrWriter.print("ui-tree: the surface cannot be read back\n", &())
       fail GpuError.status(0)
     }
-    configuration.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
     renderer.setTextSettings(TextSettings.none())
   }
   let alphaMode = if capabilities.alphaModes().length != 0 {
@@ -1319,16 +1337,30 @@ effect fn renderLoop(
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run seconds(&mut clock)
     run renderer.setScrolls(newer.asSlice())
-    run renderer.draw(
-      &device,
-      &queue,
-      &job.scene,
-      &textures,
-      &view,
-      job.width,
-      job.height,
-      color.white(),
-    )
+    if canCopy {
+      run renderer.drawReadable(
+        &device,
+        &queue,
+        &job.scene,
+        &textures,
+        &texture.texture,
+        &view,
+        job.width,
+        job.height,
+        color.white(),
+      )
+    } else {
+      run renderer.draw(
+        &device,
+        &queue,
+        &job.scene,
+        &textures,
+        &view,
+        job.width,
+        job.height,
+        color.white(),
+      )
+    }
     let drawn = run seconds(&mut clock)
     let mut status: i32 = -1
     if fresh && job.compare {
@@ -1363,6 +1395,7 @@ effect fn renderLoop(
         (presented - previousPresented) * 1000.0
       },
       dropped: 0,
+      textures: renderer.textureBytes(),
     }
     current = Option<FrameJob>.some(move job)
     recordFrame(shared, report)

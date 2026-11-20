@@ -64,7 +64,11 @@ pub const SCALE: u32 = 47
 pub const TRANSFORM_ORIGIN: u32 = 48
 pub const PERSPECTIVE: u32 = 49
 pub const PERSPECTIVE_ORIGIN: u32 = 50
-pub const FIELDS: u32 = 51
+pub const OFFSET_DISTANCE: u32 = 51
+pub const OFFSET_ROTATE: u32 = 52
+pub const OFFSET_ANCHOR: u32 = 53
+pub const OFFSET_POSITION: u32 = 54
+pub const FIELDS: u32 = 55
 
 
 /// The CSS longhand of field `field`, as transition records name it.
@@ -120,7 +124,11 @@ pub fn fieldName(field: u32) -> &'static [u8] {
     47 => b"scale"
     48 => b"transform-origin"
     49 => b"perspective"
-    _ => b"perspective-origin"
+    50 => b"perspective-origin"
+    51 => b"offset-distance"
+    52 => b"offset-rotate"
+    53 => b"offset-anchor"
+    _ => b"offset-position"
   }
 }
 
@@ -192,6 +200,9 @@ pub fn propertyMask(name: &[u8]) -> u64 {
   }
   if timing.named(name, b"text-decoration") {
     return bit(DECORATION_COLOR)
+  }
+  if timing.named(name, b"offset") {
+    return bits(OFFSET_DISTANCE, 4)
   }
   return 0
 }
@@ -350,6 +361,13 @@ pub union Sample {
   Place { pub value: Origin },
   /// A `perspective` distance, 0 for `none`.
   Distance { pub value: f32 },
+  /// An `offset-distance`: pixels and a fraction of the path.
+  Along { pub pixels: f32, pub fraction: f32 },
+  /// An `offset-rotate`: radians, and whether it follows the path.
+  Turn { pub value: f32, pub auto: bool },
+  /// An `offset-anchor` or `offset-position`, with its `transform.PLACE_*` kind (an anchor is
+  /// `PLACE_AUTO` or `PLACE_SET`).
+  Spot { pub value: Origin, pub kind: u8 },
 }
 
 impl Copy for Sample {}
@@ -415,7 +433,14 @@ pub fn sample(computed: &Computed, field: u32) -> Sample {
     47 => Sample.Function { value: computed.transform.scale }
     48 => Sample.Place { value: computed.transform.origin }
     49 => Sample.Distance { value: computed.transform.perspective }
-    _ => Sample.Place { value: computed.transform.perspectiveOrigin }
+    50 => Sample.Place { value: computed.transform.perspectiveOrigin }
+    51 => Sample.Along { pixels: computed.transform.offset.distance, fraction: computed.transform.offset.distanceFraction }
+    52 => Sample.Turn { value: computed.transform.offset.rotate, auto: computed.transform.offset.autoRotate }
+    53 => Sample.Spot {
+      value: computed.transform.offset.anchor,
+      kind: if computed.transform.offset.anchorAuto { transform.PLACE_AUTO } else { transform.PLACE_SET },
+    }
+    _ => Sample.Spot { value: computed.transform.offset.position, kind: computed.transform.offset.positionKind }
   }
 }
 
@@ -574,6 +599,23 @@ pub fn write(computed: &mut Computed, field: u32, value: Sample) -> () {
       Sample.Distance { value: distance } => {
         computed.transform.perspective = distance
       }
+      Sample.Along { pixels, fraction } => {
+        computed.transform.offset.distance = pixels
+        computed.transform.offset.distanceFraction = fraction
+      }
+      Sample.Turn { value: turn, auto } => {
+        computed.transform.offset.rotate = turn
+        computed.transform.offset.autoRotate = auto
+      }
+      Sample.Spot { value: spot, kind } => {
+        if field == OFFSET_ANCHOR {
+          computed.transform.offset.anchor = spot
+          computed.transform.offset.anchorAuto = kind != transform.PLACE_SET
+        } else {
+          computed.transform.offset.position = spot
+          computed.transform.offset.positionKind = kind
+        }
+      }
       _ => {}
     }
   }
@@ -647,6 +689,18 @@ pub fn same(a: Sample, b: Sample) -> bool {
       Sample.Distance { value: other } => value == other
       _ => false
     }
+    Sample.Along { pixels, fraction } => match b {
+      Sample.Along { pixels: otherPixels, fraction: otherFraction } => pixels == otherPixels && fraction == otherFraction
+      _ => false
+    }
+    Sample.Turn { value, auto } => match b {
+      Sample.Turn { value: other, auto: otherAuto } => value == other && auto == otherAuto
+      _ => false
+    }
+    Sample.Spot { value, kind } => match b {
+      Sample.Spot { value: other, kind: otherKind } => kind == otherKind && value.same(&other)
+      _ => false
+    }
   }
 }
 
@@ -690,6 +744,14 @@ pub fn interpolable(a: Sample, b: Sample) -> bool {
       _ => false
     }
     Sample.Shown { .. } => false
+    Sample.Turn { auto, .. } => match b {
+      Sample.Turn { auto: otherAuto, .. } => auto == otherAuto
+      _ => false
+    }
+    Sample.Spot { kind, .. } => match b {
+      Sample.Spot { kind: otherKind, .. } => kind == transform.PLACE_SET && otherKind == transform.PLACE_SET
+      _ => false
+    }
     Sample.Distance { value } => match b {
       Sample.Distance { value: other } => value > 0.0 && other > 0.0
       _ => false
@@ -934,6 +996,27 @@ pub fn mix(field: u32, a: Sample, b: Sample, p: f32, width: f32, height: f32) ->
     Sample.Distance { value } => {
       return Sample.Distance { value: lerp(value, numberOf(b), p) }
     }
+    Sample.Along { pixels, fraction } => {
+      return match b {
+        Sample.Along { pixels: otherPixels, fraction: otherFraction } => Sample.Along {
+          pixels: lerp(pixels, otherPixels, p),
+          fraction: lerp(fraction, otherFraction, p),
+        }
+        _ => b
+      }
+    }
+    Sample.Turn { value, auto } => {
+      return match b {
+        Sample.Turn { value: other, .. } => Sample.Turn { value: lerp(value, other, p), auto: auto }
+        _ => b
+      }
+    }
+    Sample.Spot { value, kind } => {
+      return match b {
+        Sample.Spot { value: other, .. } => Sample.Spot { value: transform.mixOrigin(value, other, p), kind: kind }
+        _ => b
+      }
+    }
   }
 }
 
@@ -1089,6 +1172,10 @@ pub effect fn transition(
   }
   let now = tree.input.time
   let id = tree.node(slot).id
+  // The after-change style, before any running transition writes over it: some fields share
+  // one value (the four border colors, and the decoration color that follows `color`), and
+  // a value one of them writes is not the end another one heads to.
+  let target = computed.*
   let mut field: u32 = 0
   while field < FIELDS {
     if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(field))) != 0 {
@@ -1096,7 +1183,7 @@ pub effect fn transition(
       field = field + 1
       continue
     }
-    let after = sample(&computed.*, field)
+    let after = sample(&target, field)
     let spec = lists.spec(field, &tree.easingStops)
     let at = find(&tree.*, slot, id, field)
     if at != usize.MAX {
@@ -1229,7 +1316,9 @@ pub effect fn tick(tree: &mut UiTree<'_>) -> ()
     }
     if now >= item.start + item.duration {
       // Ended: the style shows its final value, and the next resolve starts from it.
-      write(&mut tree.nodeMut(slot).computed, item.field, item.to)
+      let mut ended = tree.node(slot).computed().*
+      write(&mut ended, item.field, item.to)
+      run tree.setComputed(slot, &ended)
       drop tree.transitions.remove(i)
       run record(&mut tree, EventKind.TransitionEnd, slot, item.field, f64.toF32(item.duration))
       tree.restyleTick(slot)

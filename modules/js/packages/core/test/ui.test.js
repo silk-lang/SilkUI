@@ -22,6 +22,24 @@ test("nodes queue their mutations", () => {
   assert.equal(nodeById(box.nodeId), box);
 });
 
+test("class aliases distinguish absent and empty alongside other attributes", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("className", "");
+  assert.equal(box.hasAttribute("class"), true);
+  box.setAttribute("data-mode", "on");
+  box.setAttribute("class", 42);
+  assert.equal(box.getAttribute("className"), "42");
+  box.removeAttribute("className");
+  assert.equal(box.className, "");
+  assert.equal(box.hasAttribute("class"), false);
+  assert.equal(box.getAttribute("data-mode"), "on");
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.nodeId, "class", ""], ["attribute", box.nodeId, "data-mode", "on"],
+    ["attribute", box.nodeId, "class", "42"], ["attribute", box.nodeId, "class", null],
+  ]);
+});
+
 test("a style sends what changed, and removal restarts the look", () => {
   const box = createBox({ width: 10, height: 20 });
   mock.take();
@@ -421,7 +439,7 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   b.destroy();
   a.destroy();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "release").length, 2, "both released");
+  assert.equal(calls.filter((call) => call[0] === "release").length, 1, "a went live when it changed, so only b held the markup");
   assert.throws(() => createNode("icon"), /no node kind 'icon'/);
 });
 
@@ -443,7 +461,7 @@ test("an image src loads its address once while some node shows it", () => {
   assert.equal(mock.take().filter((call) => call[0] === "release").length, 1);
 });
 
-test("svg markup built from elements draws once as one node, and again when it changes", async () => {
+test("svg markup built from elements draws once as one node, then changes go live per element", async () => {
   mock.take();
   const svg = createNode("svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -462,14 +480,35 @@ test("svg markup built from elements draws once as one node, and again when it c
   assert.ok(calls.some((call) => call[0] === "attribute" && call[2] === "class" && call[3] === "size-4"), "class is the node's");
   assert.equal(svg.outerHTML, markup);
   path.setAttribute("fill", "currentColor");
-  path.setAttribute("fill", "red");
   flushSvg();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 1, "two changes, one new markup");
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "a change after the first draw goes live");
+  const id = svg.nodeId;
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [
+    ["svgAttribute", id, 0, "viewBox", "0 0 24 24"],
+    ["svgAttribute", id, 0, "stroke-width", "2"],
+    ["svgInsert", id, 1, "path", 0, -1],
+    ["svgAttribute", id, 1, "d", 'M5 12h14"'],
+    ["svgAttribute", id, 1, "fill", "currentColor"],
+    ["svgInsert", id, 2, "title", 0, -1],
+  ]);
+  path.setAttribute("fill", "red");
+  title.firstChild.data = "B";
+  assert.deepEqual(mock.take(), [["svgAttribute", id, 1, "fill", "red"]], "one write, and title text stays quiet");
   path.destroy();
   title.remove();
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 1], ["svgRemove", id, 2]]);
+  const circle = createSvgElement("circle");
+  circle.setAttribute("r", 4);
+  svg.appendChild(circle);
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgInsert", id, 2, "circle", 0, -1], ["svgAttribute", id, 2, "r", "4"]], "numbers are reused");
+  const text = createSvgElement("text");
+  svg.appendChild(text);
+  calls = mock.take();
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 0]], "content the live svg cannot draw goes back to markup");
   flushSvg();
-  assert.ok(svg.outerHTML.endsWith('stroke-width="2"></svg>'));
+  assert.equal(mock.take().filter((call) => call[0] === "defineIcon").length, 1);
+  assert.ok(svg.outerHTML.endsWith('stroke-width="2"><circle r="4"/><text/></svg>'), svg.outerHTML);
   svg.destroy();
 });
 
@@ -870,4 +909,50 @@ test("setRangeText on a rich input keeps marks and atoms outside the range", () 
   input.setRangeText("x" + OBJECT, 5, 8, "select");
   assert.deepEqual(input.document, { text: "hellox\ufffdthere", marks: [{ start: 7, end: 12, marks: ["bold"] }], atoms: [] });
   assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 7]);
+});
+
+test("listeners on svg elements make the svg live and hear the shape under the pointer", () => {
+  mock.take();
+  const svg = createNode("svg");
+  const group = createSvgElement("g");
+  const a = createSvgElement("rect");
+  const b = createSvgElement("rect");
+  group.appendChild(a);
+  svg.append(group, b);
+  const heard = [];
+  const log = (name) => (event) => heard.push(name + ":" + event.type + "@" + (event.target.localName ?? "?") + (event.target === a ? "a" : event.target === b ? "b" : ""));
+  group.addEventListener("pointerenter", log("g"));
+  group.addEventListener("pointerleave", log("g"));
+  b.addEventListener("click", log("b"));
+  svg.addEventListener("click", log("svg"));
+  flushSvg();
+  const calls = mock.take();
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "listeners draw it live from the start");
+  const listen = calls.filter((call) => call[0] === "listen" && call[1] === svg.nodeId).at(-1);
+  for (const kind of [2, 3, 4, 5, 28, 29]) assert.ok(listen[2] & (1 << kind), "listens for kind " + kind);
+  const at = (element) => element._n * 4294967296 + 256 + 64;
+  mock.native.dispatch(28, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(4, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(3, svg.nodeId, 50, 5, at(b), 0, 0);
+  mock.native.dispatch(2, svg.nodeId, 50, 5, at(b), 0, 1);
+  mock.native.dispatch(2, svg.nodeId, 90, 90, 256 + 64, 0, 1);
+  assert.deepEqual(heard, ["g:pointerenter@g", "g:pointerleave@g", "b:click@rectb", "svg:click@rectb", "svg:click@svg"]);
+  svg.destroy();
+});
+
+test("svg elements measure their markup for getBBox and path lengths", () => {
+  mock.take();
+  const group = createSvgElement("g");
+  group.setAttribute("transform", "scale(2)");
+  const path = createSvgElement("path");
+  path.setAttribute("d", "M60 60h30v30h-30z");
+  group.appendChild(path);
+  assert.deepEqual({ ...group.getBBox() }, { x: 1, y: 2, width: 3, height: 4 });
+  assert.equal(path.getTotalLength(), 120);
+  assert.deepEqual(path.getPointAtLength(45), { x: 90, y: 75 });
+  assert.deepEqual(mock.take().map((call) => call.slice(1)), [
+    [0, "0\x1fg\x1ftransform\x1fscale(2)\x1e1\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [1, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [2, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 45],
+  ]);
 });

@@ -47,6 +47,8 @@ import float_shapes
 import expand
 import font_features
 import font_features { VariationTable }
+import font_rules
+import font_rules { FontRules }
 import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
@@ -64,7 +66,6 @@ import mutation {
   FontStyle,
   Overflow,
   WhiteSpace,
-  CanvasCommand,
   LISTEN_FOCUS,
   LISTEN_BLUR,
   LISTEN_LAYOUT,
@@ -94,6 +95,7 @@ import lists
 import first_letter
 import lists { Scope }
 import paint_css { Effects }
+import offset_path
 import paint_css
 import font_units
 import font_units { Source as FontSource }
@@ -106,15 +108,19 @@ import timing { EasingStops }
 import transform
 import style
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
-import style_identity { Atoms, NodeIdentity }
+import style_identity { Atoms, NodeIdentity, IdentityExtras }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach, Extent }
+import style_invalidation { Reach, Extent, StartingSubjects }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
 import svg_css.element { PseudoTarget, StateBits, ElementTree }
 import style_sheets { RootSheets, Resolved, Resolution }
 import style_share
+import properties.census { Census }
+import node { Work }
+import style_pool
+import style_pool { StylePool }
 import selector_tree { SelectorTree }
 import sheet_cache { Pending as PendingStyle }
 import silk.mem.frozen { Frozen }
@@ -130,6 +136,8 @@ import svg_css.media_features { Environment }
 import svg_css.colors { Color as SheetColor }
 import style_attributes
 import ui_protocol.aria { isNamedAttribute }
+import live_svg
+import live_svg { LiveSvg }
 import node {
   NONE,
   WATCH_OUTSIDE,
@@ -140,16 +148,20 @@ import node {
   Event,
   PaintCache,
   Node,
+  NodeExtras,
   Semantics,
   FaceSlot,
   Pending
 }
-import paint { TextInk, Painter, paintRoots, hashFragments, inkFragments, foldLiftedRoots }
+import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import svg_css.effect_values { Image }
+import repair { Repair, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
+import ui_text.fonts as text_fonts
 import ui_text.set { FaceRule, FaceState, UnicodeRange }
 import svg_fonts.database { FaceStyle as RuleStyle, Range as RuleRange }
 import svg_fonts.names { same as sameFamilyName }
@@ -158,10 +170,10 @@ import font_raster.cache { GlyphCache }
 import font_raster.face { FontFace }
 import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
 import ui_scene.scene { Scene }
-import ui_scene.primitives { ContentMask }
+import ui_scene.primitives { ContentMask, Quad, GlyphSprite, ImageSprite, Shadow, PathSprite, Underline, LayerSprite }
 import ui_scene.path_cache { PathCache }
+import layout_table { LayoutTable, LayoutView }
 import layout.lib {
-  Tree,
   Fragment,
   NodeId,
   LayoutTree,
@@ -191,6 +203,7 @@ import silk.num.f32
 import silk.num.f64
 import silk.num.u32
 import silk.num.u64
+import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
 
@@ -368,6 +381,9 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetGrid { id, .. } => id
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
+    Mutation.SvgInsert { id, .. } => id
+    Mutation.SvgRemove { id, .. } => id
+    Mutation.SvgAttribute { id, .. } => id
     Mutation.SetRichText { id, .. } => id
     Mutation.DefineMark { id, .. } => id
     Mutation.DefineAtom { id, .. } => id
@@ -379,6 +395,32 @@ fn nodeOf(mutation: &Mutation) -> u32 {
 
 /// Whether a mutation that names no node changes every root: a resource, a font family. A new
 /// node is nobody's yet, and a root mutation changes its own root.
+/// Whether `mutation` only moves a scroll container's content.
+/// Whether all a mutation changes of what is painted is its node's own paint inputs, styles
+/// and layout (see `UiTree.repair`).
+fn repaintsNode(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.Create { .. } => true
+    Mutation.InsertBefore { .. } => true
+    Mutation.Remove { .. } => true
+    Mutation.Destroy { .. } => true
+    Mutation.SetStyle { .. } => true
+    Mutation.SetCustomProperty { .. } => true
+    Mutation.ClearStyle { .. } => true
+    Mutation.SetText { .. } => true
+    Mutation.SetAttribute { .. } => true
+    Mutation.SetListeners { .. } => true
+    _ => false
+  }
+}
+
+fn scrollsOnly(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.ScrollTo { .. } => true
+    _ => false
+  }
+}
+
 fn reachesEveryRoot(mutation: &Mutation) -> bool {
   return match &mutation.* {
     Mutation.Create { .. } => false
@@ -437,6 +479,10 @@ effect fn layoutFailed<E>(error: E) -> never
   ! TreeError {
   drop error
   fail TreeError.Layout
+}
+
+effect fn noShape(error: TreeError) -> () {
+  drop error
 }
 
 effect fn viewFailed(error: CssomError) -> never
@@ -541,9 +587,8 @@ pub effect fn applyResolved(computed: &mut Computed, list: &List<Declaration>, p
 }
 
 /// Applies non-font declarations after the node's font dependencies have resolved.
-pub effect fn applyUsing(computed: &mut Computed, list: &List<Declaration>, parent: &Computed,
+pub effect fn applyUsing(computed: &mut Computed, items: &[Declaration], parent: &Computed,
   stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
-  let items = list.asSlice()
   let mut pass: u32 = 0
   while pass < 2 {
     let mut i: usize = 0
@@ -617,8 +662,7 @@ pub effect fn applyAll(computed: &mut Computed, list: &List<Declaration>, stops:
   }
 }
 
-fn applyPixelList(computed: &mut Computed, list: &List<Declaration>) {
-  let items = list.asSlice()
+fn applyPixelList(computed: &mut Computed, items: &[Declaration]) {
   let units = computed.unitContext()
   let mut i: usize = 0
   while i < items.length {
@@ -662,6 +706,9 @@ pub effect fn applyTransformIn(computed: &mut Computed, declaration: &Declaratio
   let text = run values.cssText(&declaration.value)
   let units = transform.Units { context: context.* }
   transform.declare(&mut computed.transform, which, text.asSlice(), &units)
+  if which == transform.OFFSET_PATH_PROPERTY && computed.transform.offset.path == transform.PATH_SHAPE {
+    computed.effects.declared = true
+  }
   if !computed.usesViewport && style.viewportDependent(declaration) {
     computed.usesViewport = true
   }
@@ -683,6 +730,12 @@ fn transformProperty(property: CssProperty) -> u32 {
     CssProperty.Perspective => transform.PERSPECTIVE_PROPERTY
     CssProperty.PerspectiveOrigin => transform.PERSPECTIVE_ORIGIN_PROPERTY
     CssProperty.BackfaceVisibility => transform.BACKFACE_PROPERTY
+    CssProperty.OffsetPath => transform.OFFSET_PATH_PROPERTY
+    CssProperty.OffsetDistance => transform.OFFSET_DISTANCE_PROPERTY
+    CssProperty.OffsetRotate => transform.OFFSET_ROTATE_PROPERTY
+    CssProperty.OffsetAnchor => transform.OFFSET_ANCHOR_PROPERTY
+    CssProperty.OffsetPosition => transform.OFFSET_POSITION_PROPERTY
+    CssProperty.TransformStyle => transform.TRANSFORM_STYLE_PROPERTY
     _ => NONE
   }
 }
@@ -757,7 +810,8 @@ pub struct UiTree<'a> {
   pub virtualLists: List<VirtualList>,
   /// Retained popup placement relationships. Configure them through SetAnchor.
   pub anchors: List<Anchored>,
-  pub layout: Tree,
+  /// The tree css-layout lays out (see `layout_table`).
+  pub layout: LayoutTable,
   pub output: LayoutTree,
   pub containerWatches: List<Watch>,
   pub styleChanges: List<Change>,
@@ -799,6 +853,10 @@ pub struct UiTree<'a> {
   fontKeys: List<FontKeyEntry>,
   fontFaces: List<FontFaceEntry>,
   pub sheetFaces: SheetFaces,
+  /// `@font-palette-values` and `@font-feature-values` rules, and font property handles.
+  pub fontRules: FontRules,
+  /// When the next `font-display` block or swap period ends, or negative.
+  fontBlockEnd: f64,
   /// The files of faces declared with a URL (`Mutation.DeclareFontFace`).
   faceSources: List<FaceSource>,
   nextHostFace: u32,
@@ -832,6 +890,11 @@ pub struct UiTree<'a> {
   pub snapUsed: bool,
   /// A style used anchor positioning (`anchor-name` or an anchored box).
   pub cssAnchorUsed: bool,
+  /// A style used `offset-path` (see `offset_path.settle`).
+  pub offsetUsed: bool,
+  /// Whether some style ever set `transform-style: preserve-3d`: until then paint and hit
+  /// testing skip the 3D rendering context checks.
+  pub preserveUsed: bool,
   pub cssPlacements: List<css_anchor.Placement>,
   /// User scrolls of snap containers that snap once they stop.
   pub snapWaits: List<SnapWait>,
@@ -841,6 +904,10 @@ pub struct UiTree<'a> {
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
   pub styleModels: HashMap<u64, u32>,
+  /// The computed styles the nodes hold, each once.
+  pub stylePool: StylePool,
+  /// The style a new node of each kind starts with (see `freshStyle`).
+  freshStyles: List<FreshStyle>,
   /// The last `Node.computedStamp` handed out.
   pub computedStamps: u32,
   pub frameNumber: u64,
@@ -877,15 +944,27 @@ pub struct UiTree<'a> {
   pub fragmentScrollers: List<bool>,
   /// Per fragment of the last layout: where stacking paints it (see `stacking`).
   pub fragmentStacking: Stacking,
-  /// Whether the fragment hashes and ink are out of date: layout, styles or mutations changed
-  /// since they were computed. Scrolling leaves them as they are.
+  /// Whether the fragment hashes, ink and stacking must all be worked out again: something
+  /// changed that `repair` does not follow. Scrolling leaves them as they are.
   paintCachesStale: bool,
+  /// What changed for them short of that: the fragments a layout pass wrote, the nodes a
+  /// restyle or a mutation repaints. The next refresh works out those alone (see `repair`).
+  pub repair: Repair,
+  /// The slots of the nodes that listen for layout (see `notifyLayout`): each one that began
+  /// to, until the next report finds it gone or no longer listening.
+  layoutListeners: List<u32>,
   /// Whether a scroll offset changed since the last frame.
   pub scrolled: bool,
   /// Whether some node may hold a scroll offset other than zero: set by every write of one,
   /// cleared by `settleScrolls` when it finds none, so a tree that never scrolled skips its
   /// walk over the nodes.
   pub offsets: bool,
+  /// The most nodes the tree has held since it last gave back what a larger tree left
+  /// (see `releaseSlack`).
+  heldNodes: usize,
+  /// The nodes that may hold a scroll offset (see `interact.settleScrolls`): each node whose
+  /// offset left zero since it was last settled.
+  pub scrolledSlots: List<u32>,
   /// Whether no scroll offset changed between the previous frame and this one.
   scrollsStill: bool,
   pub textInk: List<TextInk>,
@@ -1002,7 +1081,51 @@ pub struct UiTree<'a> {
   tickHeight: f32,
   /// What the host last showed for a cursor image (`cursorShown`), 0 for a keyword.
   pub cursorShown: u64,
+  /// Work done since the tree was made, for the bench census.
+  pub work: Work,
 }
+
+/// What `scene` holds, for the bench census: its layers and the primitives of each kind.
+effect fn sceneCensus(scene: &Scene, out: &mut Census) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let layers = scene.layerCount()
+  let mut quads: usize = 0
+  let mut glyphs: usize = 0
+  let mut images: usize = 0
+  let mut shadows: usize = 0
+  let mut paths: usize = 0
+  let mut underlines: usize = 0
+  let mut sprites: usize = 0
+  let mut batches: usize = 0
+  let mut layer: u32 = 0
+  while layer < layers {
+    quads = quads + scene.quads(layer).length
+    glyphs = glyphs + scene.glyphs(layer).length
+    images = images + scene.images(layer).length
+    shadows = shadows + scene.shadows(layer).length
+    paths = paths + scene.paths(layer).length
+    underlines = underlines + scene.underlines(layer).length
+    sprites = sprites + scene.layers(layer).length
+    batches = batches + scene.batches(layer).length
+    layer = layer + 1
+  }
+  run out.unit("scene.layers", u32.toUsize(layers))
+  run out.unit("scene.operations", scene.operationCount())
+  run out.held("scene.quads", quads, quads, Intrinsic.layoutOf<Quad>().bytes)
+  run out.held("scene.glyphs", glyphs, glyphs, Intrinsic.layoutOf<GlyphSprite>().bytes)
+  run out.held("scene.images", images, images, Intrinsic.layoutOf<ImageSprite>().bytes)
+  run out.held("scene.shadows", shadows, shadows, Intrinsic.layoutOf<Shadow>().bytes)
+  run out.held("scene.paths", paths, paths, Intrinsic.layoutOf<PathSprite>().bytes)
+  run out.held("scene.underlines", underlines, underlines, Intrinsic.layoutOf<Underline>().bytes)
+  run out.held("scene.layer-sprites", sprites, sprites, Intrinsic.layoutOf<LayerSprite>().bytes)
+  run out.unit("scene.batches", batches)
+  run out.unit("scene.scroll-groups", scene.scrollGroups().length)
+  run out.unit("scene.scroll-positions", scene.scrolls().length)
+}
+
+/// The style nodes of one kind are made with.
+struct FreshStyle { kind: NodeKind, styled: Frozen<Computed> }
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
 pub struct TickBase {
@@ -1014,6 +1137,243 @@ pub struct TickBase {
 }
 
 impl<'a> UiTree<'a> {
+  /// What the tree holds and the work it did since it was made, as rows of a census
+  /// (`properties.census`): the bench prints them with `SILK_UI_BENCH_CENSUS`. It reads
+  /// everything and changes nothing.
+  pub effect fn census(self: &Self, out: &mut Census) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let u = Intrinsic.layoutOf<usize>().bytes
+    let declaration = Intrinsic.layoutOf<Declaration>().bytes
+    // Natural units.
+    let mut live: usize = 0
+    let mut texts: usize = 0
+    let mut boxes: usize = 0
+    let mut other: usize = 0
+    let mut generated: usize = 0
+    let mut textBytes: usize = 0
+    let mut textRoom: usize = 0
+    let mut labelRoom: usize = 0
+    let mut baseUsed: usize = 0
+    let mut baseRoom: usize = 0
+    let mut withBase: usize = 0
+    let mut extras: usize = 0
+    let mut moving: usize = 0
+    let mut editing: usize = 0
+    let mut effects: usize = 0
+    let mut semantics: usize = 0
+    let mut sheets: usize = 0
+    let mut twins: usize = 0
+    let mut identities: usize = 0
+    let mut identityExtras: usize = 0
+    let mut classBytes: usize = 0
+    let mut classRoom: usize = 0
+    let mut tagRoom: usize = 0
+    let mut classAtoms: usize = 0
+    let mut classAtomRoom: usize = 0
+    let mut withClasses: usize = 0
+    let mut listening: usize = 0
+    let mut hovered: usize = 0
+    let mut distinctClasses = HashMap<u64, usize>.make(self.seed)
+    let mut distinctTexts = HashMap<u64, usize>.make(self.seed)
+    let mut repeatedTextBytes: usize = 0
+    let mut at: usize = 0
+    while at < self.nodes.length() {
+      let node = &self.nodes.asSlice()[at]
+      at = at + 1
+      if !node.live { continue }
+      live = live + 1
+      if node.kind == NodeKind.Text { texts = texts + 1 } else if node.kind == NodeKind.Box { boxes = boxes + 1 } else { other = other + 1 }
+      if node.isGenerated() { generated = generated + 1 }
+      let bytes = String.utf8Bytes(String.view(&node.text))
+      textBytes = textBytes + bytes.length
+      textRoom = textRoom + node.text.capacity()
+      if bytes.length != 0 {
+        let mut hashed = Hash.mix(&self.seed, usize.toU64(bytes.length))
+        let mut b: usize = 0
+        while b < bytes.length {
+          hashed = Hash.combine(hashed, u8.toU64(bytes[b]))
+          b = b + 1
+        }
+        if distinctTexts.contains(hashed) { repeatedTextBytes = repeatedTextBytes + bytes.length } else { drop run distinctTexts.insert(hashed, 1) }
+      }
+      labelRoom = labelRoom + node.label.capacity()
+      baseUsed = baseUsed + node.base.length()
+      baseRoom = baseRoom + node.base.capacity()
+      if node.base.length() != 0 { withBase = withBase + 1 }
+      if node.extras.isSome() { extras = extras + 1 }
+      if node.moving.isSome() { moving = moving + 1 }
+      if node.editing.isSome() { editing = editing + 1 }
+      if node.effects.isSome() { effects = effects + 1 }
+      if node.semantics.isSome() { semantics = semantics + 1 }
+      if node.resolvedSheet.isSome() { sheets = sheets + 1 }
+      if node.styleTwin != NONE { twins = twins + 1 }
+      if node.listeners != 0 { listening = listening + 1 }
+      if node.hovered { hovered = hovered + 1 }
+      if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
+        identities = identities + 1
+        if identity.extras.isSome() { identityExtras = identityExtras + 1 }
+        let classes = String.utf8Bytes(String.view(&identity.classes))
+        classBytes = classBytes + classes.length
+        classRoom = classRoom + identity.classes.capacity()
+        tagRoom = tagRoom + identity.tag.capacity()
+        classAtoms = classAtoms + identity.classAtoms.length()
+        classAtomRoom = classAtomRoom + identity.classAtoms.capacity()
+        if classes.length != 0 {
+          withClasses = withClasses + 1
+          let mut hashed = Hash.mix(&self.seed, usize.toU64(classes.length))
+          let mut b: usize = 0
+          while b < classes.length {
+            hashed = Hash.combine(hashed, u8.toU64(classes[b]))
+            b = b + 1
+          }
+          if !distinctClasses.contains(hashed) { drop run distinctClasses.insert(hashed, 1) }
+        }
+      }
+    }
+    run out.unit("nodes", live)
+    run out.unit("nodes.elements", boxes + other)
+    run out.unit("nodes.text", texts)
+    run out.unit("nodes.other(input, image, icon, canvas)", other)
+    run out.unit("nodes.generated", generated)
+    run out.unit("nodes.with-inline-style", withBase)
+    run out.unit("nodes.with-classes", withClasses)
+    run out.unit("nodes.with-sheet-record", sheets)
+    run out.unit("nodes.sheet-record-from-twin", twins)
+    run out.unit("nodes.listening", listening)
+    run out.unit("nodes.hovered", hovered)
+    run out.unit("classes.distinct-class-attributes", distinctClasses.length())
+    run out.unit("classes.atoms-on-nodes", classAtoms)
+    run out.unit("text.distinct-node-texts", distinctTexts.length())
+    run out.unit("text.bytes-in-repeated-node-texts", repeatedTextBytes)
+    run out.unit("style.sheet-classes-handed-out", u32.toUsize(self.styleClasses))
+    run out.unit("fragments", self.output.fragments.values.length())
+    run out.unit("text-records", self.output.fragments.texts.length())
+
+    // The node table and what hangs off a node.
+    run out.held("tree.nodes", live, self.nodes.capacity(), Intrinsic.layoutOf<Node>().bytes)
+    run out.unit("tree.nodes.slots", self.nodes.length())
+    run out.bytes("tree.nodes.text", textBytes, textRoom)
+    run out.bytes("tree.nodes.label", 0, labelRoom)
+    run out.held("tree.nodes.base-declarations", baseUsed, baseRoom, declaration)
+    run out.held("tree.nodes.extras(NodeExtras)", extras, extras, Intrinsic.layoutOf<NodeExtras>().bytes)
+    run out.held("tree.nodes.moving(Computed)", moving, moving, Intrinsic.layoutOf<Computed>().bytes)
+    run out.held("tree.nodes.editing", editing, editing, Intrinsic.layoutOf<EditState>().bytes)
+    run out.held("tree.nodes.effects", effects, effects, Intrinsic.layoutOf<Effects>().bytes)
+    run out.held("tree.nodes.semantics", semantics, semantics, Intrinsic.layoutOf<Semantics>().bytes)
+    run out.held("tree.nodes.identity(NodeIdentity)", identities, identities, Intrinsic.layoutOf<NodeIdentity>().bytes)
+    run out.held("tree.nodes.identity.extras", identityExtras, identityExtras, Intrinsic.layoutOf<IdentityExtras>().bytes)
+    run out.bytes("tree.nodes.identity.class-text", classBytes, classRoom)
+    run out.bytes("tree.nodes.identity.tag-text", 0, tagRoom)
+    run out.held("tree.nodes.identity.class-atoms", classAtoms, classAtomRoom, u)
+    run out.held("tree.ids(map id to slot)", self.ids.length(), self.ids.bucketCount(), 21)
+    run out.held("tree.slot-of-css", self.slotOfCss.length(), self.slotOfCss.capacity(), 4)
+    run out.held("tree.free-slots", self.free.length(), self.free.capacity(), 4)
+    run out.held("tree.tick-places", self.tickPlaces.length(), self.tickPlaces.capacity(), 4)
+    run out.held("tree.tick-bases", self.tickBases.length(), self.tickBases.capacity(), Intrinsic.layoutOf<TickBase>().bytes)
+    run out.held("tree.layout-listeners", self.layoutListeners.length(), self.layoutListeners.capacity(), 4)
+    run out.held("tree.events", self.events.length(), self.events.capacity(), Intrinsic.layoutOf<Event>().bytes)
+    run out.held("tree.transitions", self.transitions.length(), self.transitions.capacity(), Intrinsic.layoutOf<Running>().bytes)
+    run out.held("tree.animations", self.animations.length(), self.animations.capacity(), Intrinsic.layoutOf<Playing>().bytes)
+    run out.held("tree.container-watches", self.containerWatches.length(), self.containerWatches.capacity(), Intrinsic.layoutOf<Watch>().bytes)
+    run out.held("tree.style-changes", self.styleChanges.length(), self.styleChanges.capacity(), Intrinsic.layoutOf<Change>().bytes)
+    run out.held("tree.naturals(per slot)", self.provider.naturals.length(), self.provider.naturals.capacity(), Intrinsic.layoutOf<NaturalDimensions>().bytes)
+    // Style: atoms, sheets, shared records and computed values.
+    run out.held("tree.class-atoms", self.styleAtoms.length(), self.styleAtoms.length(), Intrinsic.layoutOf<Bytes>().bytes)
+    run out.bytes("tree.class-atoms.names", self.styleAtoms.nameBytes(), self.styleAtoms.nameBytes())
+    run out.held("tree.style-models", self.styleModels.length(), self.styleModels.bucketCount(), 21)
+    run self.stylePool.census(&mut out)
+    run out.held("tree.font-keys", self.fontKeys.length(), self.fontKeys.capacity(), Intrinsic.layoutOf<FontKeyEntry>().bytes)
+    run out.held("tree.faces", self.faces.length(), self.faces.capacity(), Intrinsic.layoutOf<FaceSlot<'a>>().bytes)
+    let mut root: usize = 0
+    while root < self.styleSheets.length() {
+      let sheets = &self.styleSheets.asSlice()[root]
+      run sheets.cache.census(&mut out)
+      run sheets.sheets.census(&mut out)
+      root = root + 1
+    }
+    // Per fragment and per node paint tables.
+    run out.held("tree.fragment-hashes", self.fragmentHashes.length(), self.fragmentHashes.capacity(), 8)
+    run out.held("tree.fragment-ink", self.fragmentInk.length(), self.fragmentInk.capacity(), 16)
+    run out.held("tree.fragment-scrollers", self.fragmentScrollers.length(), self.fragmentScrollers.capacity(), 1)
+    run self.fragmentStacking.census(&mut out)
+    run self.repair.index.census(&mut out)
+    run out.bytes("tree.repair.lists", self.repair.nodes.length() * 4 + self.repair.fragments.length() * 8,
+      self.repair.nodes.capacity() * 4 + (self.repair.fragments.capacity() + self.repair.dirty.capacity() + self.repair.stack.capacity() + self.repair.spareHashes.capacity()) * 8
+        + self.repair.spareInk.capacity() * 16 + self.repair.spareFlags.capacity() + self.repair.marks.capacity())
+    run out.held("tree.fragment-of(per css node)", self.fragmentOf.length(), self.fragmentOf.capacity(), u)
+    run out.held("tree.next-source-fragment(per fragment)", self.nextSourceFragment.length(), self.nextSourceFragment.capacity(), u)
+    run out.held("tree.paint-order", self.paintOrder.length(), self.paintOrder.capacity(), 4)
+    run out.held("tree.paint-index-of(per slot)", self.paintIndexOf.length(), self.paintIndexOf.capacity(), 4)
+    run out.held("tree.text-ink", self.textInk.length(), self.textInk.capacity(), Intrinsic.layoutOf<TextInk>().bytes)
+    run out.held("tree.scrolled-slots", self.scrolledSlots.length(), self.scrolledSlots.capacity(), 4)
+    // The scenes: what the last frame drew.
+    run sceneCensus(self.scene(), &mut out)
+    run out.unit("atlas.tiles", u32.toUsize(self.atlas.tileCount()))
+    run out.unit("atlas.textures", self.atlas.textureCount())
+    run out.unit("paths.cached", self.paths.length())
+    run out.unit("images.decoded", self.resources.images.length())
+    run out.bytes("images.decoded-pixels(RGBA)", self.resources.images.censusPixels() * 4, self.resources.images.censusPixels() * 4)
+    run out.unit("images.with-atlas-tile", self.resources.images.censusTiles())
+    run out.work("images.uploads", u64.wrappingToUsize(self.resources.images.uploadCount()))
+    // css-layout and text.
+    run self.layout.census(&mut out)
+    run self.output.census(&mut out)
+    run self.provider.text.census(&mut out)
+    // Work.
+    let w = &self.work
+    run out.work("frames", w.frames)
+    run out.work("frames.styled", w.styleFrames)
+    run out.work("frames.layout-step", w.layoutFrames)
+    run out.work("mutations", w.mutations)
+    run out.work("mutations.batches", w.batches)
+    run out.work("mutations.create", w.creates)
+    run out.work("mutations.insert", w.inserts)
+    run out.work("mutations.set-style", w.setStyles)
+    run out.work("mutations.set-style.declarations", w.styleDeclarations)
+    run out.work("mutations.set-text", w.setTexts)
+    run out.work("mutations.set-text.bytes", w.textBytes)
+    run out.work("mutations.set-attribute", w.attributes)
+    run out.work("mutations.set-attribute.class-and-named-bytes", w.attributeBytes)
+    run out.work("bridge.calls", w.bridgeCalls)
+    run out.work("mutations.set-listeners", w.listens)
+    run out.work("atoms.interns", self.styleAtoms.interns)
+    run out.work("atoms.compares", self.styleAtoms.compares)
+    run out.work("style.resolve-styles-calls", w.styleCalls)
+    run out.work("style.resolve-styles-calls.past-early-return", w.stylePasses)
+    run out.work("style.media-conditions-evaluated", w.conditionsEvaluated)
+    run out.work("style.rules-walked-for-conditions", w.conditionRulesWalked)
+    run out.work("style.resolves", w.resolves)
+    run out.work("style.resolves.ticks", w.ticks)
+    run out.work("style.sheet.skipped(text or no sheet)", w.sheetSkips)
+    run out.work("style.sheet.from-twin", w.sheetTwins)
+    run out.work("style.sheet.matched", w.sheetMatches)
+    run out.work("style.sheet.matched.record-cache-hits", w.sheetCacheHits)
+    run out.work("style.computed-from-lender", w.lenders)
+    run out.work("style.pool-shares", w.styleShares)
+    run out.work("layout.computes.passes", w.layoutPasses)
+    run out.work("layout.full-layouts", w.layoutFull)
+    run out.work("layout.size-probes", w.layoutProbes)
+    run out.work("layout.cache-hits", w.layoutCacheHits)
+    run out.work("layout.reused-layouts", w.layoutReused)
+    run out.work("layout.inline-layouts-and-probes", w.inlineLayouts)
+    run out.work("layout.plain-line-probes", w.plainLines)
+    run out.work("layout.lines-emitted", w.linesEmitted)
+    run out.work("layout.scroll-only-moves", w.layoutMoves)
+    run out.work("layout.fragments-resolved", w.fragmentsResolved)
+    run out.work("hover.refreshes", w.hoverRefreshes)
+    run out.work("paint.cache-repairs", self.repair.repairs)
+    run out.work("paint.cache-rebuilds", self.repair.rebuilds)
+    run out.work("paint.fragments-painted", w.paintedFragments)
+    run out.work("paint.subtrees-culled", w.culledSubtrees)
+    run out.work("paint.subtrees-replayed", w.replayedSubtrees)
+    run out.work("paint.subtrees-repainted", w.repaintedSubtrees)
+    run out.work("paint.operations-replayed", w.replayedOperations)
+    run out.work("paint.glyphs-emitted", w.paintedGlyphs)
+    run out.work("paths.hits", u64.wrappingToUsize(self.paths.hits()))
+    run out.work("paths.misses", u64.wrappingToUsize(self.paths.misses()))
+  }
+
   /// An empty tree drawing with the fonts of `collection`.
   pub effect fn make(collection: &'a FontCollection) -> UiTree<'a>
     ! TreeError | OutOfMemoryError
@@ -1021,7 +1381,7 @@ impl<'a> UiTree<'a> {
     let mut viewport = CssStyle.make()
     viewport.width = SizeValue.px(0.0)
     viewport.height = SizeValue.px(0.0)
-    let mut layout = run Tree.make(move viewport)
+    let mut layout = run LayoutTable.make(move viewport)
 
     // Scroll and sticky offsets are applied when painting, so scrolling needs no layout.
     layout.stickyDeferred = true
@@ -1063,6 +1423,8 @@ impl<'a> UiTree<'a> {
       fontKeys: List<FontKeyEntry>.make(),
       fontFaces: List<FontFaceEntry>.make(),
       sheetFaces: SheetFaces.make(),
+      fontRules: FontRules.make(),
+      fontBlockEnd: -1.0,
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
@@ -1083,11 +1445,15 @@ impl<'a> UiTree<'a> {
       firstLines: List<first_letter.FirstLine>.make(),
       snapUsed: false,
       cssAnchorUsed: false,
+      offsetUsed: false,
+      preserveUsed: false,
       cssPlacements: List<css_anchor.Placement>.make(),
       snapWaits: List<SnapWait>.make(),
       scrollAnchors: List<ScrollAnchor>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
+      stylePool: StylePool.make(),
+      freshStyles: List<FreshStyle>.make(),
       computedStamps: 0,
       frameNumber: 0,
       semanticRevision: 0,
@@ -1110,8 +1476,12 @@ impl<'a> UiTree<'a> {
       fragmentScrollers: List<bool>.make(),
       fragmentStacking: Stacking.make(),
       paintCachesStale: true,
+      repair: Repair.make(),
+      layoutListeners: List<u32>.make(),
       scrolled: false,
       offsets: false,
+      scrolledSlots: List<u32>.make(),
+      heldNodes: 0,
       scrollsStill: false,
       textInk: List<TextInk>.make(),
       facesDirty: true,
@@ -1174,6 +1544,7 @@ impl<'a> UiTree<'a> {
       tickWidth: 0.0,
       tickHeight: 0.0,
       cursorShown: 0,
+      work: Work.zero(),
     }
   }
 
@@ -1187,6 +1558,19 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     if self.resources.settleCssImage(resource, ok) {
       self.paintCachesStale = true
+      // Floats whose `shape-outside` is a stylesheet image wrap around it once it loads.
+      let mut i: usize = 0
+      while i < self.nodes.length() {
+        let node = &self.nodes.asSlice()[i]
+        let imaged = node.live && node.kind != NodeKind.Text && match node.paintEffects() {
+          Option<&Effects>.Some { value } => value.shapeImage.length() != 0
+          Option<&Effects>.None => false
+        }
+        if imaged {
+          run Effect.catch<TreeError>(self.updateShape(usize.toU32(i)), noShape)
+        }
+        i = i + 1
+      }
       return ()
     }
     let at = u32.toUsize(resource)
@@ -1206,6 +1590,30 @@ impl<'a> UiTree<'a> {
       }
       i = i + 1
     }
+  }
+
+  /// Gives css-layout the `shape-outside` of element `slot`, asking for its image first.
+  effect fn updateShape(self: &mut Self, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut url = Bytes.make()
+    if let Option<&Effects>.Some { value } = self.node(slot).paintEffects() {
+      if value.shapeImage.length() != 0 {
+        if let Image.Url { url: named } = &value.shapeImage.asSlice()[0] {
+          run url.append(Bytes.asSlice(&named))
+        }
+      }
+    }
+    if url.length() != 0 {
+      drop run self.resources.cssImage(Bytes.asSlice(&url))
+    }
+    let node = self.node(slot)
+    let css = node.css
+    let shape = match node.paintEffects() {
+      Option<&Effects>.Some { value } => run float_shapes.of(value, node.computed().paint.radii, node.computed().effects.radiusShare, &self.resources, float_shapes.contentSize(&node.computed().layout))
+      Option<&Effects>.None => FloatShape.make()
+    }
+    run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
   }
 
   fn sourceState(self: &Self, resource: u32) -> u8 {
@@ -1302,7 +1710,7 @@ impl<'a> UiTree<'a> {
     let mut found = false
     let mut i: usize = 0
     while i < declared.length {
-      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) {
+      if writtenFamily(&declared[i]) || writtenVariations(&declared[i]) || writtenHandle(&declared[i]) {
         found = true
       }
       i = i + 1
@@ -1336,6 +1744,26 @@ impl<'a> UiTree<'a> {
             important: declared[i].important,
           })
         }
+      } else if writtenHandle(&declared[i]) {
+        // A negative number: font_features.apply reads -(handle + 1). Values that do not
+        // parse are dropped.
+        let text = run values.cssText(&declared[i].value)
+        let css = Bytes.asSlice(&text)
+        let property = declared[i].property
+        let handle = if property == CssProperty.FontPalette {
+          run self.fontRules.paletteHandle(css)
+        } else if property == CssProperty.FontVariantAlternates {
+          run self.fontRules.alternatesHandle(css)
+        } else {
+          run self.fontRules.adjustHandle(css)
+        }
+        if let Option.Some { value: id } = handle {
+          run out.append(Declaration {
+            property: property,
+            value: values.number(-u32.toF32(id) - 1.0),
+            important: declared[i].important,
+          })
+        }
       } else {
         run out.append(run values.cloneDeclaration(&declared[i]))
       }
@@ -1360,14 +1788,14 @@ impl<'a> UiTree<'a> {
         let state = states[i]
         if style_sheets.active(&self, slot, state) {
           let list = match state {
-            StyleState.Hover => &node.hover
-            StyleState.Active => &node.active
-            StyleState.Focus => &node.focus
-            StyleState.FocusVisible => &node.focusVisible
-            _ => &node.base
+            StyleState.Hover => node.hover()
+            StyleState.Active => node.active()
+            StyleState.Focus => node.focus()
+            StyleState.FocusVisible => node.focusVisible()
+            _ => node.base.asSlice()
           }
           let replace = match self.overrideOf(node.id, state) { Option.Some { value } => value.replace _ => false }
-          if node.gridDeclared && !replace { run appendGrid(&mut declarations, list.asSlice()) }
+          if node.gridDeclared && !replace { run appendGrid(&mut declarations, list) }
         }
         i = i + 1
       }
@@ -1382,11 +1810,16 @@ impl<'a> UiTree<'a> {
     let styled = declarations.length() != 0
     if !styled && !node.gridStyled { return () }
     let css = node.css
+    let was = node.gridStyled
     let grid = run grid_css.gridOfWith(declarations.asSlice(), &font_units.context(&self, slot, computed, node.fontKey))
-    run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+    let before = self.layout.revision()
+    run Effect.catchAll(self.layout.installGrid(move grid, NodeId { index: css }), layoutFailed)
     let target = self.nodeMut(slot)
     target.gridStyled = styled
-    self.paintDirty = true
+    // The grid the node already had changes nothing to paint.
+    if was != styled || self.layout.revision() != before {
+      self.paintDirty = true
+    }
   }
 
   pub fn restyle(self: &mut Self, slot: u32) -> () {
@@ -1563,7 +1996,7 @@ impl<'a> UiTree<'a> {
 
   fn idReach(self: &Self, slot: u32, after: &[u8]) -> Extent {
     let before = match self.node(slot).identity() {
-      Option.Some { value } => String.utf8Bytes(String.view(&value.id))
+      Option.Some { value } => String.utf8Bytes(value.id())
       _ => b""
     }
     return self.attributeReach(&[b"id"], &[before, after])
@@ -1657,8 +2090,8 @@ impl<'a> UiTree<'a> {
     let mut custom = false
     if let Option.Some { value } = node.identity() {
       let mut i: usize = 0
-      while i < value.custom.length() {
-        if value.custom.asSlice()[i].state == state { custom = true }
+      while i < value.custom().length {
+        if value.custom()[i].state == state { custom = true }
         i = i + 1
       }
     }
@@ -1722,14 +2155,14 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     out.clear()
     let css = self.node(slot).css
-    let nodes = self.layout.nodes.asSlice()
-    let mut child = nodes[css].firstChild
+    let nodes = &self.layout
+    let mut child = nodes.firstChild(css)
     while child != NO_INDEX {
       let found = self.slotOfCssNode(child)
       if found != NONE {
         run out.append(found)
       }
-      child = nodes[child].nextSibling
+      child = nodes.nextSibling(child)
     }
   }
 
@@ -1743,6 +2176,7 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let before = self.current
+    self.work.batches = self.work.batches + 1
     if self.laidOutCurrent() && !self.stylesDirty && !self.stylesPending {
       run scroll_anchor.select(&mut self)
     }
@@ -1773,27 +2207,11 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     let mut mutations = move batch
-    let mut reversed = List<Mutation>.make()
-    while true {
-      match mutations.pop() {
-        Option<Mutation>.Some { value } => {
-          run reversed.append(move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
-    }
+    let entries = mutations.asMutSlice()
     let mut index: usize = 0
-    while true {
-      match reversed.pop() {
-        Option<Mutation>.Some { value } => {
-          run self.applyOne(index, move value)
-        }
-        Option<Mutation>.None => {
-          break
-        }
-      }
+    while index < entries.length {
+      let value = Intrinsic.replace(entries[index], Mutation.Blur)
+      run self.applyOne(index, move value)
       index = index + 1
     }
   }
@@ -1805,6 +2223,29 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.semanticRevision = self.semanticRevision + 1
+    self.work.mutations = self.work.mutations + 1
+    match &mutation {
+      Mutation.Create { .. } => { self.work.creates = self.work.creates + 1 }
+      Mutation.InsertBefore { .. } => { self.work.inserts = self.work.inserts + 1 }
+      Mutation.SetStyle { declarations, .. } => {
+        self.work.setStyles = self.work.setStyles + 1
+        self.work.styleDeclarations = self.work.styleDeclarations + declarations.length()
+      }
+      Mutation.SetText { value, .. } => {
+        self.work.setTexts = self.work.setTexts + 1
+        self.work.textBytes = self.work.textBytes + String.byteLength(String.view(&value))
+      }
+      Mutation.SetAttribute { attribute, .. } => {
+        self.work.attributes = self.work.attributes + 1
+        match &attribute {
+          Attribute.ClassName { value } => { self.work.attributeBytes = self.work.attributeBytes + String.byteLength(String.view(&value)) }
+          Attribute.Named { name, .. } => { self.work.attributeBytes = self.work.attributeBytes + String.byteLength(String.view(&name)) }
+          _ => {}
+        }
+      }
+      Mutation.SetListeners { .. } => { self.work.listens = self.work.listens + 1 }
+      _ => {}
+    }
     let about = nodeOf(&mutation)
     if self.parked.length() == 0 {
       self.revision = self.revision + 1
@@ -1821,7 +2262,23 @@ impl<'a> UiTree<'a> {
     } else if reachesEveryRoot(&mutation) {
       self.changedEveryRoot()
     }
-    self.applied = true
+    // A scroll moves what is painted and changes none of it: the fragments' hashes and ink
+    // stand, and `setOffset` says the frame scrolled.
+    if !scrollsOnly(&mutation) {
+      self.applied = true
+      // What a mutation changes of the paint is its node's own, a restyle's, which says so
+      // itself, or a layout's, which css-layout reports: the caches are repaired for those.
+      // Any other mutation rebuilds them.
+      if repaintsNode(&mutation) {
+        let slot = if about == NONE { NONE } else { self.slotOf(about) }
+        if slot != NONE {
+          run self.repair.nodes.append(slot)
+          self.repair.pending = true
+        }
+      } else {
+        self.paintCachesStale = true
+      }
+    }
     match move mutation {
       Mutation.SetAnchor { id, target, options } => {
         run anchoring.configure(&mut self, index, id, target, options)
@@ -1898,19 +2355,19 @@ impl<'a> UiTree<'a> {
               run css.set(&mut node.base, &values[i])
             }
             StyleState.Hover => {
-              run css.set(&mut node.hover, &values[i])
+              run css.set(&mut (run node.extrasMut()).hover, &values[i])
             }
             StyleState.Active => {
-              run css.set(&mut node.active, &values[i])
+              run css.set(&mut (run node.extrasMut()).active, &values[i])
             }
             StyleState.Focus => {
-              run css.set(&mut node.focus, &values[i])
+              run css.set(&mut (run node.extrasMut()).focus, &values[i])
             }
             StyleState.FocusVisible => {
-              run css.set(&mut node.focusVisible, &values[i])
+              run css.set(&mut (run node.extrasMut()).focusVisible, &values[i])
             }
             StyleState.Starting => {
-              run css.set(&mut node.starting, &values[i])
+              run css.set(&mut (run node.extrasMut()).starting, &values[i])
             }
           }
           i = i + 1
@@ -1930,26 +2387,26 @@ impl<'a> UiTree<'a> {
             node.base.clear()
           }
           StyleState.Hover => {
-            node.hover.clear()
+            if let Option.Some { value } = node.extrasHeld() { value.hover.clear() }
           }
           StyleState.Active => {
-            node.active.clear()
+            if let Option.Some { value } = node.extrasHeld() { value.active.clear() }
           }
           StyleState.Focus => {
-            node.focus.clear()
+            if let Option.Some { value } = node.extrasHeld() { value.focus.clear() }
           }
           StyleState.FocusVisible => {
-            node.focusVisible.clear()
+            if let Option.Some { value } = node.extrasHeld() { value.focusVisible.clear() }
           }
           StyleState.Starting => {
-            node.starting.clear()
+            if let Option.Some { value } = node.extrasHeld() { value.starting.clear() }
           }
         }
-        node.gridDeclared = grid_css.mentionsGrid(node.base.asSlice()) || grid_css.mentionsGrid(node.hover.asSlice())
-          || grid_css.mentionsGrid(node.active.asSlice()) || grid_css.mentionsGrid(node.focus.asSlice()) || grid_css.mentionsGrid(node.focusVisible.asSlice())
-        node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover.asSlice())
-          || style.requiresContext(node.active.asSlice()) || style.requiresContext(node.focus.asSlice())
-          || style.requiresContext(node.focusVisible.asSlice()) || style.requiresContext(node.starting.asSlice())
+        node.gridDeclared = grid_css.mentionsGrid(node.base.asSlice()) || grid_css.mentionsGrid(node.hover())
+          || grid_css.mentionsGrid(node.active()) || grid_css.mentionsGrid(node.focus()) || grid_css.mentionsGrid(node.focusVisible())
+        node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover())
+          || style.requiresContext(node.active()) || style.requiresContext(node.focus())
+          || style.requiresContext(node.focusVisible()) || style.requiresContext(node.starting())
         self.restyleLocal(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
@@ -2022,7 +2479,11 @@ impl<'a> UiTree<'a> {
             node.label = move value
           }
           Attribute.TestId { value } => {
-            node.testId = move value
+            // An empty id on a node without one changes nothing, and makes no extras.
+            if value.ownedByteLength() != 0 || node.extras.isSome() {
+              let extras = run node.extrasMut()
+              extras.testId = move value
+            }
           }
           Attribute.TabIndex { value } => {
             node.tabIndex = value
@@ -2158,7 +2619,10 @@ impl<'a> UiTree<'a> {
             drop value
           }
           Attribute.Transition { value } => {
-            node.transition = move value
+            if value.ownedByteLength() != 0 || node.extras.isSome() {
+              let extras = run node.extrasMut()
+              extras.transition = move value
+            }
             self.restyle(slot)
           }
           Attribute.LabelledBy { ids } => {
@@ -2241,8 +2705,7 @@ impl<'a> UiTree<'a> {
           }
           Attribute.ElementId { value } => {
             let identity = run node.identityMut()
-            identity.id = move value
-            identity.hasId = true
+            run identity.setId(move value)
           }
         }
         if tracked { change = change.with(self.stateReach(slot, u32.bitXor(statesBefore, self.selectorStates(slot)))) }
@@ -2263,8 +2726,10 @@ impl<'a> UiTree<'a> {
         if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
           node.layoutReported = false
         }
+        let asksLayout = u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 && u32.bitAnd(flags, LISTEN_LAYOUT) != 0
         node.listeners = flags
         self.layoutObserversDirty = true
+        if asksLayout { run self.layoutListeners.append(slot) }
       }
       Mutation.OpenRoot { root, node, options } => {
         let slot = run self.require(index, node)
@@ -2291,6 +2756,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.CloseRoot { root } => {
         run sheet_faces.close(&mut self, root)
+        font_rules.close(&mut self.fontRules, root)
         run self.closeRoot(index, root)
         let at = style_sheets.index(self.styleSheets.asSlice(), root)
         if at != usize.MAX { drop self.styleSheets.remove(at) }
@@ -2362,7 +2828,7 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let css = self.node(slot).css
         let grid = Box<Grid>.into(move value)
-        run Effect.catchAll(grid.install(&mut self.layout, NodeId { index: css }), layoutFailed)
+        run Effect.catchAll(self.layout.installGrid(move grid, NodeId { index: css }), layoutFailed)
         let node = self.nodeMut(slot)
         node.gridStyled = false
         node.gridDeclared = false
@@ -2405,8 +2871,51 @@ impl<'a> UiTree<'a> {
           fail TreeError.WrongKind { index: index, id: id }
         }
         let node = self.nodeMut(slot)
-        node.canvas = move commands
+        if commands.length() != 0 || node.extras.isSome() {
+          let extras = run node.extrasMut()
+          extras.canvas = move commands
+        }
         node.content = node.content + 1
+      }
+      Mutation.SvgInsert { id, element, tag, parent, before } => {
+        let slot = run self.requireSvg(index, id)
+        let at = match before {
+          Option<u32>.Some { value } => value
+          _ => live_svg.NO_ELEMENT
+        }
+        let node = self.nodeMut(slot)
+        let svg = run node.liveSvg()
+        drop run svg.insert(element, String.utf8Bytes(String.view(&tag)), parent, at)
+        node.content = node.content + 1
+      }
+      Mutation.SvgRemove { id, element } => {
+        let slot = run self.requireSvg(index, id)
+        let node = self.nodeMut(slot)
+        if element == 0 {
+          node.svg = Option<Box<LiveSvg>>.None
+        } else if let Option<Box<LiveSvg>>.Some { value } = &mut node.svg {
+          drop value.getMut()[0].remove(element)
+        }
+        node.content = node.content + 1
+        run self.updateNatural(slot)
+      }
+      Mutation.SvgAttribute { id, element, name, value } => {
+        let slot = run self.requireSvg(index, id)
+        let node = self.nodeMut(slot)
+        let svg = run node.liveSvg()
+        let sized = element == 0 && (String.view(&name) == "width" || String.view(&name) == "height")
+        match &value {
+          Option<String>.Some { value: text } => {
+            drop run svg.set(element, String.utf8Bytes(String.view(&name)), String.utf8Bytes(String.view(&text)), true)
+          }
+          _ => {
+            drop run svg.set(element, String.utf8Bytes(String.view(&name)), b"", false)
+          }
+        }
+        node.content = node.content + 1
+        if sized {
+          run self.updateNatural(slot)
+        }
       }
       Mutation.DefineFontFamily { family, names } => {
         run self.families.define(family, String.view(&names))
@@ -2556,6 +3065,16 @@ impl<'a> UiTree<'a> {
     return slot
   }
 
+  /// The slot of icon node `id`, which a live svg mutation addresses.
+  effect fn requireSvg(self: &Self, index: usize, id: u32) -> u32
+    ! TreeError {
+    let slot = run self.require(index, id)
+    if self.node(slot).kind != NodeKind.Icon {
+      fail TreeError.WrongKind { index: index, id: id }
+    }
+    return slot
+  }
+
   effect fn require(self: &Self, index: usize, id: u32) -> u32
     ! TreeError {
     let slot = self.slotOf(id)
@@ -2579,7 +3098,8 @@ impl<'a> UiTree<'a> {
     let mut css: usize = 0
     let mut inner: usize = NO_INDEX
     if kind == NodeKind.Text {
-      let made = run self.layout.createText(String.make())
+      // Its text is the node's own (`Node.text`), read through `slotOfCss`.
+      let made = run self.layout.createBorrowedText()
       css = made.index
     } else {
       let made = run self.layout.create(CssStyle.make())
@@ -2597,8 +3117,7 @@ impl<'a> UiTree<'a> {
         )
       }
     }
-    let mut computed = Computed.inheriting(TextStyle.initial())
-    computed.layout.display = defaultDisplay(kind)
+    let styled = run self.freshStyle(kind)
     let mut editing = Option<Box<EditState>>.None
     if kind == NodeKind.Input {
       editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
@@ -2611,12 +3130,9 @@ impl<'a> UiTree<'a> {
       inner: inner,
       parent: NONE,
       base: List<Declaration>.make(),
-      hover: List<Declaration>.make(),
-      active: List<Declaration>.make(),
-      focus: List<Declaration>.make(),
-      focusVisible: List<Declaration>.make(),
-      starting: List<Declaration>.make(),
-      computed: computed,
+      extras: Option<Box<NodeExtras>>.None,
+      styled: move styled,
+      moving: Option<Box<Computed>>.None,
       fontKey: 0,
       paintHash: 0,
       text: String.make(),
@@ -2626,7 +3142,6 @@ impl<'a> UiTree<'a> {
       valueMax: 0.0,
       valueNow: 0.0,
       label: String.make(),
-      testId: String.make(),
       tabIndex: if kind == NodeKind.Input {
         0
       } else {
@@ -2655,14 +3170,14 @@ impl<'a> UiTree<'a> {
       generatedSuppressed: false,
       subtreeDirty: false,
       rendered: false,
-      transition: String.make(),
       scrollX: 0.0,
       scrollY: 0.0,
       resource: NONE,
-      canvas: List<CanvasCommand>.make(),
+      svg: Option<Box<LiveSvg>>.None,
       content: 1,
       editing: move editing,
       effects: Option<Box<Effects>>.None,
+      offsetPlaced: Option<transform.Placement>.None,
       semantics: Option<Box<Semantics>>.None,
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -2674,9 +3189,7 @@ impl<'a> UiTree<'a> {
     }
     let mut slot: u32 = 0
     if self.free.length() != 0 {
-      let last = self.free.length() - 1
-      slot = self.free.get(last)
-      self.free.truncate(last)
+      slot = takeLowest(&mut self.free)
       let nodes = self.nodes.asMutSlice()
       nodes[u32.toUsize(slot)] = move node
     } else {
@@ -2832,7 +3345,7 @@ impl<'a> UiTree<'a> {
     while v < doomed.length() {
       let gone = doomed.get(v)
       if self.node(gone).isGenerated() {
-        let computed = self.node(gone).computed
+        let computed = self.node(gone).computed().*
         drop run animation.update(&mut self, gone, false, &computed)
         run motion.cancelAll(&mut self, gone)
       }
@@ -2867,21 +3380,23 @@ impl<'a> UiTree<'a> {
       let gone = doomed.get(i)
       let node = self.nodeMut(gone)
       node.live = false
-      node.base.clear()
-      node.hover.clear()
-      node.active.clear()
-      node.focus.clear()
-      node.focusVisible.clear()
-      node.starting.clear()
-      node.canvas.clear()
-      node.text.clear()
-      node.label.clear()
-      node.testId.clear()
       let id = node.id
       let nodeCss = node.css
       let inner = node.inner
       let trap = node.focusTrap
       let generated = node.isGenerated()
+      // A slot waits for its next node holding nothing: what this one owned goes now, not
+      // when (or if) the slot is taken again.
+      node.base.clearAndFree()
+      node.extras = Option<Box<NodeExtras>>.None
+      node.text.clearAndFree()
+      node.label.clearAndFree()
+      node.moving = Option<Box<Computed>>.None
+      node.editing = Option<Box<EditState>>.None
+      node.effects = Option<Box<Effects>>.None
+      node.semantics = Option<Box<Semantics>>.None
+      node.resolvedSheet = Option<Frozen<Resolved>>.None
+      node.selectorIdentity = Option<Box<NodeIdentity>>.None
       if node.inert {
         self.inerts = self.inerts - 1
       }
@@ -2898,7 +3413,118 @@ impl<'a> UiTree<'a> {
         self.slotOfCss.set(inner, NONE)
       }
       run self.free.append(gone)
+      let added = self.free.length() - 1
+      siftUp(&mut self.free, added)
       i = i + 1
+    }
+  }
+
+  /// Gives back what laying out and painting a much larger tree left, once the tree holds
+  /// under a quarter of the nodes it held: the layout's output and caches, the shaped text
+  /// and what each frame fills for its fragments. The frame then lays the smaller tree out
+  /// afresh, as its first frame did. With other roots open, whose layouts hold shaped text
+  /// too, the shaped text stays.
+  fn releaseSlack(self: &mut Self) -> () {
+    let live = self.liveNodes()
+    if live >= self.heldNodes {
+      self.heldNodes = live
+      return
+    }
+    if self.heldNodes < RELEASE_NODES || live * 4 >= self.heldNodes {
+      return
+    }
+    self.heldNodes = live
+    self.output = LayoutTree.make()
+    self.laidOutRevision = usize.MAX
+    if self.parked.length() == 0 {
+      self.provider.text.release()
+    }
+    self.paintOrder.clearAndFree()
+    self.fragmentHashes.clearAndFree()
+    self.fragmentInk.clearAndFree()
+    self.fragmentScrollers.clearAndFree()
+    self.textInk.clearAndFree()
+    self.fragmentOf.clearAndFree()
+    self.nextSourceFragment.clearAndFree()
+    self.paintIndexOf.clearAndFree()
+    self.fragmentStacking = Stacking.make()
+    self.paintCachesStale = true
+    self.repair.reset()
+    self.facesDirty = true
+  }
+
+  /// How many nodes the tree holds.
+  pub fn liveNodes(self: &Self) -> usize {
+    return self.nodes.length() - self.free.length()
+  }
+
+  /// Gives back the end of the node table when most of the table is free slots there, as after
+  /// a large subtree is destroyed. A slot something outside the table still names (a capture, a
+  /// focus) stays.
+  effect fn trimNodes(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let length = self.nodes.length()
+    if length < TRIM_NODES || self.free.length() * 2 < length {
+      return
+    }
+    let mut keep: usize = length
+    while keep > 0 && !self.node(usize.toU32(keep - 1)).live {
+      keep = keep - 1
+    }
+    keep = keepSlot(keep, self.root)
+    keep = keepSlot(keep, self.focused)
+    keep = keepSlot(keep, self.capture)
+    keep = keepSlot(keep, self.captureTo)
+    keep = keepSlot(keep, self.pendingTarget)
+    keep = keepSlot(keep, self.thumbSlot)
+    let parked = self.parked.asSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      keep = keepSlot(keep, parked[p].root)
+      keep = keepSlot(keep, parked[p].focused)
+      keep = keepSlot(keep, parked[p].capture)
+      keep = keepSlot(keep, parked[p].captureTo)
+      keep = keepSlot(keep, parked[p].pendingTarget)
+      keep = keepSlot(keep, parked[p].thumbSlot)
+      p = p + 1
+    }
+    drop parked
+    if keep * 2 > length {
+      return
+    }
+    while self.nodes.length() > keep {
+      drop self.nodes.pop()
+    }
+    run self.nodes.shrinkToFit()
+    // What each frame fills for the nodes it paints was sized by the larger tree.
+    run self.paintOrder.shrinkToFit()
+    run self.fragmentHashes.shrinkToFit()
+    run self.fragmentInk.shrinkToFit()
+    run self.fragmentScrollers.shrinkToFit()
+    run self.textInk.shrinkToFit()
+    run self.fragmentOf.shrinkToFit()
+    run self.nextSourceFragment.shrinkToFit()
+    run self.paintIndexOf.shrinkToFit()
+    run self.events.shrinkToFit()
+    run self.styleChanges.shrinkToFit()
+    let mut kept: usize = 0
+    let mut i: usize = 0
+    while i < self.free.length() {
+      let slot = self.free.get(i)
+      if u32.toUsize(slot) < keep {
+        self.free.set(kept, slot)
+        kept = kept + 1
+      }
+      i = i + 1
+    }
+    self.free.truncate(kept)
+    run self.free.shrinkToFit()
+    // Fewer slots, in the order they were: put the lowest first again.
+    let mut at = kept / 2
+    while at > 0 {
+      at = at - 1
+      siftDown(&mut self.free, at)
     }
   }
 
@@ -3059,6 +3685,7 @@ impl<'a> UiTree<'a> {
     if root == self.current {
       self.stylesDirty = true
       self.applied = true
+      self.paintCachesStale = true
       return ()
     }
     let at = self.parkedIndex(root)
@@ -3140,6 +3767,9 @@ impl<'a> UiTree<'a> {
 
   /// Moves the per-root state out of the tree, leaving that of a root never framed.
   fn park(self: &mut Self) -> RootState {
+    // What was pending for the paint caches is not kept: they are rebuilt.
+    if self.repair.pending { self.paintCachesStale = true }
+    self.repair.reset()
     return RootState {
       id: self.current,
       options: Intrinsic.replace(self.currentOptions, RootOptions.default()),
@@ -3224,7 +3854,8 @@ impl<'a> UiTree<'a> {
     self.stylesDirty = s.stylesDirty
     self.applied = s.applied
     self.paintDirty = s.paintDirty
-    self.paintCachesStale = s.paintCachesStale
+    self.paintCachesStale = s.paintCachesStale || s.applied
+    self.repair.reset()
     self.layoutObserversDirty = s.layoutObserversDirty
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
@@ -3264,6 +3895,7 @@ impl<'a> UiTree<'a> {
     if s.touched {
       self.stylesDirty = true
       self.applied = true
+      self.paintCachesStale = true
       self.layoutObserversDirty = true
       self.laidOutRevision = usize.MAX
     }
@@ -3640,11 +4272,12 @@ impl<'a> UiTree<'a> {
     } else {
       fail TreeError.WrongKind { index: index, id: self.node(slot).id }
     }
-    let copy = run String.copy(String.view(&value))
-    run Effect.catchAll(self.layout.setText(NodeId { index: target }, move copy), layoutFailed)
+    let wasBlank = Engine.blank(String.view(&self.node(slot).text))
+    let blank = Engine.blank(String.view(&value))
     let node = self.nodeMut(slot)
     node.text = move value
     node.content = node.content + 1
+    run Effect.catchAll(self.layout.borrowedTextChanged(NodeId { index: target }, wasBlank, blank), layoutFailed)
     if (self.letterUsed || self.letterRulesUsed()) && !self.node(slot).isGenerated() { self.restyleLetterOrigins(slot) }
   }
 
@@ -4029,6 +4662,27 @@ impl<'a> UiTree<'a> {
     return edit.nextBlink(self)
   }
 
+  /// When a `font-display` block or swap period ends, in frame time, or negative: text
+  /// waiting for its face shows the fallback then, so the host draws a frame.
+  pub fn fontWake(self: &Self) -> f64 {
+    return self.fontBlockEnd
+  }
+
+  /// Whether a block or swap period ended by frame time `time` and no frame saw it yet.
+  pub fn fontWakeDue(self: &Self, time: f64) -> bool {
+    return self.fontBlockEnd >= 0.0 && time >= self.fontBlockEnd
+  }
+
+  /// When the tree next wants a frame without new input, in frame time: a caret blink, or the
+  /// end of a `font-display` block period. Negative when it does not.
+  pub fn nextWake(self: &Self) -> f64 {
+    let blink = edit.nextBlink(self)
+    if blink < 0.0 || self.fontBlockEnd >= 0.0 && self.fontBlockEnd < blink {
+      return self.fontBlockEnd
+    }
+    return blink
+  }
+
   /// The selection of input `id` as (anchor, focus) UTF-8 byte offsets into its value, or
   /// (0, 0) when it is not an input.
   pub fn selection(self: &Self, id: u32) -> Vector2<usize> {
@@ -4153,6 +4807,7 @@ impl<'a> UiTree<'a> {
       while at < self.nodes.length() {
         let uses = match self.nodes.asSlice()[at].paintEffects() {
           Option<&Effects>.Some { value } => value.backgrounds.hasUrl() || value.masks.hasUrl()
+            || paint_css.usesUrl(&value.borderImage.image) || paint_css.usesUrl(&value.maskBorder.image)
           Option<&Effects>.None => false
         }
         if uses && self.nodes.asSlice()[at].live {
@@ -4189,16 +4844,23 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     let kind = self.node(slot).kind
     let resource = self.node(slot).resource
-    let fontSize = self.node(slot).computed.text.size
+    let fontSize = self.node(slot).computed().text.size
     // Natural sizes scale with `zoom`, as replaced elements do in browsers.
-    let zoom = self.node(slot).computed.text.zoom
+    let zoom = self.node(slot).computed().text.zoom
     let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
     if kind != NodeKind.Image && kind != NodeKind.Icon {
       return ()
     }
     let shown = self.resources.get(resource)
-    if let Option<Resource>.Some { value } = shown {
+    let liveSize = match &self.node(slot).svg {
+      Option<Box<LiveSvg>>.Some { value } => [value.get()[0].width, value.get()[0].height]
+      _ => [0.0, 0.0]
+    }
+    if liveSize[0] > 0.0 && liveSize[1] > 0.0 {
+      natural.size = OptionalSize.definite(f64.toF32(liveSize[0]), f64.toF32(liveSize[1]))
+      natural.aspectRatio = f64.toF32(liveSize[0] / liveSize[1])
+    } else if let Option<Resource>.Some { value } = shown {
       match value {
         Resource.Image { width, height, .. } => {
           natural.size = OptionalSize.definite(u32.toF32(width) * zoom, u32.toF32(height) * zoom)
@@ -4229,7 +4891,7 @@ impl<'a> UiTree<'a> {
       || !sameNatural(self.provider.naturals.get(key), natural)
     if changed {
       run self.provider.setNatural(key, natural)
-      run Effect.catchAll(
+      run Effect.catch<InvalidNode>(
         self.layout.setNaturalMeasurement(NodeId { index: css }, key),
         ignoreInvalid,
       )
@@ -4243,7 +4905,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let italic = text.style == FontStyle.Italic
-    let treatment = Treatment {
+    let mut treatment = Treatment {
       letterSpacing: text.letterSpacing,
       wordSpacing: text.wordSpacing,
       transform: text.textTransform,
@@ -4253,6 +4915,8 @@ impl<'a> UiTree<'a> {
       hyphens: text.hyphens,
       features: text.features,
     }
+    // Palette and smoothing are paint's: keys do not differ by them.
+    treatment.features.extras = text_fonts.withExtrasField(text_fonts.withExtrasField(text.features.extras, text_fonts.EXTRAS_PALETTE, 0), text_fonts.EXTRAS_SMOOTH, 0)
     let entries = self.fontKeys.asSlice()
     let mut i: usize = 0
     while i < entries.length {
@@ -4266,6 +4930,16 @@ impl<'a> UiTree<'a> {
     }
     let mut families = List<Family>.make()
     run self.families.copyOf(text.family, &mut families)
+    let mut named = List<Bytes>.make()
+    if text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES) != 0 {
+      let mut f: usize = 0
+      while f < families.length() {
+        if let Family.Named { name } = &families.asSlice()[f] {
+          run named.append(run Bytes.copy(Bytes.asSlice(&name)))
+        }
+        f = f + 1
+      }
+    }
     run sheet_faces.mapFamilies(&self.sheetFaces,self.current,&mut families)
     let mut request = FontStyleRequest.make(move families, text.size)
     request.request = Request {
@@ -4279,6 +4953,15 @@ impl<'a> UiTree<'a> {
     }
     request.treatment = treatment
     request.variations = self.variations.axes(text.features.variations)
+    request.sizeAdjust = self.fontRules.adjust(text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_SIZE_ADJUST))
+    let alternates = text_fonts.extrasField(text.features.extras, text_fonts.EXTRAS_ALTERNATES)
+    if alternates != 0 {
+      let mut pairs = List<u32>.make()
+      run self.fontRules.alternates(self.current, alternates, named.asSlice(), &mut pairs)
+      let defined = if pairs.length() == 0 { Option<u32>.None } else { run self.provider.text.fonts.defineFeatures(pairs.asSlice()) }
+      let resolved = match defined { Option.Some { value } => value _ => 0 }
+      request.treatment.features.extras = text_fonts.withExtrasField(request.treatment.features.extras, text_fonts.EXTRAS_ALTERNATES, resolved)
+    }
     let key = run self.provider.text.addStyle(move request)
     run self.fontKeys.append(
       FontKeyEntry {
@@ -4293,6 +4976,22 @@ impl<'a> UiTree<'a> {
       },
     )
     return key
+  }
+
+  /// The root's `@font-feature-values` changed: its styles get new font keys.
+  fn fontRulesChanged(self: &mut Self) -> () {
+    let entries = self.fontKeys.asMutSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      if entries[i].root == self.current { entries[i].family = NONE }
+      i = i + 1
+    }
+    let parked = self.parked.asMutSlice()
+    let mut p: usize = 0
+    while p < parked.length {
+      parked[p].touched = true
+      p = p + 1
+    }
   }
 
   // Font faces added at run time.
@@ -4431,6 +5130,7 @@ impl<'a> UiTree<'a> {
   pub fn hostFontFaceFailed(self: &Self, id: u32) -> bool {
     let index = self.fontFaceIndex(id)
     return index != usize.MAX && self.provider.text.fonts.set.state(index) == FaceState.Failed
+      && !self.provider.text.fonts.set.expired(index)
   }
 
   pub effect fn setHostFontFaceActive(self: &mut Self, id: u32, active: bool, order: usize) ! OutOfMemoryError ? &mut Allocator {
@@ -4529,7 +5229,7 @@ impl<'a> UiTree<'a> {
     let mut slot: usize = 0
     while slot < count {
       let node = &self.nodes.asSlice()[slot]
-      if node.live && (node.computed.usesViewport || placeholder.usesViewport(node) || scrollbar_parts.usesViewport(node)) {
+      if node.live && (node.computed().usesViewport || placeholder.usesViewport(node) || scrollbar_parts.usesViewport(node)) {
         self.restyle(usize.toU32(slot))
       }
       slot = slot + 1
@@ -4806,11 +5506,14 @@ impl<'a> UiTree<'a> {
       node.resolvedSheet = Option<Frozen<Resolved>>.None
       node.styleClass = 0
       node.styleTwin = NONE
+      self.work.sheetSkips = self.work.sheetSkips + 1
       run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
       return ()
     }
     let reads = self.styleSheets.asSlice()[at].reads
-    if !self.styleSheets.asSlice()[at].hasStarting {
+    let sheets = &self.styleSheets.asSlice()[at]
+    let sheetStarting = sheets.hasStarting && (self.overrides.length() != 0 || sheets.startingSubjects.mayMatch(self.node(slot)))
+    if !sheetStarting {
       let twin = style_share.twin(&self, slot, reads, self.styleSheets.asSlice()[at].sharing)
       if twin != NONE {
         let shared = match &self.node(twin).resolvedSheet {
@@ -4825,12 +5528,14 @@ impl<'a> UiTree<'a> {
         node.styleClass = class
         node.styleTwin = twin
         node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, 7), watch)
+        self.work.sheetTwins = self.work.sheetTwins + 1
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
         return ()
       }
     }
     let class = self.styleClasses + 1
     self.styleClasses = class
+    self.work.sheetMatches = self.work.sheetMatches + 1
     let fresh = self.nodeMut(slot)
     fresh.styleClass = class
     fresh.styleTwin = NONE
@@ -4838,7 +5543,7 @@ impl<'a> UiTree<'a> {
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
-    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, entries[at].hasStarting, &self, slot, &mut stops))
+    let resolved = run Effect.result(style_sheets.resolve(&mut entries[at].sheets, &mut entries[at].cache, entries[at].systemColors, sheetStarting, &self, slot, &mut stops))
     self.easingStops = move stops
     self.styleSheets = move roots
     match move resolved {
@@ -4848,6 +5553,7 @@ impl<'a> UiTree<'a> {
         let key = style_share.modelKey(&self, slot)
         if key != 0 { drop run self.styleModels.insert(key, slot) }
         if let Option<Frozen<Resolved>>.Some { value: shared } = move value.hit {
+          self.work.sheetCacheHits = self.work.sheetCacheHits + 1
           let node = self.nodeMut(slot)
           node.resolvedSheet = Option<Frozen<Resolved>>.some(move shared)
           return ()
@@ -4901,10 +5607,10 @@ impl<'a> UiTree<'a> {
     let node = self.node(slot)
     let lender = node.styleTwin
     if lender == NONE || node.kind != NodeKind.Box || node.isGenerated() || self.focused == slot || self.focused == lender { return NONE }
-    if node.transition.ownedByteLength() != 0 || node.starting.length() != 0 || node.styleNeedsContext { return NONE }
+    if node.hasTransition() || node.starting().length != 0 || node.styleNeedsContext { return NONE }
     let other = self.node(lender)
     if !other.live || other.styleDirty || other.computedStamp == 0 || other.styleClass != node.styleClass { return NONE }
-    if other.kind != NodeKind.Box || other.isGenerated() || other.transition.ownedByteLength() != 0 || other.styleNeedsContext { return NONE }
+    if other.kind != NodeKind.Box || other.isGenerated() || other.hasTransition() || other.styleNeedsContext { return NONE }
     if other.hovered != node.hovered || other.pressed != node.pressed { return NONE }
     let same = match &node.resolvedSheet {
       Option<Frozen<Resolved>>.Some { value: mine } => match &other.resolvedSheet {
@@ -4914,7 +5620,7 @@ impl<'a> UiTree<'a> {
       _ => false
     }
     if !same { return NONE }
-    let values = &other.computed
+    let values = &other.computed().*
     if values.viewportWidth != self.cssWidth() || values.viewportHeight != self.cssHeight() || values.usesContainer { return NONE }
     let none = usize.MAX
     if values.transition.properties.start != none || values.transition.durations.start != none || values.transition.delays.start != none
@@ -4969,8 +5675,52 @@ impl<'a> UiTree<'a> {
     self.tickPlaces.set(at, usize.toU32(self.tickBases.length()))
   }
 
+  /// The style a node of `kind` has until its first resolve.
+  effect fn freshStyle(self: &mut Self, kind: NodeKind) -> Frozen<Computed> ! OutOfMemoryError ? &mut Allocator {
+    let known = self.freshStyles.asSlice()
+    let mut i: usize = 0
+    while i < known.length {
+      if known[i].kind == kind { return known[i].styled.clone() }
+      i = i + 1
+    }
+    let mut computed = Computed.inheriting(TextStyle.initial())
+    computed.layout.display = defaultDisplay(kind)
+    let styled = run self.stylePool.share(&computed)
+    run self.freshStyles.append(FreshStyle { kind: kind, styled: styled.clone() })
+    return move styled
+  }
+
+  /// Gives the node at `slot` the style `value`: the handle it has when that already holds
+  /// these values, else the pool's handle to them.
+  pub effect fn setComputed(self: &mut Self, slot: u32, value: &Computed) -> () ! OutOfMemoryError ? &mut Allocator {
+    let node = self.node(slot)
+    if node.moving.isNone() && style_pool.same(node.styled.get(), value) { return () }
+    let shared = run self.stylePool.share(value)
+    self.work.styleShares = self.work.styleShares + 1
+    let target = self.nodeMut(slot)
+    target.styled = move shared
+    target.moving = Option<Box<Computed>>.None
+  }
+
+  /// Gives the node at `slot` the style `value` of a frame of the clock. An animation or a
+  /// transition gives a node a style no other has and replaces it next frame: through the
+  /// pool each frame would key it, hash it and allocate it. The node holds it alone instead
+  /// and the next frame writes over it; its next full restyle shares again (`setComputed`).
+  effect fn setMovingComputed(self: &mut Self, slot: u32, value: &Computed) -> () ! OutOfMemoryError ? &mut Allocator {
+    let target = self.nodeMut(slot)
+    match &mut target.moving {
+      Option<Box<Computed>>.Some { value: held } => {
+        let place = held.getMut()
+        place[0] = value.*
+      }
+      Option<Box<Computed>>.None => {
+        target.moving = Option<Box<Computed>>.Some { value: run Box<Computed>.make(value.*) }
+      }
+    }
+  }
+
   fn valuesToStartFrom(self: &Self, lender: u32, inherited: TextStyle) -> Computed {
-    if lender != NONE { return self.node(lender).computed }
+    if lender != NONE { return self.node(lender).computed().* }
     return Computed.inViewport(inherited, self.cssWidth(), self.cssHeight())
   }
 
@@ -5006,10 +5756,10 @@ impl<'a> UiTree<'a> {
           let parentCss = self.node(origin).css
           let boxCss = self.node(slot).css
           let textCss = self.node(child).css
-          let mut first = self.layout.nodes.asSlice()[parentCss].firstChild
+          let mut first = self.layout.firstChild(parentCss)
           // ::before follows the ::marker box, which stays first.
           if let Option.Some { value } = self.node(origin).identity() {
-            if value.marker != NONE && first == self.node(value.marker).css { first = self.layout.nodes.asSlice()[first].nextSibling }
+            if value.marker != NONE && first == self.node(value.marker).css { first = self.layout.nextSibling(first) }
           }
           let before = if target == PseudoTarget.Before && first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
           run Effect.catchAll(self.layout.insertBefore(NodeId { index: parentCss }, NodeId { index: boxCss }, before), layoutFailed)
@@ -5024,7 +5774,7 @@ impl<'a> UiTree<'a> {
         }
         let active = self.nodeMut(slot)
         active.generatedSuppressed = false
-        let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+        let child = self.slotOfCssNode(self.layout.firstChild(self.node(slot).css))
         if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
         if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
       } else if old != NONE && style_change.tracks(&self, origin) {
@@ -5049,7 +5799,7 @@ impl<'a> UiTree<'a> {
     let node = self.node(origin)
     if node.kind != NodeKind.Box || node.isGenerated() { return () }
     let old = match node.identity() { Option.Some { value } => value.marker _ => NONE }
-    let list = node.computed.list
+    let list = node.computed().list
     if !list.item() && old == NONE { return () }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     let styled = list.item() && at != usize.MAX && self.styleSheets.asSlice()[at].hasMarker
@@ -5078,7 +5828,7 @@ impl<'a> UiTree<'a> {
       slot = run self.createNode(0, id, NodeKind.Box, origin, PseudoTarget.Marker)
       let child = run self.createNode(0, id, NodeKind.Text, origin, PseudoTarget.Marker)
       let parentCss = self.node(origin).css
-      let first = self.layout.nodes.asSlice()[parentCss].firstChild
+      let first = self.layout.firstChild(parentCss)
       let before = if first != NO_INDEX { Option<NodeId>.some(NodeId { index: first }) } else { Option<NodeId>.None }
       let boxCss = self.node(slot).css
       let textCss = self.node(child).css
@@ -5117,7 +5867,7 @@ impl<'a> UiTree<'a> {
     let old = match node.identity() { Option.Some { value } => value.letterBox _ => NONE }
     let ruled = match node.identity() { Option.Some { value } => value.letterRules _ => false }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter && node.rendered && first_letter.blockContainer(&node.computed)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter && node.rendered && first_letter.blockContainer(&node.computed().*)
     if !enabled && old == NONE && !ruled { return () }
     let mut prepared = Option<Resolved>.None
     let mut wanted = false
@@ -5136,7 +5886,7 @@ impl<'a> UiTree<'a> {
     let mut letter = first_letter.Letter { start: 0, end: 0 }
     if target != NONE {
       let holder = self.node(target).parent
-      let collapse = if holder == NONE { WhiteSpaceCollapse.Collapse } else { self.node(holder).computed.text.whiteSpaceCollapse }
+      let collapse = if holder == NONE { WhiteSpaceCollapse.Collapse } else { self.node(holder).computed().text.whiteSpaceCollapse }
       letter = first_letter.letterOf(String.utf8Bytes(String.view(&self.node(target).text)), collapse != WhiteSpaceCollapse.Preserve && collapse != WhiteSpaceCollapse.BreakSpaces && collapse != WhiteSpaceCollapse.PreserveSpaces)
     }
     // An inner block's own ::first-letter takes the letter its ancestors would.
@@ -5185,7 +5935,7 @@ impl<'a> UiTree<'a> {
     let piece = run String.copy(String.slice(full, letter.start, letter.end - letter.start))
     run self.fillGenerated(slot, move piece)
     let targetCss = self.node(target).css
-    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end), layoutFailed)
+    run Effect.catchAll(self.layout.setTextStart(NodeId { index: targetCss }, letter.end, String.view(&self.nodes.asSlice()[u32.toUsize(target)].text)), layoutFailed)
     if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
   }
 
@@ -5197,7 +5947,7 @@ impl<'a> UiTree<'a> {
     if !first || origin == NONE { return () }
     let letter = match self.node(slot).sheetStyle() { Option.Some { value } => first_letter.initialLetter(value.declarations.asSlice()) _ => first_letter.InitialLetter { size: 0.0, sink: 0 } }
     if letter.size < 1.0 { return () }
-    let paragraph = self.faceOf(self.node(origin).computed.text, self.node(origin).fontKey)
+    let paragraph = self.faceOf(self.node(origin).computed().text, self.node(origin).fontKey)
     let key = run self.fontKeyOf(computed.text)
     let own = self.faceOf(computed.text, key)
     first_letter.dropCap(&mut computed.*, letter, paragraph, own)
@@ -5227,7 +5977,7 @@ impl<'a> UiTree<'a> {
     if node.kind != NodeKind.Box || node.isGenerated() { return () }
     let old = match node.identity() { Option.Some { value } => value.lineBox _ => NONE }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
-    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLine && node.rendered && first_letter.blockContainer(&node.computed)
+    let enabled = at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLine && node.rendered && first_letter.blockContainer(&node.computed().*)
     if !enabled && old == NONE { return () }
     let mut prepared = Option<Resolved>.None
     if enabled {
@@ -5287,7 +6037,8 @@ impl<'a> UiTree<'a> {
     return false
   }
 
-  /// The first line box in the first fragment of css node `css`, through in-flow blocks.
+  /// The first line box in the first fragment of css node `css`, through in-flow blocks: its
+/// fragment, or what `PlacedText.line` names it by.
   fn firstLineOf(self: &Self, css: usize) -> usize {
     if css >= self.fragmentOf.length() { return NO_INDEX }
     let top = self.fragmentOf.get(css)
@@ -5296,10 +6047,15 @@ impl<'a> UiTree<'a> {
     let mut at = values[top].firstChild
     while at != NO_INDEX {
       if values[at].kind == FragmentKind.Line { return at }
+      if values[at].kind == FragmentKind.Text && values[at].textData != NO_INDEX {
+        // A line of text alone has no fragment: its runs name it.
+        let mut runs = self.output.fragments.textRuns(at)
+        if runs.next() { return runs.current.line }
+      }
       let mut descend = values[at].kind == FragmentKind.Box
       let slot = if values[at].source == NO_INDEX { NONE } else { self.slotOfCssNode(values[at].source) }
       if descend && slot != NONE {
-        let layout = &self.node(slot).computed.layout
+        let layout = &self.node(slot).computed().layout
         descend = layout.float == Float.None && layout.position != Position.Absolute && layout.position != Position.Fixed
           && layout.display.insideIs(DisplayInside.Flow)
       }
@@ -5323,7 +6079,7 @@ impl<'a> UiTree<'a> {
   /// atomic inline or other content comes first.
   fn letterTarget(self: &Self, origin: u32) -> u32 {
     let top = self.node(origin).css
-    let mut at = self.layout.nodes.asSlice()[top].firstChild
+    let mut at = self.layout.firstChild(top)
     while at != NO_INDEX {
       let slot = self.slotOfCssNode(at)
       let mut descend = false
@@ -5335,7 +6091,7 @@ impl<'a> UiTree<'a> {
           return NONE
         } else {
           let target = match node.identity() { Option.Some { value } => value.generatedTarget _ => PseudoTarget.None }
-          let layout = &node.computed.layout
+          let layout = &node.computed().layout
           if target == PseudoTarget.Marker || target == PseudoTarget.FirstLetter || layout.display.isNone() {
           } else if layout.float != Float.None || layout.position == Position.Absolute || layout.position == Position.Fixed {
           } else if layout.display.isContents() || layout.display.insideIs(DisplayInside.Flow) {
@@ -5345,14 +6101,14 @@ impl<'a> UiTree<'a> {
           }
         }
       }
-      let links = self.layout.nodes.asSlice()
-      if descend && links[at].firstChild != NO_INDEX {
-        at = links[at].firstChild
+      let links = &self.layout
+      if descend && links.firstChild(at) != NO_INDEX {
+        at = links.firstChild(at)
         continue
       }
-      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      while at != top && links.nextSibling(at) == NO_INDEX { at = links.parent(at) }
       if at == top { break }
-      at = links[at].nextSibling
+      at = links.nextSibling(at)
     }
     return NONE
   }
@@ -5373,7 +6129,7 @@ impl<'a> UiTree<'a> {
         let textIdentity = run textNode.identityMut()
         textIdentity.letterBox = NONE
         let textCss = self.node(text).css
-        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0), layoutFailed)
+        run Effect.catchAll(self.layout.setTextStart(NodeId { index: textCss }, 0, String.view(&self.nodes.asSlice()[u32.toUsize(text)].text)), layoutFailed)
       }
     }
     run self.destroy(0, box)
@@ -5408,7 +6164,7 @@ impl<'a> UiTree<'a> {
   /// Sets the text of generated box `slot` to `text`, when it differs.
   pub effect fn fillGenerated(self: &mut Self, slot: u32, text: String) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
-    let child = self.slotOfCssNode(self.layout.nodes.asSlice()[self.node(slot).css].firstChild)
+    let child = self.slotOfCssNode(self.layout.firstChild(self.node(slot).css))
     if child == NONE || self.node(child).kind != NodeKind.Text { return () }
     if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
   }
@@ -5416,6 +6172,7 @@ impl<'a> UiTree<'a> {
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    self.work.styleCalls = self.work.styleCalls + 1
     if self.cssWidth() != self.unitsWidth || self.cssHeight() != self.unitsHeight {
       self.unitsWidth = self.cssWidth()
       self.unitsHeight = self.cssHeight()
@@ -5431,6 +6188,8 @@ impl<'a> UiTree<'a> {
       environment.initial.viewportWidth = f32.toF64(cssWidth)
       environment.initial.viewportHeight = f32.toF64(cssHeight)
       environment.resolutionDppx = f32.toF64(self.input.scale * pageZoom)
+      self.work.conditionsEvaluated = self.work.conditionsEvaluated + roots[conditionIndex].sheets.censusConditions()
+      self.work.conditionRulesWalked = self.work.conditionRulesWalked + roots[conditionIndex].sheets.censusConditionRules()
       let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
       roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
       match move updated {
@@ -5458,7 +6217,11 @@ impl<'a> UiTree<'a> {
     if !self.stylesDirty && !self.stylesPending {
       return ()
     }
-    if self.stylesDirty { run sheet_faces.sync(&mut self) }
+    self.work.stylePasses = self.work.stylePasses + 1
+    if self.stylesDirty {
+      run sheet_faces.sync(&mut self)
+      if run font_rules.sync(&mut self) { self.fontRulesChanged() }
+    }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
       let roots = self.styleSheets.asMutSlice()
@@ -5470,6 +6233,9 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].states = style_invalidation.states(&roots[sheetIndex].sheets)
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
+        roots[sheetIndex].startingSubjects = if roots[sheetIndex].hasStarting {
+          run StartingSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
+        } else { StartingSubjects.make() }
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasFirstLetter = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLetter)
@@ -5489,7 +6255,13 @@ impl<'a> UiTree<'a> {
     }
     self.stylesDirty = false
     self.stylesPending = false
-    self.paintCachesStale = true
+    // A restyle that leaves every node painting as it did keeps the fragment hashes and ink:
+    // each restyled node says below whether what they are built from changed. Layout changes
+    // reach them through the layout pass.
+    if full {
+      self.paintCachesStale = true
+    }
+    let scrollbarRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasScrollbars
     if self.root == NONE {
       return ()
     }
@@ -5510,30 +6282,46 @@ impl<'a> UiTree<'a> {
       let below = node.subtreeDirty
       let mut changed = full
       if own {
-        let before = node.computed.text
+        let before = node.computed().text
         let beforeFont = node.fontKey
-        let events = node.computed.paint.pointerEvents
-        let selects = node.computed.userSelect
-        let barColors = node.computed.scroll.colors
-        let listStyle = node.computed.list
-        let shadow = node.computed.effects
+        let events = node.computed().paint.pointerEvents
+        let nearest = node.computed().nearest
+        let selects = node.computed().userSelect
+        let barColors = node.computed().scroll.colors
+        let listStyle = node.computed().list
+        let shadow = node.computed().effects
         let wasRendered = node.rendered
-        let containment = node.computed.contain.query()
-        let skips = node.computed.contain.hidden()
+        let paintBefore = node.paintHash
+        let selectedBefore = selection.hash(node, 0)
+        let placedBefore = transform.placementHash(&node.computed().transform, 0)
+        let perspectiveBefore = transform.perspectiveHash(&node.computed().transform, 0)
+        let containment = node.computed().contain.query()
+        let skips = node.computed().contain.hidden()
         let namesChanged = run self.resolve(slot, tick)
         self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
         run self.syncGenerated(slot)
-        if listStyle.item() || self.node(slot).computed.list.item() { run self.syncMarker(slot) }
+        if listStyle.item() || self.node(slot).computed().list.item() { run self.syncMarker(slot) }
         if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
         if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
-        let after = &self.node(slot).computed
+        let styled = self.node(slot)
+        let repaints = scrollbarRules || styled.kind == NodeKind.Input
+          || paintBefore != styled.paintHash || beforeFont != styled.fontKey || wasRendered != styled.rendered
+          || shadow.shadowFrom != styled.computed().effects.shadowFrom
+          || selectedBefore != selection.hash(styled, 0)
+          || placedBefore != transform.placementHash(&styled.computed().transform, 0)
+          || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0)
+        if repaints {
+          run self.repair.nodes.append(slot)
+          self.repair.pending = true
+        }
+        let after = &self.node(slot).computed().*
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
-          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list
+          || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
@@ -5548,14 +6336,14 @@ impl<'a> UiTree<'a> {
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
-        let layoutNodes = self.layout.nodes.asSlice()
-        let mut child = layoutNodes[css].firstChild
+        let layoutNodes = &self.layout
+        let mut child = layoutNodes.firstChild(css)
         while child != NO_INDEX {
           let found = self.slotOfCssNode(child)
           if found != NONE {
             run stack.append(u64.bitOr(u32.toU64(found), flag))
           }
-          child = layoutNodes[child].nextSibling
+          child = layoutNodes.nextSibling(child)
         }
         let items = stack.asMutSlice()
         let mut a = first
@@ -5599,25 +6387,25 @@ impl<'a> UiTree<'a> {
         let watched = self.nodeMut(slot)
         watched.styleWatch = 0
       }
-      let links = self.layout.nodes.asSlice()
-      if links[at].firstChild != NO_INDEX { at = links[at].firstChild
+      let links = &self.layout
+      if links.firstChild(at) != NO_INDEX { at = links.firstChild(at)
         continue }
-      while at != top && links[at].nextSibling == NO_INDEX { at = links[at].parent }
+      while at != top && links.nextSibling(at) == NO_INDEX { at = links.parent(at) }
       if at == top { break }
-      at = links[at].nextSibling
+      at = links.nextSibling(at)
     }
   }
 
   fn applyPixelStyles(self: &Self, slot: u32, computed: &mut Computed) {
     let node = self.node(slot)
     if node.kind == NodeKind.Text { return () }
-    applyPixelList(&mut computed.*, &node.base)
-    if node.hovered { applyPixelList(&mut computed.*, &node.hover) }
-    if node.pressed { applyPixelList(&mut computed.*, &node.active) }
+    applyPixelList(&mut computed.*, node.base.asSlice())
+    if node.hovered { applyPixelList(&mut computed.*, node.hover()) }
+    if node.pressed { applyPixelList(&mut computed.*, node.active()) }
     if self.focused == slot {
-      applyPixelList(&mut computed.*, &node.focus)
+      applyPixelList(&mut computed.*, node.focus())
       if self.focusVisible || node.kind == NodeKind.Input {
-        applyPixelList(&mut computed.*, &node.focusVisible)
+        applyPixelList(&mut computed.*, node.focusVisible())
       }
     }
   }
@@ -5626,37 +6414,37 @@ impl<'a> UiTree<'a> {
     stops: &mut EasingStops, units: &Context) ! OutOfMemoryError ? &mut Allocator {
     let node = self.node(slot)
     if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-      run applyUsing(&mut computed.*, &value.declarations, parentStyle, &mut stops.*, units)
+      run applyUsing(&mut computed.*, value.declarations.asSlice(), parentStyle, &mut stops.*, units)
     } else if node.kind != NodeKind.Text && self.overrides.length() == 0 {
-      run applyUsing(&mut computed.*, &node.base, parentStyle, &mut stops.*, units)
+      run applyUsing(&mut computed.*, node.base.asSlice(), parentStyle, &mut stops.*, units)
       if node.hovered {
-        run applyUsing(&mut computed.*, &node.hover, parentStyle, &mut stops.*, units)
+        run applyUsing(&mut computed.*, node.hover(), parentStyle, &mut stops.*, units)
       }
       if node.pressed {
-        run applyUsing(&mut computed.*, &node.active, parentStyle, &mut stops.*, units)
+        run applyUsing(&mut computed.*, node.active(), parentStyle, &mut stops.*, units)
       }
       if self.focused == slot {
-        run applyUsing(&mut computed.*, &node.focus, parentStyle, &mut stops.*, units)
+        run applyUsing(&mut computed.*, node.focus(), parentStyle, &mut stops.*, units)
         if self.focusVisible || node.kind == NodeKind.Input {
-          run applyUsing(&mut computed.*, &node.focusVisible, parentStyle, &mut stops.*, units)
+          run applyUsing(&mut computed.*, node.focusVisible(), parentStyle, &mut stops.*, units)
         }
       }
     } else if node.kind != NodeKind.Text {
-      run self.applyOverridden(&mut computed.*, node.id, StyleState.Base, &node.base, &mut stops.*, parentStyle, units)
+      run self.applyOverridden(&mut computed.*, node.id, StyleState.Base, node.base.asSlice(), &mut stops.*, parentStyle, units)
       if node.hovered {
-        run self.applyOverridden(&mut computed.*, node.id, StyleState.Hover, &node.hover, &mut stops.*, parentStyle, units)
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Hover, node.hover(), &mut stops.*, parentStyle, units)
       }
       if node.pressed {
-        run self.applyOverridden(&mut computed.*, node.id, StyleState.Active, &node.active, &mut stops.*, parentStyle, units)
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Active, node.active(), &mut stops.*, parentStyle, units)
       }
       if self.focused == slot {
-        run self.applyOverridden(&mut computed.*, node.id, StyleState.Focus, &node.focus, &mut stops.*, parentStyle, units)
+        run self.applyOverridden(&mut computed.*, node.id, StyleState.Focus, node.focus(), &mut stops.*, parentStyle, units)
         if self.focusVisible || node.kind == NodeKind.Input {
           run self.applyOverridden(
             &mut computed.*,
             node.id,
             StyleState.FocusVisible,
-            &node.focusVisible,
+            node.focusVisible(),
             &mut stops.*,
             parentStyle,
             units,
@@ -5669,6 +6457,8 @@ impl<'a> UiTree<'a> {
   effect fn resolve(self: &mut Self, slot: u32, tick: bool) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    self.work.resolves = self.work.resolves + 1
+    if tick { self.work.ticks = self.work.ticks + 1 }
     if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
     if self.tickWidth != self.input.width || self.tickHeight != self.input.height {
       self.tickBases.clear()
@@ -5677,7 +6467,7 @@ impl<'a> UiTree<'a> {
       self.tickHeight = self.input.height
     }
     let parent = self.node(slot).parent
-    let inherited = if parent != NONE { self.node(parent).computed.text } else { self.rootText() }
+    let inherited = if parent != NONE { self.node(parent).computed().text } else { self.rootText() }
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
     let initialNode = self.node(slot)
     let simpleStyles = !initialNode.styleNeedsContext && initialNode.sheetStyle().isNone() && self.overrides.length() == 0 && !initialNode.isGenerated()
@@ -5685,13 +6475,14 @@ impl<'a> UiTree<'a> {
     // full restyle built there is the one this would build. Anchors move without a restyle.
     let based = if tick && self.anchors.length() == 0 { self.tickBaseOf(slot) } else { usize.MAX }
     let lender = if based != usize.MAX || simpleStyles || initialNode.styleTwin == NONE { NONE } else { self.computedLender(slot) }
+
     let mut computed = if based != usize.MAX { self.tickBases.asSlice()[based].computed } else { self.valuesToStartFrom(lender, inherited) }
     if based == usize.MAX {
     // border-collapse, border-spacing, caption-side and empty-cells inherit.
     if lender == NONE && parent != NONE {
-      inheritTable(&mut computed.layout, &self.node(parent).computed.layout)
-      computed.emptyCellsHide = self.node(parent).computed.emptyCellsHide
-      computed.list = ListStyle.inherited(self.node(parent).computed.list)
+      inheritTable(&mut computed.layout, &self.node(parent).computed().layout)
+      computed.emptyCellsHide = self.node(parent).computed().emptyCellsHide
+      computed.list = ListStyle.inherited(self.node(parent).computed().list)
     }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {
       computed.containerWidth = containers.physicalUnit(&self, slot, true)
@@ -5704,8 +6495,9 @@ impl<'a> UiTree<'a> {
     if lender == NONE {
     // CSS pointer-events inherits, but an explicit descendant auto remains targetable.
     if parent != NONE {
-      computed.paint.pointerEvents = self.node(parent).computed.paint.pointerEvents
-      computed.scroll.colors = self.node(parent).computed.scroll.colors
+      computed.paint.pointerEvents = self.node(parent).computed().paint.pointerEvents
+      computed.scroll.colors = self.node(parent).computed().scroll.colors
+      computed.nearest = self.node(parent).computed().nearest
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -5720,9 +6512,9 @@ impl<'a> UiTree<'a> {
         computed.layout.overflowY = Overflow.Hidden
       }
     }
-    if initialNode.transition.ownedByteLength() != 0 {
-      run stops.read(String.utf8Bytes(String.view(&initialNode.transition)))
-      run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(String.view(&initialNode.transition)), &mut stops)
+    if initialNode.hasTransition() {
+      run stops.read(String.utf8Bytes(initialNode.transition()))
+      run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(initialNode.transition()), &mut stops)
     }
     // The user agent's `:focus-visible { outline: auto }`, under every look the app sets, so
     // `outline: none` or another outline in any of them replaces it, as in a browser.
@@ -5734,14 +6526,16 @@ impl<'a> UiTree<'a> {
       self.applyPixelStyles(slot, &mut computed)
     } else {
       let units = run font_units.prepare(&mut self, slot, &mut computed, FontSource.Node)
-      let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
+      let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed().* }
       run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut stops, &units)
     }
     }
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
-    if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed.list) }
+    if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed().list) }
     if computed.list.item() || computed.list.counters() { self.listsUsed = true }
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
+    if computed.transform.offset.path != transform.PATH_NONE { self.offsetUsed = true }
+    if computed.transform.preserve3d { self.preserveUsed = true }
     let node = self.node(slot)
     if !node.isGenerated() { anchoring.apply(&self, node.id, &mut computed) }
     if computed.anchor.name != 0 || computed.anchor.anchored() {
@@ -5761,33 +6555,33 @@ impl<'a> UiTree<'a> {
     let kind = node.kind
     computed.userSelect = usedUserSelect(
       computed.userSelect,
-      if parent == NONE { SELECT_TEXT } else { self.node(parent).computed.userSelect },
+      if parent == NONE { SELECT_TEXT } else { self.node(parent).computed().userSelect },
       kind == NodeKind.Input,
     )
     // `content-visibility: hidden` skips its contents the way `display: none` does.
-    if node.generatedSuppressed || parent != NONE && self.node(parent).computed.contain.hidden() { computed.layout.display = CssDisplay.None }
+    if node.generatedSuppressed || parent != NONE && self.node(parent).computed().contain.hidden() { computed.layout.display = CssDisplay.None }
     run style_change.prepare(&mut self, slot, computed.usesContainer)
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
-    let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).transition.ownedByteLength() != 0
-      || self.node(slot).starting.length() != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+    let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).hasTransition()
+      || self.node(slot).starting().length != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
     if needsMotion {
       let mut before = style_change.before(&self, slot)
       let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
-      if !hasBefore && rendered && (sheetStarting || self.node(slot).starting.length() != 0) {
+      if !hasBefore && rendered && (sheetStarting || self.node(slot).starting().length != 0) {
         before = computed
-        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed().* }
         let startUnits = run font_units.prepare(&mut self, slot, &mut before, FontSource.Starting)
         run self.applyNodeLengths(slot, &mut before, &parentStyle, &mut stops, &startUnits)
         if sheetStarting {
           if let Option.Some { value } = self.node(slot).sheetStyle() {
             if let Option.Some { value: start } = &value.starting {
-              run applyUsing(&mut before, &start, &parentStyle, &mut stops, &startUnits)
+              run applyUsing(&mut before, start.asSlice(), &parentStyle, &mut stops, &startUnits)
             }
           }
         } else {
-          run applyUsing(&mut before, &self.node(slot).starting, &parentStyle, &mut stops, &startUnits)
+          run applyUsing(&mut before, self.node(slot).starting(), &parentStyle, &mut stops, &startUnits)
         }
         hasBefore = true
       }
@@ -5803,7 +6597,7 @@ impl<'a> UiTree<'a> {
       }
       if computed.text.size != underlyingFontSize {
         let moving = computed
-        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed }
+        let parentStyle = if parent == NONE { self.rootParent() } else { self.node(parent).computed().* }
         let currentUnits = run font_units.refresh(&mut self, slot, &mut computed)
         let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
         run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
@@ -5842,7 +6636,7 @@ impl<'a> UiTree<'a> {
       let mut finalStops = Intrinsic.replace(self.easingStops, EasingStops.make())
       let node = self.node(slot)
       if let Option<&Resolved>.Some { value } = node.sheetStyle() {
-        run applyUsing(&mut computed, &value.overrides, &parentStyle, &mut finalStops, &finalUnits)
+        run applyUsing(&mut computed, value.overrides.asSlice(), &parentStyle, &mut finalStops, &finalUnits)
       } else {
         let mut declarations = List<Declaration>.make()
         let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
@@ -5859,16 +6653,16 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        run applyUsing(&mut computed, &declarations, &parentStyle, &mut finalStops, &finalUnits)
+        run applyUsing(&mut computed, declarations.asSlice(), &parentStyle, &mut finalStops, &finalUnits)
       }
       self.easingStops = move finalStops
     }
     if self.letterUsed && kind == NodeKind.Box && self.node(slot).isGenerated() { run self.dropCap(slot, &mut computed) }
     let css = self.node(slot).css
-    let sizeChanged = self.node(slot).computed.text.size != computed.text.size
-    let zoomChanged = self.node(slot).computed.text.zoom != computed.text.zoom
+    let sizeChanged = self.node(slot).computed().text.size != computed.text.size
+    let zoomChanged = self.node(slot).computed().text.zoom != computed.text.zoom
     if parent != NONE {
-      let above = self.node(parent).computed.effects
+      let above = self.node(parent).computed().effects
       computed.effects.shadowFrom = above.shadowFrom
       computed.effects.shadowHash = above.shadowHash
     }
@@ -5878,8 +6672,9 @@ impl<'a> UiTree<'a> {
     let paintHash = computed.paintHash(&self.seed)
     let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
     if lender == NONE { self.computedStamps = stamp }
+    if lender != NONE { self.work.lenders = self.work.lenders + 1 }
+    if tick { run self.setMovingComputed(slot, &computed) } else { run self.setComputed(slot, &computed) }
     let target = self.nodeMut(slot)
-    target.computed = computed
     target.computedStamp = stamp
     target.rendered = rendered
     target.fontKey = fontKey
@@ -5892,11 +6687,7 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
       run self.resolveGrid(slot, &computed)
-      let shape = match self.node(slot).paintEffects() {
-        Option<&Effects>.Some { value } => run float_shapes.of(value, computed.paint.radii)
-        Option<&Effects>.None => FloatShape.make()
-      }
-      run Effect.catchAll(self.layout.setShape(NodeId { index: css }, &shape), layoutFailed)
+      run self.updateShape(slot)
     }
     let mut namesChanged = false
     if kind != NodeKind.Text {
@@ -5905,7 +6696,7 @@ impl<'a> UiTree<'a> {
       if names.length() != 0 || self.node(slot).identity().isSome() {
         let node = self.nodeMut(slot)
         let identity = run node.identityMut()
-        identity.containerNames = move names
+        run identity.setContainerNames(move names)
       }
     }
     if (kind == NodeKind.Icon && sizeChanged) || (kind == NodeKind.Image && zoomChanged) {
@@ -6051,7 +6842,7 @@ impl<'a> UiTree<'a> {
         } else if properties_convert.isKeyword(&value.value, Keyword.Initial) {
           return ()
         } else {
-          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed, node.fontKey))
+          run paint_css.apply(&mut effects.*, value, font_units.paintBasis(&self, ancestor, &node.computed().*, node.fontKey))
           return ()
         }
       }
@@ -6082,7 +6873,7 @@ impl<'a> UiTree<'a> {
     computed: &mut Computed,
     id: u32,
     state: StyleState,
-    client: &List<Declaration>,
+    client: &[Declaration],
     stops: &mut EasingStops,
     parent: &Computed,
     units: &Context,
@@ -6097,7 +6888,7 @@ impl<'a> UiTree<'a> {
     let laid = &self.overrides.asSlice()[at]
     let mut merged = List<Declaration>.make()
     if !laid.replace {
-      let own = client.asSlice()
+      let own = client
       let mut i: usize = 0
       while i < own.length {
         run merged.append(run css.cloneDeclaration(&own[i]))
@@ -6110,7 +6901,7 @@ impl<'a> UiTree<'a> {
       run css.set(&mut merged, &over[j])
       j = j + 1
     }
-    run applyUsing(&mut computed, &merged, parent, &mut stops, units)
+    run applyUsing(&mut computed, merged.asSlice(), parent, &mut stops, units)
   }
 
   /// Whether node `id` has an override in `state`. Costs nothing while there are none.
@@ -6267,11 +7058,20 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
-    if self.applied || self.paintDirty {
+    run self.trimNodes()
+    self.releaseSlack()
+    // A mutation said what it repaints when it was applied (see `repaintsNode`).
+    if self.paintDirty {
       self.paintCachesStale = true
     }
     self.applied = false
     self.input = input
+    self.provider.text.fonts.set.now = input.time
+    drop self.provider.text.fonts.set.expireLate()
+    if self.fontBlockEnd >= 0.0 && input.time >= self.fontBlockEnd {
+      // Text waiting for a face shows its fallback now.
+      self.invalidatePaint()
+    }
     self.stats = FrameStats.zero()
     self.stats.frame = self.frameNumber
     run motion.tick(&mut self)
@@ -6303,12 +7103,15 @@ impl<'a> UiTree<'a> {
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
     // variant that changes layout is laid out in the same frame.
     if !self.stats.layoutSkipped || self.scrolled {
+      // The hit test prunes by ink and follows stacking when those are current.
+      if self.pointerInside && !self.paintDirty { run self.refreshPaintCaches() }
       run interact.refreshHover(&mut self)
       run self.resolveStyles()
       run self.layoutFrame()
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     run self.notifyLayout()
     if self.laidOutCurrent() {
@@ -6317,10 +7120,20 @@ impl<'a> UiTree<'a> {
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
     run self.paintFrame()
+    self.fontBlockEnd = self.provider.text.fonts.set.nextDeadline()
     self.scrolled = false
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
+    self.work.frames = self.work.frames + 1
+    if self.stats.styledNodes != 0 { self.work.styleFrames = self.work.styleFrames + 1 }
+    self.work.paintFrames = self.work.paintFrames + 1
+    self.work.paintedFragments = self.work.paintedFragments + self.stats.paintedFragments
+    self.work.culledSubtrees = self.work.culledSubtrees + self.stats.culledSubtrees
+    self.work.replayedSubtrees = self.work.replayedSubtrees + self.stats.replayedSubtrees
+    self.work.repaintedSubtrees = self.work.repaintedSubtrees + self.stats.repaintedSubtrees
+    self.work.replayedOperations = self.work.replayedOperations + self.stats.replayedOperations
+    self.work.paintedGlyphs = self.work.paintedGlyphs + self.stats.glyphs
   }
 
   effect fn settleAnchors(self: &mut Self) -> ()
@@ -6394,7 +7207,7 @@ impl<'a> UiTree<'a> {
     while true {
       run Effect.catchAll(
         computeFragmented(
-          &self.layout,
+          &LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() },
           &mut self.output,
           &mut self.provider,
           OptionalSize.none(),
@@ -6464,6 +7277,7 @@ impl<'a> UiTree<'a> {
     }
     run self.settleVirtual()
     run self.settleAnchors()
+    run offset_path.settle(&mut self)
     run self.finishStyleChange()
     if self.laidOutCurrent() {
       run scroll_anchor.select(&mut self)
@@ -6540,11 +7354,11 @@ impl<'a> UiTree<'a> {
     let moved = self.layout.revision() == self.laidOutRevision
       && self.input.width == self.laidOut.width
       && self.input.height == self.laidOut.height
-      && (run Engine.repositionScroll(&self.layout, &mut self.output, viewport))
+      && (run Engine.repositionScroll(&LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() }, &mut self.output, viewport))
     if !moved {
       run Effect.catchAll(
         Engine.compute(
-          &self.layout,
+          &LayoutView { table: &self.layout, nodes: self.nodes.asSlice(), slots: self.slotOfCss.asSlice() },
           &mut self.output,
           &mut self.provider,
           OptionalSize.definite(self.input.width, self.input.height),
@@ -6553,16 +7367,34 @@ impl<'a> UiTree<'a> {
       )
     }
     self.output.fragments.resolveLocations()
-    self.paintCachesStale = true
     self.semanticRevision = self.semanticRevision + 1
     self.revision = self.revision + 1
+    // A viewport of another size moves what sticks to it.
+    if self.input.width != self.laidOut.width || self.input.height != self.laidOut.height {
+      self.paintCachesStale = true
+    }
     self.laidOut = self.input
     self.laidOutRevision = self.layout.revision()
     self.laidOutScrolls = self.layout.scrollRevision()
     self.stats.layout = self.output.stats
     self.stats.layoutSkipped = false
-    if !moved {
-      run self.indexFragments()
+    self.work.layoutFrames = self.work.layoutFrames + 1
+    self.work.fragmentsResolved = self.work.fragmentsResolved + self.output.fragments.resolved
+    if moved { self.work.layoutMoves = self.work.layoutMoves + 1 } else {
+      self.work.layoutPasses = self.work.layoutPasses + self.output.stats.passes
+      self.work.layoutFull = self.work.layoutFull + self.output.stats.fullLayouts
+      self.work.layoutProbes = self.work.layoutProbes + self.output.stats.sizeProbes
+      self.work.layoutCacheHits = self.work.layoutCacheHits + self.output.stats.cacheHits
+      self.work.layoutReused = self.work.layoutReused + self.output.stats.reusedLayouts
+      self.work.inlineLayouts = self.work.inlineLayouts + self.output.stats.inlineLayouts
+      self.work.plainLines = self.work.plainLines + self.output.stats.plainLines
+      self.work.linesEmitted = self.work.linesEmitted + self.output.stats.linesEmitted
+    }
+    if moved {
+      // Only visual offsets changed: every fragment may have moved, none was renumbered.
+      self.paintCachesStale = true
+    } else {
+      run self.carryFragments()
       if self.scrollAnchors.length() != 0 { run scroll_anchor.adjust(&mut self) }
     }
     self.layoutObserversDirty = true
@@ -6577,8 +7409,26 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.layoutObserversDirty = false
-    let mut i: usize = 0
-    while i < self.nodes.length() {
+    // The nodes that listen, in slot order, without those that stopped or are gone.
+    let mut listening = Intrinsic.replace(self.layoutListeners, List<u32>.make())
+    run listening.sort()
+    let mut kept: usize = 0
+    let mut at: usize = 0
+    while at < listening.length() {
+      let slot = listening.get(at)
+      at = at + 1
+      if kept != 0 && listening.get(kept - 1) == slot { continue }
+      if u32.toUsize(slot) >= self.nodes.length() { continue }
+      let listener = self.node(slot)
+      if !listener.live || u32.bitAnd(listener.listeners, LISTEN_LAYOUT) == 0 { continue }
+      listening.set(kept, slot)
+      kept = kept + 1
+    }
+    listening.truncate(kept)
+    let mut l: usize = 0
+    while l < listening.length() {
+      let i = u32.toUsize(listening.get(l))
+      l = l + 1
       let node = &self.nodes.asSlice()[i]
       if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0
         && !self.inParkedRoot(usize.toU32(i)) {
@@ -6602,8 +7452,8 @@ impl<'a> UiTree<'a> {
           }
         }
       }
-      i = i + 1
     }
+    self.layoutListeners = move listening
   }
 
   /// Fills `fragmentOf` from the last layout.
@@ -6611,20 +7461,113 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.facesDirty = true
-    self.fragmentOf.clear()
-    run self.fragmentOf.appendRepeated(NO_INDEX, self.layout.nodes.length())
-    let values = self.output.fragments.values.asSlice()
-    self.nextSourceFragment.clear()
-    run self.nextSourceFragment.appendRepeated(NO_INDEX, values.length)
-    let mut i = values.length
-    while i > 0 {
-      i = i - 1
-      let source = values[i].source
-      if source < self.fragmentOf.length() && !values[i].positioningShell {
-        self.nextSourceFragment.set(i, self.fragmentOf.get(source))
-        self.fragmentOf.set(source, i)
+    run buildIndex(
+      &self.output,
+      self.layout.nodeCount(),
+      &mut self.fragmentOf,
+      &mut self.nextSourceFragment,
+      &mut self.repair.index,
+    )
+  }
+
+  /// After a layout pass: brings what the tree keeps per fragment to the fragments css-layout
+  /// kept (`FragmentArena.carried`), and notes the others for the next refresh of the paint
+  /// caches. The index by source is repaired at once: geometry queries read it before paint.
+  effect fn carryFragments(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let count = self.output.fragments.values.length()
+    let old = self.nextSourceFragment.length()
+    let mut plan = Intrinsic.replace(self.repair.plan, CarryPlan.make())
+    let mut dirty = Intrinsic.replace(self.repair.dirty, List<usize>.make())
+    dirty.clear()
+    let mut why: u8 = 1
+    let mut carried = self.output.fragments.carriedKnown
+    if carried {
+      why = 2
+      carried = run plan.set(self.output.fragments.carried.asSlice(), old, count)
+    }
+    if carried {
+      run plan.uncovered(&mut dirty)
+      // When much changed, working everything out again costs less than repairing it.
+      why = 4
+      carried = dirty.length() <= count / 4 + 64
+    }
+    if carried {
+      why = 3
+      carried = run repairIndex(
+        &plan,
+        &self.output,
+        self.layout.nodeCount(),
+        &mut self.fragmentOf,
+        &mut self.nextSourceFragment,
+        &mut self.repair.index,
+        dirty.asSlice(),
+      )
+    }
+    if !carried {
+      run self.indexFragments()
+      if !self.paintCachesStale {
+        self.repair.uncarried = self.repair.uncarried + 1
+        self.repair.uncarriedWhy = why
+      }
+      self.paintCachesStale = true
+    } else {
+      // A text fragment of a font not seen before loads its face.
+      let values = self.output.fragments.values.asSlice()
+      let mut d: usize = 0
+      while d < dirty.length() && !self.facesDirty {
+        if values[dirty.get(d)].textData != NO_INDEX {
+          let key = u32.toUsize(values[dirty.get(d)].fontKey)
+          if key >= self.faces.length() || !self.faces.asSlice()[key].loaded { self.facesDirty = true }
+        }
+        d = d + 1
       }
     }
+    if !self.paintCachesStale {
+      if self.fragmentHashes.length() != old || self.fragmentInk.length() != old
+        || self.fragmentScrollers.length() != old || !self.fragmentStacking.carries(old) {
+        self.paintCachesStale = true
+      } else {
+        let empty = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+        run carryList<u64>(&plan, &mut self.fragmentHashes, &mut self.repair.spareHashes, 0)
+        run carryList<Rect<f32>>(&plan, &mut self.fragmentInk, &mut self.repair.spareInk, empty)
+        run carryList<bool>(&plan, &mut self.fragmentScrollers, &mut self.repair.spareFlags, false)
+        run self.fragmentStacking.carry(&plan)
+        // What was pending from an earlier pass moves too, or is gone.
+        if !plan.identity {
+          let pending = self.repair.fragments.asMutSlice()
+          let mut kept: usize = 0
+          let mut i: usize = 0
+          while i < pending.length {
+            let to = plan.newIndex(pending[i])
+            if to != NO_INDEX {
+              pending[kept] = to
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragments.truncate(kept)
+        } else {
+          let pending = self.repair.fragments.asMutSlice()
+          let mut kept: usize = 0
+          let mut i: usize = 0
+          while i < pending.length {
+            if pending[i] < count {
+              pending[kept] = pending[i]
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragments.truncate(kept)
+        }
+        run self.repair.fragments.appendSlice(dirty.asSlice())
+        self.repair.pending = true
+      }
+    }
+    if self.paintCachesStale { self.repair.settle() }
+    self.repair.plan = move plan
+    self.repair.dirty = move dirty
     if self.lineOrigins.length() != 0 { run self.indexFirstLines() }
   }
 
@@ -6635,10 +7578,16 @@ impl<'a> UiTree<'a> {
     if !self.facesDirty {
       return ()
     }
-    let count = self.output.fragments.texts.length()
+    // Every text fragment's font.
+    let values = self.output.fragments.values.asSlice()
+    let count = values.length
     let mut i: usize = 0
     while i < count {
-      let key = self.output.fragments.texts.get(i).fontKey
+      if values[i].textData == NO_INDEX {
+        i = i + 1
+        continue
+      }
+      let key = u32.toUsize(values[i].fontKey)
       while self.faces.length() <= key {
         run self.faces.append(FaceSlot<'a> { loaded: false, face: Option<FontFace<'a>>.None })
       }
@@ -6658,27 +7607,178 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     let count = self.output.fragments.values.length()
-    if !self.paintCachesStale && self.fragmentHashes.length() == count
-      && self.fragmentInk.length() == count && self.fragmentStacking.covers(count) {
+    let sized = self.fragmentHashes.length() == count && self.fragmentInk.length() == count
+      && self.fragmentScrollers.length() == count
+    if !self.paintCachesStale && !self.repair.pending && sized && self.fragmentStacking.covers(count) {
       return ()
     }
-    run hashFragments(
-      &self.seed,
-      &self.output,
-      &self.slotOfCss,
-      &self.layout,
-      &self.nodes,
-      &mut self.fragmentHashes,
+    // Only what changed, when that is known and no fragment's caches read another's.
+    let mut repaired = !self.paintCachesStale && sized && self.fragmentStacking.carries(count)
+      && self.nextSourceFragment.length() == count
+    if repaired && self.repair.fragile {
+      self.repair.fragileRebuilds = self.repair.fragileRebuilds + 1
+      repaired = false
+    }
+    if repaired {
+      repaired = run self.repairPaintCaches()
+    }
+    if repaired {
+      self.repair.repairs = self.repair.repairs + 1
+    } else {
+      self.repair.rebuilds = self.repair.rebuilds + 1
+      self.repair.fragile = run cacheFragments(
+        &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+        self.input.width, self.input.height,
+        &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+      )
+      run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
+      run foldLiftedRoots(
+        &self.fragmentStacking,
+        &mut self.fragmentHashes,
+        &mut self.fragmentInk,
+        &mut self.fragmentScrollers,
+      )
+      self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    }
+    self.repair.settle()
+    self.paintCachesStale = false
+    if repaired && self.repair.verify { run self.verifyPaintCaches() }
+  }
+
+  /// Works out again the caches of the fragments noted in `repair`, of the fragments of its
+  /// nodes, and of every fragment above those. False when it cannot: the caller rebuilds.
+  effect fn repairPaintCaches(self: &mut Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let values = self.output.fragments.values.asSlice()
+    let count = values.length
+    let mut dirty = Intrinsic.replace(self.repair.fragments, List<usize>.make())
+    let mut stack = Intrinsic.replace(self.repair.stack, List<usize>.make())
+    let mut marks = Intrinsic.replace(self.repair.marks, List<bool>.make())
+    if marks.length() < count {
+      let have = marks.length()
+      run marks.appendRepeated(false, count - have)
+    }
+    // Each fragment once.
+    let mut kept: usize = 0
+    let mut d: usize = 0
+    while d < dirty.length() {
+      let index = dirty.get(d)
+      if index < count && !marks.get(index) {
+        marks.set(index, true)
+        dirty.set(kept, index)
+        kept = kept + 1
+      }
+      d = d + 1
+    }
+    dirty.truncate(kept)
+
+    // The fragments a node's paint inputs reach: its own, and those of the text and the
+    // boxes the tree made inside it, which paint with its style (see `styleSlot`).
+    let layoutNodes = &self.layout
+    let mut n: usize = 0
+    while n < self.repair.nodes.length() {
+      let slot = self.repair.nodes.get(n)
+      n = n + 1
+      if u32.toUsize(slot) >= self.nodes.length() || !self.node(slot).live { continue }
+      let text = self.node(slot).kind == NodeKind.Text
+      let own = self.node(slot).css
+      stack.clear()
+      run stack.append(own)
+      while stack.length() != 0 {
+        let last = stack.length() - 1
+        let css = stack.get(last)
+        stack.truncate(last)
+        if css >= layoutNodes.nodeCount() { continue }
+        let mut fragment = if css < self.fragmentOf.length() { self.fragmentOf.get(css) } else { NO_INDEX }
+        while fragment != NO_INDEX && fragment < count {
+          if !marks.get(fragment) {
+            marks.set(fragment, true)
+            run dirty.append(fragment)
+          }
+          fragment = self.nextSourceFragment.get(fragment)
+        }
+        if text { continue }
+        let mut child = layoutNodes.firstChild(css)
+        while child != NO_INDEX {
+          let owner = self.slotOfCssNode(child)
+          if owner == NONE || self.node(owner).kind == NodeKind.Text {
+            run stack.append(child)
+          }
+          child = layoutNodes.nextSibling(child)
+        }
+      }
+    }
+
+    // Every fragment above a changed one folds it in.
+    let listed = dirty.length()
+    d = 0
+    while d < listed {
+      let mut at = values[dirty.get(d)].parent
+      while at != NO_INDEX && !marks.get(at) {
+        marks.set(at, true)
+        run dirty.append(at)
+        at = values[at].parent
+      }
+      d = d + 1
+    }
+    d = 0
+    while d < dirty.length() {
+      marks.set(dirty.get(d), false)
+      d = d + 1
+    }
+    self.repair.stack = move stack
+    self.repair.marks = move marks
+    run dirty.sort()
+
+    run self.fragmentStacking.repair(
+      &self.output, &self.slotOfCss, &self.layout, &self.nodes, &self.fragmentOf, dirty.asSlice(),
     )
-    run inkFragments(
-      &self.output,
-      &self.slotOfCss,
-      &self.layout,
-      &self.nodes,
-      self.input.width,
-      self.input.height,
-      &mut self.fragmentInk,
-      &mut self.fragmentScrollers,
+    // A fixed box's root is folded into the roots that paint it: those start over.
+    let lifts = self.repair.lifted || self.fragmentStacking.lifted.length() != 0
+    if lifts {
+      run dirty.appendSlice(self.fragmentStacking.roots.asSlice())
+      run sortUnique(&mut dirty)
+    }
+    let mut ordered = true
+    let fragile = repairFragments(
+      &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+      self.input.width, self.input.height,
+      &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+      dirty.asSlice(), &mut ordered,
+    )
+    dirty.clear()
+    self.repair.fragments = move dirty
+    if fragile || !ordered {
+      return false
+    }
+    if lifts {
+      run foldLiftedRoots(
+        &self.fragmentStacking,
+        &mut self.fragmentHashes,
+        &mut self.fragmentInk,
+        &mut self.fragmentScrollers,
+      )
+    }
+    self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    return true
+  }
+
+  /// Compares the repaired caches and the index by source with a full rebuild, which then
+  /// stands; `repair.mismatches` counts the refreshes that differed.
+  effect fn verifyPaintCaches(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hashes = Intrinsic.replace(self.fragmentHashes, List<u64>.make())
+    let ink = Intrinsic.replace(self.fragmentInk, List<Rect<f32>>.make())
+    let scrollers = Intrinsic.replace(self.fragmentScrollers, List<bool>.make())
+    let stacking = Intrinsic.replace(self.fragmentStacking, Stacking.make())
+    let firsts = Intrinsic.replace(self.fragmentOf, List<usize>.make())
+    let nexts = Intrinsic.replace(self.nextSourceFragment, List<usize>.make())
+    let fragile = run cacheFragments(
+      &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
+      self.input.width, self.input.height,
+      &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
     )
     run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
     run foldLiftedRoots(
@@ -6687,12 +7787,38 @@ impl<'a> UiTree<'a> {
       &mut self.fragmentInk,
       &mut self.fragmentScrollers,
     )
-    self.paintCachesStale = false
+    let facesDirty = self.facesDirty
+    run self.indexFragments()
+    self.facesDirty = facesDirty
+    let count = self.output.fragments.values.length()
+    let mut same = !fragile && hashes.length() == count && ink.length() == count && scrollers.length() == count
+      && nexts.length() == count && firsts.length() == self.fragmentOf.length()
+      && stacking.matches(&self.fragmentStacking)
+    let mut i: usize = 0
+    while same && i < count {
+      let a = ink.get(i)
+      let b = self.fragmentInk.get(i)
+      same = hashes.get(i) == self.fragmentHashes.get(i) && scrollers.get(i) == self.fragmentScrollers.get(i)
+        && a.xMin == b.xMin && a.yMin == b.yMin && a.xMax == b.xMax && a.yMax == b.yMax
+        && nexts.get(i) == self.nextSourceFragment.get(i)
+      i = i + 1
+    }
+    i = 0
+    while same && i < firsts.length() {
+      same = firsts.get(i) == self.fragmentOf.get(i)
+      i = i + 1
+    }
+    if !same {
+      self.repair.mismatches = self.repair.mismatches + 1
+      if VERIFY_ALWAYS { Intrinsic.trap("ui-tree: repaired paint caches differ from a rebuild") }
+    }
+    self.repair.lifted = self.fragmentStacking.lifted.length() != 0
+    self.repair.fragile = fragile
   }
 
   /// Whether the fragment ink describes the last layout, so hit testing can skip by it.
   pub fn inkCurrent(self: &Self) -> bool {
-    return !self.paintCachesStale
+    return !self.paintCachesStale && !self.repair.pending
       && self.fragmentInk.length() == self.output.fragments.values.length()
   }
 
@@ -6723,6 +7849,46 @@ impl<'a> UiTree<'a> {
       self.input.width,
       self.input.height,
     )
+  }
+
+  /// The border box of fragment `index` of the last layout, where it draws: for a text fragment,
+  /// the box around its runs (empty at the origin when it has none).
+  pub fn visualBounds(self: &Self, index: usize) -> Rect<f32> {
+    let values = self.output.fragments.values.asSlice()
+    if values[index].kind != FragmentKind.Text {
+      return borderBox(&self.visualFragment(index))
+    }
+    let shift = self.shiftOf(index)
+    let mut bounds = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    let mut any = false
+    let mut runs = self.output.fragments.textRuns(index)
+    while runs.next() {
+      let x = runs.current.location.x + shift.x
+      let y = runs.current.location.y + shift.y
+      let box = Rect<f32>.new(x, y, x + runs.current.size.width, y + runs.current.size.height)
+      bounds = if any {
+        Rect<f32>.new(f32.min(bounds.xMin, box.xMin), f32.min(bounds.yMin, box.yMin), f32.max(bounds.xMax, box.xMax), f32.max(bounds.yMax, box.yMax))
+      } else {
+        box
+      }
+      any = true
+    }
+    return bounds
+  }
+
+  /// Whether (`x`, `y`) lies in the box of one of the runs of text fragment `index`, where
+  /// they draw.
+  pub fn textContains(self: &Self, index: usize, x: f32, y: f32) -> bool {
+    let shift = self.shiftOf(index)
+    let mut runs = self.output.fragments.textRuns(index)
+    while runs.next() {
+      let left = runs.current.location.x + shift.x
+      let top = runs.current.location.y + shift.y
+      if x >= left && x < left + runs.current.size.width && y >= top && y < top + runs.current.size.height {
+        return true
+      }
+    }
+    return false
   }
 
   /// Fragment `index` of the last layout, moved to where it draws.
@@ -6760,6 +7926,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6781,6 +7950,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -6788,6 +7958,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6802,6 +7973,9 @@ impl<'a> UiTree<'a> {
         output: &self.output,
         text: &self.provider.text,
         faces: &self.faces,
+        fontRules: &self.fontRules,
+        sheetFaces: &self.sheetFaces,
+        root: self.current,
         atlas: &mut self.atlas,
         glyphs: &mut self.glyphs,
         textInk: &mut self.textInk,
@@ -6823,6 +7997,7 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
@@ -6830,6 +8005,7 @@ impl<'a> UiTree<'a> {
         seed: self.seed,
         only: NONE,
         inside: false,
+        planes: self.preserveUsed,
       }
       run paintRoots(&mut painter, window)
       drop painter
@@ -6856,6 +8032,8 @@ impl<'a> UiTree<'a> {
   pub effect fn paintSubtree(self: &mut Self, slot: u32, scene: &mut Scene) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    // Between a layout pass and the refresh, stacking lists no roots to paint from.
+    if self.repair.pending && !self.paintCachesStale { run self.refreshPaintCaches() }
     let window = ContentMask.new(
       Rect<f32>.new(
         0.0,
@@ -6873,6 +8051,9 @@ impl<'a> UiTree<'a> {
       output: &self.output,
       text: &self.provider.text,
       faces: &self.faces,
+      fontRules: &self.fontRules,
+      sheetFaces: &self.sheetFaces,
+      root: self.current,
       atlas: &mut self.atlas,
       glyphs: &mut self.glyphs,
       textInk: &mut self.textInk,
@@ -6894,6 +8075,7 @@ impl<'a> UiTree<'a> {
       stats: &mut stats,
       order: &mut order,
       selected: &self.textSelection.selected,
+      firstOf: &self.fragmentOf,
       frame: self.frameNumber,
       previousFrame: self.paintedAt,
       scale: self.input.scale,
@@ -6901,6 +8083,7 @@ impl<'a> UiTree<'a> {
       seed: self.seed,
       only: slot,
       inside: false,
+      planes: self.preserveUsed,
     }
     run paintRoots(&mut painter, window)
     drop painter
@@ -6974,6 +8157,75 @@ impl<'a> UiTree<'a> {
 
 effect fn ignoreInvalid(error: InvalidNode) -> () {
   drop error
+}
+
+// The free slots of the node table are a binary heap with the lowest slot first: a new node
+// takes the lowest free slot, so the nodes that stay after many are destroyed sit at the start
+// of the table and its end can be given back (see `UiTree.trimNodes`).
+
+/// Moves the free slot at `at` up to its place in the heap.
+fn siftUp(free: &mut List<u32>, at: usize) -> () {
+  let slots = free.asMutSlice()
+  let mut i = at
+  while i > 0 {
+    let parent = (i - 1) / 2
+    if slots[parent] <= slots[i] {
+      return
+    }
+    let moved = slots[parent]
+    slots[parent] = slots[i]
+    slots[i] = moved
+    i = parent
+  }
+}
+
+/// Moves the free slot at `at` down to its place in the heap.
+fn siftDown(free: &mut List<u32>, at: usize) -> () {
+  let slots = free.asMutSlice()
+  let mut i = at
+  while true {
+    let left = i * 2 + 1
+    if left >= slots.length {
+      return
+    }
+    let right = left + 1
+    let least = if right < slots.length && slots[right] < slots[left] { right } else { left }
+    if slots[i] <= slots[least] {
+      return
+    }
+    let moved = slots[i]
+    slots[i] = slots[least]
+    slots[least] = moved
+    i = least
+  }
+}
+
+/// Takes the lowest free slot. `free` is not empty.
+fn takeLowest(free: &mut List<u32>) -> u32 {
+  let last = free.length() - 1
+  let lowest = free.get(0)
+  let moved = free.get(last)
+  free.set(0, moved)
+  free.truncate(last)
+  if last > 0 {
+    siftDown(&mut free.*, 0)
+  }
+  return lowest
+}
+
+/// A tree gives back what a larger one left only after it has held this many nodes
+/// (see `UiTree.releaseSlack`).
+const RELEASE_NODES: usize = 4096
+
+/// The node table is not trimmed below this many slots (see `UiTree.trimNodes`).
+const TRIM_NODES: usize = 1024
+
+/// `keep` slots of the node table, or as many as keep `slot` in it.
+fn keepSlot(keep: usize, slot: u32) -> usize {
+  if slot == NONE || u32.toUsize(slot) < keep {
+    return keep
+  }
+  return u32.toUsize(slot) + 1
 }
 
 fn contains(list: &List<u32>, value: u32) -> bool {
@@ -7074,6 +8326,19 @@ fn writtenVariations(declaration: &Declaration) -> bool {
     && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
 }
 
+// A `font-palette`, `font-variant-alternates` or `font-size-adjust` not yet a handle.
+fn writtenHandle(declaration: &Declaration) -> bool {
+  if font_features.extrasShift(declaration.property) == 0xFFFFFFFF { return false }
+  if let Option.Some { value } = convert.number(&declaration.value) {
+    if value < 0.0 { return false }
+  }
+  return !properties_convert.isKeyword(&declaration.value, Keyword.Initial)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Inherit)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Unset)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.Revert)
+    && !properties_convert.isKeyword(&declaration.value, Keyword.RevertLayer)
+}
+
 // A `font-family` written as CSS text rather than as a family list id.
 fn writtenFamily(declaration: &Declaration) -> bool {
   return declaration.property == CssProperty.FontFamily && convert.number(&declaration.value).isNone()
@@ -7150,10 +8415,10 @@ impl<'a> Backend for UiTree<'a> {
 
 fn effectLook<'a>(node: &'a Node, state: StyleState) -> &'a [Declaration] {
   return match state {
-    StyleState.Hover => node.hover.asSlice()
-    StyleState.Active => node.active.asSlice()
-    StyleState.Focus => node.focus.asSlice()
-    StyleState.FocusVisible => node.focusVisible.asSlice()
+    StyleState.Hover => node.hover()
+    StyleState.Active => node.active()
+    StyleState.Focus => node.focus()
+    StyleState.FocusVisible => node.focusVisible()
     _ => node.base.asSlice()
   }
 }
@@ -7179,7 +8444,7 @@ fn tableSpans(node: &Node, layout: &mut CssStyle) {
   layout.columnSpan = 1
   layout.rowSpan = 1
   if let Option.Some { value: identity } = node.identity() {
-    let attributes = identity.attributes.asSlice()
+    let attributes = identity.attributes()
     let mut i: usize = 0
     while i < attributes.length {
       let name = String.view(&attributes[i].name)

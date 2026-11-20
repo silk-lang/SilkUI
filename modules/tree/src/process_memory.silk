@@ -24,6 +24,48 @@ static if Intrinsic.targetOperatingSystem() == "darwin" {
     if status != 0 || count < 38 { return 0 }
     return u64.shiftLeft(u32.toU64(info[37]), 32) | u32.toU64(info[36])
   }
+
+  /// Nothing to set in the process: see `useSpaceEfficientMalloc`.
+  pub fn returnLargeFrees() -> () {}
+
+  // Declared as `silk.io.logger_native` and `silk.system.system_info_native` declare them.
+  @foreign(noCapture: .("name"))
+  unsafe extern "C" fn getenv(name: ?[*]const u8) -> ?[*]const u8
+  @foreign(noCapture: ("name", "value"))
+  unsafe extern "C" fn setenv(name: ?[*]const u8, value: ?[*]const u8, overwrite: i32) -> i32
+  unsafe extern "C" fn _NSGetArgv() -> *const ?[*]const ?[*]const u8
+  @foreign(noCapture: ("buffer", "size"))
+  unsafe extern "C" fn _NSGetExecutablePath(buffer: ?[*]mut u8, size: *mut u32) -> i32
+  @foreign(noCapture: ("path", "argv"))
+  unsafe extern "C" fn execv(path: ?[*]const u8, argv: ?[*]const ?[*]const u8) -> i32
+
+  fn isSet(name: &[u8]) -> bool {
+    return !Pointer.isNullMany<u8>(unsafe getenv(Pointer.fromSlice<u8>(name)))
+  }
+
+  /// Starts this program again with macOS's space-efficient allocator, unless it already runs
+  /// with it or `SILK_UI_MALLOC=default` asks for the default one. Returns when it does not
+  /// restart (either variable set, or the restart failed); a restart that works never returns.
+  /// Call it first in `main`, before any thread starts.
+  ///
+  /// The default allocator keeps the pages of freed blocks dirty: layout scratch, a grown list's
+  /// old buffer or a transient string stays in the footprint after it is freed, and
+  /// `malloc_zone_pressure_relief` returns none of it (macOS 27). The space-efficient mode gives
+  /// pages back as they empty. `malloc` reads its `MallocSpaceEfficient` variable once, before
+  /// `main`, hence the restart. Headless React demo on an M1 Max, footprint after the first
+  /// frame: 1,000 chat messages 263 to 199 MB, 2,000 paragraphs 128 to 52 MB, layout time the
+  /// same.
+  pub fn useSpaceEfficientMalloc() -> () {
+    if isSet(b"MallocSpaceEfficient\x00") || isSet(b"SILK_UI_MALLOC\x00") { return }
+    let mut path: [u8; 1025] = [0; 1025]
+    let mut size: u32 = 1024
+    if unsafe _NSGetExecutablePath(Pointer.fromMutSlice<u8>(&mut path), Pointer.fromMutRef<u32>(&mut size)) != 0 { return }
+    if unsafe setenv(Pointer.fromSlice<u8>(b"MallocSpaceEfficient\x00"), Pointer.fromSlice<u8>(b"1\x00"), 1) != 0 { return }
+    let argv = unsafe Pointer.read<?[*]const ?[*]const u8>(unsafe _NSGetArgv())
+    let _failed = unsafe execv(Pointer.fromSlice<u8>(&path), argv)
+    // The restart failed: go on with the default allocator. The variable stays set, so the
+    // program's children get the space-efficient one.
+  }
 } else {
 static if Intrinsic.targetOperatingSystem() == "linux" {
   import silk.mem.pointer { Pointer }
@@ -35,13 +77,32 @@ static if Intrinsic.targetOperatingSystem() == "linux" {
   unsafe extern "C" fn open(path: ?[*]const u8, flags: i32, ...) -> i32
   unsafe extern "C" fn close(fd: i32) -> i32
   unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isize
+  unsafe extern "C" fn mallopt(parameter: i32, value: i32) -> i32
+
+  // glibc's `M_MMAP_THRESHOLD`.
+  const MMAP_THRESHOLD: i32 = -3
+  // Buffers from this size up get a mapping of their own.
+  const LARGE_BUFFER: i32 = 65536
+
+  /// Has the allocator give each large buffer its own mapping, so freeing one returns its pages
+  /// at once. glibc's heap only shrinks from its end, so a long-lived allocation above a freed
+  /// list keeps the whole list resident: a feed of 1,000 items that was cleared stayed at 367 MB
+  /// and is 92 MB with this. glibc otherwise raises the threshold as large buffers are freed, up
+  /// to 32 MB, which is how a growing list ends up on the heap. Call once, before the first
+  /// large allocation. Other C libraries ignore the call.
+  pub fn returnLargeFrees() -> () {
+    let _set = unsafe mallopt(MMAP_THRESHOLD, LARGE_BUFFER)
+  }
+
+  /// Nothing to choose: only macOS's allocator has a mode to restart into.
+  pub fn useSpaceEfficientMalloc() -> () {}
 
   // `O_RDONLY | O_CLOEXEC`.
   const READ_ONLY: i32 = 524288
 
   /// The start of the file at `path` (ending in a zero byte) in `buffer`, and its length; 0 when
   /// it cannot be read.
-  fn readStart(path: &[u8], buffer: &mut [u8]) -> usize {
+  pub fn readStart(path: &[u8], buffer: &mut [u8]) -> usize {
     let fd = unsafe open(Pointer.fromSlice<u8>(path), READ_ONLY)
     if fd < 0 { return 0 }
     let capacity = buffer.length
@@ -125,11 +186,23 @@ static if Intrinsic.targetOperatingSystem() == "windows" {
     if unsafe K32GetProcessMemoryInfo(unsafe GetCurrentProcess(), Pointer.fromMutRef<Counters>(&mut counters), 80) == 0 { return 0 }
     return counters.privateUsage
   }
+
+  /// Nothing to set on Windows.
+  pub fn returnLargeFrees() -> () {}
+
+  /// Nothing to choose: only macOS's allocator has a mode to restart into.
+  pub fn useSpaceEfficientMalloc() -> () {}
 } else {
   /// The process's footprint in bytes, or 0 when the system cannot say.
   pub fn footprint() -> u64 {
     return 0
   }
+
+  /// Nothing to set here.
+  pub fn returnLargeFrees() -> () {}
+
+  /// Nothing to choose: only macOS's allocator has a mode to restart into.
+  pub fn useSpaceEfficientMalloc() -> () {}
 }
 }
 }

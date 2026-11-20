@@ -17,10 +17,22 @@ pub struct CustomValue { pub state: StyleState, pub name: String, pub tokens: To
 
 pub struct NamedAttribute { pub name: String, pub value: String }
 
+/// What few nodes' identities hold, on the heap: an identity gets one with the first of these
+/// it is given. Each is a list or a text whose header alone is 64 bytes, and every element of
+/// a document has an identity. Read them through the identity (`NodeIdentity.attributes`, ...),
+/// which gives the empty value without one.
+pub struct IdentityExtras {
+  pub containerNames: List<Bytes>,
+  pub custom: List<CustomValue>,
+  pub id: String,
+  pub attributes: List<NamedAttribute>,
+}
+
 pub struct NodeIdentity {
   pub selection: Option<Box<Selection>>,
   pub scrollbars: Option<Box<Scrollbars>>,
-  pub containerNames: List<Bytes>,
+  /// Container names, custom properties, the id and named attributes (see `IdentityExtras`).
+  pub extras: Option<Box<IdentityExtras>>,
   pub generatedOrigin: u32,
   pub generatedTarget: PseudoTarget,
   pub before: u32,
@@ -34,80 +46,159 @@ pub struct NodeIdentity {
   pub letterRules: bool,
   /// The hidden node holding an origin's `::first-line` style, or u32.MAX.
   pub lineBox: u32,
-  pub custom: List<CustomValue>,
   pub tag: String,
-  pub id: String,
   pub classes: String,
   pub hasId: bool,
   pub hasClasses: bool,
   /// Sorted unique atom ids, so class order and repeated tokens do not change sharing keys.
   pub classAtoms: List<usize>,
-  pub attributes: List<NamedAttribute>,
 }
 
 impl NodeIdentity {
+  fn extrasOf(self: &Self) -> Option<&IdentityExtras> {
+    return match &self.extras {
+      Option<Box<IdentityExtras>>.Some { value } => Option<&IdentityExtras>.Some { value: &value.get()[0] }
+      Option<Box<IdentityExtras>>.None => Option<&IdentityExtras>.None
+    }
+  }
+
+  /// The rarer parts to change, made on first use.
+  pub effect fn extrasMut(self: &mut Self) -> &mut IdentityExtras ! OutOfMemoryError ? &mut Allocator {
+    if self.extras.isNone() {
+      self.extras = Option<Box<IdentityExtras>>.Some { value: run Box<IdentityExtras>.make(IdentityExtras {
+        containerNames: List<Bytes>.make(), custom: List<CustomValue>.make(), id: String.make(), attributes: List<NamedAttribute>.make(),
+      }) }
+    }
+    match &mut self.extras {
+      Option<Box<IdentityExtras>>.Some { value } => {
+        return &mut value.getMut()[0]
+      }
+      Option<Box<IdentityExtras>>.None => {
+        return Intrinsic.trap("ui-tree: the identity's extras were just made")
+      }
+    }
+  }
+
+  // The rarer parts to change, when the identity has them.
+  fn extrasHeld(self: &mut Self) -> Option<&mut IdentityExtras> {
+    return match &mut self.extras {
+      Option<Box<IdentityExtras>>.Some { value } => Option<&mut IdentityExtras>.Some { value: &mut value.getMut()[0] }
+      Option<Box<IdentityExtras>>.None => Option<&mut IdentityExtras>.None
+    }
+  }
+
+  /// The container names the node's style gives it.
+  pub fn containerNames(self: &Self) -> &[Bytes] {
+    return match self.extrasOf() { Option.Some { value } => value.containerNames.asSlice() _ => &[] }
+  }
+
+  /// The custom properties set on the node itself.
+  pub fn custom(self: &Self) -> &[CustomValue] {
+    return match self.extrasOf() { Option.Some { value } => value.custom.asSlice() _ => &[] }
+  }
+
+  /// The element id; it counts when `hasId`.
+  pub fn id(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.id) _ => "" }
+  }
+
+  /// The named attributes selectors can read.
+  pub fn attributes(self: &Self) -> &[NamedAttribute] {
+    return match self.extrasOf() { Option.Some { value } => value.attributes.asSlice() _ => &[] }
+  }
+
+  pub effect fn setContainerNames(self: &mut Self, names: List<Bytes>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if names.length() == 0 && self.extras.isNone() { return () }
+    let extras = run self.extrasMut()
+    extras.containerNames = move names
+  }
+
+  pub effect fn setId(self: &mut Self, id: String) -> () ! OutOfMemoryError ? &mut Allocator {
+    let extras = run self.extrasMut()
+    extras.id = move id
+    self.hasId = true
+  }
+
   pub fn clearCustom(self: &mut Self, state: StyleState) -> () {
-    let mut i = self.custom.length()
-    while i > 0 {
-      i = i - 1
-      if self.custom.asSlice()[i].state == state { drop self.custom.remove(i) }
+    if let Option.Some { value: extras } = self.extrasHeld() {
+      let mut i = extras.custom.length()
+      while i > 0 {
+        i = i - 1
+        if extras.custom.asSlice()[i].state == state { drop extras.custom.remove(i) }
+      }
     }
   }
   pub effect fn setCustom(self: &mut Self, state: StyleState, name: String, tokens: Option<TokenBuffer>, important: bool) -> ()
     ! OutOfMemoryError ? &mut Allocator {
+    if tokens.isNone() && self.extras.isNone() { return () }
+    let extras = run self.extrasMut()
     let mut i: usize = 0
-    while i < self.custom.length() {
-      let item = &self.custom.asSlice()[i]
+    while i < extras.custom.length() {
+      let item = &extras.custom.asSlice()[i]
       if item.state == state && String.view(&item.name) == String.view(&name) { break }
       i = i + 1
     }
     match move tokens {
       Option<TokenBuffer>.Some { value } => {
         let item = CustomValue { state: state, name: move name, tokens: move value, important: important }
-        if i == self.custom.length() { run self.custom.append(move item) }
-        else { let items = self.custom.asMutSlice()
+        if i == extras.custom.length() { run extras.custom.append(move item) }
+        else { let items = extras.custom.asMutSlice()
           items[i] = move item }
       }
-      _ => { if i < self.custom.length() { drop self.custom.remove(i) } }
+      _ => { if i < extras.custom.length() { drop extras.custom.remove(i) } }
     }
   }
 
   pub effect fn set(self: &mut Self, name: String, value: Option<String>) -> ()
     ! OutOfMemoryError ? &mut Allocator {
+    if value.isNone() && self.extras.isNone() { return () }
+    let extras = run self.extrasMut()
     let mut index: usize = 0
-    while index < self.attributes.length() {
-      if String.view(&self.attributes.asSlice()[index].name) == String.view(&name) { break }
+    while index < extras.attributes.length() {
+      if String.view(&extras.attributes.asSlice()[index].name) == String.view(&name) { break }
       index = index + 1
     }
     match move value {
       Option<String>.Some { value: text } => {
-        if index < self.attributes.length() { let items = self.attributes.asMutSlice()
+        if index < extras.attributes.length() { let items = extras.attributes.asMutSlice()
           items[index].value = move text
         }
-        else { run self.attributes.append(NamedAttribute { name: move name, value: move text }) }
+        else { run extras.attributes.append(NamedAttribute { name: move name, value: move text }) }
       }
       Option<String>.None => {
-        if index < self.attributes.length() { drop self.attributes.remove(index) }
+        if index < extras.attributes.length() { drop extras.attributes.remove(index) }
       }
     }
   }
 
   pub fn make() -> Self {
-    return NodeIdentity { selection: Option<Box<Selection>>.None, scrollbars: Option<Box<Scrollbars>>.None, containerNames: List<Bytes>.make(), generatedOrigin: u32.MAX, generatedTarget: PseudoTarget.None, before: u32.MAX, after: u32.MAX, marker: u32.MAX, letterBox: u32.MAX, letterText: u32.MAX, letterRules: false, lineBox: u32.MAX,
-      custom: List<CustomValue>.make(), tag: String.make(), id: String.make(), classes: String.make(),
-      hasId: false, hasClasses: false, classAtoms: List<usize>.make(), attributes: List<NamedAttribute>.make() }
+    return NodeIdentity { selection: Option<Box<Selection>>.None, scrollbars: Option<Box<Scrollbars>>.None, extras: Option<Box<IdentityExtras>>.None, generatedOrigin: u32.MAX, generatedTarget: PseudoTarget.None, before: u32.MAX, after: u32.MAX, marker: u32.MAX, letterBox: u32.MAX, letterText: u32.MAX, letterRules: false, lineBox: u32.MAX, tag: String.make(), classes: String.make(), hasId: false, hasClasses: false, classAtoms: List<usize>.make() }
   }
 }
 
-pub struct Atoms { names: List<Bytes> }
+pub struct Atoms { names: List<Bytes>, pub interns: usize, pub compares: usize }
 fn space(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13 }
 
 impl Atoms {
-  pub fn make() -> Self { return Atoms { names: List<Bytes>.make() } }
+  pub fn make() -> Self { return Atoms { names: List<Bytes>.make(), interns: 0, compares: 0 } }
 
-  pub effect fn intern(self: &mut Self, text: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  /// For the bench census: the atoms, and the bytes of their names.
+  pub fn length(self: &Self) -> usize { return self.names.length() }
+  pub fn nameBytes(self: &Self) -> usize {
+    let mut total: usize = 0
     let mut i: usize = 0
     while i < self.names.length() {
+      total = total + self.names.asSlice()[i].asSlice().length
+      i = i + 1
+    }
+    return total
+  }
+
+  pub effect fn intern(self: &mut Self, text: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    self.interns = self.interns + 1
+    let mut i: usize = 0
+    while i < self.names.length() {
+      self.compares = self.compares + 1
       if equal(self.names.asSlice()[i].asSlice(), text) { return i }
       i = i + 1
     }

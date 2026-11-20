@@ -1,6 +1,7 @@
-import host { Kind, Plan }
+import host { Kind, Plan, Allows }
 import host
 import stylesheets
+import process
 import css_style.sheet { Sheet }
 import css_style.sheet_fonts { FaceSource }
 import css_style.tokens { equal }
@@ -17,7 +18,7 @@ import silk.text.string { String }
 
 fn plan(target: string<'static>, kind: Kind, dev: bool, count: usize) -> Plan {
   return Plan { target: target, kind: kind, dev: dev, title: "Styles", width: 400.0,
-    height: 300.0, transparentTitleBar: false, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, module: "app", command: "", stylesheets: count, runtimeCss: false, natives: false, metalHud: false }
+    height: 300.0, transparentTitleBar: false, titleBarHeight: 0.0, controlsLeft: 0.0, controlsTop: 0.0, module: "app", command: "", stylesheets: count, runtimeCss: false, natives: false, image: false, metalHud: false, allows: Allows.none() }
 }
 
 effect fn generatedHosts() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
@@ -53,6 +54,22 @@ effect fn generatedHosts() -> () ! OutOfMemoryError | AssertionError<'static> ? 
   runtime.runtimeCss = true
   let runtimeHost = run host.main(&runtime)
   run Testing.expect(String.contains(String.view(&runtimeHost), "releaseWithRuntimeSheets as release") && String.contains(String.view(&runtimeHost), "app_bundle.data, &[]"), "runtime text compilation is an explicit release option even without embedded sheets")
+  // A release host on the engine with a bytecode image starts from it and keeps the text.
+  let mut imaged = plan("window", Kind.Engine, false, 0)
+  imaged.image = true
+  let imagedHost = run host.main(&imaged)
+  run Testing.expect(String.contains(String.view(&imagedHost), "import app_bundle\nimport app_image\nimport core_image\n") && String.contains(String.view(&imagedHost), "Bundle, releaseBundle as release }"), "a host with an image embeds it beside the bundle and the library's image")
+  run Testing.expect(String.contains(String.view(&imagedHost), "Bundle { source: app_bundle.data, image: app_image.data, library: core_image.data }, &[])"), "the image goes to the release entry with the bundle's text, and no sheets")
+  imaged.stylesheets = 2
+  let imagedSheets = run host.main(&imaged)
+  run Testing.expect(String.contains(String.view(&imagedSheets), "library: core_image.data }, &[style_0.data, style_1.data])"), "an imaged host embeds its sheets in adoption order")
+  imaged.runtimeCss = true
+  let imagedRuntime = run host.main(&imaged)
+  run Testing.expect(String.contains(String.view(&imagedRuntime), "Bundle, releaseBundleWithRuntimeSheets as release }"), "an imaged host keeps the runtime compiler option")
+  imaged.dev = true
+  let imagedDev = run host.main(&imaged)
+  run Testing.expect(!String.contains(String.view(&imagedDev), "app_image") && !String.contains(String.view(&imagedDev), "app_bundle"), "a development host has no bundle and no image: it runs what the server sends")
+  run Testing.expect(!String.contains(String.view(&runtimeHost), "app_image"), "a host without an image starts from the bundle's text")
   runtime.kind = Kind.Node
   let runtimeNode = run host.main(&runtime)
   run Testing.expect(String.contains(String.view(&runtimeNode), "releaseWithRuntimeSheets as release"), "Node release hosts share the runtime compiler option")
@@ -177,4 +194,41 @@ effect fn hostNatives() ! OutOfMemoryError | AssertionError<'static> ? &mut Allo
 test effect fn generatedHostsPassExportedFunctions() ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run hostNatives() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn stopsTheWholeGroup() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut FileSystem {
+  let temporary = run FileSystem.temporaryDirectory(&run Path.root(), "silkui-stop-")
+  let ready = run Path.resolve(&temporary.path, "ready")
+  let stopped = run Path.resolve(&temporary.path, "stopped")
+  // The leader waits for a process of its own, as npm waits for Vite: stopping only the leader
+  // would leave that one running.
+  // It gives up after ten seconds, so a failing run leaves nothing behind.
+  let script = "(trap 'echo > stopped; exit 0' TERM; echo > ready; i=0; while [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done) </dev/null >/dev/null 2>&1 & wait"
+  // The file system is rooted at /tmp, so its paths are relative to that.
+  let name = temporary.path.view().unwrapOr("")
+  let mut directory = run String.copy("/tmp")
+  if !String.startsWith(name, "/") { run String.append(&mut directory, "/") }
+  run String.append(&mut directory, name)
+  let mut child = run process.start("sh", &["-c", script], String.view(&directory), &[])
+  let mut waited: u32 = 0
+  while waited < 200 {
+    if run FileSystem.exists(&ready) { break }
+    process.pause(25)
+    waited = waited + 1
+  }
+  let started = run FileSystem.exists(&ready)
+  child.stop()
+  run Testing.expect(started, "the program started its own process")
+  run Testing.expect(child.ended(), "stop waits for the program")
+  run Testing.expect(run FileSystem.exists(&stopped), "stop reaches what the program started")
+}
+
+effect fn stopsInTmp() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/tmp")
+  run stopsTheWholeGroup() |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn stoppingAProgramStopsWhatItStarted() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run stopsInTmp() |> Effect.provideMut<Allocator>(&mut allocator)
 }

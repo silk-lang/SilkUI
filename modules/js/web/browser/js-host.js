@@ -25,7 +25,7 @@ const OP = {
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
-  capture: 29,
+  capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -157,6 +157,9 @@ export class JsHost {
       fontFamily(id, names) { write(OP.fontFamily, id); calls.text(names); },
       defineIcon(resource, markup) { write(OP.defineIcon, resource); calls.text(markup); },
       source(id, resource) { write(OP.source, id); calls.u32(resource); },
+      svgInsert(id, element, tag, parent, before) { write(OP.svgInsert, id); calls.u32(element); calls.text(tag); calls.u32(parent); calls.u32(before < 0 ? 0xffffffff : before); },
+      svgRemove(id, element) { write(OP.svgRemove, id); calls.u32(element); },
+      svgAttribute(id, element, name, value) { write(OP.svgAttribute, id); calls.u32(element); calls.text(name); calls.byte(typeof value === 'string' ? 1 : 0); calls.text(typeof value === 'string' ? value : ''); },
       load(resource, url, icon) { write(OP.load, resource); calls.text(url); calls.byte(icon ? 1 : 0); },
       release(resource) { write(OP.release, resource); },
       keyframe(offset, css) { calls.byte(OP.keyframe); calls.f64(offset); calls.text(css); host.queueWake(); },
@@ -167,6 +170,7 @@ export class JsHost {
       format(id, mark, on) { write(OP.format, id); calls.u32(mark); calls.byte(on ? 1 : 0); },
       insertAtom(id, start, end, atom) { write(OP.insertAtom, id); calls.u32(start); calls.u32(end); calls.text(atom); },
       markdown: (text, flags) => this.markdown(text, flags),
+      svgMeasure: (op, packed, distance) => this.svgMeasure(op, packed, distance),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
       // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
@@ -246,6 +250,21 @@ export class JsHost {
       new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
       if (!exports.silkui_validate_stylesheet(pointer, source.length)) throw new TypeError('invalid compiled stylesheet');
     } finally { exports.webgpu_free(pointer, source.length); }
+  }
+
+  svgMeasure(op, packed, distance) {
+    const exports = this.instance?.exports;
+    if (!exports?.silkui_svg_measure) return op === 1 ? '0' : op === 2 ? '0 0' : '0 0 0 0';
+    const source = encoder.encode(String(packed));
+    const pointer = exports.webgpu_alloc(source.length);
+    new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
+    const result = exports.silkui_svg_measure(pointer, source.length, op, Number(distance) || 0);
+    exports.webgpu_free(pointer, source.length);
+    if (!result) throw new Error('svg measuring ran out of memory');
+    const length = new DataView(exports.memory.buffer).getUint32(result, true);
+    const answer = decoder.decode(new Uint8Array(exports.memory.buffer, result + 4, length));
+    exports.webgpu_free(result, length + 4);
+    return answer;
   }
 
   markdown(text, flags) {

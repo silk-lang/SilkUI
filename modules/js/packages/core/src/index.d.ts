@@ -37,7 +37,12 @@ export interface Look {
 }
 
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
+/** What `signal` needs from an `AbortSignal`. */
+export interface ListenerSignal {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+}
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: ListenerSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {
@@ -142,6 +147,15 @@ export class Node {
   readonly offsetTop: number;
   readonly offsetWidth: number;
   readonly offsetHeight: number;
+  /** Whether this node matches CSS `selector`, by the stylesheet matcher. Throws a SyntaxError for an invalid selector. */
+  matches(selector: string): boolean;
+  webkitMatchesSelector(selector: string): boolean;
+  /** This node or its nearest ancestor that matches `selector`. */
+  closest(selector: string): Node | null;
+  /** The first descendant, in tree order, that matches `selector`. */
+  querySelector(selector: string): Node | null;
+  /** Every descendant that matches `selector`, in tree order (a static list). */
+  querySelectorAll(selector: string): Node[];
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   /** The app's own event types, sent with `dispatchEvent`. */
   addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
@@ -364,7 +378,10 @@ export class SvgText {
   destroy(): void;
 }
 
-/** An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node. */
+/**
+ * An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node.
+ * Once the root has drawn, a change to its elements updates them one at a time.
+ */
 export class SvgElement {
   constructor(tag: string);
   readonly localName: string;
@@ -378,6 +395,26 @@ export class SvgElement {
   /** SVG's names, or React's spellings (`strokeWidth`, `xlinkHref`). */
   setAttribute(name: string, value: unknown): void;
   removeAttribute(name: string): void;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
+  removeAttributeNS(namespace: string | null, name: string): void;
+  /** The `style` attribute as declarations: `element.style.display = "none"`. */
+  readonly style: Record<string, string>;
+  /**
+   * Hears pointer events (`click`, `pointerdown`, `pointerenter`...) on its shapes, as on the
+   * web; its `<svg>` turns live so the tree can tell which shape is under the pointer.
+   */
+  addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  dispatchEvent(event: globalThis.Event): boolean;
+  /** The box of its geometry in its own user space: a shape's fill, a group's children. */
+  getBBox(): { x: number; y: number; width: number; height: number };
+  /** The length of a shape's outline in user units. */
+  getTotalLength(): number;
+  /** The point `distance` along a shape's outline, clamped to its ends. */
+  getPointAtLength(distance: number): { x: number; y: number };
   insertBefore<T extends SvgElement | SvgText | Text>(child: T, before?: SvgElement | SvgText | Text | null): T;
   appendChild<T extends SvgElement | SvgText | Text>(child: T): T;
   append(...children: (SvgElement | SvgText | Text | string)[]): void;
@@ -390,11 +427,16 @@ export class SvgElement {
  * An inline `<svg>`: one node drawing the markup its `SvgElement` children make, at its CSS
  * size (else its `width` and `height`, else a square of the font size), with its `color` as
  * `currentColor`. Class, look, events and ARIA are the node's; `viewBox`, `fill`, `width`
- * and the rest are markup.
+ * and the rest are markup. After its first draw, changes go to the tree element by element
+ * and only the shapes that changed redraw, so scripts can animate it (lottie-web and the like).
  */
 export class Svg extends Node {
   constructor();
   readonly outerHTML: string;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
+  /** The box of what it draws, in its user space (inside `viewBox`). */
+  getBBox(): { x: number; y: number; width: number; height: number };
   textContent: string;
 }
 

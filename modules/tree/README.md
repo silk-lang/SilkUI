@@ -391,7 +391,11 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
 `frame` resolves styles, lays out, and paints:
 
 - **Layout** is incremental. Style changes reach css-layout only when they change a layout
-  input, and an unchanged tree at an unchanged size skips `compute`.
+  input, and an unchanged tree at an unchanged size skips `compute`. css-layout reads the
+  tree through its `LayoutSource` interface (`src/layout_table.silk`). It does not use a copy
+  in its own `Tree`. Each layout node is a row of links and a style index, 29 bytes. Elements
+  with equal layout styles share one style entry. A text node reads its text from its UI
+  node.
 - **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid, or
   linear, radial and conic gradients, and `url()` images the host loads), border (solid or dashed, per side, with radii), outer and inset shadow,
   opacity (an isolated layer) and `overflow: hidden` clip. Text is drawn from css-layout's text
@@ -517,8 +521,7 @@ the wasm build draw the same bytes.
 - Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
   scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
 - Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
-- Transforms flatten into their parent's plane (no `transform-style: preserve-3d`), and a
-  transformed box that is not a pure translation is resampled from its own layer, so magnified
+- A transformed box that is not a pure translation is resampled from its own layer, so magnified
   content is softer than content painted at that size. Caret and range rectangles ignore
   transforms.
 - Editing moves logically: in right-to-left text the arrows follow the text order, not the
