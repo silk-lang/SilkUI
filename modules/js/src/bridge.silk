@@ -14,6 +14,8 @@ import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
 import silk.num.u8
+import silk.num.u16
+import silk.collections.slice { Slice }
 import silk.num.usize
 import silk.num.u64
 import silk.num.u32
@@ -27,6 +29,7 @@ import ui_tree.style_media { MediaState }
 import ui_tree.battery
 import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
+import generated_clipboard { clipboardApi }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
 import ui_tree.computed_style
 import ui_tree.cssom_view
@@ -60,6 +63,10 @@ import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
 import ui_js_calls.supports as supports
 import ui_js_calls.natives { Natives, NativeCall, Reply }
+import ui_js_calls.gpu { GpuReply }
+import generated_webgpu_api { gpuApi }
+import silkjs.js_buffer_storage { ViewObject }
+import silkjs.js_buffer_storage as buffers
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
@@ -208,6 +215,19 @@ pub const UNOBSERVE: u32 = 571481 // nativeId(b"unobserve")
 pub const QUERY: u32 = 1055226 // nativeId(b"query")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
+/// `__ui.gpu(bytes)`: WebGPU commands (`webgpu.js` wrote them into the typed array `bytes`) for
+/// the host's GPU service, which takes them once the JavaScript turn ended.
+pub const GPU: u32 = 168108 // nativeId(b"gpu")
+/// `__ui.gpuApi()`: the source of `webgpu.js`, which the prelude evaluates on first use.
+pub const GPU_API: u32 = 312308 // nativeId(b"gpuApi")
+/// `__ui.gpuEnabled()`: whether the host runs WebGPU commands (`navigator.gpu` is there).
+pub const GPU_ENABLED: u32 = 1077775 // nativeId(b"gpuEnabled")
+/// `__ui.gpuReply(index, field)`: reply `index` of the replies the host called
+/// `__ui.gpuReplies(count)` for: field 0 its token, 1 its status, 2 its number, 3 its text and
+/// 4 how many bytes it has.
+pub const GPU_REPLY: u32 = 938260 // nativeId(b"gpuReply")
+/// `__ui.gpuReplyBytes(index, into)`: copies the bytes of reply `index` into typed array `into`.
+pub const GPU_REPLY_BYTES: u32 = 839230 // nativeId(b"gpuReplyBytes")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
 pub const NOW: u32 = 174806 // nativeId(b"now")
 /// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
@@ -219,6 +239,14 @@ pub const CLIPBOARD_READ: u32 = 868924 // nativeId(b"clipboardRead")
 /// `__ui.clipboardWrite(call, text)`: asks the host to put `text` on the system clipboard,
 /// answered with `__ui.clipboard(call)`.
 pub const CLIPBOARD_WRITE: u32 = 623693 // nativeId(b"clipboardWrite")
+/// `__ui.clipboardReadItem(call)`: asks the host for the clipboard's item, answered with
+/// `__ui.clipboardItem(call, header, body)` (see [`encodeItem`]).
+pub const CLIPBOARD_READ_ITEM: u32 = 857949 // nativeId(b"clipboardReadItem")
+/// `__ui.clipboardWriteItem(call, header, body)`: asks the host to replace the clipboard with
+/// one item, answered with `__ui.clipboard(call)`.
+pub const CLIPBOARD_WRITE_ITEM: u32 = 919003 // nativeId(b"clipboardWriteItem")
+/// `__ui.clipboardApi()`: the source of `clipboard.js`, which the prelude evaluates on first use.
+pub const CLIPBOARD_API: u32 = 346060 // nativeId(b"clipboardApi")
 /// `__ui.shell(call, op, text)`: asks the host for a desktop feature, answered with
 /// `__ui.shellAnswer(call, value)`. The ops and how `text` packs their arguments are
 /// [`ShellRequest`]'s.
@@ -362,6 +390,12 @@ pub struct Bridge {
   pub geometry: List<f64>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
+  /// Whether the host runs WebGPU commands.
+  pub gpuEnabled: bool,
+  /// The WebGPU commands JavaScript wrote since the host last took them (`__ui.gpu`).
+  pub gpuCommands: List<u8>,
+  /// What the host's GPU service answered, while `__ui.gpuReplies` reads them.
+  pub gpuReplies: List<GpuReply>,
   /// For the bench census: every `__ui.*` call JavaScript made; and for the collections,
   /// the allocator's bytes and blocks as each began and the sums of what each freed.
   pub calls: usize,
@@ -398,6 +432,119 @@ pub struct ShellRequest {
 pub union ClipboardRequest {
   Read { pub call: u32 },
   Write { pub call: u32, pub text: String },
+  /// `navigator.clipboard.read()`: answered with the item's representations.
+  ReadItem { pub call: u32 },
+  /// `navigator.clipboard.write()`: one item, a representation per type.
+  WriteItem { pub call: u32, pub entries: List<ClipboardData> },
+}
+
+/// One representation of a clipboard item: its MIME type and bytes.
+pub struct ClipboardData {
+  pub mime: String,
+  pub data: Bytes,
+}
+
+/// An item as clipboard.js reads it: a header of "<type> <byte length>" lines and a body of
+/// the representations' bytes, one after another.
+pub struct EncodedItem {
+  pub header: String,
+  pub body: Bytes,
+}
+
+/// `entries` as the header and body clipboard.js reads.
+pub effect fn encodeItem(entries: &[ClipboardData]) -> EncodedItem ! OutOfMemoryError ? &mut Allocator {
+  let mut header = String.make()
+  let mut body = Bytes.make()
+  let mut i: usize = 0
+  while i < entries.length {
+    if i != 0 { run String.append(&mut header, "\n") }
+    run String.append(&mut header, entries[i].mime.view())
+    run String.append(&mut header, " ")
+    run appendNumber(&mut header, entries[i].data.length())
+    run body.append(entries[i].data.asSlice())
+    i = i + 1
+  }
+  return EncodedItem { header: move header, body: move body }
+}
+
+effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendNumber(&mut out, value / 10) }
+  let digit = [usize.toU8(48 + value % 10)]
+  run String.append(&mut out, unsafe String.fromUtf8Unchecked(&digit))
+}
+
+/// The entries of a header and body clipboard.js wrote; none when they do not agree.
+effect fn decodeItem(header: string, body: &[u8]) -> Option<List<ClipboardData>> ! OutOfMemoryError ? &mut Allocator {
+  let mut entries = List<ClipboardData>.make()
+  if String.byteLength(header) == 0 { return Option<List<ClipboardData>>.some(move entries) }
+  let mut lines = String.split(header, "\n")
+  let mut at: usize = 0
+  while true {
+    match move lines.next() {
+      Option<string>.Some { value: line } => {
+        let bytes = String.utf8Bytes(line)
+        let mut space = bytes.length
+        while space > 0 && bytes[space - 1] != 32 { space = space - 1 }
+        if space == 0 { return Option<List<ClipboardData>>.None }
+        let mut length: usize = 0
+        let mut d = space
+        while d < bytes.length {
+          if bytes[d] < 48 || bytes[d] > 57 { return Option<List<ClipboardData>>.None }
+          length = length * 10 + u8.toUsize(bytes[d] - 48)
+          d = d + 1
+        }
+        if at + length > body.length { return Option<List<ClipboardData>>.None }
+        let mime = run String.copy(String.slice(line, 0, space - 1))
+        let data = run Bytes.copy(Slice.view(body, at, length))
+        run entries.append(ClipboardData { mime: move mime, data: move data })
+        at = at + length
+      }
+      _ => { break }
+    }
+  }
+  return Option<List<ClipboardData>>.some(move entries)
+}
+
+/// The bytes of a string whose code units are all below 256 (a "binary string"); higher
+/// units keep their low byte.
+effect fn latin1<'v>(value: ValueRef<'v>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let bits = value.view()
+  if !bits.isString() { return Bytes.make() }
+  let flat = Strings.flatView(bits)
+  let length = Strings.length(flat)
+  let mut bytes = run Bytes.zeroed(length)
+  let mut writable = bytes.asMutSlice()
+  let mut i: usize = 0
+  while i < length {
+    writable[i] = u16.toU8(Strings.codeUnit(flat, i) % 256)
+    i = i + 1
+  }
+  drop writable
+  return move bytes
+}
+
+/// Where typed array `value` keeps the bytes it shows and how many there are; no bytes for
+/// anything else and for a detached or out of bounds view. The pointer holds while no
+/// JavaScript runs.
+struct ViewBytes {
+  data: [*]mut u8,
+  length: usize,
+}
+
+fn viewBytes<'v>(value: ValueRef<'v>) -> Option<ViewBytes> {
+  let view = match ViewObject<'v>.ofTypedArray(value) {
+    Option<ViewObject<'v>>.Some { value: found } => found
+    Option<ViewObject<'v>>.None => { return Option<ViewBytes>.None }
+  }
+  if view.isOutOfBounds() { return Option<ViewBytes>.None }
+  let span = view.span()
+  if span.bytes.detached || Pointer.isNull<u8>(span.bytes.data) { return Option<ViewBytes>.None }
+  let length = usize.shiftLeft(u64.toUsize(view.count()), u32.toUsize(buffers.sizeLog2(view.classId())))
+  if length == 0 { return Option<ViewBytes>.None }
+  return Option<ViewBytes>.some(ViewBytes {
+    data: unsafe Pointer.assumeManyMut<u8>(unsafe buffers.dataAt(span.bytes.data, span.offset)),
+    length: length,
+  })
 }
 
 /// A rejected promise nothing handles yet. Both values are owned.
@@ -433,6 +580,9 @@ impl Bridge {
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
       observers: Observers.make(),
+      gpuEnabled: false,
+      gpuCommands: List<u8>.make(),
+      gpuReplies: List<GpuReply>.make(),
       calls: 0,
       gcBeforeBytes: 0, gcBeforeBlocks: 0, gcFreedBytes: 0, gcFreedBlocks: 0, gcScannedBytes: 0,
     }
@@ -540,8 +690,11 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"computed", arity: 2 },
     Native { name: b"capture", arity: 1 },
     Native { name: b"clearStyle", arity: 2 },
+    Native { name: b"clipboardApi", arity: 0 },
     Native { name: b"clipboardRead", arity: 1 },
+    Native { name: b"clipboardReadItem", arity: 1 },
     Native { name: b"clipboardWrite", arity: 2 },
+    Native { name: b"clipboardWriteItem", arity: 3 },
     Native { name: b"create", arity: 2 },
     Native { name: b"defineIcon", arity: 2 },
     Native { name: b"destroy", arity: 1 },
@@ -582,6 +735,11 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"style", arity: 3 },
     Native { name: b"caret", arity: 2 },
     Native { name: b"geometry", arity: 1 },
+    Native { name: b"gpu", arity: 1 },
+    Native { name: b"gpuApi", arity: 0 },
+    Native { name: b"gpuEnabled", arity: 0 },
+    Native { name: b"gpuReply", arity: 2 },
+    Native { name: b"gpuReplyBytes", arity: 2 },
     Native { name: b"hit", arity: 2 },
     Native { name: b"hits", arity: 2 },
     Native { name: b"metrics", arity: 1 },
@@ -883,6 +1041,51 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     return Outcome.Returned { value: ValueBits.Bool { value: answer } }
   } else if function == QUERY {
     return run query(&mut bridge.*, first, id(argv.get(1).view()), argv.get(2))
+  } else if function == GPU {
+    if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
+      let anchor: u8 = 0
+      run bridge.gpuCommands.appendSlice(unsafe Pointer.borrowMany<u8, u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(bytes.data), bytes.length))
+    }
+  } else if function == GPU_API {
+    let made = run Effect.result(Strings.fromUtf8(gpuApi()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
+  } else if function == GPU_ENABLED {
+    return Outcome.Returned { value: ValueBits.Bool { value: bridge.gpuEnabled } }
+  } else if function == GPU_REPLY {
+    let replies = bridge.gpuReplies.asSlice()
+    let at = u32.toUsize(first)
+    if at >= replies.length { return Outcome.Returned { value: ValueBits.Undefined } }
+    let field = id(argv.get(1).view())
+    if field == 3 {
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&replies[at].text))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    let value = if field == 0 { u32.toF64(replies[at].token) }
+      else if field == 1 { u32.toF64(replies[at].status) }
+      else if field == 2 { replies[at].number }
+      else { usize.toF64(replies[at].bytes.length()) }
+    return Outcome.Returned { value: ValueBits.number(value) }
+  } else if function == GPU_REPLY_BYTES {
+    let replies = bridge.gpuReplies.asSlice()
+    let at = u32.toUsize(first)
+    if at < replies.length {
+      let from = replies[at].bytes.asSlice()
+      if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(1)) {
+        let mut anchor: u8 = 0
+        let into = unsafe Pointer.borrowManyMut<u8, u8>(&mut anchor, bytes.data, bytes.length)
+        let mut i: usize = 0
+        while i < from.length && i < into.length {
+          into[i] = from[i]
+          i = i + 1
+        }
+      }
+    }
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {
@@ -918,6 +1121,25 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == CLIPBOARD_WRITE {
     let value = run text(argv.get(1))
     run bridge.clipboard.append(ClipboardRequest.Write { call: first, text: move value })
+  } else if function == CLIPBOARD_READ_ITEM {
+    run bridge.clipboard.append(ClipboardRequest.ReadItem { call: first })
+  } else if function == CLIPBOARD_WRITE_ITEM {
+    let header = run text(argv.get(1))
+    let body = run latin1(argv.get(2))
+    match move run decodeItem(String.view(&header), body.asSlice()) {
+      Option.Some { value: entries } => run bridge.clipboard.append(ClipboardRequest.WriteItem { call: first, entries: move entries })
+      Option.None => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"clipboardWriteItem: the header does not describe the body")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  } else if function == CLIPBOARD_API {
+    let made = run Effect.result(Strings.fromUtf8(clipboardApi()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
   } else if function == SHELL {
     let packed = run text(argv.get(2))
     run bridge.shell.append(ShellRequest { call: first, op: id(argv.get(1).view()), text: move packed })
@@ -1072,6 +1294,12 @@ effect fn measured(batch: &mut Batch, tree: &mut UiTree<'_>, function: u32, args
   ? &mut Allocator {
   if batch.length() != 0 { run tree.apply(run batch.take()) }
   if tree.layoutPending() { run tree.layoutNow() }
+  // Geometry of an element under a skipped `content-visibility: auto` element is real only
+  // once it is awake.
+  if function == RECT || function == RECTS || function == METRICS || function == RANGE_RECTS {
+    run tree.wakeFor(idOf(args[0]))
+  }
+  if function == RANGE_RECTS { run tree.wakeFor(idOf(args[2])) }
   if function == SELECTION {
     run text_selection.refresh(&mut tree.*)
     let anchor = tree.textSelection.anchor

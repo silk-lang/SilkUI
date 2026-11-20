@@ -360,6 +360,9 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
     except OSError:
         pass
     proc.wait()
+    paths = [l.split("silk-ui: ", 1)[1] for l in lines if "silk-ui: canvas frames" in l]
+    if paths:
+        record["canvas_path"] = paths
     errors = [l for l in lines if "XB " not in l and re.search(r"error|panic|failed|exception", l, re.I) and "dbus" not in l]
     if errors:
         record["notes"] += errors[:5]
@@ -475,6 +478,11 @@ def main():
         for _ in range(a.prime):
             run_once(app, scenes[0], a.suite, a.uncapped or a.suite == "cpu", "warm", a.timeout, True, set())
     for scene in scenes:
+        if scene.split("-")[0] == "canvas":
+            # The canvas scene draws with WebGPU: a GPU and one of the two apps that have it.
+            unfit = [x for x in apps if x not in ("electron", "silk-react")]
+            if a.suite != "gpu" or unfit:
+                raise SystemExit("the canvas scene runs in the gpu suite, with electron and silk-react only")
         for r in range(a.runs):
             # Interleaved: every app once per round, so drift (thermal, other load) hits all alike.
             order = apps if r % 2 == 0 else apps[::-1]

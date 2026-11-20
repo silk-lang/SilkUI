@@ -128,6 +128,100 @@ test("preventDefault reaches the host for cancelable events only", () => {
   assert.equal(mock.native.dispatch(9, box.nodeId, 0, 0, 0, 0, 0), false);
 });
 
+test("copy, cut, paste and beforeinput follow the Clipboard API and events", async () => {
+  const box = createBox();
+  const field = createInput();
+  box.append(field);
+  mock.take();
+  const onCopy = (event) => {
+    event.clipboardData.setData("text/plain", "mine");
+    event.clipboardData.setData("text", "mine too");
+    event.clipboardData.setData("text/html", "<b>mine</b>");
+    event.preventDefault();
+  };
+  box.addEventListener("copy", onCopy);
+  box.addEventListener("cut", () => {});
+  assert.deepEqual(mock.take(), [["listen", box.nodeId, 2 ** 31]]);
+  field.addEventListener("beforeinput", (event) => seen.push(event));
+  const [[call, node, flags]] = mock.take();
+  assert.deepEqual([call, node, (flags & 2 ** 31) >>> 0], ["listen", field.nodeId, 2 ** 31], "beforeinput shares bit 31, beside what the input keeps");
+  box.removeEventListener("copy", onCopy);
+  assert.deepEqual(mock.take(), [], "cut still listens on the shared bit");
+  box.addEventListener("copy", onCopy);
+
+  const written = [];
+  const clipboard = { writeText: async (text) => written.push(["text", text]), write: async (items) => written.push(["items", items[0]]) };
+  const before = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard }, configurable: true });
+  globalThis.ClipboardItem = class ClipboardItem {
+    constructor(items) {
+      this.items = items;
+    }
+  };
+  const seen = [];
+  try {
+    // A prevented copy writes what the listener set; the tree copies nothing.
+    let kept;
+    box.addEventListener("copy", (event) => (kept = event), { once: true });
+    assert.equal(mock.native.dispatch(34, field.nodeId, 0, 0, 0, 0, 0), true);
+    assert.ok(kept instanceof globalThis.ClipboardEvent && kept.bubbles && kept.cancelable && kept.composed);
+    assert.deepEqual(written.length, 1);
+    assert.equal(kept.clipboardData.getData("text/plain"), "", "the data is protected after the event");
+    assert.deepEqual(kept.clipboardData.types, []);
+
+    // A cut no one prevents leaves the default to the tree.
+    assert.equal(mock.native.dispatch(35, field.nodeId, 0, 0, 0, 0, 0), false);
+    assert.equal(written.length, 1);
+
+    // A paste carries the clipboard, read-only.
+    let pasted;
+    box.addEventListener("paste", (event) => {
+      pasted = { types: event.clipboardData.types, text: event.clipboardData.getData("Text"), html: event.clipboardData.getData("text/html"), file: event.clipboardData.files[0] };
+      assert.throws(() => event.clipboardData.items.add("x", "text/plain"), { name: "InvalidStateError" });
+      event.clipboardData.setData("text/plain", "ignored");
+      event.preventDefault();
+    }, { once: true });
+    assert.equal(mock.native.dispatch(36, field.nodeId, 0, 0, 0, 0, 0, "plain", "<i>x</i>", "\x89PNG"), true);
+    assert.deepEqual(pasted.types, ["text/plain", "text/html", "Files"]);
+    assert.equal(pasted.text, "plain");
+    assert.equal(pasted.html, "<i>x</i>");
+    assert.equal(pasted.file.type, "image/png");
+    assert.deepEqual([...new Uint8Array(await pasted.file.arrayBuffer())], [0x89, 0x50, 0x4e, 0x47]);
+
+    // beforeinput says what the edit inserts, and preventing it cancels the edit.
+    field.addEventListener("beforeinput", (event) => event.preventDefault(), { once: true });
+    assert.equal(mock.native.dispatch(37, field.nodeId, 0, 0, 0, 0, 0, "plain", "insertFromPaste"), true);
+    const event = seen.at(-1);
+    assert.equal(event.inputType, "insertFromPaste");
+    assert.equal(event.data, "plain");
+    assert.deepEqual(event.getTargetRanges(), []);
+  } finally {
+    if (before) Object.defineProperty(globalThis, "navigator", before);
+    else delete globalThis.navigator;
+    delete globalThis.ClipboardItem;
+  }
+  const [kind, item] = written[0];
+  assert.equal(kind, "items");
+  assert.deepEqual(item.items, { "text/plain": "mine too", "text/html": "<b>mine</b>" });
+});
+
+test("DataTransfer stores strings and files as the web's does", () => {
+  const data = new globalThis.DataTransfer();
+  data.setData("Text", "a");
+  data.setData("text/plain", "b");
+  data.setData("URL", "# comment\nhttps://example.com\nhttps://two");
+  assert.deepEqual(data.types, ["text/plain", "text/uri-list"]);
+  assert.equal(data.getData("text"), "b");
+  assert.equal(data.getData("url"), "https://example.com");
+  assert.equal(data.items.length, 2);
+  assert.equal(data.items[0].kind, "string");
+  assert.throws(() => data.items.add("c", "text/plain"), { name: "NotSupportedError" });
+  data.clearData("text/plain");
+  assert.deepEqual(data.types, ["text/uri-list"]);
+  data.clearData();
+  assert.equal(data.items.length, 0);
+});
+
 test("pointer events carry the pointer, its buttons and the spec defaults", () => {
   const box = createBox();
   const seen = [];
@@ -861,4 +955,43 @@ test("svg elements measure their markup for getBBox and path lengths", () => {
     [1, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
     [2, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 45],
   ]);
+});
+
+test("an empty node shares no list with another, and its looks read back as CSS", () => {
+  const a = createBox();
+  const b = createBox();
+  assert.deepEqual(a.childNodes, []);
+  assert.equal(a.firstChild, null);
+  assert.equal(a.hasChildNodes(), false);
+  const child = createText("x");
+  assert.equal(child.kind, "text");
+  assert.equal(child.cloneNode().kind, "text");
+  assert.equal(a.kind, "box");
+  a.appendChild(child);
+  assert.deepEqual(a.childNodes, [child]);
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, a);
+  a.removeChild(child);
+  assert.deepEqual(a.childNodes, []);
+  b.insertBefore(child);
+  assert.equal(b.firstChild, child);
+  a.style.set({ width: 12, fontWeight: 600, color: "red" });
+  assert.equal(a.style.get("width"), "12px");
+  assert.equal(a.style.get("fontWeight"), "600");
+  assert.equal(a.style.cssText, "width:12px;font-weight:600;color:red;");
+  mock.take();
+  a.style.set({ width: 12 });
+  assert.deepEqual(mock.take(), []);
+  a.look("hover").set({ opacity: 0.5 });
+  a.setAttribute("data-x", "1");
+  let heard = 0;
+  a.addEventListener("click", () => heard++);
+  const copy = a.cloneNode(true);
+  assert.equal(copy.look("hover").get("opacity"), "0.5");
+  assert.equal(copy.getAttribute("data-x"), "1");
+  assert.equal(copy.style.cssText, a.style.cssText);
+  b.destroy();
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, null);
+  assert.equal(heard, 0);
 });

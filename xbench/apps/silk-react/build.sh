@@ -7,7 +7,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); XB=$(cd "$HERE/../.." && pwd); WEB=$XB/apps/react/web
 # The Silk UI checkout to build against: by default the one this suite lives in.
 SILKUI=${SILKUI:-$(cd "$(dirname "$0")/../../.." && pwd)}
-scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(feed wall stream churn)
+scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(feed wall stream churn canvas)
 VERSION=$(grep -m1 -oh '"0\.1\.0-dev\.[^"]*"' "$SILKUI/modules/silkui/window/silk.toml" "$SILKUI/silk.toml" | head -1 | tr -d '"')
 (cd "$WEB" && [[ -d node_modules/vite ]] || npm ci --no-audit --no-fund)
 mkdir -p "$WEB/node_modules/@silkui"

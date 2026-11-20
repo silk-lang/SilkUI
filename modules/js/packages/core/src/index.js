@@ -12,15 +12,16 @@ if (!native) throw new Error("@silkui/core needs the __ui functions of a ui-js h
 const KINDS = { box: 0, text: 1, input: 2, image: 3, icon: 4, canvas: 5 };
 const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starting: 5 };
 
-// Event types in the order of the tree's LISTEN_* flags: the index is the kind number the
-// host dispatches and the bit a node listens with.
+// Event types by the kind number the host dispatches. Up to `selectionchange`, `pointerover`
+// and `pointerout` the kind is also the bit of the tree's LISTEN_* flags a node listens with;
+// copy, cut and paste share bit 30, and beforeinput has bit 31 (see `bitOf`).
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
   "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
-  "touchend", "touchcancel",
+  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
@@ -38,8 +39,13 @@ function eachLiveRange(update) {
 const CLICK = KIND_OF.get("click");
 const SELECTION_CHANGE = KIND_OF.get("selectionchange");
 const TOUCH_START = KIND_OF.get("touchstart");
-// The tree has one listener flag for the four touch kinds.
-const TOUCH_FLAG = 1 << 30;
+const COPY = KIND_OF.get("copy");
+const CUT = KIND_OF.get("cut");
+const PASTE = KIND_OF.get("paste");
+const BEFORE_INPUT = KIND_OF.get("beforeinput");
+// The listen bit of a kind: the touch kinds share bit 30, copy, cut, paste and beforeinput bit 31.
+const bitOf = (kind) => (kind < TOUCH_START ? kind : kind < COPY ? 30 : 31);
+const KINDS_OF_BIT = (bit) => TYPES.map((_, kind) => kind).filter((kind) => bitOf(kind) === bit);
 // Compatibility mouse events, as the web fires them after pointer events: each listens
 // through the pointer kind it follows.
 const MOUSE_OF = new Map([
@@ -59,7 +65,7 @@ const NO_BUBBLE = new Set([
 // The tree has a default action to skip for these. Touch records say for themselves.
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
-  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart",
+  "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart", "copy", "cut", "paste", "beforeinput",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -131,6 +137,8 @@ class Look {
   #node;
   #state;
   // Plain objects share their shape across nodes: a Map here costs four times the memory.
+  // A number or string is kept as given, which the caller's style object holds too, and
+  // turned into CSS text when it is read: no node keeps a string of its own per value.
   #values = Object.create(null);
 
   constructor(node, state) {
@@ -155,9 +163,9 @@ class Look {
         }
         continue;
       }
+      if (this.#values[name] === value) continue;
       const text = cssValue(name, value);
-      if (this.#values[name] === text) continue;
-      this.#values[name] = text;
+      this.#values[name] = typeof value === "number" || typeof value === "string" ? value : text;
       css += cssName(name) + ":" + text + ";";
     }
     if (removed) {
@@ -177,12 +185,13 @@ class Look {
   }
 
   get(name) {
-    return this.#values[name];
+    const value = this.#values[name];
+    return value === undefined ? undefined : cssValue(name, value);
   }
 
   get cssText() {
     let css = "";
-    for (const name in this.#values) css += cssName(name) + ":" + this.#values[name] + ";";
+    for (const name in this.#values) css += cssName(name) + ":" + cssValue(name, this.#values[name]) + ";";
     return css;
   }
 
@@ -407,27 +416,48 @@ export function updateStyleSheet(id, compiled) {
   }
 }
 
+// What few nodes have, made on first use (see `Node`).
+class NodeState {
+  listeners = null;
+  // The state looks by name.
+  looks = null;
+  flags = 0;
+  // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
+  kept = 0;
+  attributes = null;
+  classList = null;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
-  #listeners = null;
-  // The base look, and the state looks by name: most nodes have the base alone.
+  // A node is a handle on the tree's node: it keeps only what the tree cannot answer at once
+  // (its place among its siblings, its class, its base look), and puts the state few nodes
+  // have (listeners, attributes, state looks) in one record made on first use. Every field
+  // is a slot in every node, and a node of up to eight fits its object's own cell.
+  // The base look: most nodes have the base alone.
   #base = null;
-  #looks = null;
-  #flags = 0;
-  // Kinds the node hears whatever its listeners: an input keeps its value and selection current.
-  #kept = 0;
-  #attributes = null;
   #className = null;
-  #classList = null;
+  #rare = null;
 
   constructor(kind) {
     Object.defineProperty(this, "nodeId", { value: ++nextId, enumerable: true });
-    this.kind = kind;
+    // A text node's kind is its prototype's: one slot fewer in the most numerous node.
+    if (kind !== "text") this.kind = kind;
     this.parentNode = null;
-    // A text leaf has no children: they all share one empty list.
-    this.childNodes = kind === "text" ? NO_CHILDREN : [];
+    // A node with no children shares one empty list, and gets its own at its first child.
+    this.childNodes = NO_CHILDREN;
     nodes.set(this.nodeId, this);
     native.create(this.nodeId, KINDS[kind]);
+  }
+
+  #more() {
+    return (this.#rare ??= new NodeState());
+  }
+
+  // The node's own child list, made on its first child.
+  _ownChildren() {
+    if (this.childNodes === NO_CHILDREN) this.childNodes = [];
+    return this.childNodes;
   }
 
   get adoptedStyleSheets() { return adoptedList(this).proxy; }
@@ -464,8 +494,9 @@ export class Node {
   cloneNode(deep = false) {
     const copy = this._shallowClone();
     if (this.#base) this.#base._copyTo(copy.look("base"));
-    for (const state in this.#looks ?? {}) this.#looks[state]._copyTo(copy.look(state));
-    for (const [name, value] of this.#attributes ?? []) copy.setAttribute(name, value);
+    const looks = this.#rare?.looks;
+    for (const state in looks ?? {}) looks[state]._copyTo(copy.look(state));
+    for (const [name, value] of this.#rare?.attributes ?? []) copy.setAttribute(name, value);
     if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
     return copy;
   }
@@ -537,7 +568,7 @@ export class Node {
       this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
       native.insertBefore(this.nodeId, child.nodeId, before.nodeId);
     } else {
-      this.childNodes.push(child);
+      this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
     return child;
@@ -609,8 +640,9 @@ export class Node {
   look(state) {
     if (state === "base") return (this.#base ??= new Look(this, 0));
     if (!(state in STATES)) throw new TypeError("the tree has no look '" + state + "'");
-    this.#looks ??= Object.create(null);
-    return (this.#looks[state] ??= new Look(this, STATES[state]));
+    const rare = this.#more();
+    rare.looks ??= Object.create(null);
+    return (rare.looks[state] ??= new Look(this, STATES[state]));
   }
 
   /**
@@ -626,13 +658,13 @@ export class Node {
   set id(value) { this.setAttribute("id", String(value)); }
   get className() { return this.getAttribute("class") ?? ""; }
   set className(value) { this.setAttribute("class", String(value)); }
-  get classList() { return this.#classList ??= new ClassList(this); }
+  get classList() { return this.#more().classList ??= new ClassList(this); }
 
   getAttribute(name) {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
     const aria = ariaName(name);
-    return this.#attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
+    return this.#rare?.attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
@@ -668,8 +700,8 @@ export class Node {
       native.attribute(this.nodeId, name,
         name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
     }
-    if (text === null) this.#attributes?.delete(name);
-    else (this.#attributes ??= new Map()).set(name, text);
+    if (text === null) this.#rare?.attributes?.delete(name);
+    else (this.#more().attributes ??= new Map()).set(name, text);
   }
 
   // The `id` other nodes' relations name this node by.
@@ -683,14 +715,17 @@ export class Node {
   // Tells the tree which events this node wants: its listeners', and clicks on a link.
   #want(kind) {
     const [wanted, bit] = this.#wanted(kind);
-    const flags = (wanted ? this.#flags | bit : this.#flags & ~bit) | this.#kept | (this._extra ?? 0);
-    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+    const rare = this.#rare;
+    const old = rare?.flags ?? 0;
+    const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
+    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
   #wanted(kind) {
-    const has = (type) => (this.#listeners?.get(type)?.length ?? 0) > 0;
-    if (kind >= TOUCH_START) return [TYPES.slice(TOUCH_START).some(has), TOUCH_FLAG];
+    const listeners = this.#rare?.listeners;
+    const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
+    if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
     const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
       || (kind === SELECTION_CHANGE && has("selectstart"));
@@ -699,16 +734,18 @@ export class Node {
 
   /** Listens again for every kind its listeners, kept kinds and `_extra` flags ask for. */
   _relisten() {
-    let flags = this.#kept | (this._extra ?? 0);
-    for (let kind = 0; kind <= TOUCH_START; kind++) {
+    let flags = (this.#rare?.kept ?? 0) | (this._extra ?? 0);
+    for (let kind = 0; kind < TYPES.length; kind++) {
       const [wanted, bit] = this.#wanted(kind);
       if (wanted) flags |= bit;
     }
-    if (flags !== this.#flags) native.listen(this.nodeId, (this.#flags = flags));
+    flags >>>= 0;
+    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
   }
 
   _keep(...types) {
-    for (const type of types) this.#kept |= 1 << KIND_OF.get(type);
+    const rare = this.#more();
+    for (const type of types) rare.kept = (rare.kept | (1 << bitOf(KIND_OF.get(type)))) >>> 0;
     this.#want(KIND_OF.get(types[0]));
   }
 
@@ -844,9 +881,9 @@ export class Node {
     if (listener == null || signal?.aborted) return;
     const kind = KIND_OF.get(LISTENS_AS.get(type) ?? type);
     const capture = options === true || !!options?.capture;
-    this.#listeners ??= new Map();
-    let list = this.#listeners.get(type);
-    if (!list) this.#listeners.set(type, (list = []));
+    const listeners = (this.#more().listeners ??= new Map());
+    let list = listeners.get(type);
+    if (!list) listeners.set(type, (list = []));
     if (list.some((entry) => entry.listener === listener && entry.capture === capture)) return;
     list.push({ listener, capture, once: !!options?.once });
     if (kind !== undefined) this.#want(kind);
@@ -854,7 +891,7 @@ export class Node {
   }
 
   removeEventListener(type, listener, options) {
-    const list = this.#listeners?.get(type);
+    const list = this.#rare?.listeners?.get(type);
     if (!list) return;
     const capture = options === true || !!options?.capture;
     const index = list.findIndex((entry) => entry.listener === listener && entry.capture === capture);
@@ -872,7 +909,7 @@ export class Node {
 
   /** Runs the capture or the bubble listeners of `event.type`. Used by the dispatcher. */
   _run(event, capture) {
-    const list = this.#listeners?.get(event.type);
+    const list = this.#rare?.listeners?.get(event.type);
     if (!list) return;
     for (const entry of list.slice()) {
       if (event._immediate) return;
@@ -982,6 +1019,8 @@ export class Text extends Node {
     return rest;
   }
 }
+
+Object.defineProperty(Text.prototype, "kind", { value: "text", writable: true, configurable: true });
 
 /**
  * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
@@ -1226,6 +1265,72 @@ export class Image extends Node {
   }
 }
 
+/**
+ * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
+ * size of what is drawn in pixels (300 by 150 at first) and `getContext("webgpu")` gives a
+ * `GPUCanvasContext`. The node lays out as an image of that size does: its style can
+ * stretch it, and `objectFit` says how the drawing fits. Drawing happens on a GPU device of
+ * the application's own, so a canvas that is slow to draw does not slow the rest of the window.
+ */
+export class Canvas extends Node {
+  #width = 300;
+  #height = 150;
+  #context = null;
+
+  constructor() {
+    super("canvas");
+  }
+
+  get width() {
+    return this.#width;
+  }
+
+  set width(value) {
+    value = Math.max(0, Number(value) | 0);
+    if (value === this.#width) return;
+    this.#width = value;
+    this.#context?._resized();
+  }
+
+  get height() {
+    return this.#height;
+  }
+
+  set height(value) {
+    value = Math.max(0, Number(value) | 0);
+    if (value === this.#height) return;
+    this.#height = value;
+    this.#context?._resized();
+  }
+
+  /** The canvas's `GPUCanvasContext` for "webgpu"; null for any other kind of context. */
+  getContext(kind) {
+    if (kind !== "webgpu") return null;
+    if (this.#context) return this.#context;
+    const api = native.gpuLoad?.();
+    return api ? (this.#context = api.context(this)) : null;
+  }
+
+  setAttribute(name, value) {
+    if (name === "width") this.width = value == null ? 300 : value;
+    else if (name === "height") this.height = value == null ? 150 : value;
+    else super.setAttribute(name, value);
+  }
+
+  getAttribute(name) {
+    if (name === "width") return String(this.#width);
+    if (name === "height") return String(this.#height);
+    return super.getAttribute(name);
+  }
+
+  _shallowClone() {
+    const copy = new Canvas();
+    copy.width = this.#width;
+    copy.height = this.#height;
+    return copy;
+  }
+}
+
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
 // SVG attribute names that are camel case in SVG itself. Any other name with a capital letter
@@ -1340,7 +1445,7 @@ const svgChildren = {
     }
     child.parentNode = this;
     if (before) this.childNodes.splice(this.childNodes.indexOf(before), 0, child);
-    else this.childNodes.push(child);
+    else (this.childNodes === NO_CHILDREN ? (this.childNodes = []) : this.childNodes).push(child);
     if (child instanceof Text) child._svgText = true;
     liveOwner(this)?._inserted(child, this, before);
     svgChanged(this);
@@ -1873,7 +1978,7 @@ export class Svg extends Node {
     for (const type of types) {
       const kind = KIND_OF.get(type);
       if (kind === undefined) continue;
-      extra |= 1 << kind;
+      extra = (extra | (1 << bitOf(kind))) >>> 0;
       if (HOVER_TYPES.has(type)) extra |= HOVER_FLAGS;
     }
     if (extra === (this._extra ?? 0)) return;
@@ -2204,7 +2309,7 @@ function forget(node) {
     child.parentNode = null;
     forget(child);
   }
-  node.childNodes = [];
+  node.childNodes = NO_CHILDREN;
 }
 
 export function createNode(kind) {
@@ -2215,6 +2320,7 @@ export function createNode(kind) {
   if (kind === "text") return new Text();
   if (kind === "input") return new Input();
   if (kind === "image") return new Image();
+  if (kind === "canvas") return new Canvas();
   return new Node(kind);
 }
 
@@ -3359,7 +3465,7 @@ function fillPointer(event, kind, bits, d) {
 }
 
 function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) {
-  if (kind >= TOUCH_START) {
+  if (kind >= TOUCH_START && kind < COPY) {
     fillTouch(event, kind, a, b, modifiers, d);
     event.shiftKey = (modifiers & 1) !== 0;
     event.ctrlKey = (modifiers & 2) !== 0;
@@ -3506,6 +3612,7 @@ function compatTap(click, target) {
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
@@ -3530,6 +3637,52 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   }
   return prevented;
 };
+
+// Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
+// paste carries the clipboard's text, HTML and a PNG (bytes as a Latin-1 string). A copy or
+// cut a listener prevented puts what it set on `clipboardData` on the clipboard; one it did
+// not prevent lets the tree copy the selection.
+function dispatchEditing(kind, target, first, second, third) {
+  let event;
+  if (kind === BEFORE_INPUT) {
+    event = new InputEvent("beforeinput", { bubbles: true, cancelable: true, composed: true, inputType: second ?? "", data: first ?? "" });
+  } else {
+    const data = new DataTransfer();
+    if (kind === PASTE) {
+      if (first) data.setData("text/plain", first);
+      if (second) data.setData("text/html", second);
+      if (third) data.items.add(new FileClass([bytesOf(third)], "image.png", { type: "image/png" }));
+      data._mode = "readonly";
+    }
+    event = new ClipboardEvent(TYPES[kind], { bubbles: true, cancelable: true, composed: true, clipboardData: data });
+  }
+  event.target = target;
+  dispatchEvent(event);
+  if (event.clipboardData) {
+    if ((kind === COPY || kind === CUT) && event.defaultPrevented) writeClipboard(event.clipboardData);
+    event.clipboardData._mode = "protected";
+  }
+  return event.defaultPrevented;
+}
+
+const bytesOf = (text) => {
+  const bytes = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i);
+  return bytes;
+};
+
+// What a prevented copy or cut set, onto the system clipboard.
+function writeClipboard(data) {
+  const clipboard = globalThis.navigator?.clipboard;
+  const entries = data._entries();
+  if (!clipboard || entries.length === 0) return;
+  const item = {};
+  for (const [type, value] of entries) item[type] = value;
+  const written = entries.length === 1 && entries[0][0] === "text/plain" || typeof globalThis.ClipboardItem !== "function"
+    ? clipboard.writeText(item["text/plain"] ?? "")
+    : clipboard.write([new globalThis.ClipboardItem(item)]);
+  Promise.resolve(written).catch(reportError);
+}
 
 // The default action of a click: the nearest link around the target opens.
 function follow(target) {
@@ -3592,23 +3745,218 @@ export class DroppedFile {
   }
 }
 
-/**
- * What a file drag carries, as the web's `DataTransfer`: `types` is `["Files"]` while files
- * are over the window, and `files` lists them in `drop`, as on the web.
- */
-export class DataTransfer {
-  constructor(paths) {
-    this.files = paths.map((path) => new DroppedFile(path));
-    this.items = this.files.map((file) => ({ kind: "file", type: "", getAsFile: () => file }));
-    this.types = ["Files"];
-    this.dropEffect = "copy";
-    this.effectAllowed = "copy";
+// `File` where the runtime has one, else a `Blob` with a name.
+const FileClass = globalThis.File ?? (globalThis.Blob ? class File extends globalThis.Blob {
+  constructor(parts, name, options = {}) {
+    super(parts, options);
+    this.name = String(name);
+    this.lastModified = options.lastModified ?? Date.now();
+  }
+} : null);
+
+const normalFormat = (format) => {
+  const lower = String(format).toLowerCase();
+  return lower === "text" ? "text/plain" : lower === "url" ? "text/uri-list" : lower;
+};
+
+/** One entry of a `DataTransfer`, as the web's `DataTransferItem`. */
+class DataTransferItem {
+  #owner;
+  #value;
+  constructor(owner, kind, type, value) {
+    this.#owner = owner;
+    this.kind = kind;
+    this.type = type;
+    this.#value = value;
   }
 
-  getData() {
-    return "";
+  getAsString(callback) {
+    if (this.kind !== "string" || typeof callback !== "function" || this.#owner._mode === "protected") return;
+    const value = this.#value;
+    queueMicrotask(() => callback(value));
+  }
+
+  getAsFile() {
+    return this.kind === "file" && this.#owner._mode !== "protected" ? this.#value : null;
+  }
+
+  _value() {
+    return this.#value;
   }
 }
+
+/** The entries of a `DataTransfer`, as the web's `DataTransferItemList`. */
+class DataTransferItemList {
+  #owner;
+  #list = [];
+  constructor(owner) {
+    this.#owner = owner;
+    return new Proxy(this, {
+      get: (self, key) => {
+        if (typeof key === "string" && /^\d+$/.test(key)) return self.length > Number(key) ? self.#list[Number(key)] : undefined;
+        const value = Reflect.get(self, key, self);
+        return typeof value === "function" ? value.bind(self) : value;
+      },
+    });
+  }
+
+  get length() {
+    return this.#owner._mode === "protected" ? 0 : this.#list.length;
+  }
+
+  /** `add(data, type)` for a string, `add(file)` for a file. Read-only data throws. */
+  add(data, type) {
+    this.#owner._writable();
+    if (typeof data === "string") {
+      const format = normalFormat(type ?? "");
+      if (this.#list.some((item) => item.kind === "string" && item.type === format)) {
+        throw domError("NotSupportedError", "The data already holds an item of type " + format);
+      }
+      const item = new DataTransferItem(this.#owner, "string", format, data);
+      this.#list.push(item);
+      return item;
+    }
+    if (data && typeof data === "object") {
+      const item = new DataTransferItem(this.#owner, "file", String(data.type ?? "").toLowerCase(), data);
+      this.#list.push(item);
+      return item;
+    }
+    throw new TypeError("DataTransferItemList.add takes a string and a type, or a File");
+  }
+
+  remove(index) {
+    this.#owner._writable();
+    if (index >= 0 && index < this.#list.length) this.#list.splice(index, 1);
+  }
+
+  clear() {
+    this.#owner._writable();
+    this.#list.length = 0;
+  }
+
+  [Symbol.iterator]() {
+    return (this.#owner._mode === "protected" ? [] : this.#list)[Symbol.iterator]();
+  }
+
+  _all() {
+    return this.#list;
+  }
+}
+
+/**
+ * What a copy, cut, paste or file drag carries, as the web's `DataTransfer`. `new
+ * DataTransfer()` is empty and writable. A file drag lists the dragged `paths` in `files`;
+ * its `types` is `["Files"]` while they are over the window.
+ */
+export class DataTransfer {
+  #items;
+  constructor(paths) {
+    // "readwrite", "readonly" (paste, drop) or "protected" (after the event).
+    this._mode = "readwrite";
+    this._drag = Array.isArray(paths);
+    paths ??= [];
+    this.#items = new DataTransferItemList(this);
+    for (const path of paths) this.#items.add(new DroppedFile(path));
+    this.dropEffect = paths.length ? "copy" : "none";
+    this.effectAllowed = paths.length ? "copy" : "uninitialized";
+  }
+
+  _writable() {
+    if (this._mode !== "readwrite") throw domError("InvalidStateError", "The DataTransfer is read-only now");
+  }
+
+  get items() {
+    return this.#items;
+  }
+
+  get types() {
+    if (this._mode === "protected") return Object.freeze([]);
+    const types = [];
+    let files = false;
+    for (const item of this.#items._all()) {
+      if (item.kind === "string") types.push(item.type);
+      else files = true;
+    }
+    if (files || this._drag) types.push("Files");
+    return Object.freeze(types);
+  }
+
+  get files() {
+    if (this._mode === "protected") return Object.freeze([]);
+    return Object.freeze(this.#items._all().filter((item) => item.kind === "file").map((item) => item._value()));
+  }
+
+  getData(format) {
+    if (this._mode === "protected") return "";
+    const type = normalFormat(format);
+    const item = this.#items._all().find((each) => each.kind === "string" && each.type === type);
+    const value = item ? item._value() : "";
+    return type === "text/uri-list" ? (value.split(/\r?\n/).find((line) => line && !line.startsWith("#")) ?? "") : value;
+  }
+
+  setData(format, data) {
+    if (this._mode !== "readwrite") return;
+    const type = normalFormat(format);
+    const list = this.#items._all();
+    const at = list.findIndex((each) => each.kind === "string" && each.type === type);
+    if (at >= 0) list.splice(at, 1);
+    this.#items.add(String(data), type);
+  }
+
+  clearData(format) {
+    if (this._mode !== "readwrite") return;
+    const list = this.#items._all();
+    const type = format === undefined ? null : normalFormat(format);
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].kind === "string" && (type === null || list[i].type === type)) list.splice(i, 1);
+    }
+  }
+
+  setDragImage() {}
+
+  // The strings, and the PNG files, to put on the clipboard.
+  _entries() {
+    const entries = [];
+    for (const item of this.#items._all()) {
+      if (item.kind === "string") entries.push([item.type, item._value()]);
+      else if (item.type === "image/png" && !entries.some(([type]) => type === "image/png")) entries.push(["image/png", item._value()]);
+    }
+    return entries;
+  }
+}
+
+/** A copy, cut or paste, as the web's `ClipboardEvent`. */
+export class ClipboardEvent extends Event {
+  constructor(type, init = {}) {
+    super(String(type), null);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.clipboardData = init.clipboardData ?? null;
+  }
+}
+
+/** An edit about to happen (`beforeinput`), as the web's `InputEvent`. */
+class InputEvent extends Event {
+  constructor(type, init = {}) {
+    super(String(type), null);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.inputType = init.inputType ?? "";
+    this.data = init.data ?? null;
+    this.dataTransfer = init.dataTransfer ?? null;
+    this.isComposing = !!init.isComposing;
+  }
+
+  getTargetRanges() {
+    return [];
+  }
+}
+
+globalThis.ClipboardEvent ??= ClipboardEvent;
+globalThis.InputEvent ??= InputEvent;
+globalThis.DataTransfer ??= DataTransfer;
 
 let dragTarget = null;
 

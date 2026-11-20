@@ -108,7 +108,7 @@
   forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
   globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
   const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-  for (const name of ["setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
+  for (const name of ["Blob", "setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
     Object.defineProperty(globalThis, name, {
       get: () => {
         const value = api()[name];
@@ -157,35 +157,42 @@
     else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
   };
 
-  // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
-  // clipboard after the code that asked has run, then settles the promise.
-  const clipboardCalls = new Map();
-  let nextClipboardCall = 0;
-  function clipboardCall(read, ask) {
-    const call = ++nextClipboardCall;
-    return new Promise((resolve) => {
-      clipboardCalls.set(call, { read, resolve });
-      ask(call);
-    });
-  }
-  // The host's answer to clipboard call `call`: a read's text, undefined when there is none.
-  native.clipboard = function (call, text) {
-    const pending = clipboardCalls.get(call);
-    if (!pending) return;
-    clipboardCalls.delete(call);
-    pending.resolve(pending.read ? (text ?? "") : undefined);
-  };
-  const clipboard = {
-    readText: () => clipboardCall(true, (call) => native.clipboardRead(call)),
-    writeText: (text) => {
-      const value = String(text);
-      return clipboardCall(false, (call) => native.clipboardWrite(call, value));
+  // As `navigator.clipboard` and `ClipboardItem` in a browser (clipboard.js, evaluated on
+  // first use).
+  let clipboardApi = null;
+  const clip = () => (clipboardApi ??= (0, eval)(native.clipboardApi())(native));
+  const clipboard = {};
+  for (const name of ["readText", "writeText", "read", "write"]) clipboard[name] = (...args) => clip().clipboard[name](...args);
+  Object.defineProperty(globalThis, "ClipboardItem", {
+    get: () => {
+      const value = clip().ClipboardItem;
+      Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true });
+      return value;
     },
-  };
+    set: (value) => Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true }),
+    configurable: true,
+  });
   if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
   Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
   Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
   Object.defineProperty(globalThis.navigator, "getBattery", { value: () => api().getBattery(), writable: true, configurable: true });
+
+  // WebGPU (webgpu.js, evaluated on first use): `navigator.gpu` and the GPU globals, in a host
+  // that runs WebGPU commands. A canvas node gets its "webgpu" context from `native.gpuLoad`.
+  let gpuApi = null;
+  const gpu = (native.gpuLoad = () => (native.gpuEnabled() ? (gpuApi ??= (0, eval)(native.gpuApi())(native)) : null));
+  Object.defineProperty(globalThis.navigator, "gpu", { get: () => gpu()?.gpu, enumerable: true, configurable: true });
+  for (const name of ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUDevice", "GPUQueue", "GPUBuffer", "GPUTexture", "GPUTextureView", "GPUSampler", "GPUBindGroupLayout", "GPUPipelineLayout", "GPUBindGroup", "GPUShaderModule", "GPUCompilationInfo", "GPURenderPipeline", "GPUComputePipeline", "GPUCommandEncoder", "GPUCommandBuffer", "GPURenderPassEncoder", "GPUComputePassEncoder", "GPUCanvasContext", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUDeviceLostInfo", "GPUError", "GPUValidationError", "GPUOutOfMemoryError", "GPUInternalError", "GPUPipelineError", "GPUUncapturedErrorEvent", "GPURenderBundleEncoder", "GPURenderBundle", "GPUQuerySet", "GPUExternalTexture", "GPUBufferUsage", "GPUTextureUsage", "GPUShaderStage", "GPUMapMode", "GPUColorWrite"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = gpu()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
 
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.

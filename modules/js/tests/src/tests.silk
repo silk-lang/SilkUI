@@ -4,12 +4,14 @@ import window_frames as _window_frames
 //! ui-js tests: a JavaScript counter builds its nodes through the bridge, handles events
 //! between the tree's begin and finish, and reports what it throws.
 //! Run from the repository root (the fixtures read fonts and scripts from there).
-import ui_js.lib { JsHost, JsError, ClipboardRequest, runtimeStylesheets, Natives, Reply, Exports, serve, imageLoadable, imageBuild, engineBuild }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, runtimeStylesheets, Natives, Reply, Exports, serve, imageLoadable, imageBuild, engineBuild }
 import ui_js_calls.natives as natives
+import ui_js_calls.gpu { GpuReply }
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
 import ui_tree.style_media { MediaState }
-import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState, EditCommand, ClipboardData as ClipboardData2 }
+import ui_tree.legacy { HostRequest as HostRequestRaw }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
 import silkjs.runtime_memory { RuntimeAllocator }
@@ -23,6 +25,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.num.usize
 import silk.text.string { String }
+import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.io.writer_native { StderrWriter }
 import silk.io.writer { Writer }
 
@@ -315,24 +319,61 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run Testing.expect(requests.length() == 2, "two clipboard calls reached the host")
   let write = match requests.remove(0) {
     ClipboardRequest.Write { call, text } => if String.view(&text) == "hi" { call } else { 0 }
-    ClipboardRequest.Read { .. } => 0
+    _ => 0
   }
   let read = match requests.remove(0) {
     ClipboardRequest.Read { call } => call
-    ClipboardRequest.Write { .. } => 0
+    _ => 0
   }
   run Testing.expect(write != 0 && read != 0, "a write of the text, then a read")
-  run host.answerClipboard(write, Option<String>.none())
+  run host.answerClipboard(write, Option<String>.none(), Option<EncodedItem>.None)
   let pasted = run String.copy("from the system")
-  run host.answerClipboard(read, Option<String>.some(move pasted))
+  run host.answerClipboard(read, Option<String>.some(move pasted), Option<EncodedItem>.None)
   let mut again = host.takeClipboard()
   let next = match again.remove(0) {
     ClipboardRequest.Read { call } => call
-    ClipboardRequest.Write { .. } => 0
+    _ => 0
   }
   run Testing.expect(next != 0, "the read's promise job read again")
-  run host.answerClipboard(next, Option<String>.none())
+  run host.answerClipboard(next, Option<String>.none(), Option<EncodedItem>.None)
   run host.evaluate(b"if (copied.join() !== 'wrote undefined,read from the system,empty \"\"') throw new Error('clipboard calls settled as ' + copied.join())", b"test")
+  run clipboardItems(&mut host)
+}
+
+/// `navigator.clipboard.write` and `read` move ClipboardItems through the host, bytes and all.
+effect fn clipboardItems(host: &mut JsHost<'_>) -> () ! OutOfMemoryError | JsError | AssertionError<'static> ? &mut Allocator {
+  run host.evaluate(b"globalThis.settled = []; const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 255, 128]); if (!ClipboardItem.supports('image/png') || ClipboardItem.supports('text/rtf')) throw new Error('supports'); const item = new ClipboardItem({ 'text/plain': 'h\\u00e9', 'text/html': new Blob(['<b>h\\u00e9</b>'], { type: 'text/html' }), 'image/png': Promise.resolve(new Blob([png], { type: 'image/png' })) }); if (item.types.join() !== 'text/plain,text/html,image/png') throw new Error('types ' + item.types); navigator.clipboard.write([item]).then((value) => settled.push('wrote ' + value)); navigator.clipboard.write([new ClipboardItem({ 'text/rtf': 'x' })]).catch((error) => settled.push(error.name)); navigator.clipboard.write([new ClipboardItem({ 'image/png': new Blob(['not png']) })]).catch((error) => settled.push(error.name))", b"test")
+  let mut requests = host.takeClipboard()
+  run Testing.expect(requests.length() == 1, "one item write reached the host; the refused ones did not")
+  let wrote = match requests.remove(0) {
+    ClipboardRequest.WriteItem { call, entries } => {
+      let e = entries.asSlice()
+      let ok = e.length == 3 && e[0].mime.view() == "text/plain" && e[0].data.asSlice() == b"h\xc3\xa9"
+        && e[1].mime.view() == "text/html" && e[1].data.asSlice() == b"<b>h\xc3\xa9</b>"
+        && e[2].mime.view() == "image/png" && e[2].data.asSlice() == b"\x89PNG\r\n\x1a\n\x00\xff\x80"
+      if ok { call } else { 0 }
+    }
+    _ => 0
+  }
+  run Testing.expect(wrote != 0, "the item's text as UTF-8, its HTML and its PNG bytes")
+  run host.answerClipboard(wrote, Option<String>.none(), Option<EncodedItem>.None)
+
+  run host.evaluate(b"navigator.clipboard.read().then(async (items) => { const item = items[0]; const html = await (await item.getType('text/html')).text(); const png = new Uint8Array(await (await item.getType('image/png')).arrayBuffer()); settled.push(items.length + ' ' + item.types.join() + ' ' + html + ' ' + png.join('.')); await item.getType('text/rtf').catch((error) => settled.push(error.name)); }); navigator.clipboard.read().then((items) => settled.push('empty ' + items.length))", b"test")
+  let mut reads = host.takeClipboard()
+  run Testing.expect(reads.length() == 2, "two item reads reached the host")
+  let first = match reads.remove(0) { ClipboardRequest.ReadItem { call } => call _ => 0 }
+  let second = match reads.remove(0) { ClipboardRequest.ReadItem { call } => call _ => 0 }
+  let mut entries = List<ClipboardData>.make()
+  run entries.append(ClipboardData { mime: run String.copy("text/html"), data: run Bytes.copy(b"<i>x</i>") })
+  run entries.append(ClipboardData { mime: run String.copy("image/png"), data: run Bytes.copy(b"\x89\x00\xfe") })
+  let encoded = run encodeItem(entries.asSlice())
+  run host.answerClipboard(first, Option<String>.none(), Option<EncodedItem>.some(move encoded))
+  let nothing = List<ClipboardData>.make()
+  let none = run encodeItem(nothing.asSlice())
+  run host.answerClipboard(second, Option<String>.none(), Option<EncodedItem>.some(move none))
+  // The answers' promise jobs run on the next turn, as after any host answer.
+  run host.evaluate(b"0", b"test")
+  run host.evaluate(b"if (settled.join() !== 'NotAllowedError,DataError,wrote undefined,empty 0,1 text/html,image/png <i>x</i> 137.0.254,NotFoundError') throw new Error('clipboard items settled as ' + settled.join())", b"test")
 }
 
 /// `memoryUsage` reads the process's memory from the system, so 64 MB the script fills shows;
@@ -395,7 +436,11 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 8 {
+  let ran = if scenario == 10 {
+    run Effect.result(webgpuCommands(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 8 {
+    run Effect.result(clipboardEvents(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 9 {
     run Effect.result(selections(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 7 {
     run Effect.result(geometryReads(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -609,6 +654,11 @@ test effect fn reloadStartsANewRealmOnAnEmptyTree() -> ()
 /// natives share an id.
 test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.APPEND == bridge.nativeId(b"append"), "APPEND")
+  run Testing.expect(bridge.GPU == bridge.nativeId(b"gpu"), "GPU")
+  run Testing.expect(bridge.GPU_API == bridge.nativeId(b"gpuApi"), "GPU_API")
+  run Testing.expect(bridge.GPU_ENABLED == bridge.nativeId(b"gpuEnabled"), "GPU_ENABLED")
+  run Testing.expect(bridge.GPU_REPLY == bridge.nativeId(b"gpuReply"), "GPU_REPLY")
+  run Testing.expect(bridge.GPU_REPLY_BYTES == bridge.nativeId(b"gpuReplyBytes"), "GPU_REPLY_BYTES")
   run Testing.expect(bridge.ATOM_STYLE == bridge.nativeId(b"atomStyle"), "ATOM_STYLE")
   run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
   run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
@@ -741,6 +791,88 @@ test effect fn constructedStylesheetsCompileReplaceAndRemoveInTheNativeTree() ->
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run withHost(3) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Copy, cut and paste from a JavaScript app: a prevented copy puts the listener's data on
+/// the clipboard, a paste carries every flavor, and a prevented beforeinput keeps the paste
+/// out of the input.
+effect fn clipboardEvents(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  run host.module(b"import { createBox, createInput, mount, ClipboardEvent } from '@silkui/core'; globalThis.seen = []; const root = createBox(); globalThis.field = createInput(); root.append(field); mount(root); root.addEventListener('copy', (event) => { seen.push(event.type + ' ' + (event instanceof ClipboardEvent)); event.clipboardData.setData('text/plain', 'mine'); event.clipboardData.setData('text/html', '<b>mine</b>'); event.preventDefault(); }); root.addEventListener('paste', (event) => { const data = event.clipboardData; seen.push('paste ' + data.types.join() + ' ' + data.getData('text') + ' ' + data.getData('text/html') + ' ' + data.files[0].type + ' ' + data.files[0].size); }); field.addEventListener('beforeinput', (event) => { seen.push(event.inputType + ' ' + event.data); event.preventDefault(); }); field.focus();", b"clipboard-events.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  drop host.takeClipboard()
+
+  run host.input(&mut tree, Input.Command { command: EditCommand.Copy })
+  let mut requests = host.takeClipboard()
+  let wrote = match requests.remove(0) {
+    ClipboardRequest.WriteItem { entries, .. } => {
+      let e = entries.asSlice()
+      e.length == 2 && e[0].data.asSlice() == b"mine" && e[1].mime.view() == "text/html"
+    }
+    _ => false
+  }
+  run Testing.expect(wrote, "a prevented copy writes what its listener set")
+  let mut asked = List<HostRequestRaw>.make()
+  run tree.engineMut().takeRequests(&mut asked)
+  run Testing.expect(asked.length() == 0, "and the tree copies nothing")
+
+  run host.input(&mut tree, Input.Command { command: EditCommand.Paste })
+  run tree.engineMut().takeRequests(&mut asked)
+  let target = match &asked.asSlice()[0] {
+    HostRequestRaw.ReadClipboard { target } => target
+    _ => 0
+  }
+  run Testing.expect(asked.length() == 1 && target != 0, "Edit > Paste asks for the clipboard for the focused field")
+  let mut image = List<u8>.make()
+  run image.appendSlice(b"\x89PNG")
+  run host.input(&mut tree, Input.Paste {
+    target: NodeId.of(target),
+    data: ClipboardData2 { text: run String.copy("plain"), html: run String.copy("<i>x</i>"), image: move image },
+  })
+  run host.evaluate(b"if (seen.join('|') !== 'copy true|paste text/plain,text/html,Files plain <i>x</i> image/png 4|insertFromPaste plain') throw new Error('clipboard events ran as ' + seen.join('|')); if (field.value !== '') throw new Error('the prevented paste went in: ' + field.value)", b"test")
+}
+
+/// `navigator.gpu` is there only for a host that runs its commands; a call leaves as one
+/// framed command (length, op, fields), and the host's answer settles the call's promise.
+effect fn webgpuCommands(host: &mut JsHost<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  run host.evaluate(b"if (navigator.gpu != null) throw new Error('navigator.gpu without a host that runs it')", b"test")
+  host.enableGpu()
+  run host.evaluate(b"globalThis.found = 'waiting'; navigator.gpu.requestAdapter().then((adapter) => { found = adapter === null ? 'none' : 'adapter' })", b"test")
+  let commands = host.takeGpuCommands()
+  // 20 bytes follow; REQUEST_ADAPTER; token 1; the adapter is object 1; no power preference;
+  // no fallback adapter.
+  let expected: [u8; 24] = [20, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let sent = commands.asSlice()
+  let mut same = sent.length == 24
+  let mut i: usize = 0
+  while same && i < 24 {
+    same = sent[i] == expected[i]
+    i = i + 1
+  }
+  run Testing.expect(same, "requestAdapter leaves as one framed command")
+  run Testing.expect(host.takeGpuCommands().length() == 0, "the commands are taken once")
+  let mut replies = List<GpuReply>.make()
+  run replies.append(GpuReply.of(1, 1))
+  run host.answerGpu(move replies)
+  run host.evaluate(b"if (found !== 'none') throw new Error('the promise was ' + found); if (typeof GPUBufferUsage.VERTEX !== 'number' || navigator.gpu.getPreferredCanvasFormat() !== 'bgra8unorm') throw new Error('the WebGPU globals are missing')", b"test")
+}
+
+test effect fn webgpuCallsLeaveAsCommandsAndAnswersSettleTheirPromises() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(10) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn clipboardEventsReachJavaScript() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(8) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 import ui_tree.access { accessibleName }
@@ -896,7 +1028,7 @@ effect fn selections(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
 test effect fn getSelectionSharesTheTreesSelection() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  run withHost(8) |> Effect.provideMut<Allocator>(&mut allocator)
+  run withHost(9) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// Layout reads, scrolling, `CSS.supports` and the observers, through the bridge.

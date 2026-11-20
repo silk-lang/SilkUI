@@ -21,7 +21,8 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest, imageLoadable, imageBuild, engineBuild }
+import ui_js_calls.gpu { GpuReply }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
@@ -34,12 +35,17 @@ import ui_tree_window.host { WindowClient, environmentVariable }
 import ui_tree_window.loader { Loader }
 import ui_tree_window.platform_thread { HostPlatform }
 import ui_tree_window.console { StderrWriter }
+import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_js_gpu.service { GpuService }
+import ui_tree.legacy { Batch }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
 import window.types { WindowError, WindowId, WindowOptions, TitleBar }
 import window.event { Event, MouseButton }
 import window.platform { Platform }
+import window.clipboard { ClipboardEntry }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
@@ -72,7 +78,20 @@ pub struct JsApp<'m> {
   openers: Openers,
   /// `SILK_UI_TRACE_JS`: say what the entry starts from.
   traced: bool,
+  /// The bytes JavaScript used after the last [`JsApp.release`].
+  settled: usize,
+  /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
+  /// gave the handle canvases present through ([`JsApp.canvases`]).
+  gpu: Option<GpuService>,
 }
+
+/// How many rounds of WebGPU commands one turn serves: the promise jobs of one round's
+/// answers may write commands again, and the rest waits for the next turn.
+const GPU_ROUNDS: usize = 16
+
+/// A quiet moment collects garbage when JavaScript's memory moved this much since the last
+/// one: a launch, a screen built or taken down. Smaller changes are the engine's own business.
+const RELEASE_MOVED_BYTES: usize = 4194304
 
 effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
   was.* = run deliverShell(&mut host, tree, event)
@@ -97,10 +116,12 @@ fn uncaught(error: JsError) -> () {
   }
 }
 
-/// The host's answer to a `navigator.clipboard` call: for a read, the clipboard's text.
+/// The host's answer to a `navigator.clipboard` call: for a text read, the clipboard's text;
+/// for an item read, its representations.
 pub struct ClipboardAnswer {
   pub call: u32,
   pub text: Option<String>,
+  pub item: Option<EncodedItem>,
 }
 
 /// How many rounds of clipboard calls one turn of the window's loop serves: the promise jobs
@@ -115,11 +136,36 @@ pub effect fn serveClipboard(requests: List<ClipboardRequest>, platform: &mut Ho
     match rest.remove(0) {
       ClipboardRequest.Read { call } => {
         let text = run platform.readClipboard()
-        run answers.append(ClipboardAnswer { call: call, text: move text })
+        run answers.append(ClipboardAnswer { call: call, text: move text, item: Option<EncodedItem>.None })
       }
       ClipboardRequest.Write { call, text } => {
         run platform.writeClipboard(String.view(&text))
-        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none() })
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
+      }
+      ClipboardRequest.ReadItem { call } => {
+        let types = run platform.clipboardTypes()
+        let mut entries = List<ClipboardData>.make()
+        let mut t: usize = 0
+        while t < types.length() {
+          let mime = types.asSlice()[t].view()
+          match move run platform.readClipboardType(mime) {
+            Option<Bytes>.Some { value } => run entries.append(ClipboardData { mime: run String.copy(mime), data: move value })
+            _ => {}
+          }
+          t = t + 1
+        }
+        let item = run encodeItem(entries.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.some(move item) })
+      }
+      ClipboardRequest.WriteItem { call, entries } => {
+        let mut native = List<ClipboardEntry>.make()
+        let mut e = move entries
+        while e.length() > 0 {
+          let ClipboardData { mime, data } = e.remove(0)
+          run native.append(ClipboardEntry { mime: move mime, data: move data })
+        }
+        run platform.writeClipboardItem(native.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
       }
     }
   }
@@ -148,6 +194,29 @@ impl<'m> JsApp<'m> {
       source: List<u8>.make(),
       image: b"",
       openers: Openers.make(),
+      settled: 0,
+      gpu: Option<GpuService>.None,
+    }
+  }
+
+  /// Hands back what JavaScript no longer uses, for a window gone quiet
+  /// (`WindowClient.quiet`): a full collection when its memory moved by
+  /// [`RELEASE_MOVED_BYTES`] since the last one or `shed` says a large subtree went (its
+  /// nodes' cycles are garbage only a collection finds), then the pooled arenas left wholly
+  /// idle go back to the system, keeping an eighth of what is in use for what comes next.
+  /// Otherwise it costs a few loads.
+  pub effect fn release(self: &mut Self, shed: bool) -> () ? &mut Allocator {
+    let used = self.memory.usedBytes()
+    let moved = if used > self.settled { used - self.settled } else { self.settled - used }
+    let collected = shed || moved >= RELEASE_MOVED_BYTES
+    if collected {
+      run self.host.collect() |> Effect.provideMut<Allocator>(&mut self.allocator)
+    }
+    let live = self.memory.usedBytes()
+    let released = self.memory.releaseIdle(live / 8)
+    self.settled = live
+    if self.traced && (collected || released != 0) {
+      StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
     }
   }
 
@@ -279,6 +348,10 @@ impl<'m> JsApp<'m> {
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => {
         self.host = move value
         self.host.attach(&mut tree)
+        if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+          runner.reset()
+          self.host.enableGpu()
+        }
       }
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
@@ -340,14 +413,51 @@ impl<'m> JsApp<'m> {
       if requests.length() == 0 { break }
       let mut answers = run serveClipboard(move requests, &mut platform)
       while answers.length() > 0 {
-        let ClipboardAnswer { call, text } = answers.remove(0)
-        let answered = run Effect.result(self.host.answerClipboard(call, move text)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        let ClipboardAnswer { call, text, item } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerClipboard(call, move text, move item)) |> Effect.provideMut<Allocator>(&mut self.allocator)
         run self.settle(move answered)
       }
       round = round + 1
     }
     if round == 0 { return false }
     run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// Gives JavaScript `navigator.gpu`: its canvases present their frames through `presenter`.
+  pub fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () {
+    self.gpu = Option<GpuService>.some(GpuService.make(move presenter))
+    self.host.enableGpu()
+  }
+
+  /// Runs the WebGPU commands JavaScript wrote on the application's GPU device, presents the
+  /// canvases they drew, and settles the promises they answer. Says whether that changed the
+  /// tree or left commands for the next turn.
+  effect fn graphics(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut changed = false
+    let mut round: usize = 0
+    while round < GPU_ROUNDS {
+      let commands = self.host.takeGpuCommands()
+      if commands.length() == 0 { return changed }
+      let mut batch = Batch.make()
+      let mut replies = List<GpuReply>.make()
+      if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+        run runner.serve(commands.asSlice(), &mut batch)
+        replies = runner.takeReplies()
+      }
+      if self.traced {
+        StderrWriter.print("silkui: gpu, {} command bytes, {} answers\n", &(commands.length(), replies.length()))
+      }
+      if batch.length() != 0 {
+        run tree.apply(run batch.take())
+        changed = true
+      }
+      self.host.attach(&mut tree)
+      let answered = run Effect.result(self.host.answerGpu(move replies)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+      run self.host.flushRaw(&mut tree)
+      round = round + 1
+    }
     return true
   }
 
@@ -492,6 +602,7 @@ impl<T: JsTools> JsClient<T> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if run self.loader.serve(&mut tree) { drop run state.handle(&mut tree) }
+    drop run state.graphics(&mut tree)
   }
 }
 
@@ -561,7 +672,14 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*)
     let natives = run state.natives(&mut self.jobs, &mut tree)
-    return clipboard || shell || natives
+    let graphics = run state.graphics(&mut tree)
+    return clipboard || shell || natives || graphics
+  }
+
+  effect fn canvases(self: &mut Self, state: &mut JsApp<'m>, presenter: CanvasPresenter) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    state.canvases(move presenter)
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
@@ -586,7 +704,8 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let loaded = run self.loader.serve(&mut tree)
     if loaded { drop run state.handle(&mut tree) }
     let natives = run state.natives(&mut self.jobs, &mut tree)
-    return styled || polled || loaded || natives
+    let graphics = run state.graphics(&mut tree)
+    return styled || polled || loaded || natives || graphics
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
@@ -646,5 +765,11 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run state.host.presented(intervals, dropped) |> Effect.provideMut<Allocator>(&mut state.allocator)
+  }
+
+  effect fn quiet(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, shed: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run state.release(shed)
   }
 }

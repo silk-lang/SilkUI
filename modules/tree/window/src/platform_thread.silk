@@ -25,6 +25,7 @@ import silk.num.f32
 import window.event { Event, Modifiers, MouseButton, Phase }
 import window.keys { KeyCode }
 import window.shell { Notification, Tray, TrayIcon }
+import window.clipboard { ClipboardEntry }
 import window.menu { MenuBar, MenuEntry, OpenDialog, SaveDialog }
 import window.native { NativePlatform, Waker }
 import window.headless { HeadlessPlatform }
@@ -49,6 +50,7 @@ import window.types {
 }
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
 import silk.concurrency.thread { Transferable }
 import silk.concurrency.thread_native { NativeThread, SpawnError }
@@ -96,6 +98,7 @@ union Command {
   SetCursorImage { window: WindowId, width: u32, height: u32, pixels: Bytes, hotX: u32, hotY: u32, scale: f64 },
   SetIme { window: WindowId, ime: ImeState },
   SetMenuBar { bar: MenuBar },
+  ShowContextMenu { window: WindowId, x: f64, y: f64, menu: MenuBar },
   OpenFileDialog {
     title: String,
     directory: Option<String>,
@@ -114,6 +117,9 @@ union Command {
   },
   ReadClipboard,
   WriteClipboard { text: String },
+  ClipboardTypes,
+  ReadClipboardType { mime: String },
+  WriteClipboardItem { entries: List<ClipboardEntry> },
   SetTray {
     pixels: List<u8>,
     width: u32,
@@ -134,6 +140,8 @@ union Reply {
   Window { window: WindowId, size: Size2<f64>, scale: f64, raw: RawSurface },
   Dialog { dialog: DialogId },
   Clipboard { text: Option<String> },
+  ClipboardTypes { types: List<String> },
+  ClipboardData { data: Option<Bytes> },
   Done { ok: bool },
   Notified { id: u32 },
   Failed { error: WindowError },
@@ -886,6 +894,9 @@ effect fn execute(
     Command.SetMenuBar { bar } => {
       run platform.setMenuBar(&bar)
     }
+    Command.ShowContextMenu { window, x, y, menu } => {
+      drop run platform.showContextMenu(window, x, y, &menu)
+    }
     Command.OpenFileDialog {
       title,
       directory,
@@ -930,6 +941,17 @@ effect fn execute(
     }
     Command.WriteClipboard { text } => {
       run platform.writeClipboard(String.view(&text))
+    }
+    Command.ClipboardTypes => {
+      let types = run platform.clipboardTypes()
+      answer(link, wakeUi, Reply.ClipboardTypes { types: move types })
+    }
+    Command.ReadClipboardType { mime } => {
+      let data = run platform.readClipboardType(String.view(&mime))
+      answer(link, wakeUi, Reply.ClipboardData { data: move data })
+    }
+    Command.WriteClipboardItem { entries } => {
+      run platform.writeClipboardItem(entries.asSlice())
     }
     Command.SetTray { pixels, width, height, template, tooltip, menu } => {
       let tray = Tray {
@@ -1096,6 +1118,12 @@ impl PlatformProxy {
       return Option<Event>.None
     }
     return Option<Event>.some(state.events.remove(0))
+  }
+
+  effect fn bytesOf(bytes: &[u8]) -> Bytes
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    return run Bytes.copy(bytes) |> Effect.provideMut<Allocator>(&mut heap)
   }
 
   effect fn copyOf(text: string) -> String
@@ -1283,6 +1311,16 @@ impl Platform for PlatformProxy {
     run self.send(Command.SetMenuBar { bar: move copy })
   }
 
+  /// Opens the menu on the platform thread; whether the system shows it is not known here,
+  /// so this says true.
+  effect fn showContextMenu(self: &mut Self, window: WindowId, x: f64, y: f64, menu: &MenuBar) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let copy = run copyMenuBar(menu)
+    run self.send(Command.ShowContextMenu { window: window, x: x, y: y, menu: move copy })
+    return true
+  }
+
   effect fn openFileDialog(self: &mut Self, options: &OpenDialog<'_>) -> DialogId
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
@@ -1337,6 +1375,40 @@ impl Platform for PlatformProxy {
     ? &mut Allocator {
     let owned = run PlatformProxy.copyOf(text)
     run self.send(Command.WriteClipboard { text: move owned })
+  }
+
+  effect fn clipboardTypes(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let reply = run self.call(Command.ClipboardTypes)
+    return match move reply {
+      Reply.ClipboardTypes { types } => move types
+      _ => List<String>.make()
+    }
+  }
+
+  effect fn readClipboardType(self: &mut Self, mime: string) -> Option<Bytes>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let owned = run PlatformProxy.copyOf(mime)
+    let reply = run self.call(Command.ReadClipboardType { mime: move owned })
+    return match move reply {
+      Reply.ClipboardData { data } => move data
+      _ => Option<Bytes>.None
+    }
+  }
+
+  effect fn writeClipboardItem(self: &mut Self, entries: &[ClipboardEntry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut owned = List<ClipboardEntry>.make()
+    let mut i: usize = 0
+    while i < entries.length {
+      run owned.append(ClipboardEntry { mime: run PlatformProxy.copyOf(entries[i].mime.view()), data: run PlatformProxy.bytesOf(entries[i].data.asSlice()) }) |> Effect.provideMut<Allocator>(&mut heap)
+      i = i + 1
+    }
+    run self.send(Command.WriteClipboardItem { entries: move owned })
   }
 
   fn appearance(self: &Self) -> Appearance {
@@ -1706,6 +1778,16 @@ impl Platform for HostPlatform {
     }
   }
 
+  effect fn showContextMenu(self: &mut Self, window: WindowId, x: f64, y: f64, menu: &MenuBar) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.showContextMenu(window, x, y, menu)
+      HostPlatform.Headless { platform } => run platform.showContextMenu(window, x, y, menu)
+      HostPlatform.Proxied { proxy } => run proxy.showContextMenu(window, x, y, menu)
+    }
+  }
+
   effect fn openFileDialog(self: &mut Self, options: &OpenDialog<'_>) -> DialogId
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
@@ -1743,6 +1825,36 @@ impl Platform for HostPlatform {
       HostPlatform.Direct { platform } => run platform.writeClipboard(text)
       HostPlatform.Headless { platform } => run platform.writeClipboard(text)
       HostPlatform.Proxied { proxy } => run proxy.writeClipboard(text)
+    }
+  }
+
+  effect fn clipboardTypes(self: &mut Self) -> List<String>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.clipboardTypes()
+      HostPlatform.Headless { platform } => run platform.clipboardTypes()
+      HostPlatform.Proxied { proxy } => run proxy.clipboardTypes()
+    }
+  }
+
+  effect fn readClipboardType(self: &mut Self, mime: string) -> Option<Bytes>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.readClipboardType(mime)
+      HostPlatform.Headless { platform } => run platform.readClipboardType(mime)
+      HostPlatform.Proxied { proxy } => run proxy.readClipboardType(mime)
+    }
+  }
+
+  effect fn writeClipboardItem(self: &mut Self, entries: &[ClipboardEntry]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match &mut self.* {
+      HostPlatform.Direct { platform } => run platform.writeClipboardItem(entries)
+      HostPlatform.Headless { platform } => run platform.writeClipboardItem(entries)
+      HostPlatform.Proxied { proxy } => run proxy.writeClipboardItem(entries)
     }
   }
 

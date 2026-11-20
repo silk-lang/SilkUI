@@ -53,6 +53,7 @@ import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
+  NO_SURFACE,
   FIRST_ROOT,
   FACE_ITALIC,
   FACE_OBLIQUE,
@@ -108,7 +109,7 @@ import timing { EasingStops }
 import transform
 import style
 import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
-import style_identity { Atoms, NodeIdentity, IdentityExtras }
+import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
 import style_invalidation { Reach, Extent, StartingSubjects }
@@ -138,7 +139,10 @@ import style_attributes
 import ui_protocol.aria { isNamedAttribute }
 import live_svg
 import live_svg { LiveSvg }
+import thin { Thin }
 import node {
+  CanvasSurface,
+  NodeRare,
   NONE,
   WATCH_OUTSIDE,
   NO_INDEX,
@@ -146,7 +150,7 @@ import node {
   FrameStats,
   EventKind,
   Event,
-  PaintCache,
+  PaintCaches,
   Node,
   NodeExtras,
   Semantics,
@@ -349,6 +353,8 @@ fn keyboardInput(input: &Input) -> bool {
     Input.TextInput { .. } => true
     Input.ImePreedit { .. } => true
     Input.Paste { .. } => true
+    Input.Command { .. } => true
+    Input.Edit { .. } => true
     _ => false
   }
 }
@@ -379,6 +385,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetGrid { id, .. } => id
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
+    Mutation.SetCanvasSurface { id, .. } => id
     Mutation.SvgInsert { id, .. } => id
     Mutation.SvgRemove { id, .. } => id
     Mutation.SvgAttribute { id, .. } => id
@@ -816,6 +823,10 @@ pub struct UiTree<'a> {
   pub changingStyles: bool,
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
+  /// The tags and class attributes elements share (see `NodeIdentity.key`).
+  pub selectorKeys: SelectorKeys,
+  /// The nodes' paint caches (see `Node.paintCache`).
+  pub paintCaches: PaintCaches,
   pub styleAtoms: Atoms,
   pub styleSheets: List<RootSheets>,
   styleLoads: List<StyleRequest>,
@@ -970,6 +981,11 @@ pub struct UiTree<'a> {
   pub uploads: Pending,
   /// The first fragment of each css-layout node in the last layout, or NO_INDEX.
   pub fragmentOf: List<usize>,
+  /// The layout revision, scroll revision and viewport height `content-visibility: auto`
+  /// elements were last reviewed at (see `reviewSkipped`).
+  skipReview: [usize; 3],
+  /// The css nodes `wakeFor` woke this frame: they stay awake until the next one.
+  heldAwake: List<u32>,
   /// Next fragment with the same CSS source, in arena order.
   pub nextSourceFragment: List<usize>,
   /// First paint-order index per node slot, or NONE.
@@ -1030,6 +1046,10 @@ pub struct UiTree<'a> {
   pub paintDirty: bool,
   /// Requests for the host (clipboard), oldest first.
   pub requests: List<HostRequest>,
+  /// Input the tree fed itself as the default action of another: the copy or cut of a
+  /// shortcut, the edit of a cut or paste. Hosts run each through `begin` and `finish` like
+  /// their own input (`takeFollowUp`).
+  pub followUps: List<Input>,
   /// The modifier keys editing shortcuts use; the compilation target's by default.
   pub keymap: Keymap,
   /// Whether text selections follow what is seen or the tree where layout reorders children.
@@ -1152,6 +1172,7 @@ impl<'a> UiTree<'a> {
     let mut baseRoom: usize = 0
     let mut withBase: usize = 0
     let mut extras: usize = 0
+    let mut rares: usize = 0
     let mut moving: usize = 0
     let mut editing: usize = 0
     let mut effects: usize = 0
@@ -1161,10 +1182,7 @@ impl<'a> UiTree<'a> {
     let mut identities: usize = 0
     let mut identityExtras: usize = 0
     let mut classBytes: usize = 0
-    let mut classRoom: usize = 0
-    let mut tagRoom: usize = 0
     let mut classAtoms: usize = 0
-    let mut classAtomRoom: usize = 0
     let mut withClasses: usize = 0
     let mut listening: usize = 0
     let mut hovered: usize = 0
@@ -1191,7 +1209,10 @@ impl<'a> UiTree<'a> {
         }
         if distinctTexts.contains(hashed) { repeatedTextBytes = repeatedTextBytes + bytes.length } else { drop run distinctTexts.insert(hashed, 1) }
       }
-      labelRoom = labelRoom + node.label.capacity()
+      if let Option.Some { value: rare } = node.rare.get() {
+        rares = rares + 1
+        labelRoom = labelRoom + rare.label.capacity()
+      }
       baseUsed = baseUsed + node.base.length()
       baseRoom = baseRoom + node.base.capacity()
       if node.base.length() != 0 { withBase = withBase + 1 }
@@ -1207,12 +1228,9 @@ impl<'a> UiTree<'a> {
       if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
         identities = identities + 1
         if identity.extras.isSome() { identityExtras = identityExtras + 1 }
-        let classes = String.utf8Bytes(String.view(&identity.classes))
+        let classes = String.utf8Bytes(identity.classes())
         classBytes = classBytes + classes.length
-        classRoom = classRoom + identity.classes.capacity()
-        tagRoom = tagRoom + identity.tag.capacity()
-        classAtoms = classAtoms + identity.classAtoms.length()
-        classAtomRoom = classAtomRoom + identity.classAtoms.capacity()
+        classAtoms = classAtoms + identity.classAtoms().length
         if classes.length != 0 {
           withClasses = withClasses + 1
           let mut hashed = Hash.mix(&self.seed, usize.toU64(classes.length))
@@ -1250,6 +1268,7 @@ impl<'a> UiTree<'a> {
     run out.bytes("tree.nodes.text", textBytes, textRoom)
     run out.bytes("tree.nodes.label", 0, labelRoom)
     run out.held("tree.nodes.base-declarations", baseUsed, baseRoom, declaration)
+    run out.held("tree.nodes.rare(NodeRare)", rares, rares, Intrinsic.layoutOf<NodeRare>().bytes)
     run out.held("tree.nodes.extras(NodeExtras)", extras, extras, Intrinsic.layoutOf<NodeExtras>().bytes)
     run out.held("tree.nodes.moving(Computed)", moving, moving, Intrinsic.layoutOf<Computed>().bytes)
     run out.held("tree.nodes.editing", editing, editing, Intrinsic.layoutOf<EditState>().bytes)
@@ -1257,9 +1276,13 @@ impl<'a> UiTree<'a> {
     run out.held("tree.nodes.semantics", semantics, semantics, Intrinsic.layoutOf<Semantics>().bytes)
     run out.held("tree.nodes.identity(NodeIdentity)", identities, identities, Intrinsic.layoutOf<NodeIdentity>().bytes)
     run out.held("tree.nodes.identity.extras", identityExtras, identityExtras, Intrinsic.layoutOf<IdentityExtras>().bytes)
-    run out.bytes("tree.nodes.identity.class-text", classBytes, classRoom)
-    run out.bytes("tree.nodes.identity.tag-text", 0, tagRoom)
-    run out.held("tree.nodes.identity.class-atoms", classAtoms, classAtomRoom, u)
+    // Tag and class text live once per distinct key, shared by the elements that have it.
+    let keys = self.selectorKeys.room()
+    run out.unit("classes.bytes-on-nodes", classBytes)
+    run out.held("tree.selector-keys(SelectorKey)", self.selectorKeys.length(), self.selectorKeys.length(), Intrinsic.layoutOf<SelectorKey>().bytes)
+    run out.bytes("tree.selector-keys.class-text", keys.classes, keys.classes)
+    run out.bytes("tree.selector-keys.tag-text", 0, keys.tag)
+    run out.held("tree.selector-keys.class-atoms", keys.atoms, keys.atomRoom, u)
     run out.held("tree.ids(map id to slot)", self.ids.length(), self.ids.bucketCount(), 21)
     run out.held("tree.slot-of-css", self.slotOfCss.length(), self.slotOfCss.capacity(), 4)
     run out.held("tree.free-slots", self.free.length(), self.free.capacity(), 4)
@@ -1394,6 +1417,8 @@ impl<'a> UiTree<'a> {
         naturals: List<NaturalDimensions>.make(),
       },
       nodes: List<Node>.make(),
+      selectorKeys: SelectorKeys.make(),
+      paintCaches: PaintCaches.make(),
       styleAtoms: Atoms.make(),
       styleSheets: List<RootSheets>.make(),
       styleLoads: List<StyleRequest>.make(),
@@ -1481,6 +1506,8 @@ impl<'a> UiTree<'a> {
       facesDirty: true,
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
+      skipReview: [usize.MAX; 3],
+      heldAwake: List<u32>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
       focusVisible: false,
@@ -1515,6 +1542,7 @@ impl<'a> UiTree<'a> {
       layoutObserversDirty: false,
       paintDirty: false,
       requests: List<HostRequest>.make(),
+      followUps: List<Input>.make(),
       keymap: NATIVE_KEYMAP,
       selectionOrder: SelectionOrder.Visual,
       current: FIRST_ROOT,
@@ -1856,7 +1884,7 @@ impl<'a> UiTree<'a> {
     if self.stylesDirty || self.styleSheets.length() == 0 { return subtree }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX { return subtree }
-    let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms.asSlice() _ => &[] }
+    let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms() _ => &[] }
     return style_invalidation.classReach(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
   }
 
@@ -2456,20 +2484,24 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         match move attribute {
           Attribute.ValueRange { min, max, value } => {
-            node.hasValueRange = true
-            node.valueMin = min
-            node.valueMax = max
-            node.valueNow = value
+            let rare = run node.rareMut()
+            rare.hasValueRange = true
+            rare.valueMin = min
+            rare.valueMax = max
+            rare.valueNow = value
           }
           Attribute.ClearValueRange => {
-            node.hasValueRange = false
+            if let Option.Some { value: rare } = node.rare.getMut() { rare.hasValueRange = false }
           }
 
           Attribute.Role { value } => {
             node.accessRole = value
           }
           Attribute.Label { value } => {
-            node.label = move value
+            if value.ownedByteLength() != 0 || node.rare.isSome() {
+              let rare = run node.rareMut()
+              rare.label = move value
+            }
           }
           Attribute.TestId { value } => {
             // An empty id on a node without one changes nothing, and makes no extras.
@@ -2652,8 +2684,12 @@ impl<'a> UiTree<'a> {
                 semantics.level = level
               }
             }
-            let identity = run node.identityMut()
-            identity.tag = move name
+            let classes = match node.identity() { Option.Some { value } => run String.copy(value.classes()) _ => String.make() }
+            let mut atoms = List<usize>.make()
+            if let Option.Some { value } = node.identity() { run atoms.appendSlice(value.classAtoms()) }
+            let key = run self.selectorKeys.intern(String.view(&name), String.view(&classes), atoms.asSlice())
+            let identity = run self.nodeMut(slot).identityMut()
+            identity.key = move key
           }
           Attribute.Named { name, value } => {
             if !isNamedAttribute(String.view(&name)) { return () }
@@ -2687,13 +2723,14 @@ impl<'a> UiTree<'a> {
             let span = style_attributes.isSpan(String.view(&name))
             let identity = run self.nodeMut(slot).identityMut()
             run identity.set(move name, move value)
-            if range { style_attributes.syncRange(self.nodeMut(slot)) }
+            if range { run style_attributes.syncRange(self.nodeMut(slot)) }
             if span { self.restyle(slot) }
           }
           Attribute.ClassName { value } => {
-            let identity = run node.identityMut()
-            identity.classes = move value
-            identity.classAtoms = move classAtoms
+            let tag = match node.identity() { Option.Some { value: identity } => run String.copy(identity.tag()) _ => String.make() }
+            let key = run self.selectorKeys.intern(String.view(&tag), String.view(&value), classAtoms.asSlice())
+            let identity = run self.nodeMut(slot).identityMut()
+            identity.key = move key
             identity.hasClasses = true
           }
           Attribute.ElementId { value } => {
@@ -2717,7 +2754,7 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
         if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
-          node.layoutReported = false
+          if let Option.Some { value: rare } = node.rare.getMut() { rare.layoutReported = false }
         }
         let asksLayout = u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 && u32.bitAnd(flags, LISTEN_LAYOUT) != 0
         node.listeners = flags
@@ -2870,6 +2907,23 @@ impl<'a> UiTree<'a> {
         }
         node.content = node.content + 1
       }
+      Mutation.SetCanvasSurface { id, surface, width, height, opaque } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        let node = self.nodeMut(slot)
+        if surface != NO_SURFACE || node.extras.isSome() {
+          let extras = run node.extrasMut()
+          extras.surface = if surface == NO_SURFACE {
+            CanvasSurface.none()
+          } else {
+            CanvasSurface { id: surface, width: width, height: height, opaque: opaque }
+          }
+        }
+        node.content = node.content + 1
+        run self.updateNatural(slot)
+      }
       Mutation.SvgInsert { id, element, tag, parent, before } => {
         let slot = run self.requireSvg(index, id)
         let at = match before {
@@ -2885,9 +2939,9 @@ impl<'a> UiTree<'a> {
         let slot = run self.requireSvg(index, id)
         let node = self.nodeMut(slot)
         if element == 0 {
-          node.svg = Option<Box<LiveSvg>>.None
-        } else if let Option<Box<LiveSvg>>.Some { value } = &mut node.svg {
-          drop value.getMut()[0].remove(element)
+          node.svg.clear()
+        } else if let Option<&mut LiveSvg>.Some { value } = node.svg.getMut() {
+          drop value.remove(element)
         }
         node.content = node.content + 1
         run self.updateNatural(slot)
@@ -3111,9 +3165,9 @@ impl<'a> UiTree<'a> {
       }
     }
     let styled = run self.freshStyle(kind)
-    let mut editing = Option<Box<EditState>>.None
+    let mut editing = Thin<EditState>.none()
     if kind == NodeKind.Input {
-      editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
+      editing = run Thin<EditState>.make(EditState.make())
     }
     let node = Node {
       id: id,
@@ -3123,18 +3177,14 @@ impl<'a> UiTree<'a> {
       inner: inner,
       parent: NONE,
       base: List<Declaration>.make(),
-      extras: Option<Box<NodeExtras>>.None,
+      extras: Thin<NodeExtras>.none(),
       styled: move styled,
-      moving: Option<Box<Computed>>.None,
+      moving: Thin<Computed>.none(),
       fontKey: 0,
       paintHash: 0,
       text: String.make(),
       accessRole: Role.None,
-      hasValueRange: false,
-      valueMin: 0.0,
-      valueMax: 0.0,
-      valueNow: 0.0,
-      label: String.make(),
+      rare: Thin<NodeRare>.none(),
       tabIndex: if kind == NodeKind.Input {
         0
       } else {
@@ -3149,8 +3199,6 @@ impl<'a> UiTree<'a> {
       selected: false,
       expanded: false,
       listeners: 0,
-      layoutReported: false,
-      reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       hovered: false,
       pressed: false,
       styleDirty: true,
@@ -3163,22 +3211,19 @@ impl<'a> UiTree<'a> {
       generatedSuppressed: false,
       subtreeDirty: false,
       rendered: false,
-      scrollX: 0.0,
-      scrollY: 0.0,
       resource: NONE,
-      svg: Option<Box<LiveSvg>>.None,
+      svg: Thin<LiveSvg>.none(),
       content: 1,
       editing: move editing,
-      effects: Option<Box<Effects>>.None,
-      offsetPlaced: Option<transform.Placement>.None,
-      semantics: Option<Box<Semantics>>.None,
+      effects: Thin<Effects>.none(),
+      semantics: Thin<Semantics>.none(),
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
       styleTwin: NONE,
       styleWatch: 0,
       computedStamp: 0,
-      selectorIdentity: Option<Box<NodeIdentity>>.None,
-      cache: PaintCache.empty(),
+      selectorIdentity: Thin<NodeIdentity>.none(),
+      paintCache: NONE,
     }
     let mut slot: u32 = 0
     if self.free.length() != 0 {
@@ -3381,15 +3426,17 @@ impl<'a> UiTree<'a> {
       // A slot waits for its next node holding nothing: what this one owned goes now, not
       // when (or if) the slot is taken again.
       node.base.clearAndFree()
-      node.extras = Option<Box<NodeExtras>>.None
+      node.extras.clear()
       node.text.clearAndFree()
-      node.label.clearAndFree()
-      node.moving = Option<Box<Computed>>.None
-      node.editing = Option<Box<EditState>>.None
-      node.effects = Option<Box<Effects>>.None
-      node.semantics = Option<Box<Semantics>>.None
+      node.rare.clear()
+      let paintCache = node.paintCache
+      node.paintCache = NONE
+      node.moving.clear()
+      node.editing.clear()
+      node.effects.clear()
+      node.semantics.clear()
       node.resolvedSheet = Option<Frozen<Resolved>>.None
-      node.selectorIdentity = Option<Box<NodeIdentity>>.None
+      node.selectorIdentity.clear()
       if node.inert {
         self.inerts = self.inerts - 1
       }
@@ -3405,6 +3452,7 @@ impl<'a> UiTree<'a> {
       if inner != NO_INDEX {
         self.slotOfCss.set(inner, NONE)
       }
+      run self.paintCaches.release(paintCache)
       run self.free.append(gone)
       let added = self.free.length() - 1
       siftUp(&mut self.free, added)
@@ -4355,6 +4403,11 @@ impl<'a> UiTree<'a> {
     if slot == self.focused {
       return ()
     }
+    // A focused element inside skipped contents is laid out, as one that is shown.
+    if slot != NONE && u32.toUsize(slot) < self.nodes.length() {
+      let id = self.node(slot).id
+      run self.wakeFor(id)
+    }
     let before = self.focused
     if note && before != NONE && slot != NONE {
       run self.noteReturns(before, slot)
@@ -4445,6 +4498,30 @@ impl<'a> UiTree<'a> {
     run interact.finish(&mut self, move input, false)
     run edit.reportSelection(&mut self)
     run text_selection.report(&mut self)
+    while self.followUps.length() > 0 {
+      let next = self.followUps.remove(0)
+      run self.dispatch(move next)
+    }
+  }
+
+  /// Queues `input` to follow the one under way, as a host's own input would. The tree queues
+  /// the copy or cut of a shortcut and the edit of a cut or paste, so each gets its own
+  /// records and its own say for the client; a host answering `HostRequest.ReadClipboard`
+  /// queues its `Input.Paste`.
+  pub effect fn queueFollowUp(self: &mut Self, input: Input) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run self.followUps.append(move input)
+  }
+
+  /// The next queued follow-up input, oldest first. A host that splits input into `begin`
+  /// and `finish` runs each one the same way after the input that queued it and after serving
+  /// requests; `dispatch` runs them itself.
+  pub fn takeFollowUp(self: &mut Self) -> Option<Input> {
+    if self.followUps.length() == 0 {
+      return Option<Input>.None
+    }
+    return Option<Input>.some(self.followUps.remove(0))
   }
 
   /// The first half of `dispatch`: hit testing, hover, and the record of the input itself
@@ -4574,8 +4651,8 @@ impl<'a> UiTree<'a> {
     self.viewScrollState.interruptTarget(
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
-    let fromX = self.node(slot).scrollX
-    let fromY = self.node(slot).scrollY
+    let fromX = self.node(slot).scrollX()
+    let fromY = self.node(slot).scrollY()
     run interact.scrolledElsewhere(&mut self, slot, x, y)
     run scroll_snap.userScrolled(&mut self, slot, fromX, fromY, false)
   }
@@ -4585,7 +4662,7 @@ impl<'a> UiTree<'a> {
     if slot == NONE {
       return Vector2<f32> { x: 0.0, y: 0.0 }
     }
-    return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
+    return Vector2<f32> { x: self.node(slot).scrollX(), y: self.node(slot).scrollY() }
   }
 
   /// Moves the queued host requests (clipboard reads and writes, font faces to load) to `out`,
@@ -4816,14 +4893,26 @@ impl<'a> UiTree<'a> {
     let fontSize = self.node(slot).computed().text.size
     // Natural sizes scale with `zoom`, as replaced elements do in browsers.
     let zoom = self.node(slot).computed().text.zoom
-    let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
+    if kind == NodeKind.Canvas {
+      // A canvas showing a GPU surface is a replaced element of the surface's size, as a
+      // `<canvas>` is. One drawn with commands has no natural size.
+      let surface = self.node(slot).surface()
+      if surface.isSome() {
+        natural.size = OptionalSize.definite(u32.toF32(surface.width) * zoom, u32.toF32(surface.height) * zoom)
+        if surface.height != 0 {
+          natural.aspectRatio = u32.toF32(surface.width) / u32.toF32(surface.height)
+        }
+      }
+      run self.setNatural(slot, natural)
+      return ()
+    }
     if kind != NodeKind.Image && kind != NodeKind.Icon {
       return ()
     }
     let shown = self.resources.get(resource)
-    let liveSize = match &self.node(slot).svg {
-      Option<Box<LiveSvg>>.Some { value } => [value.get()[0].width, value.get()[0].height]
+    let liveSize = match self.node(slot).svg.get() {
+      Option<&LiveSvg>.Some { value } => [value.width, value.height]
       _ => [0.0, 0.0]
     }
     if liveSize[0] > 0.0 && liveSize[1] > 0.0 {
@@ -4855,6 +4944,14 @@ impl<'a> UiTree<'a> {
       natural.size = OptionalSize.definite(fontSize, fontSize)
       natural.aspectRatio = 1.0
     }
+    run self.setNatural(slot, natural)
+  }
+
+  /// Gives the layout the natural size of `slot` when it changed.
+  effect fn setNatural(self: &mut Self, slot: u32, natural: NaturalDimensions) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let css = self.node(slot).css
     let key = u32.toUsize(slot)
     let changed = key >= self.provider.naturals.length()
       || !sameNatural(self.provider.naturals.get(key), natural)
@@ -5668,7 +5765,7 @@ impl<'a> UiTree<'a> {
     self.work.styleShares = self.work.styleShares + 1
     let target = self.nodeMut(slot)
     target.styled = move shared
-    target.moving = Option<Box<Computed>>.None
+    target.moving.clear()
   }
 
   /// Gives the node at `slot` the style `value` of a frame of the clock. An animation or a
@@ -5677,13 +5774,12 @@ impl<'a> UiTree<'a> {
   /// and the next frame writes over it; its next full restyle shares again (`setComputed`).
   effect fn setMovingComputed(self: &mut Self, slot: u32, value: &Computed) -> () ! OutOfMemoryError ? &mut Allocator {
     let target = self.nodeMut(slot)
-    match &mut target.moving {
-      Option<Box<Computed>>.Some { value: held } => {
-        let place = held.getMut()
-        place[0] = value.*
+    match target.moving.getMut() {
+      Option<&mut Computed>.Some { value: held } => {
+        held.* = value.*
       }
-      Option<Box<Computed>>.None => {
-        target.moving = Option<Box<Computed>>.Some { value: run Box<Computed>.make(value.*) }
+      Option<&mut Computed>.None => {
+        target.moving.set(run Thin<Computed>.make(value.*))
       }
     }
   }
@@ -6655,6 +6751,12 @@ impl<'a> UiTree<'a> {
         self.layout.setStyle(NodeId { index: css }, computed.layout),
         layoutFailed,
       )
+      if computed.contain.automatic() != self.layout.automatic(css) {
+        run Effect.catchAll(
+          self.layout.setAutomatic(NodeId { index: css }, computed.contain.automatic(), computed.contain.intrinsicBlock()),
+          layoutFailed,
+        )
+      }
       run self.resolveGrid(slot, &computed)
       run self.updateShape(slot)
     }
@@ -6683,12 +6785,9 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     if !computed.effects.declared {
-      match &self.node(slot).effects {
-        Option<Box<Effects>>.Some { .. } => {
-          let target = self.nodeMut(slot)
-          target.effects = Option<Box<Effects>>.None
-        }
-        Option<Box<Effects>>.None => {}
+      if self.node(slot).effects.isSome() {
+        let target = self.nodeMut(slot)
+        target.effects.clear()
       }
       return ()
     }
@@ -6733,9 +6832,9 @@ impl<'a> UiTree<'a> {
         computed.effects.shadowHash = effects.hash
       }
     }
-    let boxed = run Box<Effects>.make(move effects)
+    let boxed = run Thin<Effects>.make(move effects)
     let target = self.nodeMut(slot)
-    target.effects = Option<Box<Effects>>.Some { value: move boxed }
+    target.effects.set(move boxed)
   }
 
   effect fn applyEffects(self: &Self, effects: &mut Effects, declarations: &[Declaration], parent: u32, basis: paint_css.Basis) -> ()
@@ -7027,6 +7126,7 @@ impl<'a> UiTree<'a> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.frameNumber = self.frameNumber + 1
+    self.heldAwake.clear()
     run self.trimNodes()
     self.releaseSlack()
     // A mutation said what it repaints when it was applied (see `repaintsNode`).
@@ -7079,6 +7179,7 @@ impl<'a> UiTree<'a> {
       run self.layoutFrame()
     }
     run self.settleVirtual()
+    run self.settleSkipped()
     run self.settleAnchors()
     run offset_path.settle(&mut self)
     run self.finishStyleChange()
@@ -7103,6 +7204,141 @@ impl<'a> UiTree<'a> {
     self.work.repaintedSubtrees = self.work.repaintedSubtrees + self.stats.repaintedSubtrees
     self.work.replayedOperations = self.work.replayedOperations + self.stats.replayedOperations
     self.work.paintedGlyphs = self.work.paintedGlyphs + self.stats.glyphs
+  }
+
+  /// Wakes the `content-visibility: auto` elements near the viewport, nearest first, and skips
+  /// the contents of those far from it, laying out again until none changes or the frame's
+  /// passes are spent.
+  effect fn settleSkipped(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pass: usize = 0
+    while pass < SKIP_PASSES {
+      if !(run self.reviewSkipped()) { break }
+      run self.layoutFrame()
+      pass = pass + 1
+    }
+  }
+
+  // One look at the automatic elements: wakes up to SKIP_WAKES of the skipped ones within
+  // SKIP_NEAR viewports, nearest first, and skips those beyond SKIP_FAR. Returns whether any
+  // changed.
+  effect fn reviewSkipped(self: &mut Self) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    // Nothing moved since the last look that found nothing to change.
+    let seen = [self.layout.revision(), self.layout.scrollRevision(), f32.toUsize(self.input.height)]
+    // Scroll offsets move fragments while painting, without a layout revision: `scrolled`.
+    if !self.scrolled && seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2] { return false }
+    let mut automatic = List<u32>.make()
+    run self.layout.automaticElements(&mut automatic)
+    if automatic.length() == 0 { return false }
+    let height: f32 = self.input.height
+    let near: f32 = height * SKIP_NEAR
+    let far = height * SKIP_FAR
+    let mut wakes = List<u64>.make()
+    let mut changed = false
+    // Siblings under one parent fragment move by the same offset where the parent's chain only
+    // translates them: one walk up for the first, the offset for the rest.
+    let mut lastParent = NO_INDEX
+    let mut dx: f32 = 0.0
+    let mut dy: f32 = 0.0
+    let mut at: usize = 0
+    while at < automatic.length() {
+      let css = u32.toUsize(automatic.get(at))
+      at = at + 1
+      if css >= self.fragmentOf.length() { continue }
+      let index = self.fragmentOf.get(css)
+      if index == NO_INDEX { continue }
+      let fragment = self.output.fragments.values.asSlice()[index]
+      let box = borderBox(&fragment)
+      let slot = self.slotOfCssNode(css)
+      let plain = slot != NONE && !self.node(slot).computed().transform.any()
+        && self.node(slot).computed().layout.position == Position.Static
+      let mut seen = box
+      if plain && fragment.parent != NO_INDEX && fragment.parent == lastParent {
+        seen = Rect<f32>.new(box.xMin + dx, box.yMin + dy, box.xMax + dx, box.yMax + dy)
+      } else {
+        seen = self.visualRect(index, box)
+        let translated = f32.abs(seen.width() - box.width()) < 0.01 && f32.abs(seen.height() - box.height()) < 0.01
+        if plain && translated {
+          lastParent = fragment.parent
+          dx = seen.xMin - box.xMin
+          dy = seen.yMin - box.yMin
+        } else {
+          lastParent = NO_INDEX
+        }
+      }
+      let distance: f32 = if seen.yMax < 0.0 { 0.0 - seen.yMax } else if seen.yMin > height { seen.yMin - height } else { 0.0 }
+      if self.layout.skipped(css) {
+        if distance <= near {
+          run wakes.append(u64.bitOr(u64.shiftLeft(f32.toU64(distance), 32), usize.toU64(css)))
+        }
+      } else if distance > far && !self.held(css) {
+        run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
+        changed = true
+      }
+    }
+    run wakes.sort()
+    at = 0
+    while at < wakes.length() && at < SKIP_WAKES {
+      let css = u64.wrappingToUsize(u64.bitAnd(wakes.get(at), 4294967295))
+      run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, false, 0.0), layoutFailed)
+      changed = true
+      at = at + 1
+    }
+    self.skipReview = if changed { [usize.MAX; 3] } else { seen }
+    return changed
+  }
+
+  /// Wakes every `content-visibility: auto` element above node `id` whose contents are
+  /// skipped and lays out again, so that what is read of `id` next is its real geometry. They
+  /// stay awake until the next frame.
+  pub effect fn wakeFor(self: &mut Self, id: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE { return () }
+    let mut woke = false
+    let mut at = self.node(slot).parent
+    while at != NONE {
+      let css = self.node(at).css
+      if css < self.layout.nodeCount() && self.layout.automatic(css) {
+        run self.heldAwake.append(usize.toU32(css))
+        if self.layout.skipped(css) {
+          run Effect.catch<TreeError>(self.wake(css), noShape)
+          woke = true
+        }
+      }
+      at = self.node(at).parent
+    }
+    if woke { run Effect.catch<TreeError>(self.layoutFrame(), noShape) }
+  }
+
+  fn held(self: &Self, css: usize) -> bool {
+    let mut at: usize = 0
+    while at < self.heldAwake.length() {
+      if u32.toUsize(self.heldAwake.get(at)) == css { return true }
+      at = at + 1
+    }
+    return false
+  }
+
+  effect fn wake(self: &mut Self, css: usize) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, false, 0.0), layoutFailed)
+  }
+
+  /// Wakes every `content-visibility: auto` element whose contents are skipped, for a check
+  /// of the whole logical result, and holds them awake until the next frame.
+  pub effect fn wakeAll(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut automatic = List<u32>.make()
+    run self.layout.automaticElements(&mut automatic)
+    let mut at: usize = 0
+    while at < automatic.length() {
+      let css = u32.toUsize(automatic.get(at))
+      run self.heldAwake.append(usize.toU32(css))
+      if self.layout.skipped(css) { run Effect.catch<TreeError>(self.wake(css), noShape) }
+      at = at + 1
+    }
+    run Effect.catch<TreeError>(self.layoutFrame(), noShape)
   }
 
   effect fn settleAnchors(self: &mut Self) -> ()
@@ -7245,6 +7481,7 @@ impl<'a> UiTree<'a> {
       run self.layoutFrame()
     }
     run self.settleVirtual()
+    run self.settleSkipped()
     run self.settleAnchors()
     run offset_path.settle(&mut self)
     run self.finishStyleChange()
@@ -7402,8 +7639,8 @@ impl<'a> UiTree<'a> {
       if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0
         && !self.inParkedRoot(usize.toU32(i)) {
         let id = node.id
-        let before = node.reportedBounds
-        let reported = node.layoutReported
+        let before = match node.rare.get() { Option.Some { value: rare } => rare.reportedBounds _ => Rect<f32>.new(0.0, 0.0, 0.0, 0.0) }
+        let reported = match node.rare.get() { Option.Some { value: rare } => rare.layoutReported _ => false }
         if let Option<inspect.NodeInfo>.Some { value } = run inspect.info(&self.*, id) {
           let bounds = value.bounds
           if !reported || before.xMin != bounds.xMin || before.yMin != bounds.yMin
@@ -7411,8 +7648,9 @@ impl<'a> UiTree<'a> {
             || before.yMax != bounds.yMax {
             let slot = usize.toU32(i)
             let target = self.nodeMut(slot)
-            target.layoutReported = true
-            target.reportedBounds = bounds
+            let rare = run target.rareMut()
+            rare.layoutReported = true
+            rare.reportedBounds = bounds
             let mut path = List<u32>.make()
             run self.pathTo(slot, &mut path)
             let mut event = Event.make(EventKind.Layout, id, move path)
@@ -7890,6 +8128,7 @@ impl<'a> UiTree<'a> {
       self.sceneB.clear()
       let mut painter = Painter {
         nodes: &mut self.nodes,
+        caches: &mut self.paintCaches,
         slotOfCss: &self.slotOfCss,
         css: &self.layout,
         output: &self.output,
@@ -7937,6 +8176,7 @@ impl<'a> UiTree<'a> {
       self.sceneA.clear()
       let mut painter = Painter {
         nodes: &mut self.nodes,
+        caches: &mut self.paintCaches,
         slotOfCss: &self.slotOfCss,
         css: &self.layout,
         output: &self.output,
@@ -8015,6 +8255,7 @@ impl<'a> UiTree<'a> {
     let mut order = List<u32>.make()
     let mut painter = Painter {
       nodes: &mut self.nodes,
+      caches: &mut self.paintCaches,
       slotOfCss: &self.slotOfCss,
       css: &self.layout,
       output: &self.output,
@@ -8184,6 +8425,13 @@ fn takeLowest(free: &mut List<u32>) -> u32 {
 
 /// A tree gives back what a larger one left only after it has held this many nodes
 /// (see `UiTree.releaseSlack`).
+/// `content-visibility: auto`: skipped elements within this many viewports of the viewport
+/// wake, awake ones beyond SKIP_FAR are skipped, at most SKIP_WAKES a pass and SKIP_PASSES
+/// passes a frame.
+const SKIP_NEAR: f32 = 2.0
+const SKIP_FAR: f32 = 3.0
+const SKIP_WAKES: usize = 8
+const SKIP_PASSES: usize = 8
 const RELEASE_NODES: usize = 4096
 
 /// The node table is not trimmed below this many slots (see `UiTree.trimNodes`).
