@@ -429,8 +429,11 @@ How it works:
 - A present of a `bgra8unorm` canvas (what `getPreferredCanvasFormat()` answers) stays on the
   GPU where both devices can share images (macOS): the canvas draws into a swap chain of
   IOSurfaces that the window's device samples after the application's fences
-  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). An `rgba8unorm` canvas, and every
-  canvas on other systems, copies the frame through the CPU.
+  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). A canvas nothing covers, with a
+  rectangular clip, can also show in a compositor layer of its own, whose frames do not draw the
+  window ([canvas_layer_plan.silk](../tree/window/src/canvas_layer_plan.silk)). That is opt-in
+  for now: `SILK_UI_CANVAS_LAYERS=on`. An `rgba8unorm` canvas, and every canvas on other
+  systems, copies the frame through the CPU.
 
 What is not there yet: query sets, render bundles and external textures throw, compilation
 info is always empty, and `copyExternalImageToTexture` takes `ImageData` only. The canvas
