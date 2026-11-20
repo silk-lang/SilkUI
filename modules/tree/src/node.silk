@@ -17,7 +17,7 @@ pub import ui_protocol.record { Event, EventKind }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
-import silk.mem.box { Box }
+import thin { Thin }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -130,14 +130,14 @@ pub struct Node {
   pub base: List<Declaration>,
   /// The other looks, the transition text, the test id and the canvas commands: what most
   /// nodes leave empty, on the heap (see `NodeExtras`).
-  pub extras: Option<Box<NodeExtras>>,
+  pub extras: Thin<NodeExtras>,
   /// The computed style, shared with every node whose values are the same (see `style_pool`).
   /// Read it with [`Node.computed`]; `UiTree.setComputed` replaces it.
   pub styled: Frozen<Computed>,
   /// The computed style of a node an animation or a transition is moving, in place of
   /// `styled`: it changes every frame and no other node has it, so the node holds it alone
   /// and each frame writes it where it is (`UiTree.setMovingComputed`).
-  pub moving: Option<Box<Computed>>,
+  pub moving: Thin<Computed>,
   pub fontKey: usize,
   pub paintHash: u64,
   pub text: String,
@@ -185,21 +185,21 @@ pub struct Node {
   pub scrollY: f32,
   pub resource: u32,
   /// An icon node's live svg (`Mutation.SvgInsert`), on the heap: drawn instead of its resource.
-  pub svg: Option<Box<LiveSvg>>,
+  pub svg: Thin<LiveSvg>,
   /// Bumped when the text, source or canvas changes, and for inputs when the caret, the
   /// selection or the composition does.
   pub content: u64,
   /// An input's editing state, on the heap: inputs get one when they are made, other nodes
   /// only when given an editing attribute (`Multiline`, `ReadOnly`, `Placeholder`).
-  pub editing: Option<Box<EditState>>,
+  pub editing: Thin<EditState>,
   /// The paint effects the node declares (`filter`, `mask`, background layers...), on the
   /// heap: only nodes that declare one get them.
-  pub effects: Option<Box<Effects>>,
+  pub effects: Thin<Effects>,
   /// Where the node's `offset-path` puts it, from the last layout (see `offset_path.settle`).
   pub offsetPlaced: Option<Placement>,
   /// The ARIA states and properties most nodes do not have, on the heap: a node gets them
   /// with the first such attribute.
-  pub semantics: Option<Box<Semantics>>,
+  pub semantics: Thin<Semantics>,
   pub resolvedSheet: Option<Frozen<Resolved>>,
   /// Nodes with one class hold one record and had equal selector inputs and ancestors when they
   /// took it; zero is no class. See `style_share`.
@@ -213,7 +213,7 @@ pub struct Node {
   /// Names the computed values the node holds: a fresh number each time they are computed, the
   /// lender's when they are copied. Zero is none yet.
   pub computedStamp: u32,
-  pub selectorIdentity: Option<Box<NodeIdentity>>,
+  pub selectorIdentity: Thin<NodeIdentity>,
   pub cache: PaintCache,
 }
 
@@ -309,41 +309,25 @@ impl Node {
   /// The node's computed style.
   @inlineAlways
   pub fn computed(self: &Self) -> &Computed {
-    return match &self.moving {
-      Option<Box<Computed>>.Some { value } => &value.get()[0]
-      Option<Box<Computed>>.None => self.styled.get()
+    return match self.moving.get() {
+      Option<&Computed>.Some { value } => value
+      Option<&Computed>.None => self.styled.get()
     }
   }
 
   /// The node's rarer parts, when it was given any (see `NodeExtras`).
   pub fn extrasOf(self: &Self) -> Option<&NodeExtras> {
-    return match &self.extras {
-      Option<Box<NodeExtras>>.Some { value } => Option<&NodeExtras>.Some { value: &value.get()[0] }
-      Option<Box<NodeExtras>>.None => Option<&NodeExtras>.None
-    }
+    return self.extras.get()
   }
 
   /// The node's rarer parts to change, made on first use.
   pub effect fn extrasMut(self: &mut Self) -> &mut NodeExtras ! OutOfMemoryError ? &mut Allocator {
-    if self.extras.isNone() {
-      self.extras = Option<Box<NodeExtras>>.Some { value: run Box<NodeExtras>.make(NodeExtras.make()) }
-    }
-    match &mut self.extras {
-      Option<Box<NodeExtras>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<NodeExtras>>.None => {
-        return Intrinsic.trap("ui-tree: the node's extras were just made")
-      }
-    }
+    return run self.extras.getOrMake(NodeExtras.make)
   }
 
   /// The node's rarer parts to change, when it has them.
   pub fn extrasHeld(self: &mut Self) -> Option<&mut NodeExtras> {
-    return match &mut self.extras {
-      Option<Box<NodeExtras>>.Some { value } => Option<&mut NodeExtras>.Some { value: &mut value.getMut()[0] }
-      Option<Box<NodeExtras>>.None => Option<&mut NodeExtras>.None
-    }
+    return self.extras.getMut()
   }
 
   /// The `:hover` look.
@@ -421,108 +405,60 @@ impl Node {
   }
 
   pub fn identity(self: &Self) -> Option<&NodeIdentity> {
-    return match &self.selectorIdentity {
-      Option<Box<NodeIdentity>>.Some { value } => Option<&NodeIdentity>.some(&value.get()[0])
-      _ => Option<&NodeIdentity>.None
-    }
+    return self.selectorIdentity.get()
   }
 
   pub effect fn identityMut(self: &mut Self) -> &mut NodeIdentity ! OutOfMemoryError ? &mut Allocator {
-    if self.selectorIdentity.isNone() {
-      self.selectorIdentity = Option<Box<NodeIdentity>>.some(run Box<NodeIdentity>.make(NodeIdentity.make()))
-    }
-    return match &mut self.selectorIdentity {
-      Option<Box<NodeIdentity>>.Some { value } => &mut value.getMut()[0]
-      _ => Intrinsic.trap("ui-tree: selector identity was just made")
-    }
+    return run self.selectorIdentity.getOrMake(NodeIdentity.make)
   }
 
   /// The node's live svg, made empty on first use.
   pub effect fn liveSvg(self: &mut Self) -> &mut LiveSvg ! OutOfMemoryError ? &mut Allocator {
     if self.svg.isNone() {
-      self.svg = Option<Box<LiveSvg>>.some(run Box<LiveSvg>.make(run LiveSvg.make()))
+      self.svg.set(run Thin<LiveSvg>.make(run LiveSvg.make()))
     }
-    return match &mut self.svg {
-      Option<Box<LiveSvg>>.Some { value } => &mut value.getMut()[0]
-      _ => Intrinsic.trap("ui-tree: live svg was just made")
-    }
+    return self.svg.expectMut()
+  }
+
+  /// Whether the node declares paint effects.
+  pub fn hasEffects(self: &Self) -> bool {
+    return self.effects.isSome()
   }
 
   /// The node's paint effects, when it declares any.
-  /// Whether the node declares paint effects.
-  pub fn hasEffects(self: &Self) -> bool {
-    return match &self.effects {
-      Option<Box<Effects>>.Some { .. } => true
-      Option<Box<Effects>>.None => false
-    }
-  }
-
   pub fn paintEffects(self: &Self) -> Option<&Effects> {
-    return match &self.effects {
-      Option<Box<Effects>>.Some { value } => Option<&Effects>.some(&value.get()[0])
-      Option<Box<Effects>>.None => Option<&Effects>.None
-    }
+    return self.effects.get()
   }
 
   /// Whether the node has editing state: every input does.
   pub fn hasEdit(self: &Self) -> bool {
-    return match &self.editing {
-      Option<Box<EditState>>.Some { .. } => true
-      Option<Box<EditState>>.None => false
-    }
+    return self.editing.isSome()
   }
 
   /// The editing state; the node must have one (`hasEdit`), as inputs do.
   pub fn edit(self: &Self) -> &EditState {
-    match &self.editing {
-      Option<Box<EditState>>.Some { value } => {
-        return &value.get()[0]
-      }
-      Option<Box<EditState>>.None => {
-        return Intrinsic.trap("ui-tree: the node has no editing state")
-      }
-    }
+    return self.editing.expect()
   }
 
   /// The editing state to change; the node must have one (`hasEdit`), as inputs do.
   pub fn editMut(self: &mut Self) -> &mut EditState {
-    match &mut self.editing {
-      Option<Box<EditState>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<EditState>>.None => {
-        return Intrinsic.trap("ui-tree: the node has no editing state")
-      }
-    }
+    return self.editing.expectMut()
   }
 
   /// The node's rarer accessibility attributes, when it was given any.
   pub fn semanticsOf(self: &Self) -> Option<&Semantics> {
-    return match &self.semantics {
-      Option<Box<Semantics>>.Some { value } => Option<&Semantics>.Some { value: &value.get()[0] }
-      Option<Box<Semantics>>.None => Option<&Semantics>.None
-    }
+    return self.semantics.get()
   }
 
   /// The node's rarer accessibility attributes to change, made on first use.
   pub effect fn semanticsMut(self: &mut Self) -> &mut Semantics ! OutOfMemoryError ? &mut Allocator {
-    if self.semantics.isNone() {
-      self.semantics = Option<Box<Semantics>>.Some { value: run Box<Semantics>.make(Semantics.make()) }
-    }
-    match &mut self.semantics {
-      Option<Box<Semantics>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<Semantics>>.None => {
-        return Intrinsic.trap("ui-tree: semantics were just made")
-      }
-    }
+    return run self.semantics.getOrMake(Semantics.make)
   }
 
   /// Gives the node editing state when it has none.
   pub effect fn ensureEdit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     if !self.hasEdit() {
-      self.editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
+      self.editing.set(run Thin<EditState>.make(EditState.make()))
     }
   }
 }
