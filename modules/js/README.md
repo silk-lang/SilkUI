@@ -405,6 +405,10 @@ context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat() });
 
 [examples/webgpu-canvas](examples/webgpu-canvas/app.js) draws a triangle and reads a pixel
 back; run it with `silk run --manifest-path modules/js/demo/silk.toml -- modules/js/examples/webgpu-canvas/app.js`.
+[examples/three-canvas](examples/three-canvas/src/main.js) is three.js with its WebGPU
+renderer (`three/webgpu`), unchanged: `npm run build` there, then run `dist/app.js` the same
+way. Its Vite config defines `self` as `globalThis`, which three.js reads
+`requestAnimationFrame` from.
 
 How it works:
 
