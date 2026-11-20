@@ -1,0 +1,301 @@
+//! The frames of GPU canvases on their way to the renderer.
+//!
+//! A canvas node that shows a GPU surface (`Mutation.SetCanvasSurface`) is drawn by the app on
+//! a GPU device of its own, never on the renderer's: a canvas that takes long to draw must not
+//! hold the window's frames back. What the app finished drawing reaches the renderer through a
+//! [`CanvasPresenter`]: [`CanvasPresenter.open`] numbers a surface, [`CanvasPresenter.present`]
+//! hands over a frame of it, and the renderer shows the newest frame of each surface the next
+//! time it draws. A present wakes the renderer, which draws the window's last frame again with
+//! the new canvas: the UI thread paints nothing for it.
+//!
+//! A frame here is pixels in the process heap: the app read them back from its device and the
+//! renderer uploads them into a texture of its own. That works on every adapter, software ones
+//! included.
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex, Unparker }
+import silk.concurrency.thread { Transferable }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+
+/// One finished frame of surface `surface`: `width` by `height` premultiplied RGBA8 pixels in
+/// rows from the top, without padding.
+pub struct CanvasFrame {
+  pub surface: u32,
+  pub width: u32,
+  pub height: u32,
+  pub pixels: List<u8>,
+}
+
+impl Transferable for CanvasFrame {}
+
+struct Table {
+  /// The number the next surface gets. Numbers start at 1 and are not reused.
+  next: u32,
+  /// The newest frame of each surface the renderer has not taken yet.
+  pending: List<CanvasFrame>,
+  /// Surfaces closed since the renderer last looked.
+  closed: List<u32>,
+  /// Whether a copy of each surface's newest frame is kept in `latest` (check mode: the
+  /// reference image of a frame shows the canvases too).
+  keeps: bool,
+  latest: List<CanvasFrame>,
+}
+
+impl Transferable for Table {}
+
+/// What the renderer took: the frames to show, oldest first, and the surfaces to forget.
+pub struct TakenCanvases {
+  pub frames: List<CanvasFrame>,
+  pub closed: List<u32>,
+}
+
+/// The app's and the renderer's handle to the canvas frames of a window host. Clones share
+/// one table.
+pub struct CanvasPresenter {
+  table: Arc<Mutex<Table>>,
+  /// Wakes the renderer, where it sleeps on another thread.
+  wake: Option<Unparker>,
+}
+
+impl Transferable for CanvasPresenter {}
+
+impl CanvasPresenter {
+  /// A table of its own. `wake` wakes the renderer after a present.
+  pub effect fn make(wake: Option<Unparker>) -> CanvasPresenter
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let table = Table {
+      next: 1,
+      pending: List<CanvasFrame>.make(),
+      closed: List<u32>.make(),
+      keeps: false,
+      latest: List<CanvasFrame>.make(),
+    }
+    return CanvasPresenter {
+      table: run Arc<Mutex<Table>>.make(run Mutex<Table>.make(move table)),
+      wake: move wake,
+    }
+  }
+
+  /// A table no renderer on another thread sleeps for.
+  pub effect fn detached() -> CanvasPresenter
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run CanvasPresenter.make(Option<Unparker>.None)
+  }
+
+  pub fn clone(self: &Self) -> CanvasPresenter {
+    return CanvasPresenter {
+      table: self.table.clone(),
+      wake: match &self.wake {
+        Option<Unparker>.Some { value } => Option<Unparker>.some(value.clone())
+        Option<Unparker>.None => Option<Unparker>.None
+      },
+    }
+  }
+
+  /// Numbers a new surface, for `Mutation.SetCanvasSurface` and [`CanvasPresenter.present`].
+  pub fn open(self: &Self) -> u32 {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    let id = table.next
+    table.next = table.next + 1
+    return id
+  }
+
+  /// Hands `frame` to the renderer, in place of a frame of its surface the renderer has not
+  /// taken yet. A frame whose pixels do not fill its size is dropped.
+  pub effect fn present(self: &Self, frame: CanvasFrame) -> ()
+    ! OutOfMemoryError {
+    let wanted = u32.toUsize(frame.width) * u32.toUsize(frame.height) * 4
+    if frame.width == 0 || frame.height == 0 || frame.pixels.length() != wanted {
+      return ()
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    run store(&self.table, move frame) |> Effect.provideMut<Allocator>(&mut heap)
+    self.wakeRenderer()
+  }
+
+  /// Forgets surface `surface`: the renderer releases its texture, and nodes still naming it
+  /// draw nothing.
+  pub effect fn close(self: &Self, surface: u32) -> ()
+    ! OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    run forget(&self.table, surface) |> Effect.provideMut<Allocator>(&mut heap)
+    self.wakeRenderer()
+  }
+
+  fn wakeRenderer(self: &Self) -> () {
+    if let Option<Unparker>.Some { value } = &self.wake {
+      value.unpark()
+    }
+  }
+
+  /// Whether the renderer has frames to take or surfaces to forget.
+  pub fn waiting(self: &Self) -> bool {
+    let guard = self.table.get().lock()
+    let table = guard.get()
+    return table.pending.length() != 0 || table.closed.length() != 0
+  }
+
+  /// The renderer's: everything presented and closed since it last took.
+  pub fn take(self: &Self) -> TakenCanvases {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    return TakenCanvases {
+      frames: Intrinsic.replace(table.pending, List<CanvasFrame>.make()),
+      closed: Intrinsic.replace(table.closed, List<u32>.make()),
+    }
+  }
+
+  /// Keeps a copy of each surface's newest frame from now on, for [`CanvasPresenter.compose`].
+  pub fn keepLatest(self: &Self) -> () {
+    let mut guard = self.table.get().lock()
+    let table = guard.getMut()
+    table.keeps = true
+  }
+
+  /// Draws the newest frame of surface `surface` into `target`, `targetWidth` by
+  /// `targetHeight` RGBA8 pixels, stretched over the rectangle from (`left`, `top`) to
+  /// (`right`, `bottom`) in pixels and blended over what is there. Texels are picked nearest,
+  /// which is exact where the frame has the rectangle's size. Does nothing for a surface with
+  /// no kept frame (see [`CanvasPresenter.keepLatest`]).
+  pub fn compose(
+    self: &Self,
+    surface: u32,
+    target: &mut [u8],
+    targetWidth: u32,
+    targetHeight: u32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+  ) -> () {
+    let guard = self.table.get().lock()
+    let table = guard.get()
+    let at = indexOf(&table.latest, surface)
+    if at == usize.MAX || right <= left || bottom <= top {
+      return ()
+    }
+    let frame = &table.latest.asSlice()[at]
+    let source = frame.pixels.asSlice()
+    let x0 = clampPixel(left, targetWidth)
+    let x1 = clampPixel(right, targetWidth)
+    let y0 = clampPixel(top, targetHeight)
+    let y1 = clampPixel(bottom, targetHeight)
+    let mut y = y0
+    while y < y1 {
+      let v = (u32.toF32(y) + 0.5 - top) / (bottom - top)
+      let sy = texel(v, frame.height)
+      let mut x = x0
+      while x < x1 {
+        let u = (u32.toF32(x) + 0.5 - left) / (right - left)
+        let sx = texel(u, frame.width)
+        let from = (u32.toUsize(sy) * u32.toUsize(frame.width) + u32.toUsize(sx)) * 4
+        let to = (u32.toUsize(y) * u32.toUsize(targetWidth) + u32.toUsize(x)) * 4
+        if to + 3 < target.length {
+          let alpha = u8.toU32(source[from + 3])
+          let mut c: usize = 0
+          while c < 4 {
+            // Premultiplied source over the target.
+            let under = u8.toU32(target[to + c]) * (255 - alpha)
+            let value = u8.toU32(source[from + c]) + (under + 127) / 255
+            target[to + c] = if value > 255 {
+              255
+            } else {
+              u32.toU8(value)
+            }
+            c = c + 1
+          }
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+  }
+}
+
+effect fn store(shared: &Arc<Mutex<Table>>, frame: CanvasFrame) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  if table.keeps {
+    let mut copy = List<u8>.make()
+    run copy.appendSlice(frame.pixels.asSlice())
+    let kept = CanvasFrame {
+      surface: frame.surface,
+      width: frame.width,
+      height: frame.height,
+      pixels: move copy,
+    }
+    let old = indexOf(&table.latest, frame.surface)
+    if old != usize.MAX {
+      drop table.latest.remove(old)
+    }
+    run table.latest.append(move kept)
+  }
+  let at = indexOf(&table.pending, frame.surface)
+  if at != usize.MAX {
+    drop table.pending.remove(at)
+  }
+  run table.pending.append(move frame)
+}
+
+effect fn forget(shared: &Arc<Mutex<Table>>, surface: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut guard = shared.get().lock()
+  let table = guard.getMut()
+  let at = indexOf(&table.pending, surface)
+  if at != usize.MAX {
+    drop table.pending.remove(at)
+  }
+  let kept = indexOf(&table.latest, surface)
+  if kept != usize.MAX {
+    drop table.latest.remove(kept)
+  }
+  run table.closed.append(surface)
+}
+
+fn indexOf(frames: &List<CanvasFrame>, surface: u32) -> usize {
+  let values = frames.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].surface == surface {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// The pixel column or row at or after coordinate `value` whose center `value` is left of,
+/// within `0..=limit`.
+fn clampPixel(value: f32, limit: u32) -> u32 {
+  let rounded = f32.floor(value + 0.5)
+  if rounded <= 0.0 {
+    return 0
+  }
+  if rounded >= u32.toF32(limit) {
+    return limit
+  }
+  return f32.toU32(rounded)
+}
+
+/// The texel of `count` that fraction `at` of the way falls in.
+fn texel(at: f32, count: u32) -> u32 {
+  let scaled = f32.floor(at * u32.toF32(count))
+  if scaled <= 0.0 {
+    return 0
+  }
+  if scaled >= u32.toF32(count) {
+    return count - 1
+  }
+  return f32.toU32(scaled)
+}

@@ -63,6 +63,10 @@ import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
 import ui_js_calls.supports as supports
 import ui_js_calls.natives { Natives, NativeCall, Reply }
+import ui_js_calls.gpu { GpuReply }
+import generated_webgpu_api { gpuApi }
+import silkjs.js_buffer_storage { ViewObject }
+import silkjs.js_buffer_storage as buffers
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
 
 /// A native function's id: a hash of its JavaScript name, so a feature adds a native without
@@ -211,6 +215,19 @@ pub const UNOBSERVE: u32 = 571481 // nativeId(b"unobserve")
 pub const QUERY: u32 = 1055226 // nativeId(b"query")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
+/// `__ui.gpu(bytes)`: WebGPU commands (`webgpu.js` wrote them into the typed array `bytes`) for
+/// the host's GPU service, which takes them once the JavaScript turn ended.
+pub const GPU: u32 = 168108 // nativeId(b"gpu")
+/// `__ui.gpuApi()`: the source of `webgpu.js`, which the prelude evaluates on first use.
+pub const GPU_API: u32 = 312308 // nativeId(b"gpuApi")
+/// `__ui.gpuEnabled()`: whether the host runs WebGPU commands (`navigator.gpu` is there).
+pub const GPU_ENABLED: u32 = 1077775 // nativeId(b"gpuEnabled")
+/// `__ui.gpuReply(index, field)`: reply `index` of the replies the host called
+/// `__ui.gpuReplies(count)` for: field 0 its token, 1 its status, 2 its number, 3 its text and
+/// 4 how many bytes it has.
+pub const GPU_REPLY: u32 = 938260 // nativeId(b"gpuReply")
+/// `__ui.gpuReplyBytes(index, into)`: copies the bytes of reply `index` into typed array `into`.
+pub const GPU_REPLY_BYTES: u32 = 839230 // nativeId(b"gpuReplyBytes")
 /// `__ui.now()`: the host's clock in milliseconds, as `performance.now()`.
 pub const NOW: u32 = 174806 // nativeId(b"now")
 /// `__ui.timer(id, delay)`: asks for `__ui.fire(id)` once, `delay` milliseconds from now.
@@ -373,6 +390,12 @@ pub struct Bridge {
   pub geometry: List<f64>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
+  /// Whether the host runs WebGPU commands.
+  pub gpuEnabled: bool,
+  /// The WebGPU commands JavaScript wrote since the host last took them (`__ui.gpu`).
+  pub gpuCommands: List<u8>,
+  /// What the host's GPU service answered, while `__ui.gpuReplies` reads them.
+  pub gpuReplies: List<GpuReply>,
   /// For the bench census: every `__ui.*` call JavaScript made; and for the collections,
   /// the allocator's bytes and blocks as each began and the sums of what each freed.
   pub calls: usize,
@@ -500,6 +523,30 @@ effect fn latin1<'v>(value: ValueRef<'v>) -> Bytes ! OutOfMemoryError ? &mut All
   return move bytes
 }
 
+/// Where typed array `value` keeps the bytes it shows and how many there are; no bytes for
+/// anything else and for a detached or out of bounds view. The pointer holds while no
+/// JavaScript runs.
+struct ViewBytes {
+  data: [*]mut u8,
+  length: usize,
+}
+
+fn viewBytes<'v>(value: ValueRef<'v>) -> Option<ViewBytes> {
+  let view = match ViewObject<'v>.ofTypedArray(value) {
+    Option<ViewObject<'v>>.Some { value: found } => found
+    Option<ViewObject<'v>>.None => { return Option<ViewBytes>.None }
+  }
+  if view.isOutOfBounds() { return Option<ViewBytes>.None }
+  let span = view.span()
+  if span.bytes.detached || Pointer.isNull<u8>(span.bytes.data) { return Option<ViewBytes>.None }
+  let length = usize.shiftLeft(u64.toUsize(view.count()), u32.toUsize(buffers.sizeLog2(view.classId())))
+  if length == 0 { return Option<ViewBytes>.None }
+  return Option<ViewBytes>.some(ViewBytes {
+    data: unsafe Pointer.assumeManyMut<u8>(unsafe buffers.dataAt(span.bytes.data, span.offset)),
+    length: length,
+  })
+}
+
 /// A rejected promise nothing handles yet. Both values are owned.
 pub struct Rejected {
   pub promise: Value,
@@ -533,6 +580,9 @@ impl Bridge {
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
       observers: Observers.make(),
+      gpuEnabled: false,
+      gpuCommands: List<u8>.make(),
+      gpuReplies: List<GpuReply>.make(),
       calls: 0,
       gcBeforeBytes: 0, gcBeforeBlocks: 0, gcFreedBytes: 0, gcFreedBlocks: 0, gcScannedBytes: 0,
     }
@@ -685,6 +735,11 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"style", arity: 3 },
     Native { name: b"caret", arity: 2 },
     Native { name: b"geometry", arity: 1 },
+    Native { name: b"gpu", arity: 1 },
+    Native { name: b"gpuApi", arity: 0 },
+    Native { name: b"gpuEnabled", arity: 0 },
+    Native { name: b"gpuReply", arity: 2 },
+    Native { name: b"gpuReplyBytes", arity: 2 },
     Native { name: b"hit", arity: 2 },
     Native { name: b"hits", arity: 2 },
     Native { name: b"metrics", arity: 1 },
@@ -986,6 +1041,51 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     return Outcome.Returned { value: ValueBits.Bool { value: answer } }
   } else if function == QUERY {
     return run query(&mut bridge.*, first, id(argv.get(1).view()), argv.get(2))
+  } else if function == GPU {
+    if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
+      let anchor: u8 = 0
+      run bridge.gpuCommands.appendSlice(unsafe Pointer.borrowMany<u8, u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(bytes.data), bytes.length))
+    }
+  } else if function == GPU_API {
+    let made = run Effect.result(Strings.fromUtf8(gpuApi()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
+  } else if function == GPU_ENABLED {
+    return Outcome.Returned { value: ValueBits.Bool { value: bridge.gpuEnabled } }
+  } else if function == GPU_REPLY {
+    let replies = bridge.gpuReplies.asSlice()
+    let at = u32.toUsize(first)
+    if at >= replies.length { return Outcome.Returned { value: ValueBits.Undefined } }
+    let field = id(argv.get(1).view())
+    if field == 3 {
+      let made = run Effect.result(Strings.fromUtf8(String.utf8Bytes(String.view(&replies[at].text))))
+      return match move made {
+        Result.Success { value: text } => Outcome.Returned { value: text }
+        Result.Failure { .. } => { fail OutOfMemoryError {} }
+      }
+    }
+    let value = if field == 0 { u32.toF64(replies[at].token) }
+      else if field == 1 { u32.toF64(replies[at].status) }
+      else if field == 2 { replies[at].number }
+      else { usize.toF64(replies[at].bytes.length()) }
+    return Outcome.Returned { value: ValueBits.number(value) }
+  } else if function == GPU_REPLY_BYTES {
+    let replies = bridge.gpuReplies.asSlice()
+    let at = u32.toUsize(first)
+    if at < replies.length {
+      let from = replies[at].bytes.asSlice()
+      if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(1)) {
+        let mut anchor: u8 = 0
+        let into = unsafe Pointer.borrowManyMut<u8, u8>(&mut anchor, bytes.data, bytes.length)
+        let mut i: usize = 0
+        while i < from.length && i < into.length {
+          into[i] = from[i]
+          i = i + 1
+        }
+      }
+    }
   } else if function == WEB_APIS {
     let made = run Effect.result(Strings.fromUtf8(webApis()))
     return match move made {
