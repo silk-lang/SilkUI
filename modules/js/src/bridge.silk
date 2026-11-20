@@ -49,7 +49,7 @@ import silkjs.js_proxy_core as core
 import silkjs.js_exceptions { JsException }
 import silkjs.js_strings { Strings }
 import silkjs.js_core_types { NativeFunctionId, NativeErrorKind, ModuleDef }
-import silkjs.js_heap { CellRef }
+import silkjs.js_heap { CellRef, HeapHeader }
 import silkjs.js_coercion_host { CoercionHooks }
 import silkjs.js_eval as evaluation
 import silkjs.js_bytecode_image as image
@@ -362,6 +362,14 @@ pub struct Bridge {
   pub geometry: List<f64>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
+  /// For the bench census: every `__ui.*` call JavaScript made; and for the collections,
+  /// the allocator's bytes and blocks as each began and the sums of what each freed.
+  pub calls: usize,
+  pub gcBeforeBytes: usize,
+  pub gcBeforeBlocks: usize,
+  pub gcFreedBytes: usize,
+  pub gcFreedBlocks: usize,
+  pub gcScannedBytes: usize,
 }
 
 /// A `__ui.nativeStart` call: `token` is the prelude's number for its promise.
@@ -425,6 +433,8 @@ impl Bridge {
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
       observers: Observers.make(),
+      calls: 0,
+      gcBeforeBytes: 0, gcBeforeBlocks: 0, gcFreedBytes: 0, gcFreedBlocks: 0, gcScannedBytes: 0,
     }
   }
 
@@ -692,6 +702,7 @@ effect fn replied(reply: Reply) -> Outcome ! OutOfMemoryError ? &mut Allocator {
 /// Runs `__ui` native function `function` on `state`. A host whose engine services are not a
 /// `Bridge` (an embedded runtime's) calls it from its own native dispatch.
 pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  bridge.calls = bridge.calls + 1
   let first = id(argv.get(0).view())
   if function == CREATE {
     run bridge.batch.create(first, nodeKind(id(argv.get(1).view())))
@@ -1336,6 +1347,17 @@ impl EngineServices for Bridge {
   /// so their code and CLDR tables stay out of the program.
   fn includesIntl<'m>(engine: &Engine<'m, Self>) -> bool { return false }
   fn includesTemporal<'m>(engine: &Engine<'m, Self>) -> bool { return false }
+  /// For the bench census: what each collection found live when it began and freed.
+  unsafe fn gcLifecycle<'m>(engine: &mut Engine<'m, Self>, runtime: *mut HeapHeader, event: u32) -> () {
+    // The gate-free reading: a collection may run where the ledger's gate is held.
+    let used = engine.memory.usedBytes()
+    if (event & 1) == 0 {
+      engine.services.gcBeforeBytes = used
+      engine.services.gcScannedBytes = engine.services.gcScannedBytes + used
+    } else if engine.services.gcBeforeBytes > used {
+      engine.services.gcFreedBytes = engine.services.gcFreedBytes + (engine.services.gcBeforeBytes - used)
+    }
+  }
   /// No host globals: a shadow realm has its intrinsics alone.
   effect fn initializeShadowRealm<'r, 's, 'm>(engine: &mut Engine<'m, Self>, caller: Realm<'r>, created: Realm<'s>) -> () ! JsException ? &mut Allocator {}
 

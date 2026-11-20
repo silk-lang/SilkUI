@@ -3,6 +3,7 @@
 //! A text style (family list, size, weight, width, style) gets a font key for css-layout's
 //! `Style.fontKey`. When fallback draws some characters with another face, that face at the
 //! style's size gets a key of its own, so `Measure.font` can give its metrics too.
+import properties.census { Census }
 import set { FontSet, Link }
 import font_collection.lib {
   FontCollection,
@@ -315,7 +316,15 @@ pub struct FontState<'a> {
   /// Shaper calls the cache did not answer, and the bytes of text they shaped, for tests and
   /// benchmarks.
   pub shaperCalls: usize,
+  /// For the bench census: `shapeTextOriented` calls and the bytes of text they hashed, the
+  /// calls the cache answered, those cut from the last paragraph, and the bytes the shaper
+  /// itself took.
+  pub shapeTextCalls: usize,
+  pub shapeTextBytes: usize,
+  pub shapeCacheHits: usize,
+  pub shapeSliceHits: usize,
   pub shaperBytes: usize,
+  pub cacheFlushes: usize,
   /// Round ascent, descent and line gap to whole pixels, as Blink does on every platform.
   pub roundMetrics: bool,
   /// OpenType features by [`FontState.defineFeatures`] handle, less one, as tag and value
@@ -476,6 +485,29 @@ effect fn shaperFeatures(features: &FontFeatures, defined: &[List<u32>]) -> List
 }
 
 impl<'a> FontState<'a> {
+  /// What the font state holds and the shaping it did, for the bench census.
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run out.held("text.fonts.styles", self.styles.length(), self.styles.capacity(), Intrinsic.layoutOf<StyleEntry>().bytes)
+    run out.held("text.fonts.keys", self.keys.length(), self.keys.capacity(), Intrinsic.layoutOf<KeyInfo>().bytes)
+    run out.held("text.fonts.metrics", self.metrics.length(), self.metrics.capacity(), Intrinsic.layoutOf<FontMetrics>().bytes)
+    run out.held("text.fonts.instances", self.instances.length(), self.instances.capacity(), Intrinsic.layoutOf<Instance>().bytes)
+    run out.held("text.fonts.shaper-data", self.data.length(), self.data.capacity(), Intrinsic.layoutOf<ShaperData<'a>>().bytes)
+    run out.held("text.fonts.data-slots(one per installed face)", self.dataSlots.length(), self.dataSlots.capacity(), 4)
+    run out.held("text.fonts.plans", self.plans.length(), self.plans.capacity(), Intrinsic.layoutOf<PlanEntry<'a>>().bytes)
+    run out.held("text.shape-cache.index", self.shapedIndex.length(), self.shapedIndex.bucketCount(), 25)
+    run out.held("text.shape-cache.entries", self.shaped.length(), self.shaped.capacity(), Intrinsic.layoutOf<Shaped>().bytes)
+    run out.held("text.shape-cache.text-bytes", self.shapedText.length(), self.shapedText.capacity(), 1)
+    run out.held("text.shape-cache.glyphs(RawGlyph)", self.shapedGlyphs.length(), self.shapedGlyphs.capacity(), Intrinsic.layoutOf<RawGlyph>().bytes)
+    run self.set.census(&mut out)
+    run out.work("text.shape-text.calls", self.shapeTextCalls)
+    run out.work("text.shape-text.bytes-hashed", self.shapeTextBytes)
+    run out.work("text.shape-text.cache-hits", self.shapeCacheHits)
+    run out.work("text.shape-text.paragraph-slice-hits", self.shapeSliceHits)
+    run out.work("text.shaper.calls", self.shaperCalls)
+    run out.work("text.shaper.bytes", self.shaperBytes)
+    run out.work("text.shape-cache.flushes", self.cacheFlushes)
+  }
+
   pub fn make(collection: &'a FontCollection) -> FontState<'a> {
     return FontState {
       set: FontSet.make(collection),
@@ -493,7 +525,7 @@ impl<'a> FontState<'a> {
       shapedText: List<u8>.make(),
       shapedGlyphs: List<RawGlyph>.make(),
       shaperCalls: 0,
-      shaperBytes: 0,
+      shapeTextCalls: 0, shapeTextBytes: 0, shapeCacheHits: 0, shapeSliceHits: 0, shaperBytes: 0, cacheFlushes: 0,
       roundMetrics: true,
       defined: List<List<u32>>.make(),
     }
@@ -928,6 +960,8 @@ impl<'a> FontState<'a> {
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.shapeTextCalls = self.shapeTextCalls + 1
+    self.shapeTextBytes = self.shapeTextBytes + String.byteLength(text)
     let hash = shapeHash(instance, text, start, end, rtl, script.value, vertical, features)
     if let Option<u32>.Some { value: at } = self.shapedIndex.get(Hash.word(hash)) {
       let entry = self.shaped.get(u32.toUsize(at))
@@ -941,12 +975,14 @@ impl<'a> FontState<'a> {
         run out.appendSlice(
           Slice.view(self.shapedGlyphs.asSlice(), entry.glyphStart, entry.glyphCount),
         )
+        self.shapeCacheHits = self.shapeCacheHits + 1
         return
       }
     }
     let first = out.length()
     run self.shapeUncached(instance, text, start, end, rtl, script, vertical, features, &mut out)
     if self.shapedGlyphs.length() + (out.length() - first) > SHAPED_GLYPHS {
+      self.cacheFlushes = self.cacheFlushes + 1
       self.shapedIndex.clear()
       self.shaped.clear()
       self.shapedText.clear()
