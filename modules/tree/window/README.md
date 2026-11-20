@@ -105,6 +105,8 @@ of paint, with the layout passes and boxes laid out. The clock moves 1/120 s a f
   through, so one run has frames with the pointer outside and inside.
 - `SILK_UI_BENCH_PAUSE=<ms>`: spins that long before the clock starts, for a sampler that
   attaches as the process starts.
+- `SILK_UI_BENCH_HOLD=<ms>`: sleeps that long after the first frame and after the last, so
+  `footprint`, `vmmap`, `heap` or `malloc_history` can look at the process at rest.
 - `SILK_UI_BENCH_DIGEST=1`: digests of the first frame's layout (every box, every glyph where
   it draws, every text run), to check that two builds lay out the same; `dump` adds a line for
   each text fragment.
