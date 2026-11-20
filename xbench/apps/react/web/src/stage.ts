@@ -12,7 +12,7 @@ const CORNERS = array<vec2f, 6>(vec2f(-1, -1), vec2f(1, -1), vec2f(-1, 1), vec2f
   let i = f32(index);
   let ring = fract(i * 0.61803398875);
   let orbit = fract(i * 0.754877666);
-  // Inner orbits turn faster. The speed must not follow `ring`, which the angle follows too.
+  // Inner orbits turn faster. The speed must not follow the ring, which the angle follows too.
   let angle = ring * 6.28318530718 + clock.x * (1.2 - orbit);
   let radius = 0.08 + 0.9 * sqrt(orbit);
   let center = vec2f(cos(angle) * radius * 0.375, sin(angle) * radius);
