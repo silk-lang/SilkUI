@@ -27,7 +27,7 @@ if [[ -n "$LOOM_SILKUI" ]]; then
     echo "note: $CACHE/$LOOM_SILKUI is a real checkout, not \$SILKUI; Loom builds against it" >&2
   fi
 fi
-VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$W" | tr -d '"')
+VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$SILKUI/silk.toml" | tr -d '"')
 sed -e "s#@SILKUI@#$SILKUI#g" -e "s#@SILK_VERSION@#$VERSION#g" \
     -e "s#@LIB_FONTS@#$(pin lib-fonts modules/collection)#g" -e "s#@LIB_GRAPHICS@#$(pin lib-graphics modules/atlas)#g" \
     -e "s#@LIB_NATIVE_WINDOW@#$(pin lib-native modules/platform/window)#g" -e "s#@LIB_NATIVE_GPU@#$(pin lib-native modules/gpu/webgpu)#g" \
