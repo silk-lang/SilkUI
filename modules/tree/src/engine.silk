@@ -941,6 +941,14 @@ pub struct UiTree<'a> {
   pub zoomKeys: bool,
   /// The frame the current root last painted at: its subtrees cached then can be replayed.
   paintedAt: u64,
+  /// The viewport and the layout and scroll revisions of the current root's last paint: a
+  /// frame where none of them changed and nothing else asked for paint keeps that scene
+  /// (see `quietFrame`). A width of -1 means no paint is known, as after a root switch.
+  quietInput: FrameInput,
+  quietRevision: usize,
+  quietScrolls: usize,
+  /// Frames whose paint was skipped because nothing changed since the last paint.
+  pub paintsKept: u64,
   pub stats: FrameStats,
   pub events: List<Event>,
   /// The node ids in the order the last frame painted them (replayed subtrees included).
@@ -1487,6 +1495,10 @@ impl<'a> UiTree<'a> {
       pageZoomFactor: 1.0,
       zoomKeys: false,
       paintedAt: 0,
+      quietInput: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      quietRevision: usize.MAX,
+      quietScrolls: usize.MAX,
+      paintsKept: 0,
       stats: FrameStats.zero(),
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
@@ -3900,6 +3912,8 @@ impl<'a> UiTree<'a> {
     self.layoutObserversDirty = s.layoutObserversDirty
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
+    // Another root's paint is not this one's: the next frame paints.
+    self.quietInput = FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 }
     self.output = Intrinsic.replace(s.output, LayoutTree.make())
     self.containerWatches = Intrinsic.replace(s.containerWatches, List<Watch>.make())
     self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
@@ -7121,10 +7135,30 @@ impl<'a> UiTree<'a> {
     return &self.sceneA
   }
 
+  /// Whether a frame at `input` can keep the last scene: the tree asks for no frame of its
+  /// own (no mutation, style, layout, scroll, animation or paint change since it was painted:
+  /// `needsFrame`), the viewport is the one painted, and nothing paints differently with time
+  /// alone (a blinking caret, an animated icon, a font block period ending) or waits to be
+  /// picked up at paint (faces to load, a selection to rebuild). A frame asked for only by the
+  /// host or the client (`requestAnimationFrame`, a canvas present) then skips its paint.
+  fn quietFrame(self: &Self, input: FrameInput) -> bool {
+    return self.paintedAt != 0
+      && !self.needsFrame()
+      && input.width == self.quietInput.width && input.height == self.quietInput.height
+      && input.scale == self.quietInput.scale
+      && !self.facesDirty && !self.paintCachesStale && !self.paintDirty
+      && self.fontBlockEnd < 0.0
+      && edit.nextBlink(self) < 0.0
+      && text_selection.settled(self)
+      && !self.resources.icons.anyAnimated()
+  }
+
   /// Applies styles, lays out what changed and paints the frame.
   pub effect fn frame(self: &mut Self, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    // Asked before the frame clears its flags: whether nothing changed since the last paint.
+    let quiet = self.quietFrame(input)
     self.frameNumber = self.frameNumber + 1
     self.heldAwake.clear()
     run self.trimNodes()
@@ -7189,7 +7223,17 @@ impl<'a> UiTree<'a> {
     }
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
-    run self.paintFrame()
+    if quiet && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty && !self.scrolled
+      && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls {
+      // Nothing this frame did changed what paints either: the last scene is this frame's.
+      self.paintsKept = self.paintsKept + 1
+      self.stats.primitives = self.scene().primitiveCount()
+    } else {
+      run self.paintFrame()
+      self.quietInput = self.input
+      self.quietRevision = self.layout.revision()
+      self.quietScrolls = self.layout.scrollRevision()
+    }
     self.fontBlockEnd = self.provider.text.fonts.set.nextDeadline()
     self.scrolled = false
     self.paintDirty = false
@@ -8724,3 +8768,4 @@ fn blankText(text: &[u8]) -> bool {
   }
   return true
 }
+
