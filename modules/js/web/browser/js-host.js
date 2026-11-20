@@ -16,6 +16,7 @@
 // window for a frame. Timers, animation frames, fetch, console and the clipboard are the
 // browser's own, so what an animation frame callback changes is painted in the next frame.
 import { runApp, unsupported } from '/ui/tree/window/browser/app-host.js';
+import { CANVAS_USAGE } from '/ui/tree/window/browser/page-canvases.mjs';
 
 export { unsupported };
 
@@ -25,7 +26,7 @@ const OP = {
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
-  capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32,
+  capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32, surface: 33, canvasFrame: 34,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -97,6 +98,64 @@ class Calls {
   }
 }
 
+const NO_SURFACE = 0xffffffff;
+
+/**
+ * What `getContext("webgpu")` of a canvas node gives in the page: the browser's own context
+ * of a canvas that is not in the document. The application draws it with the browser's
+ * WebGPU on a device of its own, and the window's renderer shows the picture in the node
+ * (`PageCanvases` in app-host.js copies it across at the next frame).
+ */
+function canvasContext(host, node) {
+  const page = new OffscreenCanvas(Math.max(1, node.width | 0), Math.max(1, node.height | 0));
+  const context = page.getContext('webgpu');
+  if (!context) return null;
+  const surface = host.canvases.open(page);
+  let opaque = true;
+  let configured = false;
+  let announced = false;
+  const show = () => {
+    host.write(OP.surface, node.nodeId);
+    const calls = host.calls;
+    calls.u32(configured ? surface : NO_SURFACE); calls.u32(page.width); calls.u32(page.height); calls.byte(opaque ? 1 : 0);
+    announced = false;
+  };
+  const { configure, unconfigure, getCurrentTexture } = context;
+  // The node the context draws for, as `context.canvas` of a canvas element.
+  Object.defineProperty(context, 'canvas', { value: node, configurable: true });
+  context.configure = configuration => {
+    // The window's renderer may have to read the picture back (page-canvases.mjs).
+    configure.call(context, { ...configuration, usage: (configuration.usage ?? 0x10) | CANVAS_USAGE });
+    opaque = (configuration.alphaMode ?? 'opaque') === 'opaque';
+    configured = true;
+    host.canvases.configured(surface, configuration.device, configuration.format, opaque);
+    show();
+  };
+  context.unconfigure = () => {
+    unconfigure.call(context);
+    configured = false;
+    show();
+  };
+  context.getCurrentTexture = () => {
+    const texture = getCurrentTexture.call(context);
+    host.canvases.drawn(surface, texture);
+    // One call per turn has the window draw a frame with the new picture.
+    if (!announced) {
+      announced = true;
+      host.write(OP.canvasFrame, node.nodeId);
+      queueMicrotask(() => { announced = false; });
+    }
+    return texture;
+  };
+  // The node's `width` or `height` changed: the canvas takes the new size, which clears it.
+  context._resized = () => {
+    page.width = Math.max(1, node.width | 0);
+    page.height = Math.max(1, node.height | 0);
+    if (configured) show();
+  };
+  return context;
+}
+
 /**
  * The page's side of one application: the `__ui` functions and the `silkui` imports of the
  * wasm. Making one installs `globalThis.__ui`, so make it before the application's bundle runs.
@@ -108,11 +167,14 @@ export class JsHost {
   ran = null;
   wakeQueued = false;
   dispatched = false;
+  /** The page's GPU canvases (`PageCanvases` of app-host.js), once the app has started. */
+  canvases = null;
+  contexts = new WeakMap();
 
   constructor() {
     const calls = this.calls;
     const host = this;
-    const write = (code, id) => {
+    const write = this.write = (code, id) => {
       calls.op(code, id);
       host.queueWake();
     };
@@ -171,10 +233,19 @@ export class JsHost {
       insertAtom(id, start, end, atom) { write(OP.insertAtom, id); calls.u32(start); calls.u32(end); calls.text(atom); },
       markdown: (text, flags) => this.markdown(text, flags),
       svgMeasure: (op, packed, distance) => this.svgMeasure(op, packed, distance),
+      // WebGPU is the browser's own (`navigator.gpu`); a canvas node asks here for its context.
+      gpuLoad: () => (this.canvases && navigator.gpu && typeof OffscreenCanvas === 'function' ? this.gpu : null),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
       // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
       memoryUsage: () => this.instance?.exports.memory.buffer.byteLength ?? 0,
+    };
+    this.gpu = {
+      context: node => {
+        let context = this.contexts.get(node);
+        if (context === undefined) this.contexts.set(node, (context = canvasContext(this, node)));
+        return context;
+      },
     };
     globalThis.__ui = this.ui;
     this.imports = {
@@ -294,9 +365,11 @@ export function runJsApp({ app, ...options }) {
   return runApp({
     ...options,
     imports: { ...options.imports, silkui: host.imports },
-    started: ({ instance, windowHost }) => {
+    started: ({ instance, windowHost, canvases }) => {
       host.instance = instance;
       host.windowHost = windowHost;
+      host.canvases = canvases;
+      canvases.wake = () => host.wake();
       // After `main` first suspends: `ready` waits for it.
       host.ran = Promise.resolve()
         .then(() => (typeof app === 'function' ? app() : import(new URL(app, location.href).href)))

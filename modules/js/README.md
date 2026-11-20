@@ -429,7 +429,9 @@ How it works:
 What is not there yet: query sets, render bundles and external textures throw, compilation
 info is always empty, `copyExternalImageToTexture` takes `ImageData` only, and a present
 copies the frame through the CPU. The canvas formats are `rgba8unorm` and `bgra8unorm`.
-On the web targets `navigator.gpu` is not provided yet.
+On the web canvas target ([web](web)) `navigator.gpu` is the browser's own, and a canvas
+node's `getContext("webgpu")` is the browser's context of a canvas outside the document, so
+the same bundle runs there: see "WebGPU in a canvas" in [web/README.md](web/README.md).
 
 `silk task embed-assets` regenerates `src/generated_webgpu_api.silk` after an edit to
 `webgpu.js`.

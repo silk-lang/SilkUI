@@ -33,6 +33,36 @@ Timers and `requestAnimationFrame` are the browser's own. A call made outside a 
 a fetch, an animation frame) asks the window host for a frame, so a change made in an
 animation frame callback is painted one frame later than in a window.
 
+## WebGPU in a canvas
+
+`navigator.gpu` is the browser's own here, and a canvas node's `getContext("webgpu")` gives
+the browser's `GPUCanvasContext` of an `OffscreenCanvas`, so an application draws as in a
+window: on a device of its own, apart from the one that draws the interface.
+[examples/three-canvas](../examples/three-canvas/src/main.js) runs unchanged:
+
+```sh
+cd modules/js/examples/three-canvas && npm run build && cd -
+silk task browser serve --app modules/js/examples/three-canvas/dist/app.js
+```
+
+The picture has to reach the renderer's device, which is another one. `__ui.gpuLoad`
+([browser/js-host.js](browser/js-host.js)) wraps the context: `configure` tells the tree
+which surface the node shows (`surface` on the wire, `Mutation.SetCanvasSurface`), and the
+first `getCurrentTexture` of a turn asks the window for a frame (`canvasFrame`) and has
+`PageCanvases` ([page-canvases.mjs](../../tree/window/browser/page-canvases.mjs)) take the
+picture once the code that draws it has run. Before each frame the renderer asks for the
+textures that are new (`silk_browser#canvas_sync`, `render_inline.silk`).
+
+A picture crosses in one of two ways. `copyExternalImageToTexture` from the canvas stays on
+the GPU; Chromium on a software Vulkan copies an empty picture that way, so the first canvas
+tries it once with a picture it knows. Until the answer is there, and where it is no, the
+picture is read back on the application's device and written into the renderer's texture,
+which shows it a frame or two later. Only the read back path has run so far (headless
+Chromium on lavapipe); the GPU path waits for a run on a real GPU.
+
+A canvas keeps its surface and texture until the page goes away, also after its node is
+destroyed.
+
 ## Foldkit
 
 The browser's `document` and DOM classes cannot be replaced, so a Foldkit bundle renames them

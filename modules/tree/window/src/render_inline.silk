@@ -22,15 +22,17 @@ import clock { Clock }
 import window.types { RawSurface, WindowId }
 import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
 import webgpu.runtime as runtime
-import webgpu.resources { Queue, Texture, getQueue }
+import webgpu.resources { Queue, Texture, TextureView, getQueue }
 import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
 import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
 import webgpu_sys.generated_webgpu as flags
+import webgpu_sys.generated_webgpu as sys
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.text.string { String }
 import silk.num.u64
 import silk.num.usize
@@ -42,8 +44,43 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   fn pause() -> () {
     unsafe hostYield()
   }
+
+  // The page's GPU canvases (`PageCanvases` in browser/app-host.js). The page draws them on a
+  // device of its own; `canvas_sync` copies the ones drawn since the last frame into textures
+  // of the renderer's device and answers how many surfaces got a new texture or went away.
+  // `canvas_change` then gives the number of one of those and `canvas_view` its texture view,
+  // null for a surface that went away.
+  unsafe extern "C" fn hostCanvasSync(device: sys.WGPUDevice) -> u32 as "silk_browser#canvas_sync"
+  unsafe extern "C" fn hostCanvasChange() -> u32 as "silk_browser#canvas_change"
+  unsafe extern "C" fn hostCanvasView() -> sys.WGPUTextureView as "silk_browser#canvas_view"
+
+  /// Brings the textures of the page's GPU canvases up to date before a frame is drawn.
+  effect fn pageCanvases(device: &Device, renderer: &mut UiRenderer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut left = unsafe hostCanvasSync(unsafe device.raw())
+    while left != 0 {
+      let surface = unsafe hostCanvasChange()
+      let handle = unsafe hostCanvasView()
+      if Pointer.isNull(handle) {
+        renderer.removeSurface(surface)
+      } else {
+        // The page handed one reference over with the handle.
+        let view = unsafe TextureView.adopt(handle)
+        run renderer.setSurface(surface, &view)
+      }
+      left = left - 1
+    }
+  }
 } else {
   fn pause() -> () {}
+
+  effect fn pageCanvases(device: &Device, renderer: &mut UiRenderer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop device
+    drop renderer
+  }
 }
 
 /// The canvas id modules/platform/window's browser backend gives window `handle`'s canvas.
@@ -220,6 +257,7 @@ impl InlineRenderer {
     let start = run self.clock.seconds()
     run self.upload(atlas, uploads) |> Effect.provideMut<Allocator>(&mut heap)
     let uploaded = run self.clock.seconds()
+    run pageCanvases(&self.device, &mut self.renderer) |> Effect.provideMut<Allocator>(&mut heap)
     let texture = run self.surface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run self.clock.seconds()
