@@ -116,7 +116,7 @@ path for typed pixel/percentage styles that need no ordered resolution. Context-
 font features, transforms, motion, sheets and inspector overrides use the full resolver. Both
 paths apply the same `Computed` property implementation.
 
-Measured on x86-64 Linux with Silk `0.1.0-dev.88+17d1a1b4d501`, LLVM 22.1.8,
+Measured on x86-64 Linux with Silk `0.1.0-dev.90+43166993a300`, LLVM 22.1.8,
 `--release` and Valgrind 3.24.0. Executable SHA-256:
 `59c61a512c558b7e1af145cba778364ccb7c47ea4d864b0f02dc5b4f9d5cb18e`.
 The runtime changes are in SilkUI `09bac4c8`; local runtime sources were used for all UI and
@@ -174,7 +174,7 @@ of fixed selector identities and 231,000 B of class string/atom capacity, exclud
 
 ### Initial instruction counts
 
-Measured on x86-64 Linux with Silk `0.1.0-dev.88+17d1a1b4d501`, LLVM 22.1.8,
+Measured on x86-64 Linux with Silk `0.1.0-dev.90+43166993a300`, LLVM 22.1.8,
 `--release`, and Valgrind 3.24.0. The original controls use SilkUI `9f7ea7e5`; the
 stylesheet implementation uses `2696d56b`. Counts include the whole process as described above.
 The stylesheet benchmark source and compiled fixture are in this directory.
