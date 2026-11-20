@@ -8,7 +8,7 @@ HERE=$(cd "$(dirname "$0")" && pwd); XB=$(cd "$HERE/../.." && pwd); WEB=$XB/apps
 # The Silk UI checkout to build against: by default the one this suite lives in.
 SILKUI=${SILKUI:-$(cd "$(dirname "$0")/../../.." && pwd)}
 scenes=("$@"); [[ ${#scenes[@]} -gt 0 ]] || scenes=(feed wall stream churn)
-VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$SILKUI/modules/silkui/window/silk.toml" | tr -d '"')
+VERSION=$(grep -h -m1 -o '"0\.1\.0-dev\.[^"]*"' "$SILKUI/modules/silkui/window/silk.toml" "$SILKUI/silk.toml" | head -1 | tr -d '"')
 (cd "$WEB" && [[ -d node_modules/vite ]] || npm ci --no-audit --no-fund)
 mkdir -p "$WEB/node_modules/@silkui"
 for p in core react vite; do rm -rf "$WEB/node_modules/@silkui/$p"; cp -R "$SILKUI/modules/js/packages/$p" "$WEB/node_modules/@silkui/$p"; done
