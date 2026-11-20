@@ -1,0 +1,167 @@
+//! GPU canvases: an app draws with WebGPU on a device of its own and the window shows the
+//! result in a canvas node.
+//!
+//! [`CanvasGpu.open`] makes the app's device, apart from the renderer's: the app's shaders,
+//! pipelines and draws never run on the device that draws the window, so a canvas that takes
+//! long to draw does not slow the rest of the interface. [`GpuCanvas.make`] makes a canvas of
+//! a size in pixels: draw into [`GpuCanvas.texture`] with any `webgpu` commands, then call
+//! [`GpuCanvas.present`]. The frame shows in every canvas node that names
+//! [`GpuCanvas.surface`] (`Tree.setCanvasSurface`), at the window's next refresh, without a
+//! frame of the UI thread.
+//!
+//! A present copies the frame through the CPU: the app's device reads the texture back and the
+//! renderer uploads it. That works on every adapter.
+import canvas_frames { CanvasFrame, CanvasPresenter }
+import ui_renderer.readback { copyOut, readbackSize, unpack }
+import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
+import webgpu.runtime as runtime
+import webgpu.resources { Queue, Texture, createTexture, getQueue }
+import webgpu.descriptors { DeviceDescriptor, Extent3D, TextureDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.core.ownership { Drop }
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.usize
+
+/// The format of every canvas texture: premultiplied RGBA.
+pub const CANVAS_FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
+
+/// The app's own GPU: an instance, a device on the default adapter and its queue.
+pub struct CanvasGpu {
+  pub instance: Instance,
+  pub device: Device,
+  pub queue: Queue,
+}
+
+impl CanvasGpu {
+  pub effect fn open() -> CanvasGpu
+    ! GpuError | OutOfMemoryError {
+    let instance = run Instance.create()
+    let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+    let device = run adapter.requestDevice(&DeviceDescriptor.default())
+    let queue = run getQueue(&device)
+    return CanvasGpu { instance: move instance, device: move device, queue: move queue }
+  }
+}
+
+/// One canvas: a texture of the app's device and the surface number its frames show under.
+pub struct GpuCanvas {
+  id: u32,
+  presenter: CanvasPresenter,
+  pixelWidth: u32,
+  pixelHeight: u32,
+  /// Whether presents make every pixel opaque, whatever alpha the app drew.
+  pub opaque: bool,
+  target: Texture,
+}
+
+effect fn makeTarget(device: &Device, width: u32, height: u32) -> Texture
+  ! GpuError {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  let mut descriptor = TextureDescriptor.default().withLabel(b"gpu canvas")
+  descriptor.setSize(size)
+  descriptor.setFormat(CANVAS_FORMAT)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(
+    flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc
+      | flags.WGPUTextureUsage_CopyDst | flags.WGPUTextureUsage_TextureBinding,
+  )
+  return run createTexture(device, &descriptor)
+}
+
+impl GpuCanvas {
+  /// A canvas of `width` by `height` pixels (each at least 1) on `gpu`, whose frames go
+  /// through `presenter`.
+  pub effect fn make(
+    gpu: &CanvasGpu,
+    presenter: &CanvasPresenter,
+    width: u32,
+    height: u32,
+  ) -> GpuCanvas
+    ! GpuError {
+    let w = if width == 0 { 1 } else { width }
+    let h = if height == 0 { 1 } else { height }
+    return GpuCanvas {
+      id: presenter.open(),
+      presenter: presenter.clone(),
+      pixelWidth: w,
+      pixelHeight: h,
+      opaque: false,
+      target: run makeTarget(&gpu.device, w, h),
+    }
+  }
+
+  /// The number canvas nodes name this canvas by (`Tree.setCanvasSurface`).
+  pub fn surface(self: &Self) -> u32 {
+    return self.id
+  }
+
+  pub fn width(self: &Self) -> u32 {
+    return self.pixelWidth
+  }
+
+  pub fn height(self: &Self) -> u32 {
+    return self.pixelHeight
+  }
+
+  /// The texture to draw the next frame into, in [`CANVAS_FORMAT`]. It keeps what was drawn
+  /// before: clear it in the frame's first pass.
+  pub fn texture(self: &Self) -> &Texture {
+    return &self.target
+  }
+
+  /// Gives the canvas a new size in pixels and an empty texture of that size. The window
+  /// keeps showing the last presented frame, stretched, until the next present.
+  pub effect fn resize(self: &mut Self, gpu: &CanvasGpu, width: u32, height: u32) -> ()
+    ! GpuError {
+    let w = if width == 0 { 1 } else { width }
+    let h = if height == 0 { 1 } else { height }
+    if w == self.pixelWidth && h == self.pixelHeight {
+      return ()
+    }
+    self.target = run makeTarget(&gpu.device, w, h)
+    self.pixelWidth = w
+    self.pixelHeight = h
+  }
+
+  /// Shows what was drawn into [`GpuCanvas.texture`]. Waits until the app's device finished
+  /// drawing it.
+  pub effect fn present(self: &Self, gpu: &CanvasGpu) -> ()
+    ! GpuError | OutOfMemoryError {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let buffer = run copyOut(&gpu.device, &gpu.queue, &self.target, self.pixelWidth, self.pixelHeight)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    let padded = run runtime.mapRead(&gpu.device, &buffer, 0, readbackSize(self.pixelWidth, self.pixelHeight))
+    let mut pixels = run unpack(padded.asSlice(), self.pixelWidth, self.pixelHeight, false)
+      |> Effect.provideMut<Allocator>(&mut heap)
+    if self.opaque {
+      let values = pixels.asMutSlice()
+      let mut i: usize = 3
+      while i < values.length {
+        values[i] = 255
+        i = i + 4
+      }
+    }
+    run self.presenter.present(
+      CanvasFrame {
+        surface: self.id,
+        width: self.pixelWidth,
+        height: self.pixelHeight,
+        pixels: move pixels,
+      },
+    )
+    run gpu.device.checkErrors()
+  }
+}
+
+impl Drop for GpuCanvas {
+  fn drop(self: &mut Self) -> () {
+    // Out of memory here leaves the renderer's texture until the window closes.
+    drop run Effect.result(self.presenter.close(self.id))
+  }
+}

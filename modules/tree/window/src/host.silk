@@ -26,6 +26,8 @@ import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
 import ui_tree.process_memory
 import render_thread { FastScroll, FastScrolled, RenderSettings }
+import canvas_frames { CanvasPresenter }
+import ui_scene.primitives { SURFACE_TEXTURE_BASE, surfaceOfTexture }
 import companion { Companion, Dock, NoCompanion, Paired, dockTarget, pointed }
 import screen_reader { ScreenReader, VARIABLE as SCREEN_READER_VARIABLE }
 
@@ -36,12 +38,23 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   /// What the renderer needs once the window exists; in the browser nothing starts before.
   struct EarlyRenderer {
     settings: RenderSettings,
+    /// GPU canvas frames: nothing shows them in the browser yet.
+    canvases: CanvasPresenter,
+  }
+
+  impl EarlyRenderer {
+    fn canvasPresenter(self: &Self) -> CanvasPresenter {
+      return self.canvases.clone()
+    }
   }
 
   effect fn prepareRenderer(settings: RenderSettings, cache: String) -> EarlyRenderer
     ! GpuError | OutOfMemoryError {
     drop cache
-    return EarlyRenderer { settings: settings }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let canvases = run CanvasPresenter.detached()
+      |> Effect.provideMut<Allocator>(&mut heap)
+    return EarlyRenderer { settings: settings, canvases: move canvases }
   }
 
   effect fn attachRenderer(early: EarlyRenderer, raw: RawSurface, window: WindowId) -> RenderThread
@@ -69,7 +82,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
 
   effect fn prepareGpu(check: bool) -> EarlyRenderer
     ! GpuError | OutOfMemoryError {
-    return EarlyRenderer { settings: RenderSettings { check: check } }
+    return run prepareRenderer(RenderSettings { check: check }, String.make())
   }
 } else {
   import render_thread { RenderThread }
@@ -194,11 +207,48 @@ pub fn showMetalHud(on: bool) -> () {
   metal_hud.showByDefault(on)
 }
 
+/// Draws the newest frame of each GPU canvas `scene` shows into `pixels`, the CPU reference of
+/// a check frame, over the bounds of its sprite. Clips, corner radii and layer transforms are
+/// not applied: a check with a canvas keeps it unclipped and square.
+fn composeCanvases(canvases: &CanvasPresenter, scene: &Scene, pixels: &mut Pixmap) -> () {
+  let width = pixels.width()
+  let height = pixels.height()
+  let mut layer: u32 = 0
+  while layer < scene.layerCount() {
+    let images = scene.images(layer)
+    let mut i: usize = 0
+    while i < images.length {
+      let index = images[i].tile.texture.index
+      if index >= SURFACE_TEXTURE_BASE {
+        let bounds = images[i].bounds
+        canvases.compose(
+          surfaceOfTexture(index),
+          pixels.dataMut(),
+          width,
+          height,
+          bounds.xMin,
+          bounds.yMin,
+          bounds.xMax,
+          bounds.yMax,
+        )
+      }
+      i = i + 1
+    }
+    layer = layer + 1
+  }
+}
+
 /// Client lifecycle hooks for the native tree host. Default hooks draw an ordinary tree.
 pub interface WindowClient<S, E, ? R> {
   /// Initializes resources before the first view and configures native window options.
   effect fn setup(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
+    ? &mut Allocator {}
+
+  /// Receives, before `setup`, the handle GPU canvases present their frames through (see
+  /// `gpu_canvas`). A client that draws no GPU canvas ignores it.
+  effect fn canvases(self: &mut Self, state: &mut S, presenter: CanvasPresenter) -> ()
+    ! OutOfMemoryError
     ? &mut Allocator {}
 
   /// Sets platform window options before the window opens.
@@ -1348,6 +1398,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   } else {
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
   }
+  let canvasFrames = early.canvasPresenter()
+  run content.canvases(&mut state, canvasFrames.clone())
   run content.setup(&mut state, &mut tree)
   run tree.apply(move resources)
   if serves && inspector.enabled() {
@@ -1811,7 +1863,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               }
               let compared = checked && status == 0
               let reference = if compared {
-                run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+                let mut pixels = run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+                // The CPU reference knows no GPU canvas: their newest frames are laid over it.
+                composeCanvases(&canvasFrames, content.scene(&state.*, &tree), &mut pixels)
+                move pixels
               } else {
                 run Pixmap.make(0, 0)
               }
@@ -1905,7 +1960,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
               // Check mode and lowest-latency apps wait for each frame on this thread.
               if check || options.lowestLatency || tracing {
-                let report = run renderer.waitFrames(drawn)
+                let report = if check {
+                  run renderer.waitPainted(drawn)
+                } else {
+                  run renderer.waitFrames(drawn)
+                }
                 if compared {
                   status = report.status
                 }
@@ -2249,6 +2308,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut tree = run UiTree.make(collection)
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
     tree.zoomKeys = true
+    // A headless run draws on the CPU: canvas frames go nowhere.
+    run content.canvases(&mut state, run CanvasPresenter.detached())
     run content.setup(&mut state, &mut tree)
     run tree.apply(move resources)
     let mut script = match move run Script.load(path, &mut inspector) {
@@ -2416,6 +2477,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let started = run seconds(&mut clock)
     let mut tree = run UiTree.make(collection)
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
+    run content.canvases(&mut state, run CanvasPresenter.detached())
     run content.setup(&mut state, &mut tree)
     let setupEnd = run seconds(&mut clock)
     run tree.apply(move resources)
