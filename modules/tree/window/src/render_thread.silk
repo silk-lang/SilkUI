@@ -34,12 +34,20 @@ import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
 import ui_renderer.renderer { UiRenderer }
 import ui_renderer.text { TextSettings }
+import canvas_frames { CanvasPresenter }
 import window.types { RawSurface, WindowId }
 import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
 import webgpu.runtime as runtime
-import webgpu.resources { Queue, Texture, getQueue }
+import webgpu.resources { Queue, Texture, createTexture, getQueue }
 import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
-import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
+import webgpu.descriptors {
+  DeviceDescriptor,
+  Extent3D,
+  TexelCopyBufferLayout,
+  TexelCopyTextureInfo,
+  TextureDescriptor,
+  TextureViewDescriptor
+}
 import webgpu_sys.generated_webgpu as flags
 import silk.collections.list { List }
 import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
@@ -264,6 +272,8 @@ pub struct RenderThread {
   handle: Option<JoinHandle<i32>>,
   /// The id the next surface of a window past the first gets.
   nextSurface: u32,
+  /// The frames of GPU canvases (see `canvas_frames`).
+  canvases: CanvasPresenter,
 }
 
 impl RenderThread {
@@ -290,6 +300,12 @@ impl RenderThread {
     let wake = theirParker.unparker()
     let wakeUi = parker.unparker()
     let theirs = shared.clone()
+    let canvases = run CanvasPresenter.make(Option<Unparker>.some(wake.clone()))
+      |> Effect.provideMut<Allocator>(&mut heap)
+    if settings.check {
+      canvases.keepLatest()
+    }
+    let theirCanvases = canvases.clone()
     let spawned = run Effect.result(
       NativeThread.spawn(
         || -> i32 {
@@ -297,7 +313,8 @@ impl RenderThread {
           let parker = move theirParker
           let wakeUi = move wakeUi
           let cache = move cache
-          return renderMain(&shared, &parker, &wakeUi, settings, String.view(&cache))
+          let canvases = move theirCanvases
+          return renderMain(&shared, &parker, &wakeUi, settings, String.view(&cache), &canvases)
         },
       ),
     )
@@ -320,6 +337,7 @@ impl RenderThread {
       wake: move wake,
       handle: Option<JoinHandle<i32>>.some(move handle),
       nextSurface: 1,
+      canvases: move canvases,
     }
     return move thread
   }
@@ -332,6 +350,11 @@ impl RenderThread {
     giveSurface(&self.shared, SurfaceHandle { raw: raw, window: window })
     self.wake.unpark()
     run self.waitReady()
+  }
+
+  /// The handle apps present GPU canvas frames through (see `canvas_frames`).
+  pub fn canvasPresenter(self: &Self) -> CanvasPresenter {
+    return self.canvases.clone()
   }
 
   /// The surface's texture format, chosen by the render thread.
@@ -547,6 +570,21 @@ impl RenderThread {
     return self.report()
   }
 
+  /// As [`RenderThread.waitFrames`], counting only frames the UI thread painted: a frame drawn
+  /// again for a compositor scroll or a new GPU canvas frame does not count. Check mode waits
+  /// with this, so the report it reads is the compared frame's.
+  pub effect fn waitPainted(self: &mut Self, frames: u64) -> RenderReport
+    ! GpuError {
+    while true {
+      if paintedOrStopped(&self.shared, frames) {
+        break
+      }
+      self.parker.park()
+    }
+    run raise(&self.shared)
+    return self.report()
+  }
+
   /// Stops the render thread and waits for it, after any frame it is drawing. Call it before
   /// the window closes.
   pub fn stop(self: &mut Self) -> () {
@@ -570,6 +608,12 @@ fn presentedOrStopped(shared: &Arc<Mutex<State>>, frames: u64) -> bool {
   let guard = shared.get().lock()
   let state = guard.get()
   return state.report.frames >= frames || Option<GpuError>.isSome(&state.failure) || state.quit
+}
+
+fn paintedOrStopped(shared: &Arc<Mutex<State>>, frames: u64) -> bool {
+  let guard = shared.get().lock()
+  let state = guard.get()
+  return state.report.painted >= frames || Option<GpuError>.isSome(&state.failure) || state.quit
 }
 
 fn requestQuit(shared: &Arc<Mutex<State>>) -> () {
@@ -761,9 +805,10 @@ fn renderMain(
   wakeUi: &Unparker,
   settings: RenderSettings,
   cache: string,
+  canvases: &CanvasPresenter,
 ) -> i32 {
   let mut heap = Allocator.systemAllocatorProvider()
-  let result = run Effect.result(renderLoop(shared, parker, wakeUi, settings, cache))
+  let result = run Effect.result(renderLoop(shared, parker, wakeUi, settings, cache, canvases))
     |> Effect.provideMut<Allocator>(&mut heap)
   let failure = match move result {
     Result.Success { value } => {
@@ -804,9 +849,9 @@ union Work {
 }
 
 /// Waits for the next work.
-fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker) -> Work {
+fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresenter) -> Work {
   while true {
-    let taken = takeWork(shared)
+    let taken = takeWork(shared, canvases)
     match move taken {
       Option<Work>.Some { value } => {
         return move value
@@ -819,7 +864,9 @@ fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker) -> Work {
   return Work.Quit
 }
 
-fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
+fn takeWork(shared: &Arc<Mutex<State>>, canvases: &CanvasPresenter) -> Option<Work> {
+  // A canvas frame shows by drawing the last frame again, as a compositor scroll does.
+  let canvasWaiting = canvases.waiting()
   let mut guard = shared.get().lock()
   let state = guard.getMut()
   if state.quit {
@@ -830,7 +877,7 @@ fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
       state.redraw = false
       Option<Work>.some(Work.Job { job: move value })
     }
-    Option<FrameJob>.None => if state.redraw {
+    Option<FrameJob>.None => if state.redraw || canvasWaiting {
       state.redraw = false
       Option<Work>.some(Work.Redraw)
     } else if state.extraJobs.length() != 0 || state.opening.length() != 0
@@ -839,6 +886,104 @@ fn takeWork(shared: &Arc<Mutex<State>>) -> Option<Work> {
     } else {
       Option<Work>.None
     }
+  }
+}
+
+/// The renderer's texture for one GPU canvas surface.
+struct CanvasTexture {
+  surface: u32,
+  width: u32,
+  height: u32,
+  texture: Texture,
+}
+
+fn canvasTextureIndex(shown: &List<CanvasTexture>, surface: u32) -> usize {
+  let values = shown.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].surface == surface {
+      return i
+    }
+    i = i + 1
+  }
+  return usize.MAX
+}
+
+/// Uploads the canvas frames presented since the last call into textures the renderer's
+/// surface sprites sample, and releases the textures of closed surfaces.
+effect fn serveCanvases(
+  canvases: &CanvasPresenter,
+  device: &Device,
+  queue: &Queue,
+  renderer: &mut UiRenderer,
+  shown: &mut List<CanvasTexture>,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  if !canvases.waiting() {
+    return ()
+  }
+  let taken = canvases.take()
+  let closed = taken.closed.asSlice()
+  let mut c: usize = 0
+  while c < closed.length {
+    renderer.removeSurface(closed[c])
+    let at = canvasTextureIndex(&shown.*, closed[c])
+    if at != usize.MAX {
+      drop shown.remove(at)
+    }
+    c = c + 1
+  }
+  let frames = taken.frames.asSlice()
+  let mut f: usize = 0
+  while f < frames.length {
+    let frame = &frames[f]
+    let mut at = canvasTextureIndex(&shown.*, frame.surface)
+    if at != usize.MAX
+      && (shown.asSlice()[at].width != frame.width || shown.asSlice()[at].height != frame.height) {
+      renderer.removeSurface(frame.surface)
+      drop shown.remove(at)
+      at = usize.MAX
+    }
+    if at == usize.MAX {
+      let mut size = Extent3D.default()
+      size.setWidth(frame.width)
+      size.setHeight(frame.height)
+      size.setDepthOrArrayLayers(1)
+      let mut descriptor = TextureDescriptor.default().withLabel(b"ui canvas")
+      descriptor.setSize(size)
+      descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+      descriptor.setDimension(flags.WGPUTextureDimension_2D)
+      descriptor.setMipLevelCount(1)
+      descriptor.setSampleCount(1)
+      descriptor.setUsage(flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst)
+      let texture = run createTexture(device, &descriptor)
+      let view = run texture.createView(&TextureViewDescriptor.default())
+      run renderer.setSurface(frame.surface, &view)
+      at = shown.length()
+      run shown.append(
+        CanvasTexture {
+          surface: frame.surface,
+          width: frame.width,
+          height: frame.height,
+          texture: move texture,
+        },
+      )
+    }
+    let mut size = Extent3D.default()
+    size.setWidth(frame.width)
+    size.setHeight(frame.height)
+    size.setDepthOrArrayLayers(1)
+    let mut layout = TexelCopyBufferLayout.default()
+    layout.setBytesPerRow(frame.width * 4)
+    layout.setRowsPerImage(frame.height)
+    queue.writeTexture(
+      &TexelCopyTextureInfo.default().withTexture(&shown.asSlice()[at].texture),
+      frame.pixels.asSlice(),
+      &layout,
+      &size,
+    )
+    f = f + 1
   }
 }
 
@@ -1159,6 +1304,7 @@ effect fn renderLoop(
   wakeUi: &Unparker,
   settings: RenderSettings,
   cache: string,
+  canvases: &CanvasPresenter,
 ) -> ()
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
@@ -1244,6 +1390,7 @@ effect fn renderLoop(
   markReady(shared, format)
   wakeUi.unpark()
   let mut others = List<ExtraSurface>.make()
+  let mut canvasTextures = List<CanvasTexture>.make()
 
   let mut canImmediate = false
   let modes = capabilities.presentModes()
@@ -1261,7 +1408,7 @@ effect fn renderLoop(
   let mut current = Option<FrameJob>.None
   let mut newer = List<ScrollPosition>.make()
   while true {
-    let work = nextWork(shared, parker)
+    let work = nextWork(shared, parker, canvases)
 
     // Whatever the work, surfaces change and atlas pixels are written first, and the other
     // windows' frames are drawn, so the first window's frame below has every tile too.
@@ -1276,6 +1423,7 @@ effect fn renderLoop(
       }
       run serveSurfaces(shared, wakeUi, &instance, &owner, &mut others)
       run writeUploads(shared, &device, &queue, &mut textures)
+      run serveCanvases(canvases, &device, &queue, &mut renderer, &mut canvasTextures)
       run drawOthers(
         shared,
         &device,

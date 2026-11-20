@@ -177,6 +177,23 @@
   Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
   Object.defineProperty(globalThis.navigator, "getBattery", { value: () => api().getBattery(), writable: true, configurable: true });
 
+  // WebGPU (webgpu.js, evaluated on first use): `navigator.gpu` and the GPU globals, in a host
+  // that runs WebGPU commands. A canvas node gets its "webgpu" context from `native.gpuLoad`.
+  let gpuApi = null;
+  const gpu = (native.gpuLoad = () => (native.gpuEnabled() ? (gpuApi ??= (0, eval)(native.gpuApi())(native)) : null));
+  Object.defineProperty(globalThis.navigator, "gpu", { get: () => gpu()?.gpu, enumerable: true, configurable: true });
+  for (const name of ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUDevice", "GPUQueue", "GPUBuffer", "GPUTexture", "GPUTextureView", "GPUSampler", "GPUBindGroupLayout", "GPUPipelineLayout", "GPUBindGroup", "GPUShaderModule", "GPUCompilationInfo", "GPURenderPipeline", "GPUComputePipeline", "GPUCommandEncoder", "GPUCommandBuffer", "GPURenderPassEncoder", "GPUComputePassEncoder", "GPUCanvasContext", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUDeviceLostInfo", "GPUError", "GPUValidationError", "GPUOutOfMemoryError", "GPUInternalError", "GPUPipelineError", "GPUUncapturedErrorEvent", "GPURenderBundleEncoder", "GPURenderBundle", "GPUQuerySet", "GPUExternalTexture", "GPUBufferUsage", "GPUTextureUsage", "GPUShaderStage", "GPUMapMode", "GPUColorWrite"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = gpu()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
   globalThis.open = (url) => {

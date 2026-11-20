@@ -6,6 +6,7 @@ import window_frames as _window_frames
 //! Run from the repository root (the fixtures read fonts and scripts from there).
 import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, runtimeStylesheets, Natives, Reply, Exports, serve, imageLoadable, imageBuild, engineBuild }
 import ui_js_calls.natives as natives
+import ui_js_calls.gpu { GpuReply }
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
 import ui_tree.style_media { MediaState }
@@ -435,7 +436,9 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 8 {
+  let ran = if scenario == 10 {
+    run Effect.result(webgpuCommands(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 8 {
     run Effect.result(clipboardEvents(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 9 {
     run Effect.result(selections(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -651,6 +654,11 @@ test effect fn reloadStartsANewRealmOnAnEmptyTree() -> ()
 /// natives share an id.
 test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.APPEND == bridge.nativeId(b"append"), "APPEND")
+  run Testing.expect(bridge.GPU == bridge.nativeId(b"gpu"), "GPU")
+  run Testing.expect(bridge.GPU_API == bridge.nativeId(b"gpuApi"), "GPU_API")
+  run Testing.expect(bridge.GPU_ENABLED == bridge.nativeId(b"gpuEnabled"), "GPU_ENABLED")
+  run Testing.expect(bridge.GPU_REPLY == bridge.nativeId(b"gpuReply"), "GPU_REPLY")
+  run Testing.expect(bridge.GPU_REPLY_BYTES == bridge.nativeId(b"gpuReplyBytes"), "GPU_REPLY_BYTES")
   run Testing.expect(bridge.ATOM_STYLE == bridge.nativeId(b"atomStyle"), "ATOM_STYLE")
   run Testing.expect(bridge.ATTRIBUTE == bridge.nativeId(b"attribute"), "ATTRIBUTE")
   run Testing.expect(bridge.CANCEL_TIMER == bridge.nativeId(b"cancelTimer"), "CANCEL_TIMER")
@@ -826,6 +834,39 @@ effect fn clipboardEvents(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
     data: ClipboardData2 { text: run String.copy("plain"), html: run String.copy("<i>x</i>"), image: move image },
   })
   run host.evaluate(b"if (seen.join('|') !== 'copy true|paste text/plain,text/html,Files plain <i>x</i> image/png 4|insertFromPaste plain') throw new Error('clipboard events ran as ' + seen.join('|')); if (field.value !== '') throw new Error('the prevented paste went in: ' + field.value)", b"test")
+}
+
+/// `navigator.gpu` is there only for a host that runs its commands; a call leaves as one
+/// framed command (length, op, fields), and the host's answer settles the call's promise.
+effect fn webgpuCommands(host: &mut JsHost<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  run host.evaluate(b"if (navigator.gpu != null) throw new Error('navigator.gpu without a host that runs it')", b"test")
+  host.enableGpu()
+  run host.evaluate(b"globalThis.found = 'waiting'; navigator.gpu.requestAdapter().then((adapter) => { found = adapter === null ? 'none' : 'adapter' })", b"test")
+  let commands = host.takeGpuCommands()
+  // 20 bytes follow; REQUEST_ADAPTER; token 1; the adapter is object 1; no power preference;
+  // no fallback adapter.
+  let expected: [u8; 24] = [20, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let sent = commands.asSlice()
+  let mut same = sent.length == 24
+  let mut i: usize = 0
+  while same && i < 24 {
+    same = sent[i] == expected[i]
+    i = i + 1
+  }
+  run Testing.expect(same, "requestAdapter leaves as one framed command")
+  run Testing.expect(host.takeGpuCommands().length() == 0, "the commands are taken once")
+  let mut replies = List<GpuReply>.make()
+  run replies.append(GpuReply.of(1, 1))
+  run host.answerGpu(move replies)
+  run host.evaluate(b"if (found !== 'none') throw new Error('the promise was ' + found); if (typeof GPUBufferUsage.VERTEX !== 'number' || navigator.gpu.getPreferredCanvasFormat() !== 'rgba8unorm') throw new Error('the WebGPU globals are missing')", b"test")
+}
+
+test effect fn webgpuCallsLeaveAsCommandsAndAnswersSettleTheirPromises() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(10) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn clipboardEventsReachJavaScript() -> ()
