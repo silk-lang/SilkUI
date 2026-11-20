@@ -611,6 +611,59 @@ impl RenderThread {
     self.wake.unpark()
   }
 
+  /// Draws the last frame handed over again with its scroll containers at `positions` (device
+  /// pixels): how a frame that only scrolled reaches the window, with no new scene, as a
+  /// compositor scroll does. `fastSeq` is the last compositor scroll the UI thread has taken:
+  /// a container the compositor moved after that keeps the compositor's newer offset. Returns
+  /// the number to pass as `fastSeq` from now on, so the next frame handed over, painted or kept
+  /// at these offsets, replaces them.
+  pub effect fn rescroll(self: &mut Self, positions: &[ScrollPosition], fastSeq: u64) -> u64
+    ! GpuError | OutOfMemoryError {
+    run raise(&self.shared)
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut guard = self.shared.get().lock()
+    let state = guard.getMut()
+    let mut taken = fastSeq
+    let mut any = false
+    let mut i: usize = 0
+    while i < positions.length {
+      let position = positions[i]
+      i = i + 1
+      if newerSeqOf(&state.*, position.node) > fastSeq {
+        continue
+      }
+      if let Option<ScrollPosition>.Some { value: shown } = current(&state.*, position.node) {
+        if shown.x == position.x && shown.y == position.y {
+          continue
+        }
+      }
+      let seq = state.seq + 1
+      state.seq = seq
+      run setNewer(&mut state, position, seq) |> Effect.provideMut<Allocator>(&mut heap)
+      taken = seq
+      any = true
+    }
+    if any {
+      state.redraw = true
+      drop guard
+      self.wake.unpark()
+    }
+    return taken
+  }
+
+  /// Whether a redraw asked for (a [`RenderThread.rescroll`], a grab) still waits for the
+  /// render thread.
+  pub fn redrawPending(self: &Self) -> bool {
+    return self.shared.get().lock().get().redraw
+  }
+
+  /// Waits until the render thread has started the redraw asked for last, or has stopped.
+  pub fn waitRedrawn(self: &mut Self) -> () {
+    while self.redrawPending() && !stopped(&self.shared) {
+      self.parker.park()
+    }
+  }
+
   /// The frame copy [`RenderThread.grab`] asked for, once it is drawn, or None until then.
   pub fn takeGrab(self: &mut Self) -> Option<Grab> {
     let mut guard = self.shared.get().lock()
@@ -2378,6 +2431,19 @@ fn current(state: &State, node: u32) -> Option<ScrollPosition> {
     i = i + 1
   }
   return Option<ScrollPosition>.None
+}
+
+/// The `seq` of the compositor's offset for node `node`, 0 when it holds none.
+fn newerSeqOf(state: &State, node: u32) -> u64 {
+  let newer = state.newer.asSlice()
+  let mut i: usize = 0
+  while i < newer.length {
+    if newer[i].node == node {
+      return state.newerSeq.get(i)
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 effect fn setNewer(state: &mut State, position: ScrollPosition, seq: u64) -> ()
