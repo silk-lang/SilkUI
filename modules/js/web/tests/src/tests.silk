@@ -1,7 +1,7 @@
 //! The calls the page's `__ui` writes (browser/js-host.js), decoded into the tree.
 import ui_js_web.wire as wire
 import ui_tree.lib { Tree, TreeError, ProtocolError, NodeId }
-import ui_tree.legacy { Batch, Keyframe }
+import ui_tree.legacy { Batch, Keyframe, Mutation }
 import ui_fixtures.fixtures as fixtures
 import silk.collections.list { List }
 import silk.core.effect { Effect }
@@ -155,3 +155,50 @@ test effect fn compiledSheetsCrossTheBrowserWire() -> () ! TreeError | ProtocolE
   let mut allocator = Allocator.systemAllocatorProvider()
   run compiledSheets() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn canvasSurfaces() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut calls = Calls { bytes: List<u8>.make() }
+  run calls.op(wire.CREATE, 1)
+  run calls.word(0)
+  run calls.op(wire.CREATE, 2)
+  run calls.word(5)
+  run calls.op(wire.ROOT, 1)
+  run calls.op(wire.APPEND, 1)
+  run calls.word(2)
+  run calls.op(wire.STYLE, 1)
+  run calls.word(0)
+  run calls.text("display: flex; align-items: flex-start; width: 2000px; height: 1000px")
+  run calls.op(wire.SURFACE, 2)
+  run calls.word(7)
+  run calls.word(640)
+  run calls.word(400)
+  run calls.bytes.append(1)
+  // A frame of the canvas changes nothing in the tree.
+  run calls.op(wire.CANVAS_FRAME, 2)
+  let mut batch = Batch.make()
+  let mut frames = List<Keyframe>.make()
+  drop run wire.decode(calls.bytes.asSlice(), &mut batch, &mut frames)
+  let mutations = run batch.take()
+  let items = mutations.asSlice()
+  let mut shown = false
+  let mut surfaces: u32 = 0
+  let mut i: usize = 0
+  while i < items.length {
+    if let Mutation.SetCanvasSurface { id, surface, width, height, opaque } = &items[i] {
+      surfaces = surfaces + 1
+      shown = id == 2 && surface == 7 && width == 640 && height == 400 && opaque
+    }
+    i = i + 1
+  }
+  run Testing.expect(shown, "the canvas shows the page's surface at its size")
+  run Testing.expect(surfaces == 1, "a frame of the canvas is no mutation")
+  let fonts = run fixtures.fonts()
+  let mut tree = run Tree.make(&fonts)
+  run tree.apply(move mutations)
+}
+
+test effect fn pageCanvasShowsItsSurface() -> () ! TreeError | ProtocolError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run canvasSurfaces() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+

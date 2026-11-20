@@ -15,6 +15,7 @@
 // Needs WebGPU and JSPI (WebAssembly.Suspending): Chrome and Edge 137 or later.
 import { WindowHost } from '/native/platform/window/browser/window-host.js';
 import { WebGPUHost } from '/native/gpu/webgpu/browser/host.ts';
+import { PageCanvases } from './page-canvases.mjs';
 import { AccessMirror } from './access-mirror.js';
 import { MediaPreferences } from './media.mjs';
 import { SheetFetch } from './sheet-fetch.mjs';
@@ -59,8 +60,9 @@ export function unsupported() {
  *   for screen readers (default). Pass false for a page that needs none.
  * - `imports`: more import modules, for functions the app declares itself
  *   (`extern … as "name#function"` is `imports.name.function`).
- * - `started({ instance, windowHost })`: called with the instance just before `main` starts, for
- *   a page that runs code of its own beside the app (browser/js-host.js in modules/js/web).
+ * - `started({ instance, windowHost, canvases })`: called with the instance just before `main`
+ *   starts, for a page that runs code of its own beside the app (browser/js-host.js in
+ *   modules/js/web). `canvases` is the page's GPU canvases (page-canvases.mjs).
  * - `windows(control)`: called before the app starts, for a page that stands in for the desktop
  *   around the app's windows (a title bar with a close button, say). `control.close(id)` asks
  *   window `id` to close, as a desktop's close button does: the app hears a close request and
@@ -98,6 +100,7 @@ export async function runApp({
     },
   });
   const gpuHost = new WebGPUHost();
+  const canvases = new PageCanvases(gpuHost.table);
   const mirror = new AccessMirror(windowHost);
   let memory;
   let media;
@@ -116,6 +119,7 @@ export async function runApp({
     math: { sin: Math.sin, cos: Math.cos, tan: Math.tan, hypot: Math.hypot, fmod: (x, y) => x % y },
     silk_browser: {
       ...mirror.imports(() => memory, accessibility && !check),
+      ...canvases.imports(),
       write: (pointer, length) => print(decoder.decode(new Uint8Array(memory.buffer, pointer, length))),
       now: () => performance.now(),
       check: () => (check ? 1 : 0),
@@ -164,7 +168,7 @@ export async function runApp({
     if (!length) return '';
     return decoder.decode(new Uint8Array(memory.buffer, instance.exports.silk_report(), length).slice());
   };
-  started?.({ instance, windowHost });
+  started?.({ instance, windowHost, canvases });
   let status;
   try {
     sheetFetch = new SheetFetch(() => {
