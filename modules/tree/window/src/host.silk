@@ -181,6 +181,8 @@ import silk.geometry.size { Size2 }
 import silk.num.u32
 import silk.num.usize
 import console { StderrWriter }
+import canvas_layer_plan { layersAllowed, switchedOn }
+import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import clock { Clock }
 import metal_hud
@@ -1488,6 +1490,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if !check && (hudAsked || metal_hud.defaultOn()) {
     renderer.setMetalHud(true)
   }
+  // GPU canvases may show in compositor layers of their own above the window
+  // (canvas_layer_plan.silk), when SILK_UI_CANVAS_LAYERS=on asks for it.
+  let layersOn = match move run environmentVariable("SILK_UI_CANVAS_LAYERS") {
+    Option<String>.Some { value } => switchedOn(String.utf8Bytes(String.view(&value)))
+    Option<String>.None => false
+  }
+  renderer.allowCanvasLayers(layersAllowed(check, serves, layersOn))
   if uncapped {
     renderer.setUncapped(true)
   }
@@ -1526,6 +1535,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     run content.pump(&mut state, &mut tree)
   }
   let mut drawn: u64 = 0
+  // The device size of the last frame submitted: a frame of another size is always submitted.
+  let mut submittedWidth: u32 = 0
+  let mut submittedHeight: u32 = 0
   let mut status: i32 = 0
   let mut backlog = List<Event>.make()
   let first = clientSize(width, height, &dock)
@@ -1799,10 +1811,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if check && drawn == 1 {
                 run content.checkInput(&mut state, &mut tree, viewport, options.checkClick)
               }
+              // A canvas the animation callbacks draw shows with this frame, not on its own.
+              renderer.beginFrame()
               let tickStart = run seconds(&mut clock)
               if !check && content.wantsFrames(&state.*) {
                 run content.tick(&mut state, &mut tree, time, true)
               }
+              let keptBefore = tree.paintsKept
               let frameStart = run seconds(&mut clock)
               run content.prepare(&mut state, &mut tree)
 
@@ -1897,28 +1912,48 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 // What the overlay draws stays put: the frame cannot scroll under it alone.
                 run fast.blocked.append(Rect<f32>.new(0.0, 0.0, f32.MAX, f32.MAX))
               }
-              run renderer.submit(
-                if layered {
-                  &composed
-                } else if serves {
-                  inspector.sceneWith(content.scene(&state.*, &tree))
-                } else {
-                  content.scene(&state.*, &tree)
+              // A frame that would draw the window as it is goes nowhere (`submitsFrame`).
+              let unchanged = !submitsFrame(
+                FrameSubmit {
+                  check: check,
+                  inspector: serves,
+                  layered: layered,
+                  submitted: drawn,
+                  kept: tree.paintsKept > keptBefore,
+                  uploads: tree.pendingUploads().entries().length,
+                  width: deviceWidth,
+                  height: deviceHeight,
+                  lastWidth: submittedWidth,
+                  lastHeight: submittedHeight,
                 },
-                &tree.atlas,
-                tree.pendingUploads(),
-                deviceWidth,
-                deviceHeight,
-                compared,
-                reference.data(),
-                move fast,
-                fastSeq,
               )
+              if !unchanged {
+                run renderer.submit(
+                  if layered {
+                    &composed
+                  } else if serves {
+                    inspector.sceneWith(content.scene(&state.*, &tree))
+                  } else {
+                    content.scene(&state.*, &tree)
+                  },
+                  &tree.atlas,
+                  tree.pendingUploads(),
+                  deviceWidth,
+                  deviceHeight,
+                  compared,
+                  reference.data(),
+                  move fast,
+                  fastSeq,
+                )
+                drawn = drawn + 1
+                submittedWidth = deviceWidth
+                submittedHeight = deviceHeight
+              }
+              renderer.endFrame()
               tree.clearUploads()
-              drawn = drawn + 1
               let submitted = run seconds(&mut clock)
               if watching {
-                if drawn == 1 {
+                if drawn == 1 && !unchanged {
                   inspector.started(
                     Startup {
                       windowMs: f64.toF32(windowOpenAt * 1000.0),
@@ -2978,6 +3013,37 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run Effect.sleep(f64.toU64(headless.number(String.view(&hold)) * 1000000.0)) |> Effect.provideMut<MonotonicClock>(&mut clock)
     }
   }
+}
+
+/// What decides whether a frame of the first window goes to the renderer ([`submitsFrame`]).
+pub struct FrameSubmit {
+  /// Check mode, and a window serving the inspector, submit every frame.
+  pub check: bool,
+  pub inspector: bool,
+  /// A dock or an overlay is composed over the frame.
+  pub layered: bool,
+  /// Frames submitted so far.
+  pub submitted: u64,
+  /// The tree kept its last scene this frame (`UiTree.paintsKept` grew).
+  pub kept: bool,
+  /// Atlas uploads the frame has.
+  pub uploads: usize,
+  /// The frame's device size, and that of the last frame submitted.
+  pub width: u32,
+  pub height: u32,
+  pub lastWidth: u32,
+  pub lastHeight: u32,
+}
+
+impl Copy for FrameSubmit {}
+
+/// Whether a frame is handed to the renderer. One that kept the tree's last scene, with no
+/// atlas pixels and the size of the last one submitted, would draw the window as it is: it is
+/// not, and the render thread draws only what changes there (a canvas frame, a scroll).
+pub fn submitsFrame(frame: FrameSubmit) -> bool {
+  let same = !frame.check && !frame.inspector && !frame.layered && frame.submitted > 0 && frame.kept
+    && frame.uploads == 0 && frame.width == frame.lastWidth && frame.height == frame.lastHeight
+  return !same
 }
 
 pub effect fn environmentVariable(name: string) -> Option<String>

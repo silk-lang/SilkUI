@@ -12,6 +12,7 @@ of each app's framework (`versions`), and a free label (`--label`). The artifact
 | CPU per frame | `drivers.NAME.cpu_ms_per_frame` | CPU time of the whole tree (all threads) over the driver, per frame |
 | Frame intervals | `drivers.NAME.intervals` | The app's own frame-to-frame times: p50, p95, p99, max, and how many were over 8.3 and 16.7 ms |
 | FPS | 1000 / `frame_ms` | Uncapped runs only (below) |
+| Canvas frames shown | `drivers.NAME.canvas_shown`, `canvas_shown_per_s` | Silk UI, canvas scene: GPU canvas frames the renderer put on screen during the driver (`silk-ui: canvas shown N`, from `SILK_UI_TRACE_CANVAS`). Uncapped, a newer canvas frame replaces one not yet shown, so `frames` counts rAF callbacks and this counts what reached the screen. The path they took is `canvas_path` |
 | Idle CPU | `idle.NAME.cpu_pct` | Percent of one core between `idle-begin` and `idle-end` (windowed runs only) |
 
 Start time is the median of the warm runs; the cold run is reported on its own. On macOS the

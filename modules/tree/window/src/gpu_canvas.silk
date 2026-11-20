@@ -18,6 +18,9 @@
 //!   the renderer gave back. The renderer gives an image back when a newer frame replaces it,
 //!   with fences of its own the app waits for before it draws into it again, so the app never
 //!   draws into an image the renderer still samples.
+//!   With `SILK_UI_CANVAS_LAYERS=on`, where the scene allows it (canvas_layer_plan.silk), the
+//!   render thread goes further on macOS: the canvas shows in a compositor layer of its own above
+//!   the window, a frame changes only that layer's contents, and the window is not drawn for it.
 //! - A copy through the CPU everywhere else (RGBA canvases, other systems, adapters without the
 //!   features): the app's device reads the texture back and the renderer uploads it. That works
 //!   on every adapter.
@@ -55,6 +58,10 @@ import webgpu_sys.generated_webgpu as flags
 import silk.collections.list { List }
 import silk.concurrency.sync { Arc }
 import silk.concurrency.thread_native { NativeThread }
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+}
 import silk.core.ownership { Copy, Drop }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -109,9 +116,9 @@ const NO_FEATURES: [u32; 0] = []
 /// Images in a swap chain: one the app draws, one waiting for the renderer and one shown.
 const CHAIN_LENGTH: u32 = 3
 
-/// How long a present waits for the renderer to give an image back before it fails, in yields
-/// of the thread (a renderer gives one back within a frame).
-const RECLAIM_SPINS: u32 = 2000000
+/// How long a present waits for the renderer to give an image back before it fails: 64 yields of
+/// the thread, then sleeps of a quarter of a millisecond, about two seconds in all.
+const RECLAIM_SPINS: u32 = 8064
 
 /// How long [`GpuCanvas.make`] waits for the renderer to say whether it shares images.
 const SHARING_SPINS: u32 = 2000000
@@ -404,8 +411,24 @@ effect fn presentChain(gpu: &CanvasGpu, presenter: &CanvasPresenter, chain: &mut
       if spins > RECLAIM_SPINS {
         fail GpuError.status(shared.SHARED_TEXTURE_UNAVAILABLE)
       }
-      NativeThread.yieldNow()
+      // The renderer gives an image back within a frame, or when the window server lets go of one
+      // a layer showed (up to a refresh): after a few turns, sleep instead of spinning.
+      if spins > 64 {
+        run waitAWhile()
+      } else {
+        NativeThread.yieldNow()
+      }
     }
+}
+
+/// Sleeps a quarter of a millisecond.
+effect fn waitAWhile() -> () {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    NativeThread.yieldNow()
+  } else {
+    let mut clock = OsMonotonicClock.make()
+    run Effect.sleep(250000) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
 }
 
 /// Whether the renderer's device imports shared images, waiting a little for a renderer that
