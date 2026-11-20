@@ -24,6 +24,7 @@ import ui_tree.style_media { Preferences }
 import window.types { Appearance }
 import ui_tree.lib { RootSupport, RootEventKind, ExtraRoot, RootOptions }
 import ui_tree.mutation { FIRST_ROOT }
+import ui_tree.process_memory
 import render_thread { FastScroll, FastScrolled, RenderSettings }
 import companion { Companion, Dock, NoCompanion, Paired, dockTarget, pointed }
 import screen_reader { ScreenReader, VARIABLE as SCREEN_READER_VARIABLE }
@@ -180,6 +181,8 @@ import ui_tree.input { Input, BUTTON_PRIMARY }
 import ui_tree.inspect { info, NodeInfo }
 import ui_tree.digest { digestLayout, DigestBox, DigestText }
 import ui_tree.node { NONE }
+import ui_tree.process_memory
+import ui_tree.census { Census, HELD, UNIT, WORK }
 import silk.geometry.rect { Rect }
 
 /// Shows the Metal Performance HUD over the windows opened from now on (macOS 13 and later):
@@ -317,6 +320,11 @@ pub interface WindowClient<S, E, ? R> {
   effect fn pump(self: &mut Self, state: &mut S, tree: &mut UiTree<'_>) -> ()
     ! E | TreeError | OutOfMemoryError
     ? R | &mut Allocator {}
+
+  /// Adds what the client itself holds and did to the bench census (`SILK_UI_BENCH_CENSUS`).
+  effect fn census(self: &mut Self, state: &mut S, out: &mut Census) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {}
 
   /// Delivers the record of an input before the tree runs its default action (focus,
   /// scrolling, what a key does), and returns whether a handler prevented that default. The
@@ -1086,6 +1094,7 @@ pub effect fn runWindowWith<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 ) -> i32
   ! E | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? R | &mut Allocator {
+  process_memory.returnLargeFrees()
   static if Intrinsic.profileText("optimization") == "none" {
     let asked = run environmentVariable(SCREEN_READER_VARIABLE)
     let mut reader = run ScreenReader.make(!options.check, move asked)
@@ -2291,6 +2300,8 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     if let Option<String>.Some { value: patch } = move run environmentVariable("SILK_UI_BOX_PATCH") {
       if String.view(&patch) == "off" { tree.output.patching = false }
     }
+    // `SILK_UI_BENCH_CENSUS=1`: see `printCensus`.
+    let census = (run environmentVariable("SILK_UI_BENCH_CENSUS")).isSome()
     let mut frame: u32 = 0
     let mut counted: u32 = 0
     let mut tickSum: f64 = 0.0
@@ -2347,6 +2358,13 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         if let Option<String>.Some { value: wanted } = move run environmentVariable("SILK_UI_BENCH_DIGEST") {
           run benchDigest(&tree, String.view(&wanted) == "dump")
         }
+        if census {
+          let mut rows = Census.make()
+          run tree.census(&mut rows)
+          run content.census(&mut state, &mut rows)
+          run printCensus("first", frame, &rows)
+        }
+        run benchHold("first frame")
       } else {
         // `SILK_UI_BENCH_TRACE=<ms>`: one line for each frame whose layout step took that long.
         if trace >= 0.0 && (layoutEnd - layoutStart) * 1000.0 >= trace {
@@ -2369,6 +2387,19 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
               tree.stats.fragments,
             ),
           )
+        }
+        // The steady state is measured between two marks: frames/2 - 60 (before the pointer
+        // moves in) and the last frame.
+        let mut mark = ""
+        if frame + 60 == frames / 2 { mark = "steady-a" }
+        if frame + 2 == frames / 2 { mark = "steady-b" }
+        if frame + 1 == frames / 2 + frames / 4 { mark = "inside-a" }
+        if frame + 1 == frames { mark = "last" }
+        if census && mark != "" {
+          let mut rows = Census.make()
+          run tree.census(&mut rows)
+          run content.census(&mut state, &mut rows)
+          run printCensus(mark, frame, &rows)
         }
         counted = counted + 1
         tickSum = tickSum + (layoutStart - tickStart)
@@ -2417,10 +2448,48 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       "bench: paint-caches repaired={} rebuilt={} (uncarried={} fragile={}) verify={} mismatches={}\n",
       &(tree.repair.repairs, tree.repair.rebuilds, tree.repair.uncarried, tree.repair.fragileRebuilds, tree.repair.verify, tree.repair.mismatches),
     )
+    run benchHold("last frame")
     StderrWriter.print("bench: done\n", &())
     run inspector.close()
     platform.closeWindow(owner)
     return 0
+  }
+}
+
+/// `SILK_UI_BENCH_CENSUS`: a line for every container the engine keeps and every count of
+/// work, at `phase` (after the first frame, and after the last). A container's line has its
+/// entries, capacity, bytes an entry and bytes held (capacity times bytes an entry); a unit's
+/// and a work count's line has the count. `footprint` is the process's, in bytes.
+/// SILK_UI_BENCH_CENSUS prints, at each mark, a header and then one line a row of the census
+/// (see `ui_tree.census`), every line carrying its mark so a reader can take lines alone:
+///   census: phase=P frame=F footprint=B
+///   census: phase=P frame=F held NAME entries=E capacity=C each=S used=E*S reserved=C*S
+///   census: phase=P frame=F unit NAME count=N
+///   census: phase=P frame=F work NAME count=N
+/// Bytes are what the container's entries take (`used`) and what its room takes (`reserved`).
+effect fn printCensus(phase: string<'static>, frame: u32, rows: &Census) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  StderrWriter.print("census: phase={} frame={} footprint={}\n", &(phase, frame, process_memory.footprint()))
+  let names = rows.names.asSlice()
+  let values = rows.values.asSlice()
+  let mut index: usize = 0
+  while index < names.length {
+    let kind = values[index * 4]
+    let entries = values[index * 4 + 1]
+    if kind == HELD {
+      let capacity = values[index * 4 + 2]
+      let each = values[index * 4 + 3]
+      StderrWriter.print(
+        "census: phase={} frame={} held {} entries={} capacity={} each={} used={} reserved={}\n",
+        &(phase, frame, names[index], entries, capacity, each, entries * each, capacity * each),
+      )
+    } else if kind == UNIT {
+      StderrWriter.print("census: phase={} frame={} unit {} count={}\n", &(phase, frame, names[index], entries))
+    } else if kind == WORK {
+      StderrWriter.print("census: phase={} frame={} work {} count={}\n", &(phase, frame, names[index], entries))
+    }
+    index = index + 1
   }
 }
 
@@ -2656,6 +2725,22 @@ effect fn underDirectory(base: Option<String>, path: string) -> String
       move joined
     }
     Option<String>.None => String.make()
+  }
+}
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.system.monotonic_clock { MonotonicClock }
+  import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+  /// `SILK_UI_BENCH_HOLD=<ms>`: the bench sleeps that long after its first frame and after its
+  /// last, so a memory tool (footprint, vmmap, heap, malloc_history) can look at the process at
+  /// rest.
+  effect fn benchHold(phase: string) -> () ! OutOfMemoryError ? &mut Allocator {
+    if let Option<String>.Some { value: hold } = move run environmentVariable("SILK_UI_BENCH_HOLD") {
+      StderrWriter.print("bench: hold {} ms={}\n", &(phase, String.view(&hold)))
+      let mut clock = OsMonotonicClock.make()
+      run Effect.sleep(f64.toU64(headless.number(String.view(&hold)) * 1000000.0)) |> Effect.provideMut<MonotonicClock>(&mut clock)
+    }
   }
 }
 

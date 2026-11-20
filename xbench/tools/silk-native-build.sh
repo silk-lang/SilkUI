@@ -27,7 +27,7 @@ if [[ -n "$LOOM_SILKUI" ]]; then
     echo "note: $CACHE/$LOOM_SILKUI is a real checkout, not \$SILKUI; Loom builds against it" >&2
   fi
 fi
-VERSION=$(grep -m1 -o '"0\.1\.0-dev\.[^"]*"' "$W" | tr -d '"')
+VERSION=$(grep -m1 -oh '"0\.1\.0-dev\.[^"]*"' "$W" "$SILKUI/silk.toml" | head -1 | tr -d '"')
 sed -e "s#@SILKUI@#$SILKUI#g" -e "s#@SILK_VERSION@#$VERSION#g" \
     -e "s#@LIB_FONTS@#$(pin lib-fonts modules/collection)#g" -e "s#@LIB_GRAPHICS@#$(pin lib-graphics modules/atlas)#g" \
     -e "s#@LIB_NATIVE_WINDOW@#$(pin lib-native modules/platform/window)#g" -e "s#@LIB_NATIVE_GPU@#$(pin lib-native modules/gpu/webgpu)#g" \
@@ -42,7 +42,7 @@ if [[ ! -f "$WEB/dist-silk/feed/app.sheet" ]]; then
 fi
 cp "$WEB/dist-silk/feed/app.sheet" "$APP/assets/app.sheet"
 (cd "$APP" && silk build --release --progress plain > "$APP/build.log" 2>&1) || { grep -a -A6 -E "error|warning" "$APP/build.log" | head -80; exit 1; }
-bin=$(ls "$APP"/build/llvm/*/release/"$NAME")
+bin=$(ls "$APP"/build/*/release/"$NAME")
 for scene in "${scenes[@]}"; do
   mkdir -p "$APP/out/$scene"; cp "$bin" "$APP/out/$scene/$NAME"
   [[ $(uname) == Darwin ]] && codesign -f -s - "$APP/out/$scene/$NAME" > /dev/null 2>&1 || true

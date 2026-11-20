@@ -105,9 +105,31 @@ of paint, with the layout passes and boxes laid out. The clock moves 1/120 s a f
   through, so one run has frames with the pointer outside and inside.
 - `SILK_UI_BENCH_PAUSE=<ms>`: spins that long before the clock starts, for a sampler that
   attaches as the process starts.
+- `SILK_UI_BENCH_HOLD=<ms>`: sleeps that long after the first frame and after the last, so
+  `footprint`, `vmmap`, `heap` or `malloc_history` can look at the process at rest.
 - `SILK_UI_BENCH_DIGEST=1`: digests of the first frame's layout (every box, every glyph where
   it draws, every text run), to check that two builds lay out the same; `dump` adds a line for
   each text fragment.
+- `SILK_UI_BENCH_CENSUS=1`: after the first frame and at four later marks (`steady-a`,
+  `inside-a`, `steady-b`, `last`), what the engine holds and did, one line a row, each line
+  carrying its mark:
+
+      census: phase=first frame=0 footprint=50355200
+      census: phase=first frame=0 held tree.layout-table.links entries=4 capacity=4 each=28 used=112 reserved=112
+      census: phase=first frame=0 unit tree.layout-table.nodes count=4
+      census: phase=first frame=0 work css.tree.revision count=13
+
+  `held` rows are containers: entries in use and room for `capacity`, `each` bytes an entry,
+  so `used` and `reserved` bytes. `unit` rows count the document (nodes, lines, glyphs),
+  `work` rows count work since the start. Rows come from every package: the type is
+  css-properties' `census.Census` (re-exported as `ui_tree.census`), and each owner adds its
+  own with `held`, `bytes`, `unit` or `work`. To add a container, add a row in its owner's
+  `census` method: `UiTree.census` (modules/tree/src/engine.silk) calls the tree's own
+  (`LayoutTable`, style pool, sheet cache, stacking, repair), css-layout's and css-style's
+  (lib-css), ui-text's (`TextSystem.census`) and the scenes'; the JS host adds the
+  engine's heap, pools and work counters (lib-silkjs `js_census`, through modules/js); and a
+  client adds its own through `WindowClient.census`. Counters only: nothing changes what is
+  laid out or painted.
 
     SILK_UI_BENCH=2400 SILK_UI_BENCH_X=520 SILK_UI_BENCH_Y=400 dist/window/my-app
 
