@@ -14,6 +14,8 @@ import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
 import silk.num.u8
+import silk.num.u16
+import silk.collections.slice { Slice }
 import silk.num.usize
 import silk.num.u64
 import silk.num.u32
@@ -27,6 +29,7 @@ import ui_tree.style_media { MediaState }
 import ui_tree.battery
 import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
+import generated_clipboard { clipboardApi }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
 import ui_tree.computed_style
 import ui_tree.cssom_view
@@ -219,6 +222,14 @@ pub const CLIPBOARD_READ: u32 = 868924 // nativeId(b"clipboardRead")
 /// `__ui.clipboardWrite(call, text)`: asks the host to put `text` on the system clipboard,
 /// answered with `__ui.clipboard(call)`.
 pub const CLIPBOARD_WRITE: u32 = 623693 // nativeId(b"clipboardWrite")
+/// `__ui.clipboardReadItem(call)`: asks the host for the clipboard's item, answered with
+/// `__ui.clipboardItem(call, header, body)` (see [`encodeItem`]).
+pub const CLIPBOARD_READ_ITEM: u32 = 857949 // nativeId(b"clipboardReadItem")
+/// `__ui.clipboardWriteItem(call, header, body)`: asks the host to replace the clipboard with
+/// one item, answered with `__ui.clipboard(call)`.
+pub const CLIPBOARD_WRITE_ITEM: u32 = 919003 // nativeId(b"clipboardWriteItem")
+/// `__ui.clipboardApi()`: the source of `clipboard.js`, which the prelude evaluates on first use.
+pub const CLIPBOARD_API: u32 = 346060 // nativeId(b"clipboardApi")
 /// `__ui.shell(call, op, text)`: asks the host for a desktop feature, answered with
 /// `__ui.shellAnswer(call, value)`. The ops and how `text` packs their arguments are
 /// [`ShellRequest`]'s.
@@ -398,6 +409,95 @@ pub struct ShellRequest {
 pub union ClipboardRequest {
   Read { pub call: u32 },
   Write { pub call: u32, pub text: String },
+  /// `navigator.clipboard.read()`: answered with the item's representations.
+  ReadItem { pub call: u32 },
+  /// `navigator.clipboard.write()`: one item, a representation per type.
+  WriteItem { pub call: u32, pub entries: List<ClipboardData> },
+}
+
+/// One representation of a clipboard item: its MIME type and bytes.
+pub struct ClipboardData {
+  pub mime: String,
+  pub data: Bytes,
+}
+
+/// An item as clipboard.js reads it: a header of "<type> <byte length>" lines and a body of
+/// the representations' bytes, one after another.
+pub struct EncodedItem {
+  pub header: String,
+  pub body: Bytes,
+}
+
+/// `entries` as the header and body clipboard.js reads.
+pub effect fn encodeItem(entries: &[ClipboardData]) -> EncodedItem ! OutOfMemoryError ? &mut Allocator {
+  let mut header = String.make()
+  let mut body = Bytes.make()
+  let mut i: usize = 0
+  while i < entries.length {
+    if i != 0 { run String.append(&mut header, "\n") }
+    run String.append(&mut header, entries[i].mime.view())
+    run String.append(&mut header, " ")
+    run appendNumber(&mut header, entries[i].data.length())
+    run body.append(entries[i].data.asSlice())
+    i = i + 1
+  }
+  return EncodedItem { header: move header, body: move body }
+}
+
+effect fn appendNumber(out: &mut String, value: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run appendNumber(&mut out, value / 10) }
+  let digit = [usize.toU8(48 + value % 10)]
+  run String.append(&mut out, unsafe String.fromUtf8Unchecked(&digit))
+}
+
+/// The entries of a header and body clipboard.js wrote; none when they do not agree.
+effect fn decodeItem(header: string, body: &[u8]) -> Option<List<ClipboardData>> ! OutOfMemoryError ? &mut Allocator {
+  let mut entries = List<ClipboardData>.make()
+  if String.byteLength(header) == 0 { return Option<List<ClipboardData>>.some(move entries) }
+  let mut lines = String.split(header, "\n")
+  let mut at: usize = 0
+  while true {
+    match move lines.next() {
+      Option<string>.Some { value: line } => {
+        let bytes = String.utf8Bytes(line)
+        let mut space = bytes.length
+        while space > 0 && bytes[space - 1] != 32 { space = space - 1 }
+        if space == 0 { return Option<List<ClipboardData>>.None }
+        let mut length: usize = 0
+        let mut d = space
+        while d < bytes.length {
+          if bytes[d] < 48 || bytes[d] > 57 { return Option<List<ClipboardData>>.None }
+          length = length * 10 + u8.toUsize(bytes[d] - 48)
+          d = d + 1
+        }
+        if at + length > body.length { return Option<List<ClipboardData>>.None }
+        let mime = run String.copy(String.slice(line, 0, space - 1))
+        let data = run Bytes.copy(Slice.view(body, at, length))
+        run entries.append(ClipboardData { mime: move mime, data: move data })
+        at = at + length
+      }
+      _ => { break }
+    }
+  }
+  return Option<List<ClipboardData>>.some(move entries)
+}
+
+/// The bytes of a string whose code units are all below 256 (a "binary string"); higher
+/// units keep their low byte.
+effect fn latin1<'v>(value: ValueRef<'v>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let bits = value.view()
+  if !bits.isString() { return Bytes.make() }
+  let flat = Strings.flatView(bits)
+  let length = Strings.length(flat)
+  let mut bytes = run Bytes.zeroed(length)
+  let mut writable = bytes.asMutSlice()
+  let mut i: usize = 0
+  while i < length {
+    writable[i] = u16.toU8(Strings.codeUnit(flat, i) % 256)
+    i = i + 1
+  }
+  drop writable
+  return move bytes
 }
 
 /// A rejected promise nothing handles yet. Both values are owned.
@@ -540,8 +640,11 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"computed", arity: 2 },
     Native { name: b"capture", arity: 1 },
     Native { name: b"clearStyle", arity: 2 },
+    Native { name: b"clipboardApi", arity: 0 },
     Native { name: b"clipboardRead", arity: 1 },
+    Native { name: b"clipboardReadItem", arity: 1 },
     Native { name: b"clipboardWrite", arity: 2 },
+    Native { name: b"clipboardWriteItem", arity: 3 },
     Native { name: b"create", arity: 2 },
     Native { name: b"defineIcon", arity: 2 },
     Native { name: b"destroy", arity: 1 },
@@ -918,6 +1021,25 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
   } else if function == CLIPBOARD_WRITE {
     let value = run text(argv.get(1))
     run bridge.clipboard.append(ClipboardRequest.Write { call: first, text: move value })
+  } else if function == CLIPBOARD_READ_ITEM {
+    run bridge.clipboard.append(ClipboardRequest.ReadItem { call: first })
+  } else if function == CLIPBOARD_WRITE_ITEM {
+    let header = run text(argv.get(1))
+    let body = run latin1(argv.get(2))
+    match move run decodeItem(String.view(&header), body.asSlice()) {
+      Option.Some { value: entries } => run bridge.clipboard.append(ClipboardRequest.WriteItem { call: first, entries: move entries })
+      Option.None => {
+        let mut message = List<u8>.make()
+        run message.appendSlice(b"clipboardWriteItem: the header does not describe the body")
+        return Outcome.TypeError { message: move message }
+      }
+    }
+  } else if function == CLIPBOARD_API {
+    let made = run Effect.result(Strings.fromUtf8(clipboardApi()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
   } else if function == SHELL {
     let packed = run text(argv.get(2))
     run bridge.shell.append(ShellRequest { call: first, op: id(argv.get(1).view()), text: move packed })

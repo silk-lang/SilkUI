@@ -77,31 +77,21 @@
     else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
   };
 
-  // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
-  // clipboard after the code that asked has run, then settles the promise.
-  const clipboardCalls = new Map();
-  let nextClipboardCall = 0;
-  function clipboardCall(read, ask) {
-    const call = ++nextClipboardCall;
-    return new Promise((resolve) => {
-      clipboardCalls.set(call, { read, resolve });
-      ask(call);
-    });
-  }
-  // The host's answer to clipboard call `call`: a read's text, undefined when there is none.
-  native.clipboard = function (call, text) {
-    const pending = clipboardCalls.get(call);
-    if (!pending) return;
-    clipboardCalls.delete(call);
-    pending.resolve(pending.read ? (text ?? "") : undefined);
-  };
-  const clipboard = {
-    readText: () => clipboardCall(true, (call) => native.clipboardRead(call)),
-    writeText: (text) => {
-      const value = String(text);
-      return clipboardCall(false, (call) => native.clipboardWrite(call, value));
+  // As `navigator.clipboard` and `ClipboardItem` in a browser (clipboard.js, evaluated on
+  // first use).
+  let clipboardApi = null;
+  const clip = () => (clipboardApi ??= (0, eval)(native.clipboardApi())(native));
+  const clipboard = {};
+  for (const name of ["readText", "writeText", "read", "write"]) clipboard[name] = (...args) => clip().clipboard[name](...args);
+  Object.defineProperty(globalThis, "ClipboardItem", {
+    get: () => {
+      const value = clip().ClipboardItem;
+      Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true });
+      return value;
     },
-  };
+    set: (value) => Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true }),
+    configurable: true,
+  });
   if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
   Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
 

@@ -8,6 +8,7 @@ import id { NodeId, FontFaceId }
 import record { Event as RawEvent, EventKind }
 import input {
   Input as RawInput,
+  EditCommand,
   MOD_SHIFT,
   MOD_CONTROL,
   MOD_ALT,
@@ -161,8 +162,26 @@ pub union Input {
   /// The input method's composition text. `selectionStart` and `selectionEnd` are UTF-8 byte
   /// offsets into `text`. Empty text ends the composition without committing it.
   ImePreedit { pub text: String, pub selectionStart: usize, pub selectionEnd: usize },
-  /// The clipboard text a host read to answer `HostRequest.ReadClipboard`.
-  Paste { pub target: NodeId, pub text: String },
+  /// What the clipboard held when a host read it to answer `HostRequest.ReadClipboard`.
+  /// The target hears `paste` with it; unless a handler prevents that, an editable target
+  /// gets the text through an `Edit`.
+  Paste { pub target: NodeId, pub data: ClipboardData },
+  /// An Edit menu or context menu command. Copy and cut fire their events at the focused
+  /// node first, as the shortcuts do.
+  Command { pub command: EditCommand },
+  /// An edit about to replace the selection of input `target` with `text`, named as
+  /// `InputType` names it (`insertFromPaste`, `deleteByCut`). `beforeinput`
+  /// fires first, and a handler that prevents it cancels the edit. The tree queues these
+  /// after a cut or paste itself (`Tree.takeFollowUp`).
+  Edit { pub target: NodeId, pub inputType: String, pub text: String },
+}
+
+/// The flavors of a clipboard, each empty when it has none: `text/plain`, `text/html`, and
+/// the bytes of an `image/png`.
+pub struct ClipboardData {
+  pub text: String,
+  pub html: String,
+  pub image: List<u8>,
 }
 
 impl Input {
@@ -286,7 +305,18 @@ impl Input {
         selectionStart: selectionStart,
         selectionEnd: selectionEnd,
       }
-      Input.Paste { target, text } => RawInput.Paste { target: target.raw(), text: move text }
+      Input.Paste { target, data } => RawInput.Paste {
+        target: target.raw(),
+        text: move data.text,
+        html: move data.html,
+        image: move data.image,
+      }
+      Input.Command { command } => RawInput.Command { command: command }
+      Input.Edit { target, inputType, text } => RawInput.Edit {
+        target: target.raw(),
+        inputType: move inputType,
+        text: move text,
+      }
     }
   }
 }
@@ -561,6 +591,17 @@ pub union Event {
   /// `selectionchange` at an input; it bubbles. The selection has no direction (`anchor` is
   /// the lower offset).
   SelectionChange { pub selection: Selection, pub activeMarks: u32 },
+  /// A copy at the target, as DOM `copy`; it bubbles. Preventing it keeps the tree from
+  /// copying the selection, so a handler can put its own data on the clipboard.
+  Copy,
+  /// A cut at the target, as DOM `cut`. Preventing it keeps the selection where it is.
+  Cut,
+  /// A paste at the target with what the clipboard holds, as DOM `paste`. Preventing it
+  /// keeps the text out of the input.
+  Paste { pub data: ClipboardData },
+  /// An edit is about to change the target input, as DOM `beforeinput`: `data` is the text it
+  /// inserts. Preventing it cancels the edit.
+  BeforeInput { pub inputType: InputType, pub data: String },
 }
 
 /// What a transition or animation event is about: the CSS property of a transition or the
@@ -608,6 +649,10 @@ impl Event {
       Event.AnimationEnd { .. } => EventKind.AnimationEnd
       Event.AnimationCancel { .. } => EventKind.AnimationCancel
       Event.SelectionChange { .. } => EventKind.SelectionChange
+      Event.Copy => EventKind.Copy
+      Event.Cut => EventKind.Cut
+      Event.Paste { .. } => EventKind.Paste
+      Event.BeforeInput { .. } => EventKind.BeforeInput
     }
   }
 }
@@ -730,6 +775,19 @@ impl EventRecord {
         selection: Selection.range(raw.selectionStart, raw.selectionEnd),
         activeMarks: raw.activeMarks,
       }
+      EventKind.Copy => Event.Copy
+      EventKind.Cut => Event.Cut
+      EventKind.Paste => Event.Paste {
+        data: ClipboardData {
+          text: run String.copy(String.view(&raw.value)),
+          html: run String.copy(String.view(&raw.html)),
+          image: run copyBytes(&raw.image),
+        },
+      }
+      EventKind.BeforeInput => Event.BeforeInput {
+        inputType: InputType.fromName(String.view(&raw.inputType)),
+        data: run String.copy(String.view(&raw.value)),
+      }
     }
     return EventRecord { target: NodeId.of(raw.target), path: move path, event: move event }
   }
@@ -737,6 +795,12 @@ impl EventRecord {
 
 effect fn motionOf(raw: &RawEvent) -> Motion ! OutOfMemoryError ? &mut Allocator {
   return Motion { name: run String.copy(String.view(&raw.name)), elapsedTime: raw.elapsedTime, pseudoElement: run String.copy(String.view(&raw.pseudoElement)) }
+}
+
+effect fn copyBytes(bytes: &List<u8>) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendSlice(bytes.asSlice())
+  return move out
 }
 
 effect fn copySpans(spans: &List<MarkSpan>) -> List<MarkSpan>
@@ -764,7 +828,13 @@ effect fn copyAtoms(atoms: &List<Atom>) -> List<Atom>
 pub union HostRequest {
   /// Put `text` on the clipboard (copy and cut).
   WriteClipboard { pub text: String },
-  /// Read the clipboard and answer with `Input.Paste { target, text }`.
+  /// Put `text` on the clipboard as `text/plain`, and `html` as `text/html` unless it is
+  /// empty.
+  WriteClipboardItem { pub text: String, pub html: String },
+  /// Open the edit context menu of an input at (`x`, `y`), CSS pixels of the viewport, with
+  /// Cut, Copy and Paste enabled as the flags say. Answer a chosen item with `Input.Command`.
+  ShowEditMenu { pub x: f32, pub y: f32, pub cut: bool, pub copy: bool, pub paste: bool },
+  /// Read the clipboard and answer with `Input.Paste` for `target`.
   ReadClipboard { pub target: NodeId },
   /// Load the file of font face `face`, declared with `Tree.declareFontFace`: text needs a
   /// character its `unicode-range` covers. Answer with `Tree.loadFontFace` or
@@ -776,6 +846,17 @@ impl HostRequest {
   pub fn lift(raw: RawHostRequest) -> HostRequest {
     return match move raw {
       RawHostRequest.WriteClipboard { text } => HostRequest.WriteClipboard { text: move text }
+      RawHostRequest.WriteClipboardItem { text, html } => HostRequest.WriteClipboardItem {
+        text: move text,
+        html: move html,
+      }
+      RawHostRequest.ShowEditMenu { x, y, cut, copy, paste } => HostRequest.ShowEditMenu {
+        x: x,
+        y: y,
+        cut: cut,
+        copy: copy,
+        paste: paste,
+      }
       RawHostRequest.ReadClipboard { target } => HostRequest.ReadClipboard {
         target: NodeId.of(target),
       }
@@ -831,6 +912,10 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.TouchMove => 1073741824
     EventKind.TouchEnd => 1073741824
     EventKind.TouchCancel => 1073741824
+    EventKind.Copy => 2147483648
+    EventKind.Cut => 2147483648
+    EventKind.Paste => 2147483648
+    EventKind.BeforeInput => 2147483648
   }
 }
 

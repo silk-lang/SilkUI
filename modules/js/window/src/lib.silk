@@ -21,7 +21,7 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest, imageLoadable, imageBuild, engineBuild }
+import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
@@ -39,7 +39,9 @@ import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
 import window.types { WindowError, WindowId, WindowOptions, TitleBar }
 import window.event { Event, MouseButton }
 import window.platform { Platform }
+import window.clipboard { ClipboardEntry }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
@@ -103,10 +105,12 @@ fn uncaught(error: JsError) -> () {
   }
 }
 
-/// The host's answer to a `navigator.clipboard` call: for a read, the clipboard's text.
+/// The host's answer to a `navigator.clipboard` call: for a text read, the clipboard's text;
+/// for an item read, its representations.
 pub struct ClipboardAnswer {
   pub call: u32,
   pub text: Option<String>,
+  pub item: Option<EncodedItem>,
 }
 
 /// How many rounds of clipboard calls one turn of the window's loop serves: the promise jobs
@@ -121,11 +125,36 @@ pub effect fn serveClipboard(requests: List<ClipboardRequest>, platform: &mut Ho
     match rest.remove(0) {
       ClipboardRequest.Read { call } => {
         let text = run platform.readClipboard()
-        run answers.append(ClipboardAnswer { call: call, text: move text })
+        run answers.append(ClipboardAnswer { call: call, text: move text, item: Option<EncodedItem>.None })
       }
       ClipboardRequest.Write { call, text } => {
         run platform.writeClipboard(String.view(&text))
-        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none() })
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
+      }
+      ClipboardRequest.ReadItem { call } => {
+        let types = run platform.clipboardTypes()
+        let mut entries = List<ClipboardData>.make()
+        let mut t: usize = 0
+        while t < types.length() {
+          let mime = types.asSlice()[t].view()
+          match move run platform.readClipboardType(mime) {
+            Option<Bytes>.Some { value } => run entries.append(ClipboardData { mime: run String.copy(mime), data: move value })
+            _ => {}
+          }
+          t = t + 1
+        }
+        let item = run encodeItem(entries.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.some(move item) })
+      }
+      ClipboardRequest.WriteItem { call, entries } => {
+        let mut native = List<ClipboardEntry>.make()
+        let mut e = move entries
+        while e.length() > 0 {
+          let ClipboardData { mime, data } = e.remove(0)
+          run native.append(ClipboardEntry { mime: move mime, data: move data })
+        }
+        run platform.writeClipboardItem(native.asSlice())
+        run answers.append(ClipboardAnswer { call: call, text: Option<String>.none(), item: Option<EncodedItem>.None })
       }
     }
   }
@@ -368,8 +397,8 @@ impl<'m> JsApp<'m> {
       if requests.length() == 0 { break }
       let mut answers = run serveClipboard(move requests, &mut platform)
       while answers.length() > 0 {
-        let ClipboardAnswer { call, text } = answers.remove(0)
-        let answered = run Effect.result(self.host.answerClipboard(call, move text)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+        let ClipboardAnswer { call, text, item } = answers.remove(0)
+        let answered = run Effect.result(self.host.answerClipboard(call, move text, move item)) |> Effect.provideMut<Allocator>(&mut self.allocator)
         run self.settle(move answered)
       }
       round = round + 1

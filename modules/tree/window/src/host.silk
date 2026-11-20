@@ -17,7 +17,7 @@
 import ui_scene.scene { Scene }
 import ui_tree.inspect { findAll }
 import ui_tree.legacy { UiTree, TreeError, FrameInput, CpuSnapshot, Mutation }
-import lib { toInputAt, showCursor, HostState, serve, coalesce }
+import lib { toInputAt, showCursor, HostState, serve, coalesce, editMenuEvent }
 import adapter { fastScrollOf, reportWindow, reportWindowOf }
 import browser { stylePreferences }
 import ui_tree.style_media { Preferences }
@@ -1006,6 +1006,17 @@ effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         run tree.finish(move input, prevented)
         drop run tree.useRoot(root)
         run serve(&mut platform, shown.window, &mut tree, &mut shown.host)
+        run followUps(
+          &mut state,
+          &mut tree,
+          &mut content,
+          &mut companion,
+          &mut inspector,
+          &mut platform,
+          shown.window,
+          &mut shown.host,
+          root,
+        )
         run pumpOwner(
           &mut state,
           &mut tree,
@@ -1031,6 +1042,43 @@ effect fn otherEvent<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           )
           _ => {}
         }
+      }
+    }
+  }
+}
+
+/// Runs the input the tree queued for itself as the host's own: a shortcut's copy or cut, the
+/// edit of a cut or paste, the paste a clipboard read answered. The handlers of each decide
+/// on it before its default runs, as in a browser.
+effect fn followUps<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
+  state: &mut S,
+  tree: &mut UiTree<'_>,
+  content: &mut H,
+  companion: &mut K,
+  inspector: &mut Inspector,
+  platform: &mut HostPlatform,
+  window: WindowId,
+  host: &mut HostState,
+  root: u32,
+) -> ()
+  ! E | TreeError | OutOfMemoryError
+  ? R | &mut Allocator {
+  while true {
+    match tree.takeFollowUp() {
+      Option<Input>.Some { value: next } => {
+        run tree.beginAt(root, &next)
+        let into = tree.current
+        let prevented = if companion.owns(into) {
+          run companion.decide(&mut tree, &mut inspector)
+        } else {
+          run content.decide(&mut state, &mut tree)
+        }
+        run tree.finish(move next, prevented)
+        drop run tree.useRoot(root)
+        run serve(&mut platform, window, &mut tree, &mut host)
+      }
+      Option<Input>.None => {
+        break
       }
     }
   }
@@ -1538,7 +1586,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       let taken = move next
       next = match move taken {
         Option<Event>.Some { value } => Option<Event>.some(
-          run coalesce(&mut platform, move value, &mut backlog),
+          run coalesce(&mut platform, editMenuEvent(move value, owner), &mut backlog),
         )
         Option<Event>.None => Option<Event>.None
       }
@@ -2028,6 +2076,17 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   let prevented = run companion.decide(&mut tree, &mut inspector)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
+                  run followUps(
+                    &mut state,
+                    &mut tree,
+                    &mut content,
+                    &mut companion,
+                    &mut inspector,
+                    &mut platform,
+                    owner,
+                    &mut host,
+                    target,
+                  )
                   drop run companion.pump(&mut tree, &mut inspector, time)
                   drop run tree.useRoot(into)
                   let cursorScale = platform.scaleFactor(owner)
@@ -2039,6 +2098,17 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   let prevented = run content.decide(&mut state, &mut tree)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
+                  run followUps(
+                    &mut state,
+                    &mut tree,
+                    &mut content,
+                    &mut companion,
+                    &mut inspector,
+                    &mut platform,
+                    owner,
+                    &mut host,
+                    target,
+                  )
                   if serves { run inspector.observe(&tree) }
                   run content.pump(&mut state, &mut tree)
                   if handling >= 0.0 {

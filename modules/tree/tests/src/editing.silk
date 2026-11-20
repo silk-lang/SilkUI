@@ -11,6 +11,7 @@ import ui_tree.legacy {
   Event,
   EventKind,
   Input,
+  EditCommand,
   HostRequest,
   Keymap,
   MOD_SHIFT,
@@ -26,6 +27,7 @@ import vector.geometry_error { GeometryError }
 import vector.pixmap { Pixmap }
 import font_collection.lib { FontCollection }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.core.effect { Effect }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -358,8 +360,7 @@ fn writes(list: &List<HostRequest>, text: string) -> bool {
   }
   return match &values[0] {
     HostRequest.WriteClipboard { text: written } => String.view(&written) == text
-    HostRequest.ReadClipboard { .. } => false
-    HostRequest.LoadFontFace { .. } => false
+    _ => false
   }
 }
 
@@ -369,10 +370,140 @@ fn reads(list: &List<HostRequest>, id: u32) -> bool {
     return false
   }
   return match &values[0] {
-    HostRequest.WriteClipboard { .. } => false
     HostRequest.ReadClipboard { target } => target == id
-    HostRequest.LoadFontFace { .. } => false
+    _ => false
   }
+}
+
+effect fn pasteOf(target: u32, text: string) -> Input ! OutOfMemoryError ? &mut Allocator {
+  return Input.Paste {
+    target: target,
+    text: run String.copy(text),
+    html: String.make(),
+    image: List<u8>.make(),
+  }
+}
+
+/// Runs `input` as a host whose client decides does: `begin`, then `finish` with `prevent`,
+/// then each follow-up the same way with `follow`. Returns the kinds of the records.
+effect fn decided(tree: &mut UiTree<'_>, input: Input, prevent: bool, follow: bool) -> List<EventKind>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut kinds = List<EventKind>.make()
+  run tree.begin(&input)
+  run kindsOf(&mut tree, &mut kinds)
+  run tree.finish(move input, prevent)
+  run kindsOf(&mut tree, &mut kinds)
+  while true {
+    match tree.takeFollowUp() {
+      Option<Input>.Some { value: next } => {
+        run tree.begin(&next)
+        run kindsOf(&mut tree, &mut kinds)
+        run tree.finish(move next, follow)
+        run kindsOf(&mut tree, &mut kinds)
+      }
+      Option<Input>.None => {
+        break
+      }
+    }
+  }
+  return move kinds
+}
+
+effect fn kindsOf(tree: &mut UiTree<'_>, kinds: &mut List<EventKind>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let events = run drain(&mut tree)
+  let values = events.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    run kinds.append(values[i].kind)
+    i = i + 1
+  }
+}
+
+fn has(kinds: &List<EventKind>, kind: EventKind) -> bool {
+  let values = kinds.asSlice()
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == kind {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn keyDown(name: string, modifiers: u32) -> Input ! OutOfMemoryError ? &mut Allocator {
+  return Input.KeyDown {
+    key: run String.copy(name),
+    code: run String.copy(name),
+    modifiers: modifiers,
+    repeat: false,
+  }
+}
+
+effect fn clipboardEventsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run editor(&collection)
+
+  // A prevented copy writes nothing: the client puts its own data there.
+  let copy = run decided(&mut tree, run keyDown("c", MOD_CONTROL), false, true)
+  run Testing.expect(has(&copy, EventKind.KeyDown) && has(&copy, EventKind.Copy), "Control+C fires keydown, then copy")
+  let none = run requests(&mut tree)
+  run Testing.expect(none.length() == 0, "a prevented copy writes nothing")
+  drop run decided(&mut tree, Input.Command { command: EditCommand.Copy }, false, false)
+  let menu = run requests(&mut tree)
+  run Testing.expect(writes(&menu, "wonderful"), "the Edit menu's copy writes the selection")
+
+  // A prevented cut keeps the text; a prevented beforeinput too.
+  let cut = run decided(&mut tree, Input.Command { command: EditCommand.Cut }, true, false)
+  run Testing.expect(has(&cut, EventKind.Cut) && !has(&cut, EventKind.BeforeInput), "cut fires, prevented")
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello wonderful world", "a prevented cut keeps the text")
+  let kept = run decided(&mut tree, Input.Command { command: EditCommand.Cut }, false, true)
+  run Testing.expect(has(&kept, EventKind.BeforeInput) && !has(&kept, EventKind.Input), "beforeinput deleteByCut, prevented")
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello wonderful world", "keeps it too")
+  drop run requests(&mut tree)
+
+  // Paste carries the clipboard's flavors; preventing it or its beforeinput keeps them out.
+  let mut events = run drain(&mut tree)
+  run tree.begin(&Input.Paste {
+    target: fixtures.SEARCH,
+    text: run String.copy("plain"),
+    html: run String.copy("<b>rich</b>"),
+    image: List<u8>.make(),
+  })
+  events = run drain(&mut tree)
+  let first = events.asSlice()
+  run Testing.expect(
+    first.length == 1 && first[0].kind == EventKind.Paste && String.view(&first[0].value) == "plain"
+      && String.view(&first[0].html) == "<b>rich</b>",
+    "paste carries text and html",
+  )
+  run tree.finish(run pasteOf(fixtures.SEARCH, "plain"), true)
+  run Testing.expect(tree.takeFollowUp().isNone(), "a prevented paste edits nothing")
+  drop run decided(&mut tree, run pasteOf(fixtures.SEARCH, "plain"), false, true)
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello wonderful world", "nor does a prevented beforeinput")
+  let pasted = run decided(&mut tree, run pasteOf(fixtures.SEARCH, "plain"), false, false)
+  run Testing.expect(has(&pasted, EventKind.BeforeInput) && has(&pasted, EventKind.Input), "beforeinput, then input")
+  run Testing.expect(value(&tree, fixtures.SEARCH) == "Hello plain world", "the paste goes in")
+
+  // The Edit menu's paste asks for the clipboard; Shift+Insert and Shift+Delete are shortcuts.
+  drop run decided(&mut tree, Input.Command { command: EditCommand.Paste }, false, false)
+  let asked = run requests(&mut tree)
+  run Testing.expect(reads(&asked, fixtures.SEARCH), "Edit > Paste reads the clipboard")
+  tree.keymap = Keymap.Standard
+  drop run decided(&mut tree, run keyDown("Insert", MOD_SHIFT), false, false)
+  let inserted = run requests(&mut tree)
+  run Testing.expect(reads(&inserted, fixtures.SEARCH), "Shift+Insert pastes")
+}
+
+test effect fn clipboardEventsArePreventable() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run clipboardEventsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 effect fn clipboardBody() -> ()
@@ -392,14 +523,14 @@ effect fn clipboardBody() -> ()
   run key(&mut tree, "v", MOD_CONTROL)
   let pasting = run requests(&mut tree)
   run Testing.expect(reads(&pasting, fixtures.SEARCH), "Control+V asks for the clipboard")
-  run tree.dispatch(Input.Paste { target: fixtures.SEARCH, text: run String.copy("big\nnew") })
+  run tree.dispatch(run pasteOf(fixtures.SEARCH, "big\nnew"))
   run Testing.expect(
     value(&tree, fixtures.SEARCH) == "Hello big new world",
     "the answer is pasted, line breaks as spaces",
   )
   let pasted = run drain(&mut tree)
   run Testing.expect(lastInput(&pasted, "Hello big new world", "insertFromPaste"), "as a paste")
-  run tree.dispatch(Input.Paste { target: fixtures.NAME, text: run String.copy("stale") })
+  run tree.dispatch(run pasteOf(fixtures.NAME, "stale"))
   run Testing.expect(
     value(&tree, fixtures.SEARCH) == "Hello big new world" && value(&tree, fixtures.NAME) == "",
     "a paste for an input without focus is dropped",
@@ -411,13 +542,18 @@ effect fn clipboardBody() -> ()
   // Read-only inputs copy but neither cut nor paste.
   run focus(&mut tree, fixtures.LOCKED)
   run key(&mut tree, "a", MOD_CONTROL)
-  run key(&mut tree, "x", MOD_CONTROL)
+  run key(&mut tree, "c", MOD_CONTROL)
   let locked = run requests(&mut tree)
   run Testing.expect(writes(&locked, "Read only"), "a read-only input copies")
-  run Testing.expect(value(&tree, fixtures.LOCKED) == "Read only", "but does not cut")
+  run key(&mut tree, "x", MOD_CONTROL)
+  let uncut = run requests(&mut tree)
+  run Testing.expect(uncut.length() == 0, "but does not cut")
+  run Testing.expect(value(&tree, fixtures.LOCKED) == "Read only", "and keeps its text")
   run key(&mut tree, "v", MOD_CONTROL)
-  let none = run requests(&mut tree)
-  run Testing.expect(none.length() == 0, "nor paste")
+  let asked = run requests(&mut tree)
+  run Testing.expect(reads(&asked, fixtures.LOCKED), "paste still reads, for its listeners")
+  run tree.dispatch(run pasteOf(fixtures.LOCKED, "more"))
+  run Testing.expect(value(&tree, fixtures.LOCKED) == "Read only", "but nothing goes in")
 }
 
 test effect fn clipboardGoesThroughHostRequests() -> ()
