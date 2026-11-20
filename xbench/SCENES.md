@@ -33,6 +33,15 @@ Every app keeps every item in its tree. A list that only builds the visible rows
 scene, and that is a property of the app, not of the framework. The scenes ask what a framework
 costs when the app does not do that work.
 
+## Offscreen release switch
+
+With the switch on, every item of `feed`, `stream` and `churn` gets `content-visibility: auto;
+contain-intrinsic-size: auto 400px` (`.lazy > .item` in style/bench.css): items far from the
+viewport skip their contents and keep their size. The app still holds every item; the
+framework decides what to lay out. The switch is `XB_CONTENT_VISIBILITY=1` at run time for
+silk-direct, and `VITE_XB_CONTENT_VISIBILITY=1` at build time for the React builds (silk-react,
+Electron). Off is the default, and results with it on are labelled so (`--label`).
+
 ## Parity
 
 The Silk apps report the tree's node and fragment counts (`silk_first_frame` in the results); on

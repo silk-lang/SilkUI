@@ -9,6 +9,8 @@ import { pictures } from "./pictures";
 
 const asked = (import.meta.env.VITE_XB_SCENE as string | undefined) ?? "feed";
 const [scene, sized] = asked.split("-");
+// VITE_XB_CONTENT_VISIBILITY=1: items get `content-visibility: auto` (style/bench.css).
+const FEED = import.meta.env.VITE_XB_CONTENT_VISIBILITY ? "feed lazy" : "feed";
 const DEFAULTS: Record<string, number> = { feed: 1000, wall: 0, stream: 300, churn: 1000 };
 const SIZE = sized ? Number(sized) : DEFAULTS[scene];
 
@@ -109,7 +111,7 @@ function Feed() {
     ];
     run(steps);
   }, []);
-  return <Frame title={`xbench feed-${SIZE}`} scroller={scroller}><box className="feed">{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
+  return <Frame title={`xbench feed-${SIZE}`} scroller={scroller}><box className={FEED}>{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
 }
 
 const COLUMNS = 16;
@@ -218,7 +220,7 @@ function Stream() {
       { mark: "streamed" },
     ]);
   }, []);
-  return <Frame title={`xbench stream-${SIZE}`} scroller={scroller}><box className="feed">{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
+  return <Frame title={`xbench stream-${SIZE}`} scroller={scroller}><box className={FEED}>{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
 }
 
 function Churn() {
@@ -239,7 +241,7 @@ function Churn() {
     }
     run(steps);
   }, []);
-  return <Frame title={`xbench churn-${SIZE}`} scroller={scroller}><box className="feed">{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
+  return <Frame title={`xbench churn-${SIZE}`} scroller={scroller}><box className={FEED}>{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
 }
 
 export function App() {
