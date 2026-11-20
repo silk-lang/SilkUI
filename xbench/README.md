@@ -7,7 +7,8 @@ A benchmark of UI frameworks on the same content: Silk UI + React, Silk UI + Loo
 a hand-built tree, Electron, GPUI, Rune and FerroUI.
 
 - SCENES.md: the four scenes (long feed, a wall of visible cells, a growing chat stream, memory
-  churn) and their scripts, and the WebGPU canvas scene of the gpu suite.
+  churn) and their scripts, the WebGPU canvas scene of the gpu suite, and the chat page scene of
+  the two React apps.
 - METRICS.md: what is measured, how, and why the GPU suite runs uncapped.
 - PROTOCOL.md: the `XB ...` lines an app prints and what the runner does with them.
 - LOG.md: what each app does differently. Read it before comparing numbers.
@@ -27,7 +28,7 @@ Everything builds from `xbench/`, the folder this README is in. Linux needs `xvf
 ```sh
 # React (for Electron and Silk UI + React)
 (cd apps/react/web && npm ci)
-for s in feed wall stream churn canvas; do (cd apps/react/web && VITE_XB_SCENE=$s npx vite build --config vite.web.config.js); done
+for s in feed wall stream churn canvas chat; do (cd apps/react/web && VITE_XB_SCENE=$s npx vite build --config vite.web.config.js); done
 (cd apps/electron && npm ci)
 
 # Silk UI apps. SILKUI is the Silk UI checkout to measure: by default this one, the repository

@@ -11,10 +11,14 @@ if (!packages) throw new Error("set SILK_PACKAGES to <silkui>/modules/js/package
 // (vite, react-reconciler) resolve to this app's.
 const { default: silk } = await import("@silkui/vite");
 const { default: react } = await import("@silkui/react/vite");
+// `xb-scene.css` (src/main.tsx) is style/chat.css in the chat build and bench.css, imported
+// already, in every other one: their CSS stays what it was.
+const sceneCss = fileURLToPath(new URL(`../../../style/${(process.env.VITE_XB_SCENE ?? "feed").split("-")[0] === "chat" ? "chat" : "bench"}.css`, import.meta.url));
 
 export default defineConfig({
   plugins: [silk({ entry: "src/main.tsx" }), react()],
   resolve: {
+    alias: [{ find: /^xb-scene\.css$/, replacement: sceneCss }],
     dedupe: ["react", "react-reconciler", "scheduler"],
   },
   build: {
