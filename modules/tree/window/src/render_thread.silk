@@ -34,7 +34,8 @@ import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
 import ui_renderer.renderer { UiRenderer }
 import ui_renderer.text { TextSettings }
-import canvas_frames { CanvasPresenter }
+import canvas_frames { CanvasFrame, CanvasPresenter, ChainImage, ReturnedImage, SharedPicture }
+import gpu_canvas { sharingFeatures }
 import window.types { RawSurface, WindowId }
 import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
 import webgpu.runtime as runtime
@@ -48,6 +49,7 @@ import webgpu.descriptors {
   TextureDescriptor,
   TextureViewDescriptor
 }
+import webgpu.shared_texture { BeginAccess, SharedFence, SharedImage, SharedTextureMemory }
 import webgpu_sys.generated_webgpu as flags
 import silk.collections.list { List }
 import silk.concurrency.sync { Arc, Mutex, Parker, Unparker }
@@ -889,12 +891,27 @@ fn takeWork(shared: &Arc<Mutex<State>>, canvases: &CanvasPresenter) -> Option<Wo
   }
 }
 
-/// The renderer's texture for one GPU canvas surface.
+/// The renderer's texture for one GPU canvas surface: one it uploads pixel frames into, or the
+/// shared images of the surface's swap chain it imported, one of which it samples.
 struct CanvasTexture {
   surface: u32,
   width: u32,
   height: u32,
+  texture: Option<Texture>,
+  imports: List<ImportedImage>,
+  /// The import the renderer samples, with access begun, or `usize.MAX`.
+  shown: usize,
+}
+
+/// A shared image of a canvas's swap chain, imported on the renderer's device.
+struct ImportedImage {
+  image: Arc<ChainImage>,
+  chain: u32,
+  index: u32,
+  memory: SharedTextureMemory,
   texture: Texture,
+  /// The app's fences the access waited for, kept until it ends.
+  fences: List<SharedFence>,
 }
 
 fn canvasTextureIndex(shown: &List<CanvasTexture>, surface: u32) -> usize {
@@ -909,8 +926,109 @@ fn canvasTextureIndex(shown: &List<CanvasTexture>, surface: u32) -> usize {
   return usize.MAX
 }
 
+/// Ends the access to the image `entry` samples. With `giveBack` the image goes back to the
+/// app with the renderer's fences, to draw into once they signaled.
+effect fn endShown(entry: &mut CanvasTexture, canvases: &CanvasPresenter, giveBack: bool) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  if entry.shown == usize.MAX {
+    return ()
+  }
+  let image = &mut entry.imports.asMutSlice()[entry.shown]
+  entry.shown = usize.MAX
+  let end = run image.memory.endAccess(&image.texture, false)
+  image.fences = List<SharedFence>.make()
+  if giveBack {
+    run canvases.giveBack(
+      ReturnedImage {
+        surface: entry.surface,
+        chain: image.chain,
+        index: image.index,
+        fences: move end.fences,
+        values: move end.signaledValues,
+      },
+    )
+  }
+}
+
+/// Shows shared frame `frame` of `entry`: imports its image the first time, waits on the GPU
+/// for the app's fences, samples it, and gives the image it replaces back to the app.
+effect fn showShared(
+  canvases: &CanvasPresenter,
+  device: &Device,
+  renderer: &mut UiRenderer,
+  entry: &mut CanvasTexture,
+  frame: &CanvasFrame,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<SharedPicture>.Some { value } = &frame.shared {
+    run showPicture(canvases, device, &mut renderer, &mut entry, frame.surface, &value)
+  }
+}
+
+effect fn showPicture(
+  canvases: &CanvasPresenter,
+  device: &Device,
+  renderer: &mut UiRenderer,
+  entry: &mut CanvasTexture,
+  surface: u32,
+  picture: &SharedPicture,
+) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at: usize = 0
+  while at < entry.imports.length()
+    && (entry.imports.asSlice()[at].chain != picture.chain || entry.imports.asSlice()[at].index != picture.index) {
+    at = at + 1
+  }
+  if at == entry.imports.length() {
+    let memory = run SharedTextureMemory.importImage(device, b"ui canvas", &picture.image.get().image)
+    let texture = run memory.createTexture(b"ui canvas")
+    run entry.imports.append(
+      ImportedImage {
+        image: picture.image.clone(),
+        chain: picture.chain,
+        index: picture.index,
+        memory: move memory,
+        texture: move texture,
+        fences: List<SharedFence>.make(),
+      },
+    )
+  }
+  // A fence belongs to the device that made it: this device imports the app's.
+  let mut fences = List<SharedFence>.make()
+  let given = picture.fences.asSlice()
+  let mut f: usize = 0
+  while f < given.length {
+    let info = given[f].exportInfo()
+    run fences.append(run SharedFence.importMtlSharedEvent(device, info.handle))
+    f = f + 1
+  }
+  let image = &mut entry.imports.asMutSlice()[at]
+  run image.memory.beginAccessAfter(&image.texture, BeginAccess.ready(), fences.asSlice(), picture.values.asSlice())
+  image.fences = move fences
+  let view = run image.texture.createView(&TextureViewDescriptor.default())
+  run renderer.setSurface(surface, &view)
+  run endShown(&mut entry, canvases, true)
+  // Images of chains the app replaced (a resize) are not shown again.
+  let mut i: usize = 0
+  let mut kept = at
+  while i < entry.imports.length() {
+    if entry.imports.asSlice()[i].chain != picture.chain {
+      drop entry.imports.remove(i)
+      if i < kept {
+        kept = kept - 1
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  entry.shown = kept
+}
+
 /// Uploads the canvas frames presented since the last call into textures the renderer's
-/// surface sprites sample, and releases the textures of closed surfaces.
+/// device samples, and shows the shared ones in place.
 effect fn serveCanvases(
   canvases: &CanvasPresenter,
   device: &Device,
@@ -930,6 +1048,7 @@ effect fn serveCanvases(
     renderer.removeSurface(closed[c])
     let at = canvasTextureIndex(&shown.*, closed[c])
     if at != usize.MAX {
+      run endShown(&mut shown.asMutSlice()[at], canvases, false)
       drop shown.remove(at)
     }
     c = c + 1
@@ -938,28 +1057,38 @@ effect fn serveCanvases(
   let mut f: usize = 0
   while f < frames.length {
     let frame = &frames[f]
+    let isShared = frame.shared.isSome()
     let mut at = canvasTextureIndex(&shown.*, frame.surface)
     if at != usize.MAX
-      && (shown.asSlice()[at].width != frame.width || shown.asSlice()[at].height != frame.height) {
-      renderer.removeSurface(frame.surface)
+      && (shown.asSlice()[at].width != frame.width || shown.asSlice()[at].height != frame.height
+        || shown.asSlice()[at].texture.isSome() == isShared) {
+      // The old picture stays on screen until the new one is bound below.
+      run endShown(&mut shown.asMutSlice()[at], canvases, true)
+      if !isShared {
+        renderer.removeSurface(frame.surface)
+      }
       drop shown.remove(at)
       at = usize.MAX
     }
     if at == usize.MAX {
-      let mut size = Extent3D.default()
-      size.setWidth(frame.width)
-      size.setHeight(frame.height)
-      size.setDepthOrArrayLayers(1)
-      let mut descriptor = TextureDescriptor.default().withLabel(b"ui canvas")
-      descriptor.setSize(size)
-      descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
-      descriptor.setDimension(flags.WGPUTextureDimension_2D)
-      descriptor.setMipLevelCount(1)
-      descriptor.setSampleCount(1)
-      descriptor.setUsage(flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst)
-      let texture = run createTexture(device, &descriptor)
-      let view = run texture.createView(&TextureViewDescriptor.default())
-      run renderer.setSurface(frame.surface, &view)
+      let mut texture = Option<Texture>.None
+      if !isShared {
+        let mut size = Extent3D.default()
+        size.setWidth(frame.width)
+        size.setHeight(frame.height)
+        size.setDepthOrArrayLayers(1)
+        let mut descriptor = TextureDescriptor.default().withLabel(b"ui canvas")
+        descriptor.setSize(size)
+        descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+        descriptor.setDimension(flags.WGPUTextureDimension_2D)
+        descriptor.setMipLevelCount(1)
+        descriptor.setSampleCount(1)
+        descriptor.setUsage(flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst)
+        let made = run createTexture(device, &descriptor)
+        let view = run made.createView(&TextureViewDescriptor.default())
+        run renderer.setSurface(frame.surface, &view)
+        texture = Option<Texture>.some(move made)
+      }
       at = shown.length()
       run shown.append(
         CanvasTexture {
@@ -967,22 +1096,33 @@ effect fn serveCanvases(
           width: frame.width,
           height: frame.height,
           texture: move texture,
+          imports: List<ImportedImage>.make(),
+          shown: usize.MAX,
         },
       )
     }
-    let mut size = Extent3D.default()
-    size.setWidth(frame.width)
-    size.setHeight(frame.height)
-    size.setDepthOrArrayLayers(1)
-    let mut layout = TexelCopyBufferLayout.default()
-    layout.setBytesPerRow(frame.width * 4)
-    layout.setRowsPerImage(frame.height)
-    queue.writeTexture(
-      &TexelCopyTextureInfo.default().withTexture(&shown.asSlice()[at].texture),
-      frame.pixels.asSlice(),
-      &layout,
-      &size,
-    )
+    if isShared {
+      run showShared(canvases, device, &mut renderer, &mut shown.asMutSlice()[at], frame)
+    } else {
+      let mut size = Extent3D.default()
+      size.setWidth(frame.width)
+      size.setHeight(frame.height)
+      size.setDepthOrArrayLayers(1)
+      let mut layout = TexelCopyBufferLayout.default()
+      layout.setBytesPerRow(frame.width * 4)
+      layout.setRowsPerImage(frame.height)
+      match &shown.asSlice()[at].texture {
+        Option<Texture>.Some { value } => {
+          queue.writeTexture(
+            &TexelCopyTextureInfo.default().withTexture(&value),
+            frame.pixels.asSlice(),
+            &layout,
+            &size,
+          )
+        }
+        Option<Texture>.None => ()
+      }
+    }
     f = f + 1
   }
 }
@@ -1318,9 +1458,12 @@ effect fn renderLoop(
   // startup, and need no surface. The pipelines are made for BGRA8, the format almost every
   // surface offers, and again below if this one does not.
   let instance = run Instance.create()
-  let deviceOptions = DeviceDescriptor.cachedIn(String.utf8Bytes(cache))
   let mut adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  // With the features that share GPU canvas images with the apps' devices, when the adapter
+  // has them (gpu_canvas.silk): the canvases then reach this device without a copy.
+  let deviceOptions = DeviceDescriptor.cachedIn(String.utf8Bytes(cache)).withRequiredFeatures(sharingFeatures(&adapter))
   let mut device = run adapter.requestDevice(&deviceOptions)
+  canvases.setSharing(SharedImage.supported(&device))
   let mut queue = run getQueue(&device)
   let mut renderer = run UiRenderer.make(&device, flags.WGPUTextureFormat_BGRA8Unorm)
 
@@ -1350,6 +1493,9 @@ effect fn renderLoop(
       drop error
       adapter = run instance.requestAdapter(&RequestAdapterOptions.forSurface(&gpuSurface))
       device = run adapter.requestDevice(&deviceOptions)
+      if !SharedImage.supported(&device) {
+        StderrWriter.print("ui-tree: the adapter that presents does not share canvas images\n", &())
+      }
       queue = run getQueue(&device)
       renderer = run UiRenderer.make(&device, flags.WGPUTextureFormat_BGRA8Unorm)
       run gpuSurface.getCapabilities(&adapter)

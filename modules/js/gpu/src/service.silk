@@ -17,7 +17,7 @@ import ui_js_calls.gpu { GpuReply }
 import ui_tree.legacy { Batch }
 import ui_tree.mutation { NO_SURFACE }
 import ui_tree_window.canvas_frames { CanvasPresenter }
-import ui_tree_window.gpu_canvas { CanvasGpu, GpuCanvas }
+import ui_tree_window.gpu_canvas { CanvasGpu, GpuCanvas, sharingFeatures }
 import webgpu.runtime { Adapter, Device, GpuError, Instance, MappedBuffer, RequestAdapterOptions }
 import webgpu.runtime as runtime
 import webgpu.resources as gpu
@@ -535,6 +535,17 @@ effect fn deviceText(device: &Device) -> String
   return move out
 }
 
+fn contains(values: &[u32], value: u32) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == value {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 effect fn requestDevice(adapter: &Adapter, instance: &Instance, r: &mut Reader<'_>) -> CanvasGpu
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
@@ -553,6 +564,15 @@ effect fn requestDevice(adapter: &Adapter, instance: &Instance, r: &mut Reader<'
     let index = r.word()
     setLimit(&mut limits, index, r.number())
     i = i + 1
+  }
+  // The features of zero copy canvases (gpu_canvas.sharingFeatures), when the adapter has them.
+  let sharing = sharingFeatures(adapter)
+  let mut s: usize = 0
+  while s < sharing.length {
+    if !contains(features.asSlice(), sharing[s]) {
+      run features.append(sharing[s])
+    }
+    s = s + 1
   }
   let mut descriptor = DeviceDescriptor.default().withLabel(label).withRequiredFeatures(features.asSlice())
   if limitCount > 0 {
@@ -1691,25 +1711,30 @@ impl GpuService {
     while i < self.objects.length() {
       let mut failure = Option<GpuError>.None
       let mut device: u32 = 0
+      let mut drawn = false
       match &self.objects.asSlice()[i] {
         Object.Canvas { value } => {
-          if value.drawn {
-            device = value.device
-            let presented = run Effect.result(presentOne(&self.objects, &value))
-            match move presented {
-              Result<(), GpuError | OutOfMemoryError>.Success { .. } => ()
-              Result<(), GpuError | OutOfMemoryError>.Failure { error } => match move error {
-                OutOfMemoryError allocation => {
-                  fail move allocation
-                }
-                GpuError { code, message } => {
-                  failure = Option<GpuError>.some(GpuError { code: code, message: move message })
-                }
-              }
+          drawn = value.drawn
+          device = value.device
+        }
+        _ => {}
+      }
+      if drawn {
+        // Out of the table while it presents: a present moves the canvas to its next image.
+        let mut taken = Intrinsic.replace(self.objects.asMutSlice()[i], Object.Empty)
+        let presented = run Effect.result(presentTaken(&self.objects, &mut taken))
+        drop Intrinsic.replace(self.objects.asMutSlice()[i], move taken)
+        match move presented {
+          Result<(), GpuError | OutOfMemoryError>.Success { .. } => ()
+          Result<(), GpuError | OutOfMemoryError>.Failure { error } => match move error {
+            OutOfMemoryError allocation => {
+              fail move allocation
+            }
+            GpuError { code, message } => {
+              failure = Option<GpuError>.some(GpuError { code: code, message: move message })
             }
           }
         }
-        _ => {}
       }
       let entry = &mut self.objects.asMutSlice()[i]
       match &mut entry.* {
@@ -1754,7 +1779,15 @@ impl GpuService {
   }
 }
 
-effect fn presentOne(objects: &List<Object>, shown: &Shown) -> ()
+effect fn presentTaken(objects: &List<Object>, taken: &mut Object) -> ()
+  ! GpuError | OutOfMemoryError
+  ? &mut Allocator {
+  if let Object.Canvas { value } = &mut taken.* {
+    run presentOne(objects, &mut value)
+  }
+}
+
+effect fn presentOne(objects: &List<Object>, shown: &mut Shown) -> ()
   ! GpuError | OutOfMemoryError
   ? &mut Allocator {
   let device = run deviceOf(objects, shown.device)

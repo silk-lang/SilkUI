@@ -426,9 +426,15 @@ How it works:
 - A host turns it on with `JsHost.enableGpu`; without that `navigator.gpu` is undefined. The
   window does it for every application, and makes the device only when one asks for it.
 
+- A present of a `bgra8unorm` canvas (what `getPreferredCanvasFormat()` answers) stays on the
+  GPU where both devices can share images (macOS): the canvas draws into a swap chain of
+  IOSurfaces that the window's device samples after the application's fences
+  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). An `rgba8unorm` canvas, and every
+  canvas on other systems, copies the frame through the CPU.
+
 What is not there yet: query sets, render bundles and external textures throw, compilation
-info is always empty, `copyExternalImageToTexture` takes `ImageData` only, and a present
-copies the frame through the CPU. The canvas formats are `rgba8unorm` and `bgra8unorm`.
+info is always empty, and `copyExternalImageToTexture` takes `ImageData` only. The canvas
+formats are `rgba8unorm` and `bgra8unorm`.
 On the web canvas target ([web](web)) `navigator.gpu` is the browser's own, and a canvas
 node's `getContext("webgpu")` is the browser's context of a canvas outside the document, so
 the same bundle runs there: see "WebGPU in a canvas" in [web/README.md](web/README.md).

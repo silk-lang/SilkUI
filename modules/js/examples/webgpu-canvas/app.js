@@ -92,7 +92,7 @@ async function start() {
 
   // Reads the middle pixel of a frame back, as a test of the frame would.
   async function middle() {
-    const texture = device.createTexture({ size: [16, 16], format: "rgba8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    const texture = device.createTexture({ size: [16, 16], format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: texture.createView(), clearValue: [0, 0, 0, 1], loadOp: "clear", storeOp: "store" }],
@@ -108,7 +108,9 @@ async function start() {
     await out.mapAsync(GPUMapMode.READ);
     const bytes = new Uint8Array(out.getMappedRange());
     const at = 8 * 256 + 8 * 4;
-    const pixel = [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
+    const pixel = format === "bgra8unorm"
+      ? [bytes[at + 2], bytes[at + 1], bytes[at], bytes[at + 3]]
+      : [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
     out.unmap();
     return pixel;
   }
