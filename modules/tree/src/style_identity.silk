@@ -9,9 +9,14 @@ import svg_css.tokens { equal, TokenBuffer }
 import mutation { StyleState }
 import selection { Selection }
 import scrollbar_parts { Scrollbars }
-import silk.mem.box { Box }
+import thin { Thin }
 import svg_css.element { PseudoTarget }
 import silk.num.u32
+import silk.num.u8
+import silk.num.usize
+import silk.mem.frozen { Frozen }
+import silk.collections.hash { Hash, Word }
+import silk.collections.hash_map { HashMap }
 
 pub struct CustomValue { pub state: StyleState, pub name: String, pub tokens: TokenBuffer, pub important: bool }
 
@@ -28,11 +33,17 @@ pub struct IdentityExtras {
   pub attributes: List<NamedAttribute>,
 }
 
+impl IdentityExtras {
+  pub fn make() -> IdentityExtras {
+    return IdentityExtras { containerNames: List<Bytes>.make(), custom: List<CustomValue>.make(), id: String.make(), attributes: List<NamedAttribute>.make() }
+  }
+}
+
 pub struct NodeIdentity {
-  pub selection: Option<Box<Selection>>,
-  pub scrollbars: Option<Box<Scrollbars>>,
+  pub selection: Thin<Selection>,
+  pub scrollbars: Thin<Scrollbars>,
   /// Container names, custom properties, the id and named attributes (see `IdentityExtras`).
-  pub extras: Option<Box<IdentityExtras>>,
+  pub extras: Thin<IdentityExtras>,
   pub generatedOrigin: u32,
   pub generatedTarget: PseudoTarget,
   pub before: u32,
@@ -46,45 +57,52 @@ pub struct NodeIdentity {
   pub letterRules: bool,
   /// The hidden node holding an origin's `::first-line` style, or u32.MAX.
   pub lineBox: u32,
-  pub tag: String,
-  pub classes: String,
+  /// The tag and the class attribute, shared by every element with the same ones (see
+  /// `SelectorKeys`); none for an element with neither.
+  pub key: Option<Frozen<SelectorKey>>,
   pub hasId: bool,
   pub hasClasses: bool,
-  /// Sorted unique atom ids, so class order and repeated tokens do not change sharing keys.
-  pub classAtoms: List<usize>,
 }
 
 impl NodeIdentity {
-  fn extrasOf(self: &Self) -> Option<&IdentityExtras> {
-    return match &self.extras {
-      Option<Box<IdentityExtras>>.Some { value } => Option<&IdentityExtras>.Some { value: &value.get()[0] }
-      Option<Box<IdentityExtras>>.None => Option<&IdentityExtras>.None
+  /// The element's tag name, empty when it has none.
+  pub fn tag(self: &Self) -> string {
+    return match &self.key { Option.Some { value } => String.view(&value.get().tag) _ => "" }
+  }
+
+  /// The class attribute's text.
+  pub fn classes(self: &Self) -> string {
+    return match &self.key { Option.Some { value } => String.view(&value.get().classes) _ => "" }
+  }
+
+  /// Sorted unique atom ids, so class order and repeated tokens do not change sharing keys.
+  pub fn classAtoms(self: &Self) -> &[usize] {
+    return match &self.key { Option.Some { value } => value.get().classAtoms.asSlice() _ => &[] }
+  }
+
+  /// Whether both have the same tag and class attribute.
+  pub fn sameKey(self: &Self, other: &NodeIdentity) -> bool {
+    return match &self.key {
+      Option.Some { value: left } => match &other.key {
+        Option.Some { value: right } => Frozen<SelectorKey>.same(&left, &right) || sameKeyText(left.get(), right.get())
+        _ => false
+      }
+      _ => other.key.isNone()
     }
+  }
+
+  fn extrasOf(self: &Self) -> Option<&IdentityExtras> {
+    return self.extras.get()
   }
 
   /// The rarer parts to change, made on first use.
   pub effect fn extrasMut(self: &mut Self) -> &mut IdentityExtras ! OutOfMemoryError ? &mut Allocator {
-    if self.extras.isNone() {
-      self.extras = Option<Box<IdentityExtras>>.Some { value: run Box<IdentityExtras>.make(IdentityExtras {
-        containerNames: List<Bytes>.make(), custom: List<CustomValue>.make(), id: String.make(), attributes: List<NamedAttribute>.make(),
-      }) }
-    }
-    match &mut self.extras {
-      Option<Box<IdentityExtras>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<IdentityExtras>>.None => {
-        return Intrinsic.trap("ui-tree: the identity's extras were just made")
-      }
-    }
+    return run self.extras.getOrMake(IdentityExtras.make)
   }
 
   // The rarer parts to change, when the identity has them.
   fn extrasHeld(self: &mut Self) -> Option<&mut IdentityExtras> {
-    return match &mut self.extras {
-      Option<Box<IdentityExtras>>.Some { value } => Option<&mut IdentityExtras>.Some { value: &mut value.getMut()[0] }
-      Option<Box<IdentityExtras>>.None => Option<&mut IdentityExtras>.None
-    }
+    return self.extras.getMut()
   }
 
   /// The container names the node's style gives it.
@@ -172,7 +190,115 @@ impl NodeIdentity {
   }
 
   pub fn make() -> Self {
-    return NodeIdentity { selection: Option<Box<Selection>>.None, scrollbars: Option<Box<Scrollbars>>.None, extras: Option<Box<IdentityExtras>>.None, generatedOrigin: u32.MAX, generatedTarget: PseudoTarget.None, before: u32.MAX, after: u32.MAX, marker: u32.MAX, letterBox: u32.MAX, letterText: u32.MAX, letterRules: false, lineBox: u32.MAX, tag: String.make(), classes: String.make(), hasId: false, hasClasses: false, classAtoms: List<usize>.make() }
+    return NodeIdentity { selection: Thin<Selection>.none(), scrollbars: Thin<Scrollbars>.none(), extras: Thin<IdentityExtras>.none(), generatedOrigin: u32.MAX, generatedTarget: PseudoTarget.None, before: u32.MAX, after: u32.MAX, marker: u32.MAX, letterBox: u32.MAX, letterText: u32.MAX, letterRules: false, lineBox: u32.MAX, key: Option<Frozen<SelectorKey>>.None, hasId: false, hasClasses: false }
+  }
+}
+
+/// What selectors read of an element that many elements have alike: its tag and class attribute.
+pub struct SelectorKey {
+  pub tag: String,
+  pub classes: String,
+  /// Sorted unique atom ids, so class order and repeated tokens do not change sharing keys.
+  pub classAtoms: List<usize>,
+}
+
+fn sameKeyText(left: &SelectorKey, right: &SelectorKey) -> bool {
+  return String.view(&left.tag) == String.view(&right.tag) && String.view(&left.classes) == String.view(&right.classes)
+}
+
+fn hashBytes(seed: u64, bytes: &[u8]) -> u64 {
+  let mut hash = Hash.combine(seed, usize.toU64(bytes.length))
+  let mut i: usize = 0
+  while i < bytes.length {
+    hash = Hash.combine(hash, u8.toU64(bytes[i]))
+    i = i + 1
+  }
+  return hash
+}
+
+struct KeyEntry { hash: u64, key: Frozen<SelectorKey> }
+
+/// What `SelectorKeys.room` counts.
+pub struct KeysRoom { pub tag: usize, pub classes: usize, pub atoms: usize, pub atomRoom: usize }
+
+/// One `SelectorKey` per distinct tag and class attribute, shared by the elements that have them.
+/// A long document has a few dozen distinct ones for tens of thousands of elements.
+pub struct SelectorKeys {
+  /// Key hash to entry; a hash two different keys share keeps the first, and the second is made
+  /// alone (sharing is only a saving, equal keys compare equal either way).
+  map: HashMap<Word, u32>,
+  entries: List<KeyEntry>,
+  /// Entries at the last sweep, which drops the keys no element holds any more.
+  swept: usize,
+}
+
+impl SelectorKeys {
+  pub fn make() -> SelectorKeys {
+    return SelectorKeys { map: HashMap<Word, u32>.make(Hash.seed(0x73656c6b)), entries: List<KeyEntry>.make(), swept: 16 }
+  }
+
+  /// The shared key for `tag` and `classes` (whose sorted atoms are `atoms`), or none when both
+  /// are empty.
+  pub effect fn intern(self: &mut Self, tag: string, classes: string, atoms: &[usize]) -> Option<Frozen<SelectorKey>>
+    ! OutOfMemoryError ? &mut Allocator {
+    if String.utf8Bytes(tag).length == 0 && String.utf8Bytes(classes).length == 0 { return Option<Frozen<SelectorKey>>.None }
+    let hash = hashBytes(hashBytes(0x7461, String.utf8Bytes(tag)), String.utf8Bytes(classes))
+    let word = Word { value: hash }
+    if let Option.Some { value: at } = self.map.get(word) {
+      let entry = &self.entries.asSlice()[u32.toUsize(at)]
+      if String.view(&entry.key.get().tag) == tag && String.view(&entry.key.get().classes) == classes {
+        return Option<Frozen<SelectorKey>>.some(entry.key.clone())
+      }
+    }
+    let mut classAtoms = List<usize>.make()
+    run classAtoms.appendSlice(atoms)
+    let made = run Frozen<SelectorKey>.make(SelectorKey {
+      tag: run String.copy(tag),
+      classes: run String.copy(classes),
+      classAtoms: move classAtoms,
+    })
+    if !self.map.contains(word) {
+      if self.entries.length() >= self.swept * 2 { run self.sweep() }
+      drop run self.map.insert(word, usize.toU32(self.entries.length()))
+      run self.entries.append(KeyEntry { hash: hash, key: made.clone() })
+    }
+    return Option<Frozen<SelectorKey>>.some(move made)
+  }
+
+  /// How many distinct keys the table holds.
+  pub fn length(self: &Self) -> usize { return self.entries.length() }
+
+  /// The room the table's keys hold: tag text, class text, class atoms and the atoms' room.
+  pub fn room(self: &Self) -> KeysRoom {
+    let mut room = KeysRoom { tag: 0, classes: 0, atoms: 0, atomRoom: 0 }
+    let entries = self.entries.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      let key = entries[i].key.get()
+      room.tag = room.tag + key.tag.capacity()
+      room.classes = room.classes + key.classes.capacity()
+      room.atoms = room.atoms + key.classAtoms.length()
+      room.atomRoom = room.atomRoom + key.classAtoms.capacity()
+      i = i + 1
+    }
+    return move room
+  }
+
+  // Drops the keys only the table still holds.
+  effect fn sweep(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut kept = List<KeyEntry>.make()
+    let mut old = Intrinsic.replace(self.entries, List<KeyEntry>.make())
+    self.map.clear()
+    while old.length() != 0 {
+      let last = old.length() - 1
+      let entry = old.remove(last)
+      if entry.key.count() > 1 {
+        drop run self.map.insert(Word { value: entry.hash }, usize.toU32(kept.length()))
+        run kept.append(move entry)
+      }
+    }
+    self.entries = move kept
+    self.swept = if self.entries.length() > 16 { self.entries.length() } else { 16 }
   }
 }
 
