@@ -102,6 +102,8 @@ import font_units
 import font_units { Source as FontSource }
 import motion
 import motion { Running }
+import filter_motion
+import filter_motion { FilterList }
 import animation
 import animation { Rule, Playing, KeptSamples }
 import timing
@@ -6644,9 +6646,13 @@ impl<'a> UiTree<'a> {
     let rendered = parentRendered && !computed.layout.display.isNone()
     let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).hasTransition()
       || self.node(slot).starting().length != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+    // What `filter`, which lives in the paint effects, eases with (see `moveFilters`).
+    let mut filterBefore = false
+    let mut motionAnimated: u64 = 0
     if needsMotion {
       let mut before = style_change.before(&self, slot)
       let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
+      filterBefore = hasBefore
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
       if !hasBefore && rendered && (sheetStarting || self.node(slot).starting().length != 0) {
         before = computed
@@ -6667,6 +6673,7 @@ impl<'a> UiTree<'a> {
       self.easingStops = move stops
       let underlyingFontSize = computed.text.size
       let animated = run animation.update(&mut self, slot, rendered, &computed)
+      motionAnimated = animated
       if self.node(slot).generatedSuppressed { run motion.cancelAll(&mut self, slot) }
       else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
       if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
@@ -6746,7 +6753,7 @@ impl<'a> UiTree<'a> {
       computed.effects.shadowHash = above.shadowHash
     }
     let fontKey = if simpleStyles && kind == NodeKind.Text && parent != NONE { self.node(parent).fontKey } else { run self.fontKeyOf(computed.text) }
-    run self.resolveEffects(slot, &mut computed, fontKey)
+    run self.resolveEffects(slot, &mut computed, fontKey, needsMotion, filterBefore, motionAnimated)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
     let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
@@ -6795,15 +6802,26 @@ impl<'a> UiTree<'a> {
 
   /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
   /// rest of its style is in `computed`, so `em` and `currentColor` see its font and color.
-  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize) -> ()
+  /// With `moving` (the node's style went through `motion`), its `filter` also eases: see
+  /// [`moveFilters`] for `hasBefore` and `animated`.
+  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize, moving: bool, hasBefore: bool, animated: u64) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let moves = moving && motion.filterMoves(&self, slot, &computed.transition, animated)
     if !computed.effects.declared {
-      if self.node(slot).effects.isSome() {
-        let target = self.nodeMut(slot)
-        target.effects.clear()
+      // A filter that eases away (or an animation's filter) still needs effects to paint.
+      let showing = match self.node(slot).paintEffects() {
+        Option.Some { value } => value.filters.length() != 0
+        _ => false
       }
-      return ()
+      let animatesFilter = u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FILTER))) != 0
+      if !moves || !(showing || animatesFilter) {
+        if self.node(slot).effects.isSome() {
+          let target = self.nodeMut(slot)
+          target.effects.clear()
+        }
+        return ()
+      }
     }
     let basis = font_units.paintBasis(&self, slot, &computed.*, fontKey)
     let mut effects = Effects.make()
@@ -6834,6 +6852,15 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+    if moves { run self.moveFilters(slot, &mut effects, &computed.*, basis, hasBefore, animated) }
+    if !computed.effects.declared && effects.filters.length() == 0 {
+      // Eased all the way to `none`, with nothing else declared.
+      if self.node(slot).effects.isSome() {
+        let target = self.nodeMut(slot)
+        target.effects.clear()
+      }
+      return ()
+    }
     computed.effects.hash = effects.hash
     computed.effects.layered = effects.layered()
     computed.effects.stacks = effects.stacks
@@ -6849,6 +6876,33 @@ impl<'a> UiTree<'a> {
     let boxed = run Thin<Effects>.make(move effects)
     let target = self.nodeMut(slot)
     target.effects.set(move boxed)
+  }
+
+  /// Eases the `filter` of `effects`, the paint effects node `slot`'s new style `computed`
+  /// computes: a `filter` transition from the list the node showed (when `hasBefore`, it had a
+  /// before-change style), then the animations that set it (bits of `animated`) over that.
+  effect fn moveFilters(self: &mut Self, slot: u32, effects: &mut Effects, computed: &Computed, basis: paint_css.Basis, hasBefore: bool, animated: u64) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let after = match filter_motion.of(&effects.*) {
+      Option.Some { value } => value
+      // Too long to ease: it shows as computed.
+      _ => { return () }
+    }
+    let showed = filter_motion.ofNode(self.node(slot).paintEffects())
+    let before = match showed { Option.Some { value } => value _ => FilterList.none() }
+    let mut shown = after
+    let mut moved = false
+    if let Option.Some { value } = run motion.transitionFilter(&mut self, slot, computed, before, hasBefore && showed.isSome(), after, animated) {
+      shown = value
+      moved = true
+    }
+    if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FILTER))) != 0 {
+      if let Option.Some { value } = run animation.applyFilters(&self, slot, shown, basis) {
+        shown = value
+        moved = true
+      }
+    }
+    if moved { run filter_motion.write(&shown, &mut effects.*) }
   }
 
   effect fn applyEffects(self: &Self, effects: &mut Effects, declarations: &[Declaration], parent: u32, basis: paint_css.Basis) -> ()
