@@ -112,7 +112,7 @@ of paint, with the layout passes and boxes laid out. The clock moves 1/120 s a f
   each text fragment.
 - `SILK_UI_BENCH_CENSUS=1`: after the first frame and at four later marks (`steady-a`,
   `inside-a`, `steady-b`, `last`), what the engine holds and did, one line a row, each line
-  carrying its mark:
+  carrying its mark. A number above 1 also prints one every that many frames (phase `every`):
 
       census: phase=first frame=0 footprint=50355200
       census: phase=first frame=0 held tree.layout-table.links entries=4 capacity=4 each=28 used=112 reserved=112
