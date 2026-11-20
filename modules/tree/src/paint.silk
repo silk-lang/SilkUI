@@ -14,7 +14,7 @@ import first_letter
 import properties.computed as computed_values
 import read_fonts.model.charmap { Charmap }
 import properties.computed { DecorationLine }
-import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache }
+import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache, PaintCaches }
 import resources { Resources, Resource }
 import scrollbar { geometryOf, Thumb, rangeOf, scrolls, usedOverflow }
 import layers
@@ -123,6 +123,7 @@ impl TextInk {
 /// Everything a frame's paint reads and writes, borrowed from the tree.
 pub struct Painter<'p, 'a> {
   pub nodes: &'p mut List<Node>,
+  pub caches: &'p mut PaintCaches,
   pub slotOfCss: &'p List<u32>,
   pub css: &'p LayoutTable,
   pub output: &'p LayoutTree,
@@ -2906,6 +2907,16 @@ effect fn shiftChildren(
   }
 }
 
+// Writes the paint cache of `slot`, giving it an entry on its first.
+effect fn putCache(p: &mut Painter<'_, '_>, slot: u32, cache: PaintCache) -> () ! OutOfMemoryError ? &mut Allocator {
+  let index = p.nodes.asSlice()[u32.toUsize(slot)].paintCache
+  let at = run p.caches.put(index, cache)
+  if at != index {
+    let nodes = p.nodes.asMutSlice()
+    nodes[u32.toUsize(slot)].paintCache = at
+  }
+}
+
 effect fn shiftOne(
   p: &mut Painter<'_, '_>,
   child: usize,
@@ -2920,10 +2931,13 @@ effect fn shiftOne(
   let slot = slotIn(p.slotOfCss, f.source)
   if slot != NONE && f.kind == FragmentKind.Box {
     let node = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
-    if node.cache.frame == p.previousFrame && node.cache.start >= from {
-      node.cache.start = node.cache.start - from + to
-      node.cache.end = node.cache.end - from + to
-      node.cache.frame = p.frame
+    if node.paintCache != NONE {
+      let cache = p.caches.at(node.paintCache)
+      if cache.frame == p.previousFrame && cache.start >= from {
+        cache.start = cache.start - from + to
+        cache.end = cache.end - from + to
+        cache.frame = p.frame
+      }
     }
   }
   run shiftCaches(&mut p, child, from, to, mask)
@@ -2998,7 +3012,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
     0
   }
   if cacheable && p.replayable {
-    let cache = p.nodes.asSlice()[u32.toUsize(slot)].cache
+    let cache = p.caches.get(p.nodes.asSlice()[u32.toUsize(slot)].paintCache)
     let culledAlike = sameRect(cache.cull, p.cull)
       || (inkInside(&p.*, index, cache.cull) && inkInside(&p.*, index, p.cull))
     if cache.frame == p.previousFrame && cache.hash == hash && sameRect(cache.mask, mask.bounds)
@@ -3009,8 +3023,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       let end = p.scene.operationCount()
       run noteOrder(&mut p, index, &f)
       run shiftCaches(&mut p, index, cache.start, start, mask)
-      let nodes = p.nodes.asMutSlice()
-      nodes[u32.toUsize(slot)].cache = PaintCache {
+      let replayed = PaintCache {
         hash: hash,
         start: start,
         end: end,
@@ -3019,6 +3032,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
         scale: p.scale,
         cull: p.cull,
       }
+      run putCache(&mut p, slot, replayed)
       p.stats.replayedSubtrees = p.stats.replayedSubtrees + 1
       p.stats.replayedOperations = p.stats.replayedOperations + (end - start)
       return ()
@@ -3092,8 +3106,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   }
   let end = p.scene.operationCount()
   if cacheable {
-    let nodes = p.nodes.asMutSlice()
-    nodes[u32.toUsize(slot)].cache = PaintCache {
+    let painted = PaintCache {
       hash: hash,
       start: start,
       end: end,
@@ -3102,6 +3115,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
       scale: p.scale,
       cull: p.cull,
     }
+    run putCache(&mut p, slot, painted)
     p.stats.repaintedSubtrees = p.stats.repaintedSubtrees + 1
   }
 }
@@ -3123,7 +3137,7 @@ effect fn paintThumbs(
     node,
     f,
     if generated {
-      node.scrollY
+      node.scrollY()
     } else {
       range.minY
     },
@@ -3133,7 +3147,7 @@ effect fn paintThumbs(
     node,
     f,
     if generated {
-      node.scrollX
+      node.scrollX()
     } else {
       range.minX
     },
@@ -3215,8 +3229,8 @@ effect fn openScroller(
   let s = p.scale
   let node = &p.nodes.asSlice()[u32.toUsize(slot)]
   let id = node.id
-  let sx: f32 = node.scrollX * s
-  let sy: f32 = node.scrollY * s
+  let sx: f32 = node.scrollX() * s
+  let sy: f32 = node.scrollY() * s
   let range = rangeOf(c, f)
   if node.isGenerated() {
     // Private boxes have no compositor-facing client id. Their offsets are baked into
@@ -3432,7 +3446,7 @@ fn ownHash(
     if slot != NONE {
       let node = &nodes.asSlice()[u32.toUsize(slot)]
       h = selection.hash(node, Hash.combine(h, node.paintHash))
-      if node.isGenerated() { h = floatHash(h, node.scrollX) h = floatHash(h, node.scrollY) }
+      if node.isGenerated() { h = floatHash(h, node.scrollX()) h = floatHash(h, node.scrollY()) }
     }
     // The text node's own content: what the document selection covers of it, say.
     let own = slotIn(slots, f.source)
@@ -3470,8 +3484,8 @@ fn ownHash(
     let node = &nodes.asSlice()[u32.toUsize(slot)]
     h = selection.hash(node, Hash.combine(h, node.paintHash))
     if node.isGenerated() {
-      h = floatHash(h, node.scrollX)
-      h = floatHash(h, node.scrollY)
+      h = floatHash(h, node.scrollX())
+      h = floatHash(h, node.scrollY())
     }
     if f.kind == FragmentKind.Box {
       h = transform.perspectiveHash(&node.computed().transform, h)
@@ -3514,7 +3528,7 @@ fn placedHash(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index:
     let slot = slotIn(slots, f.source)
     if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed().transform.any() {
       let mut placed = transform.placementHash(&nodes.asSlice()[u32.toUsize(slot)].computed().transform, combined)
-      if let Option<transform.Placement>.Some { value: at } = nodes.asSlice()[u32.toUsize(slot)].offsetPlaced {
+      if let Option<transform.Placement>.Some { value: at } = nodes.asSlice()[u32.toUsize(slot)].offsetPlaced() {
         placed = Hash.combine(Hash.combine(Hash.combine(placed, u32.toU64(f32.toBits(at.x))), u32.toU64(f32.toBits(at.y))), u32.toU64(f32.toBits(at.angle)))
       }
       return placed

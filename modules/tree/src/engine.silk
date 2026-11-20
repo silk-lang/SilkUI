@@ -138,6 +138,7 @@ import live_svg
 import live_svg { LiveSvg }
 import thin { Thin }
 import node {
+  NodeRare,
   NONE,
   WATCH_OUTSIDE,
   NO_INDEX,
@@ -145,7 +146,7 @@ import node {
   FrameStats,
   EventKind,
   Event,
-  PaintCache,
+  PaintCaches,
   Node,
   NodeExtras,
   Semantics,
@@ -814,6 +815,8 @@ pub struct UiTree<'a> {
   pub changingStyles: bool,
   pub provider: Provider<'a>,
   pub nodes: List<Node>,
+  /// The nodes' paint caches (see `Node.paintCache`).
+  pub paintCaches: PaintCaches,
   pub styleAtoms: Atoms,
   pub styleSheets: List<RootSheets>,
   styleLoads: List<StyleRequest>,
@@ -1114,6 +1117,7 @@ impl<'a> UiTree<'a> {
         naturals: List<NaturalDimensions>.make(),
       },
       nodes: List<Node>.make(),
+      paintCaches: PaintCaches.make(),
       styleAtoms: Atoms.make(),
       styleSheets: List<RootSheets>.make(),
       styleLoads: List<StyleRequest>.make(),
@@ -2151,20 +2155,24 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         match move attribute {
           Attribute.ValueRange { min, max, value } => {
-            node.hasValueRange = true
-            node.valueMin = min
-            node.valueMax = max
-            node.valueNow = value
+            let rare = run node.rareMut()
+            rare.hasValueRange = true
+            rare.valueMin = min
+            rare.valueMax = max
+            rare.valueNow = value
           }
           Attribute.ClearValueRange => {
-            node.hasValueRange = false
+            if let Option.Some { value: rare } = node.rare.getMut() { rare.hasValueRange = false }
           }
 
           Attribute.Role { value } => {
             node.accessRole = value
           }
           Attribute.Label { value } => {
-            node.label = move value
+            if value.ownedByteLength() != 0 || node.rare.isSome() {
+              let rare = run node.rareMut()
+              rare.label = move value
+            }
           }
           Attribute.TestId { value } => {
             // An empty id on a node without one changes nothing, and makes no extras.
@@ -2382,7 +2390,7 @@ impl<'a> UiTree<'a> {
             let span = style_attributes.isSpan(String.view(&name))
             let identity = run self.nodeMut(slot).identityMut()
             run identity.set(move name, move value)
-            if range { style_attributes.syncRange(self.nodeMut(slot)) }
+            if range { run style_attributes.syncRange(self.nodeMut(slot)) }
             if span { self.restyle(slot) }
           }
           Attribute.ClassName { value } => {
@@ -2412,7 +2420,7 @@ impl<'a> UiTree<'a> {
         let slot = run self.require(index, id)
         let node = self.nodeMut(slot)
         if u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 {
-          node.layoutReported = false
+          if let Option.Some { value: rare } = node.rare.getMut() { rare.layoutReported = false }
         }
         let asksLayout = u32.bitAnd(node.listeners, LISTEN_LAYOUT) == 0 && u32.bitAnd(flags, LISTEN_LAYOUT) != 0
         node.listeners = flags
@@ -2825,11 +2833,7 @@ impl<'a> UiTree<'a> {
       paintHash: 0,
       text: String.make(),
       accessRole: Role.None,
-      hasValueRange: false,
-      valueMin: 0.0,
-      valueMax: 0.0,
-      valueNow: 0.0,
-      label: String.make(),
+      rare: Thin<NodeRare>.none(),
       tabIndex: if kind == NodeKind.Input {
         0
       } else {
@@ -2844,8 +2848,6 @@ impl<'a> UiTree<'a> {
       selected: false,
       expanded: false,
       listeners: 0,
-      layoutReported: false,
-      reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
       hovered: false,
       pressed: false,
       styleDirty: true,
@@ -2858,14 +2860,11 @@ impl<'a> UiTree<'a> {
       generatedSuppressed: false,
       subtreeDirty: false,
       rendered: false,
-      scrollX: 0.0,
-      scrollY: 0.0,
       resource: NONE,
       svg: Thin<LiveSvg>.none(),
       content: 1,
       editing: move editing,
       effects: Thin<Effects>.none(),
-      offsetPlaced: Option<transform.Placement>.None,
       semantics: Thin<Semantics>.none(),
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -2873,7 +2872,7 @@ impl<'a> UiTree<'a> {
       styleWatch: 0,
       computedStamp: 0,
       selectorIdentity: Thin<NodeIdentity>.none(),
-      cache: PaintCache.empty(),
+      paintCache: NONE,
     }
     let mut slot: u32 = 0
     if self.free.length() != 0 {
@@ -3078,7 +3077,9 @@ impl<'a> UiTree<'a> {
       node.base.clearAndFree()
       node.extras.clear()
       node.text.clearAndFree()
-      node.label.clearAndFree()
+      node.rare.clear()
+      let paintCache = node.paintCache
+      node.paintCache = NONE
       node.moving.clear()
       node.editing.clear()
       node.effects.clear()
@@ -3100,6 +3101,7 @@ impl<'a> UiTree<'a> {
       if inner != NO_INDEX {
         self.slotOfCss.set(inner, NONE)
       }
+      run self.paintCaches.release(paintCache)
       run self.free.append(gone)
       let added = self.free.length() - 1
       siftUp(&mut self.free, added)
@@ -4269,8 +4271,8 @@ impl<'a> UiTree<'a> {
     self.viewScrollState.interruptTarget(
       ViewTarget { kind: ViewTargetKind.Element, id: u32.toUsize(id) },
     )
-    let fromX = self.node(slot).scrollX
-    let fromY = self.node(slot).scrollY
+    let fromX = self.node(slot).scrollX()
+    let fromY = self.node(slot).scrollY()
     run interact.scrolledElsewhere(&mut self, slot, x, y)
     run scroll_snap.userScrolled(&mut self, slot, fromX, fromY, false)
   }
@@ -4280,7 +4282,7 @@ impl<'a> UiTree<'a> {
     if slot == NONE {
       return Vector2<f32> { x: 0.0, y: 0.0 }
     }
-    return Vector2<f32> { x: self.node(slot).scrollX, y: self.node(slot).scrollY }
+    return Vector2<f32> { x: self.node(slot).scrollX(), y: self.node(slot).scrollY() }
   }
 
   /// Moves the queued host requests (clipboard reads and writes, font faces to load) to `out`,
@@ -7059,8 +7061,8 @@ impl<'a> UiTree<'a> {
       if node.live && u32.bitAnd(node.listeners, LISTEN_LAYOUT) != 0
         && !self.inParkedRoot(usize.toU32(i)) {
         let id = node.id
-        let before = node.reportedBounds
-        let reported = node.layoutReported
+        let before = match node.rare.get() { Option.Some { value: rare } => rare.reportedBounds _ => Rect<f32>.new(0.0, 0.0, 0.0, 0.0) }
+        let reported = match node.rare.get() { Option.Some { value: rare } => rare.layoutReported _ => false }
         if let Option<inspect.NodeInfo>.Some { value } = run inspect.info(&self.*, id) {
           let bounds = value.bounds
           if !reported || before.xMin != bounds.xMin || before.yMin != bounds.yMin
@@ -7068,8 +7070,9 @@ impl<'a> UiTree<'a> {
             || before.yMax != bounds.yMax {
             let slot = usize.toU32(i)
             let target = self.nodeMut(slot)
-            target.layoutReported = true
-            target.reportedBounds = bounds
+            let rare = run target.rareMut()
+            rare.layoutReported = true
+            rare.reportedBounds = bounds
             let mut path = List<u32>.make()
             run self.pathTo(slot, &mut path)
             let mut event = Event.make(EventKind.Layout, id, move path)
@@ -7547,6 +7550,7 @@ impl<'a> UiTree<'a> {
       self.sceneB.clear()
       let mut painter = Painter {
         nodes: &mut self.nodes,
+        caches: &mut self.paintCaches,
         slotOfCss: &self.slotOfCss,
         css: &self.layout,
         output: &self.output,
@@ -7594,6 +7598,7 @@ impl<'a> UiTree<'a> {
       self.sceneA.clear()
       let mut painter = Painter {
         nodes: &mut self.nodes,
+        caches: &mut self.paintCaches,
         slotOfCss: &self.slotOfCss,
         css: &self.layout,
         output: &self.output,
@@ -7672,6 +7677,7 @@ impl<'a> UiTree<'a> {
     let mut order = List<u32>.make()
     let mut painter = Painter {
       nodes: &mut self.nodes,
+      caches: &mut self.paintCaches,
       slotOfCss: &self.slotOfCss,
       css: &self.layout,
       output: &self.output,
