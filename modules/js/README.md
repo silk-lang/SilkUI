@@ -382,6 +382,54 @@ what those mean:
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
 
+## WebGPU in a canvas
+
+In a window, `navigator.gpu` and a canvas node's `getContext("webgpu")` follow the
+[W3C WebGPU API](https://www.w3.org/TR/webgpu/), so code written for a browser canvas runs
+as it is:
+
+```js
+import { createNode, mount } from "@silkui/core";
+
+const canvas = createNode("canvas");
+canvas.width = 480; // the drawing size in pixels; `style` gives the size on screen
+canvas.height = 360;
+mount(canvas);
+
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+const context = canvas.getContext("webgpu");
+context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat() });
+// ... pipelines and passes into context.getCurrentTexture().createView() ...
+```
+
+[examples/webgpu-canvas](examples/webgpu-canvas/app.js) draws a triangle and reads a pixel
+back; run it with `silk run --manifest-path modules/js/demo/silk.toml -- modules/js/examples/webgpu-canvas/app.js`.
+
+How it works:
+
+- The application draws on a GPU device of its own, apart from the one that draws the
+  window. A canvas that takes long to draw does not slow the rest of the interface, and a
+  frame it presents shows at the window's next refresh without a frame of the UI.
+- [src/webgpu.js](src/webgpu.js) is the API. It is evaluated on first use, and every call
+  writes a command into a stream of bytes (`ui_js_gpu.wire` lists them). Objects are numbers
+  JavaScript picks, so no call waits for the GPU.
+- When the JavaScript turn ends, the window takes the stream (`JsHost.takeGpuCommands`) and
+  the GPU service (`ui_js_gpu.service`, [gpu/](gpu)) runs it, presents each canvas whose
+  current texture was taken, and answers the calls that return promises
+  (`JsHost.answerGpu`). A command the GPU refuses is dropped alone: its promise rejects, or
+  the device gets an `uncapturederror` event.
+- A host turns it on with `JsHost.enableGpu`; without that `navigator.gpu` is undefined. The
+  window does it for every application, and makes the device only when one asks for it.
+
+What is not there yet: query sets, render bundles and external textures throw, compilation
+info is always empty, `copyExternalImageToTexture` takes `ImageData` only, and a present
+copies the frame through the CPU. The canvas formats are `rgba8unorm` and `bgra8unorm`.
+On the web targets `navigator.gpu` is not provided yet.
+
+`silk task embed-assets` regenerates `src/generated_webgpu_api.silk` after an edit to
+`webgpu.js`.
+
 ## In a window
 
 [window](window) is `ui-js-window`: `JsApp` and `JsClient`, a client of the window host
