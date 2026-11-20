@@ -57,8 +57,10 @@ A picture crosses in one of two ways. `copyExternalImageToTexture` from the canv
 the GPU; Chromium on a software Vulkan copies an empty picture that way, so the first canvas
 tries it once with a picture it knows. Until the answer is there, and where it is no, the
 picture is read back on the application's device and written into the renderer's texture,
-which shows it a frame or two later. Only the read back path has run so far (headless
-Chromium on lavapipe); the GPU path waits for a run on a real GPU.
+which shows it a frame or two later. CI runs headless Chromium on lavapipe, where the
+answer is no and only the read back path runs. Headless Chrome on an Apple GPU (Metal)
+answers yes: the three.js example then shows the same picture as with the read back path,
+pixel for pixel (checked in November 2026 by reading the window's texture back).
 
 A canvas keeps its surface and texture until the page goes away, also after its node is
 destroyed.
