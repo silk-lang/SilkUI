@@ -27,6 +27,9 @@ const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
 // The live `Range`s (see Range below), held weakly: a range nobody holds stops being updated.
 const liveRanges = new Set();
+// The `MutationObserver`s observing a node (see MutationObserver below). While there are none
+// a mutation costs one size check.
+const mutationObservers = new Set();
 
 function eachLiveRange(update) {
   for (const ref of liveRanges) {
@@ -110,6 +113,13 @@ function familyOf(names) {
   return String(id);
 }
 
+// The look's key for a CSS property name: camel case, and custom properties as written.
+function lookKey(name) {
+  name = String(name);
+  if (name.startsWith("--")) return name;
+  return name.replace(/^-(webkit|moz|ms)-/, "$1-").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
 function cssValue(name, value) {
   if (name.startsWith("--")) return String(value);
   if (name === "fontFamily") return familyOf(String(value));
@@ -187,6 +197,27 @@ class Look {
   get(name) {
     const value = this.#values[name];
     return value === undefined ? undefined : cssValue(name, value);
+  }
+
+  // CSSOM's spellings, by CSS name (`background-color`, `--accent`), as `element.style` has.
+  setProperty(name, value, priority) {
+    const key = lookKey(name);
+    const text = value == null ? "" : String(value);
+    this.set({ [key]: text && priority === "important" ? text + " !important" : text });
+  }
+
+  getPropertyValue(name) {
+    return this.get(lookKey(name)) ?? "";
+  }
+
+  removeProperty(name) {
+    const old = this.getPropertyValue(name);
+    this.set({ [lookKey(name)]: null });
+    return old;
+  }
+
+  getPropertyPriority() {
+    return "";
   }
 
   get cssText() {
@@ -481,6 +512,11 @@ export class Node {
     return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
   }
 
+  /** Whether the node is in the mounted tree. */
+  get isConnected() {
+    return inDocument(this);
+  }
+
   /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
   get nodeType() {
     return 1;
@@ -557,6 +593,7 @@ export class Node {
     if (old) {
       const index = old.childNodes.indexOf(child);
       if (liveRanges.size) eachLiveRange((range) => range._removing(child, old, index));
+      if (mutationObservers.size) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
       old.childNodes.splice(index, 1);
     }
     child.parentNode = this;
@@ -571,6 +608,7 @@ export class Node {
       this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
+    if (mutationObservers.size) childListRecord(this, child, null, child.previousSibling, before);
     return child;
   }
 
@@ -599,6 +637,7 @@ export class Node {
     if (child.parentNode !== this) throw domError("NotFoundError", "the node to remove is not a child of this node");
     const index = this.childNodes.indexOf(child);
     if (liveRanges.size) eachLiveRange((range) => range._removing(child, this, index));
+    if (mutationObservers.size) childListRecord(this, null, child, this.childNodes[index - 1], this.childNodes[index + 1]);
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
@@ -616,6 +655,7 @@ export class Node {
     if (parent) {
       const index = parent.childNodes.indexOf(this);
       if (liveRanges.size) eachLiveRange((range) => range._removing(this, parent, index));
+      if (mutationObservers.size) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
       parent.childNodes.splice(index, 1);
       this.parentNode = null;
     }
@@ -673,6 +713,7 @@ export class Node {
   setAttribute(name, value) {
     name = String(name);
     const text = value == null ? null : String(value);
+    if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
@@ -1000,6 +1041,7 @@ export class Text extends Node {
     if (value === old && value !== "") return;
     this.#data = value;
     native.setText(this.nodeId, value);
+    if (mutationObservers.size) characterDataRecord(this, old);
     if (this._svgText) svgChanged(this);
   }
 
@@ -3209,6 +3251,16 @@ function selectionRecord(target, start) {
 }
 
 let rootNode = null;
+// What events pass above the root, outermost last: the document and the window of a DOM layer
+// over the tree (`@silkui/core/globals`). Each has `_run(event, capture)` as a node does.
+let outerTargets = [];
+// Events the web does not send on to the document and the window.
+const NOT_OUTER = new Set(["scroll", "layout", "load", "error"]);
+
+/** Has events that reach the root go on to `targets` (outermost last), as `@silkui/core/globals` does for `document` and `window`. */
+export function setOuterTargets(...targets) {
+  outerTargets = targets;
+}
 
 /** Makes `node` the root of the window's tree. */
 /**
@@ -3363,6 +3415,7 @@ export class Event {
   composedPath() {
     const path = [];
     for (let node = this.target; node; node = node.parentNode) path.push(node);
+    if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(this.type)) path.push(...outerTargets);
     return path;
   }
 }
@@ -3528,6 +3581,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
 export function dispatchEvent(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
+  if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
@@ -4634,4 +4688,117 @@ export function frameStats() {
     p99: native.frameStats(4),
     max: native.frameStats(5),
   };
+}
+
+// MutationObserver, as in the DOM Standard, for the tree's nodes: child lists, attributes and
+// text. Records are queued as the mutations happen and delivered in one microtask.
+
+class MutationRecord {
+  constructor(type, target, fields) {
+    this.type = type;
+    this.target = target;
+    this.addedNodes = fields.addedNodes ?? [];
+    this.removedNodes = fields.removedNodes ?? [];
+    this.previousSibling = fields.previousSibling ?? null;
+    this.nextSibling = fields.nextSibling ?? null;
+    this.attributeName = fields.attributeName ?? null;
+    this.attributeNamespace = null;
+    this.oldValue = fields.oldValue ?? null;
+  }
+}
+
+let mutationsQueued = false;
+
+function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
+  for (const observer of mutationObservers) {
+    let options = null;
+    for (let node = target; node; node = node.parentNode) {
+      const found = observer._targets.get(node);
+      if (found && (node === target || found.subtree) && found[wants]) {
+        if (filterName !== undefined && found.attributeFilter && !found.attributeFilter.includes(filterName)) continue;
+        options = found;
+        break;
+      }
+    }
+    if (!options) continue;
+    const record = new MutationRecord(type, target, fields);
+    if (oldValueOption && !options[oldValueOption]) record.oldValue = null;
+    observer._records.push(record);
+    if (!mutationsQueued) {
+      mutationsQueued = true;
+      queueMicrotask(deliverMutations);
+    }
+  }
+}
+
+function deliverMutations() {
+  mutationsQueued = false;
+  for (const observer of [...mutationObservers]) {
+    const records = observer.takeRecords();
+    if (records.length === 0) continue;
+    try {
+      observer._callback.call(observer, records, observer);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+}
+
+function childListRecord(parent, added, removed, previousSibling, nextSibling) {
+  queueRecord("childList", parent, {
+    addedNodes: added ? [added] : [],
+    removedNodes: removed ? [removed] : [],
+    previousSibling: previousSibling ?? null,
+    nextSibling: nextSibling ?? null,
+  }, "childList");
+}
+
+function attributeRecord(node, name, text) {
+  const old = node.getAttribute(name);
+  if (old === text) return;
+  queueRecord("attributes", node, { attributeName: name, oldValue: old }, "attributes", "attributeOldValue", name);
+}
+
+function characterDataRecord(node, old) {
+  queueRecord("characterData", node, { oldValue: old }, "characterData", "characterDataOldValue");
+}
+
+export class MutationObserver {
+  constructor(callback) {
+    if (typeof callback !== "function") throw new TypeError("MutationObserver needs a function");
+    this._callback = callback;
+    this._targets = new Map();
+    this._records = [];
+  }
+
+  observe(target, options = {}) {
+    if (!(target instanceof Node)) return;
+    const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined);
+    const characterData = options.characterData ?? options.characterDataOldValue !== undefined;
+    if (!options.childList && !attributes && !characterData) {
+      throw new TypeError("MutationObserver.observe needs childList, attributes or characterData");
+    }
+    this._targets.set(target, {
+      childList: !!options.childList,
+      attributes: !!attributes,
+      characterData: !!characterData,
+      subtree: !!options.subtree,
+      attributeOldValue: !!options.attributeOldValue,
+      characterDataOldValue: !!options.characterDataOldValue,
+      attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
+    });
+    mutationObservers.add(this);
+  }
+
+  disconnect() {
+    this._targets.clear();
+    this._records = [];
+    mutationObservers.delete(this);
+  }
+
+  takeRecords() {
+    const records = this._records;
+    this._records = [];
+    return records;
+  }
 }

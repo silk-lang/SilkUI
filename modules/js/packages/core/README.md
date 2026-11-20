@@ -85,8 +85,23 @@ elements make it live from its first draw. The tree draws
 `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `clipPath` and linear
 and radial gradients this way; anything else (text, masks, filters, `use`...) puts the `Svg`
 back to drawing its markup whole, which is right but slower. Browser libraries that build SVG
-with `document`, such as lottie-web, run after `import "@silkui/core/globals"`, which adds a
-minimal `window` and `document` where the realm has none.
+with `document`, such as lottie-web, run after `import "@silkui/core/globals"`.
+
+### Browser globals
+
+`import "@silkui/core/globals"`, first in the app, gives code written for a browser page the
+globals it expects. `document` has an `<html>` element as the tree's root and a `<body>` that
+fills it: render into `document.body`. Events that reach the root go on to `document` and
+`window` in both phases, so `document.addEventListener("keydown", ...)` works, and
+`document.documentElement.classList` and `style.setProperty("--name", value)` style `:root`.
+It also adds `document.activeElement`, `getElementById` and the query methods, `innerWidth`
+and `innerHeight` with `resize` events, `HTMLElement`, `Element`, `Node` and `Text` for
+`instanceof` (their prototypes are the nodes'), `MutationObserver`, `location` and `history`
+(entries in memory with `popstate` and `hashchange`, starting at `http://localhost/` or
+`globalThis.__silkLocation`), `localStorage` (a JSON file under `~/.silkui/storage/<app>` on
+the full runtime, or `$SILKUI_STORAGE_DIR`), `sessionStorage`, `indexedDB` (in memory, saved
+next to local storage on the full runtime), `Worker` on the full runtime, and `navigator`'s
+platform and language. Globals the realm already has stay as they are.
 
 A node has `append`, `appendChild`, `insertBefore`, `removeChild`, `remove`, `contains`,
 `parentNode`, `childNodes`, `firstChild`, `lastChild` and the sibling getters, as in the DOM.

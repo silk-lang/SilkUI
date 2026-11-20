@@ -13,6 +13,10 @@ import { writeFileSync, rmSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
+
+// The modules of `@silkui/core/globals`, and the globals it defines.
+const CORE_GLOBALS = /[\\/](?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker)\.js$/;
+const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB"];
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
@@ -98,6 +102,7 @@ export default function silk(options = {}) {
   let serving = false;
   /** name → { area, owners } */
   const uses = new Map();
+  let browserGlobals = false;
   const apiPlugin = {
     name: "silk:apis",
     enforce: "post",
@@ -109,6 +114,7 @@ export default function silk(options = {}) {
 
     buildStart() {
       uses.clear();
+      browserGlobals = false;
     },
 
     // After the other transforms, so what is scanned is JavaScript.
@@ -120,6 +126,12 @@ export default function silk(options = {}) {
       try {
         ast = this.parse(code);
       } catch {
+        return;
+      }
+      // `@silkui/core/globals` provides the browser globals, and its own modules test for what
+      // they use.
+      if (CORE_GLOBALS.test(id.split("?")[0])) {
+        browserGlobals ||= /globals\.js$/.test(id.split("?")[0]);
         return;
       }
       const owner = ownerOf(id, root);
@@ -136,6 +148,7 @@ export default function silk(options = {}) {
     },
 
     buildEnd(error) {
+      if (browserGlobals) for (const name of PROVIDED_BY_GLOBALS) uses.delete(name);
       if (error || serving || uses.size === 0) return;
       if (apis === "error") this.error(report(uses));
       this.warn(report(uses));
