@@ -6342,9 +6342,11 @@ impl<'a> UiTree<'a> {
         let shadow = node.computed().effects
         let wasRendered = node.rendered
         let paintBefore = node.paintHash
-        let selectedBefore = selection.hash(node, 0)
-        let placedBefore = transform.placementHash(&node.computed().transform, 0)
-        let perspectiveBefore = transform.perspectiveHash(&node.computed().transform, 0)
+        // Paint caches built again from scratch need no list of what to repair.
+        let tracksPaint = !self.paintCachesStale
+        let selectedBefore = if tracksPaint { selection.hash(node, 0) } else { 0 }
+        let placedBefore = if tracksPaint { transform.placementHash(&node.computed().transform, 0) } else { 0 }
+        let perspectiveBefore = if tracksPaint { transform.perspectiveHash(&node.computed().transform, 0) } else { 0 }
         let containment = node.computed().contain.query()
         let skips = node.computed().contain.hidden()
         let namesChanged = run self.resolve(slot, tick)
@@ -6357,12 +6359,12 @@ impl<'a> UiTree<'a> {
         if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
         if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
         let styled = self.node(slot)
-        let repaints = scrollbarRules || styled.kind == NodeKind.Input
+        let repaints = tracksPaint && !self.paintCachesStale && (scrollbarRules || styled.kind == NodeKind.Input
           || paintBefore != styled.paintHash || beforeFont != styled.fontKey || wasRendered != styled.rendered
           || shadow.shadowFrom != styled.computed().effects.shadowFrom
           || selectedBefore != selection.hash(styled, 0)
           || placedBefore != transform.placementHash(&styled.computed().transform, 0)
-          || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0)
+          || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0))
         if repaints {
           run self.repair.nodes.append(slot)
           self.repair.pending = true
@@ -6513,7 +6515,7 @@ impl<'a> UiTree<'a> {
     if self.overrides.length() != 0 || self.anchors.length() != 0 || node.parent == NONE { return usize.MAX }
     let stamp = self.node(node.parent).computedStamp
     if stamp == 0 { return usize.MAX }
-    return usize.bitAnd(u32.toUsize(stamp) * 2654435761, TEXT_INHERITS - 1)
+    return usize.bitAnd(u32.toUsize(stamp), TEXT_INHERITS - 1)
   }
 
   // Gives text node `slot` the style an equal parent's text child has, when one is kept.
@@ -6613,6 +6615,7 @@ impl<'a> UiTree<'a> {
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !styled.get().layout.display.isNone()
     let lenderCss = other.css
+    let lenderGrid = other.gridStyled
     run style_change.prepare(&mut self, slot, false)
     let target = self.nodeMut(slot)
     if !Frozen.same(&target.styled, &styled) || target.moving.isSome() {
@@ -6634,7 +6637,8 @@ impl<'a> UiTree<'a> {
         layoutFailed,
       )
     }
-    run self.resolveGrid(slot, values)
+    // The lender's match is this node's: no grid declaration there leaves no grid here.
+    if lenderGrid || self.node(slot).gridStyled { run self.resolveGrid(slot, values) }
     run self.updateShape(slot)
     let names = run containers.names(&self, slot)
     let namesChanged = !containers.sameNames(&self, slot, names.asSlice())
