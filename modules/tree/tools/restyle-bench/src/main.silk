@@ -6,6 +6,9 @@
 //!
 //!   restyle-bench [--runs N]
 import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.digest { DigestBox, DigestText, digestLayout }
+import silk.num.u64
+import silk.num.f32
 import ui_tree.style_media { Preferences }
 import ui_fixtures.fixtures as fixtures
 import css_style.compile { Options, CompileError }
@@ -250,6 +253,55 @@ effect fn measure(tree: &mut UiTree<'_>, targets: &Targets, kind: Kind, time: &m
   }
 }
 
+/// What the page shows: each node's paint and font keys, and every laid out box and text run.
+effect fn signature(tree: &UiTree<'_>) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u64>.make()
+  let mut slot: usize = 0
+  while slot < tree.nodes.length() {
+    let node = &tree.nodes.asSlice()[slot]
+    let shown: u64 = if node.rendered { 1 } else { 0 }
+    run out.append(u64.bitXor(node.paintHash, usize.toU64(node.fontKey) * 1000003 + shown))
+    slot = slot + 1
+  }
+  let mut boxes = List<DigestBox>.make()
+  let mut texts = List<DigestText>.make()
+  drop run digestLayout(tree, &mut boxes, &mut texts)
+  let mut i: usize = 0
+  while i < boxes.length() {
+    let b = &boxes.asSlice()[i]
+    run out.append(u64.bitXor(usize.toU64(b.source), u64.bitXor(u32.toU64(f32.toBits(b.x)), u64.shiftLeft(u32.toU64(f32.toBits(b.width)), 32))))
+    run out.append(u64.bitXor(u32.toU64(f32.toBits(b.y)), u64.shiftLeft(u32.toU64(f32.toBits(b.height)), 32)))
+    i = i + 1
+  }
+  i = 0
+  while i < texts.length() {
+    let t = &texts.asSlice()[i]
+    run out.append(u64.bitXor(usize.toU64(t.source) + usize.toU64(t.start) * 7919, u64.shiftLeft(u32.toU64(f32.toBits(t.x)), 32)))
+    run out.append(u64.bitXor(u32.toU64(f32.toBits(t.y)), u64.shiftLeft(u32.toU64(f32.toBits(t.width)), 32)))
+    i = i + 1
+  }
+  return move out
+}
+
+/// Restyles the whole page and says how many entries of the signature the incremental
+/// restyles left different from a full one.
+effect fn verify(tree: &mut UiTree<'_>, time: &mut f64) -> usize ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let incremental = run signature(&tree.*)
+  let root = tree.root
+  tree.restyle(root)
+  time.* = time.* + 1.0 / 60.0
+  run tree.frame(frameInput(time.*))
+  let full = run signature(&tree.*)
+  if full.length() != incremental.length() { return usize.MAX }
+  let mut wrong: usize = 0
+  let mut i: usize = 0
+  while i < full.length() {
+    if full.get(i) != incremental.get(i) { wrong = wrong + 1 }
+    i = i + 1
+  }
+  return wrong
+}
+
 effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
   let fonts = run fixtures.fonts()
   let mut tree = run UiTree.make(&fonts)
@@ -267,11 +319,15 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
   let finished = run MonotonicClock.now()
   StderrWriter.print("page: {} nodes, first frame {} ms; editor {} text {} sidebar {} rows {} menus {}\n", &(
     u32.toUsize(nodes), i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000), targets.editor, targets.editorText, targets.sidebarWrapper, targets.rows.length(), targets.menus.length()))
+  StderrWriter.print("watch overflows: {} (last at node {})\n", &(tree.work.watchOverflows, tree.work.lastOverflow))
   if targets.editorText == 0 || targets.sidebarWrapper == 0 || targets.rows.length() < 2 || targets.menus.length() == 0 { return 2 }
   let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu]
   let mut k: usize = 0
   while k < kinds.length {
     run measure(&mut tree, &targets, kinds[k], &mut time)
+    let wrong = run verify(&mut tree, &mut time)
+    StderrWriter.print("  against a full restyle: {} differences\n", &.(wrong))
+    if wrong != 0 { return 3 }
     k = k + 1
   }
   return 0

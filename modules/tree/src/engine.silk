@@ -115,6 +115,7 @@ import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, Identity
 import style_sheets
 import style_invalidation
 import style_invalidation { Reach, Extent, StartingSubjects }
+import svg_css.variables { ScopeId }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
 import svg_css.element { PseudoTarget, StateBits, ElementTree }
@@ -1973,10 +1974,41 @@ impl<'a> UiTree<'a> {
 
   // Callers must rule out selector changes outside this subtree and changed variable inputs.
   pub fn restyleLocal(self: &mut Self, slot: u32) -> () {
+    self.markStyle(slot, true)
+  }
+
+  /// Resolves the node at `slot` again, and below it only the children whose inherited values,
+  /// variables or explicitly inherited properties change: what changed reaches no selector of
+  /// another element.
+  pub fn restyleSelf(self: &mut Self, slot: u32) -> () {
+    self.markStyle(slot, false)
+  }
+
+  /// Gives up the share classes below `slot` (`Node.styleClass`).
+  effect fn forgetShares(self: &mut Self, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut stack = List<usize>.make()
+    run stack.append(self.layout.firstChild(self.node(slot).css))
+    while stack.length() != 0 {
+      let last = stack.length() - 1
+      let css = stack.get(last)
+      stack.truncate(last)
+      if css == NO_INDEX { continue }
+      run stack.append(self.layout.nextSibling(css))
+      let found = self.slotOfCssNode(css)
+      if found != NONE {
+        let shared = self.nodeMut(found)
+        shared.styleClass = 0
+      }
+      run stack.append(self.layout.firstChild(css))
+    }
+  }
+
+  fn markStyle(self: &mut Self, slot: u32, subtree: bool) -> () {
     self.stylesPending = true
     let nodes = self.nodes.asMutSlice()
     nodes[u32.toUsize(slot)].styleDirty = true
     nodes[u32.toUsize(slot)].styleTick = false
+    if subtree { nodes[u32.toUsize(slot)].styleSubtree = true }
     let mut up = nodes[u32.toUsize(slot)].parent
     while up != NONE {
       let at = u32.toUsize(up)
@@ -1989,12 +2021,15 @@ impl<'a> UiTree<'a> {
   }
 
   fn classReach(self: &Self, slot: u32, after: &[usize]) -> Extent {
-    let subtree = Extent { reach: Reach.Subtree, anchors: false }
+    let subtree = Extent.of(Reach.Subtree)
     if self.stylesDirty || self.styleSheets.length() == 0 { return subtree }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX { return subtree }
+    let sheets = &self.styleSheets.asSlice()[at]
     let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms() _ => &[] }
-    return style_invalidation.classReach(&self.styleSheets.asSlice()[at].sheets, &self.styleAtoms, before, after)
+    // Generated content can read the class with attr().
+    let least = if sheets.hasGenerated { Extent.itself() } else { Extent.none() }
+    return style_invalidation.classReach(&sheets.sheets, &self.styleAtoms, before, after, least)
   }
 
   /// Restyles the subtree of `slot`'s parent, which holds every sibling a selector can relate it to.
@@ -2113,13 +2148,13 @@ impl<'a> UiTree<'a> {
       // `:lang()`, `:dir()` and `:link` are no invalidation key.
       if sheets.states.derived && (css_tokens.insensitive(names[i], b"lang") || css_tokens.insensitive(names[i], b"href")
         || css_tokens.insensitive(names[i], b"dir")) {
-        return Extent { reach: Reach.Root, anchors: false }
+        return Extent.of(Reach.Root)
       }
       i = i + 1
     }
     if !any { return Extent.none() }
     // Generated content can read any attribute of its origin with attr().
-    let least = Extent { reach: if sheets.hasGenerated { Reach.Subtree } else { Reach.None }, anchors: false }
+    let least = if sheets.hasGenerated { Extent.itself() } else { Extent.none() }
     if !sheets.states.attributes { return least }
     return least.with(style_invalidation.attributeReach(&sheets.sheets, &self.styleAtoms, names, ids))
   }
@@ -2140,11 +2175,64 @@ impl<'a> UiTree<'a> {
       self.restyleAnchors(above, beside)
     }
     match change.reach {
-      Reach.None => {}
+      Reach.None => { if change.own { self.restyleSelf(slot) } }
+      Reach.Descendants => {
+        if change.own { self.restyleSelf(slot) }
+        self.restyleCarriers(slot, &change)
+      }
       Reach.Subtree => self.restyleLocal(slot)
       Reach.Siblings => self.restyleSiblings(slot)
       Reach.Root => self.restyle(slot)
     }
+  }
+
+  /// Restyles the elements below `slot` that carry one of `change.keys`: the subjects a
+  /// selector that tests `slot` in an ancestor compound can match.
+  fn restyleCarriers(self: &mut Self, slot: u32, change: &Extent) -> () {
+    let root = u32.toUsize(slot)
+    let mut at = self.elementAfter(root, root, true)
+    while at != css_element.NO_ELEMENT {
+      if self.carries(usize.toU32(at), change) { self.restyleSelf(usize.toU32(at)) }
+      at = self.elementAfter(at, root, true)
+    }
+  }
+
+  /// The element after `at` in document order within `root`'s subtree, entering `at`'s children
+  /// when `down`, or NO_ELEMENT.
+  fn elementAfter(self: &Self, at: usize, root: usize, down: bool) -> usize {
+    let adapter = SelectorTree { tree: self }
+    if down {
+      let child = ElementTree.firstChild(&adapter, at)
+      if child != css_element.NO_ELEMENT { return child }
+    }
+    let mut from = at
+    while from != root && from != css_element.NO_ELEMENT {
+      let next = ElementTree.nextSibling(&adapter, from)
+      if next != css_element.NO_ELEMENT { return next }
+      from = ElementTree.parent(&adapter, from)
+    }
+    return css_element.NO_ELEMENT
+  }
+
+  fn carries(self: &Self, slot: u32, change: &Extent) -> bool {
+    let adapter = SelectorTree { tree: self }
+    let node = self.node(slot)
+    let mut i: u32 = 0
+    while i < change.count {
+      let key = change.keys[u32.toUsize(i)]
+      if key == ancestor_filter.key(NameKind.Element, ElementTree.localName(&adapter, u32.toUsize(slot))) { return true }
+      if let Option.Some { value } = node.identity() {
+        if value.hasId && key == ancestor_filter.key(NameKind.Id, String.utf8Bytes(value.id())) { return true }
+        let atoms = value.classAtoms()
+        let mut a: usize = 0
+        while a < atoms.length {
+          if self.styleAtoms.filterKey(atoms[a]) == key { return true }
+          a = a + 1
+        }
+      }
+      i = i + 1
+    }
+    return false
   }
 
   /// What a change of the state bits `mask` on `slot` reaches. The node's own record names the
@@ -2154,12 +2242,12 @@ impl<'a> UiTree<'a> {
     if mask == 0 || at == usize.MAX { return Extent.none() }
     let reach = &self.styleSheets.asSlice()[at].states
     let own = match self.node(slot).sheetStyle() { Option.Some { value } => value.states _ => 0 }
-    return Extent {
-      reach: if u32.bitAnd(reach.siblings, mask) != 0 { Reach.Siblings }
-        else if u32.bitAnd(u32.bitOr(own, reach.descendants), mask) != 0 { Reach.Subtree }
-        else { Reach.None },
-      anchors: u32.bitAnd(reach.has, mask) != 0,
-    }
+    let mut extent = Extent.of(if u32.bitAnd(reach.siblings, mask) != 0 { Reach.Siblings }
+      else if u32.bitAnd(reach.descendants, mask) != 0 { Reach.Subtree }
+      else { Reach.None })
+    extent.own = u32.bitAnd(own, mask) != 0
+    extent.anchors = u32.bitAnd(reach.has, mask) != 0
+    return extent
   }
 
   /// Restyles the nodes whose `:focus-within` changes when focus moves from `from` to `to`
@@ -2176,13 +2264,14 @@ impl<'a> UiTree<'a> {
       return ()
     }
     let siblings = u32.bitAnd(sheets.states.siblings, css_element.FOCUS_WITHIN) != 0
+    let descendants = u32.bitAnd(sheets.states.descendants, css_element.FOCUS_WITHIN) != 0
     let mut side: usize = 0
     while side < 2 {
       let other = if side == 0 { to } else { from }
       let mut up = if side == 0 { from } else { to }
       while up != NONE && !(other != NONE && self.within(other, up)) {
         if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_FOCUS_WITHIN) != 0 {
-          if siblings { self.restyleSiblings(up) } else { self.restyleLocal(up) }
+          if siblings { self.restyleSiblings(up) } else if descendants { self.restyleLocal(up) } else { self.restyleSelf(up) }
         }
         up = self.node(up).parent
       }
@@ -2203,7 +2292,7 @@ impl<'a> UiTree<'a> {
     let mut change = self.stateReach(slot, css_element.FOCUS | css_element.FOCUS_VISIBLE)
     // `:has(:focus-within)` anchors lie above the node as those of `:has(:focus)` do.
     if self.stateReach(slot, css_element.FOCUS_WITHIN).anchors { change.anchors = true }
-    if change.reach == Reach.None { change.reach = Reach.Subtree }
+    change.own = true
     self.restyleExtent(slot, change)
   }
 
@@ -2594,11 +2683,11 @@ impl<'a> UiTree<'a> {
           Attribute.Checked { .. } => self.node(slot).accessRole == Role.Radio
           _ => false
         }
-        let mut change = if !tracked { Extent { reach: Reach.Subtree, anchors: false } } else { match &attribute {
+        let mut change = if !tracked { Extent.of(Reach.Subtree) } else { match &attribute {
           Attribute.ClassName { .. } => self.classReach(slot, classAtoms.asSlice())
           Attribute.ElementId { value } => self.idReach(slot, String.utf8Bytes(String.view(&value)))
           // Type selectors are no invalidation key.
-          Attribute.Element { .. } => Extent { reach: Reach.Root, anchors: false }
+          Attribute.Element { .. } => Extent.of(Reach.Root)
           Attribute.Named { name, .. } => self.attributeReach(&[String.utf8Bytes(String.view(&name))], &[])
           _ => Extent.none()
         } }
@@ -3328,6 +3417,7 @@ impl<'a> UiTree<'a> {
       pressed: false,
       styleDirty: true,
       styleTick: false,
+      styleSubtree: true,
       gridDeclared: false,
       gridStyled: false,
       styleNeedsContext: false,
@@ -5869,6 +5959,10 @@ impl<'a> UiTree<'a> {
     if watched.length == 0 && !all { return () }
     let mut outside = all
     let mut siblings = false
+    if all {
+      self.work.watchOverflows = self.work.watchOverflows + 1
+      self.work.lastOverflow = u32.toUsize(slot)
+    }
     let nodes = self.nodes.asMutSlice()
     let mut i: usize = 0
     while i < watched.length {
@@ -6631,13 +6725,19 @@ impl<'a> UiTree<'a> {
       let entry = stack.get(last)
       stack.truncate(last)
       let slot = u64.toU32(u64.bitAnd(entry, 0xFFFFFFFF))
-      let forced = full || rootFontChanged || u64.shiftRight(entry, 32) != 0
+      let forced = full || rootFontChanged || u64.bitAnd(entry, 0x100000000) != 0
+      // Bit 33: an ancestor's change reaches this subtree through selectors.
+      let reached = u64.bitAnd(entry, 0x200000000) != 0
       let node = self.node(slot)
-      let own = forced || node.styleDirty
-      let tick = !forced && node.styleTick
+      let own = forced || reached || node.styleDirty
+      let tick = !forced && !reached && node.styleTick
       let below = node.subtreeDirty
       let mut changed = full
+      let mut subtree = false
+      let mut forget = false
       if own {
+        let scopeBefore = node.sheetScope()
+        let classBefore = node.styleClass
         let before = node.computed().text
         let beforeFont = node.fontKey
         let events = node.computed().paint.pointerEvents
@@ -6679,19 +6779,25 @@ impl<'a> UiTree<'a> {
         let after = &self.node(slot).computed().*
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
-        changed = full || rootFontChanged || !tick && self.node(slot).sheetStyle().isSome() || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        subtree = !tick && (reached || self.node(slot).styleSubtree) && self.node(slot).sheetStyle().isSome()
+        // A descendant's share class says its ancestors had equal selector inputs: those it
+        // does not resolve again in this pass give it up.
+        forget = classBefore != self.node(slot).styleClass && !subtree
+        changed = full || rootFontChanged || !sameScope(scopeBefore, self.node(slot).sheetScope()) || !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
       }
+      if forget { run self.forgetShares(slot) }
       let cleared = self.nodeMut(slot)
       cleared.styleDirty = false
       cleared.styleTick = false
       cleared.subtreeDirty = false
-      if changed || below {
-        let flag: u64 = if changed { 0x100000000 } else { 0 }
+      cleared.styleSubtree = false
+      if changed || below || subtree || own {
+        let flag: u64 = u64.bitOr(if changed { 0x100000000 } else { 0 }, if subtree { 0x200000000 } else { 0 })
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
@@ -6699,8 +6805,10 @@ impl<'a> UiTree<'a> {
         let mut child = layoutNodes.firstChild(css)
         while child != NO_INDEX {
           let found = self.slotOfCssNode(child)
-          if found != NONE {
-            run stack.append(u64.bitOr(u32.toU64(found), flag))
+          // A child that inherits a property explicitly reads what its parent resolved to.
+          if found != NONE && (changed || below || subtree || self.node(found).styleDirty || explicitInherit(self.node(found))) {
+            let extra: u64 = if own && !changed && explicitInherit(self.node(found)) { 0x100000000 } else { 0 }
+            run stack.append(u64.bitOr(u32.toU64(found), u64.bitOr(flag, extra)))
           }
           child = layoutNodes.nextSibling(child)
         }
@@ -9166,6 +9274,27 @@ effect fn resourceFailed(error: ResourceError) -> bool {
 
 /// Whether two computed text styles are the same, so the children that inherit them need no
 /// restyle.
+fn sameScope(left: Option<ScopeId>, right: Option<ScopeId>) -> bool {
+  return match left {
+    Option<ScopeId>.Some { value: a } => match right { Option<ScopeId>.Some { value: b } => a.index == b.index _ => false }
+    _ => right.isNone()
+  }
+}
+
+/// The node's sheet style takes some property from its parent with `inherit` or `unset`.
+fn explicitInherit(node: &Node) -> bool {
+  if let Option.Some { value } = node.sheetStyle() {
+    let declarations = value.declarations.asSlice()
+    let mut i: usize = 0
+    while i < declarations.length {
+      if properties_convert.isKeyword(&declarations[i].value, Keyword.Inherit)
+        || properties_convert.isKeyword(&declarations[i].value, Keyword.Unset) { return true }
+      i = i + 1
+    }
+  }
+  return false
+}
+
 fn sameText(left: &TextStyle, right: &TextStyle) -> bool {
   return left.writingMode == right.writingMode && left.textOrientation == right.textOrientation
     && &left.textBoxEdge == &right.textBoxEdge
