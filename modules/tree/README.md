@@ -179,10 +179,14 @@ it does not maintain a separate geometry algorithm.
    Configure it with `Mutation.SetVirtualList { id, count, options }`, or
    `Batch.virtualList`. `VirtualOptions` supplies an estimated row height, overscan,
    gap, and content revision.
-2. Read `tree.virtualRange(id)`. Mount ordinary child boxes for `[first, end)` and
-   the optional `pinned` index. The pin retains the row containing keyboard focus;
-   `pinnedId` identifies its existing wrapper. Destroy other rows, retaining durable
-   application state outside those nodes.
+2. Read `tree.virtualIndices(id)`. Mount ordinary child boxes for these sorted indices.
+   The request includes overscan and any bound rows containing keyboard focus, its
+   active descendant, or the host-reported browse cursor. These may be different rows.
+   `virtualRange` still reports the contiguous range and keyboard pin. Destroy other rows, retaining durable
+   application state outside those nodes. The tree rejects removing, destroying, or
+   reparenting a bound row containing focus with `BadVirtualList`, even if a client
+   uses a stale range. To deliberately delete that item, transfer or clear focus
+   first. Moving the row within the same list and tearing down the list are allowed.
 3. Send `Mutation.SetVirtualItems { id, items }` (or `Batch.virtualItems`) with
    `{ index, id }` records for **all** direct children in ascending logical order.
    The tree owns the layout-only spacers between these nodes. These private nodes

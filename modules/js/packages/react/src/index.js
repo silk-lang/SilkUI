@@ -23,7 +23,7 @@ import {
   DefaultEventPriority,
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
-import { createContext } from "react";
+import { createContext, createElement, useLayoutEffect, useRef, useState } from "react";
 import { RichInput, SvgElement, SvgText, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
@@ -347,4 +347,26 @@ export function createRoot(container) {
 /** Runs `callback` and commits the updates it made before returning. */
 export function flushSync(callback) {
   return reconciler.flushSyncFromReconciler(callback);
+}
+
+/** A bounded scroll box whose mounted rows are requested by the retained tree. */
+export function VirtualList({ items, itemKey, children, style, rowHeight, estimatedRowHeight, overscan, gap, revision }) {
+  const port = useRef(null);
+  const [indices, setIndices] = useState([]);
+  const count = items.length;
+  const estimate = estimatedRowHeight ?? (typeof rowHeight === "number" ? rowHeight : 48);
+  useLayoutEffect(() => {
+    port.current.setVirtualList({ count, estimatedRowHeight: estimate, overscan, gap, revision },
+      wanted => flushSync(() => setIndices(wanted)));
+  }, [count, estimate, overscan, gap, revision]);
+  const mounted = indices.filter(i => i < count);
+  useLayoutEffect(() => { port.current.bindVirtualRows(mounted); });
+  return createElement("box", { ref: port, role: "list",
+    style: { ...style, display: "flex", flexDirection: "column", overflowY: "auto" } },
+    mounted.map(i => {
+      const item = items[i];
+      const height = typeof rowHeight === "function" ? rowHeight(item, i) : rowHeight;
+      return createElement("box", { key: itemKey(item, i), role: "listitem",
+        "aria-posinset": i + 1, "aria-setsize": count, style: { height, flexShrink: 0 } }, children(item, i));
+    }));
 }

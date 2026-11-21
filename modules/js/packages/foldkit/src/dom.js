@@ -346,6 +346,17 @@ class Element extends DomNode {
     this.#tag = tag;
   }
 
+  set virtualList(config) {
+    if (!config) this.node.setVirtualList(null);
+    else this.node.setVirtualList(config.options, config.onRange);
+  }
+
+  set virtualRows(indices) {
+    if (indices) queueMicrotask(() => {
+      if (this.node.parentNode) this.node.bindVirtualRows(indices);
+    });
+  }
+
   get nodeType() {
     return 1;
   }

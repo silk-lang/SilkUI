@@ -15,7 +15,7 @@
 //! ```
 import wire
 import wire { Unknown }
-import ui_tree.legacy { UiTree, TreeError, Batch, Keyframe }
+import ui_tree.legacy { UiTree, TreeError, Batch, Keyframe, FrameInput }
 import ui_tree.node { Event as RawEvent }
 import ui_tree.lib { EventRecord }
 import ui_tree_window.host { WindowClient }
@@ -40,6 +40,9 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
 
   /// How many bytes of calls the page wrote since the last `take`.
   unsafe extern "C" fn hostPending() -> u32 as "silkui#pending"
+
+  @foreign(noCapture: ("indices"))
+  unsafe extern "C" fn virtualRequest(port: u32, indices: ?[*]const usize, count: usize) -> () as "silkui#virtualRequest"
 
   /// Copies the page's calls to `into` and empties its buffer.
   @foreign(noCapture: ("into"))
@@ -211,6 +214,21 @@ impl WebJsClient {
 }
 
 impl WindowClient<WebJs, never, never> for WebJsClient {
+  effect fn layout(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>, input: FrameInput) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    run tree.frame(input)
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      let mut at: usize = 0
+      while at < tree.virtualLists.length() {
+        if let Option.Some { value } = move run tree.changedVirtualIndices(at) {
+          unsafe virtualRequest(tree.virtualLists.asSlice()[at].port, Pointer.fromSlice(value.asSlice()), value.length())
+        }
+        at = at + 1
+      }
+      if tree.virtualLists.length() != 0 && run state.apply(&mut tree) { run tree.frame(input) }
+    }
+  }
+
   effect fn start(self: &mut Self, state: &mut WebJs, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {

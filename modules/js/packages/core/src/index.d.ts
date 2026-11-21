@@ -58,6 +58,14 @@ export class ClassList implements Iterable<string> {
   toString(): string;
 }
 
+export interface VirtualListOptions {
+  count: number;
+  estimatedRowHeight: number;
+  overscan?: number;
+  gap?: number;
+  revision?: number;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   constructor(kind: NodeKind);
@@ -105,6 +113,9 @@ export class Node {
   set disabled(value: boolean);
   focus(): void;
   scrollTo(x: number, y: number): void;
+  setVirtualList(options: VirtualListOptions, onRange: (indices: number[]) => void): void;
+  setVirtualList(options: null): void;
+  bindVirtualRows(indices: readonly number[]): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
 }

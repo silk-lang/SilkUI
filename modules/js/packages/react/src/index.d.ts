@@ -16,3 +16,15 @@ export function createRoot(container?: Node): Root;
 
 /** Runs `callback` and commits the updates it made before returning. */
 export function flushSync<T>(callback: () => T): T;
+
+export function VirtualList<T>(props: {
+  items: readonly T[];
+  itemKey: (item: T, index: number) => string | number;
+  children: (item: T, index: number) => ReactNode;
+  style?: import("@silkui/core").Style;
+  rowHeight?: number | ((item: T, index: number) => number | "auto");
+  estimatedRowHeight?: number;
+  overscan?: number;
+  gap?: number;
+  revision?: number;
+}): import("react").ReactElement;
