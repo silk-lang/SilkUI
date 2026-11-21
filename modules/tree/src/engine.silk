@@ -125,6 +125,8 @@ import node { Work }
 import style_pool
 import style_pool { StylePool }
 import selector_tree { SelectorTree }
+import svg_css.ancestor_filter { AncestorFilter, NameKind }
+import svg_css.ancestor_filter
 import sheet_cache { Pending as PendingStyle }
 import silk.mem.frozen { Frozen }
 import svg_css.adopted { AdoptionError }
@@ -838,6 +840,11 @@ pub struct UiTree<'a> {
   /// The nodes' paint caches (see `Node.paintCache`).
   pub paintCaches: PaintCaches,
   pub styleAtoms: Atoms,
+  /// During a style pass: the names the ancestors of the node being styled hold, those
+  /// ancestors from the root down, and whether the two are kept (see `prepareFilter`).
+  pub ancestorFilter: AncestorFilter,
+  pub filterPath: List<u32>,
+  pub filterOn: bool,
   pub styleSheets: List<RootSheets>,
   styleLoads: List<StyleRequest>,
   styleGeneration: u64,
@@ -1492,6 +1499,9 @@ impl<'a> UiTree<'a> {
       selectorKeys: SelectorKeys.make(),
       paintCaches: PaintCaches.make(),
       styleAtoms: Atoms.make(),
+      ancestorFilter: AncestorFilter.make(),
+      filterPath: List<u32>.make(),
+      filterOn: false,
       styleSheets: List<RootSheets>.make(),
       styleLoads: List<StyleRequest>.make(),
       styleGeneration: 0,
@@ -1932,12 +1942,19 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// Asks for a style pass that matches every node again; `cause` counts who asked
+  /// (`Work.dirtyCauses`).
+  pub fn markStylesDirty(self: &mut Self, cause: usize) -> () {
+    if !self.stylesDirty && cause < 32 { self.work.dirtyCauses[cause] = self.work.dirtyCauses[cause] + 1 }
+    self.stylesDirty = true
+  }
+
   pub fn restyle(self: &mut Self, slot: u32) -> () {
     if self.styleSheets.length() != 0 {
       let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
       if at != usize.MAX && (self.styleSheets.asSlice()[at].sheets.length() != 0 || self.styleSheets.asSlice()[at].inlineVariables) {
         if !self.stylesDirty { self.work.rootRestyles = self.work.rootRestyles + 1 }
-        self.stylesDirty = true
+        self.markStylesDirty(3)
       }
     }
     self.restyleLocal(slot)
@@ -2033,7 +2050,7 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX || self.stylesDirty { return () }
     let sheets = &self.styleSheets.asSlice()[at]
     if sheets.watchAll {
-      self.stylesDirty = true
+      self.markStylesDirty(4)
       self.stylesPending = true
       return ()
     }
@@ -2154,7 +2171,7 @@ impl<'a> UiTree<'a> {
     let sheets = &self.styleSheets.asSlice()[at]
     if u32.bitAnd(sheets.states.any, css_element.FOCUS_WITHIN) == 0 { return () }
     if sheets.watchAll {
-      self.stylesDirty = true
+      self.markStylesDirty(5)
       self.stylesPending = true
       return ()
     }
@@ -2921,7 +2938,7 @@ impl<'a> UiTree<'a> {
           match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: 0 } } }
         }
         drop run self.useRoot(root)
-        self.stylesDirty = true
+        self.markStylesDirty(6)
       }
       Mutation.RemoveStyleSheet { root, sheet } => {
         self.cancelStyleLoad(root, sheet)
@@ -2931,7 +2948,7 @@ impl<'a> UiTree<'a> {
           let roots = self.styleSheets.asMutSlice()
           if run roots[at].sheets.remove(sheet) {
             drop run self.useRoot(root)
-            self.stylesDirty = true
+            self.markStylesDirty(7)
           }
         }
       }
@@ -3084,7 +3101,7 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        self.stylesDirty = true
+        self.markStylesDirty(8)
         let parked = self.parked.asMutSlice()
         let mut p: usize = 0
         while p < parked.length {
@@ -3094,7 +3111,7 @@ impl<'a> UiTree<'a> {
       }
       Mutation.DefineKeyframes { name, frames } => {
         run animation.define(&mut self, move name, move frames)
-        self.stylesDirty = true
+        self.markStylesDirty(9)
         let parked = self.parked.asMutSlice()
         let mut p: usize = 0
         while p < parked.length {
@@ -3920,7 +3937,7 @@ impl<'a> UiTree<'a> {
   fn touchRoot(self: &mut Self, root: u32) -> () {
     self.changedRoot(root)
     if root == self.current {
-      self.stylesDirty = true
+      self.markStylesDirty(10)
       self.applied = true
       self.paintCachesStale = true
       return ()
@@ -4136,7 +4153,7 @@ impl<'a> UiTree<'a> {
     self.pointerInside = s.pointerInside
     self.reveal = Intrinsic.replace(s.reveal, List<u64>.make())
     if s.touched {
-      self.stylesDirty = true
+      self.markStylesDirty(11)
       self.applied = true
       self.paintCachesStale = true
       self.layoutObserversDirty = true
@@ -4153,7 +4170,7 @@ impl<'a> UiTree<'a> {
     self.laidOutScrolls = usize.MAX
     self.replayable = false
     self.paintCachesStale = true
-    self.stylesDirty = true
+    self.markStylesDirty(12)
     self.layoutObserversDirty = true
   }
 
@@ -4499,7 +4516,7 @@ impl<'a> UiTree<'a> {
       layoutFailed,
     )
     self.root = slot
-    self.stylesDirty = true
+    self.markStylesDirty(13)
   }
 
   effect fn setText(self: &mut Self, index: usize, slot: u32, value: String) -> ()
@@ -5306,7 +5323,7 @@ impl<'a> UiTree<'a> {
     if !changed {
       return
     }
-    self.stylesDirty = true
+    self.markStylesDirty(14)
     let parked = self.parked.asMutSlice()
     let mut p: usize = 0
     while p < parked.length {
@@ -5379,7 +5396,7 @@ impl<'a> UiTree<'a> {
       run Bytes.append(&mut family, self.provider.text.fonts.set.familyOf(declared))
       run self.fontFamilyChanged(Bytes.asSlice(&family))
     }
-    if !ok && sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
+    if !ok && sheet_faces.retryable(&self.sheetFaces,id) { self.markStylesDirty(15) }
     return ok
   }
 
@@ -5388,7 +5405,7 @@ impl<'a> UiTree<'a> {
     let declared = self.fontFaceIndex(id)
     if declared != usize.MAX {
       self.provider.text.fonts.set.markFailed(declared)
-      if sheet_faces.retryable(&self.sheetFaces,id) { self.stylesDirty = true }
+      if sheet_faces.retryable(&self.sheetFaces,id) { self.markStylesDirty(16) }
     }
   }
 
@@ -5473,7 +5490,7 @@ impl<'a> UiTree<'a> {
     let wanted: f32 = f32.max(MIN_PAGE_ZOOM, f32.min(MAX_PAGE_ZOOM, zoom))
     if wanted == self.pageZoomFactor { return false }
     self.pageZoomFactor = wanted
-    self.stylesDirty = true
+    self.markStylesDirty(17)
     let count = self.nodes.length()
     let mut slot: usize = 0
     while slot < count {
@@ -5682,7 +5699,7 @@ impl<'a> UiTree<'a> {
     let roots = self.styleSheets.asMutSlice()
     roots[at].environment = environment
     roots[at].systemColors = systemColors
-    if root == self.current { self.stylesDirty = true }
+    if root == self.current { self.markStylesDirty(18) }
     else {
       let parked = self.parkedIndex(root)
       let states = self.parked.asMutSlice()
@@ -5721,7 +5738,7 @@ impl<'a> UiTree<'a> {
       match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: index, root: root, sheet: id } } }
     }
     drop run self.useRoot(root)
-    self.stylesDirty = true
+    self.markStylesDirty(19)
   }
 
   pub effect fn resolveGeneratedStyle(self: &mut Self, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool) -> Resolved
@@ -6441,6 +6458,68 @@ impl<'a> UiTree<'a> {
     if String.view(&self.node(child).text) != String.view(&text) { run self.setText(0, child, move text) }
   }
 
+  /// The ancestor filter keys of the element at `slot`: its element name, id and classes.
+  effect fn filterKeys(self: &Self, slot: u32) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+    let mut keys = List<u32>.make()
+    let node = self.node(slot)
+    if node.kind == NodeKind.Text { return move keys }
+    let adapter = SelectorTree { tree: self }
+    run keys.append(ancestor_filter.key(NameKind.Element, ElementTree.localName(&adapter, u32.toUsize(slot))))
+    if let Option.Some { value } = node.identity() {
+      if value.hasId { run keys.append(ancestor_filter.key(NameKind.Id, String.utf8Bytes(value.id()))) }
+      let atoms = value.classAtoms()
+      let mut i: usize = 0
+      while i < atoms.length {
+        run keys.append(self.styleAtoms.filterKey(atoms[i]))
+        i = i + 1
+      }
+    }
+    return move keys
+  }
+
+  effect fn filterNames(self: &mut Self, slot: u32, push: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+    let keys = run self.filterKeys(slot)
+    let mut i: usize = 0
+    while i < keys.length() {
+      if push { self.ancestorFilter.push(keys.get(i)) } else { self.ancestorFilter.pop(keys.get(i)) }
+      i = i + 1
+    }
+  }
+
+  /// Makes the ancestor filter hold the ancestors of `slot`. A pass styles nodes parents first,
+  /// so this is usually nothing, or one push for a first child; a restyle that starts deep in the
+  /// tree walks up once to the nearest ancestor already held.
+  effect fn prepareFilter(self: &mut Self, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.filterOn { return () }
+    let mut chain = List<u32>.make()
+    let mut keep: usize = 0
+    let mut up = self.node(slot).parent
+    while up != NONE {
+      let path = self.filterPath.asSlice()
+      let mut at = path.length
+      while at > 0 && path[at - 1] != up { at = at - 1 }
+      if at > 0 {
+        keep = at
+        break
+      }
+      run chain.append(up)
+      up = self.node(up).parent
+    }
+    while self.filterPath.length() > keep {
+      let last = self.filterPath.length() - 1
+      let held = self.filterPath.get(last)
+      run self.filterNames(held, false)
+      self.filterPath.truncate(last)
+    }
+    let mut i = chain.length()
+    while i > 0 {
+      i = i - 1
+      let next = chain.get(i)
+      run self.filterNames(next, true)
+      run self.filterPath.append(next)
+    }
+  }
+
   effect fn resolveStyles(self: &mut Self) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
@@ -6465,7 +6544,7 @@ impl<'a> UiTree<'a> {
       let updated = run Effect.result(roots[conditionIndex].sheets.environment(&environment, false, &Limits.make()))
       roots[conditionIndex].hasStarting = roots[conditionIndex].sheets.hasStarting()
       match move updated {
-        Result<bool, CssError | OutOfMemoryError>.Success { value } => { if value { self.stylesDirty = true } }
+        Result<bool, CssError | OutOfMemoryError>.Success { value } => { if value { self.markStylesDirty(20) } }
         Result<bool, CssError | OutOfMemoryError>.Failure { error: why } => {
           match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
         }
@@ -6474,7 +6553,7 @@ impl<'a> UiTree<'a> {
     // A full pass hands every node a fresh class long before the counter can wrap into a live one.
     if self.styleClasses > 2147483647 {
       self.styleClasses = 0
-      self.stylesDirty = true
+      self.markStylesDirty(21)
     }
     // Before the stamp counter wraps, no node holds a stamp, so none lends until it computes again.
     if self.computedStamps > 2147483647 {
@@ -6497,8 +6576,8 @@ impl<'a> UiTree<'a> {
     }
     let sheetIndex = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if sheetIndex != usize.MAX && (self.styleSheets.asSlice()[sheetIndex].sheets.length() != 0 || self.styleSheets.asSlice()[sheetIndex].inlineVariables) {
+      if !self.styleSheets.asSlice()[sheetIndex].sheets.canRetainScopes() { self.markStylesDirty(22) }
       let roots = self.styleSheets.asMutSlice()
-      if !roots[sheetIndex].sheets.canRetainScopes() { self.stylesDirty = true }
       if self.stylesDirty {
         roots[sheetIndex].watchAll = false
         roots[sheetIndex].siblingAnchors = false
@@ -6541,6 +6620,9 @@ impl<'a> UiTree<'a> {
     }
     // Root font units cross descendants with an independently specified font.
     let mut rootFontChanged = false
+    run self.ancestorFilter.clear()
+    self.filterPath.clear()
+    self.filterOn = true
     // Each entry is a slot and whether its parent's inherited values changed.
     let mut stack = List<u64>.make()
     run stack.append(u32.toU64(self.root))
@@ -6573,6 +6655,7 @@ impl<'a> UiTree<'a> {
         let perspectiveBefore = if tracksPaint { transform.perspectiveHash(&node.computed().transform, 0) } else { 0 }
         let containment = node.computed().contain.query()
         let skips = node.computed().contain.hidden()
+        run self.prepareFilter(slot)
         let namesChanged = run self.resolve(slot, tick)
         self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
@@ -7493,7 +7576,7 @@ impl<'a> UiTree<'a> {
       self.touchRoot(holder)
     } else {
       // A detached node styles when it is attached again.
-      self.stylesDirty = true
+      self.markStylesDirty(23)
     }
   }
 
