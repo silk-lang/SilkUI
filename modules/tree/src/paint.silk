@@ -1820,11 +1820,25 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
             run css.appendSlice(variables.css.asSlice())
             key = Hash.combine(key, variables.key)
           }
+          // An inline svg's viewport is its CSS box, which overrides the root's own size. In a
+          // box of another shape than the svg's, its preserveAspectRatio places it there.
+          let own = f64.toF32(p.resources.iconRatio(icon))
+          let width = content.width() / p.scale
+          let height = content.height() / p.scale
+          if own > 0.0 && f32.isFinite(own) && width > 0.0 && height > 0.0
+            && f32.abs(width / height - own) > own * 0.001 {
+            run css.appendSlice(b"width:")
+            run appendPixels(&mut css, width)
+            run css.appendSlice(b"height:")
+            run appendPixels(&mut css, height)
+            key = Hash.combine(Hash.combine(key, u32.toU64(f32.toBits(width))), u32.toU64(f32.toBits(height)))
+          }
           if css.length() != 0 {
             if let Option.Some { value: painted } = run p.resources.paintedIcon(&mut p.atlas, resource, key, css.asSlice()) { icon = painted }
           }
         }
-        // An SVG keeps its aspect in a box of another shape (xMidYMid meet).
+        // An svg keeps its aspect in a box of another shape (xMidYMid meet); an inline one sized
+        // to its box above has the box's.
         let ratio = f64.toF32(p.resources.iconRatio(icon))
         let mut boxWidth = content.width()
         let mut boxHeight = content.height()
@@ -1908,6 +1922,29 @@ fn livePaint(kind: u8, color: u32) -> Option<LivePaint> {
   if kind == PAINT_CURRENT { return Option<LivePaint>.some(LivePaint.Current) }
   if kind != PAINT_COLOR { return Option<LivePaint>.None }
   return Option<LivePaint>.some(LivePaint.Color { color: Rgba<f32> { r: channelOf(color, 24), g: channelOf(color, 16), b: channelOf(color, 8), a: channelOf(color, 0) } })
+}
+
+/// Appends `value` CSS pixels to `out` as `<number>px;`, to a thousandth.
+effect fn appendPixels(out: &mut List<u8>, value: f32) -> () ! OutOfMemoryError ? &mut Allocator {
+  let thousandths = f32.toU64(f32.min(f32.max(value, 0.0), 1000000.0) * 1000.0 + 0.5)
+  let mut digits: [u8; 20] = [0; 20]
+  let mut count: usize = 0
+  let mut whole = thousandths / 1000
+  while whole > 0 || count == 0 {
+    digits[count] = u64.toU8(48 + whole % 10)
+    count = count + 1
+    whole = whole / 10
+  }
+  while count > 0 {
+    count = count - 1
+    run out.append(digits[count])
+  }
+  let fraction = thousandths % 1000
+  run out.append(46)
+  run out.append(u64.toU8(48 + fraction / 100))
+  run out.append(u64.toU8(48 + (fraction / 10) % 10))
+  run out.append(u64.toU8(48 + fraction % 10))
+  run out.appendSlice(b"px;")
 }
 
 /// Paints the live svg of icon node `slot` over `content`, its content box in device pixels.
@@ -3187,7 +3224,7 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: Fragment, mask: Con
   let c = p.nodes.asSlice()[u32.toUsize(slot)].computed().*
   let kind = p.nodes.asSlice()[u32.toUsize(slot)].kind
   if c.paint.opacity > 0.0 {
-    let opened = run paint_effects.pushEffects(&mut p, slot, &c, &f, mask.bounds, mask)
+    let opened = run paint_effects.pushEffects(&mut p, index, slot, &c, &f, mask.bounds, mask)
     if c.text.visible && !f.nonpainting {
       let rootPaints = p.only == NONE && p.stacking.rootElement(index)
       if (c.decorated() || hasBackgrounds(&p.*, slot)) && !rootPaints && !emptyHidden(&c, &f) {
