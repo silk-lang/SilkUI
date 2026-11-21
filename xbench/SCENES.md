@@ -49,6 +49,27 @@ same in every app and every run); the pictures are the corpus's four PNGs. The s
 `style/chat.css`, plain CSS like bench.css, which only the chat build loads. A size after the
 dash sets the message count: `chat-200`, `chat-3000`.
 
+## The input scene
+
+A seventh scene, for the two React apps, in either suite. It measures what one input costs on a
+real app's page, the case where Silk UI was slow while scrolling was fine:
+
+| Scene | What is on screen | Script | What it is for |
+| --- | --- | --- | --- |
+| `input` | T3 Code's chat view: its sidebar of projects and threads, the timeline header, the composer and its menus, 470 elements with their real classes and attributes | idle 3 s, mark `loaded`, `type` (120 frames: one more letter in the composer each frame), `select` (60 frames: another sidebar thread becomes `data-active`), `collapse` (60 frames: the sidebar wrapper's `data-sidebar-state` flips), `menu` (60 frames: a menu button's `aria-expanded` and `data-popup-open` flip), idle 3 s, mark `rest` | Restyle and relayout after one change under a large utility stylesheet: about 5,000 Tailwind rules with `group-*`, `has-*`, `data-*`, `:focus-within` and `:is()`/`:where()` variants, where every rule a change can reach must be found and only the elements it reaches restyled |
+
+The page is `content/t3-page.json`, written by `tools/t3-page.py` from the T3 page fixture of
+Silk UI's restyle bench (`modules/tree/tools/restyle-bench/fixtures/t3-page.tree`): a snapshot of
+T3 Code's chat view as its Silk UI port rendered it, inline styles moved into `#xb-inline-N`
+rules and icons kept as empty `svg` elements. `html` and `body` become divs that keep their
+attributes. The style is `style/t3.css`: T3 Code's Tailwind build of `apps/web` (MIT licensed),
+then those inline rules. Each input is a React state change flushed in its frame
+(`apps/react/web/src/Input.tsx`), so a frame's CPU time is the input's cost from React to paint.
+It goes through React, not the platform's event dispatch, the same way in both apps.
+
+For the engine alone, without React or JS, Silk UI's restyle bench runs the same page and inputs
+and counts the nodes each input restyles (`modules/tree/tools/restyle-bench`).
+
 A size after a dash changes the item count: `feed-3000`, `stream-1000`, `churn-2000`.
 
 Idle memory is the mark after each idle (`loaded`, `swept`, `streamed`, `base`, `empty-k`, `rest`).

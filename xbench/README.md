@@ -28,7 +28,7 @@ Everything builds from `xbench/`, the folder this README is in. Linux needs `xvf
 ```sh
 # React (for Electron and Silk UI + React)
 (cd apps/react/web && npm ci)
-for s in feed wall stream churn canvas chat; do (cd apps/react/web && VITE_XB_SCENE=$s npx vite build --config vite.web.config.js); done
+for s in feed wall stream churn canvas chat input; do (cd apps/react/web && VITE_XB_SCENE=$s npx vite build --config vite.web.config.js); done
 (cd apps/electron && npm ci)
 
 # Silk UI apps. SILKUI is the Silk UI checkout to measure: by default this one, the repository
