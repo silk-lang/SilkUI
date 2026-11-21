@@ -31,6 +31,15 @@
     if (failure) throw failure.error;
   };
 
+  // The window's pixels per CSS pixel in its last frame, as in the engine runtime.
+  if (native.scale && !("devicePixelRatio" in globalThis)) {
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      get: () => native.scale(),
+      set: (value) => Object.defineProperty(globalThis, "devicePixelRatio", { value, writable: true, configurable: true }),
+      configurable: true,
+    });
+  }
+
   // Media queries answer for the window's last frame, as in the engine runtime. The host
   // calls `native.media` when the media changes; lists with listeners send `change` then.
   if (native.matchMedia && globalThis.matchMedia === undefined) {

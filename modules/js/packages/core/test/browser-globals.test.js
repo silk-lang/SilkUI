@@ -199,6 +199,53 @@ test("navigation follows the session history and navigates it", async () => {
   await tick();
 });
 
+test("head is in the document, CSS.escape escapes and HTML tags are upper case", () => {
+  assert.equal(document.documentElement.firstChild, document.head);
+  assert.equal(document.head.parentNode, document.documentElement);
+  assert.equal(CSS.escape("1a b"), "\\31 a\\ b");
+  assert.equal(document.createElement("button").tagName, "BUTTON");
+  assert.equal(document.createElementNS("http://www.w3.org/2000/svg", "svg").tagName, "svg");
+});
+
+test("fetch resolves against location and serves the app's own files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "silkui-app-"));
+  writeFileSync(join(dir, "pty.wasm"), new Uint8Array([0, 97, 115, 109]));
+  globalThis.__silkAppBase = pathToFileURL(dir + "/").href;
+  try {
+    const response = await fetch("/pty.wasm");
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/wasm");
+    assert.equal(response.url, "http://localhost/pty.wasm");
+    assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [0, 97, 115, 109]);
+    assert.equal((await fetch("missing.js")).status, 404);
+  } finally {
+    delete globalThis.__silkAppBase;
+  }
+});
+
+test("EventSource reads a server-sent event stream", async () => {
+  const { createServer } = await import("node:http");
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write(": hello\n\nid: 7\ndata: one\ndata: two\n\nevent: tick\ndata: 3\n\n");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const source = new EventSource("http://127.0.0.1:" + server.address().port + "/events");
+  const message = new Promise((resolve) => { source.onmessage = (event) => resolve([event.data, event.lastEventId]); });
+  const tick = new Promise((resolve) => source.addEventListener("tick", (event) => resolve(event.data)));
+  assert.deepEqual(await message, ["one\ntwo", "7"]);
+  assert.equal(await tick, "3");
+  assert.equal(source.readyState, EventSource.OPEN);
+  source.close();
+  server.closeAllConnections();
+  await new Promise((resolve) => server.close(resolve));
+});
+
+test("navigator.mediaDevices has no devices", async () => {
+  assert.deepEqual(await navigator.mediaDevices.enumerateDevices(), []);
+  await assert.rejects(navigator.mediaDevices.getUserMedia({ audio: true }), { name: "NotFoundError" });
+});
+
 test("localStorage keeps items in a file, sessionStorage in memory", async () => {
   localStorage.setItem("theme", "dark");
   localStorage.count = 2;
@@ -261,6 +308,20 @@ test("indexedDB opens, upgrades, stores, indexes, walks cursors and aborts", asy
   await new Promise((resolve) => (aborted.onabort = resolve));
   assert.deepEqual(await request(db.transaction("plain").objectStore("plain").get("a")), { n: 1 });
   assert.equal(indexedDB.cmp([1, "a"], [1, "b"]), -1);
+});
+
+test("a SharedWorker is one worker for its script, with a port per client", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "silkui-shared-"));
+  const file = join(dir, "count.js");
+  writeFileSync(file, "let clients = 0; onconnect = (event) => { const port = event.ports[0]; clients++; port.postMessage(clients); };");
+  const url = pathToFileURL(file).href;
+  const first = new SharedWorker(url);
+  const second = new SharedWorker(url);
+  const answer = (worker) => new Promise((resolve) => worker.port.once("message", resolve));
+  const counts = await Promise.all([answer(first), answer(second)]);
+  assert.deepEqual(counts.sort(), [1, 2]);
+  first.port.close();
+  second.port.close();
 });
 
 test("a Worker runs a module on its own thread and answers messages", async () => {

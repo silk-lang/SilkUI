@@ -25,6 +25,7 @@ import {
   createRange,
   createSvgElement,
   createText,
+  cssEscape,
   elementFromPoint,
   elementsFromPoint,
   getComputedStyle,
@@ -38,7 +39,8 @@ import * as core from "./index.js";
 import { Storage, localStorageArea, sessionStorageArea } from "./storage.js";
 import { History, Location, Navigation, NavigateEvent, NavigationCurrentEntryChangeEvent, NavigationHistoryEntry, PopStateEvent, HashChangeEvent } from "./location.js";
 import { indexedDBModule } from "./indexeddb.js";
-import { WorkerClass } from "./worker.js";
+import { WorkerClass, SharedWorkerClass } from "./worker.js";
+import { windowFetch, eventSourceClass } from "./fetch.js";
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const KIND_OF_TAG = { span: "box", img: "image", input: "input", textarea: "input", svg: "svg" };
@@ -188,7 +190,7 @@ function relay(type, on) {
 const windowTarget = new OuterTarget();
 
 // `<html>` is the tree's root, the size of the window; `<body>` fills it, as a page's does
-// with `height: 100%`. `<head>` is in the document, not shown, so its style elements apply.
+// with `height: 100%`. `<head>` comes first and shows nothing, as a page's.
 const documentElement = createElement("html");
 documentElement.style.set({ position: "absolute", top: 0, left: 0, right: 0, bottom: 0 });
 const head = createElement("head");
@@ -324,12 +326,6 @@ const fonts = Object.assign(new OuterTarget(), {
 fonts.ready = Promise.resolve(fonts);
 fonts._listening = () => {};
 
-function cssEscape(value) {
-  return value.replace(/[^\w-]|^\d|^-\d/g, (character) => {
-    const code = character.charCodeAt(0);
-    return /[\d]/.test(character) ? "\\3" + character + " " : code < 0x20 || code === 0x7f ? "\\" + code.toString(16) + " " : "\\" + character;
-  });
-}
 
 // `document.createTreeWalker`, over the nodes' child lists.
 class TreeWalker {
@@ -1042,6 +1038,15 @@ function lazy(name, make) {
 }
 
 if (global.Worker === undefined && WorkerClass) define("Worker", WorkerClass);
+if (global.SharedWorker === undefined && SharedWorkerClass) define("SharedWorker", SharedWorkerClass);
+
+// `fetch("/x.wasm")` as a page's: relative to `location`, the window's own origin served from
+// the app's files.
+if (typeof global.fetch === "function") {
+  const fetch = windowFetch(global.fetch, location);
+  define("fetch", fetch);
+  if (global.EventSource === undefined) define("EventSource", eventSourceClass(fetch, location, OuterTarget));
+}
 
 // `navigator` as a browser's on this machine.
 if (typeof global.navigator !== "object" || global.navigator === null) global.navigator = {};
@@ -1066,6 +1071,20 @@ for (const [name, value] of Object.entries(navigatorFields)) {
   if (global.navigator[name] === undefined || (name === "userAgent" && global.navigator.userAgent === "SilkUI")) {
     Object.defineProperty(global.navigator, name, { value, enumerable: true, configurable: true });
   }
+}
+// A window with no cameras, microphones or screens to capture: no devices, and asking for one
+// fails as a browser's does when there is none.
+if (global.navigator.mediaDevices === undefined) {
+  const mediaDevices = new OuterTarget();
+  const none = (what) => () => Promise.reject(domError("NotFoundError", "a Silk UI window has no " + what));
+  Object.assign(mediaDevices, {
+    ondevicechange: null,
+    enumerateDevices: () => Promise.resolve([]),
+    getUserMedia: none("camera or microphone"),
+    getDisplayMedia: none("screen capture"),
+    getSupportedConstraints: () => ({}),
+  });
+  Object.defineProperty(global.navigator, "mediaDevices", { value: mediaDevices, enumerable: true, configurable: true });
 }
 global.navigator.hardwareConcurrency ??= 4;
 global.navigator.sendBeacon ??= () => false;
