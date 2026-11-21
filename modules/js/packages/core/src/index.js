@@ -987,7 +987,10 @@ export class Node {
     const rare = this.#rare;
     const old = rare?.flags ?? 0;
     const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
-    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === old) return;
+    this.#more().flags = flags;
+    // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
@@ -1009,7 +1012,9 @@ export class Node {
       if (wanted) flags |= bit;
     }
     flags >>>= 0;
-    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === (this.#rare?.flags ?? 0)) return;
+    this.#more().flags = flags;
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   _keep(...types) {
