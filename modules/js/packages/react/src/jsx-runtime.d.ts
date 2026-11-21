@@ -5,6 +5,9 @@ import type { Key, Ref, ReactNode, JSX as ReactJSX } from "react";
 import type * as Silk from "@silkui/core";
 
 export { Fragment, jsx, jsxs } from "react/jsx-runtime";
+export { jsxDEV } from "react/jsx-dev-runtime";
+
+type SilkTags = "input" | "image" | "img" | "canvas" | "svg" | "path" | "circle" | "ellipse" | "line" | "polyline" | "polygon" | "rect" | "g" | "defs" | "use" | "symbol" | "title" | "desc" | "text" | "tspan" | "textPath" | "linearGradient" | "radialGradient" | "stop" | "pattern" | "clipPath" | "mask" | "marker" | "filter" | "feGaussianBlur" | "feOffset" | "feBlend" | "feColorMatrix" | "feComposite" | "feFlood" | "feMerge" | "feMergeNode" | "feDropShadow" | "animate" | "animateTransform" | "animateMotion" | "set" | "foreignObject";
 
 /** Handlers by prop name; each also takes a `Capture` suffix for the capture phase. */
 interface Handlers<T extends Silk.Node> {
@@ -140,7 +143,8 @@ export namespace JSX {
   type LibraryManagedAttributes<C, P> = ReactJSX.LibraryManagedAttributes<C, P>;
   interface IntrinsicAttributes extends ReactJSX.IntrinsicAttributes {}
   interface IntrinsicClassAttributes<T> extends ReactJSX.IntrinsicClassAttributes<T> {}
-  interface IntrinsicElements {
+  // HTML elements take React DOM's props (see the package README for what they do here).
+  interface IntrinsicElements extends Omit<ReactJSX.IntrinsicElements, SilkTags> {
     box: SilkProps;
     input: InputProps;
     richinput: RichInputProps;
