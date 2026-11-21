@@ -53,6 +53,7 @@ import silk.io.writer { Writer }
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.text.string { String }
 import silk.num.f64
+import silk.num.f32
 
 /// A module given to [`JsApp.define`], kept to define it again after a reload.
 struct Defined {
@@ -83,6 +84,8 @@ pub struct JsApp<'m> {
   /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
   /// gave the handle canvases present through ([`JsApp.canvases`]).
   gpu: Option<GpuService>,
+  /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
+  zoom: f32,
 }
 
 /// How many rounds of WebGPU commands one turn serves: the promise jobs of one round's
@@ -196,6 +199,7 @@ impl<'m> JsApp<'m> {
       openers: Openers.make(),
       settled: 0,
       gpu: Option<GpuService>.None,
+      zoom: 1.0,
     }
   }
 
@@ -483,16 +487,23 @@ impl<'m> JsApp<'m> {
     return true
   }
 
-  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
-  /// `platform`, and the calls their promise jobs made, then applies what it built. Says
-  /// whether there were calls.
-  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
+  /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
+  /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
+  /// there were calls.
+  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
+    let zoomed = tree.pageZoom() != self.zoom
+    if zoomed {
+      self.zoom = tree.pageZoom()
+      let told = run Effect.result(self.host.shellEvent(11, f32.toF64(self.zoom), 0.0, 0.0, "")) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
       let requests = self.host.takeShell()
       if requests.length() == 0 { break }
-      let mut answers = run serveShell(move requests, &mut platform)
+      let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
       while answers.length() > 0 {
         let ShellAnswer { call, value } = answers.remove(0)
         let answered = run Effect.result(self.host.answerShell(call, value)) |> Effect.provideMut<Allocator>(&mut self.allocator)
@@ -500,7 +511,7 @@ impl<'m> JsApp<'m> {
       }
       round = round + 1
     }
-    if round == 0 { return false }
+    if round == 0 && !zoomed { return false }
     run self.host.flushRaw(&mut tree)
     return true
   }
@@ -674,7 +685,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
       Platform.startWindowDrag(&mut platform.*, window)
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
-    let shell = run state.shell(&mut tree, &mut platform.*)
+    let shell = run state.shell(&mut tree, &mut platform.*, window)
     let natives = run state.natives(&mut self.jobs, &mut tree)
     let graphics = run state.graphics(&mut tree)
     return clipboard || shell || natives || graphics

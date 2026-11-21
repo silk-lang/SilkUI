@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut } = await import("../src/index.js");
+const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut, setApplicationMenu, showOpenDialog, showSaveDialog, showContextMenu, appWindow } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -827,7 +827,7 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   const shown = setTray({ icon: { width: 1, height: 1, data: [255, 0, 16, 255] }, tooltip: "App", menu: [{ label: "Quit, now", click: () => quit++ }, { type: "separator" }, { label: "More", submenu: [{ label: "Off", enabled: false }] }] });
   const [[, trayCall, trayOp, packed]] = mock.take();
   assert.equal(trayOp, 1);
-  assert.deepEqual(packed.split("\x1f"), ["App", "1", "1", "0", "ff0010ff", "A1,1,0,Quit, now\nS\nBMore\nA2,0,0,Off\nE"]);
+  assert.deepEqual(packed.split("\x1f"), ["App", "1", "1", "0", "ff0010ff", "A1,1,0,,0,Quit, now\nS\nBMore\nA2,0,0,,0,Off\nE"]);
   mock.native.shellAnswer(trayCall, 1);
   assert.equal(await shown, true);
   mock.native.shellEvent(6, 1, 0, 0, "");
@@ -842,6 +842,65 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   assert.equal(await held, false);
   mock.native.shellEvent(4, 1, 0, 0, "");
   assert.equal(pressed, 1);
+});
+
+test("menus, dialogs and the window go to the host and come back", async () => {
+  mock.take();
+  let saved = 0;
+  setApplicationMenu([
+    { role: "appMenu" },
+    { label: "File", submenu: [{ label: "Save", accelerator: "CmdOrCtrl+Shift+S", click: () => saved++ }, { label: "Go", accelerator: "F5" }] },
+    { role: "viewMenu" },
+  ]);
+  const [[, , menuOp, menu]] = mock.take();
+  assert.equal(menuOp, 7);
+  const lines = menu.split("\n");
+  assert.deepEqual(lines.slice(0, 3), ["BApp", "R0", "S"], "roles are the system's items");
+  const save = lines.find((line) => line.endsWith(",Save"));
+  assert.match(save, /^A\d+,1,0,cs,17,Save$/, "a character key with Mod and Shift");
+  assert.ok(lines.some((line) => /^A\d+,1,0,nF5,0,Go$/.test(line)), "a named key");
+  assert.ok(lines.some((line) => /^A\d+,1,0,c\+,16,Zoom In$/.test(line)), "zoom roles are JavaScript's");
+  mock.native.shellEvent(6, Number(save.slice(1, save.indexOf(","))), 0, 0, "");
+  assert.equal(saved, 1);
+
+  const picked = showOpenDialog({ properties: ["openDirectory", "multiSelections"], filters: [{ name: "Images", extensions: ["png", ".jpg"] }] });
+  const [[, openCall, openOp, openFields]] = mock.take();
+  assert.equal(openOp, 5);
+  assert.deepEqual(openFields.split("\x1f"), ["", "", "6", "png,jpg"]);
+  mock.native.shellAnswer(openCall, 3);
+  await Promise.resolve();
+  mock.native.shellEvent(8, 3, 0, 0, "/a\n/b c");
+  assert.deepEqual(await picked, { canceled: false, filePaths: ["/a", "/b c"] });
+
+  const named = showSaveDialog({ defaultPath: "/tmp/out/report.md" });
+  const [[, saveCall, , saveFields]] = mock.take();
+  assert.deepEqual(saveFields.split("\x1f"), ["", "/tmp/out", "report.md", ""]);
+  mock.native.shellAnswer(saveCall, 4);
+  await Promise.resolve();
+  mock.native.shellEvent(8, 4, 0, 0, "");
+  assert.deepEqual(await named, { canceled: true, filePath: "" });
+
+  let copied = 0;
+  const closed = showContextMenu([{ label: "Copy", click: () => copied++ }], { x: 10, y: 20 });
+  const [[, menuCall, contextOp, contextFields]] = mock.take();
+  assert.equal(contextOp, 8);
+  const [x, y, item] = contextFields.split("\x1f");
+  assert.deepEqual([x, y], ["10", "20"]);
+  mock.native.shellAnswer(menuCall, 1);
+  await Promise.resolve();
+  mock.native.shellEvent(6, Number(item.slice(1, item.indexOf(","))), 0, 0, "");
+  assert.equal(await closed, true);
+  assert.equal(copied, 1);
+
+  const changes = [];
+  appWindow.addEventListener("fullscreenchange", (event) => changes.push(event.fullScreen));
+  appWindow.setFullScreen(false);
+  assert.deepEqual(mock.take(), [], "already windowed");
+  appWindow.setFullScreen(true);
+  assert.deepEqual(mock.take().map((call) => [call[2], call[3]]), [[14, "0"]]);
+  mock.native.shellEvent(10, 1, 0, 0, "");
+  mock.native.shellEvent(11, 1.25, 0, 0, "");
+  assert.deepEqual([changes, appWindow.isFullScreen(), appWindow.getZoomFactor()], [[true], true, 1.25]);
 });
 
 test("input selection offsets are UTF-16 indices, as in Chrome", () => {
