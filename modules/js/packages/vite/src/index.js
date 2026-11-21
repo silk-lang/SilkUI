@@ -16,6 +16,8 @@ import { missingApis, ownerOf, report } from "./apis.js";
 
 // The modules of `@silkui/core/globals`, and the globals it defines.
 const CORE_GLOBALS = /[\\/](?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker)\.js$/;
+// Workers up to this size (characters) go into the bundle as data: addresses.
+const INLINE_WORKER_LIMIT = 256 * 1024;
 const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB"];
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
@@ -97,8 +99,9 @@ export default function silk(options = {}) {
     },
   };
   // `new Worker(new URL("./x.js", import.meta.url))`: Vite bundles the worker as a file of
-  // its own, which a Silk UI app carrying its bundle in memory does not have beside it. Its
-  // code goes into the bundle as a `data:` address instead.
+  // its own, which a Silk UI app carrying its bundle in memory does not have beside it. A
+  // small worker's code goes into the bundle as a `data:` address instead; a large one stays a
+  // file, addressed from the bundle's own location, and must ship beside it.
   const workerPlugin = {
     name: "silk:workers",
     apply: "build",
@@ -113,6 +116,12 @@ export default function silk(options = {}) {
           const code = item.type === "chunk" ? item.code : typeof item.source === "string" ? item.source : new TextDecoder().decode(item.source);
           const quoted = new RegExp(`(["'\`])[^"'\`]*?${escapeRegExp(item.fileName)}\\1`, "g");
           if (!quoted.test(app.code)) continue;
+          // A large worker stays a file beside the bundle, which the host reads only when it
+          // starts the worker: inlined, every start of the app would read it too.
+          if (code.length > INLINE_WORKER_LIMIT) {
+            app.code = app.code.replace(quoted, () => JSON.stringify("./" + item.fileName));
+            continue;
+          }
           app.code = app.code.replace(quoted, () => JSON.stringify("data:text/javascript," + encodeURIComponent(code)));
           delete output[item.fileName];
         }

@@ -77,6 +77,53 @@ test("dataset maps camelCase names to data-* attributes", () => {
   assert.equal(document.body.dataset, document.body.dataset);
 });
 
+test("elements take the DOM's positional edits, text and reflected attributes", () => {
+  const list = document.createElement("div");
+  const middle = document.createElement("span");
+  list.append(middle);
+  middle.before("a");
+  middle.after(document.createElement("i"), "z");
+  list.prepend("start");
+  assert.equal(list.textContent, "startaz");
+  middle.replaceWith("m");
+  assert.equal(list.textContent, "startamz");
+  list.insertAdjacentHTML("beforeend", "<b>end</b>");
+  assert.equal(list.lastChild.textContent, "end");
+  list.textContent = "only";
+  assert.equal(list.childNodes.length, 1);
+  assert.equal(list.toggleAttribute("open"), true);
+  list.hidden = true;
+  assert.ok(list.hasAttribute("hidden"));
+  list.title = "tip";
+  assert.equal(list.getAttribute("title"), "tip");
+  document.body.prepend(list);
+  assert.equal(document.body.firstChild, list);
+  assert.equal(document.body.compareDocumentPosition(list) & 16, 16);
+  list.remove();
+});
+
+test("custom elements are nodes of their tag with the class's prototype and callbacks", async () => {
+  const seen = [];
+  class Panel extends HTMLElement {
+    static observedAttributes = ["size"];
+    connectedCallback() { seen.push("connected"); }
+    attributeChangedCallback(name, _old, value) { seen.push(name + "=" + value); }
+    get label() { return "panel " + this.localName; }
+  }
+  customElements.define("x-panel", Panel);
+  const panel = document.createElement("x-panel");
+  assert.ok(panel instanceof Panel && panel instanceof HTMLElement);
+  assert.equal(panel.label, "panel x-panel");
+  const shadow = panel.attachShadow({ mode: "open" });
+  assert.equal(panel.shadowRoot, shadow);
+  document.body.append(panel);
+  panel.setAttribute("size", "2");
+  await tick();
+  assert.deepEqual(seen, ["connected", "size=2"]);
+  assert.equal(customElements.get("x-panel"), Panel);
+  panel.remove();
+});
+
 test("MutationObserver records child lists, attributes and text", async () => {
   const box = document.createElement("div");
   document.body.appendChild(box);
