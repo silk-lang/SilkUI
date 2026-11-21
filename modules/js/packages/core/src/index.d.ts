@@ -77,6 +77,8 @@ export class Node {
   className: string;
   adoptedStyleSheets: CSSStyleSheet[];
   readonly classList: ClassList;
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  readonly dataset: Record<string, string | undefined>;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
