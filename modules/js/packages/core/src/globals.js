@@ -41,6 +41,7 @@ import { History, Location, Navigation, NavigateEvent, NavigationCurrentEntryCha
 import { indexedDBModule } from "./indexeddb.js";
 import { WorkerClass, SharedWorkerClass } from "./worker.js";
 import { windowFetch, eventSourceClass } from "./fetch.js";
+import { ImageBitmap, createImageBitmap } from "./image-bitmap.js";
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const KIND_OF_TAG = { span: "box", img: "image", input: "input", textarea: "input", svg: "svg" };
@@ -1047,6 +1048,9 @@ if (typeof global.fetch === "function") {
   define("fetch", fetch);
   if (global.EventSource === undefined) define("EventSource", eventSourceClass(fetch, location, OuterTarget));
 }
+
+if (global.ImageBitmap === undefined) define("ImageBitmap", ImageBitmap);
+if (global.createImageBitmap === undefined) define("createImageBitmap", createImageBitmap);
 
 // `navigator` as a browser's on this machine.
 if (typeof global.navigator !== "object" || global.navigator === null) global.navigator = {};
