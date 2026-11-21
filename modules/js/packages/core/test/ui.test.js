@@ -370,6 +370,16 @@ test("mouse events follow pointer events, and a tap's come before its click", ()
   assert.deepEqual(log, ["pointerdown", "click"]);
 });
 
+test("a prevented mousedown prevents the press's default, as a terminal keeps focus with it", () => {
+  const box = createBox();
+  const mouse = 256 + 64;
+  assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1), false);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  box.addEventListener("mousedown", (event) => event.preventDefault());
+  assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1), true);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+});
+
 test("transition events bubble with their property and elapsed time", () => {
   const outer = createBox();
   const inner = createBox();
@@ -1055,8 +1065,13 @@ test("input selection offsets are UTF-16 indices, as in Chrome", () => {
   input.value = "a\u{1F600}e\u0301\u6f22";
   globalThis.__ui.dispatch(27, input.nodeId, 5, 8, 0, 0, 0);
   assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 5]);
+  const heard = [];
+  input.addEventListener("input", (event) => heard.push([event.inputType, event.data, event.isComposing]));
   globalThis.__ui.dispatch(11, input.nodeId, 14, 14, 0, 0, 0, input.value + "\u5b57", "insertText");
   assert.deepEqual([input.value.length, input.selectionStart], [7, 7]);
+  globalThis.__ui.dispatch(11, input.nodeId, 11, 11, 0, 0, 0, "a\u{1F600}e\u0301\u5b57", "deleteContentBackward");
+  globalThis.__ui.dispatch(11, input.nodeId, 4, 4, 0, 0, 0, "a\u{1F600}xye\u0301\u5b57", "insertText");
+  assert.deepEqual(heard, [["insertText", "\u5b57", false], ["deleteContentBackward", null, false], ["insertText", "xy", false]]);
 });
 
 test("setRangeText on a rich input keeps marks and atoms outside the range", () => {
