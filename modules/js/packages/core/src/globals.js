@@ -44,12 +44,23 @@ const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const KIND_OF_TAG = { span: "box", img: "image", input: "input", textarea: "input", svg: "svg" };
 
 // A `<canvas>` made here draws nothing: libraries such as lottie-web make one at load to probe.
-const inert = new Proxy({}, { get: (target, name) => (name in target ? target[name] : () => {}) });
+const metrics = { width: 0, actualBoundingBoxLeft: 0, actualBoundingBoxRight: 0, actualBoundingBoxAscent: 0, actualBoundingBoxDescent: 0, fontBoundingBoxAscent: 0, fontBoundingBoxDescent: 0 };
+const pixels = (width = 1, height = 1) => ({ width, height, data: new Uint8ClampedArray(Math.max(0, width * height * 4)) });
+const inert = new Proxy({
+  measureText: () => ({ ...metrics }),
+  getImageData: (_x, _y, width, height) => pixels(width, height),
+  createImageData: (width, height) => pixels(width, height),
+  getLineDash: () => [],
+  isPointInPath: () => false,
+  isPointInStroke: () => false,
+}, { get: (target, name) => (name in target ? target[name] : () => {}), set: (target, name, value) => { target[name] = value; return true; } });
 
 // What a tag becomes: `@silkui/core`'s own `createElement` when it has one (HTML tags as
 // nodes), else a box, an input, an image or an svg.
 function createElement(tag) {
   tag = String(tag).toLowerCase();
+  const Custom = customTags.get(tag);
+  if (Custom) return new Custom();
   const html = exported("createElement");
   if (typeof html === "function") {
     const node = html(tag);
@@ -69,6 +80,10 @@ function createElement(tag) {
 }
 
 const global = globalThis;
+// Custom element classes by tag, and tags by class (see `customElements` below).
+const customTags = new Map();
+const customClasses = new Map();
+const customWaits = new Map();
 // An export `@silkui/core` may have, read by name so a build without it does not warn.
 const exported = (name) => core[name];
 
@@ -262,6 +277,18 @@ class Document extends OuterTarget {
   elementFromPoint(x, y) { return elementFromPoint(x, y); }
   elementsFromPoint(x, y) { return elementsFromPoint(x, y); }
   caretPositionFromPoint(x, y) { return caretPositionFromPoint(x, y); }
+  caretRangeFromPoint(x, y) {
+    const position = caretPositionFromPoint(x, y);
+    if (!position) return null;
+    const range = createRange();
+    range.setStart(position.offsetNode, position.offset);
+    return range;
+  }
+  get styleSheets() { return []; }
+  get adoptedStyleSheets() { return documentElement.adoptedStyleSheets ?? []; }
+  set adoptedStyleSheets(sheets) { documentElement.adoptedStyleSheets = sheets; }
+  get currentScript() { return null; }
+  get implementation() { return implementation; }
   importNode(node, deep) { return node.cloneNode(deep); }
   adoptNode(node) { node.remove?.(); return node; }
   exitFullscreen() { return Promise.resolve(); }
@@ -274,6 +301,12 @@ class Document extends OuterTarget {
   // The fonts the app's style sheets load are the host's, ready before the first frame.
   get fonts() { return fonts; }
 }
+
+const implementation = {
+  hasFeature: () => true,
+  createHTMLDocument: () => documentTarget,
+  createDocument: () => documentTarget,
+};
 
 const fonts = Object.assign(new OuterTarget(), {
   status: "loaded",
@@ -407,6 +440,244 @@ if (!("blur" in CoreNode.prototype)) {
   });
 }
 
+// The rest of the element surface DOM libraries call: tree edits by position, reflected
+// attributes, comparisons and the calls a tree answers trivially.
+const HTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+// Nodes for `append`-style calls: strings become text, fragments give their children.
+function nodesOf(items) {
+  const nodes = [];
+  for (const item of items) {
+    if (item == null || typeof item !== "object") nodes.push(createText(String(item)));
+    else if (item.nodeType === 11) nodes.push(...item.childNodes);
+    else nodes.push(item);
+  }
+  return nodes;
+}
+const reflect = (name) => ({
+  get() { return this.getAttribute(name) ?? ""; },
+  set(value) { this.setAttribute(name, String(value)); },
+});
+const flag = (name) => ({
+  get() { return this.hasAttribute(name); },
+  set(value) { if (value) this.setAttribute(name, ""); else this.removeAttribute(name); },
+});
+const treeMethods = {
+  before(...items) {
+    const parent = this.parentNode;
+    if (parent) for (const node of nodesOf(items)) parent.insertBefore(node, this);
+  },
+  after(...items) {
+    const parent = this.parentNode;
+    if (!parent) return;
+    const next = this.nextSibling;
+    for (const node of nodesOf(items)) parent.insertBefore(node, next);
+  },
+  replaceWith(...items) {
+    const parent = this.parentNode;
+    if (!parent) return;
+    const nodes = nodesOf(items).filter((node) => node !== this);
+    const next = this.nextSibling;
+    this.remove();
+    for (const node of nodes) parent.insertBefore(node, next && next.parentNode === parent ? next : null);
+  },
+  compareDocumentPosition(other) {
+    if (other === this) return 0;
+    const chain = (node) => { const list = []; for (; node; node = node.parentNode) list.unshift(node); return list; };
+    const mine = chain(this);
+    const theirs = chain(other);
+    if (mine[0] !== theirs[0]) return 1 | 32 | (mine[0] === documentElement ? 4 : 2);
+    let depth = 0;
+    while (mine[depth] === theirs[depth]) depth++;
+    if (depth === mine.length) return 16 | 4;
+    if (depth === theirs.length) return 8 | 2;
+    const siblings = mine[depth - 1].childNodes;
+    return siblings.indexOf(theirs[depth]) > siblings.indexOf(mine[depth]) ? 4 : 2;
+  },
+  isSameNode(other) { return other === this; },
+  isEqualNode(other) {
+    if (!other || other.nodeType !== this.nodeType) return false;
+    if (this.nodeType === 3) return other.data === this.data;
+    return other.outerHTML === this.outerHTML;
+  },
+  lookupNamespaceURI() { return null; },
+};
+for (const prototype of [CoreNode.prototype, SvgElement.prototype, SvgText.prototype]) {
+  for (const [name, value] of Object.entries(treeMethods)) {
+    if (!(name in prototype)) Object.defineProperty(prototype, name, { value, writable: true, configurable: true });
+  }
+}
+const elementMethods = {
+  prepend(...items) {
+    const first = this.firstChild ?? this.childNodes?.[0] ?? null;
+    for (const node of nodesOf(items)) this.insertBefore(node, first);
+  },
+  replaceChildren(...items) {
+    const nodes = nodesOf(items);
+    for (const child of [...this.childNodes]) if (!nodes.includes(child)) child.remove();
+    for (const node of nodes) this.appendChild(node);
+  },
+  toggleAttribute(name, force) {
+    const on = force === undefined ? !this.hasAttribute(name) : Boolean(force);
+    if (on) { if (!this.hasAttribute(name)) this.setAttribute(name, ""); } else this.removeAttribute(name);
+    return on;
+  },
+  hasAttributes() { return this.getAttributeNames().length > 0; },
+  getAttributeNS(_namespace, name) { return this.getAttribute(name); },
+  setAttributeNS(_namespace, name, value) { this.setAttribute(String(name).replace(/^[^:]*:/, (prefix) => prefix === "xlink:" ? prefix : ""), value); },
+  removeAttributeNS(_namespace, name) { this.removeAttribute(name); },
+  hasAttributeNS(_namespace, name) { return this.hasAttribute(name); },
+  getElementsByTagName(tag) { return this.querySelectorAll(tag === "*" ? "*" : String(tag)); },
+  getElementsByClassName(names) {
+    const selector = String(names).trim().split(/\s+/).filter(Boolean).map((name) => "." + cssEscape(name)).join("");
+    return selector ? this.querySelectorAll(selector) : [];
+  },
+  insertAdjacentElement(where, node) {
+    switch (String(where).toLowerCase()) {
+      case "beforebegin": this.before(node); break;
+      case "afterbegin": this.prepend(node); break;
+      case "beforeend": this.append(node); break;
+      case "afterend": this.after(node); break;
+      default: throw new SyntaxError("insertAdjacent takes beforebegin, afterbegin, beforeend or afterend, not " + where);
+    }
+    return node;
+  },
+  insertAdjacentText(where, text) { this.insertAdjacentElement(where, createText(String(text))); },
+  insertAdjacentHTML(where, html) {
+    const holder = createElement("div");
+    holder.innerHTML = String(html);
+    const fragment = createDocumentFragment();
+    for (const child of [...holder.childNodes]) fragment.appendChild(child);
+    this.insertAdjacentElement(where, fragment);
+  },
+  click() {
+    if (this.hasAttribute("disabled")) return;
+    const MouseEventClass = global.MouseEvent ?? global.Event;
+    this.dispatchEvent(new MouseEventClass("click", { bubbles: true, cancelable: true, composed: true }));
+  },
+  // Animations run to their end at once: the end state is the app's style, so nothing waits.
+  animate(_keyframes, options) {
+    const animation = new FinishedAnimation(this, options);
+    queueMicrotask(() => animation._end());
+    return animation;
+  },
+  getAnimations() { return []; },
+  // A shadow root is a part of the element's own tree here: what goes in it shows inside.
+  attachShadow() {
+    if (this._shadowRoot) throw domError("NotSupportedError", "the element already has a shadow root");
+    const shadow = createElement("div");
+    shadow.style.set?.({ display: "contents" });
+    Object.defineProperty(shadow, "host", { value: this, configurable: true });
+    Object.defineProperty(this, "_shadowRoot", { value: shadow, configurable: true });
+    this.prepend(shadow);
+    return shadow;
+  },
+  showPopover() { this.hidden = false; this.dispatchEvent(new global.Event("toggle")); },
+  hidePopover() { this.hidden = true; this.dispatchEvent(new global.Event("toggle")); },
+  togglePopover(force) { const show = force === undefined ? this.hidden : Boolean(force); if (show) this.showPopover(); else this.hidePopover(); return show; },
+  checkVisibility() { return this.isConnected && this.getClientRects?.().length !== 0; },
+  requestFullscreen() { return Promise.reject(domError("NotSupportedError", "a Silk UI element cannot go full screen")); },
+  requestPointerLock() { return Promise.resolve(); },
+};
+const elementProperties2 = {
+  textContent: {
+    get() { let text = ""; for (const child of this.childNodes ?? []) if (child.nodeType !== 8) text += child.textContent ?? ""; return text; },
+    set(value) { for (const child of [...(this.childNodes ?? [])]) child.remove(); const text = value == null ? "" : String(value); if (text) this.appendChild(createText(text)); },
+  },
+  innerText: {
+    get() { return this.textContent; },
+    set(value) { this.textContent = value; },
+  },
+  outerText: {
+    get() { return this.textContent; },
+  },
+  nodeValue: { get() { return null; }, set() {} },
+  namespaceURI: { get() { return this instanceof SvgElement || this instanceof Svg ? SVG_NAMESPACE : HTML_NAMESPACE; } },
+  prefix: { get() { return null; } },
+  attributes: {
+    get() {
+      const list = this.getAttributeNames().map((name) => ({ name, localName: name, value: this.getAttribute(name), namespaceURI: null, prefix: null, specified: true }));
+      return Object.assign(list, {
+        getNamedItem: (name) => list.find((item) => item.name === name) ?? null,
+        item: (index) => list[index] ?? null,
+      });
+    },
+  },
+  shadowRoot: { get() { return this._shadowRoot ?? null; } },
+  assignedSlot: { get() { return null; } },
+  hidden: flag("hidden"),
+  inert: flag("inert"),
+  autofocus: flag("autofocus"),
+  title: reflect("title"),
+  dir: reflect("dir"),
+  lang: reflect("lang"),
+  slot: reflect("slot"),
+  accessKey: reflect("accesskey"),
+  draggable: { get() { return this.getAttribute("draggable") === "true"; }, set(value) { this.setAttribute("draggable", String(Boolean(value))); } },
+  spellcheck: { get() { return this.getAttribute("spellcheck") !== "false"; }, set(value) { this.setAttribute("spellcheck", String(Boolean(value))); } },
+  translate: { get() { return this.getAttribute("translate") !== "no"; }, set(value) { this.setAttribute("translate", value ? "yes" : "no"); } },
+  popover: { get() { return this.getAttribute("popover"); }, set(value) { if (value == null) this.removeAttribute("popover"); else this.setAttribute("popover", String(value)); } },
+  part: { get() { return this.classList; } },
+};
+for (const prototype of [CoreNode.prototype, SvgElement.prototype]) {
+  for (const [name, value] of Object.entries(elementMethods)) {
+    if (!(name in prototype)) Object.defineProperty(prototype, name, { value, writable: true, configurable: true });
+  }
+  for (const [name, descriptor] of Object.entries(elementProperties2)) {
+    // A read-only one a node sets for itself (as an svg its namespaceURI) becomes its own.
+    const set = descriptor.set ?? function (value) { Object.defineProperty(this, name, { value, writable: true, configurable: true }); };
+    if (!(name in prototype)) Object.defineProperty(prototype, name, { ...descriptor, set, configurable: true });
+  }
+}
+// Text has its own text; what it lacks of an element's character-data surface.
+for (const [name, descriptor] of Object.entries({
+  wholeText: { get() { return this.data ?? this.textContent ?? ""; } },
+})) {
+  if (!(name in CoreText.prototype)) Object.defineProperty(CoreText.prototype, name, { ...descriptor, configurable: true });
+}
+
+class FinishedAnimation extends OuterTarget {
+  constructor(effectTarget, options) {
+    super();
+    this.effect = { target: effectTarget, getTiming: () => ({ ...(typeof options === "number" ? { duration: options } : options) }) };
+    this.id = typeof options === "object" && options?.id ? String(options.id) : "";
+    this.playState = "running";
+    this.currentTime = 0;
+    this.startTime = 0;
+    this.playbackRate = 1;
+    this.pending = false;
+    this.onfinish = null;
+    this.oncancel = null;
+    this.finished = new Promise((resolve) => { this._resolve = resolve; });
+    this.ready = Promise.resolve(this);
+  }
+  _end() {
+    if (this.playState !== "running") return;
+    this.playState = "finished";
+    this._resolve(this);
+    const event = new global.Event("finish");
+    this.onfinish?.(event);
+    this.dispatchEvent(event);
+  }
+  finish() { this._end(); }
+  cancel() {
+    if (this.playState === "idle") return;
+    this.playState = "idle";
+    const event = new global.Event("cancel");
+    this.oncancel?.(event);
+    this.dispatchEvent(event);
+  }
+  play() {}
+  pause() {}
+  reverse() {}
+  persist() {}
+  commitStyles() {}
+  updatePlaybackRate(rate) { this.playbackRate = rate; }
+}
+
+function domError(name, message) {
+  return global.DOMException ? new global.DOMException(message, name) : Object.assign(new Error(message), { name });
+}
+
 // Classes for `instanceof`, by what a node is. Their prototypes are the nodes', so a library
 // that adds to `HTMLElement.prototype` adds to every node.
 function nodeClass(name, prototype, test) {
@@ -416,6 +687,78 @@ function nodeClass(name, prototype, test) {
   Object.defineProperty(Class, Symbol.hasInstance, { value: (value) => value != null && typeof value === "object" && test(value) });
   return Class;
 }
+// Custom elements: `class X extends HTMLElement` makes a node of the tag it is defined as,
+// with X's prototype. Connection and observed attributes reach its callbacks through a
+// MutationObserver on the document, so they come a microtask after the change.
+let customWatcher = null;
+function customElementBase(Base) {
+  const HTMLElement = function HTMLElement() {
+    const tag = new.target && customClasses.get(new.target);
+    if (!tag) return Base();
+    const node = createElement("div");
+    Object.defineProperty(node, "localName", { value: tag, configurable: true });
+    Object.defineProperty(node, "tagName", { value: tag.toUpperCase(), configurable: true });
+    Object.setPrototypeOf(node, new.target.prototype);
+    watchCustom(node, new.target);
+    return node;
+  };
+  Object.defineProperty(HTMLElement, "prototype", { value: CoreNode.prototype, writable: false });
+  Object.defineProperty(HTMLElement, Symbol.hasInstance, { value: (value) => Base[Symbol.hasInstance](value) });
+  return HTMLElement;
+}
+function watchCustom(node, Class) {
+  customWatcher ??= new MutationObserver((records) => {
+    for (const record of records) {
+      if (record.type === "attributes") {
+        const node = record.target;
+        node.attributeChangedCallback?.(record.attributeName, record.oldValue, node.getAttribute(record.attributeName));
+        continue;
+      }
+      for (const added of record.addedNodes) forCustom(added, (node) => node.isConnected && connect(node, true));
+      for (const removed of record.removedNodes) forCustom(removed, (node) => !node.isConnected && connect(node, false));
+    }
+  });
+  customWatcher.observe(documentElement, { childList: true, subtree: true });
+  const observed = Class.observedAttributes;
+  if (Array.isArray(observed) && observed.length && typeof node.attributeChangedCallback === "function") {
+    customWatcher.observe(node, { attributes: true, attributeOldValue: true, attributeFilter: observed.map(String) });
+  }
+}
+const connected = new WeakSet();
+function connect(node, on) {
+  if (on === connected.has(node)) return;
+  if (on) { connected.add(node); node.connectedCallback?.(); } else { connected.delete(node); node.disconnectedCallback?.(); }
+}
+function forCustom(node, run) {
+  if (node == null || node.nodeType !== 1) return;
+  if (customClasses.has(node.constructor)) run(node);
+  for (const child of node.childNodes ?? []) forCustom(child, run);
+}
+const customElements = {
+  define(name, Class, _options) {
+    name = String(name);
+    if (!/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(name)) throw domError("SyntaxError", "'" + name + "' is not a valid custom element name");
+    if (customTags.has(name)) throw domError("NotSupportedError", "'" + name + "' is already defined");
+    customTags.set(name, Class);
+    customClasses.set(Class, name);
+    customWaits.get(name)?.resolve(Class);
+  },
+  get: (name) => customTags.get(String(name)),
+  getName: (Class) => customClasses.get(Class) ?? null,
+  whenDefined(name) {
+    name = String(name);
+    if (customTags.has(name)) return Promise.resolve(customTags.get(name));
+    let wait = customWaits.get(name);
+    if (!wait) {
+      let resolve;
+      const promise = new Promise((done) => { resolve = done; });
+      customWaits.set(name, wait = { promise, resolve });
+    }
+    return wait.promise;
+  },
+  upgrade() {},
+};
+
 const isSvg = (value) => value instanceof Svg || value instanceof SvgElement;
 const isTreeElement = (value) => value instanceof CoreNode && value.nodeType === 1;
 const isHtml = (value) => isTreeElement(value) && !(value instanceof Svg);
@@ -424,7 +767,7 @@ const classes = {
   EventTarget: null,
   Node: nodeClass("Node", CoreNode.prototype, (value) => value instanceof CoreNode || value instanceof SvgElement || value instanceof SvgText || value === documentTarget),
   Element: nodeClass("Element", CoreNode.prototype, (value) => isTreeElement(value) || value instanceof SvgElement),
-  HTMLElement: nodeClass("HTMLElement", CoreNode.prototype, isHtml),
+  HTMLElement: customElementBase(nodeClass("HTMLElement", CoreNode.prototype, isHtml)),
   SVGElement: nodeClass("SVGElement", SvgElement.prototype, isSvg),
   SVGSVGElement: nodeClass("SVGSVGElement", Svg.prototype, (value) => value instanceof Svg),
   CharacterData: nodeClass("CharacterData", CoreText.prototype, (value) => value instanceof CoreText || value instanceof SvgText),
@@ -481,6 +824,122 @@ for (const [name, value] of Object.entries({
 })) {
   if (global[name] === undefined) define(name, value);
 }
+// The UI event classes, for events an app makes and dispatches (`el.dispatchEvent(new
+// KeyboardEvent("keydown", { key }))`) and for `instanceof` tests.
+const BaseEvent = global.Event;
+const uiEventFields = { view: null, detail: 0, which: 0 };
+const modifierFields = { altKey: false, ctrlKey: false, metaKey: false, shiftKey: false };
+const mouseFields = { ...modifierFields, screenX: 0, screenY: 0, clientX: 0, clientY: 0, pageX: 0, pageY: 0, offsetX: 0, offsetY: 0, movementX: 0, movementY: 0, x: 0, y: 0, button: 0, buttons: 0, relatedTarget: null };
+function eventClass(name, Parent, fields) {
+  const Class = class extends Parent {
+    constructor(type, init = {}) {
+      super(type, init);
+      for (const [field, fallback] of Object.entries(fields)) {
+        if (!Object.prototype.hasOwnProperty.call(this, field)) Object.defineProperty(this, field, { value: init?.[field] ?? fallback, enumerable: true, configurable: true });
+      }
+    }
+  };
+  Object.defineProperty(Class, "name", { value: name });
+  return Class;
+}
+const UIEvent = global.UIEvent ?? eventClass("UIEvent", BaseEvent, uiEventFields);
+const MouseEvent = global.MouseEvent ?? eventClass("MouseEvent", UIEvent, mouseFields);
+if (!MouseEvent.prototype.getModifierState) MouseEvent.prototype.getModifierState = function (key) { return Boolean(this[{ Alt: "altKey", Control: "ctrlKey", Meta: "metaKey", Shift: "shiftKey" }[key]]); };
+const KeyboardEvent = global.KeyboardEvent ?? eventClass("KeyboardEvent", UIEvent, { ...modifierFields, key: "", code: "", location: 0, repeat: false, isComposing: false, charCode: 0, keyCode: 0 });
+if (!KeyboardEvent.prototype.getModifierState) KeyboardEvent.prototype.getModifierState = MouseEvent.prototype.getModifierState;
+const eventClasses = {
+  UIEvent,
+  MouseEvent,
+  KeyboardEvent,
+  FocusEvent: global.FocusEvent ?? eventClass("FocusEvent", UIEvent, { relatedTarget: null }),
+  PointerEvent: global.PointerEvent ?? eventClass("PointerEvent", MouseEvent, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: "mouse", isPrimary: true }),
+  WheelEvent: global.WheelEvent ?? eventClass("WheelEvent", MouseEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }),
+  DragEvent: global.DragEvent ?? eventClass("DragEvent", MouseEvent, { dataTransfer: null }),
+  InputEvent: global.InputEvent ?? eventClass("InputEvent", UIEvent, { data: null, inputType: "", isComposing: false, dataTransfer: null }),
+  TouchEvent: global.TouchEvent ?? eventClass("TouchEvent", UIEvent, { ...modifierFields, touches: [], targetTouches: [], changedTouches: [] }),
+  AnimationEvent: global.AnimationEvent ?? eventClass("AnimationEvent", BaseEvent, { animationName: "", elapsedTime: 0, pseudoElement: "" }),
+  TransitionEvent: global.TransitionEvent ?? eventClass("TransitionEvent", BaseEvent, { propertyName: "", elapsedTime: 0, pseudoElement: "" }),
+  ErrorEvent: global.ErrorEvent ?? eventClass("ErrorEvent", BaseEvent, { message: "", filename: "", lineno: 0, colno: 0, error: null }),
+  ProgressEvent: global.ProgressEvent ?? eventClass("ProgressEvent", BaseEvent, { lengthComputable: false, loaded: 0, total: 0 }),
+  StorageEvent: global.StorageEvent ?? eventClass("StorageEvent", BaseEvent, { key: null, oldValue: null, newValue: null, url: "", storageArea: null }),
+  PageTransitionEvent: global.PageTransitionEvent ?? eventClass("PageTransitionEvent", BaseEvent, { persisted: false }),
+};
+for (const [name, value] of Object.entries(eventClasses)) if (global[name] === undefined) define(name, value);
+
+// Markup to nodes and back: an HTML or SVG string becomes a document whose root is the parsed
+// element, as `DOMParser` gives.
+class DOMParser {
+  parseFromString(markup, type = "text/html") {
+    const holder = createElement("div");
+    holder.innerHTML = String(markup).replace(/^\s*<\?xml[^>]*\?>/, "").replace(/<!DOCTYPE[^>]*>/i, "");
+    const html = !/xml|svg/.test(String(type));
+    const rootElement = html ? holder : holder.firstElementChild ?? holder;
+    return {
+      documentElement: rootElement,
+      body: html ? holder : null,
+      head: null,
+      querySelector: (selector) => holder.querySelector(selector),
+      querySelectorAll: (selector) => holder.querySelectorAll(selector),
+      getElementsByTagName: (tag) => holder.querySelectorAll(tag),
+      getElementById: (id) => holder.querySelector("#" + cssEscape(String(id))),
+      createElement: (tag) => createElement(tag),
+      importNode: (node, deep) => node.cloneNode(deep),
+    };
+  }
+}
+class XMLSerializer {
+  serializeToString(node) {
+    return node?.outerHTML ?? node?.documentElement?.outerHTML ?? node?.textContent ?? "";
+  }
+}
+// `FileReader` over the runtime's `Blob`.
+class FileReader extends OuterTarget {
+  static EMPTY = 0;
+  static LOADING = 1;
+  static DONE = 2;
+  readyState = 0;
+  result = null;
+  error = null;
+  onload = null;
+  onloadend = null;
+  onerror = null;
+  onloadstart = null;
+  onprogress = null;
+  onabort = null;
+  #read(blob, as) {
+    this.readyState = 1;
+    this.#fire("loadstart");
+    Promise.resolve()
+      .then(async () => {
+        if (as === "text") return blob.text();
+        const buffer = await blob.arrayBuffer();
+        if (as === "buffer") return buffer;
+        if (as === "binary") return String.fromCharCode(...new Uint8Array(buffer));
+        let binary = "";
+        for (const byte of new Uint8Array(buffer)) binary += String.fromCharCode(byte);
+        return "data:" + (blob.type || "application/octet-stream") + ";base64," + btoa(binary);
+      })
+      .then(
+        (result) => { this.result = result; this.readyState = 2; this.#fire("load"); this.#fire("loadend"); },
+        (error) => { this.error = error; this.readyState = 2; this.#fire("error"); this.#fire("loadend"); },
+      );
+  }
+  #fire(type) {
+    const event = new global.Event(type);
+    this["on" + type]?.call(this, event);
+    this.dispatchEvent(event);
+  }
+  readAsText(blob) { this.#read(blob, "text"); }
+  readAsArrayBuffer(blob) { this.#read(blob, "buffer"); }
+  readAsDataURL(blob) { this.#read(blob, "data"); }
+  readAsBinaryString(blob) { this.#read(blob, "binary"); }
+  abort() { this.readyState = 2; this.#fire("abort"); }
+}
+for (const [name, value] of Object.entries({ customElements, DOMParser, XMLSerializer, FileReader, CSSStyleSheet: core.CSSStyleSheet })) {
+  if (value && global[name] === undefined) define(name, value);
+}
+global.isSecureContext ??= true;
+if (global.origin === undefined) Object.defineProperty(global, "origin", { get: () => location.origin, configurable: true });
 if (global.CSS === undefined) define("CSS", { supports: (...args) => supports(...args), escape: (value) => cssEscape(String(value)) });
 global.getSelection ??= getSelection;
 global.DOMRectReadOnly ??= DOMRect;
