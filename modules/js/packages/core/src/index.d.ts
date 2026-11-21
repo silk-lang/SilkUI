@@ -857,6 +857,8 @@ export class WebViewEvent {
   readonly title?: string;
   readonly ok?: boolean;
   readonly error?: string;
+  /** `loadend`: the Chromium net error of a failed load (`-105` name not resolved, ...), 0 when it loaded. */
+  readonly errorCode?: number;
   readonly progress?: number;
   readonly canGoBack?: boolean;
   readonly canGoForward?: boolean;
