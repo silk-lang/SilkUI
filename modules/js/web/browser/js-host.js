@@ -35,6 +35,21 @@ const ATTRIBUTES = new Set([
   'element', 'tabIndex', 'disabled', 'focusTrap', 'multiline', 'readOnly', 'checked', 'selected', 'expanded',
   'indeterminate', 'label', 'testId', 'inert', 'id', 'class', 'className', 'lang', 'dir', 'placeholder', 'href', 'transition', 'cursor',
 ]);
+// HTML attributes the tree keeps as text for selectors (ui-protocol's `isHtmlAttribute`).
+for (const name of [
+  'abbr', 'accept', 'accept-charset', 'accesskey', 'action', 'align', 'allow', 'allowfullscreen', 'async',
+  'autocapitalize', 'autocomplete', 'autocorrect', 'autofocus', 'autoplay', 'bgcolor', 'border', 'charset',
+  'cite', 'color', 'cols', 'content', 'contenteditable', 'controls', 'coords', 'crossorigin', 'datetime',
+  'decoding', 'default', 'defer', 'dirname', 'download', 'draggable', 'enctype', 'enterkeyhint', 'face',
+  'for', 'form', 'formaction', 'formmethod', 'formnovalidate', 'formtarget', 'frameborder', 'headers',
+  'height', 'hidden', 'high', 'hreflang', 'http-equiv', 'inputmode', 'integrity', 'is', 'itemprop',
+  'itemscope', 'itemtype', 'kind', 'list', 'loading', 'loop', 'low', 'max', 'maxlength', 'media', 'method',
+  'min', 'minlength', 'multiple', 'muted', 'name', 'nomodule', 'novalidate', 'open', 'optimum', 'pattern',
+  'ping', 'playsinline', 'popover', 'popovertarget', 'poster', 'preload', 'referrerpolicy', 'rel',
+  'required', 'reversed', 'rows', 'sandbox', 'scope', 'scrolling', 'shape', 'size', 'sizes', 'slot',
+  'spellcheck', 'srcdoc', 'srclang', 'srcset', 'step', 'summary', 'target', 'title', 'translate', 'type',
+  'usemap', 'valign', 'width', 'wrap', 'xmlns', 'part', 'nowrap',
+]) ATTRIBUTES.add(name);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

@@ -52,3 +52,7 @@ export interface WebViewProps {
 
 /** A box with a real browser page over it (see @silkui/core `createWebView`). */
 export function WebView(props: WebViewProps): import("react").ReactElement;
+/** Renders `children` into `container`, a @silkui/core node elsewhere in the tree. */
+export function createPortal(children: ReactNode, container: Node, key?: string | null): ReactNode;
+
+export { createElement } from "react";

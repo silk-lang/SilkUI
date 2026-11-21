@@ -37,6 +37,8 @@ function eachLiveRange(update) {
 }
 
 const CLICK = KIND_OF.get("click");
+const FOCUS = KIND_OF.get("focus");
+const BLUR = KIND_OF.get("blur");
 const SELECTION_CHANGE = KIND_OF.get("selectionchange");
 const TOUCH_START = KIND_OF.get("touchstart");
 const COPY = KIND_OF.get("copy");
@@ -78,6 +80,10 @@ const UNITLESS = new Set([
 ]);
 
 const nodes = new Map();
+// HTML boolean attributes that are also the tree's own.
+const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline"]);
+// The tag stylesheets match a tree node by, by its kind (see ui-tree's `SelectorTree`).
+const LOCAL_NAMES = { box: "div", input: "input", image: "img", canvas: "canvas", svg: "svg", text: "#text" };
 const NO_CHILDREN = Object.freeze([]);
 let nextId = 0;
 
@@ -92,6 +98,68 @@ function cssName(name) {
     CSS_NAMES.set(name, css);
   }
   return css;
+}
+
+// A CSS name as the camel case name looks take: `background-color` is `backgroundColor`,
+// `-webkit-line-clamp` is `WebkitLineClamp`; custom properties stay as they are.
+function camelName(name) {
+  if (name.startsWith("--") || !name.includes("-")) return name;
+  return name.replace(/^-ms-/, "ms-").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+// `color: red; --gap: 4px` as camel case properties. Semicolons inside parentheses or
+// quotes (`url("a;b")`) stay in their value.
+function parseDeclarations(text) {
+  const properties = {};
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  const take = (end) => {
+    const part = text.slice(start, end);
+    const colon = part.indexOf(":");
+    if (colon > 0) {
+      const name = part.slice(0, colon).trim();
+      const value = part.slice(colon + 1).trim();
+      if (name && value) properties[camelName(name.startsWith("--") ? name : name.toLowerCase())] = value;
+    }
+    start = end + 1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === ";" && depth <= 0) take(i);
+  }
+  take(text.length);
+  return properties;
+}
+
+// `element.style` of an HTML element: the base look, whose CSS properties also read and write
+// as fields (`style.height = "10px"`), as a CSSStyleDeclaration's do.
+const styleProxies = new WeakMap();
+function styleProxy(look) {
+  let proxy = styleProxies.get(look);
+  if (proxy) return proxy;
+  proxy = new Proxy(look, {
+    get(target, key) {
+      if (typeof key !== "string" || key in target) {
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return target.get(key) ?? "";
+    },
+    set(target, key, value) {
+      if (typeof key !== "string" || key in target) return Reflect.set(target, key, value, target);
+      target.set({ [key]: value });
+      return true;
+    },
+  });
+  styleProxies.set(look, proxy);
+  return proxy;
 }
 
 // The tree names font family lists by number: each `fontFamily` text is defined once, as a
@@ -193,6 +261,41 @@ class Look {
     let css = "";
     for (const name in this.#values) css += cssName(name) + ":" + cssValue(name, this.#values[name]) + ";";
     return css;
+  }
+
+  /** Replaces the look with declarations in CSS text, as `element.style.cssText`. */
+  set cssText(text) {
+    this.replace(parseDeclarations(String(text ?? "")));
+  }
+
+  get length() {
+    return Object.keys(this.#values).length;
+  }
+
+  item(index) {
+    const name = Object.keys(this.#values)[index];
+    return name === undefined ? "" : cssName(name);
+  }
+
+  // CSSStyleDeclaration's methods, which take CSS names (`background-color`, `--gap`).
+  setProperty(name, value, priority) {
+    const text = value === null || value === undefined ? "" : String(value) + (priority === "important" ? " !important" : "");
+    this.set({ [camelName(String(name))]: text });
+  }
+
+  removeProperty(name) {
+    const camel = camelName(String(name));
+    const old = this.get(camel) ?? "";
+    this.set({ [camel]: null });
+    return old;
+  }
+
+  getPropertyValue(name) {
+    return this.get(camelName(String(name))) ?? "";
+  }
+
+  getPropertyPriority() {
+    return "";
   }
 
   _copyTo(look) {
@@ -486,6 +589,30 @@ export class Node {
     return 1;
   }
 
+  /**
+   * The element's tag: the HTML tag it was made with (see `createElement`), or for a tree
+   * node the tag stylesheets match it by (`div` for a box).
+   */
+  get localName() {
+    return this._tag ?? LOCAL_NAMES[this.kind] ?? "div";
+  }
+
+  set localName(value) {
+    this._tag = String(value);
+  }
+
+  /** The tag in upper case for HTML elements, as in the DOM. */
+  get tagName() {
+    const name = this.localName;
+    return this.namespaceURI === undefined ? name.toUpperCase() : name;
+  }
+
+  set tagName(_value) {}
+
+  get nodeName() {
+    return this.tagName;
+  }
+
   hasChildNodes() {
     return this.childNodes.length > 0;
   }
@@ -628,11 +755,12 @@ export class Node {
    * `node.style = { ... }` replaces the look.
    */
   get style() {
-    return this.look("base");
+    return this._tag === undefined ? this.look("base") : styleProxy(this.look("base"));
   }
 
   set style(properties) {
-    this.look("base").replace(properties);
+    if (typeof properties === "string") this.look("base").cssText = properties;
+    else this.look("base").replace(properties);
   }
 
   /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
@@ -668,11 +796,33 @@ export class Node {
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
+
+  getAttributeNames() {
+    const names = this.#className === null ? [] : ["class"];
+    for (const name of this.#rare?.attributes?.keys() ?? []) names.push(name);
+    return names;
+  }
+
+  /** The children as HTML; setting it replaces them with nodes parsed from HTML. */
+  get innerHTML() {
+    let html = "";
+    for (const child of this.childNodes) html += markupOf(child);
+    return html;
+  }
+
+  set innerHTML(html) {
+    for (const child of this.childNodes.slice()) child.destroy();
+    parseHTML(String(html ?? ""), this);
+  }
+
+  get outerHTML() {
+    return markupOf(this);
+  }
   removeAttribute(name) { this.setAttribute(name, null); }
 
   setAttribute(name, value) {
     name = String(name);
-    const text = value == null ? null : String(value);
+    let text = value == null ? null : String(value);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
@@ -692,6 +842,20 @@ export class Node {
       else warnOnce("only an image has a src: it is ignored");
     } else if (name === "alt") {
       native.attribute(this.nodeId, "label", text ?? "");
+    } else if (this._tag !== undefined && (name === "tabindex" || name === "tabIndex")) {
+      this._keep("focus", "blur");
+      native.attribute(this.nodeId, "tabIndex", text === null ? -2147483648 : Number(text));
+    } else if (this._tag !== undefined && name === "style") {
+      this.style.cssText = text ?? "";
+    } else if (this._tag !== undefined && BOOLEAN_TREE_ATTRIBUTES.has(name)) {
+      // An HTML boolean attribute is on whatever its text, `disabled=""` included.
+      const on = value !== null && value !== undefined && value !== false;
+      text = on ? "" : null;
+      if (name === "checked" && "checked" in this) this.checked = on;
+      else native.attribute(this.nodeId, name === "readonly" ? "readOnly" : name, on);
+    } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
+      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`).
+      native.attribute(this.nodeId, name, text);
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -727,7 +891,7 @@ export class Node {
     const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
     if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
-    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
+    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
     return [wanted, 1 << kind];
   }
@@ -944,6 +1108,10 @@ export class Text extends Node {
 
   get nodeType() {
     return 3;
+  }
+
+  get nodeName() {
+    return "#text";
   }
 
   get nodeValue() {
@@ -1820,8 +1988,6 @@ export class Svg extends Node {
     // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
     super("icon");
     this.kind = "svg";
-    this.localName = "svg";
-    this.tagName = "svg";
     this.namespaceURI = SVG_NAMESPACE;
     svgChanged(this);
   }
@@ -2322,6 +2488,278 @@ export function createNode(kind) {
   if (kind === "image") return new Image();
   if (kind === "canvas") return new Canvas();
   return new Node(kind);
+}
+
+// `<input>` types that are not a text field.
+const BOX_INPUTS = new Set(["checkbox", "radio", "range", "color", "file", "hidden", "submit", "button", "reset", "image"]);
+// Tags that take focus without a tabindex, as on the web.
+const FOCUSABLE_TAGS = new Set(["button", "select", "summary", "iframe"]);
+
+/**
+ * `<input type="checkbox">` and `type="radio"`: a box a click checks, as on the web. It fires
+ * `input` and `change` when the click changes it.
+ */
+export class CheckInput extends Node {
+  #checked = false;
+
+  constructor(type = "checkbox") {
+    super("box");
+    this._tag = "input";
+    this.type = type;
+    this.value = "on";
+    this.defaultChecked = false;
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", type);
+    native.attribute(this.nodeId, "role", type === "radio" ? "radio" : "checkbox");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur");
+    this._relisten();
+  }
+
+  _shallowClone() {
+    const copy = new CheckInput(this.type);
+    copy.checked = this.#checked;
+    return copy;
+  }
+
+  get name() {
+    return this.getAttribute("name") ?? "";
+  }
+
+  get checked() {
+    return this.#checked;
+  }
+
+  set checked(value) {
+    value = !!value;
+    if (value === this.#checked) return;
+    this.#checked = value;
+    native.attribute(this.nodeId, "checked", value);
+    if (value && this.type === "radio" && this.name) {
+      let top = this;
+      while (top.parentNode) top = top.parentNode;
+      eachDescendant(top, (node) => {
+        if (node !== this && node instanceof CheckInput && node.type === "radio" && node.name === this.name) node.checked = false;
+      });
+    }
+  }
+
+  _activate() {
+    if (this.hasAttribute("disabled")) return true;
+    if (this.type === "radio" && this.#checked) return true;
+    this.checked = this.type === "radio" ? true : !this.#checked;
+    const input = new Event("input", this);
+    input.bubbles = true;
+    dispatchEvent(input);
+    const change = new Event("change", this);
+    change.bubbles = true;
+    dispatchEvent(change);
+    return true;
+  }
+}
+
+function eachDescendant(node, visit) {
+  for (const child of node.childNodes) {
+    visit(child);
+    if (child.childNodes.length) eachDescendant(child, visit);
+  }
+}
+
+function findById(id) {
+  for (const node of nodes.values()) if (node._elementId === id && (node.parentNode || node === rootNode)) return node;
+  return null;
+}
+
+// What a click on a label, summary or submit button does (see `activate`).
+function labelActivate() {
+  const id = this.getAttribute("for");
+  let control = id ? findById(id) : null;
+  if (!control) eachDescendant(this, (node) => {
+    if (!control && (node instanceof Input || node instanceof CheckInput)) control = node;
+  });
+  if (!control) return false;
+  if (control instanceof CheckInput) control._activate();
+  else control.focus();
+  return true;
+}
+
+function summaryActivate() {
+  const details = this.parentNode;
+  if (details?.localName !== "details") return false;
+  details.setAttribute("open", details.hasAttribute("open") ? null : "");
+  const toggle = new Event("toggle", details);
+  dispatchEvent(toggle);
+  return true;
+}
+
+function buttonActivate() {
+  if (this.hasAttribute("disabled")) return true;
+  const type = this.getAttribute("type") ?? "submit";
+  if (type !== "submit" && type !== "reset") return false;
+  let form = this.parentNode;
+  while (form && form.localName !== "form") form = form.parentNode;
+  if (!form) return false;
+  const event = new Event(type, form);
+  event.bubbles = true;
+  event.cancelable = true;
+  event.submitter = this;
+  dispatchEvent(event);
+  return true;
+}
+
+/**
+ * The node for HTML element `tag`, as `document.createElement` makes it: `<input>` and
+ * `<textarea>` are text fields (an `<input>` whose `type` is not a text field's is a box),
+ * `<img>` an image, `<canvas>` a canvas, `<svg>` inline SVG, and every other tag a box the
+ * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
+ * `@silkui/react`. `localName` and `tagName` give the tag.
+ */
+export function createElement(tag, options) {
+  tag = String(tag).toLowerCase();
+  const type = String(options?.type ?? "text").toLowerCase();
+  let node;
+  if (tag === "svg") return new Svg();
+  if (tag === "input" && (type === "checkbox" || type === "radio")) return new CheckInput(type);
+  if (tag === "input" && !BOX_INPUTS.has(type)) node = new Input();
+  else if (tag === "textarea") node = new Input();
+  else if (tag === "img") node = new Image();
+  else if (tag === "canvas") node = new Canvas();
+  else node = new Node("box");
+  node._tag = tag;
+  native.attribute(node.nodeId, "element", tag);
+  if (tag === "textarea") native.attribute(node.nodeId, "multiline", true);
+  if (tag === "input" && type !== "text") native.attribute(node.nodeId, "type", type);
+  if (node instanceof Input || FOCUSABLE_TAGS.has(tag)) {
+    if (!(node instanceof Input)) native.attribute(node.nodeId, "tabIndex", 0);
+    node._keep("focus", "blur");
+  }
+  if (tag === "label") node._activate = labelActivate;
+  else if (tag === "summary") node._activate = summaryActivate;
+  else if (tag === "button") node._activate = buttonActivate;
+  if (node._activate) node._relisten();
+  return node;
+}
+
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+// Elements whose content is not markup. Scripts and styles in parsed HTML are left out.
+const RAW_TAGS = new Set(["script", "style", "textarea", "title"]);
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", copy: "©", reg: "®", hellip: "…", mdash: "—", ndash: "–", laquo: "«", raquo: "»", times: "×", middot: "·", bull: "•" };
+const ATTRIBUTE = /\s*([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/y;
+
+function decodeEntities(text) {
+  if (!text.includes("&")) return text;
+  return text.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (whole, name) => {
+    if (name[0] === "#") {
+      const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+    }
+    return ENTITIES[name] ?? whole;
+  });
+}
+
+const escapeText = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/ /g, "&nbsp;");
+const escapeAttribute = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+
+function markupOf(node) {
+  if (node.nodeType === 3) return escapeText(node.data);
+  if (node instanceof Svg || node instanceof SvgElement) return node.outerHTML ?? node._markup();
+  if (node.nodeType === 11) return node.innerHTML;
+  const tag = node.localName;
+  let html = "<" + tag;
+  for (const name of node.getAttributeNames()) if (name !== "style") html += " " + name + '="' + escapeAttribute(node.getAttribute(name)) + '"';
+  const css = node.look("base").cssText;
+  if (css) html += ' style="' + escapeAttribute(css) + '"';
+  html += ">";
+  if (VOID_TAGS.has(tag)) return html;
+  if (node instanceof Input) html += escapeText(node.value);
+  else html += node.innerHTML;
+  return html + "</" + tag + ">";
+}
+
+/**
+ * Parses `html` and appends its nodes to `parent`, as `innerHTML` does: elements, text with
+ * character references, and `<svg>` markup. Comments, scripts and styles are left out.
+ */
+export function parseHTML(html, parent) {
+  const stack = [parent];
+  const top = () => stack[stack.length - 1];
+  const inSvg = () => top() instanceof Svg || top() instanceof SvgElement;
+  let i = 0;
+  const text = (data) => {
+    if (!data) return;
+    const value = decodeEntities(data);
+    top().appendChild(inSvg() ? new SvgText(value) : createText(value));
+  };
+  while (i < html.length) {
+    const open = html.indexOf("<", i);
+    if (open < 0) {
+      text(html.slice(i));
+      break;
+    }
+    text(html.slice(i, open));
+    if (html.startsWith("<!--", open)) {
+      const end = html.indexOf("-->", open + 4);
+      i = end < 0 ? html.length : end + 3;
+      continue;
+    }
+    if (html[open + 1] === "!" || html[open + 1] === "?") {
+      const end = html.indexOf(">", open);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    if (html[open + 1] === "/") {
+      const end = html.indexOf(">", open);
+      const name = html.slice(open + 2, end < 0 ? html.length : end).trim().toLowerCase();
+      i = end < 0 ? html.length : end + 1;
+      for (let at = stack.length - 1; at > 0; at--) {
+        if (stack[at].localName.toLowerCase() === name) {
+          stack.length = at;
+          break;
+        }
+      }
+      continue;
+    }
+    const nameMatch = /^[a-zA-Z][^\s\/>]*/.exec(html.slice(open + 1, open + 64));
+    if (!nameMatch) {
+      text("<");
+      i = open + 1;
+      continue;
+    }
+    const written = nameMatch[0];
+    const tag = inSvg() ? written : written.toLowerCase();
+    let at = open + 1 + written.length;
+    const attributes = [];
+    ATTRIBUTE.lastIndex = at;
+    for (let match; (match = ATTRIBUTE.exec(html)); ATTRIBUTE.lastIndex = at) {
+      at = ATTRIBUTE.lastIndex;
+      attributes.push([match[1], decodeEntities(match[2] ?? match[3] ?? match[4] ?? "")]);
+    }
+    while (at < html.length && html[at] !== ">") at++;
+    const selfClosing = html[at - 1] === "/";
+    i = at + 1;
+    if (RAW_TAGS.has(tag)) {
+      const close = html.toLowerCase().indexOf("</" + tag, i);
+      const content = html.slice(i, close < 0 ? html.length : close);
+      const end = close < 0 ? html.length : html.indexOf(">", close);
+      i = end < 0 ? html.length : end + 1;
+      if (tag === "script" || tag === "style") continue;
+      const node = createElement(tag);
+      for (const [name, value] of attributes) node.setAttribute(name, value);
+      if (tag === "textarea") node.value = decodeEntities(content);
+      else node.appendChild(createText(decodeEntities(content)));
+      top().appendChild(node);
+      continue;
+    }
+    const svg = inSvg() || tag === "svg";
+    const type = attributes.find(([name]) => name.toLowerCase() === "type")?.[1];
+    const node = svg ? createSvgElement(tag) : createElement(tag, { type });
+    for (const [name, value] of attributes) {
+      if (!svg && name.toLowerCase() === "value" && node instanceof Input) node.value = value;
+      else node.setAttribute(svg ? name : name.toLowerCase(), value);
+    }
+    top().appendChild(node);
+    if (!selfClosing && !(VOID_TAGS.has(tag) && !svg)) stack.push(node);
+  }
 }
 
 /** A box with `style` as its base look and `children` appended. */
@@ -3614,8 +4052,10 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (!target) return false;
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
+  if (kind === FOCUS) focusing(target);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
+  if (kind === FOCUS || kind === BLUR) event.relatedTarget = kind === FOCUS ? blurredNode : null;
   const live = target instanceof Svg && target._live && isPointerKind(kind);
   if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
   // A live svg sends pointer records on to the element under the pointer.
@@ -3625,7 +4065,12 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
     dispatchEvent(event);
     prevented = event.defaultPrevented;
   }
-  if (kind === CLICK && !prevented) follow(target);
+  if (kind === FOCUS) {
+    focusEvent("focusin", target, blurredNode);
+    blurredNode = null;
+  }
+  else if (kind === BLUR) blurring(target);
+  if (kind === CLICK && !prevented && !activate(target)) follow(target);
   if (kind !== CLICK && isPointerKind(kind)) {
     if (event.pointerType !== "touch") compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target);
     // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
@@ -3682,6 +4127,57 @@ function writeClipboard(data) {
     ? clipboard.writeText(item["text/plain"] ?? "")
     : clipboard.write([new globalThis.ClipboardItem(item)]);
   Promise.resolve(written).catch(reportError);
+}
+
+// The focused node, as far as focus and blur records tell (HTML elements that can take focus
+// listen for both: see `createElement`).
+let focusedNode = null;
+// The node a blur record left, until the focus record that follows it.
+let blurredNode = null;
+let pendingFocusOut = null;
+
+/** The focused node, or null. */
+export function activeElement() {
+  return focusedNode?.parentNode || focusedNode === rootNode ? focusedNode : null;
+}
+
+function focusEvent(type, target, relatedTarget) {
+  const event = new Event(type, target);
+  event.bubbles = true;
+  event.relatedTarget = relatedTarget;
+  dispatchEvent(event);
+}
+
+// `focusout` waits for the focus record that follows a blur, so its `relatedTarget` is where
+// focus went, as on the web; with none, it goes out on its own.
+function blurring(target) {
+  if (focusedNode === target) focusedNode = null;
+  blurredNode = target;
+  pendingFocusOut = target;
+  queueMicrotask(() => {
+    if (pendingFocusOut !== target) return;
+    pendingFocusOut = null;
+    blurredNode = null;
+    focusEvent("focusout", target, null);
+  });
+}
+
+function focusing(target) {
+  focusedNode = target;
+  const left = pendingFocusOut;
+  pendingFocusOut = null;
+  if (left) focusEvent("focusout", left, target);
+  else blurredNode = null;
+}
+
+// HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its
+// control, a summary opens its details, a submit button submits its form. True when one ran.
+function activate(target) {
+  for (let node = target; node; node = node.parentNode) {
+    if (node._activate) return node._activate() !== false;
+    if (node._href) return false;
+  }
+  return false;
 }
 
 // The default action of a click: the nearest link around the target opens.
