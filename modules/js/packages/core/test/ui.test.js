@@ -96,6 +96,15 @@ test("listen flags follow the listeners", () => {
   assert.deepEqual(mock.take(), []);
 });
 
+test("a host keydown answers getModifierState from its modifier keys", () => {
+  const box = createBox();
+  const seen = [];
+  box.addEventListener("keydown", (event) => seen.push(["Shift", "Control", "Alt", "Meta", "CapsLock"].map((key) => event.getModifierState(key))));
+  // Shift (1) and Meta (8) down.
+  mock.native.dispatch(7, box.nodeId, 0, 0, 9, 0, 0, "Enter", "Enter");
+  assert.deepEqual(seen, [[true, false, false, true, false]]);
+});
+
 test("the app's own events go through the tree as on the web", () => {
   const outer = createBox();
   const inner = createBox();
