@@ -28,12 +28,14 @@ function App() {
     document.documentElement.classList.toggle("odd", keys % 2 === 1);
     document.documentElement.style.setProperty("--keys", String(keys));
   }, [keys]);
-  const wide = innerWidth > 0 && document.body instanceof HTMLElement ? "sized" : "unsized";
+  const body = document.body instanceof HTMLElement ? "body is an element" : "body is not an element";
   return (
     <box style={{ padding: 24, gap: 8, display: "flex", flexDirection: "column" }}>
       <box>{"keys " + keys}</box>
       <box>{"hash " + (hash || "none")}</box>
-      <box>{"root " + (document.documentElement.className || "even") + " " + wide}</box>
+      <box>{"root " + (document.documentElement.className || "even")}</box>
+      <box>{body}</box>
+      <box>{"width " + (innerWidth > 0 ? "known" : "unknown")}</box>
     </box>
   );
 }
