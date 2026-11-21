@@ -2,7 +2,8 @@
 // panel and its agent do, prints "webview check: passed" and quits with 0, or 1 on a failure.
 import { createBox, createText, createWebView, clearWebViewData, mount, quit } from "@silkui/core";
 
-const page = `<!doctype html><title>Guest book</title>
+const icon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+const page = `<!doctype html><title>Guest book</title><link rel="icon" href="${icon}">
 <h1>Guest book</h1>
 <input id="name" aria-label="Name">
 <button onclick="document.title = 'Signed ' + document.getElementById('name').value">Sign</button>
@@ -69,6 +70,15 @@ async function run() {
   const shot = await view.screenshot();
   expect(shot.width > 0 && shot.height > 0, "empty screenshot");
   step("screenshot");
+
+  if (view.favicon !== icon) await until(view, "faviconchange", () => view.favicon === icon);
+  step("favicon");
+
+  const failed = until(view, "loadend", (event) => !event.ok);
+  view.navigate("https://silk-webview-check.invalid/");
+  const failure = await failed;
+  expect(failure.errorCode < 0, `a failed load has net error ${failure.errorCode}`);
+  step(`failed load (${failure.errorCode}: ${failure.error})`);
 
   await clearWebViewData({});
   step("cleared data");

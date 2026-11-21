@@ -106,6 +106,37 @@ static NSString *error_text(NSError *error) {
     return message.length ? message : error.localizedDescription;
 }
 
+// The Chromium net error (net/base/net_error_list.h) closest to a failed load, as Electron
+// reports it: 0 when it loaded, -2 (FAILED) when nothing closer matches.
+static int32_t net_error(NSError *error) {
+    if (!error) return 0;
+    if ([error.domain isEqualToString:NSURLErrorDomain]) {
+        switch (error.code) {
+        case NSURLErrorCancelled: return -3;
+        case NSURLErrorTimedOut: return -7;
+        case NSURLErrorBadURL:
+        case NSURLErrorUnsupportedURL: return -300;
+        case NSURLErrorCannotFindHost:
+        case NSURLErrorDNSLookupFailed: return -105;
+        case NSURLErrorCannotConnectToHost: return -102;
+        case NSURLErrorNetworkConnectionLost: return -101;
+        case NSURLErrorNotConnectedToInternet: return -106;
+        case NSURLErrorBadServerResponse: return -320;
+        case NSURLErrorHTTPTooManyRedirects: return -310;
+        case NSURLErrorFileDoesNotExist: return -6;
+        case NSURLErrorSecureConnectionFailed: return -107;
+        case NSURLErrorServerCertificateHasBadDate: return -201;
+        case NSURLErrorServerCertificateUntrusted:
+        case NSURLErrorServerCertificateHasUnknownRoot: return -202;
+        case NSURLErrorServerCertificateNotYetValid: return -201;
+        default: return -2;
+        }
+    }
+    // WebKit's "frame load interrupted": a new load replaced this one.
+    if ([error.domain isEqualToString:@"WebKitErrorDomain"] && error.code == 102) return -3;
+    return -2;
+}
+
 // ---------------------------------------------------------------------------------------
 // Views.
 
@@ -167,6 +198,33 @@ static void set_focused(SilkWKWebView *webView, BOOL focused) {
 - (BOOL)isFlipped { return YES; }
 @end
 
+// Reports the page's icon as a data: URL, as Electron's page-favicon-updated callers want, so
+// the app need not fetch it again. A fetch that fails, or that a newer icon overtook, reports
+// nothing.
+static void report_favicon(uint32_t view, NSString *favicon) {
+    if (favicon.length == 0 || [favicon hasPrefix:@"data:"]) {
+        push_text(SILK_WEBVIEW_FAVICON_CHANGED, view, favicon);
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:favicon];
+    if (!url) return;
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession
+          dataTaskWithURL:url
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+          if (error || data.length == 0 || data.length > (1 << 20)) return;
+          NSString *type = response.MIMEType.length ? response.MIMEType : @"image/x-icon";
+          if (![type hasPrefix:@"image/"]) return;
+          NSString *encoded = [NSString stringWithFormat:@"data:%@;base64,%@", type,
+                                                         [data base64EncodedStringWithOptions:0]];
+          dispatch_async(dispatch_get_main_queue(), ^{
+            SilkWebViewRecord *record = find_view(view);
+            if (!record || ![record.favicon isEqualToString:favicon]) return;
+            push_text(SILK_WEBVIEW_FAVICON_CHANGED, view, encoded);
+          });
+        }];
+    [task resume];
+}
+
 @implementation SilkConsoleHandler
 - (void)userContentController:(WKUserContentController *)controller
       didReceiveScriptMessage:(WKScriptMessage *)message {
@@ -177,7 +235,7 @@ static void set_focused(SilkWKWebView *webView, BOOL focused) {
         NSString *favicon = body[@"favicon"];
         if (![favicon isEqualToString:record.favicon ?: @""]) {
             record.favicon = favicon;
-            push_text(SILK_WEBVIEW_FAVICON_CHANGED, self.viewId, favicon);
+            report_favicon(self.viewId, favicon);
         }
         return;
     }
@@ -261,6 +319,7 @@ enum { OBSERVED_COUNT = 5 };
 - (void)finishLoad:(WKWebView *)webView error:(NSError *)error {
     SilkWebViewEvent event = blank(SILK_WEBVIEW_LOAD_FINISHED, self.viewId);
     if (!error) event.flags |= SILK_WEBVIEW_FLAG_OK;
+    event.value = net_error(error);
     NSString *url = webView.URL.absoluteString;
     if (!url) url = error.userInfo[NSURLErrorFailingURLStringErrorKey];
     push_texts(event, @[ utf8(url ? url : @""), utf8(error_text(error)) ]);
