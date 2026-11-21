@@ -13,8 +13,9 @@ import style_change
 import style { Computed }
 import timing { EasingStops, Easing, TransitionLists, TransitionSpec, TransitionItem, TimingList, Span, ALL }
 import timing
-import node { NONE, Event, EventKind }
+import node { NONE, Event, EventKind, Move, MOVE_LINK, MOVE_CURVE }
 import mutation {
+  FIRST_ROOT,
   LISTEN_TRANSITION_RUN,
   LISTEN_TRANSITION_START,
   LISTEN_TRANSITION_END,
@@ -25,6 +26,8 @@ import transform { TransformList, Op, Origin }
 import filter_motion { FilterList }
 import filter_motion
 import properties.computed { Fill, BoxShadow, Visibility, Dimension, SizeValue, DimensionKind, Display }
+import animation
+import silk.geometry.rect { Rect }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
@@ -1439,4 +1442,100 @@ pub fn animating(tree: &UiTree<'_>) -> bool {
     i = i + 1
   }
   return false
+}
+
+/// Whether another transition of `slot` moves how its transform maps, besides `translate`.
+fn turns(tree: &UiTree<'_>, slot: u32) -> bool {
+  let list = tree.transitions.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].slot == slot && list[i].field >= TRANSFORM && list[i].field <= OFFSET_POSITION
+      && list[i].field != TRANSLATE {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Finds the `translate` transitions a renderer can run by itself and writes them to
+/// `tree.moves` (see [`Move`]), for the frame about to be painted. Only when the host asked
+/// (`tree.compositedMoves`), and only for a node whose transform is a plain move at both ends
+/// with nothing else easing it. Returns whether the set of nodes changed since the last
+/// frame: those paint through another group.
+pub effect fn slides(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.current != FIRST_ROOT {
+    // Only the first window's frames are drawn again by the renderer.
+    return false
+  }
+  let mut m: usize = 0
+  while m < tree.moves.length() {
+    let slot = tree.moves.get(m).slot
+    if u32.toUsize(slot) < tree.nodes.length() {
+      let nodes = tree.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].sliding = false
+    }
+    m = m + 1
+  }
+  tree.moves.clear()
+  let mut key: u64 = 0
+  if tree.compositedMoves && !animation.animating(&tree.*) {
+    let now = tree.input.time
+    let mut i: usize = 0
+    while i < tree.transitions.length() {
+      let item = tree.transitions.asSlice()[i]
+      i = i + 1
+      let slot = item.slot
+      if item.field != TRANSLATE || item.duration <= 0.0 || u32.toUsize(slot) >= tree.nodes.length()
+        || !tree.node(slot).live
+        || tree.node(slot).id != item.id
+        || !tree.holdsCurrent(slot)
+        || tree.node(slot).sliding
+        || turns(&tree.*, slot) {
+        continue
+      }
+      let shown = tree.node(slot).computed().*
+      if shown.transform.deep() || shown.transform.preserve3d || shown.transform.offset.path != transform.PATH_NONE {
+        continue
+      }
+      let size = boxSize(&tree.*, slot)
+      let box = Rect<f32>.new(0.0, 0.0, size[0], size[1])
+      let mut first = shown
+      write(&mut first, TRANSLATE, item.from)
+      let mut last = shown
+      write(&mut last, TRANSLATE, item.to)
+      let from = transform.flatten(transform.matrix(&first.transform, box))
+      let to = transform.flatten(transform.matrix(&last.transform, box))
+      if !transform.translation(&from) || !transform.translation(&to) {
+        continue
+      }
+      let mut curve: [f32; 17] = [0.0; 17]
+      let mut c: usize = 0
+      while c < MOVE_CURVE {
+        curve[c] = item.easing.at(usize.toF32(c) / 16.0, &tree.easingStops)
+        c = c + 1
+      }
+      run tree.moves.append(
+        Move {
+          node: u32.bitOr(MOVE_LINK, item.id),
+          slot: slot,
+          fromX: from.values[6],
+          fromY: from.values[7],
+          toX: to.values[6],
+          toY: to.values[7],
+          elapsed: now - item.start,
+          duration: item.duration,
+          curve: curve,
+        },
+      )
+      let nodes = tree.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].sliding = true
+      key = u64.wrappingMultiply(key ^ (u32.toU64(item.id) + 1), 1099511628211)
+    }
+  }
+  let changed = key != tree.movesKey
+  tree.movesKey = key
+  return changed
 }
