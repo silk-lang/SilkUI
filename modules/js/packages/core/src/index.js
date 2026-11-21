@@ -629,6 +629,7 @@ export class Node {
   }
 
   _shallowClone() {
+    if (this._tag !== undefined && this.constructor === Node) return createElement(this._tag);
     return new Node(this.kind);
   }
 
@@ -866,6 +867,38 @@ export class Node {
     }
     if (text === null) this.#rare?.attributes?.delete(name);
     else (this.#more().attributes ??= new Map()).set(name, text);
+    if (name === "contenteditable") this.#editableChanged();
+  }
+
+  // An editing host takes focus (as a tab stop, unless its tabindex says otherwise) and hears
+  // the tree's edits, which `hostEdit` makes.
+  #editableChanged() {
+    if (editableValue(this) === 1) {
+      this._keep("beforeinput", "focus", "blur");
+      if (!this.hasAttribute("tabindex")) native.attribute(this.nodeId, "tabIndex", 0);
+    } else if (!this.hasAttribute("tabindex") && !FOCUSABLE_TAGS.has(this._tag)) {
+      native.attribute(this.nodeId, "tabIndex", -2147483648);
+    }
+  }
+
+  /** "true", "false", "plaintext-only" or "inherit", from the `contenteditable` attribute. */
+  get contentEditable() {
+    const value = this.getAttribute("contenteditable");
+    if (value === null) return "inherit";
+    const lower = value.toLowerCase();
+    return lower === "" || lower === "true" ? "true" : lower === "false" || lower === "plaintext-only" ? lower : "inherit";
+  }
+
+  set contentEditable(value) {
+    const lower = String(value).toLowerCase();
+    if (lower === "inherit") this.removeAttribute("contenteditable");
+    else if (lower === "true" || lower === "false" || lower === "plaintext-only") this.setAttribute("contenteditable", lower);
+    else throw domError("SyntaxError", "contentEditable takes true, false, plaintext-only or inherit");
+  }
+
+  /** Whether the user can edit the element: it is in an editing host (see `contentEditable`). */
+  get isContentEditable() {
+    return editingHostOf(this) !== null;
   }
 
   // The `id` other nodes' relations name this node by.
@@ -1189,6 +1222,56 @@ export class Text extends Node {
 }
 
 Object.defineProperty(Text.prototype, "kind", { value: "text", writable: true, configurable: true });
+
+// `<br>`: to the tree a text node of U+2028, which breaks the line whatever `white-space`
+// says and gives an empty block its line, and to scripts an element with no children. Its
+// attributes stay here: the tree's text nodes have none.
+const LINE_BREAK = "\u2028";
+
+export class LineBreak extends Node {
+  #attributes = new Map();
+
+  constructor() {
+    super("text");
+    this.kind = "text";
+    this._tag = "br";
+    native.setText(this.nodeId, LINE_BREAK);
+  }
+
+  get nodeType() { return 1; }
+  get textContent() { return ""; }
+  set textContent(_value) {}
+  getAttribute(name) { return this.#attributes.get(String(name).toLowerCase()) ?? null; }
+  hasAttribute(name) { return this.#attributes.has(String(name).toLowerCase()); }
+  getAttributeNames() { return [...this.#attributes.keys()]; }
+  removeAttribute(name) { this.setAttribute(name, null); }
+
+  setAttribute(name, value) {
+    name = String(name).toLowerCase();
+    if (name === "classname") name = "class";
+    if (value == null) this.#attributes.delete(name);
+    else this.#attributes.set(name, String(value));
+  }
+
+  get className() { return this.getAttribute("class") ?? ""; }
+  set className(value) { this.setAttribute("class", value); }
+  appendChild() { throw domError("HierarchyRequestError", "a br has no children"); }
+  insertBefore() { throw domError("HierarchyRequestError", "a br has no children"); }
+
+  _shallowClone() {
+    const copy = new LineBreak();
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    return copy;
+  }
+
+  cloneNode() { return this._shallowClone(); }
+}
+
+// A point the tree has in a `<br>` (its text node), as a point in the br's parent.
+function fromTreePoint(node, offset) {
+  if (!(node instanceof LineBreak) || !node.parentNode) return [node, offset];
+  return [node.parentNode, indexIn(node) + (offset > 0 ? 1 : 0)];
+}
 
 /**
  * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
@@ -2624,6 +2707,7 @@ export function createElement(tag, options) {
   else if (tag === "textarea") node = new Input();
   else if (tag === "img") node = new Image();
   else if (tag === "canvas") node = new Canvas();
+  else if (tag === "br") return new LineBreak();
   else node = new Node("box");
   node._tag = tag;
   native.attribute(node.nodeId, "element", tag);
@@ -3381,21 +3465,23 @@ export class Selection {
   #sync() {
     if (this.#pending) this.#flush();
     const count = native.selection?.() ?? 0;
-    const anchor = count ? nodes.get(geometry(0)) : null;
-    const focus = count ? nodes.get(geometry(2)) : null;
-    if (!anchor || !focus) {
+    const rawAnchor = count ? nodes.get(geometry(0)) : null;
+    const rawFocus = count ? nodes.get(geometry(2)) : null;
+    if (!rawAnchor || !rawFocus) {
       if (this.#anchor) this.#forget();
       return;
     }
+    const [anchor, anchorOffset] = fromTreePoint(rawAnchor, geometry(1));
+    const [focus, focusOffset] = fromTreePoint(rawFocus, geometry(3));
     const stretches = [];
     for (let i = 0; i < count; i++) {
       const at = 4 + 4 * i;
       const start = nodes.get(geometry(at));
       const end = nodes.get(geometry(at + 2));
-      if (start && end) stretches.push([start, geometry(at + 1), end, geometry(at + 3)]);
+      if (start && end) stretches.push([...fromTreePoint(start, geometry(at + 1)), ...fromTreePoint(end, geometry(at + 3))]);
     }
-    const same = anchor === this.#anchor && geometry(1) === this.#anchorOffset && focus === this.#focus
-      && geometry(3) === this.#focusOffset && stretches.length === this.#ranges.length
+    const same = anchor === this.#anchor && anchorOffset === this.#anchorOffset && focus === this.#focus
+      && focusOffset === this.#focusOffset && stretches.length === this.#ranges.length
       && stretches.every(([a, b, c, d], i) => {
         const range = this.#ranges[i];
         return range._startNode === a && range._startOffset === b && range._endNode === c && range._endOffset === d;
@@ -3403,9 +3489,9 @@ export class Selection {
     if (same) return;
     this.#unhook();
     this.#anchor = anchor;
-    this.#anchorOffset = geometry(1);
+    this.#anchorOffset = anchorOffset;
     this.#focus = focus;
-    this.#focusOffset = geometry(3);
+    this.#focusOffset = focusOffset;
     this.#backward = comparePoints(anchor, this.#anchorOffset, focus, this.#focusOffset) > 0;
     this.#ranges = stretches.map(([a, b, c, d]) => {
       const range = new Range();
@@ -4083,11 +4169,402 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   return prevented;
 };
 
+// Editing hosts, as the HTML Standard's contenteditable has them. The tree sends a focused
+// host's typing, composition, deleting, line breaks and pastes as `beforeinput` records;
+// unless a listener prevents one, `hostEdit` makes the change in the host's nodes, moves
+// the selection after it and fires `input`, as a browser's editing does. Editors that keep
+// their own model (ProseMirror) prevent what they handle and read the rest back from the
+// nodes, through mutation observers.
+
+// 1 for an editable `contenteditable` ("", "true", "plaintext-only"), 2 for "false", else 0.
+function editableValue(node) {
+  const value = node.nodeType === 1 ? node.getAttribute("contenteditable") : null;
+  if (value === null) return 0;
+  const lower = value.toLowerCase();
+  return lower === "" || lower === "true" || lower === "plaintext-only" ? 1 : lower === "false" ? 2 : 0;
+}
+
+/** The editing host `node` is in (the outermost editable element up to a `contenteditable="false"`), or null. */
+export function editingHostOf(node) {
+  let host = null;
+  for (let at = node; at; at = at.parentNode) {
+    const value = editableValue(at);
+    if (value === 2) return host;
+    if (value === 1) host = at;
+  }
+  return host;
+}
+
+export class CompositionEvent extends Event {
+  constructor(type, init = {}) {
+    super(String(type), null);
+    this.bubbles = init.bubbles ?? true;
+    this.cancelable = !!init.cancelable;
+    this.composed = init.composed ?? true;
+    this.data = init.data ?? "";
+  }
+}
+
+globalThis.CompositionEvent ??= CompositionEvent;
+
+// Tags that start a block of their own, for joining and splitting paragraphs.
+const BLOCK_TAGS = new Set([
+  "address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "fieldset", "figcaption",
+  "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol",
+  "p", "pre", "section", "summary", "table", "td", "th", "tr", "ul",
+]);
+
+function isBlock(node) {
+  return node.nodeType === 1 && !(node instanceof LineBreak) && (BLOCK_TAGS.has(node.localName) || node.kind === "box" && node._tag === undefined);
+}
+
+// The block `node` is in, inside `host` (the host itself when there is none).
+function blockIn(host, node) {
+  for (let at = node; at && at !== host; at = at.parentNode) if (isBlock(at)) return at;
+  return host;
+}
+
+// What the caret steps over: text, `<br>`s and elements with no children (images).
+function isLeaf(node) {
+  return node.nodeType === 3 ? node.length > 0 : node.nodeType === 1 && node.childNodes.length === 0 && !isBlock(node);
+}
+
+// The leaf before (or after) the point (`container`, `offset`) in tree order, inside `host`.
+function leafBeside(host, container, offset, forward) {
+  let node;
+  if (container.nodeType === 3) node = container;
+  else if (forward) {
+    node = container.childNodes[offset];
+    if (!node) node = following(container, host, true);
+    else if (isLeaf(node)) return node;
+  } else {
+    node = container.childNodes[offset - 1];
+    if (node) {
+      while (node.lastChild) node = node.lastChild;
+      if (isLeaf(node)) return node;
+    } else node = container;
+  }
+  if (forward) {
+    for (let at = node === container && container.nodeType === 3 ? following(node, host, true) : node; at; at = following(at, host)) {
+      if (isLeaf(at)) return at;
+    }
+  } else {
+    for (let at = preceding(node, host); at; at = preceding(at, host)) if (isLeaf(at)) return at;
+  }
+  return null;
+}
+
+// The node before `node` in tree order (its previous sibling's last descendant, or its
+// parent), inside `within`.
+function preceding(node, within) {
+  if (node === within) return null;
+  let at = node.previousSibling;
+  if (!at) return node.parentNode === within ? null : node.parentNode;
+  while (at.lastChild) at = at.lastChild;
+  return at;
+}
+
+const segmenter = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter() : null;
+
+// The UTF-16 offset of the grapheme boundary before (or after) `offset` in `text`.
+function graphemeStep(text, offset, forward) {
+  if (segmenter) {
+    let last = 0;
+    for (const { index } of segmenter.segment(text)) {
+      if (forward && index > offset) return index;
+      if (!forward && index >= offset) return last;
+      last = index;
+    }
+    return forward ? text.length : last;
+  }
+  const code = forward ? text.charCodeAt(offset) : text.charCodeAt(offset - 1);
+  const pair = forward ? code >= 0xd800 && code < 0xdc00 : code >= 0xdc00 && code < 0xe000;
+  return forward ? Math.min(text.length, offset + (pair ? 2 : 1)) : Math.max(0, offset - (pair ? 2 : 1));
+}
+
+function wordStep(text, offset, forward) {
+  if (forward) {
+    const rest = /^\s*\S*/.exec(text.slice(offset))[0];
+    return offset + Math.max(rest.length, 1);
+  }
+  const before = /\S*\s*$/.exec(text.slice(0, offset))[0];
+  return offset - Math.max(before.length, 1);
+}
+
+// Makes (`node`, `offset`) a point between children: splits text there.
+function elementPoint(node, offset) {
+  if (node.nodeType !== 3) return [node, offset];
+  const parent = node.parentNode;
+  if (offset === 0) return [parent, indexIn(node)];
+  if (offset < node.length) node.splitText(offset);
+  return [parent, indexIn(node) + 1];
+}
+
+// Gives an empty block a `<br>`, so it keeps a line for the caret.
+function keepLine(block) {
+  for (let at = block.firstChild; at; at = following(at, block)) if (isLeaf(at)) return;
+  block.appendChild(new LineBreak());
+}
+
+// Moves `from`'s content to the end of `into` and removes `from`, as deleting the boundary
+// between two paragraphs does. Returns the point where they met.
+function joinBlocks(into, from) {
+  onlyBreak(into)?.remove();
+  if (leafBeside(into, into, 0, true)) onlyBreak(from)?.remove();
+  const point = into.lastChild?.nodeType === 3 ? [into.lastChild, into.lastChild.length] : [into, into.childNodes.length];
+  while (from.firstChild) into.appendChild(from.firstChild);
+  from.remove();
+  return point;
+}
+
+// The `<br>` that alone gives `block` its line, if that is all it holds.
+function onlyBreak(block) {
+  let found = null;
+  for (let at = block.firstChild; at; at = following(at, block)) {
+    if (!isLeaf(at)) continue;
+    if (found || !(at instanceof LineBreak)) return null;
+    found = at;
+  }
+  return found;
+}
+
+// Splits `block` at (`node`, `offset`): what follows goes to a copy of the block (and of each
+// element on the way) after it. Returns the copy.
+function splitBlock(block, node, offset) {
+  let [level, at] = elementPoint(node, offset);
+  let carried = null;
+  for (;;) {
+    const copy = level.cloneNode(false);
+    if (carried) copy.appendChild(carried);
+    while (level.childNodes.length > at) copy.appendChild(level.childNodes[at]);
+    if (level === block) {
+      block.parentNode.insertBefore(copy, block.nextSibling);
+      keepLine(block);
+      keepLine(copy);
+      return copy;
+    }
+    carried = copy;
+    at = indexIn(level) + 1;
+    level = level.parentNode;
+  }
+}
+
+// The first point in text (or the start) inside `node`.
+function startIn(node) {
+  for (let at = node; at; at = following(at, node)) {
+    if (at.nodeType === 3) return [at, 0];
+    if (at instanceof LineBreak) return [at.parentNode, indexIn(at)];
+  }
+  return [node, 0];
+}
+
+// Inserts `text` at the collapsed point (`node`, `offset`); returns the point after it.
+// Line breaks in it become `<br>`s.
+function insertText(node, offset, text) {
+  const lines = text.split(/\r\n|\r|\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      [node, offset] = elementPoint(node, offset);
+      node.insertBefore(new LineBreak(), node.childNodes[offset] ?? null);
+      offset += 1;
+    }
+    const line = lines[i];
+    if (!line) continue;
+    if (node.nodeType === 3) {
+      node.insertData(offset, line);
+      offset += line.length;
+      continue;
+    }
+    const before = node.childNodes[offset - 1];
+    const after = node.childNodes[offset];
+    if (before?.nodeType === 3) {
+      const at = before.length;
+      before.appendData(line);
+      [node, offset] = [before, at + line.length];
+    } else if (after?.nodeType === 3) {
+      after.insertData(0, line);
+      [node, offset] = [after, line.length];
+    } else {
+      const created = new Text(line);
+      node.insertBefore(created, after ?? null);
+      [node, offset] = [created, line.length];
+    }
+  }
+  return [node, offset];
+}
+
+// Deletes what `range` covers; paragraphs it crossed into become one. Returns the point
+// where the deleted content was.
+function deleteRange(host, range) {
+  const startBlock = blockIn(host, range.startContainer);
+  const endBlock = blockIn(host, range.endContainer);
+  range.deleteContents();
+  let point = [range.startContainer, range.startOffset];
+  if (startBlock !== endBlock && startBlock.isConnected !== false && endBlock.parentNode && host.contains(endBlock) && host.contains(startBlock)) {
+    point = joinBlocks(startBlock, endBlock);
+  }
+  if (startBlock !== host) keepLine(startBlock);
+  return point;
+}
+
+// Deletes one step (a grapheme, a word, to the line's edge) before or after the caret.
+function deleteStep(host, node, offset, forward, unit) {
+  if (node.nodeType === 3 && (forward ? offset < node.length : offset > 0)) {
+    const data = node.data;
+    const to = unit === "word" ? wordStep(data, offset, forward)
+      : unit === "line" ? (forward ? data.length : 0)
+        : graphemeStep(data, offset, forward);
+    const start = Math.min(offset, to);
+    node.deleteData(start, Math.abs(to - offset));
+    const block = blockIn(host, node);
+    if (block !== host) keepLine(block);
+    return [node, start];
+  }
+  const leaf = leafBeside(host, node, offset, forward);
+  if (!leaf) return [node, offset];
+  const here = blockIn(host, node);
+  const there = blockIn(host, leaf);
+  if (here === there || here === host || there === host) {
+    if (leaf.nodeType === 3) return deleteStep(host, leaf, forward ? 0 : leaf.length, forward, unit);
+    const parent = leaf.parentNode;
+    const index = indexIn(leaf);
+    leaf.remove();
+    if (here !== host) keepLine(here);
+    return [parent, index];
+  }
+  return forward ? joinBlocks(here, there) : joinBlocks(there, here);
+}
+
+const compositions = new WeakMap();
+
+function editEvent(type, host, inputType, data, isComposing, cancelable = true) {
+  const event = new InputEvent(type, { bubbles: true, cancelable, composed: true, inputType, data, isComposing });
+  event.target = host;
+  dispatchEvent(event);
+  return event;
+}
+
+function compositionEvent(type, host, data) {
+  const event = new CompositionEvent(type, { data });
+  event.target = host;
+  dispatchEvent(event);
+}
+
+// The edit `inputType` with `data` that the tree asked of `host`. Returns whether a listener
+// prevented it.
+function hostEdit(host, inputType, data) {
+  const plain = editableValue(host) === 1 && host.getAttribute("contenteditable").toLowerCase() === "plaintext-only";
+  const selection = getSelection();
+  let range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (range && (!host.contains(range.startContainer) || !host.contains(range.endContainer))) range = null;
+  const composing = compositions.get(host);
+
+  if (inputType === "insertCompositionText" || composing && inputType === "insertText") {
+    if (!composing && !data) return false;
+    let start;
+    if (!composing) {
+      compositionEvent("compositionstart", host, range ? range.toString() : "");
+      if (!range) return false;
+      start = range.collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+    } else {
+      start = [composing.node, composing.offset];
+    }
+    const committing = inputType === "insertText";
+    if (!committing) compositionEvent("compositionupdate", host, data);
+    editEvent("beforeinput", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
+    let [node, offset] = start;
+    if (composing && composing.node.isConnected !== false && composing.node.nodeType === 3) {
+      composing.node.deleteData(composing.offset, Math.min(composing.length, composing.node.length - composing.offset));
+    }
+    const end = data ? insertText(node, offset, data) : [node, offset];
+    // Text inserted into an element point lands in a text node: the composition starts there.
+    if (node.nodeType !== 3 && end[0].nodeType === 3) [node, offset] = [end[0], end[1] - data.length];
+    selection.collapse(end[0], end[1]);
+    editEvent("input", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
+    if (committing || !data) {
+      compositions.delete(host);
+      compositionEvent("compositionend", host, data);
+    } else {
+      compositions.set(host, { node, offset, length: data.length });
+    }
+    return false;
+  }
+
+  const event = editEvent("beforeinput", host, inputType, data || null, false);
+  if (event.defaultPrevented || !range) return event.defaultPrevented;
+  let point;
+  const collapsed = range.collapsed;
+  switch (inputType) {
+    case "insertText":
+    case "insertReplacementText":
+    case "insertFromPaste":
+    case "insertFromDrop": {
+      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+      point = insertText(point[0], point[1], data);
+      break;
+    }
+    case "insertLineBreak":
+    case "insertParagraph": {
+      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+      const block = blockIn(host, point[0]);
+      if (inputType === "insertParagraph" && !plain && block !== host) {
+        point = startIn(splitBlock(block, point[0], point[1]));
+      } else {
+        const [parent, index] = elementPoint(point[0], point[1]);
+        parent.insertBefore(new LineBreak(), parent.childNodes[index] ?? null);
+        // A break that ends its block needs another after it for the new line to show.
+        if (!leafBeside(block, parent, index + 1, true)) parent.insertBefore(new LineBreak(), parent.childNodes[index + 1] ?? null);
+        point = [parent, index + 1];
+      }
+      break;
+    }
+    case "deleteByCut":
+    case "deleteByDrag":
+    case "deleteContent":
+      if (collapsed) return false;
+      point = deleteRange(host, range);
+      break;
+    default: {
+      const match = /^delete(Content|Word|SoftLine|HardLine)(Backward|Forward)$/.exec(inputType);
+      if (!match) return false;
+      if (!collapsed) point = deleteRange(host, range);
+      else {
+        const unit = match[1] === "Content" ? "grapheme" : match[1] === "Word" ? "word" : "line";
+        point = deleteStep(host, range.startContainer, range.startOffset, match[2] === "Forward", unit);
+      }
+    }
+  }
+  selection.collapse(point[0], point[1]);
+  editEvent("input", host, inputType, data || null, false, false);
+  return false;
+}
+
+/**
+ * The classic editing commands an editor may still call: `insertText`, `delete`,
+ * `forwardDelete`, `insertParagraph`, `insertLineBreak` and `selectAll`, in the focused
+ * editing host. Returns whether it ran.
+ */
+export function execCommand(command, _showUI = false, value = "") {
+  const selection = getSelection();
+  const node = selection.rangeCount ? selection.getRangeAt(0).startContainer : null;
+  const host = node ? editingHostOf(node) : null;
+  if (!host) return false;
+  if (command === "selectAll") {
+    selection.selectAllChildren(host);
+    return true;
+  }
+  const inputType = { insertText: "insertText", delete: "deleteContentBackward", forwardDelete: "deleteContentForward", insertParagraph: "insertParagraph", insertLineBreak: "insertLineBreak", insertHTML: "insertText" }[command];
+  if (!inputType) return false;
+  hostEdit(host, inputType, inputType === "insertText" ? String(value) : "");
+  return true;
+}
+
 // Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
 // paste carries the clipboard's text, HTML and a PNG (bytes as a Latin-1 string). A copy or
 // cut a listener prevented puts what it set on `clipboardData` on the clipboard; one it did
 // not prevent lets the tree copy the selection.
 function dispatchEditing(kind, target, first, second, third) {
+  if (kind === BEFORE_INPUT && !(target instanceof Input) && editingHostOf(target) === target) return hostEdit(target, second ?? "", first ?? "");
   let event;
   if (kind === BEFORE_INPUT) {
     event = new InputEvent("beforeinput", { bubbles: true, cancelable: true, composed: true, inputType: second ?? "", data: first ?? "" });
