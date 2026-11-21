@@ -88,3 +88,30 @@ test("onFocus and onBlur bubble, and a portal renders into its container", () =>
   assert.deepEqual(events, ["focus button"]);
   assert.equal(elsewhere.firstChild.localName, "p");
 });
+
+test("a style with href and precedence is hoisted into the head once, as React DOM does", () => {
+  const stub = globalThis.document === undefined;
+  if (stub) globalThis.document = { head: createBox() };
+  try {
+    const head = globalThis.document.head;
+    const before = head.childNodes.length;
+    const style = (key) => h("style", { key, href: "hoist-test", precedence: "low" }, ".a{color:red}");
+    const container = createBox();
+    const root = createRoot(container);
+    root.render(h("div", null, h("div", { key: "x" }, style("s")), h("div", { key: "y" }, style("s"))));
+    assert.equal(head.childNodes.length, before + 1);
+    const hoisted = head.childNodes[before];
+    assert.equal(hoisted.getAttribute("href"), "hoist-test");
+    assert.equal(hoisted.firstChild.data, ".a{color:red}");
+    assert.equal(container.firstChild.firstChild.firstChild.nodeType, 3, "the instance is an empty text node in its place");
+    root.render(h("div", null));
+    root.unmount();
+    assert.equal(head.childNodes[before], hoisted, "unmounting keeps the hoisted style");
+    const again = createRoot(createBox());
+    again.render(style("s"));
+    assert.equal(head.childNodes.length, before + 1, "mounting again adds no style");
+    again.unmount();
+  } finally {
+    if (stub) delete globalThis.document;
+  }
+});

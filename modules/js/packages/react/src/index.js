@@ -353,6 +353,45 @@ function applyProps(node, previous, next) {
 }
 
 const EMPTY = {};
+
+// React DOM hoists a `<style href precedence>` into the head and keeps one per href for good,
+// so a component that renders one (Base UI's ScrollArea) adds no sheet when it mounts again
+// and removes none when it unmounts. Each instance here is an empty text node in its place.
+const hoistedStyles = new Map();
+const hoistedOrder = [];
+const styleMarks = new WeakSet();
+
+function hoistable(type, props, context) {
+  return type === "style" && context !== SVG && typeof props.href === "string" && props.href !== ""
+    && props.precedence != null && globalThis.document?.head != null;
+}
+
+function styleText(children) {
+  if (children == null || typeof children === "boolean") return "";
+  return Array.isArray(children) ? children.map(styleText).join("") : String(children);
+}
+
+function hoistStyle(props) {
+  if (!hoistedStyles.has(props.href)) {
+    const element = createHtmlElement("style", EMPTY);
+    element.setAttribute("href", props.href);
+    element.setAttribute("precedence", String(props.precedence));
+    element.appendChild(createText(styleText(props.children)));
+    // Precedences keep the order they first appeared in; a style goes after its own.
+    const precedence = String(props.precedence);
+    if (!hoistedOrder.includes(precedence)) hoistedOrder.push(precedence);
+    const rank = hoistedOrder.indexOf(precedence);
+    const later = [...hoistedStyles.values()].find((other) => hoistedOrder.indexOf(other.getAttribute("precedence")) > rank);
+    const head = globalThis.document.head;
+    if (later) head.insertBefore(element, later);
+    else head.appendChild(element);
+    hoistedStyles.set(props.href, element);
+  }
+  const mark = createText("");
+  styleMarks.add(mark);
+  return mark;
+}
+
 // The host context inside an <svg>: its elements are markup, not nodes.
 const SVG = { svg: true };
 
@@ -395,8 +434,10 @@ const hostConfig = {
   resetAfterCommit: () => flushSvg(),
   preparePortalMount() {},
   // A textarea's children are its first value, and markup set as HTML has no React children.
-  shouldSetTextContent: (type, props) => type === "textarea" || props.dangerouslySetInnerHTML != null,
+  shouldSetTextContent: (type, props) => type === "textarea" || props.dangerouslySetInnerHTML != null
+    || (type === "style" && typeof props.href === "string" && props.href !== "" && props.precedence != null && globalThis.document?.head != null),
   createInstance(type, props, _root, context) {
+    if (hoistable(type, props, context)) return hoistStyle(props);
     if (context === SVG && type !== "svg") {
       const element = createSvgElement(type);
       applySvgProps(element, EMPTY, props);
@@ -414,6 +455,7 @@ const hostConfig = {
     node.focus?.();
   },
   commitUpdate(node, type, previous, next) {
+    if (styleMarks.has(node)) return;
     if (node instanceof SvgElement) applySvgProps(node, previous, next);
     else applyProps(node, previous, next);
   },

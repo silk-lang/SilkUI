@@ -1,5 +1,5 @@
 // The xbench scenes in React (SCENES.md). One scene per build: VITE_XB_SCENE names it
-// (feed, wall, stream, churn, canvas, chat; a count after a dash changes the size: feed-3000).
+// (feed, wall, stream, churn, canvas, chat, input; a count after a dash changes the size: feed-3000).
 import { memo, useEffect, useRef, useState } from "react";
 import { flushSync } from "@silkui/react";
 import corpus from "../../../../content/corpus.txt?raw";
@@ -8,6 +8,7 @@ import { run, type Step } from "./driver";
 import { pictures } from "./pictures";
 import { stage } from "./stage";
 import { Chat } from "./Chat";
+import { Input } from "./Input";
 
 const asked = (import.meta.env.VITE_XB_SCENE as string | undefined) ?? "feed";
 const [scene, sized] = asked.split("-");
@@ -277,6 +278,7 @@ function Canvas() {
 }
 
 export function App() {
+  if (scene === "input") return <Input />;
   if (scene === "chat") return <Chat count={SIZE} lazy={!!import.meta.env.VITE_XB_CONTENT_VISIBILITY} />;
   if (scene === "canvas") return <Canvas />;
   if (scene === "wall") return <Wall />;

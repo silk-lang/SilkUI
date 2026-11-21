@@ -123,6 +123,21 @@ each one is driven. Read it before comparing two numbers.
   sheet are byte for byte what they were; their JavaScript bundles carry the chat code (about
   7.5 kB) without running it.
 
+## The input scene
+
+- `input` exists for the two React apps only (`apps/react/web/src/Input.tsx`), like `chat`.
+- The page is T3 Code's chat view as its Silk UI port rendered it (content/t3-page.json), under
+  T3's own Tailwind build (style/t3.css). Electron reads the same markup and CSS; its own user
+  agent sheet styles the HTML elements, Silk UI's built-in html.css does on Silk.
+- Icons are empty `svg` elements: the fixture kept the elements, not their paths.
+- Subtrees that hold no input target are rendered once and handed back to React as the same
+  element, which React skips as it skips a memoized component, so a frame reconciles only the
+  path to what changed, in both apps. T3 Code memoizes its own components the same way.
+- Inputs are React state changes flushed in the frame, not synthesized key or mouse events, so
+  event dispatch is not measured in either app.
+- The input build alone loads the page (the `xb-page.json` alias) and `style/t3.css` (the
+  `xb-scene.css` alias); every other build gets an empty page, so its bundle grows only by the scene code (about 2 kB).
+
 ## Fake clocks
 
 Silk's windowless bench and the three Rust apps' cpu mode move their clock 1/120 s a frame and run
