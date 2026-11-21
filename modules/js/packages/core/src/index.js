@@ -4069,6 +4069,8 @@ function reportError(error) {
 }
 
 /** An event of the tree, with the members of the DOM event it corresponds to. */
+const MODIFIER_FIELDS = { __proto__: null, Shift: "shiftKey", Control: "ctrlKey", Alt: "altKey", Meta: "metaKey" };
+
 export class Event {
   constructor(type, target) {
     this.type = type;
@@ -4093,6 +4095,14 @@ export class Event {
   stopImmediatePropagation() {
     this._stopped = true;
     this._immediate = true;
+  }
+
+  /**
+   * Whether modifier `key` ("Shift", "Control", "Alt", "Meta") was down, for keyboard, mouse,
+   * pointer and touch events. Lock keys and others answer false.
+   */
+  getModifierState(key) {
+    return this[MODIFIER_FIELDS[key]] === true;
   }
 
   /** The nodes the event passes, target first. */
