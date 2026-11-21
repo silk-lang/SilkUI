@@ -28,11 +28,11 @@ import ui_tree.legacy { FrameInput }
 import ui_tree.style_media { MediaState }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
-import ui_tree_window.host { WindowClient, RunOptions, runWindow, environmentVariable }
+import ui_tree_window.host { WindowClient, RunOptions, runWindow, environmentVariable, startInspector }
 import ui_tree_window.loader { Loader }
 import ui_tree_window.console { StderrWriter }
 import ui_tree_window.platform_thread { HostPlatform, AlsoWake }
-import ui_inspect_server.lib { Inspector }
+import ui_inspect_server.lib { Inspector, InspectorOptions }
 import font_collection.lib { FontCollection }
 import node_runtime.runtime.embed { Host, Options }
 import node_runtime.runtime.embed as embed
@@ -881,6 +881,35 @@ impl Host for Imaging {
   }
 }
 
+fn sayTreeError(error: TreeError) -> () {
+  match error {
+    TreeError.StyleSheet { index, sheet, .. } => sayFailure("a style sheet failed", index, sheet)
+    TreeError.UnknownNode { index, id } => sayFailure("a mutation names a node that does not exist", index, id)
+    TreeError.IdInUse { index, id } => sayFailure("a mutation creates a node id already in use", index, id)
+    TreeError.WrongKind { index, id } => sayFailure("a mutation does not apply to the node's kind", index, id)
+    TreeError.BadMove { index, id } => sayFailure("a mutation would put a node inside itself", index, id)
+    TreeError.UnknownResource { index, resource } => sayFailure("a mutation names an undefined resource", index, resource)
+    TreeError.BadResource { index, resource } => sayFailure("a resource did not decode", index, resource)
+    TreeError.Layout => sayFailure("layout or text shaping failed", 0, 0)
+    TreeError.BadVirtualList { index, id } => sayFailure("a virtual list is invalid", index, id)
+    TreeError.View { .. } => sayFailure("a scroll operation failed", 0, 0)
+  }
+}
+
+fn sayFailure(what: string, index: usize, id: u32) -> () {
+  StderrWriter.print("silkui: the JavaScript window host failed: {what} (mutation {index}, id {id})\n", &.{ what: what, index: index, id: id })
+}
+
+/// The inspector of a debug build, when SILK_UI_INSPECT asks for it. Its own debug check
+/// sees an optimized package in a development host, so the check is this package's.
+effect fn windowInspector() -> Inspector ! OutOfMemoryError ? &mut Allocator {
+  static if Intrinsic.profileText("optimization") == "none" {
+    return run startInspector(InspectorOptions { releaseBuilds: true, announce: true })
+  } else {
+    return Inspector.off()
+  }
+}
+
 impl<'f> Host for NodeWindow<'f> {
   effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
@@ -905,20 +934,34 @@ impl<'f> Host for NodeWindow<'f> {
       Option<RunOptions>.None => { return 1 }
     }
     let mut client = Driven<C> { client: &mut self.client, composition: Pointer.null<C>() }
-    let ran = run Effect.result(runWindow(&mut app, self.fonts, List<Mutation>.make(), move options, Inspector.off(), &mut client))
+    let inspector = run windowInspector()
+    let ran = run Effect.result(runWindow(&mut app, self.fonts, List<Mutation>.make(), move options, move inspector, &mut client))
     let status = match move ran {
       Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Success { value } => value
       Result<i32, WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
-        WindowError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
-        GpuError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
-        TreeError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
-        AtlasError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
-        GeometryError failure => { self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1 }
+        WindowError failure => {
+          StderrWriter.print("silkui: the JavaScript window host failed: window error\n", &())
+          self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1
+        }
+        GpuError failure => {
+          StderrWriter.print("silkui: the JavaScript window host failed: GPU error\n", &())
+          self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1
+        }
+        TreeError failure => {
+          sayTreeError(failure)
+          self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1
+        }
+        AtlasError failure => {
+          StderrWriter.print("silkui: the JavaScript window host failed: atlas error\n", &())
+          self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1
+        }
+        GeometryError failure => {
+          StderrWriter.print("silkui: the JavaScript window host failed: geometry error\n", &())
+          self.failure = Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.some(move failure) 1
+        }
       }
     }
-    // A process the runtime owns ends with it, so `start` never sees the failure.
-    if self.ownsProcess && self.failure.isSome() { StderrWriter.print("silkui: the JavaScript window host failed\n", &()) }
     return match app.exitStatus() {
       Option<i32>.Some { value } => value
       Option<i32>.None => status
