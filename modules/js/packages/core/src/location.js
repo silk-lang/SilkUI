@@ -107,6 +107,8 @@ export class History {
   #window;
   #entries;
   #index = 0;
+  // `navigation` hears every change of the current entry (see Navigation).
+  _changed = null;
 
   constructor(location, windowTarget) {
     this.#location = location;
@@ -138,6 +140,7 @@ export class History {
     this.#index = index;
     const entry = this.#entries[index];
     this.#location[url] = entry.url;
+    this._changed?.("traverse", old);
     // As in a browser, the traversal's events come in a later task.
     setTimeout(() => this.#traversed(old, entry), 0);
   }
@@ -165,7 +168,11 @@ export class History {
       this.#index++;
     }
     this.#location[url] = next;
+    this._changed?.(replace ? "replace" : "push", current);
   }
+
+  get _entries() { return this.#entries; }
+  get _index() { return this.#index; }
 
   // A navigation by `location`: a new hash only scrolls in a browser, which sends `hashchange`;
   // another address of the app becomes the entry, with `popstate` for the router.
@@ -194,5 +201,154 @@ function structuredCopy(value) {
     return typeof structuredClone === "function" ? structuredClone(value) : value;
   } catch {
     return value;
+  }
+}
+
+// The Navigation API over the same session history: entries, canGoBack/canGoForward and
+// `currententrychange` for every change, `navigate` before a navigation it starts.
+export class NavigateEvent extends (globalThis.Event ?? class {}) {
+  constructor(type, init = {}) {
+    super(type, { cancelable: true, ...init });
+    for (const name of ["navigationType", "destination", "canIntercept", "userInitiated", "hashChange", "signal", "formData", "downloadRequest", "info", "hasUAVisualTransition", "sourceElement"]) {
+      Object.defineProperty(this, name, { value: init[name] ?? null, enumerable: true });
+    }
+  }
+  intercept(options) { this._handler = options?.handler; }
+  scroll() {}
+}
+
+export class NavigationCurrentEntryChangeEvent extends (globalThis.Event ?? class {}) {
+  constructor(type, init = {}) {
+    super(type, init);
+    Object.defineProperty(this, "navigationType", { value: init.navigationType ?? null, enumerable: true });
+    Object.defineProperty(this, "from", { value: init.from ?? null, enumerable: true });
+  }
+}
+
+const EventTargetBase = globalThis.EventTarget ?? class {};
+let nextKey = 0;
+
+export class NavigationHistoryEntry extends EventTargetBase {
+  #entry;
+  #history;
+  constructor(entry, history) {
+    super();
+    this.#entry = entry;
+    this.#history = history;
+    this.key = String(++nextKey);
+    this.id = this.key;
+    this.ondispose = null;
+  }
+  get url() { return this.#entry.url.href; }
+  get index() { return this.#history._entries.indexOf(this.#entry); }
+  get sameDocument() { return true; }
+  getState() { return this.#entry.navigationState; }
+}
+
+export class Navigation extends EventTargetBase {
+  #history;
+  #location;
+  #views = new WeakMap();
+  oncurrententrychange = null;
+  onnavigate = null;
+  onnavigatesuccess = null;
+  onnavigateerror = null;
+
+  constructor(history, location) {
+    super();
+    this.#history = history;
+    this.#location = location;
+    history._changed = (navigationType) => this.#changed(navigationType);
+    this.#from = this.currentEntry;
+  }
+
+  #view(entry) {
+    let view = this.#views.get(entry);
+    if (!view) this.#views.set(entry, (view = new NavigationHistoryEntry(entry, this.#history)));
+    return view;
+  }
+
+  #fire(event) {
+    const handler = this["on" + event.type];
+    if (typeof handler === "function") handler.call(this, event);
+    return this.dispatchEvent?.(event) ?? true;
+  }
+
+  #from = null;
+  #changed(navigationType) {
+    const from = this.#from;
+    this.#from = this.currentEntry;
+    this.#fire(new NavigationCurrentEntryChangeEvent("currententrychange", { navigationType, from }));
+  }
+
+  get currentEntry() {
+    const entry = this.#history._entries[this.#history._index];
+    return this.#view(entry);
+  }
+  entries() { return this.#history._entries.map((entry) => this.#view(entry)); }
+  get canGoBack() { return this.#history._index > 0; }
+  get canGoForward() { return this.#history._index < this.#history._entries.length - 1; }
+  get transition() { return null; }
+  get activation() { return null; }
+
+  updateCurrentEntry({ state } = {}) {
+    this.#history._entries[this.#history._index].navigationState = state;
+  }
+
+  // Runs a navigation: `navigate` first (a listener may cancel it), then the change.
+  #run(navigationType, destinationUrl, info, change) {
+    const destination = { url: destinationUrl, key: null, id: null, index: -1, sameDocument: true, getState: () => undefined };
+    const event = new NavigateEvent("navigate", { navigationType, destination, canIntercept: true, userInitiated: false, info, hashChange: false });
+    if (!this.#fire(event)) {
+      const error = new (globalThis.DOMException ?? Error)("the navigation was cancelled", "AbortError");
+      const failed = Promise.reject(error);
+      failed.catch(() => {});
+      return { committed: failed, finished: failed };
+    }
+    change();
+    const entry = this.currentEntry;
+    const finished = Promise.resolve(event._handler?.()).then(() => {
+      this.#fire(new (globalThis.Event ?? class {})("navigatesuccess"));
+      return entry;
+    });
+    return { committed: Promise.resolve(entry), finished };
+  }
+
+  navigate(address, options = {}) {
+    const target = new URL(String(address), this.#location.href).href;
+    const replace = options.history === "replace";
+    return this.#run(replace ? "replace" : "push", target, options.info, () => {
+      if (replace) this.#location.replace(target);
+      else this.#location.assign(target);
+      if ("state" in options) this.updateCurrentEntry({ state: options.state });
+    });
+  }
+
+  reload(options = {}) {
+    return this.#run("reload", this.#location.href, options.info, () => {
+      if ("state" in options) this.updateCurrentEntry({ state: options.state });
+    });
+  }
+
+  traverseTo(key, options = {}) {
+    const index = this.entries().findIndex((entry) => entry.key === key);
+    if (index < 0) {
+      const error = new (globalThis.DOMException ?? Error)("no entry has the key " + key, "InvalidStateError");
+      const failed = Promise.reject(error);
+      failed.catch(() => {});
+      return { committed: failed, finished: failed };
+    }
+    const entry = this.#history._entries[index];
+    return this.#run("traverse", entry.url.href, options.info, () => this.#history.go(index - this.#history._index));
+  }
+
+  back(options) {
+    if (!this.canGoBack) return this.traverseTo("", options);
+    return this.traverseTo(this.entries()[this.#history._index - 1].key, options);
+  }
+
+  forward(options) {
+    if (!this.canGoForward) return this.traverseTo("", options);
+    return this.traverseTo(this.entries()[this.#history._index + 1].key, options);
   }
 }

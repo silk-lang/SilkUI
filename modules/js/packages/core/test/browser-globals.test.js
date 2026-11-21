@@ -173,6 +173,32 @@ test("history and location keep entries and send popstate and hashchange", async
   window.removeEventListener("hashchange", onHash);
 });
 
+test("navigation follows the session history and navigates it", async () => {
+  const changes = [];
+  const onChange = (event) => changes.push([event.navigationType, navigation.currentEntry.url]);
+  navigation.addEventListener("currententrychange", onChange);
+  const start = navigation.entries().length;
+  history.pushState(null, "", "/settings");
+  assert.equal(navigation.canGoBack, true);
+  assert.equal(navigation.canGoForward, false);
+  assert.equal(navigation.currentEntry.url, "http://localhost/settings");
+  assert.equal(navigation.entries().length, start + 1);
+  const { finished } = navigation.navigate("/threads/1", { state: { open: true } });
+  assert.equal((await finished).getState().open, true);
+  assert.equal(location.pathname, "/threads/1");
+  navigation.back();
+  assert.equal(location.pathname, "/settings");
+  assert.equal(navigation.canGoForward, true);
+  const cancel = (event) => event.preventDefault();
+  navigation.addEventListener("navigate", cancel);
+  await assert.rejects(navigation.navigate("/nowhere").finished);
+  navigation.removeEventListener("navigate", cancel);
+  assert.equal(location.pathname, "/settings");
+  assert.deepEqual(changes, [["push", "http://localhost/settings"], ["push", "http://localhost/threads/1"], ["traverse", "http://localhost/settings"]]);
+  navigation.removeEventListener("currententrychange", onChange);
+  await tick();
+});
+
 test("localStorage keeps items in a file, sessionStorage in memory", async () => {
   localStorage.setItem("theme", "dark");
   localStorage.count = 2;
