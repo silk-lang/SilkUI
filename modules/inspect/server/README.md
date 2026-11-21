@@ -11,8 +11,9 @@ request, read the reply) and the MCP bridge (`mcp`) live here too, so both share
 
 It is off unless both hold:
 
-- the app is a debug build (`optimization = "none"`; `InspectorOptions.releaseBuilds` lifts this
-  for tests), and
+- the build has the development tools (`devtools.enabled`: on by default without optimization,
+  and bound on for a JavaScript app's optimized development host; `InspectorOptions.releaseBuilds`
+  lifts this for tests), and
 - `SILK_UI_INSPECT` is set:
   - `1`: the Unix socket `silk-ui-inspect.sock` in the working directory (TCP port 7357 on
     Windows, where std has no Unix sockets)
