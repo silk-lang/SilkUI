@@ -292,6 +292,20 @@ struct Entry {
 struct Markup {
   id: u32,
   data: Bytes,
+  /// The custom properties its `var()`s name (`--tone`), which page CSS on the inline
+  /// `<svg>` supplies.
+  variables: List<Bytes>,
+}
+
+/// The custom property declarations an inline `<svg>` node's markup reads, as the page cascade
+/// resolves them for that node (`--tone:#123;`), and their key. Made for each frame.
+/// `base` is the node's paint hash without the key, `mixed` with it.
+pub struct IconVariables {
+  pub slot: u32,
+  pub key: u64,
+  pub css: List<u8>,
+  pub base: u64,
+  pub mixed: u64,
 }
 
 // Icon `id` drawn with the root paint keyed `key`; `icon` is the icon itself when that fails.
@@ -337,6 +351,41 @@ effect fn badUrl(error: UrlError) -> never
   ! ResourceError {
   drop error
   fail ResourceError {}
+}
+
+// The distinct names in `var(--name` references of `data`.
+effect fn variableNames(data: &[u8]) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut names = List<Bytes>.make()
+  let mut at: usize = 0
+  while at + 6 <= data.length {
+    if data[at] == 118 && data[at + 1] == 97 && data[at + 2] == 114 && data[at + 3] == 40 {
+      let mut start = at + 4
+      while start < data.length && spaceByte(data[start]) { start = start + 1 }
+      let mut end = start
+      if end + 1 < data.length && data[end] == 45 && data[end + 1] == 45 {
+        end = end + 2
+        while end < data.length && nameByte(data[end]) { end = end + 1 }
+      }
+      if end > start + 2 {
+        let name = Slice.view<u8>(data, start, end - start)
+        let mut known = false
+        let mut i: usize = 0
+        while i < names.length() {
+          if names.asSlice()[i].asSlice() == name { known = true }
+          i = i + 1
+        }
+        if !known { run names.append(run Bytes.copy(name)) }
+      }
+      at = end
+    } else {
+      at = at + 1
+    }
+  }
+  return move names
+}
+
+fn nameByte(c: u8) -> bool {
+  return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 45 || c == 95 || c >= 128
 }
 
 // `data` with `css` first in the style of its root `<svg>`, or empty when it has no root tag.
@@ -517,6 +566,8 @@ pub struct Resources {
   resolver: DataOnly,
   markup: List<Markup>,
   painted: List<Painted>,
+  /// This frame's custom properties of inline svgs whose markup reads some.
+  pub variables: List<IconVariables>,
 }
 
 impl Resources {
@@ -534,6 +585,7 @@ impl Resources {
       resolver: DataOnly.make(ResourceLimits.defaults()),
       markup: List<Markup>.make(),
       painted: List<Painted>.make(),
+      variables: List<IconVariables>.make(),
     }
   }
 
@@ -668,7 +720,7 @@ impl Resources {
     let icon = run self.registerIcon(data)
     run self.release(&mut atlas, id)
     run self.put(id, Resource.Icon { icon: icon })
-    run self.markup.append(Markup { id: id, data: run Bytes.copy(data) })
+    run self.markup.append(Markup { id: id, data: run Bytes.copy(data), variables: run variableNames(data) })
   }
 
   // Parses and classifies `data`; an SVG that draws nothing, such as a zero-sized sprite of
@@ -697,6 +749,39 @@ impl Resources {
     drop host
     drop white
     return icon
+  }
+
+  /// The custom properties the markup of icon `id` reads, none when it is no icon.
+  pub fn markupVariables(self: &Self, id: u32) -> &[Bytes] {
+    let markup = self.markup.asSlice()
+    let mut i: usize = 0
+    while i < markup.length {
+      if markup[i].id == id { return markup[i].variables.asSlice() }
+      i = i + 1
+    }
+    return &[]
+  }
+
+  /// Whether any icon's markup reads custom properties.
+  pub fn readsVariables(self: &Self) -> bool {
+    let markup = self.markup.asSlice()
+    let mut i: usize = 0
+    while i < markup.length {
+      if markup[i].variables.length() != 0 { return true }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// This frame's custom properties for the inline svg at `slot`.
+  pub fn iconVariables(self: &Self, slot: u32) -> Option<&IconVariables> {
+    let all = self.variables.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      if all[i].slot == slot { return Option<&IconVariables>.some(&all[i]) }
+      i = i + 1
+    }
+    return Option<&IconVariables>.None
   }
 
   /// Icon `id` with `css`, declarations keyed `key`, on its root's style: page CSS on an inline
