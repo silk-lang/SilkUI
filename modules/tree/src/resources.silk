@@ -20,6 +20,7 @@ import silk.num.u64
 import codec.decode
 import font_collection.lib { Family, Generic }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
@@ -287,6 +288,24 @@ struct Entry {
   resource: Resource,
 }
 
+// An icon's markup, kept to draw it again with page CSS on its root (`paintedIcon`).
+struct Markup {
+  id: u32,
+  data: Bytes,
+}
+
+// Icon `id` drawn with the root paint keyed `key`; `icon` is the icon itself when that fails.
+struct Painted {
+  id: u32,
+  key: u64,
+  icon: IconId,
+}
+
+impl Copy for Painted {}
+
+/// How many paints of one icon are kept; the oldest goes first.
+const PAINTS_PER_ICON: usize = 4
+
 impl Copy for Entry {}
 
 struct IconHost {
@@ -319,6 +338,59 @@ effect fn badUrl(error: UrlError) -> never
   drop error
   fail ResourceError {}
 }
+
+// `data` with `css` first in the style of its root `<svg>`, or empty when it has no root tag.
+effect fn withRootStyle(data: &[u8], css: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let mut start: usize = 0
+  let mut found = false
+  while start + 5 <= data.length && !found {
+    if data[start] == 60 && data[start + 1] == 115 && data[start + 2] == 118 && data[start + 3] == 103 && (spaceByte(data[start + 4]) || data[start + 4] == 62 || data[start + 4] == 47) {
+      found = true
+    } else {
+      start = start + 1
+    }
+  }
+  if !found { return move out }
+  let afterName = start + 4
+  // The root's style attribute, if it has one: where its value starts.
+  let mut at = afterName
+  let mut quote: u8 = 0
+  let mut valueAt = usize.MAX
+  while at < data.length && valueAt == usize.MAX {
+    let c = data[at]
+    if quote != 0 {
+      if c == quote { quote = 0 }
+    } else if c == 34 || c == 39 {
+      quote = c
+    } else if c == 62 {
+      break
+    } else if spaceByte(data[at - 1]) && at + 5 <= data.length && data[at] == 115 && data[at + 1] == 116 && data[at + 2] == 121 && data[at + 3] == 108 && data[at + 4] == 101 {
+      let mut v = at + 5
+      while v < data.length && spaceByte(data[v]) { v = v + 1 }
+      if v < data.length && data[v] == 61 {
+        v = v + 1
+        while v < data.length && spaceByte(data[v]) { v = v + 1 }
+        if v < data.length && (data[v] == 34 || data[v] == 39) { valueAt = v + 1 }
+      }
+    }
+    at = at + 1
+  }
+  if valueAt != usize.MAX {
+    run out.appendSlice(Slice.view<u8>(data, 0, valueAt))
+    run out.appendSlice(css)
+    run out.appendSlice(Slice.view<u8>(data, valueAt, data.length - valueAt))
+  } else {
+    run out.appendSlice(Slice.view<u8>(data, 0, afterName))
+    run out.appendSlice(b" style=\"")
+    run out.appendSlice(css)
+    run out.append(34)
+    run out.appendSlice(Slice.view<u8>(data, afterName, data.length - afterName))
+  }
+  return move out
+}
+
+fn spaceByte(c: u8) -> bool { return c == 32 || c == 9 || c == 10 || c == 13 }
 
 const EMPTY_ICON: &'static [u8] = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'/>"
 
@@ -443,6 +515,8 @@ pub struct Resources {
   pub icons: IconCache,
   host: IconHost,
   resolver: DataOnly,
+  markup: List<Markup>,
+  painted: List<Painted>,
 }
 
 impl Resources {
@@ -458,6 +532,8 @@ impl Resources {
       icons: IconCache.make(IconOptions.default()),
       host: IconHost { base: move base, fonts: FontDatabase.make() },
       resolver: DataOnly.make(ResourceLimits.defaults()),
+      markup: List<Markup>.make(),
+      painted: List<Painted>.make(),
     }
   }
 
@@ -572,6 +648,11 @@ impl Resources {
           }
           Resource.Icon { icon } => {
             run self.icons.unregister(&mut atlas, icon)
+            run self.forgetPaints(&mut atlas, id, icon, usize.MAX)
+            let mut m: usize = 0
+            while m < self.markup.length() {
+              if self.markup.asSlice()[m].id == id { drop self.markup.remove(m) } else { m = m + 1 }
+            }
           }
         }
         return ()
@@ -582,6 +663,17 @@ impl Resources {
 
   /// Parses an SVG file as icon `id`.
   pub effect fn defineIcon(self: &mut Self, atlas: &mut Atlas, id: u32, data: &[u8]) -> ()
+    ! ResourceError | OutOfMemoryError
+    ? &mut Allocator {
+    let icon = run self.registerIcon(data)
+    run self.release(&mut atlas, id)
+    run self.put(id, Resource.Icon { icon: icon })
+    run self.markup.append(Markup { id: id, data: run Bytes.copy(data) })
+  }
+
+  // Parses and classifies `data`; an SVG that draws nothing, such as a zero-sized sprite of
+  // symbols, is an empty icon.
+  effect fn registerIcon(self: &mut Self, data: &[u8]) -> IconId
     ! ResourceError | OutOfMemoryError
     ? &mut Allocator {
     let host = hostOf(&self.host, black())
@@ -604,8 +696,68 @@ impl Resources {
       |> Effect.provideMut<Resolver>(&mut self.resolver)
     drop host
     drop white
-    run self.release(&mut atlas, id)
-    run self.put(id, Resource.Icon { icon: icon })
+    return icon
+  }
+
+  /// Icon `id` with `css`, declarations keyed `key`, on its root's style: page CSS on an inline
+  /// `<svg>` beats the presentation attributes of its root. The icon itself when its markup
+  /// does not take them; None when `id` is no icon.
+  pub effect fn paintedIcon(self: &mut Self, atlas: &mut Atlas, id: u32, key: u64, css: &[u8]) -> Option<IconId>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let base = match self.get(id) {
+      Option<Resource>.Some { value: Resource.Icon { icon } } => icon
+      _ => { return Option<IconId>.None }
+    }
+    let painted = self.painted.asSlice()
+    let mut i: usize = 0
+    let mut count: usize = 0
+    while i < painted.length {
+      if painted[i].id == id {
+        if painted[i].key == key { return Option<IconId>.some(painted[i].icon) }
+        count = count + 1
+      }
+      i = i + 1
+    }
+    if count >= PAINTS_PER_ICON { run self.forgetPaints(&mut atlas, id, base, 1) }
+    let mut styled = List<u8>.make()
+    let markup = self.markup.asSlice()
+    i = 0
+    while i < markup.length {
+      if markup[i].id == id { styled = run withRootStyle(markup[i].data.asSlice(), css) }
+      i = i + 1
+    }
+    let mut made = base
+    if styled.length() != 0 {
+      let registered = run Effect.result(self.registerIcon(styled.asSlice()))
+      match move registered {
+        Result<IconId, ResourceError | OutOfMemoryError>.Success { value } => { made = value }
+        Result<IconId, ResourceError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError failure => { fail move failure }
+          ResourceError _ => {}
+        }
+      }
+    }
+    run self.painted.append(Painted { id: id, key: key, icon: made })
+    return Option<IconId>.some(made)
+  }
+
+  // Drops up to `limit` of the paints of icon `id`, oldest first.
+  effect fn forgetPaints(self: &mut Self, atlas: &mut Atlas, id: u32, base: IconId, limit: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut left = limit
+    let mut i: usize = 0
+    while i < self.painted.length() && left > 0 {
+      let entry = self.painted.asSlice()[i]
+      if entry.id == id {
+        drop self.painted.remove(i)
+        if entry.icon.index != base.index { run self.icons.unregister(&mut atlas, entry.icon) }
+        left = left - 1
+      } else {
+        i = i + 1
+      }
+    }
   }
 
   /// The tile of `icon` at `width` x `height` device pixels, or None when it cannot be drawn:
