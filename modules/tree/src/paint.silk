@@ -9,7 +9,7 @@ import layout_table { LayoutTable }
 import layout.lib { WritingMode, DisplayInside, BorderCollapse }
 import mutation { ObjectFit, Overflow, Dimension, DimensionKind }
 import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position }
-import style { Computed, Fill }
+import style { Computed, Fill, PAINT_NONE, PAINT_CURRENT, PAINT_COLOR }
 import first_letter
 import properties.computed as computed_values
 import read_fonts.model.charmap { Charmap }
@@ -68,7 +68,7 @@ import svg_css.effect_values { GeometryBox }
 import silk.mem.box { Box }
 import ui_scene.path_cache { PathCache }
 import live_svg
-import live_svg { LiveSvg, Canvas as LiveCanvas }
+import live_svg { LiveSvg, Canvas as LiveCanvas, RootPaint, Paint as LivePaint }
 import vector.geometry { Affine }
 import vector.path { Path as VectorPath }
 import vector.strips { NONZERO }
@@ -1810,7 +1810,12 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
     run paintLiveSvg(&mut p, slot, content, mask)
   } else if kind == NodeKind.Icon || kind == NodeKind.Image {
     if let Option<Resource>.Some { value } = p.resources.get(resource) {
-      if let Resource.Icon { icon } = value {
+      if let Resource.Icon { icon: own } = value {
+        let mut icon = own
+        if kind == NodeKind.Icon && c.svg.isSet() {
+          let css = run c.svg.css()
+          if let Option.Some { value: painted } = run p.resources.paintedIcon(&mut p.atlas, resource, c.svg.key(), css.asSlice()) { icon = painted }
+        }
         // An SVG keeps its aspect in a box of another shape (xMidYMid meet).
         let ratio = f64.toF32(p.resources.iconRatio(icon))
         let mut boxWidth = content.width()
@@ -1888,6 +1893,15 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
   }
 }
 
+fn channelOf(color: u32, shift: u32) -> f32 { return u32.toF32(u32.bitAnd(u32.shiftRight(color, shift), 255)) / 255.0 }
+
+fn livePaint(kind: u8, color: u32) -> Option<LivePaint> {
+  if kind == PAINT_NONE { return Option<LivePaint>.some(LivePaint.None) }
+  if kind == PAINT_CURRENT { return Option<LivePaint>.some(LivePaint.Current) }
+  if kind != PAINT_COLOR { return Option<LivePaint>.None }
+  return Option<LivePaint>.some(LivePaint.Color { color: Rgba<f32> { r: channelOf(color, 24), g: channelOf(color, 16), b: channelOf(color, 8), a: channelOf(color, 0) } })
+}
+
 /// Paints the live svg of icon node `slot` over `content`, its content box in device pixels.
 effect fn paintLiveSvg(p: &mut Painter<'_, '_>, slot: u32, content: Rect<f32>, mask: ContentMask) -> ()
   ! OutOfMemoryError
@@ -1897,7 +1911,9 @@ effect fn paintLiveSvg(p: &mut Painter<'_, '_>, slot: u32, content: Rect<f32>, m
   let seed = Hash.mix(&p.seed, u32.toU64(p.nodes.asSlice()[index].id) + 0x5356470000000000)
   let taken = Intrinsic.replace(p.nodes.asMutSlice()[index].svg, Thin<LiveSvg>.none())
   if let Option<&LiveSvg>.Some { value } = taken.get() {
-    let mut canvas = LiveCanvas { scene: &mut p.scene.*, paths: &mut p.paths.*, seed: seed, color: color }
+    let css = p.nodes.asSlice()[index].computed().svg
+    let root = RootPaint { fill: livePaint(css.fillKind, css.fill), stroke: livePaint(css.strokeKind, css.stroke), strokeWidth: css.strokeWidth }
+    let mut canvas = LiveCanvas { scene: &mut p.scene.*, paths: &mut p.paths.*, seed: seed, color: color, root: root }
     run live_svg.paint(value, &mut canvas, content, mask)
   }
   let nodes = p.nodes.asMutSlice()
