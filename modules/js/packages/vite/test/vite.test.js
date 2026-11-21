@@ -30,6 +30,15 @@ test("builds one ES module and stamps it", async () => {
   assert.match(readFileSync(join(outDir, "app.js.stamp"), "utf8"), /^\d+\n$/);
 });
 
+test("bundles a worker into the app as a data: address", async () => {
+  const outDir = await bundle("production", "src/worker.js", { node: true });
+  const code = readFileSync(join(outDir, "app.js"), "utf8");
+  const address = /"(data:text\/javascript,[^"]+)"/.exec(code)?.[1];
+  assert.ok(address, "the worker's code is in the bundle");
+  assert.match(decodeURIComponent(address), /postMessage/);
+  assert.ok(!existsSync(join(outDir, "assets")), "no worker file beside the bundle");
+});
+
 test("development mode defines NODE_ENV for development builds", async () => {
   const outDir = await bundle("development");
   assert.ok(existsSync(join(outDir, "app.js.stamp")));
