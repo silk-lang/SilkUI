@@ -663,6 +663,105 @@ test effect fn wheelScrollsNestedContainersAndClamps() -> ()
   run scrollBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+/// The pixels of `tree`'s next frame. `snapshot` is the tree's own: it holds the atlas pixels
+/// of the frames before.
+effect fn drawnFrame(tree: &mut UiTree<'_>, snapshot: &mut CpuSnapshot) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+/// The pixels of a fresh inbox whose list is scrolled to `y` before its first frame.
+effect fn inboxScrolledTo(collection: &FontCollection, y: f32) -> Pixmap
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut fresh = run inbox(collection)
+  let mut batch = Batch.make()
+  run batch.scrollTo(fixtures.INBOX_LIST, 0.0, y)
+  run fresh.apply(run batch.take())
+  // Painted from nothing: the reference must not be a kept scene itself.
+  fresh.invalidatePaint()
+  let mut snapshot = CpuSnapshot.make()
+  let pixels = run drawnFrame(&mut fresh, &mut snapshot)
+  run Testing.expect(fresh.scrollsKept == 0, "the reference frame is painted")
+  return move pixels
+}
+
+effect fn scrolledSceneBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut snapshot = CpuSnapshot.make()
+  drop run drawnFrame(&mut tree, &mut snapshot)
+  let painted = tree.paintsKept
+
+  // A scroll within the paint's lead moves the scene's scroll group and paints nothing.
+  let mut near = Batch.make()
+  run near.scrollTo(fixtures.INBOX_LIST, 0.0, 30.0)
+  run tree.apply(run near.take())
+  let moved = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 1, "a scroll within the lead keeps the scene")
+  run Testing.expect(tree.paintsKept == painted + 1, "and counts as a kept paint")
+  run Testing.expect(tree.stats.repaintedSubtrees == 0, "it repaints nothing")
+  let expected = run inboxScrolledTo(&collection, 30.0)
+  run Testing.expect(samePixels(&moved, &expected), "the kept scene draws the scrolled frame")
+
+  // A second one moves the same scene again, and back.
+  let mut more = Batch.make()
+  run more.scrollTo(fixtures.INBOX_LIST, 0.0, 44.0)
+  run tree.apply(run more.take())
+  let again = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 2, "a second scroll keeps it too")
+  let expectedAgain = run inboxScrolledTo(&collection, 44.0)
+  run Testing.expect(samePixels(&again, &expectedAgain), "and draws the new offset")
+
+  // A change with the scroll paints.
+  let mut both = Batch.make()
+  run both.scrollTo(fixtures.INBOX_LIST, 0.0, 10.0)
+  run both.setText(fixtures.ROW + 11, "Changed")
+  run tree.apply(run both.take())
+  drop run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 2, "a scroll with another change paints")
+
+  // Past the lead (one viewport height) the content was never painted: the frame paints.
+  let mut far = Batch.make()
+  run far.scrollTo(fixtures.INBOX_LIST, 0.0, 10.0 + viewport().height + 40.0)
+  run tree.apply(run far.take())
+  let beyond = run drawnFrame(&mut tree, &mut snapshot)
+  let end = tree.scrollOffset(fixtures.INBOX_LIST).y
+  if end > 10.0 + viewport().height {
+    run Testing.expect(tree.scrollsKept == 2, "a scroll past the lead paints")
+  }
+  let mut freshFar = run inbox(&collection)
+  let mut change = Batch.make()
+  run change.setText(fixtures.ROW + 11, "Changed")
+  run change.scrollTo(fixtures.INBOX_LIST, 0.0, end)
+  run freshFar.apply(run change.take())
+  freshFar.invalidatePaint()
+  let mut farSnapshot = CpuSnapshot.make()
+  let expectedFar = run drawnFrame(&mut freshFar, &mut farSnapshot)
+  run Testing.expect(samePixels(&beyond, &expectedFar), "and draws what a fresh tree draws there")
+}
+
+test effect fn scrollsWithinThePaintedLeadKeepTheScene() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrolledSceneBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 /// The list's thumb runs down its right edge: x 339 to 345, from y 54.
 effect fn thumbBody() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
