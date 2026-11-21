@@ -16,6 +16,7 @@
 //!
 //! Everything crossing threads is allocated with the system allocator, whatever allocator the
 //! app's code provides.
+import silk.core.ownership { Drop }
 import accessibility { Bridge }
 import accesskit.lib { TreeUpdate, ActionRequest }
 import adapter { LINE_PIXELS }
@@ -742,18 +743,13 @@ pub struct AlsoWake {
 }
 
 /// Ends the wait of a client that waits itself, when it gave a waker.
+// Under the lock: the proxy's drop takes the waker away before the client's loop closes.
 fn wakeAlso(link: &Arc<Mutex<Link>>) -> () {
   let guard = link.get().lock()
-  let also = match &guard.get().also {
-    Option<AlsoWake>.Some { value } => Option<AlsoWake>.some(
-      AlsoWake { wake: value.wake, token: value.token },
-    )
-    Option<AlsoWake>.None => Option<AlsoWake>.None
-  }
-  drop guard
-  if let Option<AlsoWake>.Some { value } = &also {
+  if let Option<AlsoWake>.Some { value } = &guard.get().also {
     unsafe (value.wake)(value.token)
   }
+  drop guard
 }
 
 /// Scrolls the frame on screen through the compositor when `event` is a wheel it can take on
@@ -1204,6 +1200,15 @@ impl PlatformProxy {
     ! OutOfMemoryError {
     let mut heap = Allocator.systemAllocatorProvider()
     return run String.copy(text) |> Effect.provideMut<Allocator>(&mut heap)
+  }
+}
+
+// The window host ends before the client that gave a waker closes what it wakes.
+impl Drop for PlatformProxy {
+  fn drop(self: &mut Self) -> () {
+    let mut guard = self.link.get().lock()
+    let state = guard.getMut()
+    state.also = Option<AlsoWake>.None
   }
 }
 

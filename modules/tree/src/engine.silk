@@ -951,6 +951,11 @@ pub struct UiTree<'a> {
   /// Whether Ctrl (Cmd on macOS) with `=`, `-` and `0` changes the page zoom. Hosts whose
   /// platform zooms on its own, a browser, leave it off.
   pub zoomKeys: bool,
+  /// Whether a mutation naming a node that no longer exists is skipped, and counted in
+  /// `staleSkipped`, instead of failing its batch: a script host whose page outlives one bad
+  /// mutation turns it on.
+  pub skipsStale: bool,
+  pub staleSkipped: u64,
   /// The frame the current root last painted at: its subtrees cached then can be replayed.
   paintedAt: u64,
   /// The viewport and the layout and scroll revisions of the current root's last paint: a
@@ -1529,6 +1534,8 @@ impl<'a> UiTree<'a> {
       unitsHeight: 0.0,
       pageZoomFactor: 1.0,
       zoomKeys: false,
+      skipsStale: false,
+      staleSkipped: 0,
       paintedAt: 0,
       quietInput: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
       quietRevision: usize.MAX,
@@ -2288,7 +2295,21 @@ impl<'a> UiTree<'a> {
     let mut index: usize = 0
     while index < entries.length {
       let value = Intrinsic.replace(entries[index], Mutation.Blur)
-      run self.applyOne(index, move value)
+      if self.skipsStale {
+        let applied = run Effect.result(self.applyOne(index, move value))
+        match move applied {
+          Result<(), TreeError | OutOfMemoryError>.Success { .. } => ()
+          Result<(), TreeError | OutOfMemoryError>.Failure { error } => match move error {
+            OutOfMemoryError failure => { fail move failure }
+            TreeError failure => match failure {
+              TreeError.UnknownNode { .. } => { self.staleSkipped = self.staleSkipped + 1 }
+              _ => { fail failure }
+            }
+          }
+        }
+      } else {
+        run self.applyOne(index, move value)
+      }
       index = index + 1
     }
   }
