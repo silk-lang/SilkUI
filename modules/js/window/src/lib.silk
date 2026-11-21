@@ -42,7 +42,9 @@ import silk.num.f32
 import silk.num.u8
 import silk.num.u32
 import ui_tree_window.console { StderrWriter }
-import ui_tree_window.canvas_frames { CanvasPresenter }
+import ui_tree_window.canvas_frames { CanvasPresenter, CanvasFrame, SharedPicture }
+import ui_tree.canvas2d { Bitmap }
+import ui_tree.mutation { NO_SURFACE }
 import ui_js_gpu.service { GpuService }
 import ui_tree.legacy { Batch }
 import silkjs.js_atomics_native { Domain }
@@ -91,6 +93,8 @@ pub struct JsApp<'m> {
   /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
   /// gave the handle canvases present through ([`JsApp.canvases`]).
   gpu: Option<GpuService>,
+  /// Where the bitmaps of 2D canvases are shown from, the same handle the GPU canvases use.
+  presenter: Option<CanvasPresenter>,
   /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
   zoom: f32,
   /// The web views JavaScript opened, each shown at its node.
@@ -268,6 +272,7 @@ impl<'m> JsApp<'m> {
       openers: Openers.make(),
       settled: 0,
       gpu: Option<GpuService>.None,
+      presenter: Option<CanvasPresenter>.None,
       webViews: List<HostedView>.make(),
       placesPending: false,
       nudge: Option<Nudge>.None,
@@ -649,6 +654,7 @@ impl<'m> JsApp<'m> {
 
   /// Gives JavaScript `navigator.gpu`: its canvases present their frames through `presenter`.
   pub fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () {
+    self.presenter = Option<CanvasPresenter>.some(presenter.clone())
     self.gpu = Option<GpuService>.some(GpuService.make(move presenter))
     self.host.enableGpu()
   }
@@ -657,7 +663,7 @@ impl<'m> JsApp<'m> {
   /// canvases they drew, and settles the promises they answer. Says whether that changed the
   /// tree or left commands for the next turn.
   effect fn graphics(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
-    let mut changed = false
+    let mut changed = run self.show2d(&mut tree)
     let mut round: usize = 0
     while round < GPU_ROUNDS {
       let commands = self.host.takeGpuCommands()
@@ -681,6 +687,63 @@ impl<'m> JsApp<'m> {
       run self.host.flushRaw(&mut tree)
       round = round + 1
     }
+    return true
+  }
+
+  /// Shows the bitmaps Canvas 2D drew into since the last call, each as a frame of its canvas
+  /// node's surface, and closes the surfaces of canvases that are gone. Says whether that
+  /// changed the tree.
+  effect fn show2d(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let presenter = match &self.presenter {
+      Option<CanvasPresenter>.Some { value } => value.clone()
+      Option<CanvasPresenter>.None => { return false }
+    }
+    let mut nodes = List<u32>.make()
+    let all = tree.canvas2d.drawn()
+    let mut i: usize = 0
+    while i < all.length {
+      run nodes.append(all[i].node)
+      i = i + 1
+    }
+    i = 0
+    while i < nodes.length() {
+      if !tree.contains(nodes.get(i)) {
+        if let Option<Bitmap>.Some { value } = tree.canvas2d.remove(nodes.get(i)) {
+          if value.surface != NO_SURFACE { run presenter.close(value.surface) }
+        }
+      }
+      i = i + 1
+    }
+    let mut batch = Batch.make()
+    let mut heap = Allocator.systemAllocatorProvider()
+    let bitmaps = tree.canvas2d.drawn()
+    i = 0
+    while i < bitmaps.length {
+      let bitmap = &mut bitmaps[i]
+      i = i + 1
+      if !bitmap.drawn { continue }
+      bitmap.drawn = false
+      let width = bitmap.pixels.width()
+      let height = bitmap.pixels.height()
+      if bitmap.surface == NO_SURFACE {
+        bitmap.surface = presenter.open()
+        bitmap.resized = true
+      }
+      if bitmap.resized {
+        bitmap.resized = false
+        run batch.canvasSurface(bitmap.node, bitmap.surface, width, height, bitmap.opaque)
+      }
+      let mut pixels = List<u8>.make()
+      run pixels.appendSlice(bitmap.pixels.data()) |> Effect.provideMut<Allocator>(&mut heap)
+      if presenter.keeps() {
+        let mut kept = List<u8>.make()
+        run kept.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+        run presenter.keepPixels(bitmap.surface, width, height, move kept)
+      }
+      run presenter.present(CanvasFrame { surface: bitmap.surface, width: width, height: height, pixels: move pixels, shared: Option<SharedPicture>.None })
+    }
+    if batch.length() == 0 { return false }
+    run tree.apply(run batch.take())
     return true
   }
 

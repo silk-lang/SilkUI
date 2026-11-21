@@ -1,0 +1,838 @@
+//! Canvas 2D: the bitmaps that JavaScript's `canvas.getContext("2d")` draws into.
+//!
+//! A 2D canvas is a bitmap that keeps what was drawn until something draws over it, as in a
+//! browser. JavaScript keeps the context's state (transform, clip, styles) and writes each draw
+//! as a command in device pixels; [`Canvas2d.draw`] draws them with the CPU reference renderer,
+//! with text shaped and glyphs rasterized from the tree's own fonts. The window shows a bitmap
+//! the way it shows a GPU canvas: through a surface of its canvas node, a frame each time a
+//! turn drew into it ([`Canvas2d.drawn`]).
+//!
+//! The commands are a run of records, each its length in bytes and then that many bytes: the
+//! command's number and its fields, as `ui_js_gpu.wire` writes them (little-endian 32-bit
+//! words, 64-bit floats, strings with their length before them). Colors are straight sRGB
+//! floats. A clip is the device rectangle every pixel drawn must be inside.
+import font_raster.cache { GlyphCache, RasterGlyph }
+import font_raster.face { FontFace }
+import font_raster.key { GlyphKey, PenPosition }
+import atlas.atlas { Atlas, AtlasOptions, Kind }
+import ui_scene.cpu { AtlasPixels, CpuRenderer }
+import ui_scene.path_cache { PathCache }
+import ui_scene.primitives { Background, ContentMask, GlyphSprite, ImageSprite, Quad }
+import ui_scene.radii { Radii }
+import ui_scene.scene { Scene }
+import ui_text.fonts { TextStyle }
+import ui_text.system { TextSystem, LineGlyph }
+import resources { parseFamilies }
+import font_collection.lib { Family, Style as FontStyle }
+import vector.geometry { Affine }
+import vector.path { Path }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.stroke { Stroke }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.color.rgba { Rgba }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.ownership { Copy }
+import silk.geometry.rect { Rect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i32
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.text.string { String, InvalidUtf8 }
+import silk.core.result { Result }
+
+/// The commands, by number.
+pub const SIZE: u32 = 1
+pub const FILL_RECT: u32 = 2
+pub const CLEAR_RECT: u32 = 3
+pub const FILL_PATH: u32 = 4
+pub const STROKE_PATH: u32 = 5
+pub const FILL_TEXT: u32 = 6
+pub const PUT_PIXELS: u32 = 7
+pub const DRAW_PIXELS: u32 = 8
+pub const DRAW_CANVAS: u32 = 9
+
+/// The verbs of a path, in device pixels.
+const MOVE: u32 = 0
+const LINE: u32 = 1
+const QUAD: u32 = 2
+const CUBIC: u32 = 3
+const CLOSE: u32 = 4
+
+/// `textAlign`: start and left, center, end and right.
+const ALIGN_CENTER: u32 = 1
+const ALIGN_END: u32 = 2
+/// `textBaseline`: alphabetic, top, hanging, middle, ideographic, bottom.
+const BASELINE_TOP: u32 = 1
+const BASELINE_HANGING: u32 = 2
+const BASELINE_MIDDLE: u32 = 3
+const BASELINE_IDEOGRAPHIC: u32 = 4
+const BASELINE_BOTTOM: u32 = 5
+
+/// The bitmap of a canvas node.
+pub struct Bitmap {
+  pub node: u32,
+  /// The surface the window shows it through, or `ui_protocol` `NO_SURFACE` before the first frame.
+  pub surface: u32,
+  pub opaque: bool,
+  /// Drawn into since the window last showed it.
+  pub drawn: bool,
+  /// Its size changed since the window last showed it.
+  pub resized: bool,
+  pub pixels: Pixmap,
+}
+
+/// A font JavaScript named, and the key the tree's text system gave its style.
+struct Font {
+  name: List<u8>,
+  key: usize,
+}
+
+/// A face the canvases drew with, by font key.
+struct FaceSlot<'a> {
+  loaded: bool,
+  face: Option<FontFace<'a>>,
+}
+
+/// What [`Canvas2d.measure`] says of a text: `TextMetrics`, in CSS pixels.
+pub struct Measured {
+  pub width: f32,
+  pub ascent: f32,
+  pub descent: f32,
+  pub inkLeft: f32,
+  pub inkRight: f32,
+  pub inkAscent: f32,
+  pub inkDescent: f32,
+}
+
+impl Copy for Measured {}
+
+/// The 2D canvases of a tree.
+pub struct Canvas2d<'a> {
+  bitmaps: List<Bitmap>,
+  fonts: List<Font>,
+  faces: List<FaceSlot<'a>>,
+  renderer: CpuRenderer,
+  scene: Scene,
+  /// The canvas `scene` draws into, or 0.
+  open: u32,
+  paths: PathCache,
+  atlas: Atlas,
+  glyphs: GlyphCache,
+  atlasPixels: AtlasPixels,
+  path: Path,
+  line: List<LineGlyph>,
+}
+
+/// Reads the fields of a command. Past its end every field reads as zero.
+struct Reader<'b> {
+  bytes: &'b [u8],
+  at: usize,
+}
+
+impl<'b> Reader<'b> {
+  fn take(self: &mut Self, count: usize) -> &'b [u8] {
+    if count > self.bytes.length - self.at {
+      self.at = self.bytes.length
+      return Slice.view<u8>(self.bytes, 0, 0)
+    }
+    let taken = Slice.view<u8>(self.bytes, self.at, count)
+    self.at = self.at + count
+    return taken
+  }
+
+  fn word(self: &mut Self) -> u32 {
+    let b = self.take(4)
+    if b.length < 4 { return 0 }
+    return u8.toU32(b[0]) + u8.toU32(b[1]) * 256 + u8.toU32(b[2]) * 65536 + u8.toU32(b[3]) * 16777216
+  }
+
+  fn number(self: &mut Self) -> f64 {
+    let low = u32.toU64(self.word())
+    let high = u32.toU64(self.word())
+    let value = f64.fromBits(low + high * 4294967296)
+    return if value == value { value } else { 0.0 }
+  }
+
+  fn float(self: &mut Self) -> f32 {
+    return f64.toF32(self.number())
+  }
+
+  fn blob(self: &mut Self) -> &'b [u8] {
+    let length = u32.toUsize(self.word())
+    return self.take(length)
+  }
+
+  fn done(self: &Self) -> bool {
+    return self.at >= self.bytes.length
+  }
+
+  fn rect(self: &mut Self) -> Rect<f32> {
+    let x0 = self.float()
+    let y0 = self.float()
+    let x1 = self.float()
+    let y1 = self.float()
+    return Rect<f32>.new(x0, y0, x1, y1)
+  }
+
+  fn color(self: &mut Self) -> Rgba<f32> {
+    let r = self.float()
+    let g = self.float()
+    let b = self.float()
+    let a = self.float()
+    return Rgba<f32>.new(r, g, b, a)
+  }
+}
+
+fn nonEmpty(r: Rect<f32>) -> bool {
+  return r.xMin < r.xMax && r.yMin < r.yMax
+}
+
+fn intersect(a: Rect<f32>, b: Rect<f32>) -> Rect<f32> {
+  return Rect<f32>.new(f32.max(a.xMin, b.xMin), f32.max(a.yMin, b.yMin), f32.min(a.xMax, b.xMax), f32.min(a.yMax, b.yMax))
+}
+
+effect fn noGlyph<E>(error: E) -> Option<RasterGlyph> {
+  drop error
+  return Option<RasterGlyph>.None
+}
+
+effect fn noPath<E>(error: E) -> u32 {
+  drop error
+  return 0
+}
+
+effect fn noShape<E>(error: E) -> f32 {
+  drop error
+  return 0.0
+}
+
+effect fn noDraw<E>(error: E) -> () {
+  drop error
+}
+
+impl<'a> Canvas2d<'a> {
+  pub fn make() -> Canvas2d<'a> {
+    return Canvas2d<'a> {
+      bitmaps: List<Bitmap>.make(),
+      fonts: List<Font>.make(),
+      faces: List<FaceSlot<'a>>.make(),
+      renderer: CpuRenderer.make(),
+      scene: Scene.make(),
+      open: 0,
+      paths: PathCache.make(),
+      atlas: Atlas.make(AtlasOptions { textureSize: 512, maxTextureSize: 4096, maxTextures: 2, padding: 0 }),
+      glyphs: GlyphCache.make(),
+      atlasPixels: AtlasPixels.make(),
+      path: Path.make(),
+      line: List<LineGlyph>.make(),
+    }
+  }
+
+  /// The bitmaps, for the window to show the ones drawn into.
+  pub fn drawn(self: &mut Self) -> &mut [Bitmap] {
+    return self.bitmaps.asMutSlice()
+  }
+
+  /// Forgets the bitmap of `node` and returns it.
+  pub fn remove(self: &mut Self, node: u32) -> Option<Bitmap> {
+    let mut i: usize = 0
+    while i < self.bitmaps.length() {
+      if self.bitmaps.asSlice()[i].node == node { return Option<Bitmap>.some(self.bitmaps.remove(i)) }
+      i = i + 1
+    }
+    return Option<Bitmap>.None
+  }
+
+  fn find(self: &Self, node: u32) -> usize {
+    let items = self.bitmaps.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].node == node { return i }
+      i = i + 1
+    }
+    return usize.MAX
+  }
+
+  /// Runs `commands`, drawing with the fonts of `text`.
+  pub effect fn draw(self: &mut Self, text: &mut TextSystem<'a>, commands: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop self.atlas.beginFrame()
+    let mut stream = Reader<'_> { bytes: commands, at: 0 }
+    while !stream.done() {
+      let mut command = Reader<'_> { bytes: stream.blob(), at: 0 }
+      run self.one(&mut text, &mut command)
+    }
+    run self.flush()
+  }
+
+  effect fn one(self: &mut Self, text: &mut TextSystem<'a>, r: &mut Reader<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let op = r.word()
+    let node = r.word()
+    if op == SIZE {
+      run self.flush()
+      let width = maxU(r.word(), 1)
+      let height = maxU(r.word(), 1)
+      let opaque = r.word() != 0
+      let at = self.find(node)
+      let mut pixels = run Pixmap.make(width, height)
+      if opaque { pixels.clear(Rgba8.make(0, 0, 0, 255)) }
+      if at == usize.MAX {
+        run self.bitmaps.append(Bitmap { node: node, surface: 0xffffffff, opaque: opaque, drawn: true, resized: true, pixels: move pixels })
+      } else {
+        let bitmap = &mut self.bitmaps.asMutSlice()[at]
+        bitmap.pixels = move pixels
+        bitmap.opaque = opaque
+        bitmap.drawn = true
+        bitmap.resized = true
+      }
+      return ()
+    }
+    let at = self.find(node)
+    if at == usize.MAX { return () }
+    let width = self.bitmaps.asSlice()[at].pixels.width()
+    let height = self.bitmaps.asSlice()[at].pixels.height()
+    let whole = Rect<f32>.new(0.0, 0.0, u32.toF32(width), u32.toF32(height))
+    let clip = intersect(r.rect(), whole)
+    if !nonEmpty(clip) { return () }
+    let items = self.bitmaps.asMutSlice()
+    items[at].drawn = true
+    let mask = ContentMask.new(clip)
+    if op == CLEAR_RECT {
+      run self.flush()
+      let area = intersect(r.rect(), clip)
+      let bitmap = &mut self.bitmaps.asMutSlice()[at]
+      let alpha: u8 = if bitmap.opaque { 255 } else { 0 }
+      clearArea(&mut bitmap.pixels, area, alpha)
+      return ()
+    }
+    if op == PUT_PIXELS {
+      run self.flush()
+      let x = r.number()
+      let y = r.number()
+      let w = r.word()
+      let h = r.word()
+      let bytes = r.blob()
+      let bitmap = &mut self.bitmaps.asMutSlice()[at]
+      putPixels(&mut bitmap.pixels, f64.toI32(f64.floor(x)), f64.toI32(f64.floor(y)), w, h, bytes, clip, bitmap.opaque)
+      return ()
+    }
+    if op == DRAW_PIXELS || op == DRAW_CANVAS {
+      run self.flush()
+      let alpha = r.number()
+      let source = r.rect()
+      let target = r.rect()
+      if op == DRAW_CANVAS {
+        let from = self.find(r.word())
+        if from == usize.MAX || from == at { return () }
+        let w = self.bitmaps.asSlice()[from].pixels.width()
+        let h = self.bitmaps.asSlice()[from].pixels.height()
+        let mut copy = List<u8>.make()
+        run copy.appendSlice(self.bitmaps.asSlice()[from].pixels.data())
+        let bitmap = &mut self.bitmaps.asMutSlice()[at]
+        drawImage(&mut bitmap.pixels, copy.asSlice(), w, h, true, source, target, clip, alpha)
+      } else {
+        let w = r.word()
+        let h = r.word()
+        let bytes = r.blob()
+        let bitmap = &mut self.bitmaps.asMutSlice()[at]
+        drawImage(&mut bitmap.pixels, bytes, w, h, false, source, target, clip, alpha)
+      }
+      return ()
+    }
+    if self.open != node { run self.flush() }
+    self.open = node
+    if op == FILL_RECT {
+      let color = r.color()
+      let area = intersect(r.rect(), clip)
+      if nonEmpty(area) { drop run self.scene.quad(Quad.fill(area, mask, Background.solid(color))) }
+    } else if op == FILL_PATH || op == STROKE_PATH {
+      let color = r.color()
+      let rule = u32.toU8(r.word())
+      let mut style = Stroke.make(1.0)
+      if op == STROKE_PATH {
+        style.width = r.number()
+        style.cap = u32.toU8(r.word())
+        style.join = u32.toU8(r.word())
+        style.miterLimit = r.number()
+        let count = u32.toUsize(r.word())
+        let mut dashes = List<f64>.make()
+        let mut i: usize = 0
+        while i < count {
+          run dashes.append(r.number())
+          i = i + 1
+        }
+        style.dashOffset = r.number()
+        run style.setDashes(dashes.asSlice())
+      }
+      run self.readPath(&mut r)
+      let identity = Affine.identity()
+      if op == FILL_PATH {
+        drop run Effect.catchAll(self.paths.fill(&mut self.scene, 0, &self.path, &identity, rule, Background.solid(color), mask), noPath)
+      } else {
+        drop run Effect.catchAll(self.paths.stroke(&mut self.scene, 0, &self.path, &style, &identity, Background.solid(color), mask), noPath)
+      }
+    } else if op == FILL_TEXT {
+      let color = r.color()
+      let font = r.blob()
+      let value = r.blob()
+      let x = r.float()
+      let y = r.float()
+      let scale = r.float()
+      let align = r.word()
+      let baseline = r.word()
+      let maxWidth = r.float()
+      run self.fillText(&mut text, font, value, x, y, scale, align, baseline, maxWidth, color, mask)
+    }
+  }
+
+  effect fn readPath(self: &mut Self, r: &mut Reader<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.path.clear()
+    let count = u32.toUsize(r.word())
+    let mut i: usize = 0
+    let mut open = false
+    while i < count {
+      let verb = r.word()
+      if verb == MOVE {
+        let x = r.number()
+        let y = r.number()
+        run self.path.moveTo(x, y)
+        open = true
+      } else if !open {
+        // A segment before any point starts where it ends.
+        if verb == CLOSE {
+          i = i + 1
+          continue
+        }
+        let skip: usize = if verb == LINE { 0 } else if verb == QUAD { 2 } else { 4 }
+        let mut k: usize = 0
+        while k < skip {
+          drop r.number()
+          k = k + 1
+        }
+        let x = r.number()
+        let y = r.number()
+        run self.path.moveTo(x, y)
+        open = true
+      } else if verb == LINE {
+        let x = r.number()
+        let y = r.number()
+        run self.path.lineTo(x, y)
+      } else if verb == QUAD {
+        let x1 = r.number()
+        let y1 = r.number()
+        let x = r.number()
+        let y = r.number()
+        run self.path.quadTo(x1, y1, x, y)
+      } else if verb == CUBIC {
+        let x1 = r.number()
+        let y1 = r.number()
+        let x2 = r.number()
+        let y2 = r.number()
+        let x = r.number()
+        let y = r.number()
+        run self.path.cubicTo(x1, y1, x2, y2, x, y)
+      } else if verb == CLOSE {
+        run self.path.close()
+      }
+      i = i + 1
+    }
+  }
+
+  /// The key of `font` ("style weight size families", as `canvas2d.js` writes it).
+  effect fn fontKey(self: &mut Self, text: &mut TextSystem<'a>, font: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let fonts = self.fonts.asSlice()
+    let mut i: usize = 0
+    while i < fonts.length {
+      if sameBytes(fonts[i].name.asSlice(), font) { return fonts[i].key }
+      i = i + 1
+    }
+    let mut fields: [usize; 3] = [0, 0, 0]
+    let mut found: usize = 0
+    let mut at: usize = 0
+    while at < font.length && found < 3 {
+      if font[at] == 32 {
+        fields[found] = at
+        found = found + 1
+      }
+      at = at + 1
+    }
+    let italic = found > 0 && fields[0] >= 6 && font[0] == 105
+    let weight = if found > 1 { decimal(Slice.view(font, fields[0] + 1, fields[1] - fields[0] - 1)) } else { 400.0 }
+    let size = if found > 2 { decimal(Slice.view(font, fields[1] + 1, fields[2] - fields[1] - 1)) } else { 10.0 }
+    let families = if found > 2 { Slice.view(font, fields[2] + 1, font.length - fields[2] - 1) } else { Slice.view(font, 0, 0) }
+    let mut list = List<Family>.make()
+    run parseFamilies(families, &mut list)
+    if list.length() == 0 { run parseFamilies(b"sans-serif", &mut list) }
+    let mut style = TextStyle.make(move list, f64.toF32(f64.max(size, 0.0)))
+    style.request.weight = if weight > 0.0 { weight } else { 400.0 }
+    if italic { style.request.style = FontStyle.Italic }
+    let key = run text.addStyle(move style)
+    let mut name = List<u8>.make()
+    run name.appendSlice(font)
+    run self.fonts.append(Font { name: move name, key: key })
+    return key
+  }
+
+  effect fn faceOf(self: &mut Self, text: &TextSystem<'a>, key: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    while self.faces.length() <= key {
+      run self.faces.append(FaceSlot<'a> { loaded: false, face: Option<FontFace<'a>>.None })
+    }
+    if !self.faces.asSlice()[key].loaded {
+      let face = run text.rasterFace(key)
+      let slots = self.faces.asMutSlice()
+      slots[key] = FaceSlot<'a> { loaded: true, face: move face }
+    }
+  }
+
+  /// What `measureText` gives for `value` in `font`.
+  pub effect fn measure(self: &mut Self, text: &mut TextSystem<'a>, font: &[u8], value: &[u8]) -> Measured ! OutOfMemoryError ? &mut Allocator {
+    let key = run self.fontKey(&mut text, font)
+    let metrics = text.fonts.metricsOf(key)
+    self.line.clear()
+    let width = run self.shape(&mut text, key, value)
+    let mut inkLeft: f32 = 0.0
+    let mut inkRight: f32 = 0.0
+    let mut inkAscent: f32 = 0.0
+    let mut inkDescent: f32 = 0.0
+    let mut any = false
+    let size = text.keyInfo(key).size
+    let mut i: usize = 0
+    while i < self.line.length() {
+      let g = self.line.get(i)
+      run self.faceOf(&text, g.fontKey)
+      if let Option<FontFace<'a>>.Some { value: face } = &self.faces.asSlice()[g.fontKey].face {
+        let glyphKey = GlyphKey { font: face.id, glyph: g.glyph, size: text.keyInfo(g.fontKey).size, scale: 1.0, subpixel: 0, color: false, palette: 0, aliased: false }
+        let found = run Effect.catchAll(self.glyphs.glyph(&mut self.atlas, &face, glyphKey), noGlyph)
+        if let Option<RasterGlyph>.Some { value: drawn } = found {
+          let left = g.x + i32.toF32(drawn.left)
+          let right = left + u32.toF32(drawn.width())
+          let top = g.y + i32.toF32(drawn.top)
+          let bottom = top + u32.toF32(drawn.height())
+          if !any || left < inkLeft { inkLeft = left }
+          if !any || right > inkRight { inkRight = right }
+          if !any || -top > inkAscent { inkAscent = -top }
+          if !any || bottom > inkDescent { inkDescent = bottom }
+          any = true
+        }
+      }
+      i = i + 1
+    }
+    run self.settleUploads()
+    drop size
+    return Measured {
+      width: width, ascent: metrics.ascent, descent: metrics.descent,
+      inkLeft: -inkLeft, inkRight: inkRight, inkAscent: inkAscent, inkDescent: inkDescent,
+    }
+  }
+
+  effect fn shape(self: &mut Self, text: &mut TextSystem<'a>, key: usize, value: &[u8]) -> f32 ! OutOfMemoryError ? &mut Allocator {
+    return match String.fromUtf8(value) {
+      Result<string, InvalidUtf8>.Success { value: decoded } => run Effect.catchAll(text.shapeOneLine(key, decoded, &mut self.line), noShape)
+      Result<string, InvalidUtf8>.Failure { .. } => 0.0
+    }
+  }
+
+  effect fn fillText(
+    self: &mut Self,
+    text: &mut TextSystem<'a>,
+    font: &[u8],
+    value: &[u8],
+    x: f32,
+    y: f32,
+    scale: f32,
+    align: u32,
+    baseline: u32,
+    maxWidth: f32,
+    color: Rgba<f32>,
+    mask: ContentMask,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let key = run self.fontKey(&mut text, font)
+    let metrics = text.fonts.metricsOf(key)
+    self.line.clear()
+    let advance = run self.shape(&mut text, key, value)
+    if self.line.length() == 0 { return () }
+    // maxWidth condenses the text horizontally, as browsers do.
+    let squeeze: f32 = if maxWidth >= 0.0 && advance > maxWidth && advance > 0.0 { maxWidth / advance } else { 1.0 }
+    let width = advance * squeeze
+    let shift: f32 = if align == ALIGN_CENTER { -width * 0.5 } else if align == ALIGN_END { -width } else { 0.0 }
+    let rise: f32 = if baseline == BASELINE_TOP { metrics.ascent }
+      else if baseline == BASELINE_HANGING { metrics.ascent * 0.8 }
+      else if baseline == BASELINE_MIDDLE { (metrics.ascent - metrics.descent) * 0.5 }
+      else if baseline == BASELINE_IDEOGRAPHIC || baseline == BASELINE_BOTTOM { -metrics.descent }
+      else { 0.0 }
+    let s: f32 = if scale > 0.0 { scale } else { 1.0 }
+    let mut i: usize = 0
+    while i < self.line.length() {
+      let g = self.line.get(i)
+      i = i + 1
+      run self.faceOf(&text, g.fontKey)
+      let size = text.keyInfo(g.fontKey).size
+      if let Option<FontFace<'a>>.Some { value: face } = &self.faces.asSlice()[g.fontKey].face {
+        let pen = PenPosition.of(f32.toF64(x + (shift + g.x * squeeze) * s), f32.toF64(y + (rise + g.y) * s))
+        let glyphKey = GlyphKey { font: face.id, glyph: g.glyph, size: size, scale: s, subpixel: pen.subpixel, color: true, palette: 0, aliased: false }
+        let found = run Effect.catchAll(self.glyphs.glyph(&mut self.atlas, &face, glyphKey), noGlyph)
+        if let Option<RasterGlyph>.Some { value: drawn } = found {
+          let left = i32.toF32(pen.x + drawn.left)
+          let top = i32.toF32(pen.y + drawn.top)
+          let bounds = Rect<f32>.new(left, top, left + u32.toF32(drawn.width()), top + u32.toF32(drawn.height()))
+          if &drawn.kind == &Kind.Polychrome {
+            drop run self.scene.image(ImageSprite {
+              quarterTurns: 0, clipBounds: bounds, bounds: bounds, mask: mask, tile: drawn.tile,
+              opacity: color.a, cornerRadii: Radii.zero(), grayscale: false, nearest: false,
+            })
+          } else {
+            drop run self.scene.glyph(GlyphSprite { bounds: bounds, mask: mask, tile: drawn.tile, color: color })
+          }
+        }
+      }
+    }
+  }
+
+  /// Copies the glyphs rasterized since the last call into the renderer's atlas pixels.
+  effect fn settleUploads(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.atlasPixels.sync(&self.atlas)
+    let uploads = self.glyphs.uploads()
+    let bytes = self.glyphs.uploadBytes()
+    let mut i: usize = 0
+    while i < uploads.length {
+      let u = uploads[i]
+      let rows = u32.toUsize(u.tile.bounds.yMax - u.tile.bounds.yMin)
+      let length = rows * u32.toUsize(u.bytesPerRow)
+      if u.offset + length <= bytes.length {
+        self.atlasPixels.write(u.tile, Slice.view(bytes, u.offset, length))
+      }
+      i = i + 1
+    }
+    self.glyphs.clearUploads()
+  }
+
+  /// Draws what the scene holds into the canvas it was built for.
+  effect fn flush(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.open == 0 { return () }
+    let node = self.open
+    self.open = 0
+    run self.settleUploads()
+    run self.scene.finish()
+    let at = self.find(node)
+    if at != usize.MAX {
+      let bitmap = &mut self.bitmaps.asMutSlice()[at]
+      run Effect.catchAll(self.renderer.draw(&self.scene, &self.atlasPixels, &mut bitmap.pixels), noDraw)
+    }
+    self.scene.clear()
+  }
+
+  /// `getImageData`: the straight RGBA pixels of `width` by `height` at `x`, `y` of the bitmap
+  /// of `node`, transparent outside it.
+  pub fn read(self: &Self, node: u32, x: i32, y: i32, width: u32, height: u32, out: &mut [u8]) -> () {
+    let at = self.find(node)
+    if at == usize.MAX { return () }
+    let pixels = &self.bitmaps.asSlice()[at].pixels
+    let w = maxI(u32.toI32(pixels.width()), 0)
+    let h = maxI(u32.toI32(pixels.height()), 0)
+    let data = pixels.data()
+    let mut row: u32 = 0
+    while row < height {
+      let sy = y + u32.toI32(row)
+      let mut column: u32 = 0
+      while column < width {
+        let sx = x + u32.toI32(column)
+        let to = (u32.toUsize(row) * u32.toUsize(width) + u32.toUsize(column)) * 4
+        if to + 3 < out.length && sx >= 0 && sy >= 0 && sx < w && sy < h {
+          let from = (i32.toUsize(sy) * i32.toUsize(w) + i32.toUsize(sx)) * 4
+          let a = u8.toU32(data[from + 3])
+          out[to + 3] = data[from + 3]
+          if a == 0 {
+            out[to] = 0
+            out[to + 1] = 0
+            out[to + 2] = 0
+          } else {
+            out[to] = u32.toU8(minU((u8.toU32(data[from]) * 255 + a / 2) / a, 255))
+            out[to + 1] = u32.toU8(minU((u8.toU32(data[from + 1]) * 255 + a / 2) / a, 255))
+            out[to + 2] = u32.toU8(minU((u8.toU32(data[from + 2]) * 255 + a / 2) / a, 255))
+          }
+        }
+        column = column + 1
+      }
+      row = row + 1
+    }
+  }
+}
+
+fn minU(a: u32, b: u32) -> u32 { return if a < b { a } else { b } }
+
+fn maxU(a: u32, b: u32) -> u32 { return if a > b { a } else { b } }
+
+fn maxI(a: i32, b: i32) -> i32 { return if a > b { a } else { b } }
+
+fn sameBytes(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// A plain decimal such as `14` or `13.5`.
+fn decimal(text: &[u8]) -> f64 {
+  let mut value: f64 = 0.0
+  let mut fraction: f64 = 0.0
+  let mut i: usize = 0
+  while i < text.length {
+    let c = text[i]
+    if c == 46 {
+      fraction = 1.0
+    } else if c >= 48 && c <= 57 {
+      let digit = u8.toF64(c - 48)
+      if fraction > 0.0 {
+        fraction = fraction / 10.0
+        value = value + digit * fraction
+      } else {
+        value = value * 10.0 + digit
+      }
+    }
+    i = i + 1
+  }
+  return value
+}
+
+/// The whole pixels `area` covers, inside `width` by `height`.
+fn pixelSpan(area: Rect<f32>, width: u32, height: u32) -> [u32; 4] {
+  let x0 = f32.toU32(f32.max(f32.floor(area.xMin + 0.5), 0.0))
+  let y0 = f32.toU32(f32.max(f32.floor(area.yMin + 0.5), 0.0))
+  let x1 = minU(f32.toU32(f32.max(f32.floor(area.xMax + 0.5), 0.0)), width)
+  let y1 = minU(f32.toU32(f32.max(f32.floor(area.yMax + 0.5), 0.0)), height)
+  return [x0, y0, x1, y1]
+}
+
+fn clearArea(pixels: &mut Pixmap, area: Rect<f32>, alpha: u8) -> () {
+  let width = pixels.width()
+  let span = pixelSpan(area, width, pixels.height())
+  let data = pixels.dataMut()
+  let mut y = span[1]
+  while y < span[3] {
+    let mut x = span[0]
+    while x < span[2] {
+      let at = (u32.toUsize(y) * u32.toUsize(width) + u32.toUsize(x)) * 4
+      data[at] = 0
+      data[at + 1] = 0
+      data[at + 2] = 0
+      data[at + 3] = alpha
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `putImageData`: straight RGBA `bytes` of `w` by `h` replace the pixels at `x`, `y`.
+fn putPixels(pixels: &mut Pixmap, x: i32, y: i32, w: u32, h: u32, bytes: &[u8], clip: Rect<f32>, opaque: bool) -> () {
+  let width = pixels.width()
+  let span = pixelSpan(clip, width, pixels.height())
+  let data = pixels.dataMut()
+  let mut row: u32 = 0
+  while row < h {
+    let ty = y + u32.toI32(row)
+    let mut column: u32 = 0
+    while column < w {
+      let tx = x + u32.toI32(column)
+      let from = (u32.toUsize(row) * u32.toUsize(w) + u32.toUsize(column)) * 4
+      if from + 3 < bytes.length && tx >= u32.toI32(span[0]) && ty >= u32.toI32(span[1]) && tx < u32.toI32(span[2]) && ty < u32.toI32(span[3]) {
+        let to = (i32.toUsize(ty) * u32.toUsize(width) + i32.toUsize(tx)) * 4
+        let a = if opaque { 255 } else { u8.toU32(bytes[from + 3]) }
+        data[to] = u32.toU8((u8.toU32(bytes[from]) * a + 127) / 255)
+        data[to + 1] = u32.toU8((u8.toU32(bytes[from + 1]) * a + 127) / 255)
+        data[to + 2] = u32.toU8((u8.toU32(bytes[from + 2]) * a + 127) / 255)
+        data[to + 3] = u32.toU8(a)
+      }
+      column = column + 1
+    }
+    row = row + 1
+  }
+}
+
+/// `drawImage`: `source` of `bytes` (`w` by `h`, premultiplied when `premultiplied`, else
+/// straight) stretched over `target`, bilinear, source-over at `alpha`.
+fn drawImage(
+  pixels: &mut Pixmap,
+  bytes: &[u8],
+  w: u32,
+  h: u32,
+  premultiplied: bool,
+  source: Rect<f32>,
+  target: Rect<f32>,
+  clip: Rect<f32>,
+  alpha: f64,
+) -> () {
+  let tw = target.xMax - target.xMin
+  let th = target.yMax - target.yMin
+  if tw <= 0.0 || th <= 0.0 || w == 0 || h == 0 { return () }
+  let width = pixels.width()
+  let span = pixelSpan(intersect(target, clip), width, pixels.height())
+  let data = pixels.dataMut()
+  let opacity = f64.toU32(f64.min(f64.max(alpha, 0.0), 1.0) * 255.0 + 0.5)
+  let sw = (source.xMax - source.xMin) / tw
+  let sh = (source.yMax - source.yMin) / th
+  let mut y = span[1]
+  while y < span[3] {
+    let sy = source.yMin + (u32.toF32(y) + 0.5 - target.yMin) * sh - 0.5
+    let mut x = span[0]
+    while x < span[2] {
+      let sx = source.xMin + (u32.toF32(x) + 0.5 - target.xMin) * sw - 0.5
+      let sample = bilinear(bytes, w, h, premultiplied, sx, sy)
+      let sa = (sample[3] * opacity + 127) / 255
+      if sa != 0 {
+        let at = (u32.toUsize(y) * u32.toUsize(width) + u32.toUsize(x)) * 4
+        let keep = 255 - sa
+        let mut c: usize = 0
+        while c < 3 {
+          let s = (sample[c] * opacity + 127) / 255
+          data[at + c] = u32.toU8(minU(s + (u8.toU32(data[at + c]) * keep + 127) / 255, 255))
+          c = c + 1
+        }
+        data[at + 3] = u32.toU8(minU(sa + (u8.toU32(data[at + 3]) * keep + 127) / 255, 255))
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// The premultiplied color at `x`, `y` (pixel centers at whole numbers), edges clamped.
+fn bilinear(bytes: &[u8], w: u32, h: u32, premultiplied: bool, x: f32, y: f32) -> [u32; 4] {
+  let cx = f32.min(f32.max(x, 0.0), u32.toF32(w - 1))
+  let cy = f32.min(f32.max(y, 0.0), u32.toF32(h - 1))
+  let x0 = f32.toU32(f32.floor(cx))
+  let y0 = f32.toU32(f32.floor(cy))
+  let x1 = minU(x0 + 1, w - 1)
+  let y1 = minU(y0 + 1, h - 1)
+  let fx = f32.toU32((cx - u32.toF32(x0)) * 256.0)
+  let fy = f32.toU32((cy - u32.toF32(y0)) * 256.0)
+  let a = texel(bytes, w, x0, y0, premultiplied)
+  let b = texel(bytes, w, x1, y0, premultiplied)
+  let c = texel(bytes, w, x0, y1, premultiplied)
+  let d = texel(bytes, w, x1, y1, premultiplied)
+  let mut out: [u32; 4] = [0, 0, 0, 0]
+  let mut i: usize = 0
+  while i < 4 {
+    let top = a[i] * (256 - fx) + b[i] * fx
+    let bottom = c[i] * (256 - fx) + d[i] * fx
+    out[i] = (top * (256 - fy) + bottom * fy + 32768) / 65536
+    i = i + 1
+  }
+  return out
+}
+
+fn texel(bytes: &[u8], w: u32, x: u32, y: u32, premultiplied: bool) -> [u32; 4] {
+  let at = (u32.toUsize(y) * u32.toUsize(w) + u32.toUsize(x)) * 4
+  if at + 3 >= bytes.length { return [0, 0, 0, 0] }
+  let a = u8.toU32(bytes[at + 3])
+  if premultiplied {
+    return [u8.toU32(bytes[at]), u8.toU32(bytes[at + 1]), u8.toU32(bytes[at + 2]), a]
+  }
+  return [(u8.toU32(bytes[at]) * a + 127) / 255, (u8.toU32(bytes[at + 1]) * a + 127) / 255, (u8.toU32(bytes[at + 2]) * a + 127) / 255, a]
+}

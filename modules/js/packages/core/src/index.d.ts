@@ -369,15 +369,17 @@ export class Image extends Node {
 }
 
 /**
- * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
- * drawing's size in pixels and `getContext("webgpu")` gives its `GPUCanvasContext` (the types
- * of `@webgpu/types` describe it). Drawing runs on a GPU device of the application's own.
+ * A canvas the application draws with WebGPU or Canvas 2D, as a `<canvas>`: `width` and
+ * `height` are the drawing's size in pixels, `getContext("webgpu")` gives its
+ * `GPUCanvasContext` (the types of `@webgpu/types` describe it) and `getContext("2d")` its
+ * `CanvasRenderingContext2D`.
  */
 export class Canvas extends Node {
   constructor();
   width: number;
   height: number;
   getContext(kind: "webgpu"): unknown | null;
+  getContext(kind: "2d", options?: { alpha?: boolean }): unknown | null;
   getContext(kind: string): unknown | null;
 }
 

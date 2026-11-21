@@ -10,6 +10,15 @@ import font_collection.lib { FontCollection }
 import layout.lib {
   TextMeasure,
   TextContext,
+  TextToken,
+  TextTokenKind,
+  Direction,
+  UnicodeBidi,
+  WritingMode,
+  TextOrientation,
+  WhiteSpaceCollapse,
+  TextJustify,
+  TextRange,
   TextBreak,
   TextAnalysis,
   TextShapeRequest,
@@ -35,6 +44,19 @@ import silk.collections.slice { Slice }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.usize
+import silk.text.string { String }
+import silk.core.ownership { Copy }
+
+/// A glyph of a line shaped by [`TextSystem.shapeOneLine`]: its font key, and its origin from
+/// the line's start and from its baseline, y down, in CSS pixels.
+pub struct LineGlyph {
+  pub fontKey: usize,
+  pub glyph: u32,
+  pub x: f32,
+  pub y: f32,
+}
+
+impl Copy for LineGlyph {}
 
 /// Text measurement and shaping for css-layout over the fonts of a [`FontCollection`].
 ///
@@ -133,6 +155,53 @@ impl<'a> TextSystem<'a> {
   /// its baseline.
   pub fn runGlyphs(self: &Self, shapeKey: usize) -> &[PositionedGlyph] {
     return self.glyphs.glyphsOf(shapeKey)
+  }
+
+  /// Shapes `text` as one unbroken left-to-right line in font key `fontKey`, with the fallback
+  /// of its style, appends its glyphs to `out`, and returns its advance. For text drawn
+  /// outside layout (a 2D canvas): the glyph store and the line cache keep nothing of it.
+  pub effect fn shapeOneLine(self: &mut Self, fontKey: usize, text: string, out: &mut List<LineGlyph>) -> f32
+    ! OutOfMemoryError | TextError
+    ? &mut Allocator {
+    if String.byteLength(text) == 0 { return 0.0 }
+    let tokens = [
+      TextToken {
+        kind: TextTokenKind.Text, text: text, source: 0, sourceStart: 0, sourceEnd: String.byteLength(text),
+        fontKey: fontKey, writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed,
+        direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal, replacedInline: false,
+        whiteSpaceCollapse: WhiteSpaceCollapse.Preserve, textJustify: TextJustify.Auto, shapingBarrier: false,
+      },
+    ]
+    let context = TextContext {
+      tokens: &tokens, writingMode: WritingMode.HorizontalTb, textOrientation: TextOrientation.Mixed,
+      direction: Direction.Ltr, unicodeBidi: UnicodeBidi.Normal, textJustify: TextJustify.Auto,
+    }
+    let mut breaks = List<TextBreak>.make()
+    let analysis = run analyze(&mut self.analyzer, context, &self.fonts, &mut breaks)
+    let hanging: [TextRange; 0] = []
+    let request = TextShapeRequest {
+      context: context, start: TextCursor { unit: 0, offset: 0 }, end: analysis.paragraph.end,
+      analysis: &analysis, hyphenated: false, ellipsis: false, justificationSpace: 0.0, hangingRanges: &hanging,
+    }
+    let mark = self.glyphs.length()
+    let mut runs = List<TextRun>.make()
+    run shapeLine(&mut self.shaping, &mut self.fonts, &mut self.glyphs, request, &mut runs)
+    let mut pen: f32 = 0.0
+    let mut i: usize = 0
+    while i < runs.length() {
+      if let TextRun.Text { fontKey: key, shapeKey, advance, .. } = runs.get(i) {
+        let glyphs = self.glyphs.glyphsOf(shapeKey)
+        let mut g: usize = 0
+        while g < glyphs.length {
+          run out.append(LineGlyph { fontKey: key, glyph: glyphs[g].glyph, x: pen + glyphs[g].x, y: glyphs[g].y })
+          g = g + 1
+        }
+        pen = pen + advance
+      }
+      i = i + 1
+    }
+    self.glyphs.truncate(mark)
+    return pen
   }
 
   /// The face of font key `key` at its variation coordinates, for a `font-raster` glyph
