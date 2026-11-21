@@ -655,7 +655,8 @@ export class Node {
   /** The tag in upper case for HTML elements, as in the DOM. */
   get tagName() {
     const name = this.localName;
-    return this.namespaceURI === undefined ? name.toUpperCase() : name;
+    const namespace = this.namespaceURI;
+    return namespace === undefined || namespace === null || namespace === "http://www.w3.org/1999/xhtml" ? name.toUpperCase() : name;
   }
 
   set tagName(_value) {}
@@ -6344,8 +6345,25 @@ export function supports(conditionOrProperty, value) {
   return arguments.length > 1 ? native.supports(String(conditionOrProperty), String(value)) : native.supports(String(conditionOrProperty));
 }
 
+/** `CSS.escape(text)`: `text` as a CSS identifier, escaped as the CSSOM spec does. */
+export function cssEscape(value) {
+  const text = String(value);
+  let result = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const character = text[i];
+    if (code === 0) result += "\uFFFD";
+    else if ((code >= 0x1 && code <= 0x1f) || code === 0x7f || (i === 0 && code >= 0x30 && code <= 0x39) || (i === 1 && code >= 0x30 && code <= 0x39 && text.charCodeAt(0) === 0x2d)) result += "\\" + code.toString(16) + " ";
+    else if (i === 0 && text.length === 1 && code === 0x2d) result += "\\" + character;
+    else if (code >= 0x80 || code === 0x2d || code === 0x5f || (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) result += character;
+    else result += "\\" + character;
+  }
+  return result;
+}
+
 if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
 globalThis.CSS.supports ??= supports;
+globalThis.CSS.escape ??= cssEscape;
 
 let frameStatsSince = 0;
 

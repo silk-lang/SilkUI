@@ -3,6 +3,8 @@
 // `MessageEvent`s, and an uncaught exception as an `error` event. A runtime without worker
 // threads (the embedded engine) has no `Worker`.
 
+import { appBase, appFile } from "./base.js";
+
 const threads = globalThis.process?.getBuiltinModule?.("node:worker_threads");
 
 // What runs first on the worker's thread: the worker globals, then the script.
@@ -25,10 +27,20 @@ globalThis.importScripts = (...urls) => {
   for (const url of urls) (0, eval)(readFileSync(fileURLToPath(new URL(url, workerData.url)), "utf8"));
 };
 parentPort.on("message", (data) => {
+  // A shared worker hears its clients as \`connect\` events, each with the client's port.
+  if (workerData.shared) {
+    const port = data[workerData.connectKey];
+    if (!port) return;
+    const event = new MessageEvent("connect", { data: "", ports: [port] });
+    if (typeof globalThis.onconnect === "function") globalThis.onconnect(event);
+    target.dispatchEvent(event);
+    return;
+  }
   const event = new MessageEvent("message", { data });
   if (typeof globalThis.onmessage === "function") globalThis.onmessage(event);
   target.dispatchEvent(event);
 });
+if (workerData.shared) globalThis.onconnect = null;
 const ErrorEvent = globalThis.ErrorEvent ?? class ErrorEvent extends Event {
   constructor(type, init = {}) { super(type, init); this.message = init.message ?? ""; this.error = init.error; }
 };
@@ -51,6 +63,8 @@ else {
 `;
 
 const ERROR_KEY = "__silkWorkerError";
+const CONNECT_KEY = "__silkWorkerConnect";
+const SHARED = Symbol("shared");
 
 // Node has no ErrorEvent.
 const ErrorEvent = !threads ? null : globalThis.ErrorEvent ?? class ErrorEvent extends Event {
@@ -73,11 +87,12 @@ function scriptUrl(specifier) {
     return { blob };
   }
   const { pathToFileURL } = globalThis.process.getBuiltinModule("node:url");
-  const base = globalThis.__silkWorkerBase ?? pathToFileURL(globalThis.process.cwd() + "/").href;
+  const base = appBase() ?? pathToFileURL(globalThis.process.cwd() + "/").href;
   // An address of the window's own origin names a file of the app.
   try {
     const own = new URL(text, globalThis.location?.href);
-    if (globalThis.location && own.origin === globalThis.location.origin) return new URL("." + own.pathname, base).href;
+    const file = globalThis.location && appFile(own, globalThis.location.origin);
+    if (file) return file.href;
   } catch {}
   return new URL(text, base).href;
 }
@@ -96,7 +111,7 @@ export const WorkerClass = threads
         const start = (href) => {
           this.#thread = new threads.Worker(BOOTSTRAP, {
             eval: true,
-            workerData: { url: href, module: options.type === "module", name: options.name ?? "", errorKey: ERROR_KEY },
+            workerData: { url: href, module: options.type === "module", name: options.name ?? "", errorKey: ERROR_KEY, shared: Boolean(options[SHARED]), connectKey: CONNECT_KEY },
           });
           this.#thread.on("message", (data) => {
             if (data && typeof data === "object" && ERROR_KEY in data) {
@@ -131,6 +146,42 @@ export const WorkerClass = threads
       terminate() {
         this.#thread?.terminate();
         this.#queue = [];
+      }
+    }
+  : undefined;
+
+// `SharedWorker`: one worker for each script and name, shared by every `new SharedWorker` of
+// it in the window. Each gets a port of a channel of its own, which the worker hears as
+// `connect`.
+const sharedWorkers = new Map();
+export const SharedWorkerClass = threads
+  ? class SharedWorker extends EventTarget {
+      onerror = null;
+
+      constructor(specifier, options = {}) {
+        super();
+        if (typeof options === "string") options = { name: options };
+        const key = JSON.stringify([String(specifier instanceof URL ? specifier.href : specifier), options.name ?? "", options.type ?? "classic"]);
+        let shared = sharedWorkers.get(key);
+        if (!shared) {
+          shared = { worker: new WorkerClass(specifier, { ...options, [SHARED]: true }), clients: 0 };
+          sharedWorkers.set(key, shared);
+        }
+        const worker = shared.worker;
+        shared.clients++;
+        worker.addEventListener("error", (event) => {
+          if (typeof this.onerror === "function") this.onerror(event);
+          this.dispatchEvent(new ErrorEvent("error", { error: event.error, message: event.message }));
+        });
+        const { port1, port2 } = new threads.MessageChannel();
+        this.port = port1;
+        // The worker ends when its last client's port closes.
+        port1.once("close", () => {
+          if (--shared.clients > 0) return;
+          worker.terminate();
+          sharedWorkers.delete(key);
+        });
+        worker.postMessage({ [CONNECT_KEY]: port2 }, [port2]);
       }
     }
   : undefined;
