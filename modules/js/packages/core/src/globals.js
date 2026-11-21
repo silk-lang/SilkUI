@@ -36,7 +36,7 @@ import {
 } from "./index.js";
 import * as core from "./index.js";
 import { Storage, localStorageArea, sessionStorageArea } from "./storage.js";
-import { History, Location, PopStateEvent, HashChangeEvent } from "./location.js";
+import { History, Location, Navigation, NavigateEvent, NavigationCurrentEntryChangeEvent, NavigationHistoryEntry, PopStateEvent, HashChangeEvent } from "./location.js";
 import { indexedDBModule } from "./indexeddb.js";
 import { WorkerClass } from "./worker.js";
 
@@ -950,6 +950,10 @@ global.self ??= global;
 define("document", documentTarget);
 define("location", location);
 define("history", history);
+if (global.navigation === undefined) define("navigation", new Navigation(history, location));
+for (const [name, value] of Object.entries({ Navigation, NavigateEvent, NavigationCurrentEntryChangeEvent, NavigationHistoryEntry })) {
+  if (global[name] === undefined) define(name, value);
+}
 global.top ??= global;
 global.parent ??= global;
 global.frames ??= global;

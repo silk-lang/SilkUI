@@ -18,7 +18,7 @@ import { missingApis, ownerOf, report } from "./apis.js";
 const CORE_GLOBALS = /[\\/](?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker)\.js$/;
 // Workers up to this size (characters) go into the bundle as data: addresses.
 const INLINE_WORKER_LIMIT = 256 * 1024;
-const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB"];
+const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "navigation", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB"];
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";

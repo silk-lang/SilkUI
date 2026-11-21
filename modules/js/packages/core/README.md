@@ -96,7 +96,7 @@ fills it: render into `document.body`. Events that reach the root go on to `docu
 `document.documentElement.classList` and `style.setProperty("--name", value)` style `:root`.
 It also adds `document.activeElement`, `getElementById` and the query methods, `innerWidth`
 and `innerHeight` with `resize` events, `HTMLElement`, `Element`, `Node` and `Text` for
-`instanceof` (their prototypes are the nodes'), `MutationObserver`, `location` and `history`
+`instanceof` (their prototypes are the nodes'), `MutationObserver`, `location`, `history` and `navigation`
 (entries in memory with `popstate` and `hashchange`, starting at `http://localhost/` or
 `globalThis.__silkLocation`), `localStorage` (a JSON file under `~/.silkui/storage/<app>` on
 the full runtime, or `$SILKUI_STORAGE_DIR`), `sessionStorage`, `indexedDB` (in memory, saved
