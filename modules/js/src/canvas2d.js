@@ -8,14 +8,25 @@
 // the host draws it at once into the canvas's bitmap (ui_tree canvas2d.silk), which the window
 // shows as it shows a GPU canvas.
 //
-// Not drawn as in a browser: gradients and patterns paint their first color, a clip is the
-// bounding box of its path, shadows and filters are ignored, rotated text keeps its glyphs
-// upright, and only source-over compositing exists.
+// A draw that needs more than a color over the bitmap (a gradient or pattern, a clip shaped like
+// its path, a shadow, another composite operation) goes first with an EFFECTS command, and a clip
+// that is not a rectangle goes as a CLIP_MASK command the first time a draw uses it. Not drawn as
+// in a browser: `filter`, `letterSpacing` and `wordSpacing`, and images other than 2D canvases
+// and `ImageData`.
 //
 // Edit this, then run `silk task embed-assets` to regenerate generated_canvas2d_api.silk.
 (function (native) {
   const SIZE = 1, FILL_RECT = 2, CLEAR_RECT = 3, FILL_PATH = 4, STROKE_PATH = 5, FILL_TEXT = 6;
-  const PUT_PIXELS = 7, DRAW_PIXELS = 8, DRAW_CANVAS = 9;
+  const PUT_PIXELS = 7, DRAW_PIXELS = 8, DRAW_CANVAS = 9, CLIP_MASK = 10, EFFECTS = 11;
+  const COMPOSITE = {
+    "source-over": 0, "source-in": 1, "source-out": 2, "source-atop": 3, "destination-over": 4,
+    "destination-in": 5, "destination-out": 6, "destination-atop": 7, lighter: 8, copy: 9, xor: 10,
+    multiply: 11, screen: 12, overlay: 13, darken: 14, lighten: 15, "color-dodge": 16,
+    "color-burn": 17, "hard-light": 18, "soft-light": 19, difference: 20, exclusion: 21, hue: 22,
+    saturation: 23, color: 24, luminosity: 25,
+  };
+  const REPEAT = { repeat: 3, "repeat-x": 1, "repeat-y": 2, "no-repeat": 0, "": 3 };
+  const LINEAR = 1, RADIAL = 2, CONIC = 3, PATTERN = 4;
   const MOVE = 0, LINE = 1, QUAD = 2, CUBIC = 3, CLOSE = 4;
   const CAPS = { butt: 0, round: 1, square: 2 };
   const JOINS = { miter: 0, round: 2, bevel: 3 };
@@ -176,24 +187,38 @@
     return found;
   }
 
+  // `kind` is LINEAR (x0, y0, x1, y1), RADIAL (x0, y0, r0, x1, y1, r1) or CONIC (angle, x, y).
   class CanvasGradient {
-    constructor() {
+    constructor(kind, geometry) {
+      this._kind = kind;
+      this._geometry = geometry;
       this._stops = [];
     }
     addColorStop(offset, color) {
+      offset = +offset;
+      if (!(offset >= 0 && offset <= 1)) throw new RangeError("The offset is outside 0 to 1.");
       const parsed = parseColor(String(color));
       if (!parsed) throw new SyntaxError("'" + color + "' is not a color");
-      this._stops.push([+offset, parsed]);
-      this._stops.sort((a, b) => a[0] - b[0]);
+      let at = this._stops.length;
+      while (at > 0 && this._stops[at - 1][0] > offset) at--;
+      this._stops.splice(at, 0, [offset, parsed]);
     }
   }
+  // `source` is a context (another canvas) or an ImageData.
   class CanvasPattern {
-    setTransform() {}
+    constructor(source, repeat) {
+      this._source = source;
+      this._repeat = repeat;
+      this._matrix = IDENTITY;
+    }
+    setTransform(m) {
+      if (m === undefined) this._matrix = IDENTITY;
+      else this._matrix = [m.a ?? m.m11 ?? 1, m.b ?? m.m12 ?? 0, m.c ?? m.m21 ?? 0, m.d ?? m.m22 ?? 1, m.e ?? m.m41 ?? 0, m.f ?? m.m42 ?? 0];
+    }
   }
-  // The color a style paints: a gradient paints its first stop.
+  // The color a style paints, or null when it is a gradient or a pattern.
   function paintOf(style) {
-    if (style instanceof CanvasGradient) return style._stops.length ? style._stops[0][1] : [0, 0, 0, 0];
-    if (style instanceof CanvasPattern) return [0, 0, 0, 0];
+    if (style instanceof CanvasGradient || style instanceof CanvasPattern) return null;
     return parseColor(style) ?? [0, 0, 0, 1];
   }
 
@@ -487,6 +512,10 @@
     return {
       transform: IDENTITY,
       clip: [0, 0, width, height],
+      // Clips that are not rectangles, in device pixels: [{ points, rule }], and their number.
+      clipPaths: [],
+      clipId: 0,
+      shadow: [0, 0, 0, 0],
       fillStyle: "#000000",
       fill: [0, 0, 0, 1],
       strokeStyle: "#000000",
@@ -540,6 +569,8 @@
       const height = Math.max(1, this.canvas.height | 0);
       this._state = initialState(width, height);
       this._stack = [];
+      // The clip whose mask the host keeps for this canvas.
+      this._sentClip = 0;
       this._begin();
       const w = command(SIZE, this._node);
       w.u32(width);
@@ -658,43 +689,145 @@
       w.rect(clip[0], clip[1], clip[2], clip[3]);
       return w;
     }
-    fill(path, rule) {
-      if (typeof path === "string") [path, rule] = [undefined, path];
-      const points = this._pointsOf(path);
-      if (!points.length) return;
-      const w = this._clipped(command(FILL_PATH, this._node));
-      w.color(this._state.fill, this._state.globalAlpha);
-      w.u32(rule === "evenodd" ? 1 : 0);
-      writePath(w, points);
-    }
-    stroke(path) {
-      const points = this._pointsOf(path);
-      if (!points.length) return;
+    // Sends what the next draw needs beyond a color over the bitmap: the clip mask, and EFFECTS
+    // (`style` a gradient or pattern, a shadow, another operation). Returns the alpha the draw's
+    // own colors carry (EFFECTS carries globalAlpha), or -1 when nothing would be drawn.
+    // `op` overrides the composite operation with no shadow and no globalAlpha (clearRect).
+    _effects(style, op) {
       const s = this._state;
-      const scale = Math.sqrt(Math.abs(s.transform[0] * s.transform[3] - s.transform[1] * s.transform[2])) || 1;
-      const w = this._clipped(command(STROKE_PATH, this._node));
-      w.color(s.stroke, s.globalAlpha);
-      w.u32(0);
-      w.f64(s.lineWidth * scale);
+      const clip = s.clip;
+      if (!(clip[0] < clip[2] && clip[1] < clip[3])) return -1;
+      const plain = op !== undefined;
+      op ??= COMPOSITE[s.globalCompositeOperation];
+      const masked = s.clipPaths.length > 0;
+      if (masked && this._sentClip !== s.clipId) {
+        const w = this._clipped(command(CLIP_MASK, this._node));
+        w.u32(s.clipPaths.length);
+        for (const { points, rule } of s.clipPaths) {
+          w.u32(rule);
+          writePath(w, points);
+        }
+        this._sentClip = s.clipId;
+      }
+      const shadow = !plain && s.shadow[3] > 0 && (s.shadowBlur > 0 || s.shadowOffsetX !== 0 || s.shadowOffsetY !== 0);
+      const painted = style instanceof CanvasGradient || style instanceof CanvasPattern;
+      if (!masked && !shadow && op === 0 && !painted) return s.globalAlpha;
+      let inverse = null;
+      if (painted) {
+        inverse = invert(style instanceof CanvasPattern ? multiply(s.transform, style._matrix) : s.transform);
+        if (!inverse) return -1;
+      }
+      const w = this._clipped(command(EFFECTS, this._node));
+      w.u32(op);
+      w.f64(plain ? 1 : s.globalAlpha);
+      w.u32(masked ? 1 : 0);
+      w.u32(s.imageSmoothingEnabled ? 1 : 0);
+      w.color(shadow ? s.shadow : [0, 0, 0, 0], 1);
+      w.f64(s.shadowBlur);
+      w.f64(s.shadowOffsetX);
+      w.f64(s.shadowOffsetY);
+      if (!painted) {
+        w.u32(0);
+        return 1;
+      }
+      w.u32(style instanceof CanvasGradient ? style._kind : PATTERN);
+      for (const value of inverse) w.f64(value);
+      if (style instanceof CanvasGradient) {
+        for (let i = 0; i < 6; i++) w.f64(style._geometry[i] ?? 0);
+        w.u32(style._stops.length);
+        for (const [offset, color] of style._stops) {
+          w.f64(offset);
+          w.color(color, 1);
+        }
+      } else {
+        const image = style._source;
+        w.u32(REPEAT[style._repeat]);
+        w.u32(image.width);
+        w.u32(image.height);
+        w.u32(image.data.length);
+        w.raw(new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength));
+      }
+      return 1;
+    }
+    _strokeStyle(w) {
+      const s = this._state;
+      w.f64(s.lineWidth);
       w.u32(CAPS[s.lineCap]);
       w.u32(JOINS[s.lineJoin]);
       w.f64(s.miterLimit);
       w.u32(s.lineDash.length);
-      for (const value of s.lineDash) w.f64(value * scale);
-      w.f64(s.lineDashOffset * scale);
+      for (const value of s.lineDash) w.f64(value);
+      w.f64(s.lineDashOffset);
+    }
+    fill(path, rule) {
+      if (typeof path === "string") [path, rule] = [undefined, path];
+      const points = this._pointsOf(path);
+      if (!points.length) return;
+      const alpha = this._effects(this._state.fillStyle);
+      if (alpha < 0) return;
+      const w = this._clipped(command(FILL_PATH, this._node));
+      w.color(this._state.fill ?? WHITE, alpha);
+      w.u32(rule === "evenodd" ? 1 : 0);
       writePath(w, points);
     }
+    // The path goes in user space with the transform, so the line width, dashes and joins follow
+    // the transform as a browser strokes them.
+    stroke(path) {
+      const points = this._pointsOf(path);
+      if (!points.length) return;
+      const s = this._state;
+      const inverse = invert(s.transform);
+      if (!inverse) return;
+      const alpha = this._effects(s.strokeStyle);
+      if (alpha < 0) return;
+      const w = this._clipped(command(STROKE_PATH, this._node));
+      w.color(s.stroke ?? WHITE, alpha);
+      w.u32(0);
+      this._strokeStyle(w);
+      for (const value of s.transform) w.f64(value);
+      writePath(w, mapPoints(points, inverse));
+    }
     clip(path, rule) {
-      if (typeof path === "string") path = undefined;
-      const bounds = boundsOf(this._pointsOf(path));
-      const clip = this._state.clip;
-      this._state.clip = [Math.max(clip[0], bounds[0]), Math.max(clip[1], bounds[1]), Math.min(clip[2], bounds[2]), Math.min(clip[3], bounds[3])];
-      void rule;
+      if (typeof path === "string") [path, rule] = [undefined, path];
+      const points = this._pointsOf(path);
+      const rect = rectOf(points);
+      const bounds = rect ?? boundsOf(points);
+      const s = this._state;
+      const clip = s.clip;
+      s.clip = [Math.max(clip[0], bounds[0]), Math.max(clip[1], bounds[1]), Math.min(clip[2], bounds[2]), Math.min(clip[3], bounds[3])];
+      if (!rect) {
+        s.clipPaths = s.clipPaths.concat([{ points: points.slice(), rule: rule === "evenodd" ? 1 : 0 }]);
+        s.clipId = ++clipCount;
+      }
     }
-    isPointInPath() {
-      return false;
+    // `x`, `y` are in canvas pixels, as the points are.
+    isPointInPath(path, x, y, rule) {
+      if (!(path instanceof Path2D)) [path, x, y, rule] = [undefined, path, x, y];
+      if (!finite(x, y)) return false;
+      const lines = flatten(this._pointsOf(path));
+      let winding = 0;
+      for (let i = 0; i < lines.length; i += 4) {
+        const [x0, y0, x1, y1] = [lines[i], lines[i + 1], lines[i + 2], lines[i + 3]];
+        if ((y0 <= y) !== (y1 <= y)) {
+          const cross = x0 + ((y - y0) / (y1 - y0)) * (x1 - x0);
+          if (cross > x) winding += y1 > y0 ? 1 : -1;
+        }
+      }
+      return rule === "evenodd" ? winding % 2 !== 0 : winding !== 0;
     }
-    isPointInStroke() {
+    isPointInStroke(path, x, y) {
+      if (!(path instanceof Path2D)) [path, x, y] = [undefined, path, x];
+      if (!finite(x, y)) return false;
+      const m = this._state.transform;
+      const half = (this._state.lineWidth * (Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])) || 1)) / 2;
+      const lines = flatten(this._pointsOf(path));
+      for (let i = 0; i < lines.length; i += 4) {
+        const [x0, y0, x1, y1] = [lines[i], lines[i + 1], lines[i + 2], lines[i + 3]];
+        const dx = x1 - x0, dy = y1 - y0;
+        const length = dx * dx + dy * dy;
+        const t = length ? Math.max(0, Math.min(1, ((x - x0) * dx + (y - y0) * dy) / length)) : 0;
+        if (Math.hypot(x - (x0 + t * dx), y - (y0 + t * dy)) <= half) return true;
+      }
       return false;
     }
 
@@ -715,9 +848,11 @@
         path.rect(x, y, w, h);
         return this.fill(path);
       }
+      const alpha = this._effects(this._state.fillStyle);
+      if (alpha < 0) return;
       const r = this._deviceRect(x, y, w, h);
       const writer = this._clipped(command(FILL_RECT, this._node));
-      writer.color(this._state.fill, this._state.globalAlpha);
+      writer.color(this._state.fill ?? WHITE, alpha);
       writer.rect(r[0], r[1], r[2], r[3]);
     }
     strokeRect(x, y, w, h) {
@@ -728,34 +863,44 @@
     }
     clearRect(x, y, w, h) {
       if (!finite(x, y, w, h) || w === 0 || h === 0) return;
-      const r = this._axisAligned() ? this._deviceRect(x, y, w, h) : boundsOf(mapPoints([MOVE, x, y, LINE, x + w, y, LINE, x + w, y + h, LINE, x, y + h], this._state.transform));
-      const writer = this._clipped(command(CLEAR_RECT, this._node));
-      writer.rect(r[0], r[1], r[2], r[3]);
+      if (this._axisAligned() && !this._state.clipPaths.length) {
+        const r = this._deviceRect(x, y, w, h);
+        const writer = this._clipped(command(CLEAR_RECT, this._node));
+        writer.rect(r[0], r[1], r[2], r[3]);
+        return;
+      }
+      // Erased as a fill that takes away what it covers.
+      if (this._effects(null, COMPOSITE["destination-out"]) < 0) return;
+      const writer = this._clipped(command(FILL_PATH, this._node));
+      writer.color([0, 0, 0, 1], 1);
+      writer.u32(0);
+      writePath(writer, mapPoints([MOVE, x, y, LINE, x + w, y, LINE, x + w, y + h, LINE, x, y + h, CLOSE], this._state.transform));
     }
 
     // Text.
     fillText(text, x, y, maxWidth) {
+      this._text(text, x, y, maxWidth, false);
+    }
+    strokeText(text, x, y, maxWidth) {
+      this._text(text, x, y, maxWidth, true);
+    }
+    _text(text, x, y, maxWidth, stroke) {
       if (!finite(x, y)) return;
       const s = this._state;
-      const m = s.transform;
-      const origin = apply(m, [x, y]);
-      const scale = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2])) || 1;
+      const alpha = this._effects(stroke ? s.strokeStyle : s.fillStyle);
+      if (alpha < 0) return;
       const w = this._clipped(command(FILL_TEXT, this._node));
-      w.color(s.fill, s.globalAlpha);
+      w.color((stroke ? s.stroke : s.fill) ?? WHITE, alpha);
       w.str(s.fontKey);
       w.str(String(text).replace(/[\t\n\f\r]/g, " "));
-      w.f64(origin[0]);
-      w.f64(origin[1]);
-      w.f64(scale);
+      w.f64(x);
+      w.f64(y);
+      for (const value of s.transform) w.f64(value);
       w.u32(ALIGNS[s.direction === "rtl" && (s.textAlign === "start" || s.textAlign === "end") ? (s.textAlign === "start" ? "end" : "start") : s.textAlign]);
       w.u32(BASELINES[s.textBaseline]);
       w.f64(maxWidth === undefined || !Number.isFinite(+maxWidth) ? -1 : Math.max(0, +maxWidth));
-    }
-    strokeText(text, x, y, maxWidth) {
-      const fill = this._state.fill;
-      this._state.fill = this._state.stroke;
-      this.fillText(text, x, y, maxWidth);
-      this._state.fill = fill;
+      w.u32(stroke ? 1 : 0);
+      if (stroke) this._strokeStyle(w);
     }
     measureText(text) {
       native.canvas2dText(this._state.fontKey, String(text));
@@ -787,23 +932,29 @@
       writer.raw(new Uint8Array(image.data.buffer, image.data.byteOffset, image.data.byteLength));
     }
     drawImage(image, ...args) {
-      const context = image?.getContext?.("2d");
-      const source = context instanceof CanvasRenderingContext2D ? context : image instanceof ImageData || (image?.data && image.width && image.height) ? image : null;
+      const source = imageSource(image);
       if (!source) return;
-      const width = source instanceof CanvasRenderingContext2D ? image.width : source.width;
-      const height = source instanceof CanvasRenderingContext2D ? image.height : source.height;
+      const { width, height } = source;
       let sx = 0, sy = 0, sw = width, sh = height, dx, dy, dw, dh;
       if (args.length <= 2) [dx, dy, dw, dh] = [args[0], args[1], width, height];
       else if (args.length <= 4) [dx, dy, dw, dh] = args;
       else [sx, sy, sw, sh, dx, dy, dw, dh] = args;
-      if (!finite(sx, sy, sw, sh, dx, dy, dw, dh)) return;
-      const r = this._deviceRect(dx, dy, dw, dh);
-      const w = this._clipped(command(source instanceof CanvasRenderingContext2D ? DRAW_CANVAS : DRAW_PIXELS, this._node));
-      w.f64(this._state.globalAlpha);
+      if (!finite(sx, sy, sw, sh, dx, dy, dw, dh) || sw === 0 || sh === 0 || dw === 0 || dh === 0) return;
+      if (sw < 0) [sx, sw] = [sx + sw, -sw];
+      if (sh < 0) [sy, sh] = [sy + sh, -sh];
+      if (dw < 0) [dx, dw] = [dx + dw, -dw];
+      if (dh < 0) [dy, dh] = [dy + dh, -dh];
+      const alpha = this._effects(null);
+      if (alpha < 0) return;
+      const context = source.context;
+      const w = this._clipped(command(context ? DRAW_CANVAS : DRAW_PIXELS, this._node));
+      w.f64(alpha);
       w.rect(sx, sy, sx + sw, sy + sh);
-      w.rect(r[0], r[1], r[2], r[3]);
-      if (source instanceof CanvasRenderingContext2D) {
-        w.u32(source._node);
+      w.rect(dx, dy, dx + dw, dy + dh);
+      for (const value of this._state.transform) w.f64(value);
+      w.u32(this._state.imageSmoothingEnabled ? 1 : 0);
+      if (context) {
+        w.u32(context._node);
       } else {
         w.u32(source.width);
         w.u32(source.height);
@@ -812,17 +963,27 @@
       }
     }
 
-    createLinearGradient() {
-      return new CanvasGradient();
+    createLinearGradient(x0, y0, x1, y1) {
+      if (!finite(x0, y0, x1, y1)) throw new TypeError("The gradient's points are not finite.");
+      return new CanvasGradient(LINEAR, [x0, y0, x1, y1]);
     }
-    createRadialGradient() {
-      return new CanvasGradient();
+    createRadialGradient(x0, y0, r0, x1, y1, r1) {
+      if (!finite(x0, y0, r0, x1, y1, r1)) throw new TypeError("The gradient's circles are not finite.");
+      if (r0 < 0 || r1 < 0) throw new RangeError("The radius is negative.");
+      return new CanvasGradient(RADIAL, [x0, y0, r0, x1, y1, r1]);
     }
-    createConicGradient() {
-      return new CanvasGradient();
+    createConicGradient(angle, x, y) {
+      if (!finite(angle, x, y)) throw new TypeError("The gradient's center is not finite.");
+      return new CanvasGradient(CONIC, [angle, x, y]);
     }
-    createPattern() {
-      return new CanvasPattern();
+    // A canvas's pixels are taken as they are now, as a browser does.
+    createPattern(image, repetition) {
+      const repeat = repetition === null || repetition === undefined ? "repeat" : String(repetition);
+      if (!(repeat in REPEAT)) throw new SyntaxError("'" + repeat + "' is not a pattern repetition");
+      const source = imageSource(image);
+      if (!source || !source.width || !source.height) return null;
+      const pixels = source.context ? source.context.getImageData(0, 0, source.width, source.height) : source;
+      return new CanvasPattern(pixels, repeat);
     }
     drawFocusIfNeeded() {}
     scrollPathIntoView() {}
@@ -860,10 +1021,100 @@
         return this._state[name];
       },
       set(value) {
-        this._state[name] = name === "imageSmoothingEnabled" ? !!value : String(value);
+        if (name === "imageSmoothingEnabled") {
+          this._state[name] = !!value;
+          return;
+        }
+        value = String(value);
+        if (name === "globalCompositeOperation" && !(value in COMPOSITE)) return;
+        if (name === "shadowColor") {
+          const parsed = parseColor(value);
+          if (!parsed) return;
+          this._state.shadow = parsed;
+        }
+        this._state[name] = value;
       },
       configurable: true,
     });
+  }
+
+  const WHITE = [1, 1, 1, 1];
+  let clipCount = 0;
+  function invert(m) {
+    const det = m[0] * m[3] - m[1] * m[2];
+    if (!det || !Number.isFinite(det)) return null;
+    return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
+  }
+  // What drawImage and createPattern take: another 2D canvas, or pixels such as ImageData.
+  function imageSource(image) {
+    const context = image?.getContext?.("2d");
+    if (context instanceof CanvasRenderingContext2D) return { context, width: image.width, height: image.height };
+    if (image?.data && image.width && image.height) return image;
+    return null;
+  }
+  // The rectangle a path is, when it is one rectangle with sides along the axes.
+  function rectOf(points) {
+    const xs = [], ys = [];
+    let i = 0;
+    while (i < points.length) {
+      const verb = points[i++];
+      if (verb === QUAD || verb === CUBIC) return null;
+      if (verb === CLOSE) continue;
+      if (verb === MOVE && xs.length) {
+        // closePath starts the next subpath at the first point; anything after it is more.
+        if (i + 2 < points.length) return null;
+        break;
+      }
+      xs.push(points[i]);
+      ys.push(points[i + 1]);
+      i += 2;
+    }
+    if (xs.length === 5 && xs[4] === xs[0] && ys[4] === ys[0]) {
+      xs.pop();
+      ys.pop();
+    }
+    if (xs.length !== 4) return null;
+    for (let k = 0; k < 4; k++) {
+      const n = (k + 1) % 4;
+      if (xs[k] !== xs[n] && ys[k] !== ys[n]) return null;
+    }
+    const sides = xs[0] === xs[1] ? xs[1] !== xs[2] && ys[1] === ys[2] : ys[1] !== ys[2] && xs[1] === xs[2];
+    if (!sides) return null;
+    return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  }
+  // The path as line segments [x0, y0, x1, y1, ...], each subpath closed.
+  function flatten(points) {
+    const out = [];
+    let x = 0, y = 0, sx = 0, sy = 0;
+    const to = (nx, ny) => {
+      out.push(x, y, nx, ny);
+      [x, y] = [nx, ny];
+    };
+    let i = 0;
+    while (i < points.length) {
+      const verb = points[i++];
+      if (verb === MOVE) {
+        if (x !== sx || y !== sy) to(sx, sy);
+        [x, y, sx, sy] = [points[i], points[i + 1], points[i], points[i + 1]];
+        i += 2;
+      } else if (verb === LINE) {
+        to(points[i], points[i + 1]);
+        i += 2;
+      } else if (verb === QUAD || verb === CUBIC) {
+        const p = points.slice(i, i + (verb === QUAD ? 4 : 6));
+        i += p.length;
+        const [x0, y0] = [x, y];
+        for (let k = 1; k <= 16; k++) {
+          const t = k / 16, u = 1 - t;
+          if (verb === QUAD) to(u * u * x0 + 2 * u * t * p[0] + t * t * p[2], u * u * y0 + 2 * u * t * p[1] + t * t * p[3]);
+          else to(u * u * u * x0 + 3 * u * u * t * p[0] + 3 * u * t * t * p[2] + t * t * t * p[4], u * u * u * y0 + 3 * u * u * t * p[1] + 3 * u * t * t * p[3] + t * t * t * p[5]);
+        }
+      } else if (verb === CLOSE) {
+        to(sx, sy);
+      }
+    }
+    if (x !== sx || y !== sy) to(sx, sy);
+    return out;
   }
 
   function writePath(w, points) {

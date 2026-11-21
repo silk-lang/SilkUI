@@ -1,5 +1,6 @@
 // A terminal-like drawing with Canvas 2D, as a web page draws one: rows of text on a dark
-// background, a cursor, shapes, a clip and an image. Click and it reads a pixel back.
+// background, a cursor, shapes, clips, gradients, a pattern, a shadow and an image. Click and
+// it reads a pixel back.
 // Run from the repository root:
 //   silk run --manifest-path modules/js/demo/silk.toml -- modules/js/examples/canvas2d/app.js
 import { createBox, createNode, createText, mount } from "@silkui/core";
@@ -80,6 +81,72 @@ context.textAlign = "center";
 context.fillStyle = "white";
 context.fillText("centered", 400, 290);
 context.textAlign = "start";
+
+// Effects: gradients, a pattern inside a star-shaped clip, a shadow, a blend mode and text turned
+// and outlined.
+const linear = context.createLinearGradient(20, 0, 140, 0);
+linear.addColorStop(0, "#ff5a78");
+linear.addColorStop(0.5, "#f0c85a");
+linear.addColorStop(1, "#5a8cff");
+context.fillStyle = linear;
+context.fillRect(20, 128, 120, 22);
+const radial = context.createRadialGradient(176, 150, 2, 176, 150, 24);
+radial.addColorStop(0, "white");
+radial.addColorStop(1, "rgba(90, 140, 255, 0)");
+context.fillStyle = radial;
+context.fillRect(150, 124, 52, 52);
+const conic = context.createConicGradient(0, 230, 150);
+conic.addColorStop(0, "red");
+conic.addColorStop(0.33, "lime");
+conic.addColorStop(0.66, "blue");
+conic.addColorStop(1, "red");
+context.fillStyle = conic;
+context.beginPath();
+context.arc(230, 150, 22, 0, Math.PI * 2);
+context.fill();
+const tile = context.createImageData(4, 4);
+for (let i = 0; i < 16; i++) tile.data.set((((i & 3) >> 1) + (i >> 3)) % 2 ? [240, 200, 90, 255] : [16, 18, 24, 255], i * 4);
+context.save();
+context.beginPath();
+for (let i = 0; i < 10; i++) {
+  const angle = -Math.PI / 2 + (i * Math.PI) / 5;
+  const radius = i % 2 ? 10 : 24;
+  context.lineTo(290 + radius * Math.cos(angle), 152 + radius * Math.sin(angle));
+}
+context.closePath();
+context.clip();
+context.fillStyle = context.createPattern(tile, "repeat");
+context.fillRect(260, 124, 60, 56);
+context.restore();
+context.save();
+context.shadowColor = "rgba(255, 90, 120, 0.9)";
+context.shadowBlur = 6;
+context.shadowOffsetX = 3;
+context.shadowOffsetY = 3;
+context.fillStyle = "white";
+context.font = "normal 700 16px sans-serif";
+context.fillText("shadow", 330, 146);
+context.restore();
+context.fillStyle = "white";
+context.fillRect(326, 154, 84, 32);
+context.save();
+context.globalCompositeOperation = "multiply";
+context.fillStyle = "rgb(90, 220, 255)";
+context.fillRect(330, 156, 50, 20);
+context.fillStyle = "rgb(255, 220, 90)";
+context.fillRect(355, 162, 50, 20);
+context.restore();
+context.save();
+context.translate(450, 128);
+context.rotate(Math.PI / 2);
+context.font = "normal 400 12px sans-serif";
+context.fillStyle = "rgb(120, 220, 140)";
+context.fillText("turned", 0, 0);
+context.restore();
+context.strokeStyle = "white";
+context.lineWidth = 1;
+context.font = "normal 700 20px sans-serif";
+context.strokeText("outlined", 100, 196);
 
 // An image: a 2 by 2 checker scaled into the corner.
 const image = context.createImageData(2, 2);
