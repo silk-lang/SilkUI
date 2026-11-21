@@ -352,6 +352,10 @@ pub interface WindowClient<S, E, ? R> {
     ! TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {}
 
+  /// The frame the last `frame` call made is on its way to the screen. `frame` alone does
+  /// not say so: a served inspector also asks for frames only it reads.
+  fn shown(self: &mut Self, state: &S) -> () {}
+
   /// Returns the completed tree scene or a client composition.
   fn scene<'s>(self: &'s Self, state: &'s S, tree: &'s UiTree<'_>) -> &'s Scene {
     return tree.scene()
@@ -1365,6 +1369,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let tracePresents = !check && (run environmentVariable("SILK_UI_TRACE_PRESENTS")).isSome()
   let mut shownTotal: u64 = 0
   let mut shownSaidAt: f64 = 0.0
+  // How far the clock of frame requests is ahead of this loop's `time`.
+  let mut frameClockAhead: f64 = 0.0
   let mut timed = FrameTimes.none()
   // The most nodes the tree has held since freed memory was last handed back, and the frames
   // in a row it has held under half of that.
@@ -1514,6 +1520,14 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
   // the tree takes the offsets on its next pass.
   let compositing = platform.threaded() && !check
+  // The render thread also runs `translate` transitions by itself (`UiTree.moves`), so a
+  // screen keeps sliding while this thread is busy. SILK_UI_COMPOSITED_MOVES=off leaves
+  // them to this thread.
+  let movesOff = match move run environmentVariable("SILK_UI_COMPOSITED_MOVES") {
+    Option<String>.Some { value } => !switchedOn(String.utf8Bytes(String.view(&value)))
+    Option<String>.None => false
+  }
+  tree.compositedMoves = compositing && !movesOff
   static if Intrinsic.targetArchitecture() != "wasm32" {
     if compositing {
       platform.setCompositor(renderer.compositor())
@@ -1857,6 +1871,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
             let behind = !check && !reveal && renderer.pending()
             if !behind && deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
               let area = clientSize(width, height, &dock)
+              frameClockAhead = targetTime - time
               let viewport = FrameInput {
                 width: f64.toF32(area.width),
                 height: f64.toF32(area.height),
@@ -2023,6 +2038,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 submittedHeight = deviceHeight
               }
               renderer.endFrame()
+              content.shown(&state.*)
               tree.clearUploads()
               let submitted = run seconds(&mut clock)
               if watching {
@@ -2111,9 +2127,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 if submitted - timed.since >= 1.0 {
                   let n = u64.toF64(timed.frames)
                   StderrWriter.print(
-                    "frame-stats: frames={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={} pool-mb={} page-mb={} blur-mb={} pool-textures={} pages={} nodes={} node-slots={} laid-out={} kept={}\n",
+                    "frame-stats: frames={} presented={} painted={} tick={} layout={} paint={} submit={} gpu-acquire={} gpu-encode={} gpu-present={} pool-mb={} page-mb={} blur-mb={} pool-textures={} pages={} nodes={} node-slots={} laid-out={} kept={}\n",
                     &(
                       timed.frames,
+                      report.frames,
+                      report.painted,
                       timed.tick * 1000.0 / n,
                       timed.layout * 1000.0 / n,
                       timed.paint * 1000.0 / n,
@@ -2321,7 +2339,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           width: f64.toF32(area.width),
           height: f64.toF32(area.height),
           scale: f64.toF32(scale),
-          time: time,
+          // On the frames' clock: a transition this restyle starts is timed by them.
+          time: time + frameClockAhead,
         },
       )
       run serve(&mut platform, owner, &mut tree, &mut host)
@@ -2515,6 +2534,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run content.prepare(&mut state, &mut tree)
       run content.layout(&mut state, &mut tree, viewport)
       run content.frame(&mut state, &mut tree, viewport, &inspector)
+      content.shown(&state.*)
       run serve(&mut platform, owner, &mut tree, &mut host)
       run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
       run snapshot.copyUploads(&tree)
@@ -2684,6 +2704,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run content.layout(&mut state, &mut tree, input)
       let layoutEnd = run seconds(&mut clock)
       run content.frame(&mut state, &mut tree, input, &inspector)
+      content.shown(&state.*)
       let paintEnd = run seconds(&mut clock)
       run serve(&mut platform, owner, &mut tree, &mut host)
       tree.clearUploads()
