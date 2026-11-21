@@ -927,6 +927,8 @@ pub struct UiTree<'a> {
   pub styleModels: HashMap<u64, u32>,
   /// The computed styles the nodes hold, each once.
   pub stylePool: StylePool,
+  /// The style a text node takes under a parent, by the parent's stamp (see `TextInherit`).
+  pub textInherits: List<TextInherit>,
   /// The style a new node of each kind starts with (see `freshStyle`).
   freshStyles: List<FreshStyle>,
   /// The last `Node.computedStamp` handed out.
@@ -1041,7 +1043,7 @@ pub struct UiTree<'a> {
   pub captureMode: u32,
   pub captureTo: u32,
   pub captureToId: u32,
-  /// The last key down had its default prevented, so the text it types is dropped.
+  /// The key that is down had its default prevented, so the text it types is dropped.
   pub suppressText: bool,
   /// The target `begin` found for the input under way, as a (slot, id) pair, so `finish`
   /// applies the default action to that node even when handlers changed the tree between.
@@ -1187,6 +1189,25 @@ effect fn sceneCensus(scene: &Scene, out: &mut Census) -> ()
 
 /// The style nodes of one kind are made with.
 struct FreshStyle { kind: NodeKind, styled: Frozen<Computed> }
+
+/// Text nodes take their style from their parent alone: equal parents (one computed stamp, the
+/// same rendered state, in one viewport) give their text children one style. The first text
+/// child builds it; the others take its handle and keys (`UiTree.inheritText`). Blink and Stylo
+/// give text no style of its own for the same reason.
+struct TextInherit {
+  parentStamp: u32,
+  parentRendered: bool,
+  width: f32,
+  height: f32,
+  styled: Frozen<Computed>,
+  stamp: u32,
+  rendered: bool,
+  fontKey: usize,
+  paintHash: u64,
+}
+
+/// Entries `UiTree.textInherits` holds, indexed by the parent's stamp.
+const TEXT_INHERITS: usize = 64
 
 /// The style of a node before its animations (see `UiTree.tickBases`).
 pub struct TickBase {
@@ -1414,6 +1435,8 @@ impl<'a> UiTree<'a> {
     run out.work("style.sheet.matched", w.sheetMatches)
     run out.work("style.sheet.matched.record-cache-hits", w.sheetCacheHits)
     run out.work("style.computed-from-lender", w.lenders)
+    run out.work("style.computed-from-lender.whole-result", w.sharedResults)
+    run out.work("style.text-inherited", w.textInherits)
     run out.work("style.pool-shares", w.styleShares)
     run out.work("layout.computes.passes", w.layoutPasses)
     run out.work("layout.full-layouts", w.layoutFull)
@@ -1520,6 +1543,7 @@ impl<'a> UiTree<'a> {
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
       stylePool: StylePool.make(),
+      textInherits: List<TextInherit>.make(),
       freshStyles: List<FreshStyle>.make(),
       computedStamps: 0,
       frameNumber: 0,
@@ -6448,6 +6472,7 @@ impl<'a> UiTree<'a> {
     // Before the stamp counter wraps, no node holds a stamp, so none lends until it computes again.
     if self.computedStamps > 2147483647 {
       self.computedStamps = 0
+      self.textInherits.clear()
       let nodes = self.nodes.asMutSlice()
       let mut at: usize = 0
       while at < nodes.length {
@@ -6533,9 +6558,11 @@ impl<'a> UiTree<'a> {
         let shadow = node.computed().effects
         let wasRendered = node.rendered
         let paintBefore = node.paintHash
-        let selectedBefore = selection.hash(node, 0)
-        let placedBefore = transform.placementHash(&node.computed().transform, 0)
-        let perspectiveBefore = transform.perspectiveHash(&node.computed().transform, 0)
+        // Paint caches built again from scratch need no list of what to repair.
+        let tracksPaint = !self.paintCachesStale
+        let selectedBefore = if tracksPaint { selection.hash(node, 0) } else { 0 }
+        let placedBefore = if tracksPaint { transform.placementHash(&node.computed().transform, 0) } else { 0 }
+        let perspectiveBefore = if tracksPaint { transform.perspectiveHash(&node.computed().transform, 0) } else { 0 }
         let containment = node.computed().contain.query()
         let skips = node.computed().contain.hidden()
         let namesChanged = run self.resolve(slot, tick)
@@ -6548,12 +6575,12 @@ impl<'a> UiTree<'a> {
         if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
         if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
         let styled = self.node(slot)
-        let repaints = scrollbarRules || styled.kind == NodeKind.Input
+        let repaints = tracksPaint && !self.paintCachesStale && (scrollbarRules || styled.kind == NodeKind.Input
           || paintBefore != styled.paintHash || beforeFont != styled.fontKey || wasRendered != styled.rendered
           || shadow.shadowFrom != styled.computed().effects.shadowFrom
           || selectedBefore != selection.hash(styled, 0)
           || placedBefore != transform.placementHash(&styled.computed().transform, 0)
-          || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0)
+          || perspectiveBefore != transform.perspectiveHash(&styled.computed().transform, 0))
         if repaints {
           run self.repair.nodes.append(slot)
           self.repair.pending = true
@@ -6695,12 +6722,161 @@ impl<'a> UiTree<'a> {
     }
   }
 
+
+  // The text child style key of node `slot`'s parent, or usize.MAX when the text node at
+  // `slot` cannot take a shared one: it must be plain text with nothing of its own.
+  fn textInheritPlace(self: &Self, slot: u32) -> usize {
+    let node = self.node(slot)
+    if node.kind != NodeKind.Text || node.styleNeedsContext || node.sheetStyle().isSome() || node.isGenerated() || node.generatedSuppressed { return usize.MAX }
+    if self.overrides.length() != 0 || self.anchors.length() != 0 || node.parent == NONE { return usize.MAX }
+    let stamp = self.node(node.parent).computedStamp
+    if stamp == 0 { return usize.MAX }
+    return usize.bitAnd(u32.toUsize(stamp), TEXT_INHERITS - 1)
+  }
+
+  // Gives text node `slot` the style an equal parent's text child has, when one is kept.
+  effect fn inheritText(self: &mut Self, slot: u32) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let place = self.textInheritPlace(slot)
+    if place == usize.MAX || place >= self.textInherits.length() { return false }
+    let parent = self.node(self.node(slot).parent)
+    let kept = &self.textInherits.asSlice()[place]
+    if kept.parentStamp != parent.computedStamp || kept.parentRendered != parent.rendered
+      || kept.width != self.cssWidth() || kept.height != self.cssHeight() { return false }
+    let styled = kept.styled.clone()
+    let stamp = kept.stamp
+    let rendered = kept.rendered
+    let fontKey = kept.fontKey
+    let paintHash = kept.paintHash
+    run style_change.prepare(&mut self, slot, false)
+    self.work.textInherits = self.work.textInherits + 1
+    let target = self.nodeMut(slot)
+    if !Frozen.same(&target.styled, &styled) || target.moving.isSome() {
+      target.styled = move styled
+      target.moving.clear()
+    }
+    target.computedStamp = stamp
+    target.rendered = rendered
+    target.fontKey = fontKey
+    target.paintHash = paintHash
+    if target.effects.isSome() { target.effects.clear() }
+    run self.dropTickBase(slot)
+    return true
+  }
+
+  // Keeps what text node `slot` was just given, for its parent's equals' text children.
+  effect fn keepTextInherit(self: &mut Self, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let place = self.textInheritPlace(slot)
+    if place == usize.MAX { return () }
+    let node = self.node(slot)
+    if node.moving.isSome() || node.effects.isSome() { return () }
+    let parent = self.node(node.parent)
+    let entry = TextInherit {
+      parentStamp: parent.computedStamp, parentRendered: parent.rendered, width: self.cssWidth(), height: self.cssHeight(),
+      styled: node.styled.clone(), stamp: node.computedStamp, rendered: node.rendered, fontKey: node.fontKey, paintHash: node.paintHash,
+    }
+    while self.textInherits.length() <= place {
+      let filler = entry.styled.clone()
+      run self.textInherits.append(TextInherit {
+        parentStamp: 0, parentRendered: false, width: 0.0, height: 0.0,
+        styled: move filler, stamp: 0, rendered: false, fontKey: 0, paintHash: 0,
+      })
+    }
+    let entries = self.textInherits.asMutSlice()
+    entries[place] = move entry
+  }
+
+  // Forgets the base of animations node `slot` kept, as a full restyle with none playing does.
+  effect fn dropTickBase(self: &mut Self, slot: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let at = u32.toUsize(slot)
+    if at >= self.tickPlaces.length() { return () }
+    let place = self.tickPlaces.get(at)
+    if place != 0 {
+      let bases = self.tickBases.asMutSlice()
+      bases[u32.toUsize(place) - 1].id = NONE
+    }
+  }
+
+  // The lender of node `slot` when the node can take the lender's whole result, else NONE:
+  // what `resolve` would build from the lender's values is then the lender's own result.
+  fn wholeLender(self: &Self, slot: u32) -> u32 {
+    let node = self.node(slot)
+    if node.styleTwin == NONE || node.generatedSuppressed || node.moving.isSome() { return NONE }
+    if self.listsUsed || self.letterUsed { return NONE }
+    let lender = self.computedLender(slot)
+    if lender == NONE { return NONE }
+    let other = self.node(lender)
+    if other.moving.isSome() || other.effects.isSome() || other.generatedSuppressed { return NONE }
+    let values = other.computed()
+    if values.effects.declared || values.list.item() || values.list.counters() { return NONE }
+    // A table part's spans come from its own attributes.
+    if values.layout.display.isTablePart() && !sameSpans(node, &values.layout) { return NONE }
+    if values.anchor.name != 0 || values.anchor.anchored() || values.cursorUrl { return NONE }
+    if node.parent != NONE && self.node(node.parent).computed().contain.hidden() { return NONE }
+    return lender
+  }
+
+  // Gives node `slot` the whole result of its lender (`wholeLender`): the lender's style
+  // handle, stamp, font and paint keys, and its layout style entry.
+  effect fn takeLenderResult(self: &mut Self, slot: u32, lender: u32) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    self.work.lenders = self.work.lenders + 1
+    self.work.sharedResults = self.work.sharedResults + 1
+    let other = self.node(lender)
+    let styled = other.styled.clone()
+    let stamp = other.computedStamp
+    let fontKey = other.fontKey
+    let paintHash = other.paintHash
+    let parent = self.node(slot).parent
+    let parentRendered = parent == NONE || self.node(parent).rendered
+    let rendered = parentRendered && !styled.get().layout.display.isNone()
+    let lenderCss = other.css
+    let lenderGrid = other.gridStyled
+    run style_change.prepare(&mut self, slot, false)
+    let target = self.nodeMut(slot)
+    if !Frozen.same(&target.styled, &styled) || target.moving.isSome() {
+      target.styled = styled.clone()
+      target.moving.clear()
+    }
+    target.computedStamp = stamp
+    target.rendered = rendered
+    target.fontKey = fontKey
+    target.paintHash = paintHash
+    if target.effects.isSome() { target.effects.clear() }
+    run self.dropTickBase(slot)
+    let css = self.node(slot).css
+    let values = styled.get()
+    run Effect.catchAll(self.layout.shareStyle(NodeId { index: css }, NodeId { index: lenderCss }, values.layout), layoutFailed)
+    if values.contain.automatic() != self.layout.automatic(css) {
+      run Effect.catchAll(
+        self.layout.setAutomatic(NodeId { index: css }, values.contain.automatic(), values.contain.intrinsicBlock()),
+        layoutFailed,
+      )
+    }
+    // The lender's match is this node's: no grid declaration there leaves no grid here.
+    if lenderGrid || self.node(slot).gridStyled { run self.resolveGrid(slot, values) }
+    run self.updateShape(slot)
+    let names = run containers.names(&self, slot)
+    let namesChanged = !containers.sameNames(&self, slot, names.asSlice())
+    if names.length() != 0 || self.node(slot).identity().isSome() {
+      let node = self.nodeMut(slot)
+      let identity = run node.identityMut()
+      run identity.setContainerNames(move names)
+    }
+    return namesChanged
+  }
+
   effect fn resolve(self: &mut Self, slot: u32, tick: bool) -> bool
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     self.work.resolves = self.work.resolves + 1
     if tick { self.work.ticks = self.work.ticks + 1 }
     if !tick && self.styleSheets.length() != 0 && !(self.node(slot).isGenerated() && self.node(slot).kind == NodeKind.Box) { run self.resolveSheet(slot) }
+    if !tick {
+      if run self.inheritText(slot) { return false }
+      let shared = self.wholeLender(slot)
+      if shared != NONE { return run self.takeLenderResult(slot, shared) }
+    }
     if self.tickWidth != self.input.width || self.tickHeight != self.input.height {
       self.tickBases.clear()
       self.tickPlaces.clear()
@@ -6927,6 +7103,7 @@ impl<'a> UiTree<'a> {
     target.fontKey = fontKey
     target.paintHash = paintHash
     run container_watch.units(&mut self, slot)
+    if !tick && kind == NodeKind.Text && simpleStyles { run self.keepTextInherit(slot) }
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
       run Effect.catchAll(
@@ -9063,19 +9240,36 @@ fn inheritTable(target: &mut CssStyle, parent: &CssStyle) {
 
 // HTML's `colspan` and `rowspan` on cells and `span` on columns, for the table layout.
 fn tableSpans(node: &Node, layout: &mut CssStyle) {
-  layout.columnSpan = 1
-  layout.rowSpan = 1
+  let spans = spansOf(node)
+  layout.columnSpan = spans.0
+  layout.rowSpan = spans.1
+}
+
+// A table part's column and row spans.
+tuple Spans(usize, usize)
+
+// The column and row spans `node`'s attributes give a table part.
+fn spansOf(node: &Node) -> Spans {
+  let mut columns: usize = 1
+  let mut rows: usize = 1
   if let Option.Some { value: identity } = node.identity() {
     let attributes = identity.attributes()
     let mut i: usize = 0
     while i < attributes.length {
       let name = String.view(&attributes[i].name)
       let value = style_attributes.spanValue(String.view(&attributes[i].value))
-      if (name == "colspan" || name == "span") && value > 0 && value != usize.MAX { layout.columnSpan = if value > 1000 { 1000 } else { value } }
-      if name == "rowspan" && value != usize.MAX { layout.rowSpan = value }
+      if (name == "colspan" || name == "span") && value > 0 && value != usize.MAX { columns = if value > 1000 { 1000 } else { value } }
+      if name == "rowspan" && value != usize.MAX { rows = value }
       i = i + 1
     }
   }
+  return Spans(columns, rows)
+}
+
+// Whether `node`'s span attributes give the spans `layout` holds.
+fn sameSpans(node: &Node, layout: &CssStyle) -> bool {
+  let spans = spansOf(node)
+  return spans.0 == layout.columnSpan && spans.1 == layout.rowSpan
 }
 
 /// Whether `url` names an SVG file: a `.svg` path (before any query or fragment) or a

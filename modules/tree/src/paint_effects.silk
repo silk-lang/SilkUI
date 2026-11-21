@@ -12,6 +12,7 @@ import atlas.atlas { AtlasTile }
 import silk.collections.bytes { Bytes }
 import style { Computed }
 import node { NONE }
+import stacking { IN_FLOW }
 import layout.lib { Fragment }
 import svg_css.effect_values {
   Composite,
@@ -1216,11 +1217,60 @@ pub fn shadowReach(shadows: &[TextShadow]) -> f32 {
   return reach
 }
 
+/// Whether `isolation: isolate` is all that layers `effects`.
+fn isolationOnly(effects: &Effects) -> bool {
+  return effects.isolate && effects.filters.length() == 0 && effects.clip.length() == 0
+    && !effects.masks.painted() && !effects.maskBorder.drawn() && effects.blend == BLEND_NORMAL
+}
+
+/// Whether anything in the lists of stacking context `index` blends into the layer open around
+/// it: an entry with a blend mode, or one inside an entry that opens no layer of its own. An
+/// isolation group only bounds blending, so without any it opens no layer, as in Chromium, and a
+/// backdrop filter inside reads what is behind it (isolation makes no backdrop root).
+fn blendsWithin(p: &Painter<'_, '_>, index: usize) -> bool {
+  if !p.stacking.stacks(index) {
+    return false
+  }
+  let steps = p.stacking.steps(index)
+  let mut k: usize = 0
+  while k < steps {
+    let entry = p.stacking.step(index, k, false)
+    k = k + 1
+    if entry == IN_FLOW {
+      continue
+    }
+    let source = p.output.fragments.values.asSlice()[entry].source
+    let slot = if source < p.slotOfCss.length() { p.slotOfCss.get(source) } else { NONE }
+    if slot != NONE {
+      let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+      let c = node.computed()
+      let mut own = c.paint.opacity < 1.0 || c.paint.backdropBlur > 0.0
+      match node.paintEffects() {
+        Option<&Effects>.Some { value } => {
+          if value.blend != BLEND_NORMAL {
+            return true
+          }
+          own = own || value.layered()
+        }
+        Option<&Effects>.None => {}
+      }
+      if own {
+        continue
+      }
+    }
+    if blendsWithin(p, entry) {
+      return true
+    }
+  }
+  return false
+}
+
 /// Opens the layers node `slot` paints into (fragment `f`, ink `ink` in device pixels): its
 /// filters innermost, then one layer with its mask (`clip-path`, `mask-image`), opacity, blend
 /// mode and backdrop blur. Paint the node and its subtree, then call [`popEffects`].
 pub effect fn pushEffects(
   p: &mut Painter<'_, '_>,
+  index: usize,
   slot: u32,
   c: &Computed,
   f: &Fragment,
@@ -1240,7 +1290,7 @@ pub effect fn pushEffects(
   let mut hasEffects = false
   match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
     Option<&Effects>.Some { value } => {
-      hasEffects = value.layered()
+      hasEffects = value.layered() && !(isolationOnly(value) && !blendsWithin(&p.*, index))
       run filterGroups(value, s, &mut groups)
       blend = value.blend
       masked = value.clip.length() != 0 || value.masks.painted() || value.maskBorder.drawn()
