@@ -1,4 +1,6 @@
 //! Selector identity lives off the node record; class atoms are stable across all UI roots.
+import svg_css.ancestor_filter { NameKind }
+import svg_css.ancestor_filter
 import silk.collections.bytes { Bytes }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -302,11 +304,17 @@ impl SelectorKeys {
   }
 }
 
-pub struct Atoms { names: List<Bytes>, pub interns: usize, pub compares: usize }
+/// Class names by atom id, and back: a hash of the name heads a chain through `next` of the
+/// atoms whose names share it.
+pub struct Atoms { names: List<Bytes>, heads: HashMap<Word, u32>, next: List<u32>, filterKeys: List<u32>, pub interns: usize, pub compares: usize }
 fn space(byte: u8) -> bool { return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13 }
 
+const NO_ATOM: u32 = 0xFFFFFFFF
+
 impl Atoms {
-  pub fn make() -> Self { return Atoms { names: List<Bytes>.make(), interns: 0, compares: 0 } }
+  pub fn make() -> Self {
+    return Atoms { names: List<Bytes>.make(), heads: HashMap<Word, u32>.make(Hash.seed(0x61746f6d)), next: List<u32>.make(), filterKeys: List<u32>.make(), interns: 0, compares: 0 }
+  }
 
   /// For the bench census: the atoms, and the bytes of their names.
   pub fn length(self: &Self) -> usize { return self.names.length() }
@@ -320,20 +328,38 @@ impl Atoms {
     return total
   }
 
+  /// The atom named `text`, or usize.MAX when no class has that name.
+  pub fn find(self: &Self, text: &[u8]) -> usize {
+    let mut at = match self.heads.get(Word { value: hashBytes(0x636c, text) }) { Option.Some { value } => value _ => NO_ATOM }
+    while at != NO_ATOM {
+      if equal(self.names.asSlice()[u32.toUsize(at)].asSlice(), text) { return u32.toUsize(at) }
+      at = self.next.asSlice()[u32.toUsize(at)]
+    }
+    return usize.MAX
+  }
+
   pub effect fn intern(self: &mut Self, text: &[u8]) -> usize ! OutOfMemoryError ? &mut Allocator {
     self.interns = self.interns + 1
-    let mut i: usize = 0
-    while i < self.names.length() {
+    let word = Word { value: hashBytes(0x636c, text) }
+    let head = match self.heads.get(word) { Option.Some { value } => value _ => NO_ATOM }
+    let mut at = head
+    while at != NO_ATOM {
       self.compares = self.compares + 1
-      if equal(self.names.asSlice()[i].asSlice(), text) { return i }
-      i = i + 1
+      if equal(self.names.asSlice()[u32.toUsize(at)].asSlice(), text) { return u32.toUsize(at) }
+      at = self.next.asSlice()[u32.toUsize(at)]
     }
     let index = self.names.length()
     run self.names.append(run Bytes.copy(text))
+    run self.next.append(head)
+    run self.filterKeys.append(ancestor_filter.key(NameKind.Class, text))
+    drop run self.heads.insert(word, usize.toU32(index))
     return index
   }
 
   pub fn text(self: &Self, atom: usize) -> &[u8] { return self.names.asSlice()[atom].asSlice() }
+
+  /// The ancestor filter's key of the class `atom`.
+  pub fn filterKey(self: &Self, atom: usize) -> u32 { return self.filterKeys.asSlice()[atom] }
 
   pub effect fn classes(self: &mut Self, text: &[u8]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
     let mut result = List<usize>.make()
