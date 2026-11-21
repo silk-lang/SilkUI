@@ -1360,6 +1360,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // presents them without waiting for the display: how many frames a second the app could
   // draw, for benchmarks. Frames may tear, and the app takes a whole processor core.
   let uncapped = !check && (run environmentVariable("SILK_UI_UNCAPPED")).isSome()
+  // SILK_UI_TRACE_PRESENTS says the running total of frames the window showed on standard error
+  // (`silk-ui: frames shown N`): uncapped, a benchmark's frame callbacks can outrun the display.
+  let tracePresents = !check && (run environmentVariable("SILK_UI_TRACE_PRESENTS")).isSome()
+  let mut shownTotal: u64 = 0
+  let mut shownSaidAt: f64 = 0.0
   let mut timed = FrameTimes.none()
   // The most nodes the tree has held since freed memory was last handed back, and the frames
   // in a row it has held under half of that.
@@ -1516,6 +1521,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
+  // Whether the compositor's last frame has wheel listeners to leave alone: they move with a scroll.
+  let mut wheelBlocked = false
   let mut intervals = List<f64>.make()
 
   let initial = platform.contentSize(window)
@@ -1707,8 +1714,10 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     let time = (run seconds(&mut clock)) - started
     if (check || reveal || flowing) && next.isNone() {
       if uncapped {
-        // No frame is replaced undrawn: this one starts as soon as the last is taken.
+        // No frame is replaced undrawn: this one starts as soon as the last is taken, and a
+        // frame that only scrolled as soon as the render thread starts drawing it.
         renderer.waitTaken()
+        renderer.waitRedrawn()
       }
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
     }
@@ -1717,6 +1726,14 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree) || tree.fontWakeDue(time)
       let dropped = run renderer.takePresented(&mut intervals)
+      if tracePresents && intervals.length() != 0 {
+        shownTotal = shownTotal + usize.toU64(intervals.length())
+        // At most a line a display frame, so the trace costs a benchmark nothing it can measure.
+        if time - shownSaidAt >= 1.0 / 60.0 {
+          shownSaidAt = time
+          StderrWriter.print("silk-ui: frames shown {}\n", &.(shownTotal))
+        }
+      }
       if intervals.length() != 0 || dropped != 0 {
         run content.presented(&mut state, intervals.asSlice(), dropped)
         intervals.clear()
@@ -1750,6 +1767,19 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           run inspector.finishNext(&mut tree, prevented)
         }
         run serve(&mut platform, owner, &mut tree, &mut host)
+        // What the tree queued to follow the input (a copy, a close or back request), as
+        // after window input.
+        run followUps(
+          &mut state,
+          &mut tree,
+          &mut content,
+          &mut companion,
+          &mut inspector,
+          &mut platform,
+          owner,
+          &mut host,
+          FIRST_ROOT,
+        )
         run inspector.observe(&tree)
         run content.pump(&mut state, &mut tree)
         if !inspector.hasInput() {
@@ -1843,6 +1873,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 run content.tick(&mut state, &mut tree, time, true)
               }
               let keptBefore = tree.paintsKept
+              let scrollsKeptBefore = tree.scrollsKept
               let frameStart = run seconds(&mut clock)
               run content.prepare(&mut state, &mut tree)
 
@@ -1916,8 +1947,33 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               } else {
                 run Pixmap.make(0, 0)
               }
-              let mut fast = if compositing {
-                run fastScrollOf(&tree, f64.toF32(scale))
+              // A frame that would draw the window as it is goes nowhere (`submitsFrame`).
+              let unchanged = !submitsFrame(
+                FrameSubmit {
+                  check: check,
+                  inspector: serves,
+                  layered: layered,
+                  submitted: drawn,
+                  // A renderer that cannot redraw its last frame at new offsets gets a frame
+                  // that only scrolled as any other: the kept scene, at its new offsets.
+                  kept: tree.paintsKept > keptBefore
+                    && (tree.scrollsKept == scrollsKeptBefore || renderer.rescrolls()),
+                  uploads: tree.pendingUploads().entries().length,
+                  width: deviceWidth,
+                  height: deviceHeight,
+                  lastWidth: submittedWidth,
+                  lastHeight: submittedHeight,
+                },
+              )
+              // The frame only scrolled and kept its scene: the render thread draws the last
+              // frame again at the new offsets.
+              let rescrolled = unchanged && tree.scrollsKept > scrollsKeptBefore
+              // What the compositor may scroll is read from every node: only for a frame that
+              // is handed over, or a scroll that moved the wheel listeners it must leave alone.
+              let mut fast = if compositing && (!unchanged || rescrolled && wheelBlocked) {
+                let read = run fastScrollOf(&tree, f64.toF32(scale))
+                wheelBlocked = read.blocked.length() != 0
+                move read
               } else {
                 FastScroll.make()
               }
@@ -1937,22 +1993,14 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 // What the overlay draws stays put: the frame cannot scroll under it alone.
                 run fast.blocked.append(Rect<f32>.new(0.0, 0.0, f32.MAX, f32.MAX))
               }
-              // A frame that would draw the window as it is goes nowhere (`submitsFrame`).
-              let unchanged = !submitsFrame(
-                FrameSubmit {
-                  check: check,
-                  inspector: serves,
-                  layered: layered,
-                  submitted: drawn,
-                  kept: tree.paintsKept > keptBefore,
-                  uploads: tree.pendingUploads().entries().length,
-                  width: deviceWidth,
-                  height: deviceHeight,
-                  lastWidth: submittedWidth,
-                  lastHeight: submittedHeight,
-                },
-              )
-              if !unchanged {
+              if rescrolled {
+                fastSeq = run renderer.rescroll(
+                  content.scene(&state.*, &tree).scrolls(),
+                  fastSeq,
+                  move fast,
+                  wheelBlocked,
+                )
+              } else if !unchanged {
                 run renderer.submit(
                   if layered {
                     &composed
@@ -2433,6 +2481,18 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
             run inspector.finishNext(&mut tree, prevented)
           }
           run serve(&mut platform, owner, &mut tree, &mut host)
+          let mut alone = NoCompanion {}
+          run followUps(
+            &mut state,
+            &mut tree,
+            &mut content,
+            &mut alone,
+            &mut inspector,
+            &mut platform,
+            owner,
+            &mut host,
+            FIRST_ROOT,
+          )
           run inspector.observe(&tree)
           run content.pump(&mut state, &mut tree)
           if !inspector.hasInput() {

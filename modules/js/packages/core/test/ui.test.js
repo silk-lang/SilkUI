@@ -120,6 +120,30 @@ test("the app's own events go through the tree as on the web", () => {
   assert.deepEqual(log, ["outer capture 2 false", "outer 2 true"]);
 });
 
+test("close and navigate requests are events that bubble, and load and error share a bit", () => {
+  const pane = createBox();
+  const inside = createBox();
+  pane.append(inside);
+  mock.calls.length = 0;
+  const seen = [];
+  pane.addEventListener("closerequest", (event) => seen.push(event.type));
+  const [call, node, flags] = mock.calls.at(-1);
+  assert.deepEqual([call, node, flags], ["listen", pane.nodeId, 1 << 18], "the requests listen with bit 18");
+  pane.addEventListener("navigate", (event) => {
+    seen.push(`${event.type} ${event.navigationType} ${event.direction}`);
+    event.preventDefault();
+  });
+  assert.equal(mock.native.dispatch(38, inside.nodeId, 0, 0, 0, 0, 0), false);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 0, 0, 0, 0, 0), true);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 1, 0, 0, 0, 0), true);
+  assert.deepEqual(seen, ["closerequest", "navigate traverse back", "navigate traverse forward"]);
+
+  const image = createBox();
+  mock.calls.length = 0;
+  image.addEventListener("error", () => {});
+  assert.deepEqual(mock.calls.at(-1), ["listen", image.nodeId, 1 << 17], "error listens with the bit of load");
+});
+
 test("preventDefault reaches the host for cancelable events only", () => {
   const box = createBox();
   box.addEventListener("pointerdown", (event) => event.preventDefault());

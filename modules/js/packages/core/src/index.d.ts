@@ -376,15 +376,17 @@ export class Image extends Node {
 }
 
 /**
- * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
- * drawing's size in pixels and `getContext("webgpu")` gives its `GPUCanvasContext` (the types
- * of `@webgpu/types` describe it). Drawing runs on a GPU device of the application's own.
+ * A canvas the application draws with WebGPU or Canvas 2D, as a `<canvas>`: `width` and
+ * `height` are the drawing's size in pixels, `getContext("webgpu")` gives its
+ * `GPUCanvasContext` (the types of `@webgpu/types` describe it) and `getContext("2d")` its
+ * `CanvasRenderingContext2D`.
  */
 export class Canvas extends Node {
   constructor();
   width: number;
   height: number;
   getContext(kind: "webgpu"): unknown | null;
+  getContext(kind: "2d", options?: { alpha?: boolean }): unknown | null;
   getContext(kind: string): unknown | null;
 }
 
@@ -589,6 +591,16 @@ export interface SelectionEvent<T extends Node = Input> extends Event {
   readonly selectionEnd: number;
 }
 
+/**
+ * A request to go back or forward (`navigate`), raised after Alt+Left, Cmd+[ or a mouse back
+ * button that nothing prevented. It bubbles from the focused node; the listener that acts
+ * stops it.
+ */
+export interface NavigateEvent extends Event {
+  readonly navigationType: "traverse";
+  readonly direction: "back" | "forward";
+}
+
 /** An edit about to change an input (`beforeinput`), as the web's `InputEvent`. Preventing it cancels the edit. */
 export interface BeforeInputEvent<T extends Node = Input> extends Event {
   readonly target: FieldOf<T>;
@@ -655,6 +667,9 @@ export interface EventMap {
   cut: ClipboardEvent;
   paste: ClipboardEvent;
   beforeinput: BeforeInputEvent;
+  /** A request to close what is on top, raised after an Escape that nothing prevented. */
+  closerequest: Event;
+  navigate: NavigateEvent;
   scroll: ScrollEvent;
   layout: LayoutEvent;
   gotpointercapture: Event;
