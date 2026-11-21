@@ -19,6 +19,8 @@ import ui_tree.legacy {
   LISTEN_ALL,
   info
 }
+import ui_tree.node { MOVE_LINK }
+import silk.num.f64
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
@@ -26,6 +28,9 @@ import silk.text.string { String }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import ui_tree.computed_style
+import ui_protocol.animatable
+import properties.catalog
 
 fn sized(width: f32, height: f32, time: f64) -> FrameInput {
   return FrameInput { width: width, height: height, scale: 1.0, time: time }
@@ -84,7 +89,7 @@ fn at(time: f64) -> FrameInput {
 }
 
 fn opacityOf(tree: &UiTree<'_>, id: u32) -> f32 {
-  return tree.node(tree.slotOf(id)).computed.paint.opacity
+  return tree.node(tree.slotOf(id)).computed().paint.opacity
 }
 
 fn near(a: f32, b: f32) -> bool {
@@ -252,17 +257,17 @@ effect fn hoverBody() -> ()
   run tree.dispatch(Input.PointerMove { x: 10.0, y: 10.0, modifiers: 0 })
   run tree.frame(at(1.0))
   run tree.frame(at(1.05))
-  let own = tree.node(tree.slotOf(2)).computed.text.color
-  let inherited = tree.node(tree.slotOf(3)).computed.text.color
+  let own = tree.node(tree.slotOf(2)).computed().text.color
+  let inherited = tree.node(tree.slotOf(3)).computed().text.color
   run Testing.expect(near(own.r, 0.5) && near(own.b, 0.5), "hovering eases to the hover color")
   run Testing.expect(near(inherited.r, 0.5) && near(inherited.b, 0.5), "the text inherits the eased color")
   run tree.dispatch(Input.PointerMove { x: 300.0, y: 200.0, modifiers: 0 })
   run tree.frame(at(1.05))
   run tree.frame(at(1.075))
-  let back = tree.node(tree.slotOf(2)).computed.text.color
+  let back = tree.node(tree.slotOf(2)).computed().text.color
   run Testing.expect(near(back.r, 0.75), "leaving reverses from where it was, in half the time")
   run tree.frame(at(1.1))
-  run Testing.expect(tree.node(tree.slotOf(3)).computed.text.color.r == 1.0, "and ends on the base color")
+  run Testing.expect(tree.node(tree.slotOf(3)).computed().text.color.r == 1.0, "and ends on the base color")
 }
 
 test effect fn hoverTransitionsAndInheritance() -> ()
@@ -480,4 +485,150 @@ test effect fn inspectorOverridesWinAfterMotionWithAndWithoutSheets() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run inspectorAfterMotion(false) |> Effect.provideMut<Allocator>(&mut allocator)
   run inspectorAfterMotion(true) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The four border colors share one value, and so do `color` and the decoration color that
+// follows it: a transition that writes it must not restart the others each frame.
+effect fn sharedFieldsBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.box(1, 2, &[
+    css.width(px(100.0)),
+    css.height(px(100.0)),
+    css.color(rgb(1.0, 0.0, 0.0)),
+    css.borderColor(rgb(1.0, 0.0, 0.0)),
+    css.declare(Property.Transition, run css.text(b"all 100ms linear")),
+  ])
+  run batch.listen(2, LISTEN_ALL)
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  drop run records(&mut tree)
+  let mut change = Batch.make()
+  run change.style(2, &[css.color(rgb(0.0, 0.0, 1.0)), css.borderColor(rgb(0.0, 0.0, 1.0))])
+  run tree.apply(run change.take())
+  run tree.frame(at(1.0))
+  let started = run records(&mut tree)
+  run Testing.expect(String.byteLength(String.view(&started)) != 0, "the colors start to transition")
+  run tree.frame(at(1.025))
+  run tree.frame(at(1.05))
+  let between = run records(&mut tree)
+  run Testing.expect(String.view(&between) == "", "nothing restarts while the colors run")
+  let border = tree.node(tree.slotOf(2)).computed().paint.borderColor
+  run Testing.expect(near(border.r, 0.5) && near(border.b, 0.5), "the border color is half way")
+  run tree.frame(at(1.1))
+  let ended = run records(&mut tree)
+  run Testing.expect(!String.contains(String.view(&ended), "cancel"), "they end without a cancel")
+  run tree.frame(at(1.2))
+  run Testing.expect(!tree.needsFrame(), "nothing runs after they end")
+}
+
+test effect fn sharedFieldsTransitionOnce() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run sharedFieldsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn buildWarnsAboutExactlyThePropertiesThatDoNotAnimate() -> ()
+  ! AssertionError<'static> {
+  let all = catalog.all()
+  let mut i: usize = 0
+  while i < all.length {
+    let name = catalog.name(all[i])
+    run Testing.expect(computed_style.animates(name) == animatable.animates(name), "ui-protocol's animatable list matches the tree's motion fields")
+    i = i + 1
+  }
+  run Testing.expect(animatable.animates(b"filter"), "filter animates")
+  run Testing.expect(!animatable.animates(b"background-position"), "background-position does not animate yet")
+}
+
+
+effect fn movesBody() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(1, &[css.width(px(400.0)), css.height(px(300.0))])
+  run batch.box(1, 2, &[
+    css.width(px(400.0)),
+    css.height(px(300.0)),
+    css.backgroundColor(Rgba<f32>.new(1.0, 0.0, 0.0, 1.0)),
+    css.declare(Property.Transition, run css.text(b"translate 1s linear")),
+  ])
+  run batch.box(2, 3, &[css.width(px(40.0)), css.height(px(40.0)), css.backgroundColor(Rgba<f32>.new(0.0, 0.0, 1.0, 1.0))])
+  run batch.root(1)
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+
+  // Off by default: a transition is the tree's alone.
+  let mut slide = Batch.make()
+  run slide.style(2, &[css.declare(Property.Translate, run css.text(b"100% 0px"))])
+  run tree.apply(run slide.take())
+  run tree.frame(at(1.0))
+  run tree.frame(at(1.25))
+  run Testing.expect(tree.moves.length() == 0, "a tree whose host did not ask hands no moves")
+  run tree.frame(at(2.5))
+
+  // A host whose renderer draws by itself asks for them.
+  tree.compositedMoves = true
+  let mut back = Batch.make()
+  run back.style(2, &[css.declare(Property.Translate, run css.text(b"0px 0px"))])
+  run tree.apply(run back.take())
+  run tree.frame(at(10.0))
+  run Testing.expect(tree.moves.length() == 1, "a translate transition is a move from its first frame")
+  run tree.frame(at(10.25))
+  run Testing.expect(tree.moves.length() == 1, "and stays one while it runs")
+  let found = tree.moves.get(0)
+  run Testing.expect(
+    found.node == MOVE_LINK + 2 && near(found.fromX, 400.0) && near(found.toX, 0.0) && near(found.fromY, 0.0),
+    "it says where the transition starts and ends, with the box resolved",
+  )
+  run Testing.expect(
+    near(f64.toF32(found.elapsed), 0.25) && near(f64.toF32(found.duration), 1.0) && near(found.eased(0.5), 0.5),
+    "how far it is and how it eases",
+  )
+  let groups = tree.scene().scrollGroups()
+  let mut linked = false
+  let mut g: usize = 0
+  while g < groups.length {
+    if groups[g].link.node == found.node && groups[g].link.x.factor == 1.0 {
+      linked = true
+    }
+    g = g + 1
+  }
+  let scrolls = tree.scene().scrolls()
+  let mut placed = false
+  let mut s: usize = 0
+  while s < scrolls.length {
+    if scrolls[s].node == found.node && near(scrolls[s].x, 300.0) {
+      placed = true
+    }
+    s = s + 1
+  }
+  run Testing.expect(linked && placed, "the node paints as a group at the translation now, which the renderer can move")
+  run tree.frame(at(11.0))
+  run tree.frame(at(11.1))
+  run Testing.expect(tree.moves.length() == 0 && !tree.needsFrame(), "the move ends with the transition")
+  let after = tree.scene().scrollGroups()
+  let mut still = false
+  let mut a: usize = 0
+  while a < after.length {
+    if after[a].link.node == found.node {
+      still = true
+    }
+    a = a + 1
+  }
+  run Testing.expect(!still, "and the node paints as before")
+}
+
+test effect fn translateTransitionsBecomeMoves() -> ()
+  ! AssertionError<'static> | TreeError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run movesBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

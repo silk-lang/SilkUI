@@ -25,6 +25,7 @@
 //! A framework extends the inspector with [`Inspector.extend`] and serves its extension from the
 //! app's loop with [`Inspector.serveExtension`] (see `extension.silk`).
 import protocol { Protocol }
+import devtools
 import timeline { Interaction, Startup }
 import channel { Channel, MemoryChannel, MemoryPair, Wake, NoWake }
 import session { Session }
@@ -83,7 +84,7 @@ import silk.system.filesystem { FileError }
 import silk.system.host_input { HostInput, HostInputError }
 import silk.system.monotonic_clock { MonotonicClock }
 import silk.system.monotonic_clock_native { OsMonotonicClock }
-import silk.system.system_clock { Instant }
+import silk.time.mark { Mark }
 import silk.text.format { Format, ParseError }
 import silk.text.string { String, InvalidUtf8 }
 import silk.mem.pointer { Pointer }
@@ -190,13 +191,9 @@ impl InspectorOptions {
   }
 }
 
-/// Whether this is a debug build.
+/// Whether the build has the development tools (`devtools.enabled`).
 pub fn debugBuild() -> bool {
-  static if Intrinsic.profileText("optimization") == "none" {
-    return true
-  } else {
-    return false
-  }
+  return devtools.enabled
 }
 
 /// The inspector an app owns next to its tree. When it is off (the default), every method
@@ -499,7 +496,7 @@ impl Inspector {
       let shared = hub.clone()
       let started = run Effect.result(
         NativeThread.spawn(
-          fn() -> () {
+          || -> () {
             acceptLoop(move listener, move shared, move wake)
           },
         ),
@@ -525,6 +522,10 @@ impl Inspector {
     if self.enabled() && self.protocol.extensions.pending() {
       // Requests wait for an extension, which the loop serves on its next turn.
       return Option<f64>.some(0.0)
+    }
+    if self.enabled() && self.protocol.shots.busy() {
+      // Screenshots wait for a frame copy or for the worker that encodes them.
+      return Option<f64>.some(0.005)
     }
     if !self.enabled() || (self.listener.isNone() && self.acceptor.isNone()) {
       // Off, or serving only clients in this process, which are served on the spot.
@@ -572,6 +573,7 @@ impl Inspector {
       run self.begin(NoWake {})
     }
     run self.adopt()
+    run self.deliverShots()
     if self.awaitingFrame {
       return false
     }
@@ -624,6 +626,70 @@ impl Inspector {
     self.release()
     run self.publish(&tree.*)
     return changed
+  }
+
+  /// Sends the screenshots the worker finished to the sessions that asked.
+  effect fn deliverShots(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !run self.protocol.takeShots() {
+      return ()
+    }
+    let mut j: usize = 0
+    while j < self.sessions.length() {
+      let served = &mut self.sessions.asMutSlice()[j]
+      run served.session.deliver(&mut self.protocol)
+        |> Effect.provideMut<Channel>(&mut served.channel)
+      j = j + 1
+    }
+    self.release()
+  }
+
+  /// Says whether the host can read the frames it draws back from the GPU. When it can,
+  /// screenshots of the window wait for the next frame it draws ([`Inspector.wantsFrameCopy`],
+  /// [`Inspector.frameCopy`]) and are encoded on a worker thread, so taking one does not stop
+  /// the app's loop the way drawing it on the CPU would.
+  pub fn liveFrames(self: &mut Self, on: bool) -> () {
+    self.protocol.liveFrames = on
+  }
+
+  /// Whether a screenshot waits for a copy of the next frame: the host asks its renderer for
+  /// one and hands it to [`Inspector.frameCopy`].
+  pub fn wantsFrameCopy(self: &Self) -> bool {
+    return self.enabled() && self.protocol.shots.wantsFrame()
+  }
+
+  /// Hands the waiting screenshots the frame the host read back: `height` rows of `stride`
+  /// bytes, BGRA when `bgra`. With `ok` false the window cannot be read back, and screenshots
+  /// are drawn on the CPU from then on.
+  pub effect fn frameCopy(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    rows: List<u8>,
+    stride: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    ok: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.enabled() {
+      return ()
+    }
+    run self.protocol.frameCopy(tree, move rows, stride, width, height, bgra, ok)
+    run self.deliverShots()
+    if !ok {
+      // The CPU answers went straight to the replies.
+      let mut j: usize = 0
+      while j < self.sessions.length() {
+        let served = &mut self.sessions.asMutSlice()[j]
+        run served.session.deliver(&mut self.protocol)
+          |> Effect.provideMut<Channel>(&mut served.channel)
+        j = j + 1
+      }
+      self.release()
+    }
   }
 
   /// Takes the sessions the accept thread started since the last look.
@@ -760,6 +826,11 @@ impl Inspector {
     return run self.protocol.beginNext(&mut tree)
   }
 
+  /// The input `beginNext` started, until `finishNext`: what a headless recording shows.
+  pub fn begun(self: &Self) -> Option<&Input> {
+    return self.protocol.begun()
+  }
+
   /// Applies the default action of the input `beginNext` started, unless `prevented`.
   pub effect fn finishNext(self: &mut Self, tree: &mut UiTree<'_>, prevented: bool) -> ()
     ! OutOfMemoryError
@@ -889,6 +960,7 @@ impl Inspector {
 
   fn shutdown(self: &mut Self) -> () {
     let was = self.enabled()
+    self.protocol.shots.stop()
     while self.sessions.length() != 0 {
       let mut gone = self.sessions.remove(0)
       gone.channel.close()
@@ -1017,7 +1089,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     ? &mut MonotonicClock {
     let start = run MonotonicClock.now()
     let deadline = MonotonicClock.deadlineAfter(&start, ACCEPT_PAUSE)
-    return run accept(&mut listener, Option<Instant>.some(move deadline))
+    return run accept(&mut listener, Option<Mark>.some(move deadline))
   }
 
   /// Pairs a channel for `connection`, hands one end to the UI thread and starts the pump on
@@ -1039,7 +1111,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let flag = finished.clone()
     let copy = wake.copy()
     let handle = run NativeThread.spawn(
-      fn() -> () {
+      || -> () {
         bridge(move connection, move second, move copy)
         markDone(move flag)
       },
@@ -1115,7 +1187,7 @@ effect fn open(address: &Address) -> Listener
           connectUnixOwned(
             bytes,
             ConnectOptions.defaults(),
-            Option<Instant>.some(MonotonicClock.deadlineAfter(&start, 200000000)),
+            Option<Mark>.some(MonotonicClock.deadlineAfter(&start, 200000000)),
           ),
         )
           |> Effect.provideMut<MonotonicClock>(&mut clock)

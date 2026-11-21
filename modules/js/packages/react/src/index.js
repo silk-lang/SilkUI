@@ -24,11 +24,27 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext, createElement, useLayoutEffect, useRef, useState } from "react";
-import { RichInput, SvgElement, SvgText, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
+import { CheckInput, Input, RichInput, SvgElement, SvgText, createElement as createHtmlElement, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
 const SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "document", "defaultDocument", "marks", "atoms"]);
+// Element types that are the tree's own node kinds; every other type is an HTML element.
+const TREE_TYPES = new Set(["box", "text", "richinput", "image", "svg"]);
+// Props of HTML elements React DOM handles itself, not attributes.
+const HTML_SKIP = new Set(["children", "key", "ref", "value", "defaultValue", "checked", "defaultChecked", "dangerouslySetInnerHTML", "autoFocus", "suppressHydrationWarning", "suppressContentEditableWarning"]);
+// Tree attributes an HTML element takes as they are spelled (see @silkui/core `setAttribute`).
+const TREE_ATTRIBUTES = new Set(["tabIndex", "testId", "focusTrap", "multiline", "expanded", "indeterminate", "transition", "cursor", "label"]);
+// React DOM prop names whose attribute is not the name in lower case.
+const ATTRIBUTE_NAMES = { className: "class", htmlFor: "for", acceptCharset: "accept-charset", httpEquiv: "http-equiv" };
+// HTML attributes that are present or absent: `true` sets them, `false` takes them out.
+const BOOLEAN_ATTRIBUTES = new Set([
+  "allowfullscreen", "async", "autoplay", "checked", "controls", "default", "defer", "disabled", "formnovalidate",
+  "hidden", "inert", "itemscope", "loop", "multiple", "muted", "nomodule", "novalidate", "open", "playsinline",
+  "readonly", "required", "reversed", "selected",
+]);
+// React DOM event names whose DOM event is another type.
+const HTML_EVENTS = { focus: "focusin", blur: "focusout", doubleclick: "click", contextmenu: "pointerdown" };
 
 let updatePriority = 0;
 let eventPriority = 0;
@@ -45,15 +61,43 @@ function eventOf(name) {
   return { type, capture };
 }
 
-function listen(node, name, type, capture) {
+// React DOM's synthetic event members, on the @silkui/core event itself.
+function synthetic(event) {
+  if (event.nativeEvent !== undefined) return;
+  event.nativeEvent = event;
+  event.persist = persist;
+  event.isDefaultPrevented = isDefaultPrevented;
+  event.isPropagationStopped = isPropagationStopped;
+}
+function persist() {}
+function isDefaultPrevented() {
+  return this.defaultPrevented;
+}
+function isPropagationStopped() {
+  return !!this._stopped || this.cancelBubble === true;
+}
+
+// Which events of `type` reach a React DOM handler: a double click is a click's second, a
+// context menu a secondary button press.
+const FILTERS = {
+  onDoubleClick: (event) => event.detail === 2,
+  onDoubleClickCapture: (event) => event.detail === 2,
+  onContextMenu: (event) => event.button === 2,
+  onContextMenuCapture: (event) => event.button === 2,
+};
+
+function listen(node, name, type, capture, props) {
   let bound = bindings.get(node);
-  if (!bound) bindings.set(node, (bound = { props: {}, names: new Set() }));
+  if (!bound) bindings.set(node, (bound = { props, names: new Set() }));
   if (bound.names.has(name)) return;
   bound.names.add(name);
+  const filter = node._tag === undefined ? undefined : FILTERS[name];
   node.addEventListener(
     type,
     (event) => {
+      if (filter && !filter(event)) return;
       const handler = bound.props[name];
+      if (node._tag !== undefined) synthetic(event);
       const previous = eventPriority;
       const previousEvent = currentEvent;
       eventPriority = CONTINUOUS.has(type) ? ContinuousEventPriority : DiscreteEventPriority;
@@ -66,7 +110,11 @@ function listen(node, name, type, capture) {
       }
       // Updates from a discrete event commit before the host applies the mutations.
       if (!CONTINUOUS.has(type)) reconciler.flushSyncWork();
-      if (type === "input") restoreControlled(node);
+      // An HTML field's `onChange` may run after this listener: it is put back once every
+      // listener ran.
+      if (node._tag !== undefined) {
+        if (type === "input" || type === "change") restoreLater(node);
+      } else if (type === "input") restoreControlled(node);
     },
     capture,
   );
@@ -74,9 +122,23 @@ function listen(node, name, type, capture) {
 
 // A controlled input shows its `value` prop: what the user typed stays only when the
 // listener put it into state.
+const restoring = new Set();
+function restoreLater(node) {
+  if (restoring.has(node)) return;
+  restoring.add(node);
+  queueMicrotask(() => {
+    restoring.delete(node);
+    restoreControlled(node);
+  });
+}
+
 function restoreControlled(node) {
   const props = bindings.get(node)?.props;
   if (!props) return;
+  if (node instanceof CheckInput) {
+    if (props.checked !== undefined && !!props.checked !== node.checked) node.checked = props.checked;
+    return;
+  }
   if (node instanceof RichInput) {
     if (props.document !== undefined && !sameDocument(props.document, node.document)) node.document = props.document;
   } else if (props.value !== undefined && String(props.value) !== node.value) node.value = props.value;
@@ -139,21 +201,7 @@ function diffStyle(look, previous, next) {
   if (any) look.set(changes);
 }
 
-function applyProps(node, previous, next) {
-  for (const name of Object.keys(next)) {
-    const value = next[name];
-    if (SKIP.has(name) || previous[name] === value) continue;
-    if (name in LOOKS) {
-      diffStyle(node.look(LOOKS[name]), previous[name], value);
-      continue;
-    }
-    const event = eventOf(name);
-    if (event) {
-      if (typeof value === "function") listen(node, name, event.type, event.capture);
-      continue;
-    }
-    node.setAttribute(name, value);
-  }
+function removeMissingProps(node, previous, next) {
   for (const name of Object.keys(previous)) {
     if (name in next || SKIP.has(name)) continue;
     if (name in LOOKS) diffStyle(node.look(LOOKS[name]), previous[name], null);
@@ -162,12 +210,129 @@ function applyProps(node, previous, next) {
       else node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
     }
   }
+}
+
+// The attribute an HTML element's prop `name` sets, or null for a tree attribute.
+function attributeName(name) {
+  if (TREE_ATTRIBUTES.has(name)) return null;
+  const mapped = ATTRIBUTE_NAMES[name];
+  if (mapped) return mapped;
+  if (name.startsWith("data-") || name.startsWith("aria-")) return name;
+  return name.toLowerCase();
+}
+
+function setHtmlAttribute(node, name, value) {
+  const attribute = attributeName(name);
+  if (attribute === null) {
+    node.setAttribute(name, value);
+    return;
+  }
+  if (value === null || value === undefined || typeof value === "function" || typeof value === "symbol") {
+    node.setAttribute(attribute, null);
+  } else if (BOOLEAN_ATTRIBUTES.has(attribute)) {
+    node.setAttribute(attribute, value ? "" : null);
+  } else if (typeof value === "boolean" && !attribute.startsWith("data-") && !attribute.startsWith("aria-")) {
+    // React DOM leaves booleans out of other attributes, except enumerated ones.
+    node.setAttribute(attribute, attribute === "draggable" || attribute === "spellcheck" || attribute === "contenteditable" ? String(value) : null);
+  } else if (typeof value === "object") {
+    node.setAttribute(attribute, null);
+  } else {
+    node.setAttribute(attribute, value);
+  }
+}
+
+function htmlEventType(node, type) {
+  if (type === "change") return node instanceof Input ? "input" : "change";
+  return HTML_EVENTS[type] ?? type;
+}
+
+// An HTML element's props, as React DOM applies them.
+function applyHtmlProps(node, previous, next) {
+  const names = Object.keys(next);
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const value = next[name];
+    if (previous[name] === value) continue;
+    if (name === "dangerouslySetInnerHTML") {
+      const html = value?.__html;
+      if (html !== previous[name]?.__html) node.innerHTML = html ?? "";
+      continue;
+    }
+    if (HTML_SKIP.has(name)) continue;
+    if (name in LOOKS) {
+      diffStyle(node.look(LOOKS[name]), previous[name], value);
+      continue;
+    }
+    const event = eventOf(name);
+    if (event) {
+      if (typeof value === "function") listen(node, name, htmlEventType(node, event.type), event.capture, next);
+      continue;
+    }
+    setHtmlAttribute(node, name, value);
+  }
+  if (previous !== EMPTY) {
+    for (const name of Object.keys(previous)) {
+      if (name in next || HTML_SKIP.has(name) || eventOf(name)) continue;
+      if (name in LOOKS) diffStyle(node.look(LOOKS[name]), previous[name], null);
+      else if (TREE_ATTRIBUTES.has(name)) node.setAttribute(name, name === "tabIndex" ? -2147483648 : typeof previous[name] === "boolean" ? false : "");
+      else setHtmlAttribute(node, name, null);
+    }
+    if ("dangerouslySetInnerHTML" in previous && !("dangerouslySetInnerHTML" in next)) node.innerHTML = "";
+  }
+  if (node instanceof CheckInput) {
+    if (next.checked !== undefined) {
+      node.checked = next.checked;
+      listen(node, "onChange", "change", false, next);
+    } else if (previous === EMPTY && next.defaultChecked !== undefined) node.checked = next.defaultChecked;
+    if (next.value !== undefined) node.value = String(next.value);
+  } else if (node instanceof Input) {
+    const value = next.value;
+    if (value !== undefined && value !== null) {
+      if (String(value) !== node.value) node.value = value;
+      listen(node, "onChange", "input", false, next);
+    } else if (previous === EMPTY) {
+      const initial = next.defaultValue ?? (node.localName === "textarea" && typeof next.children === "string" ? next.children : undefined);
+      if (initial !== undefined) node.value = initial;
+    }
+  } else if (next.value !== undefined && next.value !== previous.value) {
+    setHtmlAttribute(node, "value", next.value);
+  }
+  if (previous !== EMPTY) {
+    const bound = bindings.get(node);
+    if (bound) bound.props = next;
+  }
+}
+
+function applyProps(node, previous, next) {
+  if (node._tag !== undefined) return applyHtmlProps(node, previous, next);
+  const names = Object.keys(next);
+  for (let index = 0; index < names.length; index++) {
+    const name = names[index];
+    const value = next[name];
+    if (name === "children" || previous[name] === value) continue;
+    if (name === "className") {
+      node.setAttribute(name, value);
+      continue;
+    }
+    if (SKIP.has(name)) continue;
+    if (name in LOOKS) {
+      diffStyle(node.look(LOOKS[name]), previous[name], value);
+      continue;
+    }
+    const event = eventOf(name);
+    if (event) {
+      if (typeof value === "function") listen(node, name, event.type, event.capture, next);
+      continue;
+    }
+    node.setAttribute(name, value);
+  }
+  if (previous !== EMPTY) removeMissingProps(node, previous, next);
   if (node instanceof RichInput) {
     defineLooks(previous.marks, next.marks, (name, style) => node.defineMark(name, style));
     defineLooks(previous.atoms, next.atoms, (kind, style) => node.defineAtom(kind, style));
     if (next.document !== undefined) {
       if (!sameDocument(next.document, node.document)) node.document = next.document;
-      listen(node, "onInput", "input", false);
+      listen(node, "onInput", "input", false, next);
     } else if (previous === EMPTY && next.defaultDocument !== undefined) {
       node.document = next.defaultDocument;
     }
@@ -176,17 +341,57 @@ function applyProps(node, previous, next) {
       if (String(next.value) !== node.value) node.value = next.value;
       // Typing reaches the tree first, so a controlled input needs the input event to put
       // its value back when the application does not accept the change.
-      listen(node, "onInput", "input", false);
+      listen(node, "onInput", "input", false, next);
     } else if (previous === EMPTY && next.defaultValue !== undefined) {
       node.value = next.defaultValue;
     }
   }
-  let bound = bindings.get(node);
-  if (bound) bound.props = next;
-  else if (next.value !== undefined || next.document !== undefined) bindings.set(node, { props: next, names: new Set() });
+  if (previous !== EMPTY) {
+    const bound = bindings.get(node);
+    if (bound) bound.props = next;
+  }
 }
 
 const EMPTY = {};
+
+// React DOM hoists a `<style href precedence>` into the head and keeps one per href for good,
+// so a component that renders one (Base UI's ScrollArea) adds no sheet when it mounts again
+// and removes none when it unmounts. Each instance here is an empty text node in its place.
+const hoistedStyles = new Map();
+const hoistedOrder = [];
+const styleMarks = new WeakSet();
+
+function hoistable(type, props, context) {
+  return type === "style" && context !== SVG && typeof props.href === "string" && props.href !== ""
+    && props.precedence != null && globalThis.document?.head != null;
+}
+
+function styleText(children) {
+  if (children == null || typeof children === "boolean") return "";
+  return Array.isArray(children) ? children.map(styleText).join("") : String(children);
+}
+
+function hoistStyle(props) {
+  if (!hoistedStyles.has(props.href)) {
+    const element = createHtmlElement("style", EMPTY);
+    element.setAttribute("href", props.href);
+    element.setAttribute("precedence", String(props.precedence));
+    element.appendChild(createText(styleText(props.children)));
+    // Precedences keep the order they first appeared in; a style goes after its own.
+    const precedence = String(props.precedence);
+    if (!hoistedOrder.includes(precedence)) hoistedOrder.push(precedence);
+    const rank = hoistedOrder.indexOf(precedence);
+    const later = [...hoistedStyles.values()].find((other) => hoistedOrder.indexOf(other.getAttribute("precedence")) > rank);
+    const head = globalThis.document.head;
+    if (later) head.insertBefore(element, later);
+    else head.appendChild(element);
+    hoistedStyles.set(props.href, element);
+  }
+  const mark = createText("");
+  styleMarks.add(mark);
+  return mark;
+}
+
 // The host context inside an <svg>: its elements are markup, not nodes.
 const SVG = { svg: true };
 
@@ -228,22 +433,29 @@ const hostConfig = {
   // The <svg>s this commit changed are drawn before the host applies it.
   resetAfterCommit: () => flushSvg(),
   preparePortalMount() {},
-  shouldSetTextContent: () => false,
+  // A textarea's children are its first value, and markup set as HTML has no React children.
+  shouldSetTextContent: (type, props) => type === "textarea" || props.dangerouslySetInnerHTML != null
+    || (type === "style" && typeof props.href === "string" && props.href !== "" && props.precedence != null && globalThis.document?.head != null),
   createInstance(type, props, _root, context) {
+    if (hoistable(type, props, context)) return hoistStyle(props);
     if (context === SVG && type !== "svg") {
       const element = createSvgElement(type);
       applySvgProps(element, EMPTY, props);
       return element;
     }
-    const node = createNode(type);
+    const node = TREE_TYPES.has(type) ? createNode(type) : createHtmlElement(type, props);
     applyProps(node, EMPTY, props);
     return node;
   },
   createTextInstance: (text, _root, context) => (context === SVG ? new SvgText(text) : createText(text)),
   appendInitialChild: (parent, child) => parent.appendChild(child),
-  finalizeInitialChildren: () => false,
-  commitMount() {},
+  // `autoFocus` focuses the element once it is in the tree.
+  finalizeInitialChildren: (_node, _type, props) => props.autoFocus === true,
+  commitMount(node) {
+    node.focus?.();
+  },
   commitUpdate(node, type, previous, next) {
+    if (styleMarks.has(node)) return;
     if (node instanceof SvgElement) applySvgProps(node, previous, next);
     else applyProps(node, previous, next);
   },
@@ -349,6 +561,15 @@ export function flushSync(callback) {
   return reconciler.flushSyncFromReconciler(callback);
 }
 
+export { WebView } from "./webview.js";
+/** Renders `children` into `container`, a @silkui/core node outside this part of the tree. */
+export function createPortal(children, container, key = null) {
+  return reconciler.createPortal(children, container, null, key == null ? null : String(key));
+}
+
+// The automatic JSX runtime takes `createElement` from the import source for an element with
+// both spread props and a key.
+export { createElement } from "react";
 /** A bounded scroll box whose mounted rows are requested by the retained tree. */
 export function VirtualList({ items, itemKey, children, style, rowHeight, estimatedRowHeight, overscan, gap, revision }) {
   const port = useRef(null);

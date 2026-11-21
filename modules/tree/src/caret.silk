@@ -5,30 +5,37 @@
 //!
 //! Offsets are UTF-8 byte offsets into the text css-layout laid out (an input's display text:
 //! its value with any composition spliced in).
-import layout.lib { LayoutTree, FragmentKind, TextFragmentKind }
+import layout.lib { LayoutTree, FragmentKind, TextFragmentKind, PlacedText }
 import node { NO_INDEX }
 import ui_text.system { TextSystem }
 import silk.collections.list { List }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
 import silk.num.f32
 import silk.num.usize
 
-/// One text fragment of the input's text, in CSS pixels of the viewport.
+/// One run of the input's text (a word, a space, a tab, a line break: css-layout's
+/// `LineText`), in CSS pixels of the viewport.
 pub struct Piece {
-  /// The source range the fragment covers.
+  /// The source range the run covers.
   pub start: usize,
   pub end: usize,
-  /// The fragment's box.
+  /// The run's box.
   pub x0: f32,
   pub x1: f32,
   pub top: f32,
   pub bottom: f32,
-  /// The line box it sits on: its fragment index and vertical extent.
+  /// The fragment that holds the run: a text fragment, or an atom's box.
+  pub fragment: usize,
+  /// The line box it sits on: what tells it from every other line (equal for the pieces of
+  /// one line, and nothing else: not a fragment index), and its extent.
   pub line: usize,
   pub lineTop: f32,
   pub lineBottom: f32,
+  pub lineLeft: f32,
+  pub lineRight: f32,
   pub shapeKey: usize,
   /// Whether the fragment is a shaped glyph run (not a tab or a preserved line break).
   pub glyphs: bool,
@@ -37,7 +44,7 @@ pub struct Piece {
   pub lineBreak: bool,
   pub rtl: bool,
   /// What the offsets are shifted by from the fragment's own text: a rich input's run starts
-  /// there in the display text. Glyph clusters are in the fragment's own text.
+  /// there in the display text. Glyph clusters count from the fragment's start in its own text.
   pub base: usize,
 }
 
@@ -78,38 +85,36 @@ fn lineOf(output: &LayoutTree, index: usize) -> usize {
   return index
 }
 
-/// Geometry of one actual shaped text fragment. Callers must supply a text fragment with
-/// textData; sharing this conversion keeps CSSOM ranges and input selection on the same runs.
-pub fn pieceOf(output: &LayoutTree, text: &TextSystem<'_>, index: usize) -> Piece {
-  let values = output.fragments.values.asSlice()
-  let fragment = values[index]
-  let data = output.fragments.texts.get(fragment.textData)
-  let line = lineOf(output, index)
-  let lineBox = values[line]
-  let glyphs = data.kind == TextFragmentKind.Glyphs
+/// Geometry of one run of text fragment `fragment`, as `FragmentArena.textRuns` gives it;
+/// sharing this conversion keeps CSSOM ranges and input selection on the same runs.
+pub fn pieceOf(text: &TextSystem<'_>, fragment: usize, placed: &PlacedText) -> Piece {
+  let glyphs = placed.kind == TextFragmentKind.Glyphs
   return Piece {
-    start: data.sourceStart,
-    end: data.sourceEnd,
-    x0: fragment.worldLocation.x,
-    x1: fragment.worldLocation.x + fragment.size.width,
-    top: fragment.worldLocation.y,
-    bottom: fragment.worldLocation.y + fragment.size.height,
-    line: line,
-    lineTop: lineBox.worldLocation.y,
-    lineBottom: lineBox.worldLocation.y + lineBox.size.height,
-    shapeKey: data.shapeKey,
+    start: placed.sourceStart,
+    end: placed.sourceEnd,
+    x0: placed.location.x,
+    x1: placed.location.x + placed.size.width,
+    top: placed.location.y,
+    bottom: placed.location.y + placed.size.height,
+    fragment: fragment,
+    line: placed.line,
+    lineTop: placed.lineLocation.y,
+    lineBottom: placed.lineLocation.y + placed.lineSize.height,
+    lineLeft: placed.lineLocation.x,
+    lineRight: placed.lineLocation.x + placed.lineSize.width,
+    shapeKey: placed.shapeKey,
     glyphs: glyphs,
-    lineBreak: data.kind == TextFragmentKind.SegmentBreak,
+    lineBreak: placed.kind == TextFragmentKind.SegmentBreak,
     rtl: if glyphs {
-      text.glyphRun(data.shapeKey).rtl
+      text.glyphRun(placed.shapeKey).rtl
     } else {
-      data.bidiLevel % 2 == 1
+      placed.bidiLevel % 2 == 1
     },
     base: 0,
   }
 }
 
-/// The text fragments of css-layout node `inner` inside fragment `root` (an input's box), in
+/// The runs of the text of css-layout node `inner` inside fragment `root` (an input's box), in
 /// fragment order (line by line, logical order within a line for left-to-right text).
 pub effect fn collect(
   output: &LayoutTree,
@@ -132,8 +137,11 @@ pub effect fn collect(
     let index = stack.get(last)
     stack.truncate(last)
     let f = values[index]
-    if f.kind == FragmentKind.Text && f.source == inner && f.textData != NO_INDEX {
-      run out.append(pieceOf(output, text, index))
+    if f.kind == FragmentKind.Text && f.source == inner {
+      let mut runs = output.fragments.textRuns(index)
+      while runs.next() {
+        run out.append(pieceOf(text, index, &runs.current))
+      }
     }
 
     // Children in reverse so they pop in order.
@@ -187,15 +195,18 @@ pub effect fn collectRuns(
     stack.truncate(last)
     let f = values[index]
     let mut descend = true
-    if f.kind == FragmentKind.Text && f.textData != NO_INDEX {
+    if f.kind == FragmentKind.Text {
       let mut r: usize = 0
       while r < runs.length {
         if !runs[r].atom && runs[r].text == f.source {
-          let mut piece = pieceOf(output, text, index)
-          piece.start = piece.start + runs[r].start
-          piece.end = piece.end + runs[r].start
-          piece.base = runs[r].start
-          run out.append(piece)
+          let mut placed = output.fragments.textRuns(index)
+          while placed.next() {
+            let mut piece = pieceOf(text, index, &placed.current)
+            piece.start = piece.start + runs[r].start
+            piece.end = piece.end + runs[r].start
+            piece.base = runs[r].start
+            run out.append(piece)
+          }
           break
         }
         r = r + 1
@@ -214,9 +225,12 @@ pub effect fn collectRuns(
               x1: f.worldLocation.x + f.size.width,
               top: f.worldLocation.y,
               bottom: f.worldLocation.y + f.size.height,
+              fragment: index,
               line: line,
               lineTop: lineBox.worldLocation.y,
               lineBottom: lineBox.worldLocation.y + lineBox.size.height,
+              lineLeft: lineBox.worldLocation.x,
+              lineRight: lineBox.worldLocation.x + lineBox.size.width,
               shapeKey: 0,
               glyphs: false,
               lineBreak: false,
@@ -299,7 +313,7 @@ pub fn caretX(text: &TextSystem<'_>, p: &Piece, d: usize) -> f32 {
   let mut found = false
   let mut i: usize = 0
   while i < glyphs.length {
-    let c = glyphs[i].cluster
+    let c = p.start + u32.toUsize(glyphs[i].cluster)
     if c < first {
       first = c
     }
@@ -315,7 +329,7 @@ pub fn caretX(text: &TextSystem<'_>, p: &Piece, d: usize) -> f32 {
   let mut next = p.end
   i = 0
   while i < glyphs.length {
-    let c = glyphs[i].cluster
+    let c = p.start + u32.toUsize(glyphs[i].cluster)
     if c > cluster && c < next {
       next = c
     }
@@ -329,7 +343,7 @@ pub fn caretX(text: &TextSystem<'_>, p: &Piece, d: usize) -> f32 {
   i = 0
   while i < glyphs.length {
     let g = glyphs[i]
-    if g.cluster == cluster {
+    if p.start + u32.toUsize(g.cluster) == cluster {
       lo = f32.min(lo, pen)
       hi = f32.max(hi, pen + g.advance)
     }

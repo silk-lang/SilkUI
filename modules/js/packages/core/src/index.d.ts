@@ -33,11 +33,21 @@ export interface Look {
   replace(properties: Style): void;
   /** A property as the tree got it, in CSS text (`"120px"`). */
   get(name: keyof Style): string | undefined;
+  /** CSSOM's: by CSS name (`background-color`) or custom property (`--accent`). */
+  setProperty(name: string, value: string | null, priority?: string): void;
+  getPropertyValue(name: string): string;
+  removeProperty(name: string): string;
+  getPropertyPriority(name: string): string;
   readonly cssText: string;
 }
 
 export type Listener<E extends Event = Event> = ((this: Node, event: E) => void) | { handleEvent(event: E): void };
-export type ListenerOptions = boolean | { capture?: boolean; once?: boolean };
+/** What `signal` needs from an `AbortSignal`. */
+export interface ListenerSignal {
+  readonly aborted: boolean;
+  addEventListener(type: "abort", listener: () => void, options?: { once?: boolean }): void;
+}
+export type ListenerOptions = boolean | { capture?: boolean; once?: boolean; signal?: ListenerSignal };
 
 /** Live tokens in a node's class attribute. */
 export class ClassList implements Iterable<string> {
@@ -75,6 +85,8 @@ export class Node {
   className: string;
   adoptedStyleSheets: CSSStyleSheet[];
   readonly classList: ClassList;
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  readonly dataset: Record<string, string | undefined>;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
@@ -82,8 +94,19 @@ export class Node {
   readonly lastChild: Node | null;
   readonly nextSibling: Node | null;
   readonly previousSibling: Node | null;
+  /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
+  readonly nodeType: 1 | 3 | 11;
+  /** Whether the node is in the mounted tree. */
+  readonly isConnected: boolean;
+  hasChildNodes(): boolean;
+  /** A copy with the same looks and attributes, and with `deep` copies of the children. */
+  cloneNode(deep?: boolean): this;
+  /** Joins adjacent text children and drops empty ones, in the whole subtree. */
+  normalize(): void;
   /** Whether `other` is this node or inside it. */
   contains(other: Node | null): boolean;
+  /** Puts `node` where `child` is and detaches `child`. */
+  replaceChild<T extends Node>(node: Node, child: T): T;
   /** Inserts `child` before `before`, or last without it. A child already in the tree moves. */
   insertBefore<T extends Node>(child: T, before?: Node | null): T;
   appendChild<T extends Node>(child: T): T;
@@ -112,29 +135,209 @@ export class Node {
   set tabIndex(value: number);
   set disabled(value: boolean);
   focus(): void;
+  /** As DOM `setPointerCapture`: throws `NotFoundError` for a pointer that is not down. */
+  setPointerCapture(pointerId: number): void;
+  releasePointerCapture(pointerId: number): void;
+  hasPointerCapture(pointerId: number): boolean;
   scrollTo(x: number, y: number): void;
+  scrollTo(options: ScrollToOptions): void;
+  scroll(x: number, y: number): void;
+  scroll(options: ScrollToOptions): void;
+  scrollBy(x: number, y: number): void;
+  scrollBy(options: ScrollToOptions): void;
+  /** `true` or nothing aligns to the start, `false` to the end. */
+  scrollIntoView(options?: boolean | ScrollIntoViewOptions): void;
+  scrollIntoViewIfNeeded(center?: boolean): void;
+  /** Layout reads: each lays out first when something changed, as a browser does. */
+  getBoundingClientRect(): DOMRect;
+  getClientRects(): DOMRect[] & { item(index: number): DOMRect | null };
+  readonly clientLeft: number;
+  readonly clientTop: number;
+  readonly clientWidth: number;
+  readonly clientHeight: number;
+  readonly scrollWidth: number;
+  readonly scrollHeight: number;
+  scrollLeft: number;
+  scrollTop: number;
+  readonly offsetParent: Node | null;
+  readonly offsetLeft: number;
+  readonly offsetTop: number;
+  readonly offsetWidth: number;
+  readonly offsetHeight: number;
+  /** Whether this node matches CSS `selector`, by the stylesheet matcher. Throws a SyntaxError for an invalid selector. */
+  matches(selector: string): boolean;
+  webkitMatchesSelector(selector: string): boolean;
+  /** This node or its nearest ancestor that matches `selector`. */
+  closest(selector: string): Node | null;
+  /** The first descendant, in tree order, that matches `selector`. */
+  querySelector(selector: string): Node | null;
+  /** Every descendant that matches `selector`, in tree order (a static list). */
+  querySelectorAll(selector: string): Node[];
   setVirtualList(options: VirtualListOptions, onRange: (indices: number[]) => void): void;
   setVirtualList(options: null): void;
   bindVirtualRows(indices: readonly number[]): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  /** The app's own event types, sent with `dispatchEvent`. */
+  addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
   removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  /** Sends `event` through the tree from this node, as on the web. False when a listener prevented the default. */
+  dispatchEvent(event: globalThis.Event): boolean;
+}
+
+/** `<style>` (from `createElement("style")`): its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  /** The element's stylesheet while it is in the document, else null. */
+  readonly sheet: CSSStyleSheet | null;
 }
 
 /** A text leaf. It takes its look from its parent. */
 export class Text extends Node {
   constructor(data?: string);
   data: string;
+  nodeValue: string;
   textContent: string;
+  /** In UTF-16 code units. */
+  readonly length: number;
+  substringData(offset: number, count: number): string;
+  appendData(data: string): void;
+  insertData(offset: number, data: string): void;
+  deleteData(offset: number, count: number): void;
+  replaceData(offset: number, count: number, data: string): void;
+  /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
+  splitText(offset: number): Text;
 }
 
-/** An editable text field. `value` follows what the user types. */
+/** Nodes held together outside the tree. Inserting it inserts its children and empties it. */
+export class DocumentFragment extends Node {
+  constructor();
+}
+
+export function createDocumentFragment(): DocumentFragment;
+
+/** Two boundary points: a node and an offset (a child index, or UTF-16 units in text). */
+export abstract class AbstractRange {
+  readonly startContainer: Node;
+  readonly startOffset: number;
+  readonly endContainer: Node;
+  readonly endOffset: number;
+  readonly collapsed: boolean;
+}
+
+export interface StaticRangeInit {
+  startContainer: Node;
+  startOffset: number;
+  endContainer: Node;
+  endOffset: number;
+}
+
+/** A range that does not follow changes to the tree. */
+export class StaticRange extends AbstractRange {
+  constructor(init: StaticRangeInit);
+}
+
+/** A live range over the app's nodes, as the DOM Standard defines it. */
+export class Range extends AbstractRange {
+  static readonly START_TO_START: 0;
+  static readonly START_TO_END: 1;
+  static readonly END_TO_END: 2;
+  static readonly END_TO_START: 3;
+  readonly START_TO_START: 0;
+  readonly START_TO_END: 1;
+  readonly END_TO_END: 2;
+  readonly END_TO_START: 3;
+  /** Collapsed at the start of the mounted root. */
+  constructor();
+  readonly commonAncestorContainer: Node;
+  setStart(node: Node, offset: number): void;
+  setEnd(node: Node, offset: number): void;
+  setStartBefore(node: Node): void;
+  setStartAfter(node: Node): void;
+  setEndBefore(node: Node): void;
+  setEndAfter(node: Node): void;
+  collapse(toStart?: boolean): void;
+  selectNode(node: Node): void;
+  selectNodeContents(node: Node): void;
+  compareBoundaryPoints(how: 0 | 1 | 2 | 3, sourceRange: Range): -1 | 0 | 1;
+  comparePoint(node: Node, offset: number): -1 | 0 | 1;
+  isPointInRange(node: Node, offset: number): boolean;
+  intersectsNode(node: Node): boolean;
+  cloneRange(): Range;
+  detach(): void;
+  deleteContents(): void;
+  extractContents(): DocumentFragment;
+  cloneContents(): DocumentFragment;
+  insertNode(node: Node): void;
+  surroundContents(newParent: Node): void;
+  toString(): string;
+  getClientRects(): DOMRect[];
+  getBoundingClientRect(): DOMRect;
+}
+
+/** A new live range, collapsed at the start of the root. */
+export function createRange(): Range;
+
+/**
+ * The document's selection, which the tree keeps (presses, drags, keys) and scripts can read
+ * and change. Its ranges are live, in tree order: one, or one per piece seen when the
+ * selection crosses children that layout reorders.
+ */
+export class Selection {
+  private constructor();
+  readonly anchorNode: Node | null;
+  readonly anchorOffset: number;
+  readonly focusNode: Node | null;
+  readonly focusOffset: number;
+  readonly isCollapsed: boolean;
+  readonly rangeCount: number;
+  readonly type: "None" | "Caret" | "Range";
+  readonly direction: "forward" | "backward" | "none";
+  getRangeAt(index: number): Range;
+  addRange(range: Range): void;
+  removeRange(range: Range): void;
+  removeAllRanges(): void;
+  empty(): void;
+  collapse(node: Node | null, offset?: number): void;
+  setPosition(node: Node | null, offset?: number): void;
+  collapseToStart(): void;
+  collapseToEnd(): void;
+  extend(node: Node, offset?: number): void;
+  setBaseAndExtent(anchorNode: Node, anchorOffset: number, focusNode: Node, focusOffset: number): void;
+  selectAllChildren(node: Node): void;
+  deleteFromDocument(): void;
+  containsNode(node: Node, allowPartialContainment?: boolean): boolean;
+  getComposedRanges(): StaticRange[];
+  /** The selected text as copying gives it. */
+  toString(): string;
+}
+
+/** The document's selection. Also installed as `globalThis.getSelection`. */
+export function getSelection(): Selection;
+
+/**
+ * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
+ * string indices, as on the web.
+ */
 export class Input extends Node {
   constructor();
+  /** Setting a different value puts the caret at its end. */
   value: string;
-  readonly selectionStart: number;
-  readonly selectionEnd: number;
-  /** Selects from `anchor` to `focus`, as UTF-8 byte offsets in the value. */
-  setSelectionRange(anchor: number, focus: number): void;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: "forward" | "backward" | "none";
+  /** Selects `start` to `end`; with `direction` "backward" the caret sits at `start`. */
+  setSelectionRange(start: number, end: number, direction?: "forward" | "backward" | "none"): void;
+  /** Selects the whole value. */
+  select(): void;
+  /** Replaces the selection with `replacement`. */
+  setRangeText(replacement: string): void;
+  /** Replaces `start` to `end` with `replacement` and places the selection by `selectionMode`. */
+  setRangeText(
+    replacement: string,
+    start: number,
+    end: number,
+    selectionMode?: "select" | "start" | "end" | "preserve",
+  ): void;
 }
 
 /** An inline atom of a rich input: a mention or a chip. */
@@ -180,8 +383,6 @@ export class RichInput extends Input {
   toggleMark(name: string): void;
   /** Replaces the text from `start` to `end` with `atom`. */
   insertAtom(start: number, end: number, atom: RichAtom): void;
-  /** Selects from `anchor` to `focus`, as string indices. */
-  setSelectionRange(anchor: number, focus: number): void;
 }
 
 /**
@@ -191,6 +392,21 @@ export class RichInput extends Input {
 export class Image extends Node {
   constructor(src?: string);
   src: string;
+}
+
+/**
+ * A canvas the application draws with WebGPU or Canvas 2D, as a `<canvas>`: `width` and
+ * `height` are the drawing's size in pixels, `getContext("webgpu")` gives its
+ * `GPUCanvasContext` (the types of `@webgpu/types` describe it) and `getContext("2d")` its
+ * `CanvasRenderingContext2D`.
+ */
+export class Canvas extends Node {
+  constructor();
+  width: number;
+  height: number;
+  getContext(kind: "webgpu"): unknown | null;
+  getContext(kind: "2d", options?: { alpha?: boolean }): unknown | null;
+  getContext(kind: string): unknown | null;
 }
 
 /** Text inside an `<svg>`. */
@@ -203,7 +419,10 @@ export class SvgText {
   destroy(): void;
 }
 
-/** An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node. */
+/**
+ * An element inside an `<svg>` (`path`, `g`, `circle`...): markup its root draws, no node.
+ * Once the root has drawn, a change to its elements updates them one at a time.
+ */
 export class SvgElement {
   constructor(tag: string);
   readonly localName: string;
@@ -217,6 +436,26 @@ export class SvgElement {
   /** SVG's names, or React's spellings (`strokeWidth`, `xlinkHref`). */
   setAttribute(name: string, value: unknown): void;
   removeAttribute(name: string): void;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
+  removeAttributeNS(namespace: string | null, name: string): void;
+  /** The `style` attribute as declarations: `element.style.display = "none"`. */
+  readonly style: Record<string, string>;
+  /**
+   * Hears pointer events (`click`, `pointerdown`, `pointerenter`...) on its shapes, as on the
+   * web; its `<svg>` turns live so the tree can tell which shape is under the pointer.
+   */
+  addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  removeEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
+  removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
+  dispatchEvent(event: globalThis.Event): boolean;
+  /** The box of its geometry in its own user space: a shape's fill, a group's children. */
+  getBBox(): { x: number; y: number; width: number; height: number };
+  /** The length of a shape's outline in user units. */
+  getTotalLength(): number;
+  /** The point `distance` along a shape's outline, clamped to its ends. */
+  getPointAtLength(distance: number): { x: number; y: number };
   insertBefore<T extends SvgElement | SvgText | Text>(child: T, before?: SvgElement | SvgText | Text | null): T;
   appendChild<T extends SvgElement | SvgText | Text>(child: T): T;
   append(...children: (SvgElement | SvgText | Text | string)[]): void;
@@ -229,11 +468,16 @@ export class SvgElement {
  * An inline `<svg>`: one node drawing the markup its `SvgElement` children make, at its CSS
  * size (else its `width` and `height`, else a square of the font size), with its `color` as
  * `currentColor`. Class, look, events and ARIA are the node's; `viewBox`, `fill`, `width`
- * and the rest are markup.
+ * and the rest are markup. After its first draw, changes go to the tree element by element
+ * and only the shapes that changed redraw, so scripts can animate it (lottie-web and the like).
  */
 export class Svg extends Node {
   constructor();
   readonly outerHTML: string;
+  setAttributeNS(namespace: string | null, name: string, value: unknown): void;
+  getAttributeNS(namespace: string | null, name: string): string | null;
+  /** The box of what it draws, in its user space (inside `viewBox`). */
+  getBBox(): { x: number; y: number; width: number; height: number };
   textContent: string;
 }
 
@@ -267,6 +511,26 @@ export interface PointerEvent extends ModifierEvent {
   readonly clientY: number;
   readonly x: number;
   readonly y: number;
+  /** 1 for the mouse, 2 and up for touches. */
+  readonly pointerId: number;
+  readonly pointerType: "mouse" | "pen" | "touch";
+  readonly isPrimary: boolean;
+  /** -1 for `pointermove`, as on the web. */
+  readonly button: number;
+  readonly buttons: number;
+  /** 0.5 while a button is down, 0 otherwise: no host reports pressure yet. */
+  readonly pressure: number;
+  readonly tangentialPressure: number;
+  readonly tiltX: number;
+  readonly tiltY: number;
+  readonly twist: number;
+  readonly altitudeAngle: number;
+  readonly azimuthAngle: number;
+  readonly width: number;
+  readonly height: number;
+  /** The event itself for `pointermove` (each host move is its own event), empty otherwise. */
+  getCoalescedEvents(): PointerEvent[];
+  getPredictedEvents(): PointerEvent[];
 }
 
 /** `pointerdown`, `pointerup` and `click`. */
@@ -274,6 +538,48 @@ export interface PointerButtonEvent extends PointerEvent {
   readonly button: number;
   /** The click count: 2 for a double click. */
   readonly detail: number;
+}
+
+/** A compatibility mouse event, after the pointer event of a mouse, or before a tap's click. */
+export interface MouseEvent extends ModifierEvent {
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly x: number;
+  readonly y: number;
+  readonly button: number;
+  readonly buttons: number;
+  readonly detail: number;
+}
+
+/** One finger, as DOM `Touch`. No host reports contact size or force yet. */
+export interface Touch {
+  readonly identifier: number;
+  /** The node the finger went down on, for as long as it stays down. */
+  readonly target: Node;
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly pageX: number;
+  readonly pageY: number;
+  readonly screenX: number;
+  readonly screenY: number;
+  readonly radiusX: number;
+  readonly radiusY: number;
+  readonly rotationAngle: number;
+  readonly force: number;
+}
+
+export interface TouchList extends ReadonlyArray<Touch> {
+  item(index: number): Touch | null;
+}
+
+/**
+ * As DOM `TouchEvent`, after the finger's pointer event. Preventing `touchstart` or a
+ * `touchmove` before the tree pans keeps the gesture: no pan and no click.
+ */
+export interface TouchEvent extends ModifierEvent {
+  readonly touches: TouchList;
+  readonly targetTouches: TouchList;
+  readonly changedTouches: TouchList;
 }
 
 export interface WheelEvent extends PointerEvent {
@@ -302,6 +608,27 @@ export interface SelectionEvent<T extends Node = Input> extends Event {
   readonly target: FieldOf<T>;
   readonly selectionStart: number;
   readonly selectionEnd: number;
+}
+
+/**
+ * A request to go back or forward (`navigate`), raised after Alt+Left, Cmd+[ or a mouse back
+ * button that nothing prevented. It bubbles from the focused node; the listener that acts
+ * stops it.
+ */
+export interface NavigateEvent extends Event {
+  readonly navigationType: "traverse";
+  readonly direction: "back" | "forward";
+}
+
+/** An edit about to change an input (`beforeinput`), as the web's `InputEvent`. Preventing it cancels the edit. */
+export interface BeforeInputEvent<T extends Node = Input> extends Event {
+  readonly target: FieldOf<T>;
+  readonly inputType: string;
+  /** The text the edit inserts. */
+  readonly data: string | null;
+  readonly dataTransfer: DataTransfer | null;
+  readonly isComposing: boolean;
+  getTargetRanges(): never[];
 }
 
 export interface ScrollEvent extends Event {
@@ -335,6 +662,19 @@ export interface EventMap {
   pointerenter: PointerEvent;
   pointerleave: PointerEvent;
   pointercancel: PointerEvent;
+  pointerover: PointerEvent;
+  pointerout: PointerEvent;
+  touchstart: TouchEvent;
+  touchmove: TouchEvent;
+  touchend: TouchEvent;
+  touchcancel: TouchEvent;
+  mousedown: MouseEvent;
+  mouseup: MouseEvent;
+  mousemove: MouseEvent;
+  mouseover: MouseEvent;
+  mouseout: MouseEvent;
+  mouseenter: MouseEvent;
+  mouseleave: MouseEvent;
   wheel: WheelEvent;
   keydown: KeyboardEvent;
   keyup: KeyboardEvent;
@@ -342,6 +682,13 @@ export interface EventMap {
   blur: Event;
   input: InputEvent;
   selectionchange: SelectionEvent;
+  copy: ClipboardEvent;
+  cut: ClipboardEvent;
+  paste: ClipboardEvent;
+  beforeinput: BeforeInputEvent;
+  /** A request to close what is on top, raised after an Escape that nothing prevented. */
+  closerequest: Event;
+  navigate: NavigateEvent;
   scroll: ScrollEvent;
   layout: LayoutEvent;
   gotpointercapture: Event;
@@ -366,6 +713,7 @@ export function createNode(kind: "text"): Text;
 export function createNode(kind: "input"): Input;
 export function createNode(kind: "richinput"): RichInput;
 export function createNode(kind: "image" | "img"): Image;
+export function createNode(kind: "canvas"): Canvas;
 export function createNode(kind: "svg"): Svg;
 export function createNode(kind: NodeKind): Node;
 
@@ -430,14 +778,58 @@ export class DroppedFile {
   readonly type: string;
 }
 
-/** What a file drag carries. `files` is filled in `drop`, as on the web. */
+/** A file in a `DataTransfer` that is no file on disk, such as a pasted image: the runtime's `File`. */
+export interface DataFile {
+  readonly name: string;
+  readonly type: string;
+  readonly size: number;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  text(): Promise<string>;
+}
+
+/** One entry of a `DataTransfer`. */
+export interface DataTransferItem {
+  readonly kind: "string" | "file";
+  readonly type: string;
+  getAsString(callback: (value: string) => void): void;
+  getAsFile(): DataFile | DroppedFile | null;
+}
+
+export interface DataTransferItemList extends Iterable<DataTransferItem> {
+  readonly length: number;
+  readonly [index: number]: DataTransferItem;
+  add(data: string, type: string): DataTransferItem;
+  add(file: DataFile | DroppedFile): DataTransferItem;
+  remove(index: number): void;
+  clear(): void;
+}
+
+/**
+ * What a copy, cut, paste or file drag carries, as the web's. `new DataTransfer()` is empty
+ * and writable; a paste's is read-only, and after its event none can be read.
+ */
 export class DataTransfer {
-  readonly files: DroppedFile[];
-  readonly items: { kind: "file"; type: string; getAsFile(): DroppedFile }[];
-  readonly types: string[];
+  constructor();
+  readonly files: readonly (DataFile | DroppedFile)[];
+  readonly items: DataTransferItemList;
+  readonly types: readonly string[];
   dropEffect: string;
   effectAllowed: string;
   getData(format: string): string;
+  setData(format: string, data: string): void;
+  clearData(format?: string): void;
+  setDragImage(image: unknown, x: number, y: number): void;
+}
+
+/**
+ * A copy, cut or paste at the focused node, as the web's. A `copy` or `cut` listener that sets
+ * data on `clipboardData` and prevents the default puts that data on the clipboard; a `paste`
+ * listener reads what it holds (`text/plain`, `text/html`, a pasted PNG in `files`), and
+ * preventing it keeps the paste out of the input.
+ */
+export class ClipboardEvent extends Event {
+  constructor(type: string, init?: { bubbles?: boolean; cancelable?: boolean; composed?: boolean; clipboardData?: DataTransfer | null });
+  readonly clipboardData: DataTransfer | null;
 }
 
 /** Files dragged from another app over the window (`dragenter`, `dragover`, `dragleave`, `drop`). */
@@ -498,7 +890,187 @@ export function removeTray(): void;
  * elsewhere) is pressed, whichever app has focus. Resolves to whether the system took it.
  */
 export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
+
+/** An event of a {@link WebView}; its other members depend on `type`. */
+export class WebViewEvent {
+  readonly type: string;
+  readonly url?: string;
+  readonly title?: string;
+  readonly ok?: boolean;
+  readonly error?: string;
+  readonly progress?: number;
+  readonly canGoBack?: boolean;
+  readonly canGoForward?: boolean;
+  readonly request?: number;
+  readonly userInitiated?: boolean;
+  readonly focused?: boolean;
+  readonly level?: "debug" | "log" | "info" | "warning" | "error";
+  readonly message?: string;
+  readonly command?: string;
+  readonly reason?: string;
+}
+
+export interface WebViewOptions {
+  url?: string;
+  /** A name keeps cookies and storage between runs; empty forgets them when the view closes. */
+  profile?: string;
+  /** Lets Web Inspector attach (default true). */
+  inspectable?: boolean;
+  /** Every main frame navigation waits for `answerNavigation`. */
+  askBeforeNavigating?: boolean;
+  /** The node's background shows until the page paints. */
+  transparent?: boolean;
+}
+
+export interface WebViewScreenshot {
+  width: number;
+  height: number;
+  /** RGBA, rows top first, device pixels. */
+  data: Uint8Array;
+}
+
+/** A real browser page shown over a node (WKWebView on macOS). */
+export class WebView {
+  readonly id: number;
+  readonly node: Node;
+  readonly opened: Promise<boolean>;
+  url: string;
+  title: string;
+  favicon: string;
+  loading: boolean;
+  progress: number;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  focused: boolean;
+  addEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  removeEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  navigate(url: string): void;
+  loadHtml(html: string, baseUrl?: string): void;
+  back(): void;
+  forward(): void;
+  reload(): void;
+  hardReload(): void;
+  stop(): void;
+  setZoom(factor: number): void;
+  focus(): void;
+  openDevTools(): void;
+  setAudioMuted(muted: boolean): void;
+  setColorScheme(scheme: "system" | "light" | "dark"): void;
+  setShown(shown: boolean): void;
+  evaluate(script: string): Promise<unknown>;
+  snapshot(): Promise<string>;
+  screenshot(): Promise<WebViewScreenshot>;
+  clickElement(ref: string): Promise<void>;
+  fillElement(ref: string, text: string): Promise<void>;
+  clickAt(x: number, y: number, options?: { button?: number; clickCount?: number; modifiers?: number }): void;
+  movePointer(x: number, y: number, options?: { modifiers?: number }): void;
+  scroll(x: number, y: number, deltaX: number, deltaY: number, options?: { modifiers?: number }): void;
+  typeText(text: string): void;
+  pressKey(key: string, modifiers?: number): void;
+  answerNavigation(request: number, allow: boolean): void;
+  findInPage(text: string, options?: { forward?: boolean; newSession?: boolean }): Promise<{ matches: number; activeMatchOrdinal: number }>;
+  stopFindInPage(): void;
+  close(): void;
+}
+
+/** Shows a web view over `node`; the page covers its border box and follows it. */
+export function createWebView(node: Node, options?: WebViewOptions): WebView;
+
+/** Clears what the pages of a profile stored: cookies and site storage, the cache, or both. */
+export function clearWebViewData(options?: { profile?: string; cookies?: boolean; cache?: boolean }): Promise<void>;
+
+export function quit(code?: number): void;
 export function unregisterShortcut(accelerator: string): void;
+
+/** An item of `setApplicationMenu` or `showContextMenu`, as Electron's menu templates. */
+export interface MenuItem {
+  label?: string;
+  click?: (item: MenuItem) => void;
+  /** `"Mod+Shift+K"`, `"CmdOrCtrl+O"`, `"F5"`: `Mod` is Command on macOS, Control elsewhere. */
+  accelerator?: string;
+  enabled?: boolean;
+  checked?: boolean;
+  visible?: boolean;
+  type?: "normal" | "separator" | "checkbox" | "radio" | "submenu";
+  /**
+   * The system's own items (`about`, `services`, `hide`, `hideOthers`, `unhide`, `quit`,
+   * `close`, `minimize`, `zoom`, `togglefullscreen`, `front`, `undo`, `redo`, `cut`, `copy`,
+   * `paste`, `selectAll`), the page zoom (`zoomIn`, `zoomOut`, `resetZoom`), or a whole menu
+   * (`appMenu`, `fileMenu`, `editMenu`, `viewMenu`, `windowMenu`).
+   */
+  role?: string;
+  submenu?: MenuItem[];
+}
+
+/** Replaces the app's menu bar. On macOS the first menu is the app menu. */
+export function setApplicationMenu(template: MenuItem[]): Promise<void>;
+
+/**
+ * Opens a native context menu at `x`, `y` (CSS pixels in the window). Resolves to `true` when
+ * it closes, or at once to `false` where the system has none and the app draws its own.
+ */
+export function showContextMenu(template: MenuItem[], position?: { x?: number; y?: number }): Promise<boolean>;
+
+export interface FileFilter {
+  name?: string;
+  /** Without dots; `"*"` for every file. */
+  extensions: string[];
+}
+
+export interface OpenDialogOptions {
+  title?: string;
+  defaultPath?: string;
+  filters?: FileFilter[];
+  properties?: Array<"openFile" | "openDirectory" | "multiSelections" | "createDirectory" | "showHiddenFiles">;
+}
+
+export interface SaveDialogOptions {
+  title?: string;
+  /** A folder, a file name, or a path to a file. */
+  defaultPath?: string;
+  filters?: FileFilter[];
+}
+
+export function showOpenDialog(options?: OpenDialogOptions): Promise<{ canceled: boolean; filePaths: string[] }>;
+export function showSaveDialog(options?: SaveDialogOptions): Promise<{ canceled: boolean; filePath: string }>;
+
+/** Puts `text` on the dock or taskbar icon; `""` takes it off. Resolves to whether it shows. */
+export function setBadge(text: string): Promise<boolean>;
+/** Progress from 0 to 1 on the dock or taskbar icon; negative takes it off. */
+export function setProgress(fraction: number): Promise<boolean>;
+/** Opens `url` with the system's handler (the default browser for a web page). */
+export function openExternal(url: string): Promise<boolean>;
+/** Shows the file or folder at `path` selected in Finder, Explorer or the file manager. */
+export function showItemInFolder(path: string): Promise<boolean>;
+/**
+ * Drags the files at `paths` out to other apps; call it from `pointerdown` or `pointermove`
+ * while the button is down. Resolves to whether it started (macOS and Windows).
+ */
+export function startFileDrag(paths: string | string[]): Promise<boolean>;
+
+/** The window the app runs in. */
+export interface AppWindow {
+  readonly fullScreen: boolean;
+  /** The page zoom, 1 at 100%. */
+  readonly zoomFactor: number;
+  setFullScreen(on: boolean): void;
+  toggleFullScreen(): void;
+  isFullScreen(): boolean;
+  minimize(): void;
+  /** Shows the window and brings it to the front with keyboard focus. */
+  focus(): void;
+  show(): void;
+  hide(): void;
+  setTitle(title: string): void;
+  /** From 0.25 to 5; resolves to the zoom now. */
+  setZoomFactor(zoom: number): Promise<number>;
+  getZoomFactor(): number;
+  addEventListener(type: "fullscreenchange", listener: (event: { type: "fullscreenchange"; fullScreen: boolean }) => void): void;
+  addEventListener(type: "zoomchange", listener: (event: { type: "zoomchange"; zoomFactor: number }) => void): void;
+  removeEventListener(type: "fullscreenchange" | "zoomchange", listener: (event: never) => void): void;
+}
+
+export const appWindow: AppWindow;
 
 /** The app's memory: `footprint` in bytes over `processes` processes. */
 export interface MemoryUsage {
@@ -512,3 +1084,178 @@ export interface MemoryUsage {
  * to call every second; `null` when the host cannot say.
  */
 export function memoryUsage(): MemoryUsage | null;
+
+/**
+ * The values the tree resolved for `node`, read one property at a time: typed and animated
+ * properties as they are now, box sizes, margins, padding and border widths as laid out, the
+ * rest as cascaded with lengths in pixels. Shorthands, custom properties and pseudo-elements
+ * read "". Also installed as `globalThis.getComputedStyle`.
+ */
+export function getComputedStyle(node: Node | { node: Node }, pseudo?: string | null): ComputedStyle;
+
+/**
+ * `CSS.supports`, answered as the tree's `@supports` answers. Also installed as
+ * `globalThis.CSS.supports`.
+ */
+export function supports(property: string, value: string): boolean;
+export function supports(conditionText: string): boolean;
+
+/** What `getComputedStyle` returns: read-only, live, a value per camelCase property name. */
+export type ComputedStyle = {
+  getPropertyValue(name: string): string;
+  getPropertyPriority(name: string): string;
+  item(index: number): string;
+  readonly cssText: string;
+  readonly length: number;
+} & { readonly [property: string]: string };
+
+/** What the window put on screen over a stretch of time; see `frameStats`. */
+export interface FrameStats {
+  /** Frames presented. */
+  frames: number;
+  /** `frames` per second over the stretch. */
+  fps: number;
+  /** Painted frames a newer frame replaced before the GPU drew them. */
+  dropped: number;
+  /** Milliseconds between presents: median, 95th and 99th percentile, longest. */
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+}
+
+/**
+ * The frames the window presented since the last call (since the app started, the first
+ * time), which `requestAnimationFrame` cannot count. Cheap enough to call every second;
+ * `null` in a browser build.
+ */
+export function frameStats(): FrameStats | null;
+
+export type ScrollBehavior = "auto" | "instant" | "smooth";
+export type ScrollLogicalPosition = "start" | "center" | "end" | "nearest";
+
+export interface ScrollToOptions {
+  left?: number;
+  top?: number;
+  /** `auto` follows the node's `scroll-behavior`. */
+  behavior?: ScrollBehavior;
+}
+
+export interface ScrollIntoViewOptions {
+  block?: ScrollLogicalPosition;
+  inline?: ScrollLogicalPosition;
+  behavior?: ScrollBehavior;
+}
+
+/** As `DOMRect` on the web. Also installed as `globalThis.DOMRect` when there is none. */
+export class DOMRect {
+  constructor(x?: number, y?: number, width?: number, height?: number);
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+  toJSON(): { x: number; y: number; width: number; height: number; top: number; right: number; bottom: number; left: number };
+}
+
+/** The topmost node at window point `x`, `y`. */
+export function elementFromPoint(x: number, y: number): Node | null;
+/** Every node at window point `x`, `y`, topmost first. */
+export function elementsFromPoint(x: number, y: number): Node[];
+/** The text position at window point `x`, `y`, the offset in UTF-16 units. */
+export function caretPositionFromPoint(x: number, y: number): { offsetNode: Node | null; offset: number; getClientRect(): DOMRect } | null;
+/** `Range.getClientRects` for the text from (`startNode`, `startOffset`) to (`endNode`, `endOffset`), offsets in UTF-16 units. */
+export function rangeClientRects(startNode: Node, startOffset: number, endNode: Node, endOffset: number): DOMRect[];
+/** `Range.getBoundingClientRect` for the same range. */
+export function rangeBoundingClientRect(startNode: Node, startOffset: number, endNode: Node, endOffset: number): DOMRect;
+
+type Observable = Node | { node: Node };
+
+export interface IntersectionObserverInit {
+  /** A node, or null for the window. */
+  root?: Observable | null;
+  rootMargin?: string;
+  scrollMargin?: string;
+  threshold?: number | number[];
+}
+
+export class IntersectionObserverEntry {
+  readonly time: number;
+  readonly target: Observable;
+  readonly isIntersecting: boolean;
+  readonly isVisible: boolean;
+  readonly intersectionRatio: number;
+  readonly boundingClientRect: DOMRect;
+  readonly intersectionRect: DOMRect;
+  readonly rootBounds: DOMRect | null;
+}
+
+/** As on the web. Entries come after a layout or scroll in which a target crossed a threshold. Also installed as `globalThis.IntersectionObserver`. */
+export class IntersectionObserver {
+  constructor(callback: (entries: IntersectionObserverEntry[], observer: IntersectionObserver) => void, options?: IntersectionObserverInit);
+  readonly root: Observable | null;
+  readonly rootMargin: string;
+  readonly scrollMargin: string;
+  readonly thresholds: readonly number[];
+  observe(target: Observable): void;
+  unobserve(target: Observable): void;
+  disconnect(): void;
+  takeRecords(): IntersectionObserverEntry[];
+}
+
+export interface ResizeObserverSize {
+  readonly inlineSize: number;
+  readonly blockSize: number;
+}
+
+export class ResizeObserverEntry {
+  readonly target: Observable;
+  readonly contentRect: DOMRect;
+  readonly borderBoxSize: readonly ResizeObserverSize[];
+  readonly contentBoxSize: readonly ResizeObserverSize[];
+  readonly devicePixelContentBoxSize: readonly ResizeObserverSize[];
+}
+
+/** As on the web. Entries come after a layout that changed an observed box. Also installed as `globalThis.ResizeObserver`. */
+export class ResizeObserver {
+  constructor(callback: (entries: ResizeObserverEntry[], observer: ResizeObserver) => void);
+  observe(target: Observable, options?: { box?: "content-box" | "border-box" | "device-pixel-content-box" }): void;
+  unobserve(target: Observable): void;
+  disconnect(): void;
+}
+
+/** Has events that reach the root go on to `targets` (outermost last), each with `_run(event, capture)`, as `@silkui/core/globals` does for `document` and `window`. */
+export function setOuterTargets(...targets: { _run(event: Event, capture: boolean): void }[]): void;
+
+export interface MutationObserverInit {
+  childList?: boolean;
+  attributes?: boolean;
+  characterData?: boolean;
+  subtree?: boolean;
+  attributeOldValue?: boolean;
+  characterDataOldValue?: boolean;
+  attributeFilter?: string[];
+}
+
+export interface MutationRecord {
+  readonly type: "childList" | "attributes" | "characterData";
+  readonly target: Node;
+  readonly addedNodes: Node[];
+  readonly removedNodes: Node[];
+  readonly previousSibling: Node | null;
+  readonly nextSibling: Node | null;
+  readonly attributeName: string | null;
+  readonly attributeNamespace: null;
+  readonly oldValue: string | null;
+}
+
+/** As in the DOM, for the tree's nodes. Records come in one microtask after the mutations. */
+export class MutationObserver {
+  constructor(callback: (records: MutationRecord[], observer: MutationObserver) => void);
+  observe(target: Node, options?: MutationObserverInit): void;
+  disconnect(): void;
+  takeRecords(): MutationRecord[];
+}

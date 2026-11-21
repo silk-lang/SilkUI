@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const kinds = ['at-rule', 'selector', 'property', 'value', 'feature'];
+const kinds = ['at-rule', 'selector', 'property', 'value', 'feature', 'animation'];
 let compiler;
 
 export function compileStylesheet(css, { strict = false, resolveUrl } = {}) {

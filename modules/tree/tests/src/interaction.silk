@@ -22,7 +22,8 @@ import ui_tree.legacy {
   StyleState,
   info
 }
-import ui_tree.mutation { Declaration, Value, Keyword, CssProperty }
+import ui_tree.mutation { Declaration, Value, Keyword, CssProperty, LISTEN_REQUEST }
+import ui_tree.input { Request, REQUEST_ANYWHERE, MOD_ALT, BUTTON_BACK }
 import ui_tree.style { Fill }
 import font_collection.lib { FontCollection }
 import vector.geometry_error { GeometryError }
@@ -204,7 +205,7 @@ fn sameColor(a: Rgba<f32>, b: Rgba<f32>) -> bool {
 }
 
 fn background(tree: &UiTree<'_>, id: u32) -> Rgba<f32> {
-  return match tree.node(tree.slotOf(id)).computed.paint.background {
+  return match tree.node(tree.slotOf(id)).computed().paint.background {
     Fill.Solid { color } => color
     _ => Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }
   }
@@ -256,15 +257,17 @@ effect fn pointerBody() -> ()
   run Testing.expect(tree.hitTest(5.0, 5.0) == fixtures.PANEL, "padding hits the panel")
   run Testing.expect(tree.hitTest(400.0, 5.0) == NONE, "outside the viewport hits nothing")
 
-  // Hover: enter records outermost first, then the move.
+  // Hover: over on the target, enter records outermost first, then the move.
   run pointerMove(&mut tree, 40.0, 27.0)
   let mut events = run drain(&mut tree)
   run Testing.expect(
-    events.length() == 4 && events.asSlice()[0].kind == EventKind.PointerEnter
-      && events.asSlice()[0].target == fixtures.PANEL
-      && events.asSlice()[1].target == fixtures.TOOLBAR
-      && events.asSlice()[2].target == fixtures.NEW_BUTTON,
-    "entering New enters the panel, the toolbar and the button, in that order",
+    events.length() == 5 && events.asSlice()[0].kind == EventKind.PointerOver
+      && events.asSlice()[0].target == fixtures.NEW_BUTTON
+      && events.asSlice()[1].kind == EventKind.PointerEnter
+      && events.asSlice()[1].target == fixtures.PANEL
+      && events.asSlice()[2].target == fixtures.TOOLBAR
+      && events.asSlice()[3].target == fixtures.NEW_BUTTON,
+    "entering New is over the button, then enters the panel, the toolbar and the button",
   )
   let moved = run first(&events, EventKind.PointerMove)
   run Testing.expect(
@@ -313,7 +316,7 @@ effect fn pointerBody() -> ()
     "the active look applies while pressed",
   )
   run Testing.expect(
-    !tree.node(tree.slotOf(fixtures.ARCHIVE_BUTTON)).computed.paint.hasShadow,
+    !tree.node(tree.slotOf(fixtures.ARCHIVE_BUTTON)).computed().paint.hasShadow,
     "focus from the pointer does not show the focus-visible ring",
   )
   run pointerMove(&mut tree, 40.0, 27.0)
@@ -407,7 +410,7 @@ effect fn keyboardBody() -> ()
   run keyUp(&mut tree, "Tab", 0)
   run tree.frame(viewport())
   run Testing.expect(
-    tree.node(tree.slotOf(fixtures.NEW_BUTTON)).computed.paint.hasShadow,
+    tree.node(tree.slotOf(fixtures.NEW_BUTTON)).computed().paint.hasShadow,
     "keyboard focus shows the focus-visible ring",
   )
   run tab(&mut tree, false)
@@ -514,6 +517,124 @@ test effect fn focusTrapsAndPositiveTabIndices() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run trapBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Requests.
+
+/// The target of the one record of `kind` queued since the last drain, 0 when there is not
+/// exactly one.
+effect fn heardAt(tree: &mut UiTree<'_>, kind: EventKind) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let events = run drain(&mut tree)
+  let values = events.asSlice()
+  let mut target: u32 = 0
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i].kind == kind {
+      target = values[i].target
+      count = count + 1
+    }
+    i = i + 1
+  }
+  return if count == 1 { target } else { 0 }
+}
+
+effect fn requestBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  // Two panes that listen for requests, each with a focusable child, and a third node that
+  // nothing above listens for.
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.box(1, 2, &[])
+  run batch.box(2, 3, &[])
+  run batch.box(1, 4, &[])
+  run batch.box(4, 5, &[])
+  run batch.box(1, 6, &[])
+  run batch.attribute(3, Attribute.TabIndex { value: 0 })
+  run batch.attribute(5, Attribute.TabIndex { value: 0 })
+  run batch.attribute(6, Attribute.TabIndex { value: 0 })
+  run batch.listen(2, LISTEN_REQUEST)
+  run batch.listen(4, LISTEN_REQUEST)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  drop run drain(&mut tree)
+
+  run keyDown(&mut tree, "Escape", 0)
+  run Testing.expect(
+    (run heardAt(&mut tree, EventKind.CloseRequest)) == 4,
+    "with nothing focused or pressed, Escape asks the last listener in tree order to close",
+  )
+  let mut focus = Batch.make()
+  run focus.focus(3)
+  run tree.apply(run focus.take())
+  run keyDown(&mut tree, "Escape", 0)
+  run Testing.expect(
+    (run heardAt(&mut tree, EventKind.CloseRequest)) == 3,
+    "the close request starts at the focused node, so its pane hears it while bubbling",
+  )
+  run keyDown(&mut tree, "ArrowLeft", MOD_ALT)
+  let events = run drain(&mut tree)
+  let back = run first(&events, EventKind.Navigate)
+  run Testing.expect(back.target == 3 && back.detail == 0, "Alt+Left asks to go back from the focused node")
+  run Testing.expect(back.path.length() == 3, "and the record carries the path from the root")
+  run keyDown(&mut tree, "ArrowRight", MOD_ALT)
+  let forward = run first(&(run drain(&mut tree)), EventKind.Navigate)
+  run Testing.expect(forward.detail == 1, "Alt+Right asks to go forward")
+
+  let mut elsewhere = Batch.make()
+  run elsewhere.focus(6)
+  run tree.apply(run elsewhere.take())
+  run keyDown(&mut tree, "Escape", 0)
+  run Testing.expect(
+    (run heardAt(&mut tree, EventKind.CloseRequest)) == 4,
+    "focus where nothing listens falls back to the last listener",
+  )
+  let mut cover = Batch.make()
+  run cover.attribute(4, Attribute.Inert { value: true })
+  run tree.apply(run cover.take())
+  run keyDown(&mut tree, "Escape", 0)
+  run Testing.expect(
+    (run heardAt(&mut tree, EventKind.CloseRequest)) == 2,
+    "an inert pane is skipped: the request goes to the listener that can act",
+  )
+  run tree.dispatch(Input.Request { request: Request.Back, target: 5 })
+  run Testing.expect(
+    (run heardAt(&mut tree, EventKind.Navigate)) == 2,
+    "a request named for a node in an inert pane goes to a live one too",
+  )
+  run tree.dispatch(Input.Request { request: Request.Back, target: REQUEST_ANYWHERE })
+  run Testing.expect((run heardAt(&mut tree, EventKind.Navigate)) == 2, "a host's own back request is heard")
+
+  // The back button of a mouse asks on release; a prevented release asks for nothing.
+  let release = Input.PointerUp { x: 5.0, y: 5.0, button: BUTTON_BACK, modifiers: 0 }
+  run tree.dispatch(move release)
+  run Testing.expect((run heardAt(&mut tree, EventKind.Navigate)) == 2, "the mouse back button asks to go back")
+  let again = Input.PointerUp { x: 5.0, y: 5.0, button: BUTTON_BACK, modifiers: 0 }
+  run tree.begin(&again)
+  run tree.finish(move again, true)
+  run Testing.expect(tree.takeFollowUp().isNone(), "a prevented release raises no request")
+
+  let escape = Input.KeyDown {
+    key: run String.copy("Escape"),
+    code: run String.copy("Escape"),
+    modifiers: 0,
+    repeat: false,
+  }
+  run tree.begin(&escape)
+  run tree.finish(move escape, true)
+  run Testing.expect(tree.takeFollowUp().isNone(), "a prevented Escape raises no request")
+}
+
+test effect fn escapeAndBackRaiseRequests() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run requestBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // Scrolling.
@@ -659,6 +780,105 @@ test effect fn wheelScrollsNestedContainersAndClamps() -> ()
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run scrollBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The pixels of `tree`'s next frame. `snapshot` is the tree's own: it holds the atlas pixels
+/// of the frames before.
+effect fn drawnFrame(tree: &mut UiTree<'_>, snapshot: &mut CpuSnapshot) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+/// The pixels of a fresh inbox whose list is scrolled to `y` before its first frame.
+effect fn inboxScrolledTo(collection: &FontCollection, y: f32) -> Pixmap
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut fresh = run inbox(collection)
+  let mut batch = Batch.make()
+  run batch.scrollTo(fixtures.INBOX_LIST, 0.0, y)
+  run fresh.apply(run batch.take())
+  // Painted from nothing: the reference must not be a kept scene itself.
+  fresh.invalidatePaint()
+  let mut snapshot = CpuSnapshot.make()
+  let pixels = run drawnFrame(&mut fresh, &mut snapshot)
+  run Testing.expect(fresh.scrollsKept == 0, "the reference frame is painted")
+  return move pixels
+}
+
+effect fn scrolledSceneBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  let mut snapshot = CpuSnapshot.make()
+  drop run drawnFrame(&mut tree, &mut snapshot)
+  let painted = tree.paintsKept
+
+  // A scroll within the paint's lead moves the scene's scroll group and paints nothing.
+  let mut near = Batch.make()
+  run near.scrollTo(fixtures.INBOX_LIST, 0.0, 30.0)
+  run tree.apply(run near.take())
+  let moved = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 1, "a scroll within the lead keeps the scene")
+  run Testing.expect(tree.paintsKept == painted + 1, "and counts as a kept paint")
+  run Testing.expect(tree.stats.repaintedSubtrees == 0, "it repaints nothing")
+  let expected = run inboxScrolledTo(&collection, 30.0)
+  run Testing.expect(samePixels(&moved, &expected), "the kept scene draws the scrolled frame")
+
+  // A second one moves the same scene again, and back.
+  let mut more = Batch.make()
+  run more.scrollTo(fixtures.INBOX_LIST, 0.0, 44.0)
+  run tree.apply(run more.take())
+  let again = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 2, "a second scroll keeps it too")
+  let expectedAgain = run inboxScrolledTo(&collection, 44.0)
+  run Testing.expect(samePixels(&again, &expectedAgain), "and draws the new offset")
+
+  // A change with the scroll paints.
+  let mut both = Batch.make()
+  run both.scrollTo(fixtures.INBOX_LIST, 0.0, 10.0)
+  run both.setText(fixtures.ROW + 11, "Changed")
+  run tree.apply(run both.take())
+  drop run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 2, "a scroll with another change paints")
+
+  // Past the lead (one viewport height) the content was never painted: the frame paints.
+  let mut far = Batch.make()
+  run far.scrollTo(fixtures.INBOX_LIST, 0.0, 10.0 + viewport().height + 40.0)
+  run tree.apply(run far.take())
+  let beyond = run drawnFrame(&mut tree, &mut snapshot)
+  let end = tree.scrollOffset(fixtures.INBOX_LIST).y
+  if end > 10.0 + viewport().height {
+    run Testing.expect(tree.scrollsKept == 2, "a scroll past the lead paints")
+  }
+  let mut freshFar = run inbox(&collection)
+  let mut change = Batch.make()
+  run change.setText(fixtures.ROW + 11, "Changed")
+  run change.scrollTo(fixtures.INBOX_LIST, 0.0, end)
+  run freshFar.apply(run change.take())
+  freshFar.invalidatePaint()
+  let mut farSnapshot = CpuSnapshot.make()
+  let expectedFar = run drawnFrame(&mut freshFar, &mut farSnapshot)
+  run Testing.expect(samePixels(&beyond, &expectedFar), "and draws what a fresh tree draws there")
+}
+
+test effect fn scrollsWithinThePaintedLeadKeepTheScene() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrolledSceneBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 /// The list's thumb runs down its right edge: x 339 to 345, from y 54.

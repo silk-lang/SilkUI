@@ -84,6 +84,8 @@ Each line is a command of [`ui-inspect-cli`](/native/devtools/#from-the-command-
 | `wait 500ms`, `wait 2s` | Lets that much time pass |
 | `size 640 440`, `size 640 440 2` | Resizes the window, optionally with a device pixel ratio |
 | `record pad.mp4` ... `stop` | Records the frames in between as a 60 fps video, with ffmpeg. A name ending in `/` keeps the frames as PNG files instead |
+| `record pad.mp4 --show-input` | Also draws the input into the video: a ring where the pointer goes down, and the keys pressed and text typed in a caption at the bottom. Only the video sees them, never the app or its screenshots |
+| `record pad.mp4 --overview pad.png` | At `stop`, also writes one image of twelve frames picked evenly from the recording, in rows of four, for a pull request or a review |
 | `drop notes.txt at 120 80` | Drags files in from the desktop and drops them there, the window's middle without `at` |
 | `shortcut 1`, `tray`, `tray right`, `tray-item 3`, `click-notification 1` | A global shortcut, a click on the tray icon or an item of its menu, a click on a notification |
 

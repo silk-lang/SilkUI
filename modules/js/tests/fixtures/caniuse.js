@@ -23,6 +23,8 @@ const syntax = (source) => (0, eval)(source);
 const global = (name) => typeof globalThis[name] === "function" || (typeof globalThis[name] === "object" && globalThis[name] !== null);
 const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const NODE = { engine: false, node: true };
+// The UI layer (web_apis.js) that the node runtime does not load yet.
+const ENGINE = { engine: true, node: false };
 
 // The language.
 
@@ -145,7 +147,17 @@ check("typedarrays", true, () => {
   return new Float64Array(2).byteLength === 16 && view.getUint16(0) === 0x0102 && bytes.subarray(2).join() === "3,4" &&
     new Uint8ClampedArray([300])[0] === 255 && new BigInt64Array(1).length === 1;
 });
-check("unhandledrejection", false, () => typeof globalThis.addEventListener === "function" && typeof globalThis.PromiseRejectionEvent === "function");
+check("unhandledrejection", true, () => new Promise((resolve) => {
+  const reason = new Error("caniuse");
+  const listener = (event) => {
+    if (event.reason !== reason) return;
+    event.preventDefault();
+    globalThis.removeEventListener("unhandledrejection", listener);
+    resolve(event instanceof PromiseRejectionEvent && event.promise instanceof Promise);
+  };
+  globalThis.addEventListener("unhandledrejection", listener);
+  Promise.reject(reason);
+}));
 check("use-strict", true, () => {
   try { syntax("'use strict'; undeclaredName = 1"); return false; } catch (error) { if (!(error instanceof ReferenceError)) return false; }
   return (function () { "use strict"; return this; })() === undefined;
@@ -153,22 +165,33 @@ check("use-strict", true, () => {
 
 // The APIs.
 
-check("abortcontroller", NODE, () => {
+check("abortcontroller", true, () => {
   const controller = new AbortController();
   let fired = false;
   controller.signal.addEventListener("abort", () => (fired = true));
+  const box = ui.createBox();
+  let heard = 0;
+  box.addEventListener("focus", () => heard++, { signal: controller.signal });
   controller.abort();
-  return controller.signal.aborted && fired && AbortSignal.timeout(10) instanceof AbortSignal;
+  box.dispatchEvent(new Event("focus"));
+  const either = AbortSignal.any([new AbortController().signal, AbortSignal.abort("why")]);
+  return controller.signal.aborted && fired && heard === 0 && either.aborted && either.reason === "why" && AbortSignal.timeout(10) instanceof AbortSignal;
 });
 check("accelerometer", false, () => global("Accelerometer"));
 check("ambient-light", false, () => global("AmbientLightSensor"));
 check("async-clipboard", true, () => typeof navigator.clipboard.readText === "function" && typeof navigator.clipboard.writeText === "function");
-check("async-clipboard", false, () => typeof navigator.clipboard.read === "function" || typeof navigator.clipboard.write === "function" || global("ClipboardItem"));
-check("atob-btoa", NODE, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsayBVSQ==") === "Silk UI");
+check("async-clipboard", true, async () => {
+  const item = new ClipboardItem({ "text/html": "<b>Silk</b>", "image/png": new Blob([new Uint8Array([137, 80])], { type: "image/png" }) });
+  return typeof navigator.clipboard.read === "function" && typeof navigator.clipboard.write === "function"
+    && ClipboardItem.supports("text/html") && ClipboardItem.supports("image/png") && !ClipboardItem.supports("text/rtf")
+    && item.types.join() === "text/html,image/png" && (await (await item.getType("text/html")).text()) === "<b>Silk</b>";
+});
+check("atob-btoa", true, () => btoa("Silk UI") === "U2lsayBVSQ==" && atob("U2lsayBVSQ==") === "Silk UI");
 check("audio-api", false, () => global("AudioContext"));
-check("auxclick", false, () => { ui.createBox().addEventListener("auxclick", () => {}); return true; });
-check("battery-status", false, () => typeof navigator.getBattery === "function");
-check("blobbuilder", NODE, async () => {
+// Nodes take listeners of any type, but the tree never sends these.
+check("auxclick", false, () => "onauxclick" in ui.createBox());
+check("battery-status", ENGINE, () => typeof navigator.getBattery === "function" && navigator.getBattery() instanceof Promise);
+check("blobbuilder", true, async () => {
   const blob = new Blob(["Silk", new Uint8Array([32, 85, 73])], { type: "text/plain" });
   return blob.size === 7 && blob.type === "text/plain" && (await blob.text()) === "Silk UI" && (await blob.slice(5).arrayBuffer()).byteLength === 2;
 });
@@ -187,9 +210,18 @@ check("channel-messaging", NODE, () => new Promise((resolve) => {
   port2.onmessage = (event) => { port1.close(); port2.close(); resolve(event.data.n === 2); };
   port1.postMessage({ n: 2 });
 }));
-check("clipboard", false, () => { ui.createInput().addEventListener("paste", () => {}); return true; });
+check("clipboard", true, () => {
+  const data = new DataTransfer();
+  data.setData("text/plain", "x");
+  const event = new ClipboardEvent("copy", { clipboardData: data });
+  let heard = null;
+  const node = ui.createBox();
+  node.addEventListener("copy", (copy) => (heard = copy.clipboardData.getData("text")));
+  node.dispatchEvent(event);
+  return event instanceof ClipboardEvent && heard === "x";
+});
 check("console-basic", true, () => ["log", "info", "warn", "error", "debug"].every((name) => typeof console[name] === "function"));
-check("console-time", NODE, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
+check("console-time", true, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
 check("constraint-validation", false, () => typeof ui.createInput().checkValidity === "function");
 check("createimagebitmap", false, () => typeof globalThis.createImageBitmap === "function");
 check("credential-management", false, () => typeof navigator.credentials === "object");
@@ -201,14 +233,35 @@ check("cryptography", NODE, async () => {
   const opened = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
   return digest[0] === 0xba && digest[31] === 0xad && opened.join() === "1,2,3";
 });
-check("css-supports-api", false, () => typeof CSS === "object" && typeof CSS.supports === "function");
-check("customevent", { engine: false, node: true }, () => new CustomEvent("ping", { detail: 3 }).detail === 3);
-// A node listens only to the tree's own event types, so a custom event cannot reach a listener.
-check("customevent", false, () => { ui.createBox().addEventListener("ping", () => {}); return true; });
+check("css-supports-api", true, () => typeof CSS === "object" && typeof CSS.supports === "function");
+check("customevent", true, () => new CustomEvent("ping", { detail: 3 }).detail === 3);
+check("customevent", true, () => {
+  const outer = ui.createBox();
+  const inner = ui.createBox();
+  outer.append(inner);
+  let detail = 0;
+  outer.addEventListener("ping", (event) => { detail = event.target === inner ? event.detail : -1; });
+  inner.dispatchEvent(new CustomEvent("ping", { detail: 3, bubbles: true }));
+  const target = new EventTarget();
+  let heard = false;
+  target.addEventListener("ping", () => { heard = true; });
+  target.dispatchEvent(new Event("ping"));
+  return detail === 3 && heard;
+});
 check("deviceorientation", false, () => global("DeviceOrientationEvent"));
-check("dom-range", false, () => global("Range") || typeof globalThis.document?.createRange === "function");
+check("dom-range", true, () => {
+  const box = ui.createBox(null, ui.createText("Hello world"));
+  const range = new Range();
+  range.setStart(box.firstChild, 2);
+  range.setEnd(box.firstChild, 7);
+  box.firstChild.insertData(0, ">");
+  const moved = range.startOffset === 3 && range.toString() === "llo w";
+  const fragment = range.extractContents();
+  return moved && fragment.firstChild.data === "llo w" && box.firstChild.data === ">Heorld" && range.collapsed;
+});
 check("element-scroll-methods", true, () => typeof ui.createBox().scrollTo === "function");
-check("element-scroll-methods", false, () => typeof ui.createBox().scrollBy === "function" || typeof ui.createBox().scroll === "function");
+check("element-scroll-methods", true, () => typeof ui.createBox().scroll === "function");
+check("element-scroll-methods", true, () => typeof ui.createBox().scrollBy === "function");
 check("eme", false, () => typeof navigator.requestMediaKeySystemAccess === "function");
 check("eventsource", false, () => global("EventSource"));
 check("fetch", NODE, () => typeof fetch === "function" && new Request("http://localhost/x", { method: "POST" }).method === "POST" &&
@@ -219,22 +272,22 @@ check("fileapi", NODE, async () => {
 });
 // A file dropped on a window arrives as a File-like DroppedFile: a path and a name.
 check("fileapi", true, () => new ui.DataTransfer(["/tmp/a.txt"]).files[0].name === "a.txt");
-check("filereader", false, () => global("FileReader"));
+check("filereader", NODE, () => global("FileReader"));
 check("filereadersync", false, () => global("FileReaderSync"));
 check("gamepad", false, () => typeof navigator.getGamepads === "function");
 check("geolocation", false, () => typeof navigator.geolocation === "object");
-check("getboundingclientrect", false, () => typeof ui.createBox().getBoundingClientRect === "function");
-check("getrandomvalues", NODE, () => {
+check("getboundingclientrect", true, () => typeof ui.createBox().getBoundingClientRect === "function");
+check("getrandomvalues", true, () => {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   return bytes.some((byte) => byte !== 0) && typeof crypto.randomUUID() === "string";
 });
 check("gyroscope", false, () => global("Gyroscope"));
-check("hardwareconcurrency", NODE, () => navigator.hardwareConcurrency >= 1);
+check("hardwareconcurrency", true, () => navigator.hardwareConcurrency >= 1);
 check("high-resolution-time", true, () => {
   const start = performance.now();
   return typeof start === "number" && performance.now() >= start;
 });
-check("high-resolution-time", NODE, () => typeof performance.timeOrigin === "number" && performance.timeOrigin > 0);
+check("high-resolution-time", true, () => typeof performance.timeOrigin === "number" && performance.timeOrigin > 0);
 check("imagecapture", false, () => global("ImageCapture"));
 check("ime", false, () => typeof ui.createInput().inputMethodContext === "object");
 check("indexeddb", false, () => global("indexedDB"));
@@ -242,15 +295,19 @@ check("indexeddb2", false, () => global("indexedDB"));
 check("input-file-directory", false, () => typeof globalThis.showDirectoryPicker === "function");
 check("input-selection", true, () => {
   const field = ui.createInput();
-  field.value = "Hello";
-  field.setSelectionRange(1, 3);
-  return typeof field.selectionStart === "number" && typeof field.selectionEnd === "number";
+  field.value = "a\u{1F600}\u00e9b";
+  field.setSelectionRange(1, 4, "backward");
+  if (field.selectionStart !== 1 || field.selectionEnd !== 4 || field.selectionDirection !== "backward") return false;
+  field.setRangeText("XY", 1, 3, "select");
+  if (field.value !== "aXY\u00e9b" || field.selectionEnd !== 3) return false;
+  field.select();
+  return field.selectionStart === 0 && field.selectionEnd === 5;
 });
-check("intersectionobserver", false, () => global("IntersectionObserver"));
-check("intersectionobserver-v2", false, () => global("IntersectionObserver"));
+check("intersectionobserver", true, () => global("IntersectionObserver"));
+check("intersectionobserver-v2", true, () => global("IntersectionObserver"));
 check("magnetometer", false, () => global("Magnetometer"));
-check("matchesselector", false, () => typeof ui.createBox().matches === "function");
-check("matchmedia", false, () => typeof globalThis.matchMedia === "function");
+check("matchesselector", true, () => ["matches", "webkitMatchesSelector", "closest", "querySelector", "querySelectorAll"].every((name) => typeof ui.createBox()[name] === "function"));
+check("matchmedia", true, () => typeof globalThis.matchMedia === "function" && typeof matchMedia("(min-width: 1px)").matches === "boolean");
 // The tree's inputs have no length limit attribute: setting one throws.
 check("maxlength", false, () => { ui.createInput().setAttribute("maxLength", 3); return true; });
 check("mediacapture-fromelement", false, () => typeof ui.createNode("canvas").captureStream === "function");
@@ -264,6 +321,10 @@ check("netinfo", false, () => typeof navigator.connection === "object");
 check("silkui-memory-usage", true, () => {
   const usage = ui.memoryUsage();
   return usage !== null && usage.footprint > 0 && usage.processes === 1;
+});
+check("silkui-frame-stats", true, () => {
+  const stats = ui.frameStats();
+  return stats !== null && typeof stats.fps === "number" && typeof stats.p95 === "number";
 });
 check("notifications", true, () => Notification === ui.Notification && Notification.permission === "granted" &&
   typeof Notification.requestPermission === "function");
@@ -281,14 +342,14 @@ check("requestanimationframe", true, () => node ? typeof requestAnimationFrame =
   const id = requestAnimationFrame((time) => resolve(typeof time === "number"));
   if (typeof id !== "number") resolve(false);
 }));
-check("requestidlecallback", false, () => typeof globalThis.requestIdleCallback === "function");
-check("resizeobserver", false, () => global("ResizeObserver"));
+check("requestidlecallback", true, () => new Promise((resolve) => requestIdleCallback((deadline) => resolve(deadline.timeRemaining() > 0 && deadline.didTimeout === false))));
+check("resizeobserver", true, () => global("ResizeObserver"));
 check("rtcpeerconnection", false, () => global("RTCPeerConnection"));
 check("screen-orientation", false, () => typeof globalThis.screen?.orientation === "object");
-check("scrollintoview", false, () => typeof ui.createBox().scrollIntoView === "function");
-check("scrollintoviewifneeded", false, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
-check("selection-api", false, () => typeof globalThis.getSelection === "function");
-check("setimmediate", NODE, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
+check("scrollintoview", true, () => typeof ui.createBox().scrollIntoView === "function");
+check("scrollintoviewifneeded", true, () => typeof ui.createBox().scrollIntoViewIfNeeded === "function");
+check("selection-api", true, () => typeof globalThis.getSelection === "function" && getSelection() === ui.getSelection() && typeof Selection === "function");
+check("setimmediate", true, () => new Promise((resolve) => setImmediate((value) => resolve(value === 5), 5)));
 check("speech-recognition", false, () => global("SpeechRecognition") || global("webkitSpeechRecognition"));
 check("speech-synthesis", false, () => typeof globalThis.speechSynthesis === "object");
 check("stream", false, () => typeof navigator.mediaDevices?.getUserMedia === "function");
@@ -299,11 +360,20 @@ check("streams", NODE, async () => {
   await upper.pipeTo(new WritableStream({ write(chunk) { seen.push(chunk); } }));
   return seen.join() === "A,B";
 });
-check("textencoder", NODE, () => {
+check("textencoder", true, () => {
   const bytes = new TextEncoder().encode("Silk ✓");
   return bytes.length === 8 && new TextDecoder().decode(bytes) === "Silk ✓" && new TextDecoder("utf-16le").decode(new Uint8Array([65, 0])) === "A";
 });
-check("touch", false, () => { ui.createBox().addEventListener("touchstart", () => {}); return true; });
+check("touch", true, () => {
+  const box = ui.createBox();
+  let seen = null;
+  box.addEventListener("touchstart", (event) => { seen = event; });
+  const finger = 2 * 256 + 2 * 16 + 64;
+  globalThis.__ui.dispatch(30, box.nodeId, 5, 6, finger, 1, 0);
+  globalThis.__ui.dispatch(32, box.nodeId, 5, 6, finger, 1, 0);
+  return seen !== null && seen.cancelable && seen.touches.length === 1 && seen.changedTouches.item(0).identifier === 2
+    && seen.targetTouches[0].target === box && seen.changedTouches[0].clientY === 6;
+});
 check("url", NODE, () => {
   const url = new URL("../b?x=1#top", "https://example.com/a/c");
   return url.href === "https://example.com/b?x=1#top" && url.hostname === "example.com" && url.searchParams.get("x") === "1";
@@ -313,7 +383,7 @@ check("urlsearchparams", NODE, () => {
   params.append("c", "x y");
   return params.getAll("a").join() === "1,3" && params.toString() === "a=1&b=2&a=3&c=x+y";
 });
-check("user-timing", NODE, () => {
+check("user-timing", true, () => {
   performance.mark("caniuse-start");
   performance.mark("caniuse-end");
   const measure = performance.measure("caniuse", "caniuse-start", "caniuse-end");

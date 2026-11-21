@@ -6,6 +6,7 @@ import mutation { Declaration, CssProperty }
 import properties.computed { Text, FontFeatures, MAX_FEATURE_SETTINGS }
 import properties.convert
 import ui_text.fonts { Variations, MAX_VARIATIONS }
+import ui_text.fonts as fonts
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.num.f32
@@ -25,13 +26,29 @@ pub effect fn apply(text: &mut Text, declaration: &Declaration) -> bool
   ? &mut Allocator {
   let property = declaration.property
   let group = groupOf(property)
+  let extras = extrasShift(property)
   if group == 0 && property != CssProperty.FontVariant && property != CssProperty.FontFeatureSettings
-    && property != CssProperty.FontVariationSettings && property != CssProperty.FontWidth && property != CssProperty.FontStretch {
+    && property != CssProperty.FontVariationSettings && property != CssProperty.FontWidth && property != CssProperty.FontStretch
+    && extras == INVALID && property != CssProperty.FontSmooth {
     return false
   }
   let written = run values.cssText(&declaration.value)
   let css = Bytes.asSlice(&written)
-  if property == CssProperty.FontFeatureSettings {
+  if property == CssProperty.FontSmooth {
+    // `never` (font-smooth) and `none` (-webkit-font-smoothing) draw aliased glyphs; the
+    // other values all mean the grayscale antialiasing glyphs always get.
+    let never = named(css, b"never") || named(css, b"none")
+    text.features.extras = fonts.withExtrasField(text.features.extras, fonts.EXTRAS_SMOOTH, if never { 1 } else { 0 })
+  } else if extras != INVALID {
+    // The tree turns written values into negative handles first (UiTree.namedFamilies).
+    if let Option.Some { value } = convert.number(&declaration.value) {
+      if value < 0.0 {
+        text.features.extras = fonts.withExtrasField(text.features.extras, extras, f32.toU32(-value - 1.0))
+      }
+    } else if named(css, b"normal") || named(css, b"none") || named(css, b"initial") {
+      text.features.extras = fonts.withExtrasField(text.features.extras, extras, 0)
+    }
+  } else if property == CssProperty.FontFeatureSettings {
     let mut parsed = text.features
     if featureSettings(css, &mut parsed) {
       text.features = parsed
@@ -65,6 +82,16 @@ pub effect fn apply(text: &mut Text, declaration: &Declaration) -> bool
 }
 
 const INVALID: u32 = 0xFFFFFFFF
+
+/// The `FontFeatures.extras` field `property` writes a tree handle to, or INVALID.
+pub fn extrasShift(property: CssProperty) -> u32 {
+  return match property {
+    CssProperty.FontPalette => fonts.EXTRAS_PALETTE
+    CssProperty.FontVariantAlternates => fonts.EXTRAS_ALTERNATES
+    CssProperty.FontSizeAdjust => fonts.EXTRAS_SIZE_ADJUST
+    _ => INVALID
+  }
+}
 
 fn groupOf(property: CssProperty) -> u32 {
   return match property {

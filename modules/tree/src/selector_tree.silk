@@ -1,8 +1,10 @@
 //! CSS selectors borrow the retained tree's element links, identity and live interaction state.
+import svg_css.ancestor_filter { AncestorFilter }
 import engine { UiTree }
 import containers
 import svg_css.media_features { Environment }
 import svg_css.element { PseudoTarget }
+import svg_css.variables { ScopeId }
 import node { Node, Semantics, NONE, NO_INDEX }
 import mutation { NodeKind, Role }
 import style_identity { NodeIdentity }
@@ -38,8 +40,7 @@ impl<'tree, 'fonts> SelectorTree<'tree, 'fonts> {
     while at != NO_INDEX {
       let slot = self.tree.slotOfCssNode(at)
       if slot != NONE && self.tree.node(slot).live && self.tree.node(slot).kind != NodeKind.Text && !self.tree.node(slot).isGenerated() { return u32.toUsize(slot) }
-      let link = &self.tree.layout.nodes.asSlice()[at]
-      at = if backwards { link.previousSibling } else { link.nextSibling }
+      at = if backwards { self.tree.layout.previousSibling(at) } else { self.tree.layout.nextSibling(at) }
     }
     return NO_ELEMENT
   }
@@ -47,8 +48,8 @@ impl<'tree, 'fonts> SelectorTree<'tree, 'fonts> {
   fn namedAttribute<'a>(self: &'a Self, node: usize, name: &[u8]) -> Option<&'a [u8]> {
     if let Option<&NodeIdentity>.Some { value } = self.record(node).identity() {
       let mut i: usize = 0
-      while i < value.attributes.length() {
-        let attribute = &value.attributes.asSlice()[i]
+      while i < value.attributes().length {
+        let attribute = &value.attributes()[i]
         if equal(String.utf8Bytes(String.view(&attribute.name)), name) {
           return Option<&[u8]>.some(String.utf8Bytes(String.view(&attribute.value)))
         }
@@ -63,23 +64,52 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
   fn container(self: &Self, node: usize, name: &[u8], axes: u32, pseudo: PseudoTarget) -> Option<Environment> {
     return containers.query(self.tree, usize.toU32(node), name, axes, pseudo)
   }
+  fn styleContainer(self: &Self, node: usize, name: &[u8], pseudo: PseudoTarget) -> Option<ScopeId> {
+    if let Option<u32>.Some { value: slot } = containers.select(self.tree, usize.toU32(node), pseudo, name, 0) {
+      return self.tree.node(slot).sheetScope()
+    }
+    return Option<ScopeId>.None
+  }
+  /// The tree's filter while a style pass holds exactly the ancestors of `node` in it.
+  fn ancestorFilter(self: &Self, node: usize) -> Option<&AncestorFilter> {
+    if !self.tree.filterOn { return Option<&AncestorFilter>.None }
+    let parent = self.record(node).parent
+    let path = self.tree.filterPath.asSlice()
+    let holds = if parent == NONE { path.length == 0 } else { path.length != 0 && path[path.length - 1] == parent }
+    return if holds { Option<&AncestorFilter>.some(&self.tree.ancestorFilter) } else { Option<&AncestorFilter>.None }
+  }
+  /// From the element's sorted class atoms: no scan of the class text, which a utility-class
+  /// element makes hundreds of bytes long.
+  fn hasClass(self: &Self, node: usize, name: &[u8]) -> Option<bool> {
+    let atoms = match self.record(node).identity() { Option<&NodeIdentity>.Some { value } => value.classAtoms() _ => &[] }
+    if atoms.length == 0 { return Option<bool>.some(false) }
+    let atom = self.tree.styleAtoms.find(name)
+    if atom == usize.MAX { return Option<bool>.some(false) }
+    let mut low: usize = 0
+    let mut high = atoms.length
+    while low < high {
+      let middle = low + (high - low) / 2
+      if atoms[middle] < atom { low = middle + 1 } else { high = middle }
+    }
+    return Option<bool>.some(low < atoms.length && atoms[low] == atom)
+  }
   fn parent(self: &Self, node: usize) -> usize {
     let parent = self.record(node).parent
     return if parent == NONE { NO_ELEMENT } else { u32.toUsize(parent) }
   }
   fn containingHost(self: &Self, node: usize) -> usize { return NO_ELEMENT }
   fn firstChild(self: &Self, node: usize) -> usize {
-    return self.elementAt(self.tree.layout.nodes.asSlice()[self.record(node).css].firstChild, false)
+    return self.elementAt(self.tree.layout.firstChild(self.record(node).css), false)
   }
   fn nextSibling(self: &Self, node: usize) -> usize {
-    return self.elementAt(self.tree.layout.nodes.asSlice()[self.record(node).css].nextSibling, false)
+    return self.elementAt(self.tree.layout.nextSibling(self.record(node).css), false)
   }
   fn previousSibling(self: &Self, node: usize) -> usize {
-    return self.elementAt(self.tree.layout.nodes.asSlice()[self.record(node).css].previousSibling, true)
+    return self.elementAt(self.tree.layout.previousSibling(self.record(node).css), true)
   }
   fn localName(self: &Self, node: usize) -> &[u8] {
     if let Option<&NodeIdentity>.Some { value } = self.record(node).identity() {
-      if value.tag.ownedByteLength() != 0 { return String.utf8Bytes(String.view(&value.tag)) }
+      if String.utf8Bytes(value.tag()).length != 0 { return String.utf8Bytes(value.tag()) }
     }
     return match self.record(node).kind {
       NodeKind.Input => b"input"
@@ -92,7 +122,7 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
   fn namespaceUri(self: &Self, node: usize) -> &[u8] { return b"http://www.w3.org/1999/xhtml" }
   fn attributeCount(self: &Self, node: usize) -> usize {
     if let Option<&NodeIdentity>.Some { value } = self.record(node).identity() {
-      let mut count = value.attributes.length()
+      let mut count = value.attributes().length
       if value.hasId { count = count + 1 }
       if value.hasClasses { count = count + 1 }
       return count
@@ -103,15 +133,15 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
     if let Option<&NodeIdentity>.Some { value } = self.record(node).identity() {
       let mut index = attribute
       if value.hasId {
-        if index == 0 { return AttributeText<'a> { namespace: b"", name: b"id", value: String.utf8Bytes(String.view(&value.id)) } }
+        if index == 0 { return AttributeText<'a> { namespace: b"", name: b"id", value: String.utf8Bytes(value.id()) } }
         index = index - 1
       }
       if value.hasClasses {
-        if index == 0 { return AttributeText<'a> { namespace: b"", name: b"class", value: String.utf8Bytes(String.view(&value.classes)) } }
+        if index == 0 { return AttributeText<'a> { namespace: b"", name: b"class", value: String.utf8Bytes(value.classes()) } }
         index = index - 1
       }
-      if index < value.attributes.length() {
-        let item = &value.attributes.asSlice()[index]
+      if index < value.attributes().length {
+        let item = &value.attributes()[index]
         return AttributeText<'a> { namespace: b"", name: String.utf8Bytes(String.view(&item.name)), value: String.utf8Bytes(String.view(&item.value)) }
       }
     }
@@ -131,14 +161,14 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
   }
   fn isRoot(self: &Self, node: usize) -> bool { return self.tree.isRootNode(usize.toU32(node)) }
   fn isEmpty(self: &Self, node: usize) -> bool {
-    let mut at = self.tree.layout.nodes.asSlice()[self.record(node).css].firstChild
+    let mut at = self.tree.layout.firstChild(self.record(node).css)
     while at != NO_INDEX {
       let slot = self.tree.slotOfCssNode(at)
       if slot != NONE {
         let child = self.tree.node(slot)
         if child.live && !child.isGenerated() && (child.kind != NodeKind.Text || child.text.ownedByteLength() != 0) { return false }
       }
-      at = self.tree.layout.nodes.asSlice()[at].nextSibling
+      at = self.tree.layout.nextSibling(at)
     }
     return true
   }
@@ -174,10 +204,10 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
       if value.indeterminate { bits = bits | element.INDETERMINATE }
     }
     // A progress bar with no value, and a radio whose group has nothing checked.
-    if record.accessRole == Role.ProgressBar && !record.hasValueRange { bits = bits | element.INDETERMINATE }
+    if record.accessRole == Role.ProgressBar && !record.hasValueRange() { bits = bits | element.INDETERMINATE }
     if record.accessRole == Role.Radio && !record.checked && !self.groupChecked(node) { bits = bits | element.INDETERMINATE }
-    if record.hasValueRange && record.valueMin <= record.valueMax {
-      bits = bits | (if record.valueNow >= record.valueMin && record.valueNow <= record.valueMax { element.IN_RANGE } else { element.OUT_OF_RANGE })
+    if record.hasValueRange() && record.valueMin() <= record.valueMax() {
+      bits = bits | (if record.valueNow() >= record.valueMin() && record.valueNow() <= record.valueMax() { element.IN_RANGE } else { element.OUT_OF_RANGE })
     }
     if form { bits = bits | (if required { element.REQUIRED } else { element.OPTIONAL }) }
     if record.kind == NodeKind.Input && record.hasEdit() && !record.edit().readOnly && !record.disabled { bits = bits | element.READ_WRITE }

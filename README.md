@@ -20,10 +20,10 @@ product once.
 ## Get started
 
 ```sh
-silk init my-app -t ui-react   # or ui-loom, ui-foldkit, ui-js
+silk init my-app -t ui-react  # or ui-loom, ui-foldkit, ui-js
 cd my-app
-silk task dev                  # opens the app in a window, reloading as you edit
-silk task build --release      # writes the release program to dist/window/
+silk task dev                 # opens the app in a window, reloading as you edit
+silk task build --release     # writes the release program to dist/window/
 ```
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
@@ -38,7 +38,7 @@ Loom apps, native apps, and the UI tree, plus a [Products](docs/content/products
 Every example in them is a real program under `docs/examples`, tested by `docs/tests`.
 
 ```sh
-docs/build.sh serve   # builds the site and serves it on http://localhost:8017
+docs/build.sh serve  # builds the site and serves it on http://localhost:8017
 ```
 
 ## Run a demo locally
@@ -63,7 +63,7 @@ For the versioned Homebrew toolchain, run these in the same terminal:
 export SILK_CLANG=/opt/homebrew/opt/llvm@22/bin/clang
 export PATH="/opt/homebrew/opt/lld@22/bin:$PATH"
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-"$SILK_CLANG" --version # must report clang 22, not Apple clang
+"$SILK_CLANG" --version  # must report clang 22, not Apple clang
 silk task native demo modules/tree/demo
 ```
 
@@ -104,20 +104,6 @@ Follow its setup instructions, then run from the **silk-studio repository root**
 - Desktop: `node scripts/studio --release`
 - Browser: `node scripts/browser serve`, then open <http://127.0.0.1:8050/> in Chrome/Edge 137+.
 
-### Applications in nonstd
-
-The other full applications live in [silk-lang/nonstd](https://github.com/silk-lang/nonstd),
-not in this repository. Open or clone that repository, follow its
-[local setup](https://github.com/silk-lang/nonstd#run-an-application-locally), and run
-these commands from the **nonstd repository root**:
-
-| Application | Native launch command |
-| --- | --- |
-| [Notes](https://github.com/silk-lang/nonstd/tree/main/examples/notes) | `node examples/notes/scripts/notes` |
-| [Scroll Lab](https://github.com/silk-lang/nonstd/tree/main/examples/scroll-demo) | `node examples/scroll-demo/scripts/run` |
-| [Silk Loom showcase](https://github.com/silk-lang/nonstd/tree/main/examples/showcase) | `node examples/showcase/scripts/app` |
-| [Graphics Demo](https://github.com/silk-lang/nonstd/tree/main/examples/graphics-demo) | `node examples/graphics-demo/scripts/app` |
-
 ### Strict checks
 
 Keep compiler warnings enabled and fix them. Remove genuinely unused imports and bindings.
@@ -126,9 +112,9 @@ intentional module bindings, not warning suppression or removal of test/browser 
 
 ## Provenance and toolchains
 
-Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Applications such as Notes, Studio, Scroll Lab, Showcase, and Graphics Demo live in the application repositories linked above; they are consumers, not dependencies of this repository.
+Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Studio lives in its own repository, linked above; it is a consumer, not a dependency of this repository.
 
-Use Silk **0.1.0-dev.74+205aea3f5b2e** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
+Use Silk **0.1.0-dev.94+93906b8028e6** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
 
 Hosted CI bootstraps Clang and the pinned Silk release before running any compiled task. The official installer is pinned to the compiler commit. `silk task setup-ci` invokes the exact native dependency's tasks; `--linux-gpu` provisions lavapipe and `--browser` selects Chromium. There are no old script entrypoints or Playwright compatibility aliases.
 
@@ -168,7 +154,7 @@ UI-to-UI dependencies stay local, except in the packages built with Loom (`docs`
 From this repository root, with the toolchain on `PATH`:
 
 ```sh
-silk check --manifest-path modules/tree/window/silk.toml # serial first Git fetch
+silk check --manifest-path modules/tree/window/silk.toml  # serial first Git fetch
 silk check --workspace
 silk build --manifest-path modules/inspect/cli/silk.toml
 silk task check

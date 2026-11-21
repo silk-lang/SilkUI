@@ -71,7 +71,7 @@ The input commands go through the app's real input path. A click from the CLI is
 ```sh
 silk build --manifest-path modules/inspect/mcp/silk.toml
 
-claude mcp add silk-ui -- "$PWD/build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-mcp" \
+claude mcp add silk-ui -- "$PWD/build/x86_64-unknown-linux-gnu/dev/ui-inspect-mcp" \
   --connect "$PWD/silk-ui-inspect.sock"
 ```
 
@@ -106,6 +106,13 @@ ui-inspect-cli screen-reader.set --on true --flavor nvda
 ui-inspect-cli screen-reader.do --command nextHeading     # prints what it said
 ui-inspect-cli screen-reader.transcript
 ```
+
+## See the frames that reach the screen
+
+An fps counter built on `requestAnimationFrame` counts the frames the app paints. When the GPU falls behind, that is more than the screen shows. Two things count what is presented:
+
+- On macOS 13 and later, the Metal Performance HUD draws the presented frames per second, the frame times and the GPU time over the window. Start any build with `SILK_UI_METAL_HUD=1` (`SILK_UI_METAL_HUD=1 silk task dev`) or give the window target `.metalHud(true)`. Metal decides at startup, so the HUD cannot be switched while the app runs. Other systems show nothing.
+- In JavaScript, `frameStats()` from `@silkui/core` returns what was presented since its last call: `{ frames, fps, dropped, p50, p95, p99, max }`, with frame times in milliseconds. `dropped` counts painted frames the GPU never drew.
 
 ## Turning it off for good
 

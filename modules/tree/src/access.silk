@@ -22,7 +22,8 @@ import accesskit.lib {
   Invalid as AccessInvalid,
   TreeInfo,
   TreeUpdate,
-  Rect as AccessRect
+  Rect as AccessRect,
+  Affine
 }
 import engine { UiTree }
 import node { NONE, Event, EventKind }
@@ -35,6 +36,8 @@ import edit as edit
 import layout.lib { Display as CssDisplay, WritingMode }
 import cssom_view { textPieces }
 import caret as caret
+import text_selection
+import text_selection { Point as SelectionPoint }
 import silk.collections.hash { Hash }
 import silk.collections.hash_map { HashMap }
 import silk.collections.list { List }
@@ -176,6 +179,7 @@ pub fn accessRoleOf(value: Role) -> AccessRole {
     Role.Document => AccessRole.Document
     Role.Application => AccessRole.Application
     Role.Note => AccessRole.Note
+    Role.ScrollBar => AccessRole.ScrollBar
     Role.Feed => AccessRole.Feed
   }
 }
@@ -273,8 +277,8 @@ fn exposed(tree: &UiTree<'_>, slot: u32) -> bool {
     Option.Some { value } => value.hidden
     Option.None => false
   }
-  return node.live && node.computed.text.visible
-    && &node.computed.layout.display != &CssDisplay.None
+  return node.live && node.computed().text.visible
+    && &node.computed().layout.display != &CssDisplay.None
     && !hidden
     && !node.inert
 }
@@ -357,8 +361,8 @@ effect fn appendContent(tree: &UiTree<'_>, slot: u32, out: &mut String) -> ()
       continue
     }
     let node = tree.node(child)
-    if String.ownedByteLength(&node.label) != 0 {
-      run appendWords(&mut out, String.view(&node.label))
+    if node.hasLabel() {
+      run appendWords(&mut out, node.label())
     } else if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
       run appendWords(&mut out, String.view(&node.text))
     } else {
@@ -384,8 +388,8 @@ pub effect fn accessibleName(tree: &UiTree<'_>, slot: u32, out: &mut String) -> 
       return ()
     }
   }
-  if String.ownedByteLength(&node.label) != 0 {
-    run appendWords(&mut out, String.view(&node.label))
+  if node.hasLabel() {
+    run appendWords(&mut out, node.label())
     return ()
   }
   if node.kind == NodeKind.Text {
@@ -410,8 +414,8 @@ effect fn referencedText(tree: &UiTree<'_>, source: u32, name: string, typed: &[
       continue
     }
     let node = tree.node(target)
-    if String.ownedByteLength(&node.label) != 0 {
-      run appendWords(&mut out, String.view(&node.label))
+    if node.hasLabel() {
+      run appendWords(&mut out, node.label())
     } else if node.kind == NodeKind.Text || node.kind == NodeKind.Input {
       run appendWords(&mut out, String.view(&node.text))
     } else {
@@ -578,10 +582,10 @@ fn ignorable(tree: &UiTree<'_>, slot: u32) -> bool {
   }
   return node.kind == NodeKind.Box
     && (node.accessRole == Role.None || node.accessRole == Role.Generic)
-    && String.ownedByteLength(&node.label) == 0
+    && !node.hasLabel()
     && node.tabIndex == NOT_FOCUSABLE
     && (node.listeners & LISTEN_CLICK) == 0
-    && !node.hasValueRange
+    && !node.hasValueRange()
     && !node.focusTrap
     && !node.checked
     && !node.selected
@@ -684,10 +688,10 @@ effect fn describe(tree: &UiTree<'_>, slot: u32, children: &[AccessId]) -> Acces
       i = i + 1
     }
   }
-  if node.hasValueRange {
-    run out.setMinNumericValue(f32.toF64(node.valueMin))
-    run out.setMaxNumericValue(f32.toF64(node.valueMax))
-    run out.setNumericValue(f32.toF64(node.valueNow))
+  if node.hasValueRange() {
+    run out.setMinNumericValue(f32.toF64(node.valueMin()))
+    run out.setMaxNumericValue(f32.toF64(node.valueMax()))
+    run out.setNumericValue(f32.toF64(node.valueNow()))
     out.addAction(Action.Increment)
     out.addAction(Action.Decrement)
   }
@@ -730,7 +734,7 @@ effect fn collect(
   let mut children = List<AccessId>.make()
   if !kept || !presentationalChildren(node.accessRole) {
     let inner = folded
-      || (kept && namedByContent(node.accessRole) && String.ownedByteLength(&node.label) == 0)
+      || (kept && namedByContent(node.accessRole) && !node.hasLabel())
     let mut slots = List<u32>.make()
     run tree.childSlots(slot, &mut slots)
     let mut i: usize = 0
@@ -768,6 +772,54 @@ effect fn collect(
   }
   run out.append(Entry { id: slotId(tree, slot).value, node: move described })
   run parent.append(slotId(tree, slot))
+}
+
+/// The document text point a text position names: a run of a text node.
+effect fn documentPoint(tree: &UiTree<'_>, at: TextPosition) -> SelectionPoint
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if at.node.value < u64.shiftLeft(2, 32) { return SelectionPoint.none() }
+  let slot = tree.slotOf(u64.toU32(at.node.value & 4294967295))
+  if slot == NONE || tree.node(slot).kind != NodeKind.Text { return SelectionPoint.none() }
+  return match run offsetOf(tree, slot, at) {
+    Option.Some { value } => SelectionPoint { slot: slot, id: tree.node(slot).id, offset: value }
+    Option.None => SelectionPoint.none()
+  }
+}
+
+/// Puts the document's text selection on the root's node, as browsers expose it on the web
+/// area, when both ends fall in text whose runs were published.
+effect fn documentSelection(tree: &UiTree<'_>, root: u32, entries: &mut List<Entry>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = &tree.textSelection
+  if !s.anchor.exists() || !s.focus.exists() { return () }
+  let forward = (run text_selection.compare(tree, s.anchor, s.focus)) <= 0
+  let anchor = text_selection.textPoint(tree, s.anchor, forward)
+  let focus = text_selection.textPoint(tree, s.focus, !forward)
+  if !anchor.exists() || !focus.exists() { return () }
+  let mut ends = [TextPosition { node: windowId(), characterIndex: 0 }; 2]
+  let points = [anchor, focus]
+  let mut i: usize = 0
+  while i < 2 {
+    let slot = points[i].slot
+    if !published(entries.asSlice(), runId(tree.node(slot).id, 0).value) { return () }
+    let mut scratch = List<Entry>.make()
+    let mut ids = List<AccessId>.make()
+    let spans = run textRuns(tree, slot, &mut scratch, &mut ids)
+    ends[i] = run positionOf(tree, slot, spans.asSlice(), points[i].offset)
+    i = i + 1
+  }
+  let rootId = accessId(tree.node(root).id).value
+  let items = entries.asMutSlice()
+  let mut k: usize = 0
+  while k < items.length {
+    if items[k].id == rootId {
+      run items[k].node.setTextSelection(TextSelection { anchor: ends[0], focus: ends[1] })
+      return ()
+    }
+    k = k + 1
+  }
 }
 
 fn smaller(a: usize, b: usize) -> usize {
@@ -824,7 +876,7 @@ effect fn textRuns(
   ? &mut Allocator {
   let node = tree.node(slot)
   let text = shownText(tree, slot)
-  let vertical = node.computed.text.writingMode != WritingMode.HorizontalTb
+  let vertical = node.computed().text.writingMode != WritingMode.HorizontalTb
   let mut spans = List<Span>.make()
   let mut pieces = List<caret.Piece>.make()
   if String.byteLength(text) != 0 {
@@ -1055,6 +1107,8 @@ pub struct AccessTree {
   root: u32,
   focus: AccessId,
   started: bool,
+  /// The device pixels per CSS pixel the window node's transform last carried.
+  scale: f32,
 }
 
 impl AccessTree {
@@ -1065,6 +1119,7 @@ impl AccessTree {
       root: NONE,
       focus: windowId(),
       started: false,
+      scale: 0.0,
     }
   }
 
@@ -1080,6 +1135,7 @@ impl AccessTree {
     self.root = NONE
     self.focus = windowId()
     self.started = false
+    self.scale = 0.0
   }
 
   /// The whole tree as one update, as an adapter's activation handler wants it. It also
@@ -1107,7 +1163,15 @@ impl AccessTree {
       run collect(tree, root, root, false, &mut entries, &mut top)
     }
     let hasRoot = top.length() != 0
+    if hasRoot {
+      run documentSelection(tree, root, &mut entries)
+    }
     let mut window = AccessNode.make(AccessRole.Window)
+    // Bounds are CSS pixels; AccessKit wants device pixels, which adapters divide back out.
+    let scale = tree.input.scale
+    if scale > 0.0 && scale != 1.0 {
+      run window.setTransform(Affine.scale(f32.toF64(scale)))
+    }
     if hasRoot {
       run window.setChildren(&[accessId(tree.node(root).id)])
     }
@@ -1124,7 +1188,8 @@ impl AccessTree {
     } else {
       NONE
     }
-    if !self.started || rootId != self.root {
+    let rescaled = scale != self.scale
+    if !self.started || rootId != self.root || rescaled {
       run update.push(windowId(), move window)
     }
     if !self.started {
@@ -1166,7 +1231,8 @@ impl AccessTree {
     self.started = true
     self.root = rootId
     self.focus = focus
-    if firstUpdate || changed || focusMoved || rootMoved || removed {
+    self.scale = scale
+    if firstUpdate || changed || focusMoved || rootMoved || removed || rescaled {
       return Option.Some { value: move update }
     }
     return Option.None
@@ -1248,9 +1314,6 @@ pub effect fn doAction(tree: &mut UiTree<'_>, request: &ActionRequest) -> Action
     return ActionOutcome.Done
   }
   if action == Action.SetTextSelection {
-    if tree.node(slot).kind != NodeKind.Input {
-      return ActionOutcome.Unsupported
-    }
     let wanted = match &request.data {
       Option.Some { value } => match &value {
         ActionData.SetTextSelection { value: given } => Option<TextSelection>.Some { value: given }
@@ -1263,6 +1326,15 @@ pub effect fn doAction(tree: &mut UiTree<'_>, request: &ActionRequest) -> Action
       Option.None => {
         return ActionOutcome.Unsupported
       }
+    }
+    if tree.node(slot).kind != NodeKind.Input {
+      // Document text: each position names a text node's run.
+      let anchor = run documentPoint(&tree.*, selection.anchor)
+      let focus = run documentPoint(&tree.*, selection.focus)
+      if !anchor.exists() || !focus.exists() { return ActionOutcome.Unsupported }
+      tree.textSelection.unit = text_selection.UNIT_NONE
+      run text_selection.select(&mut tree, anchor, focus)
+      return ActionOutcome.Done
     }
     let anchor = run offsetOf(&tree.*, slot, selection.anchor)
     let focus = run offsetOf(&tree.*, slot, selection.focus)
@@ -1300,7 +1372,7 @@ pub effect fn doAction(tree: &mut UiTree<'_>, request: &ActionRequest) -> Action
     return ActionOutcome.Done
   }
   if action == Action.Increment || action == Action.Decrement {
-    if !tree.node(slot).hasValueRange {
+    if !tree.node(slot).hasValueRange() {
       return ActionOutcome.Unsupported
     }
     run tree.focusSlot(slot)

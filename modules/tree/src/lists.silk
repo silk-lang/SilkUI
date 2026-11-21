@@ -1,6 +1,7 @@
 //! CSS Lists 3 and counters: the `::marker` box of a list item, and the counters pass that
 //! numbers markers and writes `counter()` and `counters()` in generated content. The pass walks
 //! the rendered tree in order after each style pass once any node uses lists (`listsUsed`).
+import silk.core.ownership { Copy }
 import engine { UiTree }
 import node { Node, NO_INDEX }
 import mutation { NodeKind }
@@ -91,14 +92,25 @@ pub fn markerLayout(computed: &mut Computed, item: ListStyle) {
   computed.apply(&declare.whiteSpace(WhiteSpace.Pre))
 }
 
-struct Counter { name: Bytes, value: i64, owner: u32 }
+// `copy`: made in a style-contained subtree from a counter outside it, which it hides there.
+struct Counter { name: Bytes, value: i64, owner: u32, copy: bool }
+
+// A style-contained element and the counters in scope when it was entered.
+struct Barrier { owner: u32, at: usize }
+impl Copy for Barrier {}
 
 /// The counters in scope at one point of the walk, innermost last. A counter belongs to the
 /// parent of the element that made it, and leaves scope with that parent (CSS Lists 3 §4.5).
-pub struct Scope { counters: List<Counter> }
+/// Inside a style-contained element (CSS Containment 2 §3.3) changes to counters from outside go
+/// to copies that leave with it.
+pub struct Scope { counters: List<Counter>, barriers: List<Barrier> }
 
 impl Scope {
-  pub fn empty() -> Scope { return Scope { counters: List<Counter>.make() } }
+  pub fn empty() -> Scope { return Scope { counters: List<Counter>.make(), barriers: List<Barrier>.make() } }
+
+  effect fn contain(self: &mut Self, owner: u32) ! OutOfMemoryError ? &mut Allocator {
+    run self.barriers.append(Barrier { owner: owner, at: self.counters.length() })
+  }
 
   fn innermost(self: &Self, name: &[u8]) -> usize {
     let items = self.counters.asSlice()
@@ -123,17 +135,24 @@ impl Scope {
       return ()
     }
     let items = self.counters.asSlice()
-    let mut wrote = false
+    // A copy stands for the counter it hides, the last one of its name before it.
+    let mut found = List<i64>.make()
     let mut i: usize = 0
     while i < items.length {
       if Bytes.asSlice(&items[i].name) == name {
-        if wrote { run out.append(separator) }
-        run counter_styles.format(items[i].value, style, &mut out.*)
-        wrote = true
+        let count = found.length()
+        if items[i].copy && count != 0 { found.set(count - 1, items[i].value) }
+        else { run found.append(items[i].value) }
       }
       i = i + 1
     }
-    if !wrote { run counter_styles.format(0, style, &mut out.*) }
+    if found.length() == 0 { run found.append(0) }
+    i = 0
+    while i < found.length() {
+      if i > 0 { run out.append(separator) }
+      run counter_styles.format(found.get(i), style, &mut out.*)
+      i = i + 1
+    }
   }
 
   effect fn reset(self: &mut Self, name: &[u8], value: i64, owner: u32) ! OutOfMemoryError ? &mut Allocator {
@@ -144,14 +163,23 @@ impl Scope {
       items[at].value = value
       return ()
     }
-    run self.counters.append(Counter { name: run Bytes.copy(name), value: value, owner: owner })
+    run self.counters.append(Counter { name: run Bytes.copy(name), value: value, owner: owner, copy: false })
   }
 
   effect fn change(self: &mut Self, name: &[u8], value: i64, owner: u32, add: bool) ! OutOfMemoryError ? &mut Allocator {
     let at = self.innermost(name)
     if at == usize.MAX {
-      run self.counters.append(Counter { name: run Bytes.copy(name), value: value, owner: owner })
+      run self.counters.append(Counter { name: run Bytes.copy(name), value: value, owner: owner, copy: false })
       return ()
+    }
+    if self.barriers.length() != 0 {
+      let barrier = self.barriers.get(self.barriers.length() - 1)
+      if at < barrier.at {
+        let start = self.counters.asSlice()[at].value
+        let next = if add { i64.saturatingAdd(start, value) } else { value }
+        run self.counters.append(Counter { name: run Bytes.copy(name), value: next, owner: barrier.owner, copy: true })
+        return ()
+      }
     }
     let items = self.counters.asMutSlice()
     items[at].value = if add { i64.saturatingAdd(items[at].value, value) } else { value }
@@ -161,6 +189,8 @@ impl Scope {
     while self.counters.length() != 0 && self.counters.asSlice()[self.counters.length() - 1].owner == owner {
       drop self.counters.pop()
     }
+    let count = self.barriers.length()
+    if count != 0 && self.barriers.get(count - 1).owner == owner { self.barriers.truncate(count - 1) }
   }
 }
 
@@ -193,7 +223,7 @@ effect fn changesOf(node: &Node, property: Property, default: i32) -> List<Count
 
 fn attribute<'a>(node: &'a Node, name: &[u8]) -> Option<&'a [u8]> {
   if let Option.Some { value } = node.identity() {
-    let attributes = value.attributes.asSlice()
+    let attributes = value.attributes()
     let mut i: usize = 0
     while i < attributes.length {
       if insensitive(String.utf8Bytes(String.view(&attributes[i].name)), name) { return Option<&'a [u8]>.some(String.utf8Bytes(String.view(&attributes[i].value))) }
@@ -221,7 +251,7 @@ fn integerOf(text: Option<&[u8]>) -> Option<i64> {
 
 fn tagIs(node: &Node, name: &[u8]) -> bool {
   return match node.identity() {
-    Option.Some { value } => insensitive(String.utf8Bytes(String.view(&value.tag)), name)
+    Option.Some { value } => insensitive(String.utf8Bytes(value.tag()), name)
     _ => false
   }
 }
@@ -230,8 +260,11 @@ fn tagIs(node: &Node, name: &[u8]) -> bool {
 // to one before its `start`; an `li` with a `value` sets it.
 effect fn enter(tree: &UiTree<'_>, slot: u32, scope: &mut Scope) ! OutOfMemoryError ? &mut Allocator {
   let node = tree.node(slot)
-  let list = node.computed.list
-  let parent = node.parent
+  let list = node.computed().list
+  let contained = node.computed().contain.style()
+  // A style-contained element's own counters stay inside it too.
+  let parent = if contained { slot } else { node.parent }
+  if contained { run scope.contain(slot) }
   let listTag = tagIs(node, b"ol") || tagIs(node, b"ul") || tagIs(node, b"menu")
   if !list.counters() && !list.item() && !listTag { return () }
   let resets = if list.counters() { run changesOf(node, Property.CounterReset, 0) } else { List<CounterChange>.make() }
@@ -309,7 +342,7 @@ effect fn markerText(tree: &UiTree<'_>, slot: u32, scope: &Scope) -> Option<Stri
     let mut counted = false
     return run Effect.catchAll(generated.content(tree, origin, declarationsOf(node), scope, &mut counted), noContent)
   }
-  let list = tree.node(origin).computed.list
+  let list = tree.node(origin).computed().list
   let mut out = Bytes.make()
   if list.typeCode() == LIST_STRING {
     out = run listString(tree, origin)
@@ -355,21 +388,21 @@ pub effect fn update(tree: &mut UiTree<'_>) ! OutOfMemoryError | TreeError ? &mu
         descend = false
       } else { run enter(&tree.*, slot, &mut scope) }
     }
-    let links = tree.layout.nodes.asSlice()
-    if descend && links[at].firstChild != NO_INDEX {
-      at = links[at].firstChild
+    let links = &tree.layout
+    if descend && links.firstChild(at) != NO_INDEX {
+      at = links.firstChild(at)
       continue
     }
     // Leaving `at` and every ancestor that has no next sibling.
-    while at != top && links[at].nextSibling == NO_INDEX {
+    while at != top && links.nextSibling(at) == NO_INDEX {
       let leaving = tree.slotOfCssNode(at)
       if leaving != NONE { scope.leave(leaving) }
-      at = links[at].parent
+      at = links.parent(at)
     }
     let leaving = tree.slotOfCssNode(at)
     if leaving != NONE { scope.leave(leaving) }
     if at == top { break }
-    at = links[at].nextSibling
+    at = links.nextSibling(at)
   }
   while fills.length() != 0 {
     let last = fills.length() - 1

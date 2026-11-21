@@ -338,8 +338,8 @@ the same code path as production, so it is the mode to check a bundle in.
 For the React example, from `modules/js/examples/react-counter`:
 
 ```sh
-silk build --manifest-path ../../demo/silk.toml --profile dev
-export SILK_UI_HOST=$PWD/../../../../build/llvm/<target>/dev/ui-js-demo
+silk build --manifest-path ../../demo/silk.toml --optimization none
+export SILK_UI_HOST=$PWD/../../../../build/<target>/dev/ui-js-demo
 npm run dev     # dev server, Fast Refresh
 npm run watch   # rebuild and reload
 ```
@@ -406,15 +406,80 @@ what those mean:
   `JsHost.answerClipboard` settles each one. Both windows do them on the system clipboard
   once the code that asked has run, so a copy button works from any listener, timer or
   promise job. A host that has no clipboard leaves the promises pending.
-- Desktop calls from `@silkui/core` (`new Notification`, `setTray`, `registerShortcut`) go
+- Desktop calls from `@silkui/core` (`new Notification`, `setTray`, `registerShortcut`,
+  menus, dialogs, `appWindow`, `openExternal`, `startFileDrag`) go
   the same way: `JsHost.takeShell` hands them over (`ShellRequest` says how each packs its
   arguments) and `JsHost.answerShell` settles them. Both windows serve them on the
   platform (`ui_js_window.shell`). File drags, global shortcuts, tray clicks and
-  notification clicks come back through `JsHost.shellEvent`; the window aims a drag at the
+  notification clicks, menu choices, closed dialogs and context menus, full screen and page
+  zoom changes come back through `JsHost.shellEvent`; the window aims a drag at the
   node under it.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
 `prelude.js`.
+
+## WebGPU in a canvas
+
+In a window, `navigator.gpu` and a canvas node's `getContext("webgpu")` follow the
+[W3C WebGPU API](https://www.w3.org/TR/webgpu/), so code written for a browser canvas runs
+as it is:
+
+```js
+import { createNode, mount } from "@silkui/core";
+
+const canvas = createNode("canvas");
+canvas.width = 480; // the drawing size in pixels; `style` gives the size on screen
+canvas.height = 360;
+mount(canvas);
+
+const adapter = await navigator.gpu.requestAdapter();
+const device = await adapter.requestDevice();
+const context = canvas.getContext("webgpu");
+context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat() });
+// ... pipelines and passes into context.getCurrentTexture().createView() ...
+```
+
+[examples/webgpu-canvas](examples/webgpu-canvas/app.js) draws a triangle and reads a pixel
+back; run it with `silk run --manifest-path modules/js/demo/silk.toml -- modules/js/examples/webgpu-canvas/app.js`.
+[examples/three-canvas](examples/three-canvas/src/main.js) is three.js with its WebGPU
+renderer (`three/webgpu`), unchanged: `npm run build` there, then run `dist/app.js` the same
+way. Its Vite config defines `self` as `globalThis`, which three.js reads
+`requestAnimationFrame` from.
+
+How it works:
+
+- The application draws on a GPU device of its own, apart from the one that draws the
+  window. A canvas that takes long to draw does not slow the rest of the interface, and a
+  frame it presents shows at the window's next refresh without a frame of the UI.
+- [src/webgpu.js](src/webgpu.js) is the API. It is evaluated on first use, and every call
+  writes a command into a stream of bytes (`ui_js_gpu.wire` lists them). Objects are numbers
+  JavaScript picks, so no call waits for the GPU.
+- When the JavaScript turn ends, the window takes the stream (`JsHost.takeGpuCommands`) and
+  the GPU service (`ui_js_gpu.service`, [gpu/](gpu)) runs it, presents each canvas whose
+  current texture was taken, and answers the calls that return promises
+  (`JsHost.answerGpu`). A command the GPU refuses is dropped alone: its promise rejects, or
+  the device gets an `uncapturederror` event.
+- A host turns it on with `JsHost.enableGpu`; without that `navigator.gpu` is undefined. The
+  window does it for every application, and makes the device only when one asks for it.
+
+- A present of a `bgra8unorm` canvas (what `getPreferredCanvasFormat()` answers) stays on the
+  GPU where both devices can share images (macOS): the canvas draws into a swap chain of
+  IOSurfaces that the window's device samples after the application's fences
+  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). A canvas nothing covers, with a
+  rectangular clip, can also show in a compositor layer of its own, whose frames do not draw the
+  window ([canvas_layer_plan.silk](../tree/window/src/canvas_layer_plan.silk)). That is opt-in
+  for now: `SILK_UI_CANVAS_LAYERS=on`. An `rgba8unorm` canvas, and every canvas on other
+  systems, copies the frame through the CPU.
+
+What is not there yet: query sets, render bundles and external textures throw, compilation
+info is always empty, and `copyExternalImageToTexture` takes `ImageData` only. The canvas
+formats are `rgba8unorm` and `bgra8unorm`.
+On the web canvas target ([web](web)) `navigator.gpu` is the browser's own, and a canvas
+node's `getContext("webgpu")` is the browser's context of a canvas outside the document, so
+the same bundle runs there: see "WebGPU in a canvas" in [web/README.md](web/README.md).
+
+`silk task embed-assets` regenerates `src/generated_webgpu_api.silk` after an edit to
+`webgpu.js`.
 
 ## In a window
 
@@ -453,7 +518,7 @@ passes an inspector that is off; since its client answers `servesInspector` with
 constant false, the window host's inspector code is not in the program either.
 
 ```sh
-silk build --manifest-path modules/js/demo/silk.toml --profile production
+silk task --manifest-path modules/js/demo/silk.toml production --release
 ```
 
 Engine features are chosen per build too. The bridge answers
@@ -464,6 +529,36 @@ locale-independent results, and a local `Date` string ends at its offset. The pr
 demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 MB from
 the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
 the engine here (it lives in the SilkJS runtime, which ui-js does not link).
+
+### Bytecode images
+
+A production host need not parse its bundle at every launch. `JsHost.writeImage(source,
+name)` compiles a module into a bytecode image without running it (its imports must be
+defined), and `JsHost.moduleFrom(image, source, name)` starts the module from that image
+when the engine build linked into the program is the one that wrote it, and from `source`
+otherwise. `JsHost.defineImaged` does the same for a module the entry imports, such as
+`@silkui/core`. The engine reads each function's code from the image when the function is
+first called, so the image must live as long as the realm: `moduleFrom` and `defineImaged`
+take bytes embedded in the program (`&'static`), and `moduleFromHeld` is the unsafe form
+for bytes the caller keeps alive itself.
+
+```silk
+// build time, in a program that links the same engine as the host
+run host.define(b"@silkui/core", uiPackage())
+let image = run host.writeImage(source, b"app.js")
+
+// launch
+let fromImage = run host.moduleFrom(app_image.data, app_bundle.data, b"app.js")
+```
+
+An image is tied to the engine build: `imageLoadable(bytes)` says whether this build can
+load it, and `imageBuild(bytes)` and `engineBuild()` give the two build numbers. Images are
+trusted input, so only the app's own build should write them. `silkui` does all of this for
+a generated host (`silkui_window.image` is the build step; see
+[silkui's README](../silkui/README.md)). In a window, `JsApp.entryImage` and
+`JsApp.defineImaged` hand the images over, a reload goes back to source, and
+`SILK_UI_TRACE_JS=1` says on standard error what the entry started from. An image from
+another engine build is always reported there, traced or not.
 
 ## On the web canvas
 

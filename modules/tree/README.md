@@ -50,7 +50,7 @@ let records = run tree.events()
   `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
   with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
   properties inherit; the rest do not.
-- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setGrid`, `setAttribute`
+- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setCanvasSurface`, `setGrid`, `setAttribute`
   (role, label, test id, tab index, cursor, disabled, focus trap, checked, selected, expanded,
   and for inputs multiline, read-only and placeholder), with `setLabel`, `setTestId` and
   `setRole` for the common ones.
@@ -100,7 +100,7 @@ run tree.apply(run batch.take())
 - `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
   `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
   `SetSelection`, `SetListeners`, `OpenRoot`, `UpdateRoot`, `CloseRoot`, `Focus`, `Blur`,
-  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetGrid`, the virtual list and anchor
+  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetCanvasSurface`, `SetGrid`, the virtual list and anchor
   mutations, and the resource definitions.
 - Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
   and a node made with `tree.box` takes a number that is not in use.
@@ -395,7 +395,11 @@ boundary on the nearest line by the same positions. Nothing is shaped outside la
 `frame` resolves styles, lays out, and paints:
 
 - **Layout** is incremental. Style changes reach css-layout only when they change a layout
-  input, and an unchanged tree at an unchanged size skips `compute`.
+  input, and an unchanged tree at an unchanged size skips `compute`. css-layout reads the
+  tree through its `LayoutSource` interface (`src/layout_table.silk`). It does not use a copy
+  in its own `Tree`. Each layout node is a row of links and a style index, 29 bytes. Elements
+  with equal layout styles share one style entry. A text node reads its text from its UI
+  node.
 - **Paint** walks the layout fragments, not the nodes. Boxes paint their background (solid, or
   linear, radial and conic gradients, and `url()` images the host loads), border (solid or dashed, per side, with radii), outer and inset shadow,
   opacity (an isolated layer) and `overflow: hidden` clip. Text is drawn from css-layout's text
@@ -448,7 +452,7 @@ For people and agents looking at a running UI (`inspect.silk`):
 ```sh
 silk test --manifest-path modules/tree/tests/silk.toml --root src/tests.silk
 silk build --manifest-path modules/tree/tests/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-tree-tests modules/tree/tests/goldens [--update]
+build/x86_64-unknown-linux-gnu/dev/ui-tree-tests modules/tree/tests/goldens [--update]
 silk task browser check-tree
 silk test --manifest-path modules/tree/window/tests/silk.toml --root src/tests.silk
 silk task native demo modules/tree/demo -- check
@@ -521,8 +525,7 @@ the wasm build draw the same bytes.
 - Scrollbars are overlays that take no space; the arrow keys, Page Up and Page Down do not
   scroll yet, and the root does not scroll the viewport (give it `overflow: auto`).
 - Hit testing uses rectangles: rounded corners and clip radii are not hit shapes.
-- Transforms flatten into their parent's plane (no `transform-style: preserve-3d`), and a
-  transformed box that is not a pure translation is resampled from its own layer, so magnified
+- A transformed box that is not a pure translation is resampled from its own layer, so magnified
   content is softer than content painted at that size. Caret and range rectangles ignore
   transforms.
 - Editing moves logically: in right-to-left text the arrows follow the text order, not the

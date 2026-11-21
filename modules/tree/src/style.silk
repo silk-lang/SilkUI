@@ -18,10 +18,10 @@ import layout.lib {
   CaptionSide,
 }
 pub import properties.computed { Text as TextStyle, Paint, Fill, DisplayOutside, DisplayInside }
-import properties.computed { Display }
+import properties.computed { Display, Bounds, EmphasisSide }
 import svg_css.counter_styles
 import properties.computed { BorderStyle, DecorationLine, WhiteSpace, ObjectFit, Position }
-import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle }
+import properties.computed { WritingMode, Direction, VerticalAlignKind, TextWrapStyle, WrapFlow, WrapThrough }
 import properties.convert { Context }
 import timing { TransitionLists, AnimationLists }
 import transform { Transform }
@@ -29,14 +29,19 @@ import properties.values { Unit, Separator, MathOperator }
 import properties.convert
 import properties.keyword_enums
 import paint_css
+import css_cursor { cursorOf, textCursor, textHasUrl }
+import anchor_style { AnchorStyle }
 import properties.keywords
 import silk.collections.hash { Hash, HashSeed }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.core.ownership { Copy }
 import silk.core.equal { Equal }
 import silk.geometry.insets { Insets }
+import silk.geometry.corners { Corners }
 import silk.geometry.rect { Rect }
 import silk.num.f32
 import silk.num.i32
@@ -112,6 +117,11 @@ pub struct Computed {
   /// to flex and grid items (see `stacking`).
   pub zIndex: i32,
   pub zAuto: bool,
+  /// `image-rendering: pixelated` or `crisp-edges` (inherits): bitmaps scale by nearest texel.
+  pub nearest: bool,
+  /// `empty-cells: hide`: an empty cell of a table with separate borders paints no
+  /// background or border. It inherits.
+  pub emptyCellsHide: bool,
   pub list: ListStyle,
   pub outline: Outline,
   pub columnRule: ColumnRule,
@@ -119,10 +129,133 @@ pub struct Computed {
   /// The CSS `cursor`, when the node sets one other than `auto`. Hovering finds it on the
   /// node or the nearest ancestor that sets one, as inheritance would.
   pub cursor: Option<Cursor>,
+  /// `cursor` lists images before its keyword, read back from the declaration on hover
+  /// (`css_cursor`).
+  pub cursorUrl: bool,
   pub contain: Containment,
+  /// Anchor positioning: names, `anchor()` insets, `position-area` (see `anchor_style`).
+  pub anchor: AnchorStyle,
+  /// `user-select`: the declared keyword while the cascade runs, the used value after it
+  /// (see `usedUserSelect`). One of the `SELECT_` constants.
+  pub userSelect: u8,
+  /// `fill`, `stroke` and `stroke-width` from page CSS, which an inline `<svg>` draws with over
+  /// its root's presentation attributes. They inherit.
+  pub svg: SvgPaint,
 }
 
 impl Copy for Computed {}
+
+/// A paint `SvgPaint` has not got: the markup's own applies.
+pub const PAINT_UNSET: u8 = 0
+pub const PAINT_NONE: u8 = 1
+pub const PAINT_CURRENT: u8 = 2
+pub const PAINT_COLOR: u8 = 3
+
+/// SVG paint properties as CSS sets them, colors as RGBA8 (red in the high byte).
+pub struct SvgPaint {
+  pub fillKind: u8,
+  pub strokeKind: u8,
+  pub fill: u32,
+  pub stroke: u32,
+  /// In user units; negative when unset.
+  pub strokeWidth: f32,
+}
+
+impl Copy for SvgPaint {}
+
+impl SvgPaint {
+  pub fn initial() -> SvgPaint {
+    return SvgPaint { fillKind: PAINT_UNSET, strokeKind: PAINT_UNSET, fill: 0, stroke: 0, strokeWidth: -1.0 }
+  }
+
+  pub fn isSet(self: &Self) -> bool {
+    return self.fillKind != PAINT_UNSET || self.strokeKind != PAINT_UNSET || self.strokeWidth >= 0.0
+  }
+
+  /// A key for drawings of the same markup in this paint; 0 when unset.
+  pub fn key(self: &Self) -> u64 {
+    if !self.isSet() { return 0 }
+    let mut h = Hash.combine(u8.toU64(self.fillKind) * 4 + u8.toU64(self.strokeKind), u32.toU64(self.fill))
+    h = Hash.combine(h, u32.toU64(self.stroke))
+    h = floatHash(h, self.strokeWidth)
+    return if h == 0 { 1 } else { h }
+  }
+}
+
+impl SvgPaint {
+  /// The declarations for an SVG root's style, such as `fill:#ff0000ff;stroke-width:1.5;`.
+  pub effect fn css(self: &Self) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut out = List<u8>.make()
+    run paintCss(&mut out, b"fill:", self.fillKind, self.fill)
+    run paintCss(&mut out, b"stroke:", self.strokeKind, self.stroke)
+    if self.strokeWidth >= 0.0 {
+      run out.appendSlice(b"stroke-width:")
+      let thousandths = f32.toU64(f32.min(self.strokeWidth, 1000000.0) * 1000.0 + 0.5)
+      run decimal(&mut out, thousandths / 1000)
+      run out.append(46)
+      let fraction = thousandths % 1000
+      run out.append(u64.toU8(48 + fraction / 100))
+      run out.append(u64.toU8(48 + (fraction / 10) % 10))
+      run out.append(u64.toU8(48 + fraction % 10))
+      run out.append(59)
+    }
+    return move out
+  }
+}
+
+effect fn paintCss(out: &mut List<u8>, name: &[u8], kind: u8, color: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if kind == PAINT_UNSET { return () }
+  run out.appendSlice(name)
+  if kind == PAINT_NONE {
+    run out.appendSlice(b"none")
+  } else if kind == PAINT_CURRENT {
+    run out.appendSlice(b"currentColor")
+  } else {
+    run out.append(35)
+    let digits = b"0123456789abcdef"
+    let mut shift: u32 = 28
+    let mut more = true
+    while more {
+      run out.append(digits[u32.toUsize(u32.bitAnd(u32.shiftRight(color, shift), 15))])
+      if shift == 0 { more = false } else { shift = shift - 4 }
+    }
+  }
+  run out.append(59)
+}
+
+effect fn decimal(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run decimal(&mut out, value / 10) }
+  run out.append(u64.toU8(48 + value % 10))
+}
+
+// A paint value: `none`, `currentColor` or a color. `url()` paints keep the markup's.
+fn setPaint(kind: &mut u8, color: &mut u32, value: &Value) -> () {
+  if convert.isKeyword(value, Keyword.None) {
+    kind.* = PAINT_NONE
+  } else if convert.isKeyword(value, Keyword.Currentcolor) {
+    kind.* = PAINT_CURRENT
+  } else if let Option.Some { value: found } = convert.color(value) {
+    kind.* = PAINT_COLOR
+    color.* = packColor(found)
+  }
+}
+
+pub const SELECT_AUTO: u8 = 0
+pub const SELECT_TEXT: u8 = 1
+pub const SELECT_NONE: u8 = 2
+pub const SELECT_ALL: u8 = 3
+/// Selectable like `text`, and a scope that select-all and drags started inside stay in.
+pub const SELECT_CONTAIN: u8 = 4
+
+/// The used `user-select` (CSS UI 4 §6.1) of a node declaring `declared` under a parent whose
+/// used value is `parent`: `auto` takes `none` and `all` from the parent and is `text`
+/// otherwise. Inputs keep their own selection, so `auto` there is a contain scope.
+pub fn usedUserSelect(declared: u8, parent: u8, input: bool) -> u8 {
+  if declared != SELECT_AUTO { return declared }
+  if input { return SELECT_CONTAIN }
+  if parent == SELECT_NONE || parent == SELECT_ALL { return parent }
+  return SELECT_TEXT
+}
 
 /// `display: list-item`, `list-style-type` and `list-style-position`, and whether the node
 /// changes counters, in one byte. Type and position inherit (copied in the engine's
@@ -157,6 +290,44 @@ impl ListStyle {
   fn setType(self: &mut Self, code: u8) { self.bits = u8.bitOr(u8.bitAnd(self.bits, u8.bitNot(LIST_TYPE)), code) }
 }
 
+// A keyword value's name, whether the catalog knows it as a keyword or not.
+fn wordOf<'a>(value: &'a Value) -> Option<&'a [u8]> {
+  return match &value.* {
+    Value.Keyword { value: word } => Option<&[u8]>.some(keywords.name(word))
+    Value.Text { css } => Option<&[u8]>.some(Bytes.asSlice(&css))
+    _ => Option<&[u8]>.None
+  }
+}
+
+fn keywordNamed(word: &[u8], name: &[u8]) -> bool {
+  if word.length != name.length { return false }
+  let mut index: usize = 0
+  while index < word.length {
+    let mut byte = word[index]
+    if byte >= 65 && byte <= 90 { byte = byte + 32 }
+    if byte != name[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+
+// CSS Exclusions 1 §3.1.
+fn wrapFlowOf(value: &Value) -> Option<WrapFlow> {
+  match wordOf(value) {
+    Option.Some { value: word } => {
+      if keywordNamed(word, b"auto") { return Option<WrapFlow>.some(WrapFlow.Auto) }
+      if keywordNamed(word, b"both") { return Option<WrapFlow>.some(WrapFlow.Both) }
+      if keywordNamed(word, b"start") { return Option<WrapFlow>.some(WrapFlow.Start) }
+      if keywordNamed(word, b"end") { return Option<WrapFlow>.some(WrapFlow.End) }
+      if keywordNamed(word, b"minimum") { return Option<WrapFlow>.some(WrapFlow.Minimum) }
+      if keywordNamed(word, b"maximum") { return Option<WrapFlow>.some(WrapFlow.Maximum) }
+      if keywordNamed(word, b"clear") { return Option<WrapFlow>.some(WrapFlow.Clear) }
+    }
+    Option.None => {}
+  }
+  return Option<WrapFlow>.None
+}
+
 fn listTypeOf(value: &Value) -> Option<u8> {
   return match &value.* {
     Value.Keyword { value: word } => listTypeNamed(keywords.name(word))
@@ -176,18 +347,26 @@ fn listTypeNamed(name: &[u8]) -> Option<u8> {
 /// `container-type`, `contain` and `content-visibility`, in one byte (the record is copied for
 /// every restyled node). css-layout reads the union of the two size containments, in
 /// `layout.sizeContainment`; container queries read only `query`.
-pub struct Containment { bits: u8 }
+pub struct Containment {
+  bits: u8,
+  /// `content-visibility: auto`: the contents are laid out only near the viewport.
+  autoVisible: bool,
+  /// The block size `contain-intrinsic-size` gives a skipped box before it was laid out, in
+  /// px; negative for none.
+  intrinsic: f32,
+}
 
 impl Copy for Containment {}
 
-struct Contained { size: SizeContainment, paint: bool }
+struct Contained { size: SizeContainment, paint: bool, layout: bool, style: bool }
 impl Copy for Contained {}
 
 const QUERY_SHIFT: u8 = 0
 const CONTAIN_SHIFT: u8 = 2
 const CONTAIN_PAINT: u8 = 16
 const HIDDEN: u8 = 32
-const PAINT: u8 = 64
+const CONTAIN_LAYOUT: u8 = 64
+const CONTAIN_STYLE: u8 = 128
 
 fn sizeCode(size: SizeContainment) -> u8 {
   return if size == SizeContainment.Size { 2 } else if size == SizeContainment.InlineSize { 1 } else { 0 }
@@ -198,28 +377,48 @@ fn sizeOfCode(code: u8) -> SizeContainment {
 }
 
 impl Containment {
-  pub fn initial() -> Containment { return Containment { bits: 0 } }
+  pub fn initial() -> Containment { return Containment { bits: 0, autoVisible: false, intrinsic: -1.0 } }
 
   /// The size containment `container-type` asks for.
   pub fn query(self: &Self) -> SizeContainment { return sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, QUERY_SHIFT), 3)) }
 
   /// Paint containment, from `contain` or `content-visibility: hidden`.
-  pub fn paint(self: &Self) -> bool { return u8.bitAnd(self.bits, PAINT) != 0 }
+  pub fn paint(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_PAINT, HIDDEN)) != 0 }
+
+  /// Layout containment, from `contain` or `content-visibility: hidden`.
+  pub fn layout(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_LAYOUT, HIDDEN)) != 0 }
+
+  /// Style containment: counters changed inside stay inside.
+  pub fn style(self: &Self) -> bool { return self.autoVisible || u8.bitAnd(self.bits, u8.bitOr(CONTAIN_STYLE, HIDDEN)) != 0 }
 
   /// `content-visibility: hidden`: the contents are skipped like `display: none`.
   pub fn hidden(self: &Self) -> bool { return u8.bitAnd(self.bits, HIDDEN) != 0 }
 
+  /// `content-visibility: auto`: far from the viewport, the contents are skipped and the box
+  /// keeps the size it had (see `skipped` in layout_table.silk).
+  pub fn automatic(self: &Self) -> bool { return self.autoVisible }
+
+  /// The block size a skipped box takes before it was ever laid out, in px.
+  pub fn intrinsicBlock(self: &Self) -> f32 { return if self.intrinsic < 0.0 { 0.0 } else { self.intrinsic } }
+
+  pub fn setIntrinsic(self: &mut Self, value: f32) -> () { self.intrinsic = value }
+
   fn contained(self: &Self) -> Contained {
-    return Contained { size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0 }
+    return Contained {
+      size: sizeOfCode(u8.bitAnd(u8.shiftRight(self.bits, CONTAIN_SHIFT), 3)), paint: u8.bitAnd(self.bits, CONTAIN_PAINT) != 0,
+      layout: u8.bitAnd(self.bits, CONTAIN_LAYOUT) != 0, style: u8.bitAnd(self.bits, CONTAIN_STYLE) != 0,
+    }
   }
 
   fn write(self: &mut Self, query: SizeContainment, contain: Contained, hidden: bool, layout: &mut CssStyle) -> () {
     let size = if hidden { SizeContainment.Size } else { contain.size }
     let mut bits = u8.bitOr(u8.shiftLeft(sizeCode(query), QUERY_SHIFT), u8.shiftLeft(sizeCode(contain.size), CONTAIN_SHIFT))
     if contain.paint { bits = u8.bitOr(bits, CONTAIN_PAINT) }
+    if contain.layout { bits = u8.bitOr(bits, CONTAIN_LAYOUT) }
+    if contain.style { bits = u8.bitOr(bits, CONTAIN_STYLE) }
     if hidden { bits = u8.bitOr(bits, HIDDEN) }
-    if hidden || contain.paint { bits = u8.bitOr(bits, PAINT) }
     self.bits = bits
+    layout.layoutContainment = hidden || self.autoVisible || contain.paint || contain.layout
     layout.sizeContainment = if query == SizeContainment.Size || size == SizeContainment.Size {
       SizeContainment.Size
     } else if query == SizeContainment.InlineSize || size == SizeContainment.InlineSize {
@@ -245,6 +444,12 @@ impl Containment {
     let query = self.query()
     let contain = self.contained()
     self.write(query, contain, hidden, &mut layout)
+  }
+
+  /// Sets `content-visibility`: `hidden`, `auto` (`automatic`) or visible (neither).
+  pub fn setVisibility(self: &mut Self, hidden: bool, automatic: bool, layout: &mut CssStyle) -> () {
+    self.autoVisible = automatic && !hidden
+    self.setHidden(hidden, &mut layout)
   }
 
   pub fn inheritContain(self: &mut Self, parent: &Containment, layout: &mut CssStyle) -> () {
@@ -314,7 +519,7 @@ fn blurInText(css: &[u8], context: &Context) -> Option<f32> {
         return Option<f32>.some(amount * context.fontSize)
       }
       if rest >= 2 && lower(css[i]) == 112 && lower(css[i + 1]) == 120 {
-        return Option<f32>.some(amount)
+        return Option<f32>.some(amount * context.zoom)
       }
       if rest >= 1 && css[i] == 41 && amount == 0.0 {
         return Option<f32>.some(0.0)
@@ -332,7 +537,7 @@ fn lower(byte: u8) -> u8 {
 
 /// `contain`'s keywords; `None` for a value that is not one.
 fn containOf(value: &Value) -> Option<Contained> {
-  let mut out = Contained { size: SizeContainment.None, paint: false }
+  let mut out = Contained { size: SizeContainment.None, paint: false, layout: false, style: false }
   if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
     if word == Keyword.None { return Option<Contained>.some(out) }
     if !containWord(&mut out, word) { return Option<Contained>.None }
@@ -357,6 +562,8 @@ fn containWord(out: &mut Contained, word: Keyword) -> bool {
   if word == Keyword.Size || word == Keyword.Strict { out.size = SizeContainment.Size }
   if word == Keyword.InlineSize && out.size == SizeContainment.None { out.size = SizeContainment.InlineSize }
   if word == Keyword.Paint || word == Keyword.Strict || word == Keyword.Content { out.paint = true }
+  if word == Keyword.Layout || word == Keyword.Strict || word == Keyword.Content { out.layout = true }
+  if word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content { out.style = true }
   return word == Keyword.Size || word == Keyword.InlineSize || word == Keyword.Paint || word == Keyword.Layout
     || word == Keyword.Style || word == Keyword.Strict || word == Keyword.Content
 }
@@ -373,8 +580,8 @@ pub struct EffectState {
   pub declared: bool,
   /// Whether `will-change` makes the box a stacking context.
   pub stacks: bool,
-  /// Whether a corner radius has a percentage, which `paint_css.Effects.radii` holds;
-  /// `paint.radii` holds the length part.
+  /// Whether a corner radius has a percentage or a vertical radius of its own, which
+  /// `paint_css.Effects` holds; `paint.radii` holds the horizontal length parts.
   pub radiusShare: bool,
   /// Whether the effects paint through a layer of their own (filter, clip, mask, blend mode),
   /// which makes the box a stacking context.
@@ -524,12 +731,18 @@ pub struct ScrollStyle {
   pub overscrollY: Overscroll,
   /// `scroll-behavior: smooth`.
   pub smooth: bool,
+  /// `overflow-anchor: none` (see `scroll_anchor`).
+  pub anchorNone: bool,
+  /// `scroll-snap-type` (container) and `scroll-snap-align`/`-stop` (item), packed: see `SNAP_*`.
+  pub snap: u8,
   /// `scroll-margin` of the box, in pixels.
   pub margin: Insets<f32>,
   /// `scroll-padding` of the scroll container; `auto` is zero.
   pub padding: Edges,
   /// `scrollbar-color`, which inherits.
   pub colors: ScrollbarColors,
+  /// `touch-action` as `TOUCH_*` bits: the gestures the tree may take for itself.
+  pub touch: u8,
 }
 
 /// `scrollbar-color`, as two 8-bit RGBA words in one (it is copied with every computed style).
@@ -584,11 +797,164 @@ impl ScrollStyle {
       overscrollX: Overscroll.Auto,
       overscrollY: Overscroll.Auto,
       smooth: false,
+      anchorNone: false,
+      snap: 0,
       margin: Insets<f32>.zero(),
       padding: Edges.all(Dimension.px(0.0)),
       colors: ScrollbarColors.initial(),
+      touch: TOUCH_AUTO,
     }
   }
+}
+
+/// `ScrollStyle.snap` bits: the container's snapping axes and strictness, then the item's
+/// alignment per axis (`SNAP_NONE` to `SNAP_END`) and `scroll-snap-stop: always`.
+pub const SNAP_X: u8 = 1
+pub const SNAP_Y: u8 = 2
+pub const SNAP_MANDATORY: u8 = 4
+pub const SNAP_STOP: u8 = 128
+pub const SNAP_NONE: u8 = 0
+pub const SNAP_START: u8 = 1
+pub const SNAP_CENTER: u8 = 2
+pub const SNAP_END: u8 = 3
+
+impl ScrollStyle {
+  /// Whether the box is a snap container on that axis.
+  pub fn snapsX(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_X) != 0 }
+  pub fn snapsY(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_Y) != 0 }
+  pub fn snapMandatory(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_MANDATORY) != 0 }
+  /// The item's `scroll-snap-align` on that axis.
+  pub fn alignX(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 3), 3) }
+  pub fn alignY(self: &Self) -> u8 { return u8.bitAnd(u8.shiftRight(self.snap, 5), 3) }
+  /// The item's `scroll-snap-stop: always`.
+  pub fn snapStop(self: &Self) -> bool { return u8.bitAnd(self.snap, SNAP_STOP) != 0 }
+
+  fn setSnapType(self: &mut Self, bits: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 248), bits)
+  }
+
+  fn setSnapAlign(self: &mut Self, x: u8, y: u8) -> () {
+    self.snap = u8.bitOr(u8.bitAnd(self.snap, 135), u8.bitOr(u8.shiftLeft(x, 3), u8.shiftLeft(y, 5)))
+  }
+
+  fn setSnapStop(self: &mut Self, always: bool) -> () {
+    self.snap = if always { u8.bitOr(self.snap, SNAP_STOP) } else { u8.bitAnd(self.snap, 127) }
+  }
+}
+
+/// `ScrollStyle.touch` bits: the directions a touch may start panning in (`pan-left` is the
+/// finger moving right, the content scrolling left) and `pinch-zoom`.
+pub const TOUCH_PAN_LEFT: u8 = 1
+pub const TOUCH_PAN_RIGHT: u8 = 2
+pub const TOUCH_PAN_UP: u8 = 4
+pub const TOUCH_PAN_DOWN: u8 = 8
+pub const TOUCH_PINCH: u8 = 16
+pub const TOUCH_PAN_X: u8 = 3
+pub const TOUCH_PAN_Y: u8 = 12
+/// `auto` and `manipulation`: every gesture (the tree has no double-tap zoom to leave out).
+pub const TOUCH_AUTO: u8 = 31
+
+fn touchWord(word: Keyword) -> u8 {
+  return if word == Keyword.PanX { TOUCH_PAN_X }
+    else if word == Keyword.PanLeft { TOUCH_PAN_LEFT }
+    else if word == Keyword.PanRight { TOUCH_PAN_RIGHT }
+    else if word == Keyword.PanY { TOUCH_PAN_Y }
+    else if word == Keyword.PanUp { TOUCH_PAN_UP }
+    else if word == Keyword.PanDown { TOUCH_PAN_DOWN }
+    else if word == Keyword.PinchZoom { TOUCH_PINCH }
+    else { 0 }
+}
+
+/// `touch-action`: `auto`, `none`, `manipulation`, or up to one horizontal pan word, one
+/// vertical pan word and `pinch-zoom`, in any order.
+fn touchActionOf(value: &Value) -> Option<u8> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    if word == Keyword.Auto || word == Keyword.Manipulation { return Option<u8>.some(TOUCH_AUTO) }
+    if word == Keyword.None { return Option<u8>.some(0) }
+    let bits = touchWord(word)
+    return if bits == 0 { Option<u8>.None } else { Option<u8>.some(bits) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length > 3 { return Option<u8>.None }
+    let mut bits: u8 = 0
+    let mut i: usize = 0
+    while i < items.length {
+      let word = match convert.keywordOf(&items[i]) {
+        Option.Some { value: found } => found
+        Option.None => { return Option<u8>.None }
+      }
+      let one = touchWord(word)
+      // Each group (horizontal, vertical, pinch) may be named once.
+      let group: u8 = if u8.bitAnd(one, TOUCH_PAN_X) != 0 { TOUCH_PAN_X }
+        else if u8.bitAnd(one, TOUCH_PAN_Y) != 0 { TOUCH_PAN_Y }
+        else { one }
+      if one == 0 || u8.bitAnd(bits, group) != 0 { return Option<u8>.None }
+      bits = u8.bitOr(bits, one)
+      i = i + 1
+    }
+    return Option<u8>.some(bits)
+  }
+  return Option<u8>.None
+}
+
+/// `scroll-snap-type`: `none`, or an axis and an optional strictness.
+fn snapTypeOf(value: &Value) -> Option<u8> {
+  let mut axis: u8 = 0
+  let mut strict: u8 = 0
+  let mut words: [Keyword; 2] = [Keyword.None; 2]
+  let mut count: usize = 0
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    words[0] = word
+    count = 1
+  } else if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<u8>.None }
+    let mut i: usize = 0
+    while i < 2 {
+      match convert.keywordOf(&items[i]) {
+        Option.Some { value: word } => { words[i] = word }
+        Option.None => { return Option<u8>.None }
+      }
+      i = i + 1
+    }
+    count = 2
+  } else {
+    return Option<u8>.None
+  }
+  let first = words[0]
+  if first == Keyword.None { return if count == 1 { Option<u8>.some(0) } else { Option<u8>.None } }
+  // Block and inline are y and x in horizontal writing modes.
+  axis = if first == Keyword.X || first == Keyword.Inline { SNAP_X }
+    else if first == Keyword.Y || first == Keyword.Block { SNAP_Y }
+    else if first == Keyword.Both { u8.bitOr(SNAP_X, SNAP_Y) } else { 0 }
+  if axis == 0 { return Option<u8>.None }
+  if count == 2 {
+    if words[1] == Keyword.Mandatory { strict = SNAP_MANDATORY } else if words[1] != Keyword.Proximity { return Option<u8>.None }
+  }
+  return Option<u8>.some(u8.bitOr(axis, strict))
+}
+
+fn snapAlignWord(word: Keyword) -> u8 {
+  return if word == Keyword.None { SNAP_NONE } else if word == Keyword.Start { SNAP_START }
+    else if word == Keyword.Center { SNAP_CENTER } else if word == Keyword.End { SNAP_END } else { 255 }
+}
+
+/// `scroll-snap-align`: one value for both axes, or the block (y) then the inline (x) one.
+fn snapAlignOf(value: &Value) -> Option<[u8; 2]> {
+  if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
+    let a = snapAlignWord(word)
+    return if a == 255 { Option<[u8; 2]>.None } else { Option<[u8; 2]>.some([a, a]) }
+  }
+  if let Value.Sequence { separator: Separator.Space, values } = &value.* {
+    let items = values.asSlice()
+    if items.length != 2 { return Option<[u8; 2]>.None }
+    let block = match convert.keywordOf(&items[0]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    let inline = match convert.keywordOf(&items[1]) { Option.Some { value: word } => snapAlignWord(word) Option.None => 255 }
+    if block == 255 || inline == 255 { return Option<[u8; 2]>.None }
+    return Option<[u8; 2]>.some([inline, block])
+  }
+  return Option<[u8; 2]>.None
 }
 
 impl ScrollStyle {
@@ -682,9 +1048,20 @@ fn setDimension(target: &mut Dimension, value: &Value, context: &Context) -> () 
   }
 }
 
-// A width, height, minimum, maximum or flex basis, which also takes `min(100%, 600px)`.
-fn setSize(target: &mut SizeValue, value: &Value, context: &Context) -> () {
-  match convert.size(value, context) {
+// A width, height, minimum, maximum or flex basis, which also takes `min(100%, 600px)` and
+// `clamp(200px, 50% + 2rem, 800px)`, whose bounds go in `bounds`.
+fn setSize(target: &mut SizeValue, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.sizeIn(value, context, &mut bounds.*) {
+    Option.Some { value: found } => {
+      target.* = found
+    }
+    Option.None => {}
+  }
+}
+
+// A margin, padding or inset, which also takes `clamp(1rem, 5%, 3rem)` (see `setSize`).
+fn setEdge(target: &mut Dimension, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.edge(value, context, &mut bounds.*) {
     Option.Some { value: found } => {
       target.* = found
     }
@@ -700,8 +1077,8 @@ fn spacingOf(value: &Value, context: &Context) -> f32 {
   }
 }
 
-fn setGap(target: &mut Dimension, value: &Value, context: &Context) -> () {
-  match convert.dimension(value, context) {
+fn setGap(target: &mut Dimension, bounds: &mut Bounds, value: &Value, context: &Context) -> () {
+  match convert.edge(value, context, &mut bounds.*) {
     Option.Some { value: found } => {
       target.* = if found.kind == DimensionKind.Auto || found.kind == DimensionKind.None {
         Dimension.keyword(DimensionKind.Normal)
@@ -721,6 +1098,23 @@ fn setScrollPadding(target: &mut Dimension, value: &Value, context: &Context) ->
     }
     Option.None => {}
   }
+}
+
+/// A `zoom` value: a non-negative number or percentage, `normal` for 1. Zero is 1, as in browsers.
+pub fn zoomOf(value: &Value) -> Option<f32> {
+  if convert.isKeyword(value, Keyword.Normal) { return Option<f32>.some(1.0) }
+  return match &value.* {
+    Value.Unit { value: amount, unit } => {
+      let factor: f32 = if unit == Unit.Number { amount } else if unit == Unit.Percent { amount / 100.0 } else { -1.0 }
+      if factor < 0.0 { Option<f32>.None } else if factor == 0.0 { Option<f32>.some(1.0) } else { Option<f32>.some(factor) }
+    }
+    _ => Option<f32>.None
+  }
+}
+
+fn zoomedEdges(edges: Edges, ratio: f32) -> Edges {
+  return Edges { top: edges.top.zoomed(ratio), right: edges.right.zoomed(ratio),
+    bottom: edges.bottom.zoomed(ratio), left: edges.left.zoomed(ratio) }
 }
 
 fn setPixels(target: &mut f32, value: &Value, context: &Context) -> () {
@@ -759,16 +1153,86 @@ fn setRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context
   }
 }
 
+/// Whether `value` is a valid corner radius: a length-percentage, not negative.
+fn validRadius(value: &Value, context: &Context) -> bool {
+  return match convert.dimension(value, context) {
+    Option.Some { value: found } => (found.kind == DimensionKind.Length || found.kind == DimensionKind.Percent
+      || found.kind == DimensionKind.Calc) && found.value >= 0.0 && found.percent >= 0.0
+    Option.None => false
+  }
+}
+
+/// A corner radius longhand: one radius for both axes, or a horizontal and a vertical one
+/// (`8px 4px`). `length` keeps the horizontal length part; a vertical radius is noted in
+/// `effects` for `paint_css` to read, as a percentage is.
+fn setCornerRadius(length: &mut f32, effects: &mut EffectState, value: &Value, context: &Context) -> () {
+  match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => {
+      let items = values.asSlice()
+      if items.length == 2 {
+        setCornerPair(&mut length.*, &mut effects.*, &items[0], &items[1], true, context)
+      }
+    }
+    _ => setCornerPair(&mut length.*, &mut effects.*, value, value, false, context)
+  }
+}
+
+/// A corner's radii: `horizontal`, and `vertical` when `paired` (else the same).
+fn setCornerPair(length: &mut f32, effects: &mut EffectState, horizontal: &Value, vertical: &Value, paired: bool, context: &Context) -> () {
+  if !validRadius(horizontal, context) {
+    return
+  }
+  if paired {
+    if !validRadius(vertical, context) {
+      return
+    }
+    effects.radiusShare = true
+    effects.declared = true
+  }
+  if hasPercent(horizontal) { setRadius(&mut length.*, &mut effects.*, horizontal, context) } else { setPixels(&mut length.*, horizontal, context) }
+}
+
+/// How many space-separated values `value` lists (one for a single value).
+fn spacedCount(value: &Value) -> usize {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => values.length()
+    _ => 1
+  }
+}
+
+/// Value `index` of a list of `spacedCount(value)` values.
+fn spacedItem(value: &Value, index: usize) -> &Value {
+  return match &value.* {
+    Value.Sequence { separator: Separator.Space, values } => &values.asSlice()[index]
+    _ => value
+  }
+}
+
+/// Which of `count` values (one to four) corner `corner` takes, top-left first, as `margin`
+/// repeats them.
+fn cornerPick(count: usize, corner: usize) -> usize {
+  if count == 1 {
+    return 0
+  }
+  if count == 2 {
+    return corner % 2
+  }
+  if count == 3 {
+    return if corner == 3 { 1 } else { corner }
+  }
+  return corner
+}
+
 /// A border width: a length, or `thin`, `medium`, `thick`.
 fn setBorderWidth(target: &mut f32, value: &Value, context: &Context) -> () {
   match convert.keywordOf(value) {
     Option.Some { value: word } => {
       if word == Keyword.Thin {
-        target.* = 1.0
+        target.* = context.zoom
       } else if word == Keyword.Medium {
-        target.* = 3.0
+        target.* = 3.0 * context.zoom
       } else if word == Keyword.Thick {
-        target.* = 5.0
+        target.* = 5.0 * context.zoom
       }
     }
     Option.None => {
@@ -829,15 +1293,18 @@ pub fn requiresContext(list: &[Declaration]) -> bool {
       CssProperty.WritingMode | CssProperty.Direction | CssProperty.TextOrientation
         | CssProperty.ContainerName | CssProperty.Container
         | CssProperty.FontVariant | CssProperty.FontFeatureSettings | CssProperty.FontVariationSettings | CssProperty.FontWidth | CssProperty.FontStretch
+        | CssProperty.FontPalette | CssProperty.FontVariantAlternates | CssProperty.FontSizeAdjust | CssProperty.FontSmooth
         | CssProperty.FontVariantLigatures | CssProperty.FontVariantCaps | CssProperty.FontVariantNumeric
         | CssProperty.FontVariantPosition | CssProperty.FontKerning
         | CssProperty.Transform | CssProperty.Translate | CssProperty.Rotate | CssProperty.Scale
-        | CssProperty.TransformOrigin | CssProperty.Perspective | CssProperty.PerspectiveOrigin | CssProperty.BackfaceVisibility
+        | CssProperty.TransformOrigin | CssProperty.Perspective | CssProperty.PerspectiveOrigin | CssProperty.BackfaceVisibility | CssProperty.TransformStyle
+        | CssProperty.OffsetPath | CssProperty.OffsetDistance | CssProperty.OffsetRotate | CssProperty.OffsetAnchor | CssProperty.OffsetPosition
         | CssProperty.Animation | CssProperty.AnimationName | CssProperty.AnimationDuration | CssProperty.AnimationTimingFunction
         | CssProperty.AnimationDelay | CssProperty.AnimationIterationCount | CssProperty.AnimationDirection
         | CssProperty.AnimationFillMode | CssProperty.AnimationPlayState
         | CssProperty.Transition | CssProperty.TransitionProperty | CssProperty.TransitionDuration
-        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior => { return true }
+        | CssProperty.TransitionTimingFunction | CssProperty.TransitionDelay | CssProperty.TransitionBehavior
+        | CssProperty.Zoom => { return true }
       _ => {}
     }
     let font = declaration.property == CssProperty.FontSize || declaration.property == CssProperty.LineHeight
@@ -882,7 +1349,56 @@ impl Computed {
     context.containerHeight = self.containerHeight
     context.containerInlineSize = if context.vertical { self.containerHeight } else { self.containerWidth }
     context.containerBlockSize = if context.vertical { self.containerWidth } else { self.containerHeight }
+    context.zoom = self.text.zoom
+    context.rootFontSize = context.rootFontSize * self.text.zoom
     return context
+  }
+
+  /// Sets the effective zoom to `parentZoom` times the element's own `zoom`. Inherited
+  /// lengths, which the parent computed at its zoom, move to the new one.
+  pub fn setZoom(self: &mut Self, own: f32, parentZoom: f32) -> () {
+    let zoom = parentZoom * own
+    if zoom == self.text.zoom || self.text.zoom <= 0.0 { return () }
+    let ratio = zoom / self.text.zoom
+    self.text.rezoom(zoom)
+    self.layout.borderSpacingX = self.layout.borderSpacingX * ratio
+    self.layout.borderSpacingY = self.layout.borderSpacingY * ratio
+    // Lengths the element's own declarations have not set yet hold initial values.
+    self.outline.width = self.outline.width * ratio
+    self.columnRule.width = self.columnRule.width * ratio
+  }
+
+  /// This style with every length it holds multiplied by `ratio`, for `inherit` across a change
+  /// of zoom.
+  pub fn zoomedBy(self: &Self, ratio: f32) -> Computed {
+    let mut out = self.*
+    if ratio == 1.0 { return out }
+    out.text.rezoom(self.text.zoom * ratio)
+    let l = &mut out.layout
+    l.width = l.width.zoomed(ratio)
+    l.height = l.height.zoomed(ratio)
+    l.minWidth = l.minWidth.zoomed(ratio)
+    l.minHeight = l.minHeight.zoomed(ratio)
+    l.maxWidth = l.maxWidth.zoomed(ratio)
+    l.maxHeight = l.maxHeight.zoomed(ratio)
+    l.flexBasis = l.flexBasis.zoomed(ratio)
+    l.rowGap = l.rowGap.zoomed(ratio)
+    l.columnGap = l.columnGap.zoomed(ratio)
+    l.margin = zoomedEdges(l.margin, ratio)
+    l.padding = zoomedEdges(l.padding, ratio)
+    l.inset = zoomedEdges(l.inset, ratio)
+    l.border = zoomedEdges(l.border, ratio)
+    l.borderSpacingX = l.borderSpacingX * ratio
+    l.borderSpacingY = l.borderSpacingY * ratio
+    if l.columnWidth > 0.0 { l.columnWidth = l.columnWidth * ratio }
+    out.paint.border = Insets<f32> { top: out.paint.border.top * ratio, right: out.paint.border.right * ratio,
+      bottom: out.paint.border.bottom * ratio, left: out.paint.border.left * ratio }
+    out.paint.radii = Corners<f32> { topLeft: out.paint.radii.topLeft * ratio, topRight: out.paint.radii.topRight * ratio,
+      bottomRight: out.paint.radii.bottomRight * ratio, bottomLeft: out.paint.radii.bottomLeft * ratio }
+    out.outline.width = out.outline.width * ratio
+    out.outline.offset = out.outline.offset * ratio
+    out.columnRule.width = out.columnRule.width * ratio
+    return out
   }
   pub fn containerWidthBasis(self: &Self) -> f32 {
     return match self.containerWidth { Option.Some { value } => value _ => self.viewportWidth }
@@ -915,12 +1431,18 @@ impl Computed {
       transform: Transform.initial(),
       zIndex: 0,
       zAuto: true,
+      nearest: false,
+      emptyCellsHide: false,
       outline: Outline.initial(),
       columnRule: ColumnRule.initial(),
       scroll: ScrollStyle.initial(),
       cursor: Option<Cursor>.None,
+      cursorUrl: false,
       contain: Containment.initial(),
       list: ListStyle.initial(),
+      anchor: AnchorStyle.none(),
+      userSelect: SELECT_AUTO,
+      svg: SvgPaint.initial(),
     }
   }
 
@@ -966,6 +1488,45 @@ impl Computed {
         self.set(c, value, context)
         self.set(d, value, context)
       }
+    }
+  }
+
+  /// `border-radius`: one to four radii, then optionally a slash and one to four vertical radii.
+  fn radiusShorthand(self: &mut Self, value: &Value, context: &Context) -> () {
+    let mut horizontal = value
+    let mut vertical = value
+    let mut paired = false
+    match &value.* {
+      Value.Sequence { separator: Separator.Slash, values } => {
+        let items = values.asSlice()
+        if items.length != 2 {
+          return ()
+        }
+        horizontal = &items[0]
+        vertical = &items[1]
+        paired = true
+      }
+      _ => {}
+    }
+    let across = spacedCount(horizontal)
+    let down = spacedCount(vertical)
+    if across == 0 || across > 4 || down == 0 || down > 4 {
+      return ()
+    }
+    let mut corner: usize = 0
+    while corner < 4 {
+      let h = spacedItem(horizontal, cornerPick(across, corner))
+      let v = spacedItem(vertical, cornerPick(down, corner))
+      if corner == 0 {
+        setCornerPair(&mut self.paint.radii.topLeft, &mut self.effects, h, v, paired, context)
+      } else if corner == 1 {
+        setCornerPair(&mut self.paint.radii.topRight, &mut self.effects, h, v, paired, context)
+      } else if corner == 2 {
+        setCornerPair(&mut self.paint.radii.bottomRight, &mut self.effects, h, v, paired, context)
+      } else {
+        setCornerPair(&mut self.paint.radii.bottomLeft, &mut self.effects, h, v, paired, context)
+      }
+      corner = corner + 1
     }
   }
 
@@ -1039,9 +1600,20 @@ impl Computed {
       CssProperty.ContentVisibility => {
         if let Option<Keyword>.Some { value: word } = convert.keywordOf(value) {
           if word == Keyword.Hidden || word == Keyword.Visible || word == Keyword.Auto {
-            self.contain.setHidden(word == Keyword.Hidden, &mut self.layout)
+            self.contain.setVisibility(word == Keyword.Hidden, word == Keyword.Auto, &mut self.layout)
           }
         }
+      }
+      CssProperty.ContainIntrinsicSize | CssProperty.ContainIntrinsicHeight | CssProperty.ContainIntrinsicBlockSize => {
+        // The last length: `auto 300px`, `200px 300px` and `300px` all give a block size of 300.
+        let mut last = value
+        if let Value.Sequence { values, .. } = &value.* {
+          if values.length() != 0 { last = &values.asSlice()[values.length() - 1] }
+        }
+        let mut size = SizeValue.auto()
+        let mut bounds = Bounds.none()
+        setSize(&mut size, &mut bounds, last, &context)
+        self.contain.setIntrinsic(if size.kind == DimensionKind.Length { size.value } else { -1.0 })
       }
       CssProperty.Container => {
         self.contain.setQuery(SizeContainment.None, &mut self.layout)
@@ -1063,7 +1635,7 @@ impl Computed {
         self.four(value, CssProperty.BorderTopWidth, CssProperty.BorderRightWidth, CssProperty.BorderBottomWidth, CssProperty.BorderLeftWidth, &context)
       }
       CssProperty.BorderRadius => {
-        self.four(value, CssProperty.BorderTopLeftRadius, CssProperty.BorderTopRightRadius, CssProperty.BorderBottomRightRadius, CssProperty.BorderBottomLeftRadius, &context)
+        self.radiusShorthand(value, &context)
       }
       // The tree paints one border color and style, so every side sets the same one.
       CssProperty.BorderColor => {
@@ -1105,12 +1677,29 @@ impl Computed {
       }
       // Sizes and edges.
       CssProperty.Cursor => {
+        self.cursorUrl = false
         match &value.* {
           Value.Keyword { value: word } => {
             self.cursor = cursorOf(keywords.name(word))
           }
           Value.Text { css } => {
-            self.cursor = cursorOf(Bytes.asSlice(&css))
+            self.cursor = textCursor(Bytes.asSlice(&css))
+            self.cursorUrl = textHasUrl(Bytes.asSlice(&css))
+          }
+          Value.Sequence { values, .. } => {
+            // `url(...) x y, ..., keyword`: the images are read back on hover.
+            self.cursorUrl = true
+            let list = values.asSlice()
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
+            if list.length > 0 {
+              if let Value.Keyword { value: word } = &list[list.length - 1] {
+                self.cursor = cursorOf(keywords.name(word))
+              }
+            }
+          }
+          Value.Function { .. } => {
+            self.cursorUrl = true
+            self.cursor = Option<Cursor>.Some { value: Cursor.Default }
           }
           _ => {}
         }
@@ -1197,16 +1786,16 @@ impl Computed {
       }
       // The tree paints one border style and color, so every side sets them.
       CssProperty.BorderBlockStartStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 1)
       }
       CssProperty.BorderBlockEndStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 4)
       }
       CssProperty.BorderInlineStartStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 8)
       }
       CssProperty.BorderInlineEndStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 2)
       }
       CssProperty.BorderBlockStartColor => {
         drop setColor(&mut self.paint.borderColor, value)
@@ -1317,6 +1906,30 @@ impl Computed {
       CssProperty.OverscrollBehaviorY => {
         setOverscroll(&mut self.scroll.overscrollY, value)
       }
+      CssProperty.AnchorName => { self.anchor.setName(value) }
+      CssProperty.PositionAnchor => { self.anchor.setTarget(value) }
+      CssProperty.PositionArea => { self.anchor.setArea(value) }
+      CssProperty.PositionTryFallbacks => { self.anchor.setTries(value) }
+      CssProperty.ScrollSnapType => {
+        if let Option<u8>.Some { value: bits } = snapTypeOf(value) { self.scroll.setSnapType(bits) }
+      }
+      CssProperty.ScrollSnapAlign => {
+        if let Option<[u8; 2]>.Some { value: pair } = snapAlignOf(value) { self.scroll.setSnapAlign(pair[0], pair[1]) }
+      }
+      CssProperty.TouchAction => {
+        if let Option<u8>.Some { value: bits } = touchActionOf(value) { self.scroll.touch = bits }
+      }
+      CssProperty.ScrollSnapStop => {
+        if convert.isKeyword(value, Keyword.Always) { self.scroll.setSnapStop(true) }
+        else if convert.isKeyword(value, Keyword.Normal) { self.scroll.setSnapStop(false) }
+      }
+      CssProperty.OverflowAnchor => {
+        if convert.isKeyword(value, Keyword.None) {
+          self.scroll.anchorNone = true
+        } else if convert.isKeyword(value, Keyword.Auto) {
+          self.scroll.anchorNone = false
+        }
+      }
       CssProperty.ScrollBehavior => {
         if convert.isKeyword(value, Keyword.Smooth) {
           self.scroll.smooth = true
@@ -1349,91 +1962,91 @@ impl Computed {
         setScrollPadding(&mut self.scroll.padding.left, value, &context)
       }
       CssProperty.Width => {
-        setSize(&mut self.layout.width, value, &context)
+        if !self.anchor.setSize(true, value) { setSize(&mut self.layout.width, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.Height => {
-        setSize(&mut self.layout.height, value, &context)
+        if !self.anchor.setSize(false, value) { setSize(&mut self.layout.height, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.MinWidth => {
-        setSize(&mut self.layout.minWidth, value, &context)
+        setSize(&mut self.layout.minWidth, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MinHeight => {
-        setSize(&mut self.layout.minHeight, value, &context)
+        setSize(&mut self.layout.minHeight, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MaxWidth => {
-        setSize(&mut self.layout.maxWidth, value, &context)
+        setSize(&mut self.layout.maxWidth, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MaxHeight => {
-        setSize(&mut self.layout.maxHeight, value, &context)
+        setSize(&mut self.layout.maxHeight, &mut self.layout.bounds, value, &context)
       }
       CssProperty.FlexBasis => {
-        setSize(&mut self.layout.flexBasis, value, &context)
+        setSize(&mut self.layout.flexBasis, &mut self.layout.bounds, value, &context)
       }
       CssProperty.RowGap => {
-        setGap(&mut self.layout.rowGap, value, &context)
+        setGap(&mut self.layout.rowGap, &mut self.layout.bounds, value, &context)
       }
       CssProperty.ColumnGap => {
-        setGap(&mut self.layout.columnGap, value, &context)
+        setGap(&mut self.layout.columnGap, &mut self.layout.bounds, value, &context)
       }
       CssProperty.MarginTop => {
-        setDimension(&mut self.layout.margin.top, value, &context)
+        setEdge(&mut self.layout.margin.top, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingTop => {
-        setDimension(&mut self.layout.padding.top, value, &context)
+        setEdge(&mut self.layout.padding.top, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Top => {
-        setDimension(&mut self.layout.inset.top, value, &context)
+        if self.anchor.setEdge(0, value) { self.layout.inset.top = Dimension.auto() } else { setEdge(&mut self.layout.inset.top, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderTopWidth => {
         setBorderWidth(&mut self.paint.border.top, value, &context)
       }
       CssProperty.MarginRight => {
-        setDimension(&mut self.layout.margin.right, value, &context)
+        setEdge(&mut self.layout.margin.right, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingRight => {
-        setDimension(&mut self.layout.padding.right, value, &context)
+        setEdge(&mut self.layout.padding.right, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Right => {
-        setDimension(&mut self.layout.inset.right, value, &context)
+        if self.anchor.setEdge(1, value) { self.layout.inset.right = Dimension.auto() } else { setEdge(&mut self.layout.inset.right, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderRightWidth => {
         setBorderWidth(&mut self.paint.border.right, value, &context)
       }
       CssProperty.MarginBottom => {
-        setDimension(&mut self.layout.margin.bottom, value, &context)
+        setEdge(&mut self.layout.margin.bottom, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingBottom => {
-        setDimension(&mut self.layout.padding.bottom, value, &context)
+        setEdge(&mut self.layout.padding.bottom, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Bottom => {
-        setDimension(&mut self.layout.inset.bottom, value, &context)
+        if self.anchor.setEdge(2, value) { self.layout.inset.bottom = Dimension.auto() } else { setEdge(&mut self.layout.inset.bottom, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderBottomWidth => {
         setBorderWidth(&mut self.paint.border.bottom, value, &context)
       }
       CssProperty.MarginLeft => {
-        setDimension(&mut self.layout.margin.left, value, &context)
+        setEdge(&mut self.layout.margin.left, &mut self.layout.bounds, value, &context)
       }
       CssProperty.PaddingLeft => {
-        setDimension(&mut self.layout.padding.left, value, &context)
+        setEdge(&mut self.layout.padding.left, &mut self.layout.bounds, value, &context)
       }
       CssProperty.Left => {
-        setDimension(&mut self.layout.inset.left, value, &context)
+        if self.anchor.setEdge(3, value) { self.layout.inset.left = Dimension.auto() } else { setEdge(&mut self.layout.inset.left, &mut self.layout.bounds, value, &context) }
       }
       CssProperty.BorderLeftWidth => {
         setBorderWidth(&mut self.paint.border.left, value, &context)
       }
       CssProperty.BorderTopLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topLeft, &mut self.effects, value, &context)
       }
       CssProperty.BorderTopRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.topRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.topRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomRightRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomRight, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomRight, &mut self.effects, value, &context)
       }
       CssProperty.BorderBottomLeftRadius => {
-        if hasPercent(value) { setRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context) } else { setPixels(&mut self.paint.radii.bottomLeft, value, &context) }
+        setCornerRadius(&mut self.paint.radii.bottomLeft, &mut self.effects, value, &context)
       }
       // Keywords.
       CssProperty.Position => {
@@ -1455,6 +2068,15 @@ impl Computed {
           Option.Some { value: word } => {
             if word == Keyword.Collapse { self.layout.borderCollapse = BorderCollapse.Collapse }
             if word == Keyword.Separate { self.layout.borderCollapse = BorderCollapse.Separate }
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.EmptyCells => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.Hide { self.emptyCellsHide = true }
+            if word == Keyword.Show { self.emptyCellsHide = false }
           }
           Option.None => {}
         }
@@ -1697,6 +2319,18 @@ impl Computed {
           Option.None => {}
         }
       }
+      CssProperty.WrapFlow => {
+        if let Option.Some { value: found } = wrapFlowOf(value) { self.layout.wrapFlow = found }
+      }
+      CssProperty.WrapThrough => {
+        match wordOf(value) {
+          Option.Some { value: word } => {
+            if keywordNamed(word, b"wrap") { self.layout.wrapThrough = WrapThrough.Wrap }
+            if keywordNamed(word, b"none") { self.layout.wrapThrough = WrapThrough.None }
+          }
+          Option.None => {}
+        }
+      }
       CssProperty.Clear => {
         match convert.keywordOf(value) {
           Option.Some { value: word } => {
@@ -1934,6 +2568,31 @@ impl Computed {
           Option.None => {}
         }
       }
+      CssProperty.TextBox => {
+        match convert.textBox(value) {
+          Option.Some { value: found } => {
+            self.layout.textBoxTrim = found.trim
+            self.text.textBoxEdge = found.edge
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextBoxTrim => {
+        match convert.textBoxTrim(value) {
+          Option.Some { value: found } => {
+            self.layout.textBoxTrim = found
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextBoxEdge => {
+        match convert.textBoxEdge(value) {
+          Option.Some { value: found } => {
+            self.text.textBoxEdge = found
+          }
+          Option.None => {}
+        }
+      }
       CssProperty.TextIndent => {
         match convert.textIndent(value, &context) {
           Option.Some { value: found } => {
@@ -2059,7 +2718,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.orphans = f32.toUsize(found)
+              self.text.orphans = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2069,7 +2728,7 @@ impl Computed {
         match convert.number(value) {
           Option.Some { value: found } => {
             if found >= 1.0 {
-              self.text.widows = f32.toUsize(found)
+              self.text.widows = f32.toU32(found)
             }
           }
           Option.None => {}
@@ -2140,6 +2799,13 @@ impl Computed {
           }
         }
       }
+      CssProperty.Fill => { setPaint(&mut self.svg.fillKind, &mut self.svg.fill, value) }
+      CssProperty.Stroke => { setPaint(&mut self.svg.strokeKind, &mut self.svg.stroke, value) }
+      CssProperty.StrokeWidth => {
+        if let Option.Some { value: found } = convert.length(value, &context) {
+          if found >= 0.0 { self.svg.strokeWidth = if context.zoom > 0.0 { found / context.zoom } else { found } }
+        }
+      }
       CssProperty.Opacity => {
         if let Option.Some { value: found } = alpha(value) {
           self.paint.opacity = f32.max(0.0, f32.min(1.0, found))
@@ -2176,16 +2842,16 @@ impl Computed {
         drop setColor(&mut self.paint.borderColor, value)
       }
       CssProperty.BorderTopStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 1)
       }
       CssProperty.BorderRightStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 2)
       }
       CssProperty.BorderBottomStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 4)
       }
       CssProperty.BorderLeftStyle => {
-        self.setBorderStyle(value)
+        self.setBorderStyle(value, 8)
       }
       CssProperty.BoxShadow => {
         if convert.isKeyword(value, Keyword.None) {
@@ -2206,6 +2872,27 @@ impl Computed {
             self.paint.backdropBlur = f32.max(0.0, found)
           }
           Option.None => {}
+        }
+      }
+      CssProperty.ImageRendering => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            self.nearest = word == Keyword.Pixelated || word == Keyword.CrispImageEdges || word == Keyword.OptimizeSpeed
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.UserSelect => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.userSelect = SELECT_AUTO
+        } else if convert.isKeyword(value, Keyword.Text) {
+          self.userSelect = SELECT_TEXT
+        } else if convert.isKeyword(value, Keyword.None) {
+          self.userSelect = SELECT_NONE
+        } else if convert.isKeyword(value, Keyword.All) {
+          self.userSelect = SELECT_ALL
+        } else if convert.isKeyword(value, Keyword.Contain) {
+          self.userSelect = SELECT_CONTAIN
         }
       }
       CssProperty.PointerEvents => {
@@ -2360,6 +3047,31 @@ impl Computed {
       CssProperty.SilkSelectionColor => {
         drop setColor(&mut self.text.selectionColor, value)
       }
+      CssProperty.TextEmphasisStyle => {
+        match convert.textEmphasisStyle(value) {
+          Option.Some { value: found } => { self.text.emphasis.mark = found }
+          Option.None => {}
+        }
+      }
+      CssProperty.TextEmphasisColor => {
+        let mut mark = self.text.color
+        let given = !convert.isKeyword(value, Keyword.Currentcolor) && setColor(&mut mark, value)
+        self.text.emphasis.color = if given { TextStyle.packFill(mark) } else { 0 }
+      }
+      CssProperty.TextEmphasisPosition => {
+        match convert.textEmphasisPosition(value) {
+          Option.Some { value: found } => {
+            self.text.emphasis.under = found.under
+            self.text.emphasis.left = found.left
+          }
+          Option.None => {}
+        }
+      }
+      CssProperty.WebkitTextFillColor => {
+        let mut fill = self.text.color
+        let given = !convert.isKeyword(value, Keyword.Currentcolor) && setColor(&mut fill, value)
+        self.text.fillColor = if given { TextStyle.packFill(fill) } else { 0 }
+      }
       CssProperty.SilkPlaceholderColor => {
         if convert.isKeyword(value, Keyword.Auto) {
           self.text.hasPlaceholderColor = false
@@ -2376,9 +3088,16 @@ impl Computed {
     }
   }
 
-  fn setBorderStyle(self: &mut Self, value: &Value) -> () {
+  /// `side` is the physical side's bit in `layout.borderHidden` (top 1, right 2, bottom 4,
+  /// left 8): `hidden` marks it, which lays out as zero and wins collapsed-border conflicts.
+  fn setBorderStyle(self: &mut Self, value: &Value, side: u8) -> () {
     match convert.keywordOf(value) {
       Option.Some { value: word } => {
+        if word == Keyword.Hidden {
+          self.layout.borderHidden = self.layout.borderHidden | side
+          return ()
+        }
+        self.layout.borderHidden = self.layout.borderHidden & (15 - side)
         match keyword_enums.borderStyleOf(word) {
           Option.Some { value: found } => {
             self.paint.borderStyle = found
@@ -2426,6 +3145,8 @@ impl Computed {
     }
     h = colorHash(h, self.paint.borderColor)
     h = Hash.combine(h, borderStyleIndex(self.paint.borderStyle))
+    let emptyBit: u64 = if self.emptyCellsHide { 16 } else { 0 }
+    h = Hash.combine(h, u8.toU64(self.layout.borderHidden) + emptyBit)
     h = floatHash(h, self.paint.radii.topLeft)
     h = floatHash(h, self.paint.radii.topRight)
     h = floatHash(h, self.paint.radii.bottomRight)
@@ -2455,6 +3176,7 @@ impl Computed {
       h = Hash.combine(h, borderStyleIndex(self.columnRule.style))
       h = if self.columnRule.current { Hash.combine(h, 5) } else { colorHash(h, self.columnRule.color) }
     }
+    h = Hash.combine(h, self.svg.key())
     h = floatHash(h, self.paint.opacity)
     h = floatHash(h, self.paint.backdropBlur)
     h = Hash.combine(Hash.combine(h, self.effects.hash), self.effects.shadowHash)
@@ -2483,8 +3205,19 @@ impl Computed {
     h = colorHash(h, self.text.caret())
     h = colorHash(h, self.text.selectionColor)
     h = colorHash(h, self.text.placeholder())
+    if self.text.fillColor != 0 { h = Hash.combine(h, u32.toU64(self.text.fillColor)) }
+    // font-palette and font-smooth only change paint; the other extras change layout too.
+    if self.text.features.extras != 0 { h = Hash.combine(h, u32.toU64(self.text.features.extras)) }
+    if self.text.emphasis.mark != 0 {
+      h = Hash.combine(Hash.combine(h, u32.toU64(self.text.emphasis.mark)), u32.toU64(self.text.emphasis.color))
+      let side: u64 = if self.text.emphasis.under { 1 } else { 0 }
+      let edge: u64 = if self.text.emphasis.left { 2 } else { 0 }
+      h = Hash.combine(h, side + edge)
+    }
     if self.contain.paint() { h = Hash.combine(h, if self.contain.hidden() { 5 } else { 4 }) }
+    if self.contain.layout() { h = Hash.combine(h, 6) }
     if !self.scroll.colors.auto() { h = Hash.combine(Hash.combine(h, 3), self.scroll.colors.words()) }
+    if self.nearest { h = Hash.combine(h, 6) }
     h = Hash.combine(
       h,
       if self.paint.pointerEvents {
@@ -2493,6 +3226,7 @@ impl Computed {
         0
       },
     )
+    h = Hash.combine(h, u8.toU64(self.userSelect))
     return h
   }
 
@@ -2506,6 +3240,13 @@ impl Computed {
     } else {
       borderEdges(self.paint.border)
     }
+    let hidden = self.layout.borderHidden
+    if hidden != 0 {
+      if hidden & 1 != 0 { self.layout.border.top = Dimension.px(0.0) }
+      if hidden & 2 != 0 { self.layout.border.right = Dimension.px(0.0) }
+      if hidden & 4 != 0 { self.layout.border.bottom = Dimension.px(0.0) }
+      if hidden & 8 != 0 { self.layout.border.left = Dimension.px(0.0) }
+    }
     self.layout.lineHeight = text.lineHeight
     self.layout.textAlign = text.align
     self.layout.direction = text.direction
@@ -2518,59 +3259,15 @@ impl Computed {
     self.layout.whiteSpaceCollapse = text.whiteSpaceCollapse
     self.layout.textJustify = text.textJustify
     self.layout.textIndent = text.textIndent
+    self.layout.textBoxEdge = text.textBoxEdge
+    // Vertical lines put `right` marks on their over side, horizontal ones `over` marks.
+    let vertical = text.writingMode != WritingMode.HorizontalTb
+    let under = if vertical { text.emphasis.left } else { text.emphasis.under }
+    self.layout.emphasis = if text.emphasis.mark == 0 { EmphasisSide.None } else if under { EmphasisSide.Under } else { EmphasisSide.Over }
     self.layout.tabSize = text.tabSize
-    self.layout.orphans = text.orphans
-    self.layout.widows = text.widows
+    self.layout.orphans = u32.toUsize(text.orphans)
+    self.layout.widows = u32.toUsize(text.widows)
   }
-}
-
-fn named(name: &[u8], word: &[u8]) -> bool {
-  if name.length != word.length { return false }
-  let mut i: usize = 0
-  while i < name.length {
-    let byte = if name[i] >= 65 && name[i] <= 90 { name[i] + 32 } else { name[i] }
-    if byte != word[i] { return false }
-    i = i + 1
-  }
-  return true
-}
-
-/// The tree's cursor for a CSS `cursor` keyword; None for `auto`. Keywords without a cursor
-/// of their own take the nearest one.
-pub fn cursorOf(name: &[u8]) -> Option<Cursor> {
-  if named(name, b"auto") { return Option<Cursor>.None }
-  if named(name, b"pointer") { return Option<Cursor>.Some { value: Cursor.Pointer } }
-  if named(name, b"text") { return Option<Cursor>.Some { value: Cursor.Text } }
-  if named(name, b"none") { return Option<Cursor>.Some { value: Cursor.None } }
-  if named(name, b"wait") { return Option<Cursor>.Some { value: Cursor.Wait } }
-  if named(name, b"progress") { return Option<Cursor>.Some { value: Cursor.Progress } }
-  if named(name, b"help") { return Option<Cursor>.Some { value: Cursor.Help } }
-  if named(name, b"context-menu") { return Option<Cursor>.Some { value: Cursor.ContextMenu } }
-  if named(name, b"copy") { return Option<Cursor>.Some { value: Cursor.Copy } }
-  if named(name, b"alias") { return Option<Cursor>.Some { value: Cursor.Alias } }
-  if named(name, b"vertical-text") { return Option<Cursor>.Some { value: Cursor.VerticalText } }
-  if named(name, b"col-resize") { return Option<Cursor>.Some { value: Cursor.ColumnResize } }
-  if named(name, b"row-resize") { return Option<Cursor>.Some { value: Cursor.RowResize } }
-  if named(name, b"zoom-in") { return Option<Cursor>.Some { value: Cursor.ZoomIn } }
-  if named(name, b"zoom-out") { return Option<Cursor>.Some { value: Cursor.ZoomOut } }
-  if named(name, b"move") || named(name, b"all-scroll") { return Option<Cursor>.Some { value: Cursor.Move } }
-  if named(name, b"grab") { return Option<Cursor>.Some { value: Cursor.Grab } }
-  if named(name, b"grabbing") { return Option<Cursor>.Some { value: Cursor.Grabbing } }
-  if named(name, b"not-allowed") || named(name, b"no-drop") { return Option<Cursor>.Some { value: Cursor.NotAllowed } }
-  if named(name, b"ew-resize") || named(name, b"e-resize") || named(name, b"w-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeHorizontal }
-  }
-  if named(name, b"ns-resize") || named(name, b"n-resize") || named(name, b"s-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeVertical }
-  }
-  if named(name, b"nwse-resize") || named(name, b"nw-resize") || named(name, b"se-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthWestSouthEast }
-  }
-  if named(name, b"nesw-resize") || named(name, b"ne-resize") || named(name, b"sw-resize") {
-    return Option<Cursor>.Some { value: Cursor.ResizeNorthEastSouthWest }
-  }
-  if named(name, b"crosshair") || named(name, b"cell") { return Option<Cursor>.Some { value: Cursor.Crosshair } }
-  return Option<Cursor>.Some { value: Cursor.Default }
 }
 
 fn borderEdges(border: Insets<f32>) -> Edges {

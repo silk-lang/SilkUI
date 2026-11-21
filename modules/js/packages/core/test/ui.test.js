@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut } = await import("../src/index.js");
+const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut, setApplicationMenu, showOpenDialog, showSaveDialog, showContextMenu, appWindow, createWebView, clearWebViewData } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -20,6 +20,24 @@ test("nodes queue their mutations", () => {
   ]);
   assert.equal(label.parentNode, box);
   assert.equal(nodeById(box.nodeId), box);
+});
+
+test("class aliases distinguish absent and empty alongside other attributes", () => {
+  const box = createBox();
+  mock.take();
+  box.setAttribute("className", "");
+  assert.equal(box.hasAttribute("class"), true);
+  box.setAttribute("data-mode", "on");
+  box.setAttribute("class", 42);
+  assert.equal(box.getAttribute("className"), "42");
+  box.removeAttribute("className");
+  assert.equal(box.className, "");
+  assert.equal(box.hasAttribute("class"), false);
+  assert.equal(box.getAttribute("data-mode"), "on");
+  assert.deepEqual(mock.take(), [
+    ["attribute", box.nodeId, "class", ""], ["attribute", box.nodeId, "data-mode", "on"],
+    ["attribute", box.nodeId, "class", "42"], ["attribute", box.nodeId, "class", null],
+  ]);
 });
 
 test("a style sends what changed, and removal restarts the look", () => {
@@ -74,7 +92,65 @@ test("listen flags follow the listeners", () => {
   box.addEventListener("keydown", listener, { once: true });
   box.removeEventListener("click", listener);
   assert.deepEqual(mock.take(), [["listen", box.nodeId, 4], ["listen", box.nodeId, 4 | 128], ["listen", box.nodeId, 128]]);
-  assert.throws(() => box.addEventListener("nope", listener), /no event/);
+  box.addEventListener("ping", listener);
+  assert.deepEqual(mock.take(), []);
+});
+
+test("a host keydown answers getModifierState from its modifier keys", () => {
+  const box = createBox();
+  const seen = [];
+  box.addEventListener("keydown", (event) => seen.push(["Shift", "Control", "Alt", "Meta", "CapsLock"].map((key) => event.getModifierState(key))));
+  // Shift (1) and Meta (8) down.
+  mock.native.dispatch(7, box.nodeId, 0, 0, 9, 0, 0, "Enter", "Enter");
+  assert.deepEqual(seen, [[true, false, false, true, false]]);
+});
+
+test("the app's own events go through the tree as on the web", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.append(inner);
+  const log = [];
+  outer.addEventListener("ping", (event) => log.push("outer capture " + event.eventPhase + " " + (event.target === inner)), true);
+  inner.addEventListener("ping", (event) => log.push("inner " + event.detail));
+  outer.addEventListener("ping", (event) => {
+    log.push("outer " + event.eventPhase + " " + (event.currentTarget === outer));
+    event.preventDefault();
+  });
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 3, bubbles: true, cancelable: true })), false);
+  assert.deepEqual(log, ["outer capture 1 true", "inner 3", "outer 3 true"]);
+
+  log.length = 0;
+  inner.addEventListener("ping", (event) => event.stopImmediatePropagation(), true);
+  assert.equal(inner.dispatchEvent(new CustomEvent("ping", { detail: 4, bubbles: true })), true);
+  assert.deepEqual(log, ["outer capture 1 true"]);
+
+  log.length = 0;
+  outer.dispatchEvent(new Event("ping"));
+  assert.deepEqual(log, ["outer capture 2 false", "outer 2 true"]);
+});
+
+test("close and navigate requests are events that bubble, and load and error share a bit", () => {
+  const pane = createBox();
+  const inside = createBox();
+  pane.append(inside);
+  mock.calls.length = 0;
+  const seen = [];
+  pane.addEventListener("closerequest", (event) => seen.push(event.type));
+  const [call, node, flags] = mock.calls.at(-1);
+  assert.deepEqual([call, node, flags], ["listen", pane.nodeId, 1 << 18], "the requests listen with bit 18");
+  pane.addEventListener("navigate", (event) => {
+    seen.push(`${event.type} ${event.navigationType} ${event.direction}`);
+    event.preventDefault();
+  });
+  assert.equal(mock.native.dispatch(38, inside.nodeId, 0, 0, 0, 0, 0), false);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 0, 0, 0, 0, 0), true);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 1, 0, 0, 0, 0), true);
+  assert.deepEqual(seen, ["closerequest", "navigate traverse back", "navigate traverse forward"]);
+
+  const image = createBox();
+  mock.calls.length = 0;
+  image.addEventListener("error", () => {});
+  assert.deepEqual(mock.calls.at(-1), ["listen", image.nodeId, 1 << 17], "error listens with the bit of load");
 });
 
 test("preventDefault reaches the host for cancelable events only", () => {
@@ -83,6 +159,225 @@ test("preventDefault reaches the host for cancelable events only", () => {
   box.addEventListener("focus", (event) => event.preventDefault());
   assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, 0, 0, 1), true);
   assert.equal(mock.native.dispatch(9, box.nodeId, 0, 0, 0, 0, 0), false);
+});
+
+test("copy, cut, paste and beforeinput follow the Clipboard API and events", async () => {
+  const box = createBox();
+  const field = createInput();
+  box.append(field);
+  mock.take();
+  const onCopy = (event) => {
+    event.clipboardData.setData("text/plain", "mine");
+    event.clipboardData.setData("text", "mine too");
+    event.clipboardData.setData("text/html", "<b>mine</b>");
+    event.preventDefault();
+  };
+  box.addEventListener("copy", onCopy);
+  box.addEventListener("cut", () => {});
+  assert.deepEqual(mock.take(), [["listen", box.nodeId, 2 ** 31]]);
+  field.addEventListener("beforeinput", (event) => seen.push(event));
+  const [[call, node, flags]] = mock.take();
+  assert.deepEqual([call, node, (flags & 2 ** 31) >>> 0], ["listen", field.nodeId, 2 ** 31], "beforeinput shares bit 31, beside what the input keeps");
+  box.removeEventListener("copy", onCopy);
+  assert.deepEqual(mock.take(), [], "cut still listens on the shared bit");
+  box.addEventListener("copy", onCopy);
+
+  const written = [];
+  const clipboard = { writeText: async (text) => written.push(["text", text]), write: async (items) => written.push(["items", items[0]]) };
+  const before = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard }, configurable: true });
+  globalThis.ClipboardItem = class ClipboardItem {
+    constructor(items) {
+      this.items = items;
+    }
+  };
+  const seen = [];
+  try {
+    // A prevented copy writes what the listener set; the tree copies nothing.
+    let kept;
+    box.addEventListener("copy", (event) => (kept = event), { once: true });
+    assert.equal(mock.native.dispatch(34, field.nodeId, 0, 0, 0, 0, 0), true);
+    assert.ok(kept instanceof globalThis.ClipboardEvent && kept.bubbles && kept.cancelable && kept.composed);
+    assert.deepEqual(written.length, 1);
+    assert.equal(kept.clipboardData.getData("text/plain"), "", "the data is protected after the event");
+    assert.deepEqual(kept.clipboardData.types, []);
+
+    // A cut no one prevents leaves the default to the tree.
+    assert.equal(mock.native.dispatch(35, field.nodeId, 0, 0, 0, 0, 0), false);
+    assert.equal(written.length, 1);
+
+    // A paste carries the clipboard, read-only.
+    let pasted;
+    box.addEventListener("paste", (event) => {
+      pasted = { types: event.clipboardData.types, text: event.clipboardData.getData("Text"), html: event.clipboardData.getData("text/html"), file: event.clipboardData.files[0] };
+      assert.throws(() => event.clipboardData.items.add("x", "text/plain"), { name: "InvalidStateError" });
+      event.clipboardData.setData("text/plain", "ignored");
+      event.preventDefault();
+    }, { once: true });
+    assert.equal(mock.native.dispatch(36, field.nodeId, 0, 0, 0, 0, 0, "plain", "<i>x</i>", "\x89PNG"), true);
+    assert.deepEqual(pasted.types, ["text/plain", "text/html", "Files"]);
+    assert.equal(pasted.text, "plain");
+    assert.equal(pasted.html, "<i>x</i>");
+    assert.equal(pasted.file.type, "image/png");
+    assert.deepEqual([...new Uint8Array(await pasted.file.arrayBuffer())], [0x89, 0x50, 0x4e, 0x47]);
+
+    // beforeinput says what the edit inserts, and preventing it cancels the edit.
+    field.addEventListener("beforeinput", (event) => event.preventDefault(), { once: true });
+    assert.equal(mock.native.dispatch(37, field.nodeId, 0, 0, 0, 0, 0, "plain", "insertFromPaste"), true);
+    const event = seen.at(-1);
+    assert.equal(event.inputType, "insertFromPaste");
+    assert.equal(event.data, "plain");
+    assert.deepEqual(event.getTargetRanges(), []);
+  } finally {
+    if (before) Object.defineProperty(globalThis, "navigator", before);
+    else delete globalThis.navigator;
+    delete globalThis.ClipboardItem;
+  }
+  const [kind, item] = written[0];
+  assert.equal(kind, "items");
+  assert.deepEqual(item.items, { "text/plain": "mine too", "text/html": "<b>mine</b>" });
+});
+
+test("DataTransfer stores strings and files as the web's does", () => {
+  const data = new globalThis.DataTransfer();
+  data.setData("Text", "a");
+  data.setData("text/plain", "b");
+  data.setData("URL", "# comment\nhttps://example.com\nhttps://two");
+  assert.deepEqual(data.types, ["text/plain", "text/uri-list"]);
+  assert.equal(data.getData("text"), "b");
+  assert.equal(data.getData("url"), "https://example.com");
+  assert.equal(data.items.length, 2);
+  assert.equal(data.items[0].kind, "string");
+  assert.throws(() => data.items.add("c", "text/plain"), { name: "NotSupportedError" });
+  data.clearData("text/plain");
+  assert.deepEqual(data.types, ["text/uri-list"]);
+  data.clearData();
+  assert.equal(data.items.length, 0);
+});
+
+test("pointer events carry the pointer, its buttons and the spec defaults", () => {
+  const box = createBox();
+  const seen = [];
+  for (const type of ["pointerdown", "pointermove", "pointerup", "pointerover", "pointerout"]) {
+    box.addEventListener(type, (event) => seen.push([event.type, event.pointerId, event.pointerType, event.isPrimary, event.buttons, event.button, event.pressure, event.width, event.getCoalescedEvents().length]));
+  }
+  // A touch: pointer 2, type touch (2 << 4), primary (64).
+  const touch = 2 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(28, box.nodeId, 5, 5, touch, 0, 0);
+  mock.native.dispatch(0, box.nodeId, 5, 5, touch, 0, 1);
+  mock.native.dispatch(3, box.nodeId, 6, 5, touch, 0, 0);
+  mock.native.dispatch(1, box.nodeId, 6, 5, touch, 0, 0);
+  // The mouse, with shift held: pointer 1, primary.
+  mock.native.dispatch(29, box.nodeId, 6, 5, 256 + 64 + 1, 0, 0);
+  assert.deepEqual(seen, [
+    ["pointerover", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerdown", 2, "touch", true, 1, 0, 0.5, 1, 0],
+    ["pointermove", 2, "touch", true, 1, -1, 0.5, 1, 1],
+    ["pointerup", 2, "touch", true, 0, 0, 0, 1, 0],
+    ["pointerout", 1, "mouse", true, 0, 0, 0, 1, 0],
+  ]);
+});
+
+test("pointer capture follows the pointer that is down", () => {
+  const box = createBox();
+  box.addEventListener("pointerdown", (event) => box.setPointerCapture(event.pointerId));
+  mock.take();
+  assert.throws(() => box.setPointerCapture(9), { name: "NotFoundError" });
+  const mouse = 256 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", box.nodeId]]);
+  assert.equal(box.hasPointerCapture(1), true);
+  box.releasePointerCapture(1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), [["capture", 0]]);
+  assert.equal(box.hasPointerCapture(1), false);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  // A finger that is not primary keeps its records where it went down; the tree is not asked.
+  const second = 3 * 256 + 2 * 16;
+  mock.native.dispatch(0, box.nodeId, 0, 0, second, 0, 1);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "capture"), []);
+  assert.equal(box.hasPointerCapture(3), true);
+  mock.native.dispatch(14, box.nodeId, 0, 0, second, 0, 0);
+  assert.equal(box.hasPointerCapture(3), false);
+});
+
+test("touch events carry their touch lists and report their own prevention", () => {
+  const outer = createBox();
+  const inner = createBox();
+  outer.appendChild(inner);
+  const seen = [];
+  for (const type of ["touchstart", "touchmove", "touchend"]) {
+    outer.addEventListener(type, (event) => {
+      seen.push([event.type, event.cancelable, event.changedTouches[0].identifier, event.touches.length, event.targetTouches.length, event.changedTouches.item(0).target === inner]);
+      if (event.type === "touchstart") event.preventDefault();
+    });
+  }
+  const flags = mock.take().filter((call) => call[0] === "listen" && call[1] === outer.nodeId);
+  assert.deepEqual(flags.at(-1), ["listen", outer.nodeId, 1 << 30]);
+  const first = 2 * 256 + 2 * 16 + 64;
+  const second = 3 * 256 + 2 * 16;
+  // A prevented pointerdown of a finger does not reach the tree; its touchstart does.
+  outer.addEventListener("pointerdown", (event) => event.preventDefault());
+  assert.equal(mock.native.dispatch(0, inner.nodeId, 5, 5, first, 0, 1), false);
+  assert.equal(mock.native.dispatch(30, inner.nodeId, 5, 5, first, 1, 0), true);
+  assert.equal(mock.native.dispatch(30, outer.nodeId, 9, 5, second, 1, 0), true);
+  // Once the tree pans, touchmove cannot be prevented; it still goes to the first node.
+  mock.native.dispatch(31, inner.nodeId, 5, 30, first, 0, 0);
+  mock.native.dispatch(32, outer.nodeId, 9, 5, second, 1, 0);
+  mock.native.dispatch(32, inner.nodeId, 5, 30, first, 0, 0);
+  assert.deepEqual(seen, [
+    ["touchstart", true, 2, 1, 1, true],
+    ["touchstart", true, 3, 2, 1, false],
+    ["touchmove", false, 2, 2, 1, true],
+    ["touchend", true, 3, 1, 0, false],
+    ["touchend", false, 2, 0, 0, true],
+  ]);
+});
+
+test("mouse events follow pointer events, and a tap's come before its click", () => {
+  const box = createBox();
+  const log = [];
+  for (const type of ["pointerdown", "mousedown", "mousemove", "mouseup", "mouseover", "click"]) {
+    box.addEventListener(type, (event) => log.push(type));
+  }
+  const mouse = 256 + 64;
+  mock.native.dispatch(28, box.nodeId, 0, 0, mouse, 0, 0);
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, mouse, 0, 1);
+  assert.deepEqual(log, ["mouseover", "pointerdown", "mousedown", "mouseup", "click"]);
+  log.length = 0;
+  // A prevented pointerdown mutes the mouse events up to the release.
+  const prevent = (event) => event.preventDefault();
+  box.addEventListener("pointerdown", prevent);
+  mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1);
+  mock.native.dispatch(3, box.nodeId, 1, 0, mouse, 0, 0);
+  mock.native.dispatch(1, box.nodeId, 1, 0, mouse, 0, 0);
+  mock.native.dispatch(3, box.nodeId, 2, 0, mouse, 0, 0);
+  assert.deepEqual(log, ["pointerdown", "mousemove"]);
+  box.removeEventListener("pointerdown", prevent);
+  log.length = 0;
+  const finger = 2 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, finger, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, finger, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, finger, 0, 1);
+  assert.deepEqual(log, ["pointerdown", "mousemove", "mousedown", "mouseup", "click"]);
+  log.length = 0;
+  box.addEventListener("pointerdown", prevent);
+  const next = 3 * 256 + 2 * 16 + 64;
+  mock.native.dispatch(0, box.nodeId, 0, 0, next, 0, 1);
+  mock.native.dispatch(1, box.nodeId, 0, 0, next, 0, 0);
+  mock.native.dispatch(2, box.nodeId, 0, 0, next, 0, 1);
+  assert.deepEqual(log, ["pointerdown", "click"]);
+});
+
+test("a prevented mousedown prevents the press's default, as a terminal keeps focus with it", () => {
+  const box = createBox();
+  const mouse = 256 + 64;
+  assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1), false);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
+  box.addEventListener("mousedown", (event) => event.preventDefault());
+  assert.equal(mock.native.dispatch(0, box.nodeId, 0, 0, mouse, 0, 1), true);
+  mock.native.dispatch(1, box.nodeId, 0, 0, mouse, 0, 0);
 });
 
 test("transition events bubble with their property and elapsed time", () => {
@@ -133,6 +428,17 @@ test("unload destroys every node, for a reload", () => {
   const destroyed = mock.take().filter((call) => call[0] === "destroy").map((call) => call[1]);
   assert.ok(destroyed.includes(box.nodeId));
   assert.equal(nodeById(box.nodeId), null);
+});
+
+test("removing a listener from a destroyed node sends nothing", () => {
+  const child = createBox();
+  const box = createBox({}, child);
+  const listener = () => {};
+  child.addEventListener("click", listener);
+  box.destroy();
+  mock.take();
+  child.removeEventListener("click", listener);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "listen"), []);
 });
 
 test("a font family list is defined once and named by number", () => {
@@ -187,8 +493,22 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   b.destroy();
   a.destroy();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "release").length, 2, "both released");
+  assert.equal(calls.filter((call) => call[0] === "release").length, 1, "a went live when it changed, so only b held the markup");
   assert.throws(() => createNode("icon"), /no node kind 'icon'/);
+});
+
+test("a use of a sprite's symbol draws it: the symbol goes into the markup", () => {
+  mock.take();
+  const sprite = createBox();
+  sprite.innerHTML = '<svg width="0" height="0"><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></svg>';
+  mount(sprite);
+  const icon = createNode("svg");
+  icon.innerHTML = '<use href="#sprite-check"/>';
+  flushSvg();
+  const defined = mock.take().filter((call) => call[0] === "defineIcon").map((call) => call[2]);
+  const used = defined.find((markup) => markup.includes("<use"));
+  assert.ok(used.includes('<defs><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></defs></svg>'), used);
+  assert.ok(!defined.find((markup) => markup.includes('width="0"')).includes("<defs>"), "the sprite names its own ids");
 });
 
 test("an image src loads its address once while some node shows it", () => {
@@ -209,7 +529,7 @@ test("an image src loads its address once while some node shows it", () => {
   assert.equal(mock.take().filter((call) => call[0] === "release").length, 1);
 });
 
-test("svg markup built from elements draws once as one node, and again when it changes", async () => {
+test("svg markup built from elements draws once as one node, then changes go live per element", async () => {
   mock.take();
   const svg = createNode("svg");
   svg.setAttribute("viewBox", "0 0 24 24");
@@ -228,14 +548,35 @@ test("svg markup built from elements draws once as one node, and again when it c
   assert.ok(calls.some((call) => call[0] === "attribute" && call[2] === "class" && call[3] === "size-4"), "class is the node's");
   assert.equal(svg.outerHTML, markup);
   path.setAttribute("fill", "currentColor");
-  path.setAttribute("fill", "red");
   flushSvg();
   calls = mock.take();
-  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 1, "two changes, one new markup");
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "a change after the first draw goes live");
+  const id = svg.nodeId;
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [
+    ["svgAttribute", id, 0, "viewBox", "0 0 24 24"],
+    ["svgAttribute", id, 0, "stroke-width", "2"],
+    ["svgInsert", id, 1, "path", 0, -1],
+    ["svgAttribute", id, 1, "d", 'M5 12h14"'],
+    ["svgAttribute", id, 1, "fill", "currentColor"],
+    ["svgInsert", id, 2, "title", 0, -1],
+  ]);
+  path.setAttribute("fill", "red");
+  title.firstChild.data = "B";
+  assert.deepEqual(mock.take(), [["svgAttribute", id, 1, "fill", "red"]], "one write, and title text stays quiet");
   path.destroy();
   title.remove();
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 1], ["svgRemove", id, 2]]);
+  const circle = createSvgElement("circle");
+  circle.setAttribute("r", 4);
+  svg.appendChild(circle);
+  assert.deepEqual(mock.take().filter((call) => call[0].startsWith("svg")), [["svgInsert", id, 2, "circle", 0, -1], ["svgAttribute", id, 2, "r", "4"]], "numbers are reused");
+  const text = createSvgElement("text");
+  svg.appendChild(text);
+  calls = mock.take();
+  assert.deepEqual(calls.filter((call) => call[0].startsWith("svg")), [["svgRemove", id, 0]], "content the live svg cannot draw goes back to markup");
   flushSvg();
-  assert.ok(svg.outerHTML.endsWith('stroke-width="2"></svg>'));
+  assert.equal(mock.take().filter((call) => call[0] === "defineIcon").length, 1);
+  assert.ok(svg.outerHTML.endsWith('stroke-width="2"><circle r="4"/><text/></svg>'), svg.outerHTML);
   svg.destroy();
 });
 
@@ -400,7 +741,7 @@ test("selectionchange moves the caret of an input and names a rich input's typin
   mock.take();
   let seen = null;
   input.addEventListener("selectionchange", (event) => (seen = event));
-  assert.equal(mock.take()[0][0], "listen");
+  assert.deepEqual(mock.take(), [], "an input hears selection changes from the start");
   // Bytes 5 and 6 are the end of the object character and of "x".
   globalThis.__ui.dispatch(27, input.nodeId, 5, 6, 0, 1, 0);
   assert.equal(seen.type, "selectionchange");
@@ -554,7 +895,7 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   const shown = setTray({ icon: { width: 1, height: 1, data: [255, 0, 16, 255] }, tooltip: "App", menu: [{ label: "Quit, now", click: () => quit++ }, { type: "separator" }, { label: "More", submenu: [{ label: "Off", enabled: false }] }] });
   const [[, trayCall, trayOp, packed]] = mock.take();
   assert.equal(trayOp, 1);
-  assert.deepEqual(packed.split("\x1f"), ["App", "1", "1", "0", "ff0010ff", "A1,1,0,Quit, now\nS\nBMore\nA2,0,0,Off\nE"]);
+  assert.deepEqual(packed.split("\x1f"), ["App", "1", "1", "0", "ff0010ff", "A1,1,0,,0,Quit, now\nS\nBMore\nA2,0,0,,0,Off\nE"]);
   mock.native.shellAnswer(trayCall, 1);
   assert.equal(await shown, true);
   mock.native.shellEvent(6, 1, 0, 0, "");
@@ -569,4 +910,267 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   assert.equal(await held, false);
   mock.native.shellEvent(4, 1, 0, 0, "");
   assert.equal(pressed, 1);
+});
+
+test("web views go to the host as text and their events come back", async () => {
+  const box = createBox();
+  mock.take();
+  const view = createWebView(box, { url: "https://silk.test/", profile: "work" });
+  const [[, openCall, openOp, opened]] = mock.take();
+  assert.equal(openOp, 40);
+  assert.deepEqual(opened.split("\x1f"), [String(view.id), String(box.nodeId), "https://silk.test/", "work", "1"]);
+  mock.native.shellAnswer(openCall, 1);
+  assert.equal(await view.opened, true);
+
+  const titles = [];
+  view.addEventListener("titlechange", (event) => titles.push(event.title));
+  mock.native.shellEvent(20, view.id, 7, 0, "A\x1fB");
+  mock.native.shellEvent(20, view.id, 8, 0, "1\x1f0");
+  assert.deepEqual(titles, ["A\x1fB"]);
+  assert.equal(view.canGoBack, true);
+  assert.equal(view.canGoForward, false);
+
+  view.setZoom(1.25);
+  const [[, , zoomOp, zoom]] = mock.take();
+  assert.equal(zoomOp, 42);
+  assert.deepEqual(zoom.split("\x1f"), [String(view.id), "zoom", "1250"]);
+
+  const value = view.evaluate("1 + 1");
+  const [[, , , evaluated]] = mock.take();
+  const request = evaluated.split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 12, 0, request + "\x1f1\x1f{\"sum\":2}");
+  assert.deepEqual(await value, { sum: 2 });
+
+  const found = view.findInPage("needle", { newSession: true });
+  const findRequest = mock.take()[0][3].split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 20, 0, findRequest + "\x1f3\x1f1");
+  assert.deepEqual(await found, { matches: 3, activeMatchOrdinal: 1 });
+
+  const failed = view.clickElement("e9");
+  const clickRequest = mock.take()[0][3].split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 15, 0, clickRequest + "\x1f0\x1fno such ref");
+  await assert.rejects(failed, /no such ref/);
+
+  const cleared = clearWebViewData({ profile: "work", cache: false });
+  const [[, , clearOp, clear]] = mock.take();
+  assert.equal(clearOp, 43);
+  const [clearRequest] = clear.split("\x1f");
+  mock.native.shellEvent(20, 0, 21, 0, clearRequest);
+  await cleared;
+});
+
+test("menus, dialogs and the window go to the host and come back", async () => {
+  mock.take();
+  let saved = 0;
+  setApplicationMenu([
+    { role: "appMenu" },
+    { label: "File", submenu: [{ label: "Save", accelerator: "CmdOrCtrl+Shift+S", click: () => saved++ }, { label: "Go", accelerator: "F5" }] },
+    { role: "viewMenu" },
+  ]);
+  const [[, , menuOp, menu]] = mock.take();
+  assert.equal(menuOp, 7);
+  const lines = menu.split("\n");
+  assert.deepEqual(lines.slice(0, 3), ["BApp", "R0", "S"], "roles are the system's items");
+  const save = lines.find((line) => line.endsWith(",Save"));
+  assert.match(save, /^A\d+,1,0,cs,17,Save$/, "a character key with Mod and Shift");
+  assert.ok(lines.some((line) => /^A\d+,1,0,nF5,0,Go$/.test(line)), "a named key");
+  assert.ok(lines.some((line) => /^A\d+,1,0,c\+,16,Zoom In$/.test(line)), "zoom roles are JavaScript's");
+  mock.native.shellEvent(6, Number(save.slice(1, save.indexOf(","))), 0, 0, "");
+  assert.equal(saved, 1);
+
+  const picked = showOpenDialog({ properties: ["openDirectory", "multiSelections"], filters: [{ name: "Images", extensions: ["png", ".jpg"] }] });
+  const [[, openCall, openOp, openFields]] = mock.take();
+  assert.equal(openOp, 5);
+  assert.deepEqual(openFields.split("\x1f"), ["", "", "6", "png,jpg"]);
+  mock.native.shellAnswer(openCall, 3);
+  await Promise.resolve();
+  mock.native.shellEvent(8, 3, 0, 0, "/a\n/b c");
+  assert.deepEqual(await picked, { canceled: false, filePaths: ["/a", "/b c"] });
+
+  const named = showSaveDialog({ defaultPath: "/tmp/out/report.md" });
+  const [[, saveCall, , saveFields]] = mock.take();
+  assert.deepEqual(saveFields.split("\x1f"), ["", "/tmp/out", "report.md", ""]);
+  mock.native.shellAnswer(saveCall, 4);
+  await Promise.resolve();
+  mock.native.shellEvent(8, 4, 0, 0, "");
+  assert.deepEqual(await named, { canceled: true, filePath: "" });
+
+  let copied = 0;
+  const closed = showContextMenu([{ label: "Copy", click: () => copied++ }], { x: 10, y: 20 });
+  const [[, menuCall, contextOp, contextFields]] = mock.take();
+  assert.equal(contextOp, 8);
+  const [x, y, item] = contextFields.split("\x1f");
+  assert.deepEqual([x, y], ["10", "20"]);
+  mock.native.shellAnswer(menuCall, 1);
+  await Promise.resolve();
+  mock.native.shellEvent(6, Number(item.slice(1, item.indexOf(","))), 0, 0, "");
+  assert.equal(await closed, true);
+  assert.equal(copied, 1);
+
+  const changes = [];
+  appWindow.addEventListener("fullscreenchange", (event) => changes.push(event.fullScreen));
+  appWindow.setFullScreen(false);
+  assert.deepEqual(mock.take(), [], "already windowed");
+  appWindow.setFullScreen(true);
+  assert.deepEqual(mock.take().map((call) => [call[2], call[3]]), [[14, "0"]]);
+  mock.native.shellEvent(10, 1, 0, 0, "");
+  mock.native.shellEvent(11, 1.25, 0, 0, "");
+  assert.deepEqual([changes, appWindow.isFullScreen(), appWindow.getZoomFactor()], [[true], true, 1.25]);
+});
+
+test("input selection offsets are UTF-16 indices, as in Chrome", () => {
+  const input = createInput();
+  const listened = mock.take().find((call) => call[0] === "listen" && call[1] === input.nodeId);
+  assert.ok(listened && (listened[2] & (1 << 11)) && (listened[2] & (1 << 27)), "it keeps value and selection current");
+
+  // a, 4-byte emoji (2 units), é (2 bytes), 漢字 (3 bytes each), b.
+  const value = "a\u{1F600}\u00e9\u6f22\u5b57b";
+  input.value = value;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [7, 7], "a new value puts the caret at its end");
+  mock.take();
+
+  input.setSelectionRange(1, 4, "backward");
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 4, "backward"]);
+  assert.deepEqual(mock.take(), [["select", input.nodeId, 7, 1]], "anchor at the end, in bytes");
+
+  // The rest of these follow what Chrome answered for the same calls.
+  input.setSelectionRange(5, 2);
+  assert.deepEqual([input.selectionStart, input.selectionEnd, input.selectionDirection], [2, 2, "forward"]);
+  input.setSelectionRange(0, 99);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 7]);
+  input.selectionStart = 3;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 7]);
+  input.selectionEnd = 1;
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [1, 1]);
+
+  input.setSelectionRange(1, 3);
+  input.setRangeText("XY");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["aXY\u00e9\u6f22\u5b57b", 1, 3]);
+  input.value = "hello world";
+  input.setSelectionRange(2, 4);
+  input.setRangeText("ZZZ", 6, 11, "select");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["hello ZZZ", 6, 9]);
+  input.setRangeText("Q", 0, 1, "start");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Qello ZZZ", 0, 0]);
+  input.setRangeText("W", 0, 1, "end");
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], ["Wello ZZZ", 1, 1]);
+  input.setSelectionRange(3, 8);
+  input.setRangeText("", 0, 5);
+  assert.deepEqual([input.value, input.selectionStart, input.selectionEnd], [" ZZZ", 0, 3]);
+  input.select();
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [0, 4]);
+  assert.throws(() => input.setRangeText("x", 3, 1), (error) => error.name === "IndexSizeError");
+
+  // The tree reports bytes: the caret after the emoji and the combining mark.
+  input.value = "a\u{1F600}e\u0301\u6f22";
+  globalThis.__ui.dispatch(27, input.nodeId, 5, 8, 0, 0, 0);
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [3, 5]);
+  const heard = [];
+  input.addEventListener("input", (event) => heard.push([event.inputType, event.data, event.isComposing]));
+  globalThis.__ui.dispatch(11, input.nodeId, 14, 14, 0, 0, 0, input.value + "\u5b57", "insertText");
+  assert.deepEqual([input.value.length, input.selectionStart], [7, 7]);
+  globalThis.__ui.dispatch(11, input.nodeId, 11, 11, 0, 0, 0, "a\u{1F600}e\u0301\u5b57", "deleteContentBackward");
+  globalThis.__ui.dispatch(11, input.nodeId, 4, 4, 0, 0, 0, "a\u{1F600}xye\u0301\u5b57", "insertText");
+  assert.deepEqual(heard, [["insertText", "\u5b57", false], ["deleteContentBackward", null, false], ["insertText", "xy", false]]);
+});
+
+test("setRangeText on a rich input keeps marks and atoms outside the range", () => {
+  const input = createRichInput();
+  input.defineMark("bold", { fontWeight: 700 });
+  input.document = { text: "hi " + OBJECT + " there", marks: [{ start: 4, end: 10, marks: ["bold"] }], atoms: [{ kind: "mention", label: "@a", data: "" }] };
+  input.setRangeText("hello", 0, 2, "end");
+  assert.deepEqual(input.document, {
+    text: "hello " + OBJECT + " there",
+    marks: [{ start: 7, end: 13, marks: ["bold"] }],
+    atoms: [{ kind: "mention", label: "@a", data: "" }],
+  });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 5]);
+  input.setRangeText("x" + OBJECT, 5, 8, "select");
+  assert.deepEqual(input.document, { text: "hellox\ufffdthere", marks: [{ start: 7, end: 12, marks: ["bold"] }], atoms: [] });
+  assert.deepEqual([input.selectionStart, input.selectionEnd], [5, 7]);
+});
+
+test("listeners on svg elements make the svg live and hear the shape under the pointer", () => {
+  mock.take();
+  const svg = createNode("svg");
+  const group = createSvgElement("g");
+  const a = createSvgElement("rect");
+  const b = createSvgElement("rect");
+  group.appendChild(a);
+  svg.append(group, b);
+  const heard = [];
+  const log = (name) => (event) => heard.push(name + ":" + event.type + "@" + (event.target.localName ?? "?") + (event.target === a ? "a" : event.target === b ? "b" : ""));
+  group.addEventListener("pointerenter", log("g"));
+  group.addEventListener("pointerleave", log("g"));
+  b.addEventListener("click", log("b"));
+  svg.addEventListener("click", log("svg"));
+  flushSvg();
+  const calls = mock.take();
+  assert.equal(calls.filter((call) => call[0] === "defineIcon").length, 0, "listeners draw it live from the start");
+  const listen = calls.filter((call) => call[0] === "listen" && call[1] === svg.nodeId).at(-1);
+  for (const kind of [2, 3, 4, 5, 28, 29]) assert.ok(listen[2] & (1 << kind), "listens for kind " + kind);
+  const at = (element) => element._n * 4294967296 + 256 + 64;
+  mock.native.dispatch(28, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(4, svg.nodeId, 5, 5, at(a), 0, 0);
+  mock.native.dispatch(3, svg.nodeId, 50, 5, at(b), 0, 0);
+  mock.native.dispatch(2, svg.nodeId, 50, 5, at(b), 0, 1);
+  mock.native.dispatch(2, svg.nodeId, 90, 90, 256 + 64, 0, 1);
+  assert.deepEqual(heard, ["g:pointerenter@g", "g:pointerleave@g", "b:click@rectb", "svg:click@rectb", "svg:click@svg"]);
+  svg.destroy();
+});
+
+test("svg elements measure their markup for getBBox and path lengths", () => {
+  mock.take();
+  const group = createSvgElement("g");
+  group.setAttribute("transform", "scale(2)");
+  const path = createSvgElement("path");
+  path.setAttribute("d", "M60 60h30v30h-30z");
+  group.appendChild(path);
+  assert.deepEqual({ ...group.getBBox() }, { x: 1, y: 2, width: 3, height: 4 });
+  assert.equal(path.getTotalLength(), 120);
+  assert.deepEqual(path.getPointAtLength(45), { x: 90, y: 75 });
+  assert.deepEqual(mock.take().map((call) => call.slice(1)), [
+    [0, "0\x1fg\x1ftransform\x1fscale(2)\x1e1\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [1, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 0],
+    [2, "0\x1fpath\x1fd\x1fM60 60h30v30h-30z", 45],
+  ]);
+});
+
+test("an empty node shares no list with another, and its looks read back as CSS", () => {
+  const a = createBox();
+  const b = createBox();
+  assert.deepEqual(a.childNodes, []);
+  assert.equal(a.firstChild, null);
+  assert.equal(a.hasChildNodes(), false);
+  const child = createText("x");
+  assert.equal(child.kind, "text");
+  assert.equal(child.cloneNode().kind, "text");
+  assert.equal(a.kind, "box");
+  a.appendChild(child);
+  assert.deepEqual(a.childNodes, [child]);
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, a);
+  a.removeChild(child);
+  assert.deepEqual(a.childNodes, []);
+  b.insertBefore(child);
+  assert.equal(b.firstChild, child);
+  a.style.set({ width: 12, fontWeight: 600, color: "red" });
+  assert.equal(a.style.get("width"), "12px");
+  assert.equal(a.style.get("fontWeight"), "600");
+  assert.equal(a.style.cssText, "width:12px;font-weight:600;color:red;");
+  mock.take();
+  a.style.set({ width: 12 });
+  assert.deepEqual(mock.take(), []);
+  a.look("hover").set({ opacity: 0.5 });
+  a.setAttribute("data-x", "1");
+  let heard = 0;
+  a.addEventListener("click", () => heard++);
+  const copy = a.cloneNode(true);
+  assert.equal(copy.look("hover").get("opacity"), "0.5");
+  assert.equal(copy.getAttribute("data-x"), "1");
+  assert.equal(copy.style.cssText, a.style.cssText);
+  b.destroy();
+  assert.deepEqual(b.childNodes, []);
+  assert.equal(child.parentNode, null);
+  assert.equal(heard, 0);
 });

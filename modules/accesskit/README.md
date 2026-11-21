@@ -43,7 +43,7 @@ dbus-daemon --session --print-address --fork   # note the address
 export AT_SPI_BUS_ADDRESS=<address> DBUS_SESSION_BUS_ADDRESS=<address>
 /usr/libexec/at-spi2-registryd &
 silk build --manifest-path modules/accesskit/unix/examples/silk.toml
-modules/accesskit/unix/examples/build/llvm/*/debug/accesskit-unix-examples &
+modules/accesskit/unix/examples/build/*/dev/accesskit-unix-examples &
 python3 modules/accesskit/unix/examples/atspi_client.py
 ```
 

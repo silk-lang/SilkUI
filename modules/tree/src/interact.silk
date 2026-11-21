@@ -2,7 +2,8 @@
 //! capture, clicks, focus and tab order, keyboard clicks, and nested scrolling. Everything a
 //! client hears about comes out as `Event` records; nothing calls back into it.
 import engine { UiTree }
-import input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY }
+import input { Input, EditCommand, Request, REQUEST_ANYWHERE, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_BACK, BUTTON_FORWARD, POINTER_TOUCH }
+import mutation { Overflow }
 import mutation {
   NodeKind,
   StyleState,
@@ -24,19 +25,29 @@ import mutation {
   LISTEN_KEY_UP,
   LISTEN_SCROLL,
   LISTEN_POINTER_CANCEL,
+  LISTEN_REQUEST,
   LISTEN_GOT_POINTER_CAPTURE,
-  LISTEN_LOST_POINTER_CAPTURE
+  LISTEN_LOST_POINTER_CAPTURE,
+  LISTEN_POINTER_OVER,
+  LISTEN_POINTER_OUT
 }
 import node { NONE, NO_INDEX, Event, EventKind }
 import edit
-import paint { styleSlot, borderBox, paddingBox, overflowClip }
+import clipboard
+import edit { Keymap }
+import text_selection
+import scroll_snap
+import touch
+import scroll_anchor
+import paint { styleSlot, borderBox, paddingBox, overflowClip, nodeRadii, insideRounded, rounds, contentBox }
+import live_svg
 import scrollbar { ScrollRange, rangeOf, scrolls, userScrolls, usedOverflow, thumbOfNode }
 import style { Overscroll }
-import layout.lib { FragmentKind, InvalidNode }
+import layout.lib { Fragment, FragmentKind, InvalidNode }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
-import silk.geometry.point { Point2 }
+import silk.geometry.point { Point2, Point3 }
 import transform
 import silk.geometry.rect { Rect }
 import layers
@@ -76,6 +87,15 @@ fn alive(tree: &UiTree<'_>, slot: u32, id: u32) -> bool {
 }
 
 /// Whether `slot` is in the tree under the root.
+/// The slot of node `id` while it is alive and in the tree, or NONE.
+fn liveSlot(tree: &UiTree<'_>, id: u32) -> u32 {
+  let slot = tree.slotOf(id)
+  if slot == NONE || !tree.node(slot).live || !attached(tree, slot) {
+    return NONE
+  }
+  return slot
+}
+
 fn attached(tree: &UiTree<'_>, slot: u32) -> bool {
   let mut at = slot
   while at != NONE {
@@ -114,12 +134,12 @@ fn inside(rect: Rect<f32>, x: f32, y: f32) -> bool {
 /// transform flattens it, the point maps behind the viewer, or it shows a hidden back face.
 fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f32>> {
   let point = Point2<f32> { x: x, y: y }
-  match layers.transformOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+  if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+    return Option<Point2<f32>>.None
+  }
+  match layers.flatOf(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
     Option.Some { value } => {
-      if layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
-        return Option<Point2<f32>>.None
-      }
-      return match transform.flatten(value).inverse() {
+      return match value.inverse() {
         Option.Some { value: inverse } => transform.map(&inverse, x, y)
         Option.None => Option<Point2<f32>>.None
       }
@@ -132,7 +152,7 @@ fn intoLocal(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> Option<Point2<f
 
 /// Whether node `slot` can be the target of pointer input.
 fn targetable(tree: &UiTree<'_>, slot: u32) -> bool {
-  let c = &tree.node(slot).computed
+  let c = &tree.node(slot).computed().*
   return c.text.visible && c.paint.pointerEvents && !inertAt(tree, slot)
 }
 
@@ -151,27 +171,88 @@ pub fn inertAt(tree: &UiTree<'_>, slot: u32) -> bool {
   return false
 }
 
+/// Whether (`x`, `y`) lies in the box of one of the runs of text fragment `index`.
+fn insideText(tree: &UiTree<'_>, index: usize, x: f32, y: f32) -> bool {
+  let mut runs = tree.output.fragments.textRuns(index)
+  while runs.next() {
+    let left = runs.current.location.x
+    let top = runs.current.location.y
+    if x >= left && x < left + runs.current.size.width && y >= top && y < top + runs.current.size.height {
+      return true
+    }
+  }
+  return false
+}
+
 /// The topmost target under (`x`, `y`) in fragment `index` and its descendants, or NONE. The
 /// point is in the fragment's layout coordinates: where it is against the fragment as laid out,
 /// with the scroll and sticky offsets above already taken off. The walk is paint order
 /// reversed (see `stacking`): what paints last is on top.
-fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) -> u32 {
+fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool, landing: &mut Landing) -> u32 {
   if pruned && !inside(tree.fragmentInk.get(index), px, py) {
     return NONE
+  }
+  // A plane of a 3D rendering context is hit through the context's root, by depth.
+  if tree.preserveUsed {
+    if layers.planeParent(&tree.output, &tree.slotOfCss, &tree.nodes, index) != NO_INDEX {
+      return NONE
+    }
+    if layers.establishes(&tree.output, &tree.slotOfCss, &tree.nodes, index) {
+      return hitContext(tree, index, px, py, &mut landing.*)
+    }
   }
   let local = intoLocal(tree, index, px, py)
   if local.isNone() {
     return NONE
   }
   let point = local.unwrapOr(Point2<f32> { x: 0.0, y: 0.0 })
-  let x = point.x
-  let y = point.y
+  return hitPlane(tree, index, point.x, point.y, pruned, &mut landing.*)
+}
+
+/// The frontmost target under (`px`, `py`), in the space around fragment `root`, among the
+/// planes of the 3D rendering context `root` establishes: each plane's own content is hit
+/// where the point meets it, and the nearest plane hit wins (the later one in tree order
+/// between coplanar ones), as in Chromium.
+fn hitContext(tree: &UiTree<'_>, root: usize, px: f32, py: f32, landing: &mut Landing) -> u32 {
+  let values = tree.output.fragments.values.asSlice()
+  let mut best = NONE
+  let mut bestDepth: f32 = 0.0
+  let end = values[root].nextSibling
+  let mut at = root
+  while at != NO_INDEX && at != end {
+    if layers.contextOf(&tree.output, &tree.slotOfCss, &tree.nodes, at) == root
+      && !layers.hiddenBack(&tree.output, &tree.slotOfCss, &tree.nodes, at) {
+      let m = layers.accumulated(&tree.output, &tree.slotOfCss, &tree.nodes, at)
+      if let Option.Some { value: inverse } = transform.flatten(m).inverse() {
+        if let Option.Some { value: local } = transform.map(&inverse, px, py) {
+          let h = m.transformHomogeneous(Point3<f32> { x: local.x, y: local.y, z: 0.0 })
+          let depth: f32 = if h[3] != 0.0 { h[2] / h[3] } else { 0.0 }
+          if best == NONE || depth >= bestDepth - 0.05 {
+            let mut planeLanding = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+            let found = hitPlane(tree, at, local.x, local.y, false, &mut planeLanding)
+            if found != NONE {
+              best = found
+              landing.* = planeLanding
+              bestDepth = depth
+            }
+          }
+        }
+      }
+    }
+    at = layers.nextInTree(&tree.output, at, root)
+  }
+  return best
+}
+
+/// The topmost target under (`x`, `y`), in fragment `index`'s own layout space, in it and its
+/// descendants.
+fn hitPlane(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let f = tree.output.fragments.values.asSlice()[index]
   if f.positioningShell || f.kind == FragmentKind.Line {
-    return hitInside(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned, &mut landing.*)
   }
   if f.kind == FragmentKind.Text {
-    if !inside(borderBox(&f), x, y) {
+    if !insideText(tree, index, x, y) {
       return NONE
     }
 
@@ -184,19 +265,46 @@ fn hitFragment(tree: &UiTree<'_>, index: usize, px: f32, py: f32, pruned: bool) 
   }
   let slot = slotIn(&tree.slotOfCss, f.source)
   if slot == NONE {
-    return hitInside(tree, index, x, y, pruned)
+    return hitInside(tree, index, x, y, pruned, &mut landing.*)
   }
-  let clips = f.kind == FragmentKind.Box && tree.node(slot).computed.clips()
-  if !clips || inside(overflowClip(&tree.node(slot).computed, &f), x, y) {
-    let below = hitInside(tree, index, x, y, pruned)
+  let clips = f.kind == FragmentKind.Box && tree.node(slot).computed().clips()
+  if !clips || insideClip(tree, slot, &f, x, y) {
+    let below = hitInside(tree, index, x, y, pruned, &mut landing.*)
     if below != NONE {
       return below
     }
   }
-  if inside(borderBox(&f), x, y) && targetable(tree, slot) {
+  if insideBorder(tree, slot, &f, x, y) && targetable(tree, slot) {
+    landing.fragment = index
+    landing.x = x
+    landing.y = y
     return slot
   }
   return NONE
+}
+
+/// Whether (`x`, `y`) is inside box fragment `f` of node `slot`, whose rounded corners cut
+/// what is hit as they cut what is painted.
+fn insideBorder(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let border = borderBox(f)
+  let c = &tree.node(slot).computed().*
+  if !rounds(c) {
+    return inside(border, x, y)
+  }
+  return insideRounded(border, nodeRadii(tree.node(slot), c, f.size.width, f.size.height), x, y)
+}
+
+/// Whether (`x`, `y`) is inside the overflow clip of box fragment `f` of node `slot`: its
+/// padding box's rounded corners clip when both axes clip, as paint's `clipMask` does.
+fn insideClip(tree: &UiTree<'_>, slot: u32, f: &Fragment, x: f32, y: f32) -> bool {
+  let c = &tree.node(slot).computed().*
+  let clip = overflowClip(c, f)
+  let both = usedOverflow(c, true) != Overflow.Visible && usedOverflow(c, false) != Overflow.Visible
+  if !rounds(c) || !(both || c.contain.paint()) {
+    return inside(clip, x, y)
+  }
+  let radii = nodeRadii(tree.node(slot), c, f.size.width, f.size.height).insetTo(borderBox(f), clip)
+  return insideRounded(clip, radii, x, y)
 }
 
 /// Whether the stacking flags describe the last layout.
@@ -219,9 +327,9 @@ fn ownShiftOf(tree: &UiTree<'_>, index: usize) -> Vector2<f32> {
 /// What is inside fragment `index`, topmost first: a stacking context's lists in reverse paint
 /// order, else its children. A root element's box is hit where it sits in flow, as the body's
 /// is in a browser, though its background paints first (see `stacking.ROOT`).
-fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   if !layered(tree) || !tree.fragmentStacking.stacks(index) {
-    return hitChildren(tree, index, x, y, pruned)
+    return hitChildren(tree, index, x, y, pruned, &mut landing.*)
   }
   let steps = tree.fragmentStacking.steps(index)
   let mut k: usize = 0
@@ -229,9 +337,9 @@ fn hitInside(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u
     let step = tree.fragmentStacking.step(index, k, true)
     k = k + 1
     let found = if step == IN_FLOW {
-      hitChildren(tree, index, x, y, pruned)
+      hitChildren(tree, index, x, y, pruned, &mut landing.*)
     } else {
-      hitHoisted(tree, index, step, x, y, pruned)
+      hitHoisted(tree, index, step, x, y, pruned, &mut landing.*)
     }
     if found != NONE {
       return found
@@ -247,7 +355,7 @@ fn clipsAt(tree: &UiTree<'_>, at: usize) -> bool {
     return false
   }
   let slot = slotIn(&tree.slotOfCss, f.source)
-  return slot != NONE && tree.node(slot).kind != NodeKind.Text && tree.node(slot).computed.clips()
+  return slot != NONE && tree.node(slot).kind != NodeKind.Text && tree.node(slot).computed().clips()
 }
 
 /// How far the boxes between stacking context `root` and its entry `entry` move it.
@@ -282,8 +390,7 @@ fn insideBetween(
     if clipsAt(tree, at) {
       let f = values[at]
       let slot = slotIn(&tree.slotOfCss, f.source)
-      let clip = overflowClip(&tree.node(slot).computed, &f)
-      if !inside(clip, x - (total.x - below.x), y - (total.y - below.y)) {
+      if !insideClip(tree, slot, &f, x - (total.x - below.x), y - (total.y - below.y)) {
         return false
       }
     }
@@ -294,23 +401,23 @@ fn insideBetween(
 }
 
 /// Hit tests `entry` of stacking context `root`'s lists, where it sits in the tree.
-fn hitHoisted(tree: &UiTree<'_>, root: usize, entry: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitHoisted(tree: &UiTree<'_>, root: usize, entry: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let total = shiftBetween(tree, root, entry)
   if !insideBetween(tree, root, entry, x, y, total) {
     return NONE
   }
   let own = ownShiftOf(tree, entry)
-  return hitFragment(tree, entry, x - total.x - own.x, y - total.y - own.y, pruned)
+  return hitFragment(tree, entry, x - total.x - own.x, y - total.y - own.y, pruned, &mut landing.*)
 }
 
-fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool) -> u32 {
+fn hitChildren(tree: &UiTree<'_>, index: usize, x: f32, y: f32, pruned: bool, landing: &mut Landing) -> u32 {
   let values = tree.output.fragments.values.asSlice()
   let skips = layered(tree)
   let mut child = values[index].lastChild
   while child != NO_INDEX {
     if !skips || !tree.fragmentStacking.hoisted(child) {
       let own = ownShiftOf(tree, child)
-      let found = hitFragment(tree, child, x - own.x, y - own.y, pruned)
+      let found = hitFragment(tree, child, x - own.x, y - own.y, pruned, &mut landing.*)
       if found != NONE {
         return found
       }
@@ -331,28 +438,68 @@ pub fn hitSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
   return eventSlot(tree, hitLayoutSlot(tree, x, y))
 }
 
+/// The node under (`x`, `y`) as layout sees it, generated boxes included: where scrolling
+/// starts from.
+pub fn layoutHit(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
+  return hitLayoutSlot(tree, x, y)
+}
+
+/// Where a hit test landed: the target's fragment and the point in its coordinates.
+pub struct Landing {
+  pub fragment: usize,
+  pub x: f32,
+  pub y: f32,
+}
+
+impl Copy for Landing {}
+
 fn hitLayoutSlot(tree: &UiTree<'_>, x: f32, y: f32) -> u32 {
+  let mut landing = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+  return hitLanding(tree, x, y, &mut landing)
+}
+
+fn hitLanding(tree: &UiTree<'_>, x: f32, y: f32, landing: &mut Landing) -> u32 {
+  if layered(tree) {
+    // Stacking lists the roots: a long page has few among very many fragments.
+    let roots = tree.fragmentStacking.roots.asSlice()
+    let mut at = roots.length
+    while at > 0 {
+      at = at - 1
+      if !tree.fragmentStacking.hoisted(roots[at]) {
+        let found = hitRoot(tree, roots[at], x, y, &mut landing.*)
+        if found != NONE {
+          return found
+        }
+      }
+    }
+    return NONE
+  }
   let values = tree.output.fragments.values.asSlice()
   let mut index = values.length
   while index > 0 {
     index = index - 1
-    if values[index].parent == NO_INDEX && !(layered(tree) && tree.fragmentStacking.hoisted(index)) {
-      let own = layers.ownShift(
-        &tree.output,
-        &tree.slotOfCss,
-        &tree.layout,
-        &tree.nodes,
-        index,
-        tree.input.width,
-        tree.input.height,
-      )
-      let found = hitFragment(tree, index, x - own.x, y - own.y, tree.inkCurrent())
+    if values[index].parent == NO_INDEX {
+      let found = hitRoot(tree, index, x, y, &mut landing.*)
       if found != NONE {
         return found
       }
     }
   }
   return NONE
+}
+
+/// The topmost target under (`x`, `y`) in the fragment tree of root `index`, or NONE.
+fn hitRoot(tree: &UiTree<'_>, index: usize, x: f32, y: f32, landing: &mut Landing) -> u32 {
+  let own = layers.ownShift(
+    &tree.output,
+    &tree.slotOfCss,
+    &tree.layout,
+    &tree.nodes,
+    index,
+    tree.input.width,
+    tree.input.height,
+  )
+  return hitFragment(tree, index, x - own.x, y - own.y, tree.inkCurrent(), &mut landing.*)
 }
 
 /// All pointer targets in front-to-back paint order, with duplicate element slots removed.
@@ -418,7 +565,7 @@ effect fn hitsFragment(
   let fragment = values[index]
   if fragment.kind == FragmentKind.Text {
     let textSlot = styleSlot(&tree.slotOfCss, &tree.layout, &tree.nodes, fragment.source)
-    if textSlot != NONE && targetable(tree, textSlot) && inside(borderBox(&fragment), x, y) {
+    if textSlot != NONE && targetable(tree, textSlot) && insideText(tree, index, x, y) {
       run appendHit(&mut out.*, eventSlot(tree, textSlot))
     }
     return ()
@@ -429,8 +576,8 @@ effect fn hitsFragment(
   } else {
     slotIn(&tree.slotOfCss, fragment.source)
   }
-  let clips = slot != NONE && fragment.kind == FragmentKind.Box && tree.node(slot).computed.clips()
-  if !clips || inside(overflowClip(&tree.node(slot).computed, &fragment), x, y) {
+  let clips = slot != NONE && fragment.kind == FragmentKind.Box && tree.node(slot).computed().clips()
+  if !clips || inside(overflowClip(&tree.node(slot).computed().*, &fragment), x, y) {
     run hitsInside(tree, index, x, y, pruned, &mut out.*)
   }
   if slot != NONE && targetable(tree, slot) && inside(borderBox(&fragment), x, y) {
@@ -493,6 +640,19 @@ effect fn hitsChildren(
 
 /// The cursor of the hovered node.
 pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
+  return cursorFrom(tree).cursor
+}
+
+/// What decides the hovered node's cursor: the cursor, and the slot whose CSS `cursor` lists
+/// images first (NONE when none does).
+pub struct CursorFrom {
+  pub cursor: Cursor,
+  pub images: u32,
+}
+
+impl Copy for CursorFrom {}
+
+pub fn cursorFrom(tree: &UiTree<'_>) -> CursorFrom {
   let chain = tree.hoverChain.asSlice()
   let mut i: usize = 0
   while i < chain.length {
@@ -500,21 +660,21 @@ pub fn cursorOf(tree: &UiTree<'_>) -> Cursor {
     if alive(tree, slot, pairId(chain[i])) {
       let node = tree.node(slot)
       if node.cursor != Cursor.Default {
-        return node.cursor
+        return CursorFrom { cursor: node.cursor, images: NONE }
       }
-      match node.computed.cursor {
+      match node.computed().cursor {
         Option.Some { value } => {
-          return value
+          return CursorFrom { cursor: value, images: if node.computed().cursorUrl { slot } else { NONE } }
         }
         Option.None => {}
       }
       if node.kind == NodeKind.Input {
-        return Cursor.Text
+        return CursorFrom { cursor: Cursor.Text, images: NONE }
       }
     }
     i = i + 1
   }
-  return Cursor.Default
+  return CursorFrom { cursor: Cursor.Default, images: NONE }
 }
 
 // Records.
@@ -561,7 +721,49 @@ effect fn pointerRecord(
   event.modifiers = modifiers
   event.button = button
   event.detail = detail
+  event.pointerId = tree.pointerId
+  event.pointerType = tree.pointerType
+  event.primary = tree.pointerPrimary
+  if tree.node(slot).svg.isSome() {
+    event.element = run svgElementAt(&tree.*, slot, tree.pointerX, tree.pointerY)
+  }
   run tree.queueEvent(move event)
+}
+
+/// The element of live svg node `slot` under the pointer at (`x`, `y`), 0 when the pointer is
+/// over none of its shapes or not over the node.
+effect fn svgElementAt(tree: &UiTree<'_>, slot: u32, x: f32, y: f32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut landing = Landing { fragment: NO_INDEX, x: 0.0, y: 0.0 }
+  if eventSlot(tree, hitLanding(tree, x, y, &mut landing)) != slot || landing.fragment == NO_INDEX {
+    return 0
+  }
+  let f = tree.output.fragments.values.asSlice()[landing.fragment]
+  let node = tree.node(slot)
+  return match node.svg.get() {
+    Option.Some { value: svg } => run live_svg.hit(svg, contentBox(&f), landing.x, landing.y, node.computed().text.color)
+    _ => 0
+  }
+}
+
+/// `pointerRecord` for the touch module.
+pub effect fn queuePointer(
+  tree: &mut UiTree<'_>,
+  kind: EventKind,
+  slot: u32,
+  modifiers: u32,
+  button: u32,
+  detail: u32,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run pointerRecord(&mut tree, kind, slot, modifiers, button, detail)
+}
+
+/// Whether `slot` or a node above it listens for `flag`.
+pub fn listensOnPath(tree: &UiTree<'_>, slot: u32, flag: u32) -> bool {
+  return pathListens(tree, slot, flag)
 }
 
 // Hover.
@@ -576,6 +778,17 @@ effect fn updateHover(tree: &mut UiTree<'_>, target: u32, modifiers: u32) -> ()
   while at != NONE {
     run chain.append(at)
     at = tree.node(at).parent
+  }
+  // The deepest node hovered before: the target of `pointerout`, as `target` is of `pointerover`.
+  let mut before = NONE
+  if tree.hoverChain.length() != 0 {
+    let deepest = tree.hoverChain.get(0)
+    if alive(&tree.*, pairSlot(deepest), pairId(deepest)) && attached(&tree.*, pairSlot(deepest)) {
+      before = pairSlot(deepest)
+    }
+  }
+  if before != target && before != NONE && pathListens(&tree.*, before, LISTEN_POINTER_OUT) {
+    run pointerRecord(&mut tree, EventKind.PointerOut, before, modifiers, 0, 0)
   }
   let old = tree.hoverChain.asSlice()
   let mut i: usize = 0
@@ -597,6 +810,9 @@ effect fn updateHover(tree: &mut UiTree<'_>, target: u32, modifiers: u32) -> ()
     i = i + 1
   }
   tree.hoverChain.clear()
+  if before != target && target != NONE && pathListens(&tree.*, target, LISTEN_POINTER_OVER) {
+    run pointerRecord(&mut tree, EventKind.PointerOver, target, modifiers, 0, 0)
+  }
   let mut j = chain.length()
   while j > 0 {
     j = j - 1
@@ -633,7 +849,7 @@ effect fn setHovered(tree: &mut UiTree<'_>, slot: u32, value: bool) -> () {
   let overridden = tree.overridden(tree.node(slot).id, StyleState.Hover)
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   node.hovered = value
-  let inline = node.hover.length() != 0 || overridden
+  let inline = node.hover().length != 0 || overridden
   tree.pointerStyleChanged(slot, StyleState.Hover, inline)
 }
 
@@ -644,6 +860,7 @@ pub effect fn refreshHover(tree: &mut UiTree<'_>) -> ()
   if !tree.pointerInside {
     return ()
   }
+  tree.work.hoverRefreshes = tree.work.hoverRefreshes + 1
   let target = hitSlot(&tree.*, tree.pointerX, tree.pointerY)
   run updateHover(&mut tree, target, 0)
 }
@@ -658,7 +875,7 @@ effect fn setPressed(tree: &mut UiTree<'_>, target: u32) -> ()
     let overridden = tree.overridden(tree.node(at).id, StyleState.Active)
     let node = &mut tree.nodes.asMutSlice()[u32.toUsize(at)]
     node.pressed = true
-    let inline = node.active.length() != 0 || overridden
+    let inline = node.active().length != 0 || overridden
     let id = node.id
     tree.pointerStyleChanged(at, StyleState.Active, inline)
     run tree.pressChain.append(pair(at, id))
@@ -677,7 +894,7 @@ fn clearPress(tree: &mut UiTree<'_>) -> () {
       let overridden = tree.overridden(tree.node(slot).id, StyleState.Active)
       let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
       node.pressed = false
-      let inline = node.active.length() != 0 || overridden
+      let inline = node.active().length != 0 || overridden
       tree.pointerStyleChanged(slot, StyleState.Active, inline)
     }
     i = i + 1
@@ -761,7 +978,10 @@ effect fn captureRecord(tree: &mut UiTree<'_>, kind: EventKind, flag: u32, slot:
   if slot == NONE || !pathListens(&tree.*, slot, flag) {
     return ()
   }
-  let event = run record(&tree.*, kind, slot)
+  let mut event = run record(&tree.*, kind, slot)
+  event.pointerId = tree.pointerId
+  event.pointerType = tree.pointerType
+  event.primary = tree.pointerPrimary
   run tree.queueEvent(move event)
 }
 
@@ -812,7 +1032,7 @@ fn commonAncestor(tree: &UiTree<'_>, a: u32, b: u32) -> u32 {
 /// visible, and nothing above it is disabled.
 fn focusable(tree: &UiTree<'_>, slot: u32) -> bool {
   let node = tree.node(slot)
-  return node.tabIndex != NOT_FOCUSABLE && node.computed.text.visible
+  return node.tabIndex != NOT_FOCUSABLE && node.computed().text.visible
     && fragmentIndex(tree, slot) != NO_INDEX
     && !disabledAt(tree, slot)
     && !inertAt(tree, slot)
@@ -957,7 +1177,8 @@ effect fn moveFocus(tree: &mut UiTree<'_>, forward: bool) -> ()
   }
   if !tree.focusVisible && tree.focused != NONE {
     let focusedSlot = tree.focused
-    tree.restyle(focusedSlot)
+    // `:focus-visible` turns on: only what its rules reach from the focused node restyles.
+    tree.focusStyleChanged(focusedSlot)
   }
   tree.focusVisible = true
   if next == focused {
@@ -1119,7 +1340,7 @@ effect fn rove(tree: &mut UiTree<'_>, slot: u32, key: &[u8]) -> bool
 /// Whether node `slot`'s name (its label, else its text) starts with ASCII `letter`, ignoring
 /// case.
 effect fn startsWith(tree: &UiTree<'_>, slot: u32, letter: u8) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let label = tree.node(slot).label.ownedUtf8Bytes()
+  let label = String.utf8Bytes(tree.node(slot).label())
   if label.length != 0 {
     return lower(label[0]) == lower(letter)
   }
@@ -1166,6 +1387,31 @@ fn same(left: &[u8], right: &[u8]) -> bool {
     }
     i = i + 1
   }
+  return true
+}
+
+// Ctrl (Cmd on macOS) with `=` or `+` zooms in a step, with `-` out, with `0` back to 100%, in
+// the steps browsers take.
+fn zoomKey(tree: &mut UiTree<'_>, key: &[u8], modifiers: u32) -> bool {
+  let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
+  if u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) != primary || key.length != 1 { return false }
+  let steps: [f32; 17] = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0]
+  let now = tree.pageZoom()
+  let mut next = now
+  if key[0] == 48 {
+    next = 1.0
+  } else if key[0] == 61 || key[0] == 43 {
+    let mut i: usize = 0
+    while i < steps.length && steps[i] <= now + 0.001 { i = i + 1 }
+    if i < steps.length { next = steps[i] }
+  } else if key[0] == 45 {
+    let mut i: usize = steps.length
+    while i > 0 && steps[i - 1] >= now - 0.001 { i = i - 1 }
+    if i > 0 { next = steps[i - 1] }
+  } else {
+    return false
+  }
+  drop tree.setPageZoom(next)
   return true
 }
 
@@ -1229,7 +1475,7 @@ fn rangeAt(tree: &UiTree<'_>, slot: u32) -> ScrollRange {
     return ScrollRange.none()
   }
   let f = tree.output.fragments.values.asSlice()[index]
-  return rangeOf(&tree.node(slot).computed, &f)
+  return rangeOf(&tree.node(slot).computed().*, &f)
 }
 
 effect fn ignoreInvalid(error: InvalidNode) -> () {
@@ -1241,16 +1487,42 @@ effect fn ignoreInvalid(error: InvalidNode) -> () {
 effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
-  if node.scrollX == x && node.scrollY == y {
+  if !run writeOffset(&mut tree, slot, x, y) {
     return false
   }
-  node.scrollX = x
-  node.scrollY = y
+  run scroll_anchor.scrolled(&mut tree, slot)
+  return true
+}
+
+/// A scroll anchoring adjustment of `slot` (see `scroll_anchor`): a scroll that keeps the anchor.
+pub effect fn anchorScroll(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if run writeOffset(&mut tree, slot, x, y) {
+    run scrollRecord(&mut tree, slot)
+  }
+}
+
+effect fn writeOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
+  if node.scrollX() == x && node.scrollY() == y {
+    return false
+  }
+  let listed = node.scrollX() != 0.0 || node.scrollY() != 0.0
+  let travel = f32.abs(x - node.scrollX()) + f32.abs(y - node.scrollY())
+  run node.setScroll(x, y)
   if node.isGenerated() { tree.paintDirty = true }
+  drop node
+  if !listed {
+    // `settleScrolls` clamps the nodes listed here.
+    run tree.scrolledSlots.append(slot)
+  }
 
   // Layout never sees scroll offsets: paint and the geometry queries apply them (see `layers`).
   tree.scrolled = true
+  tree.skipTravel = tree.skipTravel + travel
   tree.offsets = true
   tree.layoutObserversDirty = true
   return true
@@ -1260,7 +1532,7 @@ effect fn setOffset(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool
 pub effect fn scrollTo(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let c = &tree.node(slot).computed
+  let c = &tree.node(slot).computed().*
   let sx: f32 = if scrolls(usedOverflow(c, true)) {
     x
   } else {
@@ -1292,27 +1564,40 @@ effect fn scrollRecord(tree: &mut UiTree<'_>, slot: u32) -> ()
     return ()
   }
   let mut event = run record(&tree.*, EventKind.Scroll, slot)
-  event.x = tree.node(slot).scrollX
-  event.y = tree.node(slot).scrollY
+  event.x = tree.node(slot).scrollX()
+  event.y = tree.node(slot).scrollY()
   run tree.queueEvent(move event)
 }
 
-/// Scrolls by (`dx`, `dy`) from `slot` outwards: each axis scrolls the nearest container that
-/// can still move that way, and what it cannot take goes to the containers around it.
-effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> ()
+/// [`scrollChain`] for a finger pan or a flick. Returns whether anything scrolled.
+pub effect fn panChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  return run scrollChain(&mut tree, slot, dx, dy)
+}
+
+/// Scrolls by (`dx`, `dy`) from `slot` outwards: each axis scrolls the nearest container that
+/// can still move that way, and what it cannot take goes to the containers around it. Returns
+/// whether any container moved.
+pub effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut moved = false
   let mut restX = dx
   let mut restY = dy
   let mut at = slot
   while at != NONE && (restX != 0.0 || restY != 0.0) {
-    let c = tree.node(at).computed
+    let c = tree.node(at).computed().*
     let canX = userScrolls(usedOverflow(&c, true))
     let canY = userScrolls(usedOverflow(&c, false))
-    if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX {
+    if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX && scroll_snap.absorbs(&mut tree.*, at, restX, restY) {
+      // The rest of a fling aimed at a snap position.
+      restX = 0.0
+      restY = 0.0
+    } else if (canX || canY) && fragmentIndex(&tree.*, at) != NO_INDEX {
       let range = rangeAt(&tree.*, at)
-      let x = tree.node(at).scrollX
-      let y = tree.node(at).scrollY
+      let x = tree.node(at).scrollX()
+      let y = tree.node(at).scrollY()
       let nx = if canX {
         range.clampX(x + restX)
       } else {
@@ -1326,7 +1611,9 @@ effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> ()
       restX = settle(restX - (nx - x))
       restY = settle(restY - (ny - y))
       if run setOffset(&mut tree, at, nx, ny) {
+        moved = true
         run scrollRecord(&mut tree, at)
+        run scroll_snap.userScrolled(&mut tree, at, x, y, true)
       }
       // `overscroll-behavior` other than auto keeps the rest from the containers outside.
       if c.scroll.overscrollX != Overscroll.Auto {
@@ -1338,6 +1625,7 @@ effect fn scrollChain(tree: &mut UiTree<'_>, slot: u32, dx: f32, dy: f32) -> ()
     }
     at = tree.node(at).parent
   }
+  return moved
 }
 
 fn settle(value: f32) -> f32 {
@@ -1355,18 +1643,18 @@ effect fn revealSlot(tree: &mut UiTree<'_>, slot: u32) -> ()
   if index == NO_INDEX {
     return ()
   }
-  let mut rect = tree.node(slot).computed.scroll.target(borderBox(&tree.visualFragment(index)))
+  let mut rect = tree.node(slot).computed().scroll.target(borderBox(&tree.visualFragment(index)))
   let mut at = tree.node(slot).parent
   while at != NONE {
-    let c = tree.node(at).computed
+    let c = tree.node(at).computed().*
     let containerIndex = fragmentIndex(&tree.*, at)
     if (scrolls(usedOverflow(&c, true)) || scrolls(usedOverflow(&c, false)))
       && containerIndex != NO_INDEX {
       let f = tree.visualFragment(containerIndex)
       let port = c.scroll.port(paddingBox(&f))
       let range = rangeOf(&c, &f)
-      let x = tree.node(at).scrollX
-      let y = tree.node(at).scrollY
+      let x = tree.node(at).scrollX()
+      let y = tree.node(at).scrollY()
       let nx = range.clampX(x + nearest(rect.xMin, rect.xMax, port.xMin, port.xMax))
       let ny = range.clampY(y + nearest(rect.yMin, rect.yMax, port.yMin, port.yMax))
       if run setOffset(&mut tree, at, nx, ny) {
@@ -1426,27 +1714,48 @@ pub effect fn settleScrolls(tree: &mut UiTree<'_>) -> bool
   if !tree.offsets {
     return changed
   }
-  let mut held = false
-  let mut slot: u32 = 0
-  while u32.toUsize(slot) < tree.nodes.length() {
-    let node = tree.node(slot)
-    if node.live && (node.scrollX != 0.0 || node.scrollY != 0.0) {
-      held = true
+  // Only the nodes `setOffset` listed can hold one: a long page is not walked for them.
+  let mut kept: usize = 0
+  let mut at: usize = 0
+  while at < tree.scrolledSlots.length() {
+    let slot = tree.scrolledSlots.get(at)
+    at = at + 1
+    if u32.toUsize(slot) >= tree.nodes.length() {
+      continue
+    }
+    let live = tree.node(slot).live
+    let scrollX = tree.node(slot).scrollX()
+    let scrollY = tree.node(slot).scrollY()
+    if !live || (scrollX == 0.0 && scrollY == 0.0) {
+      continue
+    }
+    let mut listed = false
+    let mut before: usize = 0
+    while before < kept {
+      if tree.scrolledSlots.get(before) == slot {
+        listed = true
+      }
+      before = before + 1
+    }
+    if listed {
+      continue
+    }
+    tree.scrolledSlots.set(kept, slot)
+    kept = kept + 1
 
-      // Another root's layout is not this one: its offsets wait for its own frame.
-      if !tree.inParkedRoot(slot) {
-        let range = rangeAt(&tree.*, slot)
-        let x = range.clampX(node.scrollX)
-        let y = range.clampY(node.scrollY)
-        if run setOffset(&mut tree, slot, x, y) {
-          run scrollRecord(&mut tree, slot)
-          changed = true
-        }
+    // Another root's layout is not this one: its offsets wait for its own frame.
+    if !tree.inParkedRoot(slot) {
+      let range = rangeAt(&tree.*, slot)
+      let x = range.clampX(scrollX)
+      let y = range.clampY(scrollY)
+      if run setOffset(&mut tree, slot, x, y) {
+        run scrollRecord(&mut tree, slot)
+        changed = true
       }
     }
-    slot = slot + 1
   }
-  tree.offsets = held
+  tree.scrolledSlots.truncate(kept)
+  tree.offsets = kept != 0
   return changed
 }
 
@@ -1457,22 +1766,22 @@ fn startThumb(tree: &mut UiTree<'_>, slot: u32, x: f32, y: f32) -> bool {
   let mut at = slot
   while at != NONE {
     let index = fragmentIndex(&tree.*, at)
-    if index != NO_INDEX && tree.node(at).computed.clips() {
+    if index != NO_INDEX && tree.node(at).computed().clips() {
       let f = tree.visualFragment(index)
-      let vertical = thumbOfNode(tree.node(at), &f, tree.node(at).scrollY, true)
+      let vertical = thumbOfNode(tree.node(at), &f, tree.node(at).scrollY(), true)
       if vertical.visible && inside(vertical.rect, x, y) {
         tree.thumbSlot = at
         tree.thumbVertical = true
         tree.thumbStart = y
-        tree.thumbOffset = tree.node(at).scrollY
+        tree.thumbOffset = tree.node(at).scrollY()
         return true
       }
-      let horizontal = thumbOfNode(tree.node(at), &f, tree.node(at).scrollX, false)
+      let horizontal = thumbOfNode(tree.node(at), &f, tree.node(at).scrollX(), false)
       if horizontal.visible && inside(horizontal.rect, x, y) {
         tree.thumbSlot = at
         tree.thumbVertical = false
         tree.thumbStart = x
-        tree.thumbOffset = tree.node(at).scrollX
+        tree.thumbOffset = tree.node(at).scrollX()
         return true
       }
     }
@@ -1493,11 +1802,11 @@ effect fn dragThumb(tree: &mut UiTree<'_>) -> ()
     return ()
   }
   let f = tree.output.fragments.values.asSlice()[index]
-  let c = tree.node(slot).computed
+  let c = tree.node(slot).computed().*
   let range = rangeOf(&c, &f)
   let thumb = thumbOfNode(tree.node(slot), &f, tree.thumbOffset, tree.thumbVertical)
-  let x = tree.node(slot).scrollX
-  let y = tree.node(slot).scrollY
+  let x = tree.node(slot).scrollX()
+  let y = tree.node(slot).scrollY()
   let moved = if tree.thumbVertical {
     tree.pointerY - tree.thumbStart
   } else {
@@ -1511,6 +1820,7 @@ effect fn dragThumb(tree: &mut UiTree<'_>) -> ()
   }
   if changed {
     run scrollRecord(&mut tree, slot)
+    run scroll_snap.userScrolled(&mut tree, slot, x, y, false)
   }
 }
 
@@ -1559,6 +1869,42 @@ fn remembered(tree: &UiTree<'_>) -> u32 {
 pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let fromTouch = match &input.* {
+    Input.TouchStart { .. } => true
+    Input.TouchMove { .. } => true
+    Input.TouchEnd { .. } => true
+    Input.TouchCancel { .. } => true
+    Input.Pinch { .. } => true
+    _ => false
+  }
+  if fromTouch {
+    tree.pendingTarget = NONE
+    tree.pendingTargetId = NONE
+    run touch.begin(&mut tree, input)
+    return ()
+  }
+  match &input.* {
+    Input.PointerMove { .. } => touch.speakAsMouse(&mut tree)
+    Input.PointerDown { .. } => {
+      touch.speakAsMouse(&mut tree)
+      touch.stopFling(&mut tree)
+    }
+    Input.PointerUp { .. } => touch.speakAsMouse(&mut tree)
+    Input.PointerLeave => touch.speakAsMouse(&mut tree)
+    Input.Wheel { .. } => {
+      touch.speakAsMouse(&mut tree)
+      touch.stopFling(&mut tree)
+    }
+    _ => {}
+  }
+  run beginInput(&mut tree, input)
+}
+
+/// `begin` for pointer, wheel and key input, the pointer records speaking for the pointer
+/// `UiTree.pointerId` names.
+pub effect fn beginInput(tree: &mut UiTree<'_>, input: &Input) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   tree.pendingTarget = NONE
   tree.pendingTargetId = NONE
   match &input.* {
@@ -1584,12 +1930,15 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
         // A press that never saw its release ends here. A scrollbar thumb belongs to the
         // tree, so a press on one is no pointer down for the client.
         clearPress(&mut tree)
+        // A finger pans over a scrollbar as over the content: thumbs are for the mouse.
         let layoutHit = hitLayoutSlot(&tree.*, x, y)
-        if layoutHit != NONE && startThumb(&mut tree, layoutHit, x, y) {
+        if layoutHit != NONE && tree.pointerType != POINTER_TOUCH && startThumb(&mut tree, layoutHit, x, y) {
           return ()
         }
       }
       remember(&mut tree, hit)
+      tree.pressed = hit
+      tree.pressedId = tree.pendingTargetId
       if hit == NONE || disabledAt(&tree.*, hit) {
         return ()
       }
@@ -1663,8 +2012,118 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
     }
     Input.TextInput { .. } => {}
     Input.ImePreedit { .. } => {}
-    Input.Paste { .. } => {}
+    Input.Command { command } => {
+      let from = keyTarget(&tree.*)
+      let target = run clipboard.target(&mut tree, from)
+      remember(&mut tree, target)
+      run clipboard.beginCommand(&mut tree, target, command)
+    }
+    Input.Paste { target, text, html, image } => {
+      let slot = liveSlot(&tree.*, target)
+      remember(&mut tree, slot)
+      run clipboard.beginPaste(&mut tree, slot, &text, &html, &image)
+    }
+    Input.Edit { target, inputType, text } => {
+      let slot = liveSlot(&tree.*, target)
+      remember(&mut tree, slot)
+      run clipboard.beginEdit(&mut tree, slot, &inputType, &text)
+    }
+    Input.Request { request, target } => {
+      let slot = run requestTarget(&tree.*, target)
+      remember(&mut tree, slot)
+      if slot != NONE {
+        let kind = if request == Request.Close { EventKind.CloseRequest } else { EventKind.Navigate }
+        let mut event = run record(&tree.*, kind, slot)
+        event.detail = if request == Request.Forward { 1 } else { 0 }
+        run tree.queueEvent(move event)
+      }
+    }
+    Input.TouchStart { .. } => {}
+    Input.TouchMove { .. } => {}
+    Input.TouchEnd { .. } => {}
+    Input.TouchCancel { .. } => {}
+    Input.Pinch { .. } => {}
   }
+}
+
+/// Whether a request can start at `slot`: it is in the tree, not inert, and it or a node
+/// above it listens for requests.
+fn hearsRequest(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && tree.node(slot).live && attached(tree, slot) && !inertAt(tree, slot)
+    && pathListens(tree, slot, LISTEN_REQUEST)
+}
+
+/// The node a request starts at (see `Input.Request`), or NONE when no node would hear it:
+/// node `target` if it names one, else the focused node, else the node last pressed, each
+/// only if a listener is on its path; otherwise the last node in tree order that listens and
+/// is not inert, which is the one on top.
+effect fn requestTarget(tree: &UiTree<'_>, target: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if target != REQUEST_ANYWHERE {
+    let named = tree.slotOf(target)
+    if hearsRequest(tree, named) {
+      return named
+    }
+  }
+  if hearsRequest(tree, tree.focused) {
+    return tree.focused
+  }
+  if alive(tree, tree.pressed, tree.pressedId) && hearsRequest(tree, tree.pressed) {
+    return tree.pressed
+  }
+  return run lastListener(tree)
+}
+
+/// The last node in tree order that listens for requests and is not inert, or NONE.
+effect fn lastListener(tree: &UiTree<'_>) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = NONE
+  if tree.root == NONE {
+    return found
+  }
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run stack.append(tree.root)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let slot = stack.get(last)
+    stack.truncate(last)
+    if !tree.node(slot).inert {
+      if listens(tree, slot, LISTEN_REQUEST) {
+        found = slot
+      }
+      run tree.childSlots(slot, &mut children)
+      let mut i = children.length()
+      while i > 0 {
+        i = i - 1
+        run stack.append(children.get(i))
+      }
+    }
+  }
+  return found
+}
+
+/// The request key down `key` raises when nothing else took it: Escape closes, and the
+/// platform's back and forward keys navigate (Alt with the left and right arrows, Cmd with
+/// the brackets on a Mac, and the browser keys of a keyboard).
+fn requestOf(tree: &UiTree<'_>, key: string, modifiers: u32) -> Option<Request> {
+  let held = u32.bitAnd(modifiers, MOD_SHIFT + MOD_CONTROL + MOD_ALT + MOD_META)
+  if held == 0 {
+    if key == "Escape" { return Option<Request>.some(Request.Close) }
+    if key == "BrowserBack" { return Option<Request>.some(Request.Back) }
+    if key == "BrowserForward" { return Option<Request>.some(Request.Forward) }
+    return Option<Request>.None
+  }
+  if tree.keymap == Keymap.Mac {
+    if held == MOD_META && key == "[" { return Option<Request>.some(Request.Back) }
+    if held == MOD_META && key == "]" { return Option<Request>.some(Request.Forward) }
+    return Option<Request>.None
+  }
+  if held == MOD_ALT && key == "ArrowLeft" { return Option<Request>.some(Request.Back) }
+  if held == MOD_ALT && key == "ArrowRight" { return Option<Request>.some(Request.Forward) }
+  return Option<Request>.None
 }
 
 /// The second half of a dispatch: the default action of `input` and the records that follow
@@ -1675,6 +2134,35 @@ pub effect fn begin(tree: &mut UiTree<'_>, input: &Input) -> ()
 pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let fromTouch = match &input {
+    Input.TouchStart { .. } => true
+    Input.TouchMove { .. } => true
+    Input.TouchEnd { .. } => true
+    Input.TouchCancel { .. } => true
+    Input.Pinch { .. } => true
+    _ => false
+  }
+  if fromTouch {
+    run touch.finish(&mut tree, move input, prevented)
+    return ()
+  }
+  run finishInput(&mut tree, move input, prevented)
+}
+
+/// Ctrl with letter `lower` (Cmd with the Mac keymap), either case.
+fn commandKey(tree: &UiTree<'_>, key: string, modifiers: u32, lower: string) -> bool {
+  let primary = if tree.keymap == Keymap.Mac { MOD_META } else { MOD_CONTROL }
+  let held = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META)
+  if held != primary { return false }
+  let a = String.utf8Bytes(key)
+  let b = String.utf8Bytes(lower)
+  return a.length == 1 && (a[0] == b[0] || a[0] + 32 == b[0])
+}
+
+/// `finish` for pointer, wheel and key input.
+pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   match move input {
     Input.PointerMove { x, y, .. } => {
       if tree.thumbSlot != NONE {
@@ -1683,9 +2171,25 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       let origin = captured(&tree.*)
       if origin != NONE && origin == tree.focused && tree.node(origin).kind == NodeKind.Input {
         run edit.pointerDrag(&mut tree, origin, x, y)
+      } else if tree.textSelection.unit != text_selection.UNIT_NONE {
+        run text_selection.pointerDrag(&mut tree, x, y)
       }
     }
     Input.PointerDown { x, y, button, modifiers, clickCount } => {
+      if button == BUTTON_SECONDARY && !prevented && tree.thumbSlot == NONE {
+        // A secondary press on an input focuses it and opens its edit menu, as a browser's
+        // context menu does; a listener that prevents the press keeps the menu closed.
+        let hit = remembered(&tree.*)
+        if hit != NONE && tree.node(hit).kind == NodeKind.Input && !disabledAt(&tree.*, hit) {
+          if tree.focused != hit && !pathPrevents(&tree.*, hit, PREVENT_FOCUS) {
+            run focusFrom(&mut tree, hit)
+          }
+          if tree.focused == hit {
+            run clipboard.editMenu(&mut tree, hit, x, y)
+          }
+        }
+        return ()
+      }
       if button != BUTTON_PRIMARY || tree.thumbSlot != NONE {
         return ()
       }
@@ -1693,6 +2197,7 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
         // The press landed on nothing.
         if !prevented {
           run tree.focusSlot(NONE)
+          run text_selection.clear(&mut tree)
         }
         return ()
       }
@@ -1704,7 +2209,8 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       let keepFocus = prevented || pathPrevents(&tree.*, hit, PREVENT_FOCUS)
       if tree.focusVisible && tree.focused != NONE {
         let focusedSlot = tree.focused
-        tree.restyle(focusedSlot)
+        // `:focus-visible` turns off: only what its rules reach from the focused node restyles.
+        tree.focusStyleChanged(focusedSlot)
       }
       tree.focusVisible = false
       if disabledAt(&tree.*, hit) {
@@ -1719,8 +2225,31 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
           run edit.pointerDown(&mut tree, hit, x, y, clickCount, modifiers)
         }
       }
+      if !prevented {
+        // A press in an input selects there; anywhere else it selects document text.
+        if tree.node(hit).kind == NodeKind.Input {
+          run text_selection.clear(&mut tree)
+        } else {
+          run text_selection.pointerDown(&mut tree, hit, x, y, clickCount, u32.bitAnd(modifiers, MOD_SHIFT) != 0)
+        }
+      }
     }
     Input.PointerUp { x, y, button, modifiers } => {
+      if button == BUTTON_BACK || button == BUTTON_FORWARD {
+        // The back and forward buttons of a mouse ask to navigate from the node under the
+        // pointer, unless a listener prevented the release.
+        let hit = hitSlot(&tree.*, x, y)
+        let from = if hit == NONE { REQUEST_ANYWHERE } else { tree.node(hit).id }
+        if !prevented {
+          run tree.queueFollowUp(
+            Input.Request {
+              request: if button == BUTTON_BACK { Request.Back } else { Request.Forward },
+              target: from,
+            },
+          )
+        }
+        return ()
+      }
       if button != BUTTON_PRIMARY {
         return ()
       }
@@ -1732,6 +2261,7 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if origin != NONE && tree.node(origin).kind == NodeKind.Input {
         edit.pointerUp(&mut tree, origin)
       }
+      text_selection.pointerUp(&mut tree)
       let hit = hitSlot(&tree.*, x, y)
       let mut clicked = NONE
       if tree.captureMode == CAPTURE_EXPLICIT {
@@ -1762,6 +2292,7 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if origin != NONE && tree.node(origin).kind == NodeKind.Input {
         edit.pointerUp(&mut tree, origin)
       }
+      text_selection.pointerUp(&mut tree)
       let holder = explicitHolder(&tree.*)
       run captureRecord(
         &mut tree,
@@ -1780,9 +2311,10 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
         return ()
       }
       let layoutHit = hitLayoutSlot(&tree.*, x, y)
-      run scrollChain(&mut tree, if layoutHit != NONE { layoutHit } else { hit }, deltaX, deltaY)
+      drop run scrollChain(&mut tree, if layoutHit != NONE { layoutHit } else { hit }, deltaX, deltaY)
     }
     Input.KeyDown { key, modifiers, repeat, .. } => {
+      if tree.zoomKeys && !prevented && zoomKey(&mut tree, String.utf8Bytes(String.view(&key)), modifiers) { return () }
       let target = keyTarget(&tree.*)
       if target == NONE {
         tree.suppressText = false
@@ -1797,11 +2329,42 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       // Editing and keyboard clicks belong to the node the key went to. When a handler moved
       // focus or removed that node, they do not fall on whatever has focus now.
       let same = target == remembered(&tree.*)
+      if same {
+        if let Option<EditCommand>.Some { value: command } = clipboard.shortcut(tree.keymap, String.view(&key), modifiers) {
+          if command == EditCommand.Paste {
+            run clipboard.requestPaste(&mut tree, target)
+          } else if run clipboard.matters(&mut tree, target) {
+            run tree.queueFollowUp(Input.Command { command: command })
+          }
+          return ()
+        }
+      }
       if same && target == tree.focused && tree.node(target).kind == NodeKind.Input
         && run edit.keyDown(&mut tree, target, &key, modifiers) {
         return ()
       }
       let plain = u32.bitAnd(modifiers, MOD_CONTROL + MOD_ALT + MOD_META) == 0
+      let editing = tree.focused != NONE && tree.node(tree.focused).kind == NodeKind.Input
+      if same && !editing && commandKey(&tree.*, String.view(&key), modifiers, "a") && run text_selection.hostSelectAll(&mut tree) {
+        return ()
+      }
+      if same && !editing && commandKey(&tree.*, String.view(&key), modifiers, "a") && run text_selection.selectAll(&mut tree) {
+        return ()
+      }
+      if same && !editing && target == tree.focused && run text_selection.hostKey(&mut tree, String.view(&key), modifiers) {
+        return ()
+      }
+      if same && !editing && run text_selection.extend(&mut tree, String.view(&key), modifiers) {
+        return ()
+      }
+      if !repeat {
+        if let Option<Request>.Some { value: request } = requestOf(&tree.*, String.view(&key), modifiers) {
+          // The request starts at the node the key went to, when that is a real node.
+          let from = if target == tree.root { REQUEST_ANYWHERE } else { tree.node(target).id }
+          run tree.queueFollowUp(Input.Request { request: request, target: from })
+          return ()
+        }
+      }
       if plain && String.view(&key) == "Tab" {
         run moveFocus(&mut tree, u32.bitAnd(modifiers, MOD_SHIFT) == 0)
       } else if same && plain && target == tree.focused && run rove(&mut tree, target, String.utf8Bytes(String.view(&key))) {
@@ -1812,6 +2375,8 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       }
     }
     Input.KeyUp { key, modifiers, .. } => {
+      // A prevented key drops only the text it types itself, which comes before it is up.
+      tree.suppressText = false
       let target = keyTarget(&tree.*)
       if target == NONE || prevented || pathPrevents(&tree.*, target, PREVENT_KEYS) {
         return ()
@@ -1827,14 +2392,38 @@ pub effect fn finish(tree: &mut UiTree<'_>, input: Input, prevented: bool) -> ()
       if tree.suppressText {
         return ()
       }
+      if run text_selection.hostText(&mut tree, String.view(&text), false) {
+        return ()
+      }
       run edit.textInput(&mut tree, move text)
     }
     Input.ImePreedit { text, selectionStart, selectionEnd } => {
+      if run text_selection.hostText(&mut tree, String.view(&text), true) {
+        return ()
+      }
       run edit.preedit(&mut tree, move text, selectionStart, selectionEnd)
     }
-    Input.Paste { target, text } => {
-      run edit.paste(&mut tree, target, move text)
+    Input.Command { command } => {
+      let slot = remembered(&tree.*)
+      run clipboard.finishCommand(&mut tree, slot, command, prevented)
     }
+    Input.Paste { text, .. } => {
+      let slot = remembered(&tree.*)
+      run clipboard.finishPaste(&mut tree, slot, move text, prevented)
+    }
+    Input.Edit { inputType, text, .. } => {
+      let slot = remembered(&tree.*)
+      if !prevented && slot != NONE {
+        run edit.applyEdit(&mut tree, slot, String.view(&inputType), String.view(&text))
+      }
+    }
+    // A request has no default in the tree: the client that hears it acts.
+    Input.Request { .. } => {}
+    Input.TouchStart { .. } => {}
+    Input.TouchMove { .. } => {}
+    Input.TouchEnd { .. } => {}
+    Input.TouchCancel { .. } => {}
+    Input.Pinch { .. } => {}
   }
 }
 

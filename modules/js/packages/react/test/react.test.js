@@ -57,6 +57,21 @@ test("a click updates state and commits before the dispatch returns", () => {
   assert.equal(label.data, "Clicked 2");
 });
 
+test("a retained box dispatches only the latest handlers for each phase", () => {
+  const container = createBox();
+  const root = createRoot(container);
+  const events = [];
+  root.render(h("box", { className: "target", onClick: () => events.push("first") }, "label"));
+  const leaf = container.firstChild.firstChild;
+  mock.click(leaf.nodeId);
+  root.render(h("box", { onClickCapture: () => events.push("capture"), onClick: () => events.push("second") }, "label"));
+  mock.click(leaf.nodeId);
+  root.render(h("box", {}, "label"));
+  mock.click(leaf.nodeId);
+  assert.deepEqual(events, ["first", "capture", "second"]);
+  root.unmount();
+});
+
 test("props that change update the node, and props that go away are reset", () => {
   const root = createRoot(createBox());
   root.render(h("box", { style: { width: 1, height: 2 }, label: "one", onClick() {} }));

@@ -3,10 +3,22 @@
 A command line client for the inspector protocol ([ui-inspect-server](../server)): it sends one
 request to a running Silk UI and prints the answer.
 
+An app's `silk task dev` builds the same program beside its window host, as `<app>-inspect`,
+from the app's own silkui pin, and prints its path:
+
+```text
+silkui inspector command line: build/x86_64-unknown-linux-gnu/dev/my-app-inspect
+```
+
+Run it from the folder the app listens in (the web project for a JavaScript app) so that it finds
+`silk-ui-inspect.sock`. To build it from this repository instead:
+
 ```sh
 silk build --manifest-path modules/inspect/cli/silk.toml
-build/llvm/x86_64-unknown-linux-gnu/debug/ui-inspect-cli snapshot
+build/x86_64-unknown-linux-gnu/dev/ui-inspect-cli snapshot
 ```
+
+The program lives in ui-inspect-server's `cli` module; this package only runs it.
 
 ```text
 ui-inspect-cli [--connect ADDRESS] COMMAND [OPTIONS]

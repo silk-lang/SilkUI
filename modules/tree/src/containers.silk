@@ -26,8 +26,8 @@ fn named(tree: &UiTree<'_>, slot: u32, name: &[u8]) -> bool {
   if name.length == 0 { return true }
   if let Option.Some { value } = tree.node(slot).identity() {
     let mut i: usize = 0
-    while i < value.containerNames.length() {
-      if equal(value.containerNames.asSlice()[i].asSlice(), name) { return true }
+    while i < value.containerNames().length {
+      if equal(value.containerNames()[i].asSlice(), name) { return true }
       i = i + 1
     }
   }
@@ -36,7 +36,7 @@ fn named(tree: &UiTree<'_>, slot: u32, name: &[u8]) -> bool {
 
 pub fn contentSize(tree: &UiTree<'_>, slot: u32) -> Option<Size> {
   let node = tree.node(slot)
-  if !node.rendered || node.computed.layout.display.isContents() || node.css >= tree.output.firstBySource.length() { return Option<Size>.None }
+  if !node.rendered || node.computed().layout.display.isContents() || node.css >= tree.output.firstBySource.length() { return Option<Size>.None }
   let box = tree.output.firstBySource.get(node.css)
   if box == NO_INDEX || box >= tree.output.boxNodes.length() { return Option<Size>.None }
   let kind = tree.output.boxNodes.asSlice()[box].kind
@@ -52,8 +52,8 @@ pub fn select(tree: &UiTree<'_>, subject: u32, pseudo: PseudoTarget, name: &[u8]
     let node = tree.node(slot)
     if node.live && node.kind != NodeKind.Text && named(tree, slot, name) {
       if axes == 0 { return Option<u32>.some(slot) }
-      let containment = node.computed.contain.query()
-      let horizontal = node.computed.text.writingMode == WritingMode.HorizontalTb
+      let containment = node.computed().contain.query()
+      let horizontal = node.computed().text.writingMode == WritingMode.HorizontalTb
       let width = containment == SizeContainment.Size || containment == SizeContainment.InlineSize && horizontal
       let height = containment == SizeContainment.Size || containment == SizeContainment.InlineSize && !horizontal
       if (axes & 1 == 0 || width) && (axes & 2 == 0 || height)
@@ -99,10 +99,10 @@ pub fn usesUnits(tree: &UiTree<'_>, slot: u32) -> bool {
     }
     return false
   }
-  if unitDeclarations(node.base.asSlice()) || unitDeclarations(node.starting.asSlice()) { return true }
-  if node.hovered && unitDeclarations(node.hover.asSlice()) { return true }
-  if node.pressed && unitDeclarations(node.active.asSlice()) { return true }
-  if tree.focused == slot && (unitDeclarations(node.focus.asSlice()) || unitDeclarations(node.focusVisible.asSlice())) { return true }
+  if unitDeclarations(node.base.asSlice()) || unitDeclarations(node.starting()) { return true }
+  if node.hovered && unitDeclarations(node.hover()) { return true }
+  if node.pressed && unitDeclarations(node.active()) { return true }
+  if tree.focused == slot && (unitDeclarations(node.focus()) || unitDeclarations(node.focusVisible())) { return true }
   let overrides = tree.styleOverrides()
   let mut i: usize = 0
   while i < overrides.length {
@@ -116,10 +116,12 @@ pub fn query(tree: &UiTree<'_>, subject: u32, name: &[u8], axes: u32, pseudo: Ps
   let selected = select(tree, subject, pseudo, name, axes)
   let slot = match selected { Option<u32>.Some { value } => value _ => { return Option<Environment>.None } }
   let node = tree.node(slot)
-  let text = node.computed.text
-  let mut environment = Environment.headless(f32.toF64(tree.input.width), f32.toF64(tree.input.height))
+  let text = node.computed().text
+  let mut environment = Environment.headless(f32.toF64(tree.cssWidth()), f32.toF64(tree.cssHeight()))
   let size = match contentSize(tree, slot) { Option<Size>.Some { value } => value _ => Size { width: 0.0, height: 0.0 } }
-  environment.querySize = Option<QuerySize>.some(QuerySize { width: f32.toF64(size.width), height: f32.toF64(size.height) })
+  // Queries compare CSS pixels: the container's zoomed box over its effective zoom.
+  let zoom = f32.toF64(text.zoom)
+  environment.querySize = Option<QuerySize>.some(QuerySize { width: f32.toF64(size.width) / zoom, height: f32.toF64(size.height) / zoom })
   let initial = &mut environment.initial
   initial.fontSize = f32.toF64(text.size)
   initial.vertical = text.writingMode != WritingMode.HorizontalTb
@@ -140,7 +142,7 @@ pub fn query(tree: &UiTree<'_>, subject: u32, name: &[u8], axes: u32, pseudo: Ps
   }
   if tree.root != NONE {
     let root = tree.node(tree.root)
-    let rootText = root.computed.text
+    let rootText = root.computed().text
     let metrics = tree.provider.text.font(FontRequest { key: root.fontKey, writingMode: rootText.writingMode, textOrientation: rootText.textOrientation, direction: rootText.direction })
     initial.rootFontSize = f32.toF64(rootText.size)
     initial.rootXHeight = initial.rootFontSize * 0.5
@@ -162,6 +164,27 @@ pub fn query(tree: &UiTree<'_>, subject: u32, name: &[u8], axes: u32, pseudo: Ps
   // ancestor containers supply CQ units, just as for a declaration on that box.
   if let Option<f32>.Some { value } = physicalUnit(tree, slot, true) { initial.containerWidth = Option<f64>.some(f32.toF64(value)) }
   if let Option<f32>.Some { value } = physicalUnit(tree, slot, false) { initial.containerHeight = Option<f64>.some(f32.toF64(value)) }
+  if zoom != 1.0 {
+    initial.fontSize = initial.fontSize / zoom
+    initial.xHeight = initial.xHeight / zoom
+    initial.capHeight = initial.capHeight / zoom
+    initial.zeroAdvance = initial.zeroAdvance / zoom
+    initial.ideographAdvance = initial.ideographAdvance / zoom
+    initial.lineHeight = initial.lineHeight / zoom
+    if let Option<f64>.Some { value } = initial.containerWidth { initial.containerWidth = Option<f64>.some(value / zoom) }
+    if let Option<f64>.Some { value } = initial.containerHeight { initial.containerHeight = Option<f64>.some(value / zoom) }
+  }
+  if tree.root != NONE {
+    let rootZoom = f32.toF64(tree.node(tree.root).computed().text.zoom)
+    if rootZoom != 1.0 {
+      initial.rootFontSize = initial.rootFontSize / rootZoom
+      initial.rootXHeight = initial.rootXHeight / rootZoom
+      initial.rootCapHeight = initial.rootCapHeight / rootZoom
+      initial.rootZeroAdvance = initial.rootZeroAdvance / rootZoom
+      initial.rootIdeographAdvance = initial.rootIdeographAdvance / rootZoom
+      initial.rootLineHeight = initial.rootLineHeight / rootZoom
+    }
+  }
   initial.containerInlineSize = if initial.vertical { initial.containerHeight } else { initial.containerWidth }
   initial.containerBlockSize = if initial.vertical { initial.containerWidth } else { initial.containerHeight }
   return Option<Environment>.some(environment)
@@ -214,8 +237,8 @@ effect fn applyNames(tree: &UiTree<'_>, parent: u32, list: &[Declaration], resul
           if parent != NONE {
             if let Option.Some { value: identity } = tree.node(parent).identity() {
               let mut name: usize = 0
-              while name < identity.containerNames.length() {
-                run result.append(run Bytes.copy(identity.containerNames.asSlice()[name].asSlice()))
+              while name < identity.containerNames().length {
+                run result.append(run Bytes.copy(identity.containerNames()[name].asSlice()))
                 name = name + 1
               }
             }
@@ -241,14 +264,14 @@ pub effect fn names(tree: &UiTree<'_>, slot: u32) -> List<Bytes> ! OutOfMemoryEr
     while i < states.length {
       if style_sheets.active(tree, slot, states[i]) {
         let list = match states[i] {
-          StyleState.Hover => &node.hover
-          StyleState.Active => &node.active
-          StyleState.Focus => &node.focus
-          StyleState.FocusVisible => &node.focusVisible
-          _ => &node.base
+          StyleState.Hover => node.hover()
+          StyleState.Active => node.active()
+          StyleState.Focus => node.focus()
+          StyleState.FocusVisible => node.focusVisible()
+          _ => node.base.asSlice()
         }
         let replaced = match tree.overrideOf(node.id, states[i]) { Option.Some { value } => value.replace _ => false }
-        if !replaced { run applyNames(tree, node.parent, list.asSlice(), &mut result) }
+        if !replaced { run applyNames(tree, node.parent, list, &mut result) }
       }
       i = i + 1
     }
@@ -267,10 +290,10 @@ pub effect fn names(tree: &UiTree<'_>, slot: u32) -> List<Bytes> ! OutOfMemoryEr
 
 pub fn sameNames(tree: &UiTree<'_>, slot: u32, names: &[Bytes]) -> bool {
   if let Option.Some { value } = tree.node(slot).identity() {
-    if value.containerNames.length() != names.length { return false }
+    if value.containerNames().length != names.length { return false }
     let mut i: usize = 0
     while i < names.length {
-      if !equal(value.containerNames.asSlice()[i].asSlice(), names[i].asSlice()) { return false }
+      if !equal(value.containerNames()[i].asSlice(), names[i].asSlice()) { return false }
       i = i + 1
     }
     return true

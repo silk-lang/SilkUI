@@ -23,6 +23,7 @@ import ui_tree_window.loader { Loader }
 import ui_tree_window.console { StderrWriter }
 import ui_js_calls.lib { kindCode, numbersOf, eventStrings }
 import ui_js_calls.markdown as markdown
+import ui_tree.live_svg
 import silk.collections.list { List }
 import silk.collections.bytes { Bytes }
 import silk.core.effect { Effect }
@@ -287,7 +288,31 @@ pub unsafe fn markdownJson(source: ?[*]const u8, length: usize, flags: u32) -> ?
       Result<List<u8>, OutOfMemoryError>.Success { value } => move value
       Result<List<u8>, OutOfMemoryError>.Failure { .. } => { return Pointer.null<u8>() }
     }
-    let bytes = json.asSlice()
+    return unsafe prefixed(json.asSlice())
+  } else {
+    return Pointer.null<u8>()
+  }
+}
+
+/// `__ui.svgMeasure(op, packed, distance)` for the page (see `ui_tree.live_svg.measure`): the
+/// answer for the `length` UTF-8 bytes at `source`, allocated and freed as `markdownJson`'s.
+/// An app's root package exports this as `silkui_svg_measure`.
+pub unsafe fn svgMeasure(source: ?[*]const u8, length: usize, op: u32, distance: f64) -> ?*mut u8 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    let mut heap = Allocator.systemAllocatorProvider()
+    let out = run Effect.result(measured(source, length, op, distance)) |> Effect.provideMut<Allocator>(&mut heap)
+    return match move out {
+      Result<List<u8>, OutOfMemoryError>.Success { value } => unsafe prefixed(value.asSlice())
+      Result<List<u8>, OutOfMemoryError>.Failure { .. } => Pointer.null<u8>()
+    }
+  } else {
+    return Pointer.null<u8>()
+  }
+}
+
+/// `bytes` in a new host allocation after their length as a little-endian u32, or null.
+unsafe fn prefixed(bytes: &[u8]) -> ?*mut u8 {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
     let pointer = hostMemory.hostAllocate(bytes.length + 4)
     if Pointer.isNull(pointer) { return pointer }
     let many = unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(pointer)
@@ -309,6 +334,20 @@ pub unsafe fn markdownJson(source: ?[*]const u8, length: usize, flags: u32) -> ?
 }
 
 static if Intrinsic.targetArchitecture() == "wasm32" {
+  effect fn measured(source: ?[*]const u8, length: usize, op: u32, distance: f64) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut bytes = List<u8>.make()
+    if let Option<[*]const u8>.Some { value: many } = Pointer.nonNullMany(source) {
+      let mut i: usize = 0
+      while i < length {
+        run bytes.append(unsafe Pointer.read(unsafe Pointer.at(many, i)))
+        i = i + 1
+      }
+    }
+    let mut out = List<u8>.make()
+    run live_svg.measure(bytes.asSlice(), op, distance, &mut out)
+    return move out
+  }
+
   effect fn markdownOf(source: ?[*]const u8, length: usize, flags: u32) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
     let mut bytes = List<u8>.make()
     match Pointer.nonNullMany(source) {

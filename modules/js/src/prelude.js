@@ -1,7 +1,8 @@
 // The web globals a ui-js realm starts with, on top of the engine's ECMAScript: timers,
 // animation frames, a console, queueMicrotask, performance.now, reportError and
-// navigator.clipboard. The host evaluates this once, before any application code. Edit it,
-// then run `silk task embed-assets` to regenerate generated_prelude.silk.
+// navigator.clipboard, and stand-ins that load the rest (web_apis.js) when first used.
+// The host evaluates this once, before any application code. Edit it, then run
+// `silk task embed-assets` to regenerate generated_prelude.silk.
 (function () {
   const native = globalThis.__ui;
   const timers = new Map();
@@ -65,7 +66,10 @@
     Promise.resolve().then(callback);
   };
 
-  globalThis.performance = { now: () => native.now() };
+  // `timeOrigin` is wall-clock time when `now()` read 0, as on the web.
+  globalThis.performance = { timeOrigin: Date.now() - native.now(), now: () => native.now() };
+
+
 
   function show(value, depth) {
     if (typeof value === "string") return depth === 0 ? value : JSON.stringify(value);
@@ -78,7 +82,9 @@
     return parts.length ? "{ " + parts.join(", ") + " }" : "{}";
   }
 
-  const log = (level) => (...values) => native.log(level, values.map((value) => show(value, 0)).join(" "));
+  // Lines inside `console.group` are indented two spaces a level.
+  const shared = { groups: 0, show, log: null };
+  const log = (shared.log = (level) => (...values) => native.log(level, "  ".repeat(shared.groups) + values.map((value) => show(value, 0)).join(" ")));
   globalThis.console = {
     debug: log(0),
     log: log(1),
@@ -91,7 +97,46 @@
     },
   };
 
+  // The rest of the web APIs (web_apis.js) are evaluated on their first use: parsing them
+  // in every realm would make every app start slower.
+  let web = null;
+  const api = () => (web ??= (0, eval)(native.webApis())(native, shared));
+  const forward = (object, part, names) => {
+    for (const name of names) object[name] = (...args) => api()[part][name](...args);
+  };
+  forward(globalThis.console, "console", ["dir", "table", "group", "groupCollapsed", "groupEnd", "time", "timeLog", "timeEnd", "count", "countReset"]);
+  forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
+  globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
+  const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
+  for (const name of ["Blob", "setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = api()[name];
+        own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
   globalThis.reportError = (error) => native.log(3, "Uncaught " + show(error, 0));
+
+  // `devicePixelRatio` and `matchMedia` answer for the window's last frame; the host calls
+  // `native.media` when that changes, for the lists' `change` events.
+  Object.defineProperty(globalThis, "devicePixelRatio", { get: () => native.scale(), set: (value) => own("devicePixelRatio", value), configurable: true });
+  globalThis.matchMedia = (query) => api().matchMedia(query);
+  native.media = () => web?.mediaChanged();
+
+  // The global object as an event target, for `unhandledrejection`, the one event a realm
+  // sends it. The host asks `native.rejected` before it reports a rejection nothing handled.
+  let windowTarget = null;
+  const target = () => (windowTarget ??= new globalThis.EventTarget());
+  globalThis.addEventListener = (...args) => target().addEventListener(...args);
+  globalThis.removeEventListener = (...args) => windowTarget?.removeEventListener(...args);
+  globalThis.dispatchEvent = (event) => target().dispatchEvent(event);
+  native.rejected = (promise, reason) =>
+    windowTarget !== null && !windowTarget.dispatchEvent(new globalThis.PromiseRejectionEvent("unhandledrejection", { promise, reason, cancelable: true }));
 
   // Silk functions on a background thread: `fn.async(...)` of a `.silk` import. The host runs
   // the call on a thread and settles the promise once it ends: kind 0 is a value, 1 a
@@ -112,33 +157,59 @@
     else pending.reject(kind === 1 ? new TypeError(value) : new Error(value));
   };
 
-  // As `navigator.clipboard` in a browser, for text. The host reads and writes the system
-  // clipboard after the code that asked has run, then settles the promise.
-  const clipboardCalls = new Map();
-  let nextClipboardCall = 0;
-  function clipboardCall(read, ask) {
-    const call = ++nextClipboardCall;
-    return new Promise((resolve) => {
-      clipboardCalls.set(call, { read, resolve });
-      ask(call);
-    });
-  }
-  // The host's answer to clipboard call `call`: a read's text, undefined when there is none.
-  native.clipboard = function (call, text) {
-    const pending = clipboardCalls.get(call);
-    if (!pending) return;
-    clipboardCalls.delete(call);
-    pending.resolve(pending.read ? (text ?? "") : undefined);
-  };
-  const clipboard = {
-    readText: () => clipboardCall(true, (call) => native.clipboardRead(call)),
-    writeText: (text) => {
-      const value = String(text);
-      return clipboardCall(false, (call) => native.clipboardWrite(call, value));
+  // As `navigator.clipboard` and `ClipboardItem` in a browser (clipboard.js, evaluated on
+  // first use).
+  let clipboardApi = null;
+  const clip = () => (clipboardApi ??= (0, eval)(native.clipboardApi())(native));
+  const clipboard = {};
+  for (const name of ["readText", "writeText", "read", "write"]) clipboard[name] = (...args) => clip().clipboard[name](...args);
+  Object.defineProperty(globalThis, "ClipboardItem", {
+    get: () => {
+      const value = clip().ClipboardItem;
+      Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true });
+      return value;
     },
-  };
+    set: (value) => Object.defineProperty(globalThis, "ClipboardItem", { value, writable: true, configurable: true }),
+    configurable: true,
+  });
   if (typeof globalThis.navigator !== "object" || globalThis.navigator === null) globalThis.navigator = {};
   Object.defineProperty(globalThis.navigator, "clipboard", { value: clipboard, enumerable: true, configurable: true });
+  Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
+  Object.defineProperty(globalThis.navigator, "getBattery", { value: () => api().getBattery(), writable: true, configurable: true });
+
+  // WebGPU (webgpu.js, evaluated on first use): `navigator.gpu` and the GPU globals, in a host
+  // that runs WebGPU commands. A canvas node gets its "webgpu" context from `native.gpuLoad`.
+  let gpuApi = null;
+  const gpu = (native.gpuLoad = () => (native.gpuEnabled() ? (gpuApi ??= (0, eval)(native.gpuApi())(native)) : null));
+  Object.defineProperty(globalThis.navigator, "gpu", { get: () => gpu()?.gpu, enumerable: true, configurable: true });
+  for (const name of ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUDevice", "GPUQueue", "GPUBuffer", "GPUTexture", "GPUTextureView", "GPUSampler", "GPUBindGroupLayout", "GPUPipelineLayout", "GPUBindGroup", "GPUShaderModule", "GPUCompilationInfo", "GPURenderPipeline", "GPUComputePipeline", "GPUCommandEncoder", "GPUCommandBuffer", "GPURenderPassEncoder", "GPUComputePassEncoder", "GPUCanvasContext", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUDeviceLostInfo", "GPUError", "GPUValidationError", "GPUOutOfMemoryError", "GPUInternalError", "GPUPipelineError", "GPUUncapturedErrorEvent", "GPURenderBundleEncoder", "GPURenderBundle", "GPUQuerySet", "GPUExternalTexture", "GPUBufferUsage", "GPUTextureUsage", "GPUShaderStage", "GPUMapMode", "GPUColorWrite"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = gpu()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
+  // Canvas 2D (canvas2d.js, evaluated on first use) in a host that shows canvases: a canvas node
+  // gets its "2d" context from `native.canvas2dLoad`.
+  let canvas2dApi = null;
+  const canvas2d = (native.canvas2dLoad = () => (native.canvas2dEnabled() ? (canvas2dApi ??= (0, eval)(native.canvas2dApi())(native)) : null));
+  for (const name of ["CanvasRenderingContext2D", "Path2D", "ImageData", "TextMetrics", "CanvasGradient", "CanvasPattern"]) {
+    if (name in globalThis) continue;
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = canvas2d()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
 
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.

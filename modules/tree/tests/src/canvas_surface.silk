@@ -1,0 +1,116 @@
+//! A canvas node showing a GPU surface: it has the surface's natural size, paints one surface
+//! sprite over its content box, and goes back to its commands without the surface.
+import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, NodeInfo, NodeKind, Mutation, info }
+import ui_tree.mutation { NO_SURFACE }
+import ui_tree.css { px }
+import ui_tree.css
+import ui_fixtures.fixtures as fixtures
+import ui_scene.primitives { SURFACE_TEXTURE_BASE }
+import ui_scene.scene { PrimitiveKind, Scene }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError }
+import silk.testing.testing { Testing, AssertionError }
+
+import silk.system.host_input { HostInputError }
+
+fn input() -> FrameInput {
+  return FrameInput { width: 400.0, height: 300.0, scale: 2.0, time: 0.0 }
+}
+
+/// How many image sprites of the scene sample surface `surface`, over every layer.
+fn surfaceSprites(scene: &Scene, surface: u32) -> u32 {
+  let mut count: u32 = 0
+  let mut layer: u32 = 0
+  while layer < scene.layerCount() {
+    let batches = scene.batches(layer)
+    let mut i: usize = 0
+    while i < batches.length {
+      let image = match batches[i].kind {
+        PrimitiveKind.Image => true
+        _ => false
+      }
+      if image && batches[i].texture == SURFACE_TEXTURE_BASE + surface {
+        count = count + (batches[i].end - batches[i].start)
+      }
+      i = i + 1
+    }
+    layer = layer + 1
+  }
+  return count
+}
+
+effect fn refused(error: TreeError) -> bool {
+  drop error
+  return true
+}
+
+effect fn applied(tree: &mut UiTree<'_>, batch: List<Mutation>) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.apply(move batch)
+  return false
+}
+
+effect fn body() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+  run batch.canvasSurface(2, 5, 200, 100, true)
+  run tree.apply(run batch.take())
+  run tree.frame(input())
+
+  let shown = match run info(&tree, 2) {
+    Option<NodeInfo>.Some { value } => value
+    Option<NodeInfo>.None => {
+      run Testing.expect(false, "the canvas has info")
+      return ()
+    }
+  }
+  run Testing.expect(
+    shown.bounds.width() == 200.0 && shown.bounds.height() == 100.0,
+    "a canvas with a surface has the surface's natural size",
+  )
+  run Testing.expect(surfaceSprites(tree.scene(), 5) == 1, "and paints one surface sprite")
+
+  // A styled size wins over the natural one, as on any replaced element.
+  run batch.style(2, &[css.width(px(120.0)), css.height(px(90.0))])
+  run tree.apply(run batch.take())
+  run tree.frame(input())
+  let sized = match run info(&tree, 2) {
+    Option<NodeInfo>.Some { value } => value
+    Option<NodeInfo>.None => shown
+  }
+  run Testing.expect(
+    sized.bounds.width() == 120.0 && sized.bounds.height() == 90.0,
+    "a styled size wins over the natural size",
+  )
+  run Testing.expect(surfaceSprites(tree.scene(), 5) == 1, "and the sprite is still painted")
+
+  let mut wrong = Batch.make()
+  run wrong.canvasSurface(1, 5, 10, 10, false)
+  run Testing.expect(
+    run Effect.catch<TreeError>(applied(&mut tree, run wrong.take()), refused),
+    "only canvases take a surface",
+  )
+
+  run batch.canvasSurface(2, NO_SURFACE, 0, 0, false)
+  run batch.style(2, &[])
+  run tree.apply(run batch.take())
+  run tree.frame(input())
+  run Testing.expect(surfaceSprites(tree.scene(), 5) == 0, "without the surface no sprite is painted")
+}
+
+test effect fn canvasShowsItsSurface() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}

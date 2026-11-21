@@ -11,14 +11,20 @@ export function installMock() {
   const native = {};
   for (const name of [
     "create", "append", "insertBefore", "root", "setText", "listen", "style", "clearStyle",
-    "attribute", "focus", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
+    "attribute", "focus", "capture", "remove", "destroy", "scrollTo", "select", "fontFamily", "open",
     "defineIcon", "source", "release", "load",
     "keyframe", "keyframes", "styleSheet",
     "richText", "mark", "atomStyle", "format", "insertAtom",
-    "shell", "virtualList", "virtualItems",
+    "shell",
+    "svgInsert", "svgRemove", "svgAttribute",
+    "virtualList", "virtualItems",
   ]) {
     native[name] = record(name);
   }
+  native.svgMeasure = (op, packed, distance) => {
+    calls.push(["svgMeasure", op, packed, distance]);
+    return op === 0 ? "1 2 3 4" : op === 1 ? "120" : "90 75";
+  };
   native.markdown = (text, flags) => {
     calls.push(["markdown", text, flags]);
     return '{"type":"root","children":[]}';

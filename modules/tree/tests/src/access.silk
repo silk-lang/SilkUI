@@ -2,7 +2,7 @@
 //! focus, removals, and actions coming back from an adapter.
 import ui_tree.css
 import ui_tree.css { px, Declaration, Keyword }
-import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node, Selection, Input, Modifiers }
+import ui_tree.lib { Tree, TreeError, Viewport, EventKind, Attribute, Role, Node, Selection, Input, Modifiers, TextRange }
 import ui_tree.mutation { TriState, Live }
 import ui_tree.access { AccessTree, ActionOutcome, accessId, windowId, runId, doAction, accessibleName }
 import accesskit.lib {
@@ -16,7 +16,8 @@ import accesskit.lib {
   TextPosition,
   TextSelection,
   Toggled,
-  Live as AccessLive
+  Live as AccessLive,
+  Affine
 }
 import ui_fixtures.fixtures as fixtures
 import silk.collections.list { List }
@@ -182,6 +183,26 @@ effect fn accessUpdates() -> ()
     },
     "the root now has two children",
   )
+
+  // A Retina display: CSS pixel bounds reach adapters as device pixels via the window node.
+  drop run tree.frame(Viewport { width: 400.0, height: 300.0, scale: 2.0 }, 0.0)
+  let fourth = match run access.update(tree.engine()) {
+    Option.Some { value } => move value
+    Option.None => Intrinsic.trap("test: expected an update")
+  }
+  let mut scaled = false
+  let nodes = fourth.nodes.asSlice()
+  let mut i: usize = 0
+  while i < nodes.length {
+    if nodes[i].id.equals(windowId()) {
+      scaled = match nodes[i].node.transform() {
+        Option.Some { value } => value.equals(Affine.scale(2.0))
+        Option.None => false
+      }
+    }
+    i = i + 1
+  }
+  run Testing.expect(scaled, "a new scale reaches the window node's transform")
 }
 
 test effect fn treeBecomesAnAccessKitTree() -> ()
@@ -542,6 +563,41 @@ effect fn accessTextRuns() -> ()
     },
     "the input selects bytes 1 to 4",
   )
+
+  // The document's selection sits on the root, as a browser's web area has it.
+  run tree.selectText(TextRange { anchor: note.id(), anchorOffset: 3, focus: note.id(), focusOffset: 9 })
+  let rootId = root.id().raw()
+  let later = run access.fullUpdate(tree.engine())
+  run Testing.expect(
+    match entryOf(&later, rootId) {
+      Option.Some { value } => match value.node.textSelection() {
+        Option.Some { value: selection } => selection.anchor.node.equals(runId(noteId, 0))
+          && selection.anchor.characterIndex == 3 && selection.focus.characterIndex == 8
+        Option.None => false
+      }
+      Option.None => false
+    },
+    "the root carries the document selection in the text's run",
+  )
+  let selectDocument = ActionRequest {
+    action: Action.SetTextSelection,
+    targetTree: TreeId.root(),
+    targetNode: accessId(rootId),
+    data: Option.Some {
+      value: ActionData.SetTextSelection {
+        value: TextSelection {
+          anchor: TextPosition { node: runId(noteId, 0), characterIndex: 0 },
+          focus: TextPosition { node: runId(noteId, 0), characterIndex: 5 },
+        },
+      },
+    },
+  }
+  run Testing.expect(
+    (run doAction(tree.engineMut(), &selectDocument)) == ActionOutcome.Done,
+    "an adapter sets the document selection",
+  )
+  let text = run tree.selectedText()
+  run Testing.expect(String.view(&text) == "Hi wö", "the document selects the first five characters")
 }
 
 test effect fn textBecomesTextRunsWithTheSelection() -> ()

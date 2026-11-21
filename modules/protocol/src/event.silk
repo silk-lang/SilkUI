@@ -8,6 +8,9 @@ import id { NodeId, FontFaceId }
 import record { Event as RawEvent, EventKind }
 import input {
   Input as RawInput,
+  EditCommand,
+  Request,
+  REQUEST_ANYWHERE,
   MOD_SHIFT,
   MOD_CONTROL,
   MOD_ALT,
@@ -15,7 +18,9 @@ import input {
   BUTTON_PRIMARY,
   BUTTON_AUXILIARY,
   BUTTON_SECONDARY,
-  BUTTON_BACK
+  BUTTON_BACK,
+  POINTER_PEN,
+  POINTER_TOUCH
 }
 import request { HostRequest as RawHostRequest }
 import rich { MarkSpan, Atom }
@@ -141,6 +146,15 @@ pub union Input {
   /// The press ended without a release the tree should act on: active states and pointer
   /// capture end, and no click follows.
   PointerCancel,
+  /// A finger touched the screen. `id` is the host's number for the touch while it is down,
+  /// `time` the host's frame clock in seconds.
+  TouchStart { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  TouchMove { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  TouchEnd { pub id: u32, pub x: f32, pub y: f32, pub modifiers: Modifiers, pub time: f64 },
+  /// The system took touch `id`: its pointer is cancelled.
+  TouchCancel { pub id: u32 },
+  /// A trackpad pinch: `delta` is the change of the magnification, 0.1 for 10% larger.
+  Pinch { pub x: f32, pub y: f32, pub delta: f32, pub modifiers: Modifiers },
   /// A wheel or trackpad scroll. Positive `deltaY` scrolls down.
   Wheel { pub x: f32, pub y: f32, pub deltaX: f32, pub deltaY: f32, pub modifiers: Modifiers },
   KeyDown { pub key: String, pub code: String, pub modifiers: Modifiers, pub repeat: bool },
@@ -150,8 +164,32 @@ pub union Input {
   /// The input method's composition text. `selectionStart` and `selectionEnd` are UTF-8 byte
   /// offsets into `text`. Empty text ends the composition without committing it.
   ImePreedit { pub text: String, pub selectionStart: usize, pub selectionEnd: usize },
-  /// The clipboard text a host read to answer `HostRequest.ReadClipboard`.
-  Paste { pub target: NodeId, pub text: String },
+  /// What the clipboard held when a host read it to answer `HostRequest.ReadClipboard`.
+  /// The target hears `paste` with it; unless a handler prevents that, an editable target
+  /// gets the text through an `Edit`.
+  Paste { pub target: NodeId, pub data: ClipboardData },
+  /// An Edit menu or context menu command. Copy and cut fire their events at the focused
+  /// node first, as the shortcuts do.
+  Command { pub command: EditCommand },
+  /// An edit about to replace the selection of input `target` with `text`, named as
+  /// `InputType` names it (`insertFromPaste`, `deleteByCut`). `beforeinput`
+  /// fires first, and a handler that prevents it cancels the edit. The tree queues these
+  /// after a cut or paste itself (`Tree.takeFollowUp`).
+  Edit { pub target: NodeId, pub inputType: String, pub text: String },
+  /// A request the client answers: close what is on top, or go back or forward. The tree
+  /// queues one itself after an Escape, a back key or a back mouse button that no handler
+  /// prevented, and a host sends one for a system back gesture or button. It starts at
+  /// `target`, or where the tree chooses when there is none: the focused node, else the node
+  /// last pressed, else the topmost node that listens for requests.
+  Request { pub request: Request, pub target: Option<NodeId> },
+}
+
+/// The flavors of a clipboard, each empty when it has none: `text/plain`, `text/html`, and
+/// the bytes of an `image/png`.
+pub struct ClipboardData {
+  pub text: String,
+  pub html: String,
+  pub image: List<u8>,
 }
 
 impl Input {
@@ -174,6 +212,16 @@ impl Input {
   /// The primary release that ends [`Input.press`].
   pub fn release(x: f32, y: f32) -> Input {
     return Input.PointerUp { x: x, y: y, button: Button.Primary, modifiers: Modifiers.none() }
+  }
+
+  /// A request to go back, from wherever the tree chooses.
+  pub fn back() -> Input {
+    return Input.Request { request: Request.Back, target: Option<NodeId>.None }
+  }
+
+  /// A request to close what is on top, from wherever the tree chooses.
+  pub fn close() -> Input {
+    return Input.Request { request: Request.Close, target: Option<NodeId>.None }
   }
 
   /// A wheel scroll with no modifiers.
@@ -223,6 +271,34 @@ impl Input {
       }
       Input.PointerLeave => RawInput.PointerLeave
       Input.PointerCancel => RawInput.PointerCancel
+      Input.TouchStart { id, x, y, modifiers, time } => RawInput.TouchStart {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchMove { id, x, y, modifiers, time } => RawInput.TouchMove {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchEnd { id, x, y, modifiers, time } => RawInput.TouchEnd {
+        id: id,
+        x: x,
+        y: y,
+        modifiers: modifiers.toBits(),
+        time: time,
+      }
+      Input.TouchCancel { id } => RawInput.TouchCancel { id: id }
+      Input.Pinch { x, y, delta, modifiers } => RawInput.Pinch {
+        x: x,
+        y: y,
+        delta: delta,
+        modifiers: modifiers.toBits(),
+      }
       Input.Wheel { x, y, deltaX, deltaY, modifiers } => RawInput.Wheel {
         x: x,
         y: y,
@@ -247,16 +323,69 @@ impl Input {
         selectionStart: selectionStart,
         selectionEnd: selectionEnd,
       }
-      Input.Paste { target, text } => RawInput.Paste { target: target.raw(), text: move text }
+      Input.Paste { target, data } => RawInput.Paste {
+        target: target.raw(),
+        text: move data.text,
+        html: move data.html,
+        image: move data.image,
+      }
+      Input.Command { command } => RawInput.Command { command: command }
+      Input.Edit { target, inputType, text } => RawInput.Edit {
+        target: target.raw(),
+        inputType: move inputType,
+        text: move text,
+      }
+      Input.Request { request, target } => RawInput.Request {
+        request: request,
+        target: match target {
+          Option.Some { value } => value.raw()
+          Option.None => REQUEST_ANYWHERE
+        },
+      }
     }
   }
 }
 
-/// Where the pointer was and which modifiers were held.
+/// What a pointer is, as DOM `PointerEvent.pointerType`.
+pub enum PointerKind {
+  Mouse,
+  Pen,
+  Touch,
+}
+
+impl PointerKind {
+  pub fn fromNumber(value: u32) -> PointerKind {
+    if value == POINTER_TOUCH {
+      return PointerKind.Touch
+    }
+    if value == POINTER_PEN {
+      return PointerKind.Pen
+    }
+    return PointerKind.Mouse
+  }
+
+  /// The DOM name: `"mouse"`, `"pen"` or `"touch"`.
+  pub fn name(self: Self) -> string<'static> {
+    return match self {
+      PointerKind.Mouse => "mouse"
+      PointerKind.Pen => "pen"
+      PointerKind.Touch => "touch"
+    }
+  }
+}
+
+/// Where the pointer was and which modifiers were held, and which pointer it was: `id` is
+/// DOM `pointerId` (1 for the mouse), `primary` DOM `isPrimary`.
 pub struct Pointer {
   pub x: f32,
   pub y: f32,
   pub modifiers: Modifiers,
+  pub id: u32,
+  pub kind: PointerKind,
+  pub primary: bool,
+  /// The element of a live svg target under the pointer, 0 when none (see `Event.element`
+  /// of the raw record).
+  pub element: u32,
 }
 
 impl Copy for Pointer {}
@@ -284,6 +413,10 @@ impl Key {
 pub enum InputType {
   InsertText,
   InsertLineBreak,
+  /// Enter in an editing host: the paragraph splits at the caret.
+  InsertParagraph,
+  /// The input method's composition text in an editing host (empty when it ends uncommitted).
+  InsertCompositionText,
   InsertFromPaste,
   DeleteContentBackward,
   DeleteContentForward,
@@ -307,6 +440,8 @@ impl InputType {
     return match self {
       InputType.InsertText => "insertText"
       InputType.InsertLineBreak => "insertLineBreak"
+      InputType.InsertParagraph => "insertParagraph"
+      InputType.InsertCompositionText => "insertCompositionText"
       InputType.InsertFromPaste => "insertFromPaste"
       InputType.DeleteContentBackward => "deleteContentBackward"
       InputType.DeleteContentForward => "deleteContentForward"
@@ -330,6 +465,12 @@ impl InputType {
     }
     if name == "insertFromPaste" {
       return InputType.InsertFromPaste
+    }
+    if name == "insertParagraph" {
+      return InputType.InsertParagraph
+    }
+    if name == "insertCompositionText" {
+      return InputType.InsertCompositionText
     }
     if name == "deleteContentBackward" {
       return InputType.DeleteContentBackward
@@ -433,6 +574,16 @@ pub union Event {
   PointerMove { pub pointer: Pointer },
   PointerEnter { pub pointer: Pointer },
   PointerLeave { pub pointer: Pointer },
+  /// The pointer moved onto the target from outside it, as DOM `pointerover`; bubbles.
+  PointerOver { pub pointer: Pointer },
+  /// The pointer moved off the target, as DOM `pointerout`; bubbles.
+  PointerOut { pub pointer: Pointer },
+  /// DOM `touchstart` for the finger `pointer` describes; its `id` is the touch's
+  /// `identifier`. `cancelable` says whether preventing it stops the tree's pan and click.
+  TouchStart { pub pointer: Pointer, pub cancelable: bool },
+  TouchMove { pub pointer: Pointer, pub cancelable: bool },
+  TouchEnd { pub pointer: Pointer, pub cancelable: bool },
+  TouchCancel { pub pointer: Pointer },
   /// Deltas are CSS pixels, positive down and right.
   Wheel { pub pointer: Pointer, pub deltaX: f32, pub deltaY: f32 },
   KeyDown { pub key: Key, pub repeat: bool },
@@ -477,6 +628,23 @@ pub union Event {
   /// `selectionchange` at an input; it bubbles. The selection has no direction (`anchor` is
   /// the lower offset).
   SelectionChange { pub selection: Selection, pub activeMarks: u32 },
+  /// A copy at the target, as DOM `copy`; it bubbles. Preventing it keeps the tree from
+  /// copying the selection, so a handler can put its own data on the clipboard.
+  Copy,
+  /// A cut at the target, as DOM `cut`. Preventing it keeps the selection where it is.
+  Cut,
+  /// A paste at the target with what the clipboard holds, as DOM `paste`. Preventing it
+  /// keeps the text out of the input.
+  Paste { pub data: ClipboardData },
+  /// An edit is about to change the target input, as DOM `beforeinput`: `data` is the text it
+  /// inserts. Preventing it cancels the edit.
+  BeforeInput { pub inputType: InputType, pub data: String },
+  /// Something asked to close what is on top, as a browser's close request (Escape). The
+  /// listener that closes something stops the event there; the tree does nothing by itself.
+  CloseRequest,
+  /// Something asked to go back or forward (Alt+Left, Cmd+[, the back mouse button), as a
+  /// browser's `navigate` event for a history traversal.
+  Navigate { pub forward: bool },
 }
 
 /// What a transition or animation event is about: the CSS property of a transition or the
@@ -496,6 +664,12 @@ impl Event {
       Event.PointerMove { .. } => EventKind.PointerMove
       Event.PointerEnter { .. } => EventKind.PointerEnter
       Event.PointerLeave { .. } => EventKind.PointerLeave
+      Event.PointerOver { .. } => EventKind.PointerOver
+      Event.PointerOut { .. } => EventKind.PointerOut
+      Event.TouchStart { .. } => EventKind.TouchStart
+      Event.TouchMove { .. } => EventKind.TouchMove
+      Event.TouchEnd { .. } => EventKind.TouchEnd
+      Event.TouchCancel { .. } => EventKind.TouchCancel
       Event.Wheel { .. } => EventKind.Wheel
       Event.KeyDown { .. } => EventKind.KeyDown
       Event.KeyUp { .. } => EventKind.KeyUp
@@ -518,6 +692,12 @@ impl Event {
       Event.AnimationEnd { .. } => EventKind.AnimationEnd
       Event.AnimationCancel { .. } => EventKind.AnimationCancel
       Event.SelectionChange { .. } => EventKind.SelectionChange
+      Event.Copy => EventKind.Copy
+      Event.Cut => EventKind.Cut
+      Event.Paste { .. } => EventKind.Paste
+      Event.BeforeInput { .. } => EventKind.BeforeInput
+      Event.CloseRequest => EventKind.CloseRequest
+      Event.Navigate { .. } => EventKind.Navigate
     }
   }
 }
@@ -560,7 +740,15 @@ impl EventRecord {
       run path.append(NodeId.of(ids[i]))
       i = i + 1
     }
-    let pointer = Pointer { x: raw.x, y: raw.y, modifiers: Modifiers.fromBits(raw.modifiers) }
+    let pointer = Pointer {
+      x: raw.x,
+      y: raw.y,
+      modifiers: Modifiers.fromBits(raw.modifiers),
+      id: raw.pointerId,
+      kind: PointerKind.fromNumber(raw.pointerType),
+      primary: raw.primary,
+      element: raw.element,
+    }
     let event = match raw.kind {
       EventKind.PointerDown => Event.PointerDown {
         pointer: pointer,
@@ -579,6 +767,12 @@ impl EventRecord {
       EventKind.PointerMove => Event.PointerMove { pointer: pointer }
       EventKind.PointerEnter => Event.PointerEnter { pointer: pointer }
       EventKind.PointerLeave => Event.PointerLeave { pointer: pointer }
+      EventKind.PointerOver => Event.PointerOver { pointer: pointer }
+      EventKind.PointerOut => Event.PointerOut { pointer: pointer }
+      EventKind.TouchStart => Event.TouchStart { pointer: pointer, cancelable: raw.detail != 0 }
+      EventKind.TouchMove => Event.TouchMove { pointer: pointer, cancelable: raw.detail != 0 }
+      EventKind.TouchEnd => Event.TouchEnd { pointer: pointer, cancelable: raw.detail != 0 }
+      EventKind.TouchCancel => Event.TouchCancel { pointer: pointer }
       EventKind.Wheel => Event.Wheel { pointer: pointer, deltaX: raw.deltaX, deltaY: raw.deltaY }
       EventKind.KeyDown => Event.KeyDown {
         key: Key {
@@ -626,6 +820,21 @@ impl EventRecord {
         selection: Selection.range(raw.selectionStart, raw.selectionEnd),
         activeMarks: raw.activeMarks,
       }
+      EventKind.Copy => Event.Copy
+      EventKind.Cut => Event.Cut
+      EventKind.Paste => Event.Paste {
+        data: ClipboardData {
+          text: run String.copy(String.view(&raw.value)),
+          html: run String.copy(String.view(&raw.html)),
+          image: run copyBytes(&raw.image),
+        },
+      }
+      EventKind.BeforeInput => Event.BeforeInput {
+        inputType: InputType.fromName(String.view(&raw.inputType)),
+        data: run String.copy(String.view(&raw.value)),
+      }
+      EventKind.CloseRequest => Event.CloseRequest
+      EventKind.Navigate => Event.Navigate { forward: raw.detail != 0 }
     }
     return EventRecord { target: NodeId.of(raw.target), path: move path, event: move event }
   }
@@ -633,6 +842,12 @@ impl EventRecord {
 
 effect fn motionOf(raw: &RawEvent) -> Motion ! OutOfMemoryError ? &mut Allocator {
   return Motion { name: run String.copy(String.view(&raw.name)), elapsedTime: raw.elapsedTime, pseudoElement: run String.copy(String.view(&raw.pseudoElement)) }
+}
+
+effect fn copyBytes(bytes: &List<u8>) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendSlice(bytes.asSlice())
+  return move out
 }
 
 effect fn copySpans(spans: &List<MarkSpan>) -> List<MarkSpan>
@@ -660,7 +875,13 @@ effect fn copyAtoms(atoms: &List<Atom>) -> List<Atom>
 pub union HostRequest {
   /// Put `text` on the clipboard (copy and cut).
   WriteClipboard { pub text: String },
-  /// Read the clipboard and answer with `Input.Paste { target, text }`.
+  /// Put `text` on the clipboard as `text/plain`, and `html` as `text/html` unless it is
+  /// empty.
+  WriteClipboardItem { pub text: String, pub html: String },
+  /// Open the edit context menu of an input at (`x`, `y`), CSS pixels of the viewport, with
+  /// Cut, Copy and Paste enabled as the flags say. Answer a chosen item with `Input.Command`.
+  ShowEditMenu { pub x: f32, pub y: f32, pub cut: bool, pub copy: bool, pub paste: bool },
+  /// Read the clipboard and answer with `Input.Paste` for `target`.
   ReadClipboard { pub target: NodeId },
   /// Load the file of font face `face`, declared with `Tree.declareFontFace`: text needs a
   /// character its `unicode-range` covers. Answer with `Tree.loadFontFace` or
@@ -672,6 +893,17 @@ impl HostRequest {
   pub fn lift(raw: RawHostRequest) -> HostRequest {
     return match move raw {
       RawHostRequest.WriteClipboard { text } => HostRequest.WriteClipboard { text: move text }
+      RawHostRequest.WriteClipboardItem { text, html } => HostRequest.WriteClipboardItem {
+        text: move text,
+        html: move html,
+      }
+      RawHostRequest.ShowEditMenu { x, y, cut, copy, paste } => HostRequest.ShowEditMenu {
+        x: x,
+        y: y,
+        cut: cut,
+        copy: copy,
+        paste: paste,
+      }
       RawHostRequest.ReadClipboard { target } => HostRequest.ReadClipboard {
         target: NodeId.of(target),
       }
@@ -711,7 +943,9 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.GotPointerCapture => 32768
     EventKind.LostPointerCapture => 65536
     EventKind.Load => 131072
-    EventKind.Error => 262144
+    EventKind.Error => 131072
+    EventKind.CloseRequest => 262144
+    EventKind.Navigate => 262144
     EventKind.TransitionRun => 524288
     EventKind.TransitionStart => 1048576
     EventKind.TransitionEnd => 2097152
@@ -721,6 +955,16 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.AnimationEnd => 33554432
     EventKind.AnimationCancel => 67108864
     EventKind.SelectionChange => 134217728
+    EventKind.PointerOver => 268435456
+    EventKind.PointerOut => 536870912
+    EventKind.TouchStart => 1073741824
+    EventKind.TouchMove => 1073741824
+    EventKind.TouchEnd => 1073741824
+    EventKind.TouchCancel => 1073741824
+    EventKind.Copy => 2147483648
+    EventKind.Cut => 2147483648
+    EventKind.Paste => 2147483648
+    EventKind.BeforeInput => 2147483648
   }
 }
 

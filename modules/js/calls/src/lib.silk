@@ -4,6 +4,7 @@
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.text.string { String, InvalidUtf8 }
 import silk.collections.list { List }
+import silk.collections.bytes { Bytes }
 import silk.collections.slice { Slice }
 import silk.core.effect { Effect }
 import silk.core.result { Result }
@@ -15,7 +16,7 @@ import silk.num.f64
 import silk.num.usize
 import ui_tree.css { Declaration }
 import ui_tree.legacy { Batch, NodeKind, Attribute, StyleState, Cursor, Role, MarkSpan, Atom }
-import ui_tree.lib { EventKind, Event, Motion }
+import ui_tree.lib { EventKind, Event, Motion, Pointer, PointerKind }
 import css_style.tokens { CssError, Limits, Kind }
 import css_style.lexer
 import css_style.syntax
@@ -303,6 +304,7 @@ fn namedRole(word: &[u8]) -> Option<Role> {
   if same(word, b"document") { return Option<Role>.some(Role.Document) }
   if same(word, b"application") { return Option<Role>.some(Role.Application) }
   if same(word, b"note") { return Option<Role>.some(Role.Note) }
+  if same(word, b"scrollbar") { return Option<Role>.some(Role.ScrollBar) }
   if same(word, b"feed") { return Option<Role>.some(Role.Feed) }
   return Option<Role>.none()
 }
@@ -333,6 +335,17 @@ pub fn cursorOf(word: &[u8]) -> Cursor {
   if same(word, b"nwse-resize") { return Cursor.ResizeNorthWestSouthEast }
   if same(word, b"nesw-resize") { return Cursor.ResizeNorthEastSouthWest }
   if same(word, b"crosshair") { return Cursor.Crosshair }
+  if same(word, b"cell") { return Cursor.Cell }
+  if same(word, b"no-drop") { return Cursor.NoDrop }
+  if same(word, b"all-scroll") { return Cursor.AllScroll }
+  if same(word, b"n-resize") { return Cursor.ResizeNorth }
+  if same(word, b"e-resize") { return Cursor.ResizeEast }
+  if same(word, b"s-resize") { return Cursor.ResizeSouth }
+  if same(word, b"w-resize") { return Cursor.ResizeWest }
+  if same(word, b"ne-resize") { return Cursor.ResizeNorthEast }
+  if same(word, b"nw-resize") { return Cursor.ResizeNorthWest }
+  if same(word, b"se-resize") { return Cursor.ResizeSouthEast }
+  if same(word, b"sw-resize") { return Cursor.ResizeSouthWest }
   return Cursor.Default
 }
 
@@ -348,8 +361,9 @@ pub effect fn declarationsOf(css: &String) -> List<Declaration> ! OutOfMemoryErr
   }
 }
 
-/// The position of `kind` in the ui-protocol `LISTEN_*` flags, which is the number JavaScript
-/// receives as the event's kind.
+/// The number JavaScript receives as the event's kind: its position in the ui-protocol
+/// `LISTEN_*` flags up to `PointerOut`, then 30 to 33 for copy, cut, paste and beforeinput
+/// (which share the last two flags), and 38 and 39 for the close and navigate requests.
 pub fn kindCode(kind: EventKind) -> u32 {
   if kind == EventKind.PointerDown { return 0 }
   if kind == EventKind.PointerUp { return 1 }
@@ -378,6 +392,18 @@ pub fn kindCode(kind: EventKind) -> u32 {
   if kind == EventKind.AnimationIteration { return 24 }
   if kind == EventKind.AnimationEnd { return 25 }
   if kind == EventKind.AnimationCancel { return 26 }
+  if kind == EventKind.PointerOver { return 28 }
+  if kind == EventKind.PointerOut { return 29 }
+  if kind == EventKind.TouchStart { return 30 }
+  if kind == EventKind.TouchMove { return 31 }
+  if kind == EventKind.TouchEnd { return 32 }
+  if kind == EventKind.TouchCancel { return 33 }
+  if kind == EventKind.Copy { return 34 }
+  if kind == EventKind.Cut { return 35 }
+  if kind == EventKind.Paste { return 36 }
+  if kind == EventKind.BeforeInput { return 37 }
+  if kind == EventKind.CloseRequest { return 38 }
+  if kind == EventKind.Navigate { return 39 }
   return 27
 }
 
@@ -399,7 +425,8 @@ pub fn motionOf(event: &Event) -> Option<&Motion> {
 /// The numbers of an event, in the order `__ui.dispatch` receives them after the target:
 /// two positions, the modifier bits, and two more values.
 ///
-/// - pointer events: x, y, modifiers, button, click count
+/// - pointer events: x, y, the pointer's modifiers and identity (see [`pointerBits`]), button,
+///   click count
 /// - wheel: x, y, modifiers, deltaX, deltaY
 /// - key events: 0, 0, modifiers, 1 for a repeat
 /// - input: selection anchor, selection focus, 0, active marks
@@ -407,18 +434,38 @@ pub fn motionOf(event: &Event) -> Option<&Motion> {
 /// - scroll: x, y
 /// - layout: left, top, 0, width, height
 /// - transition and animation events: elapsed seconds
+/// The modifier bits of a pointer record with the pointer in the bits above them: bits 0-3 the
+/// modifiers, 4-5 the type (0 mouse, 1 pen, 2 touch), 6 `isPrimary`, 8-31 the `pointerId`,
+/// and from bit 32 the live svg element under the pointer (0 for none).
+pub fn pointerBits(pointer: Pointer) -> f64 {
+  let kind: f64 = match pointer.kind {
+    PointerKind.Mouse => 0.0
+    PointerKind.Pen => 1.0
+    PointerKind.Touch => 2.0
+  }
+  let primary: f64 = if pointer.primary { 64.0 } else { 0.0 }
+  return u32.toF64(pointer.modifiers.toBits()) + kind * 16.0 + primary + u32.toF64(pointer.id) * 256.0
+    + u32.toF64(pointer.element) * 4294967296.0
+}
+
 pub fn numbersOf(event: &Event) -> [f64; 5] {
   if let Option<&Motion>.Some { value: motion } = motionOf(event) {
     return [f32.toF64(motion.elapsedTime), 0.0, 0.0, 0.0, 0.0]
   }
   return match &event.* {
-    Event.PointerDown { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), u32.toF64(count)]
-    Event.PointerUp { pointer, button } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), 0.0]
-    Event.Click { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), u32.toF64(button.toNumber()), u32.toF64(count)]
-    Event.PointerMove { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerEnter { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerLeave { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
-    Event.PointerCancel { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), 0.0, 0.0]
+    Event.PointerDown { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), u32.toF64(button.toNumber()), u32.toF64(count)]
+    Event.PointerUp { pointer, button } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), u32.toF64(button.toNumber()), 0.0]
+    Event.Click { pointer, button, count } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), u32.toF64(button.toNumber()), u32.toF64(count)]
+    Event.PointerMove { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.PointerEnter { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.PointerLeave { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.PointerOver { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.PointerOut { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.TouchStart { pointer, cancelable } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), if cancelable { 1.0 } else { 0.0 }, 0.0]
+    Event.TouchMove { pointer, cancelable } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), if cancelable { 1.0 } else { 0.0 }, 0.0]
+    Event.TouchEnd { pointer, cancelable } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), if cancelable { 1.0 } else { 0.0 }, 0.0]
+    Event.TouchCancel { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
+    Event.PointerCancel { pointer } => [f32.toF64(pointer.x), f32.toF64(pointer.y), pointerBits(pointer), 0.0, 0.0]
     Event.Wheel { pointer, deltaX, deltaY } => [f32.toF64(pointer.x), f32.toF64(pointer.y), u32.toF64(pointer.modifiers.toBits()), f32.toF64(deltaX), f32.toF64(deltaY)]
     Event.KeyDown { key, repeat } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), if repeat { 1.0 } else { 0.0 }, 0.0]
     Event.KeyUp { key } => [0.0, 0.0, u32.toF64(key.modifiers.toBits()), 0.0, 0.0]
@@ -426,6 +473,7 @@ pub fn numbersOf(event: &Event) -> [f64; 5] {
     Event.SelectionChange { selection, activeMarks } => [usize.toF64(selection.anchor), usize.toF64(selection.focus), 0.0, u32.toF64(activeMarks), 0.0]
     Event.Scroll { x, y } => [f32.toF64(x), f32.toF64(y), 0.0, 0.0, 0.0]
     Event.Layout { bounds } => [f32.toF64(bounds.xMin), f32.toF64(bounds.yMin), 0.0, f32.toF64(bounds.xMax - bounds.xMin), f32.toF64(bounds.yMax - bounds.yMin)]
+    Event.Navigate { forward } => [if forward { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0, 0.0]
     _ => [0.0, 0.0, 0.0, 0.0, 0.0]
   }
 }
@@ -460,6 +508,16 @@ pub effect fn eventStrings(event: &Event) -> EventStrings ! OutOfMemoryError ? &
       second = run String.copy(change.inputType.name())
       present = [true, true]
     }
+    Event.Paste { data } => {
+      first = run String.copy(String.view(&data.text))
+      second = run String.copy(String.view(&data.html))
+      present = [true, true]
+    }
+    Event.BeforeInput { inputType, data } => {
+      first = run String.copy(String.view(&data))
+      second = run String.copy(inputType.name())
+      present = [true, true]
+    }
     _ => match motionOf(event) {
       Option<&Motion>.Some { value: motion } => {
         first = run String.copy(String.view(&motion.name))
@@ -470,9 +528,30 @@ pub effect fn eventStrings(event: &Event) -> EventStrings ! OutOfMemoryError ? &
     }
   }
   let mut packed = run richStrings(event)
+  if let Event.Paste { data } = &event.* {
+    packed[0] = run binaryText(data.image.asSlice())
+  }
   let marks = Intrinsic.replace(packed[0], String.make())
   let atoms = Intrinsic.replace(packed[1], String.make())
   return EventStrings { texts: [move first, move second, move marks, move atoms], present: present }
+}
+
+/// `bytes` as text of one character per byte, U+0000 to U+00FF, which reaches JavaScript as
+/// a binary string.
+pub effect fn binaryText(bytes: &[u8]) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  let mut i: usize = 0
+  while i < bytes.length {
+    let byte = bytes[i]
+    if byte < 128 {
+      run out.append(byte)
+    } else {
+      run out.append(192 + byte / 64)
+      run out.append(128 + byte % 64)
+    }
+    i = i + 1
+  }
+  return unsafe String.fromBytesUnchecked(run Bytes.copy(out.asSlice()))
 }
 
 /// A rich input's marks and atoms in an input record, packed as `__ui.richText` takes them

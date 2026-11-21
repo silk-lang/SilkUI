@@ -11,12 +11,17 @@ import silk.core.effect { Effect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import svg_css.effect_values { Filter, FilterKind }
+import silk.core.option { Option }
+import silk.num.f32
+import silk.num.f64
+import silk.num.i64
 
 fn at(time: f64) -> FrameInput { return FrameInput { width: 800.0, height: 300.0, scale: 1.0, time: time } }
 fn near(a: f32, b: f32) -> bool { return a - b < 0.001 && b - a < 0.001 }
-fn opacity(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.paint.opacity }
-fn width(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.width.value }
-fn height(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.layout.height.value }
+fn opacity(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed().paint.opacity }
+fn width(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed().layout.width.value }
+fn height(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed().layout.height.value }
 
 effect fn sheet(source: &[u8]) -> Bytes
   ! CompileError | CssError | OutOfMemoryError ? &mut Allocator {
@@ -321,7 +326,7 @@ effect fn easingWithText() -> ()
   run tree.frame(at(0.0))
   run tree.frame(at(0.5))
   run Testing.expect(near(opacity(&tree, 2), 0.2), "resolving a text child retains its parent's easing stops")
-  run Testing.expect(tree.node(tree.slotOf(2)).computed.animation.any(&tree.easingStops), "computed animation lists retain their backing storage")
+  run Testing.expect(tree.node(tree.slotOf(2)).computed().animation.any(&tree.easingStops), "computed animation lists retain their backing storage")
 }
 
 test effect fn stylesheetEasingSurvivesTextChildren() -> ()
@@ -382,7 +387,7 @@ test effect fn stylesheetAnimationFramesStyleOnlyWhatMoves() -> ()
   run ticksStyleOnlyWhatMoves() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-fn translateX(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed.transform.translate.x }
+fn translateX(tree: &UiTree<'_>, id: u32) -> f32 { return tree.node(tree.slotOf(id)).computed().transform.translate.x }
 
 effect fn startingTranslate() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
@@ -407,4 +412,156 @@ test effect fn stylesheetStartingTranslateFromTailwind() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run startingTranslate() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// The filter functions node `id` paints, as `kind:amount` (`shadow:x,y,blur,alpha` for a
+// drop shadow), space separated; empty without any.
+effect fn filters(tree: &UiTree<'_>, id: u32) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut out = String.make()
+  if let Option.Some { value } = tree.node(tree.slotOf(id)).paintEffects() {
+    let items = value.filters.asSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if i > 0 { run out.append(" ") }
+      match &items[i] {
+        Filter.Function { kind, amount } => {
+          run out.append(kindName(kind))
+          run out.append(":")
+          run appendInt(&mut out, rounded(if kind == FilterKind.Blur { value.pixels(amount, 0.0) } else { value.number(amount) }))
+        }
+        Filter.DropShadow { x, y, blur, color } => {
+          run out.append("shadow:")
+          run appendInt(&mut out, rounded(value.pixels(x, 0.0)))
+          run out.append(",")
+          run appendInt(&mut out, rounded(value.pixels(y, 0.0)))
+          run out.append(",")
+          run appendInt(&mut out, rounded(value.pixels(blur, 0.0)))
+          run out.append(",")
+          run appendInt(&mut out, rounded(f64.toF32(color.alpha)))
+        }
+        Filter.Url { .. } => run out.append("url")
+      }
+      i = i + 1
+    }
+  }
+  return move out
+}
+
+const DIGITS: [string<'static>; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+effect fn appendInt(out: &mut String, value: i64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value < 0 {
+    run out.append("-")
+    run appendInt(&mut out.*, 0 - value)
+    return ()
+  }
+  if value >= 10 { run appendInt(&mut out.*, value / 10) }
+  run out.append(DIGITS[i64.toUsize(value % 10)])
+}
+
+// Hundredths, so 0.75 reads 75.
+fn rounded(value: f32) -> i64 { return f64.toI64(f64.round(f32.toF64(value) * 100.0)) }
+
+fn kindName(kind: FilterKind) -> string<'static> {
+  return if kind == FilterKind.Blur { "blur" } else if kind == FilterKind.Brightness { "brightness" }
+    else if kind == FilterKind.Grayscale { "grayscale" } else if kind == FilterKind.HueRotate { "hue" }
+    else if kind == FilterKind.Sepia { "sepia" } else { "other" }
+}
+
+effect fn filterKeyframes() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run nodes(&mut batch)
+  // Node 2 declares no filter of its own; node 3 has one under the animation.
+  let bytes = run sheet(b".subject{animation:hue 1s linear}.second{filter:blur(2px);animation:grow 1s linear}@keyframes hue{from{filter:hue-rotate(0deg)}to{filter:hue-rotate(360deg)}}@keyframes grow{to{filter:blur(4px) brightness(.5)}}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "hue:0", "the first keyframe's filter shows at the start")
+  run tree.frame(at(0.25))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "hue:9000", "hue-rotate eases with the frame clock")
+  run Testing.expect(tree.needsFrame(), "a filter animation asks for frames")
+  run Testing.expect(String.view(&run filters(&tree, 3)) == "blur:250 brightness:88", "a shorter list eases from the initial value of the functions it lacks")
+  run tree.frame(at(0.5))
+  run Testing.expect(String.view(&run filters(&tree, 3)) == "blur:300 brightness:75", "and the underlying filter is the missing from frame")
+  run tree.frame(at(1.5))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "", "the filter goes when the animation ends")
+  run Testing.expect(String.view(&run filters(&tree, 3)) == "blur:200", "the underlying filter shows again")
+}
+
+test effect fn stylesheetKeyframesAnimateFilter() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run filterKeyframes() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn filterPairs() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run nodes(&mut batch)
+  let bytes = run sheet(b".subject{animation:fromnone 1s linear}.second{animation:flip 1s linear}@keyframes fromnone{from{filter:none}to{filter:grayscale(1) drop-shadow(4px 8px 2px red)}}@keyframes flip{from{filter:blur(2px)}to{filter:sepia(1)}}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.frame(at(0.25))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "grayscale:25 shadow:100,200,50,25", "none eases from each function's initial value, a shadow from transparent")
+  run Testing.expect(String.view(&run filters(&tree, 3)) == "blur:200", "functions that differ flip halfway: before")
+  run tree.frame(at(0.75))
+  run Testing.expect(String.view(&run filters(&tree, 3)) == "sepia:100", "and after")
+}
+
+test effect fn filterListsInterpolateAsTheSpecSays() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run filterPairs() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn filterTransitions() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run nodes(&mut batch)
+  run batch.listen(2, LISTEN_ALL)
+  // Tailwind's `transition` lists filter; `.dim` and `.plain` are what hover classes switch to.
+  let bytes = run sheet(b".subject{filter:brightness(1);transition-property:color,filter;transition-duration:1s;transition-timing-function:linear}.dim{filter:brightness(.5)}.plain{filter:none}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "brightness:100", "the declared filter")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("subject dim") })
+  run tree.apply(run batch.take())
+  run tree.frame(at(1.0))
+  run tree.frame(at(1.5))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "brightness:75", "filter transitions")
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  let mut ran = false
+  let mut i: usize = 0
+  while i < events.length() {
+    if events.asSlice()[i].kind == EventKind.TransitionRun && String.view(&events.asSlice()[i].name) == "filter" { ran = true }
+    i = i + 1
+  }
+  run Testing.expect(ran, "transitionrun names filter")
+  run tree.frame(at(2.0))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "brightness:50", "and ends at the new filter")
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("subject plain") })
+  run tree.apply(run batch.take())
+  run tree.frame(at(3.0))
+  run tree.frame(at(3.5))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "brightness:75", "to none eases to the initial value")
+  run tree.frame(at(4.0))
+  run tree.frame(at(4.1))
+  run Testing.expect(String.view(&run filters(&tree, 2)) == "", "and ends with no filter")
+  run Testing.expect(!tree.needsFrame(), "nothing runs after it ends")
+}
+
+test effect fn stylesheetFilterTransitions() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run filterTransitions() |> Effect.provideMut<Allocator>(&mut allocator)
 }

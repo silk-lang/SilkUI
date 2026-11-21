@@ -74,14 +74,14 @@ pub fn stateName(state: StyleState) -> string<'static> {
 }
 
 /// The declarations the client set on `node` for `state`.
-pub fn patchOf(node: &Node, state: StyleState) -> &List<Declaration> {
+pub fn patchOf(node: &Node, state: StyleState) -> &[Declaration] {
   return match state {
-    StyleState.Base => &node.base
-    StyleState.Hover => &node.hover
-    StyleState.Active => &node.active
-    StyleState.Focus => &node.focus
-    StyleState.FocusVisible => &node.focusVisible
-    StyleState.Starting => &node.starting
+    StyleState.Base => node.base.asSlice()
+    StyleState.Hover => node.hover()
+    StyleState.Active => node.active()
+    StyleState.Focus => node.focus()
+    StyleState.FocusVisible => node.focusVisible()
+    StyleState.Starting => node.starting()
   }
 }
 
@@ -95,11 +95,10 @@ pub const STATES: [StyleState; 6] = [
   StyleState.Starting,
 ]
 
-effect fn copied(list: &List<Declaration>) -> List<Declaration>
+effect fn copied(items: &[Declaration]) -> List<Declaration>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut out = List<Declaration>.make()
-  let items = list.asSlice()
   let mut i: usize = 0
   while i < items.length {
     run out.append(run cloneDeclaration(&items[i]))
@@ -182,7 +181,7 @@ pub effect fn layOver(
   let mut replacing = replace
   if !replace {
     if let Option<&StyleOverride>.Some { value } = tree.overrideOf(id, state) {
-      list = run copied(&value.declarations)
+      list = run copied(value.declarations.asSlice())
       replacing = value.replace
     }
   }
@@ -313,11 +312,10 @@ pub effect fn parts(declaration: &Declaration, name: &mut String, value: &mut St
 }
 
 /// Appends `list` as a JSON array of CSS texts.
-pub effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
+pub effect fn declarationTexts(items: &[Declaration], out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   run out.append("[")
-  let items = list.asSlice()
   let mut text = String.make()
   let mut i: usize = 0
   while i < items.length {
@@ -335,7 +333,9 @@ pub effect fn declarationTexts(list: &List<Declaration>, out: &mut String) -> ()
 /// styles: the declarations node `id` shows in each state, as text, for an editor to show:
 /// what its client set with the inspector's overrides over them. For the states the inspector
 /// overrides, `overrides` has the override's declarations (and `replacing` the states whose
-/// override leaves the client's out) and `client` the client's own underneath.
+/// override leaves the client's out) and `client` the client's own underneath. `stylesheets`
+/// has what the adopted stylesheets gave the node (the cascade's winner of each property their
+/// matched rules set) and `matchedRules` how many rules matched.
 pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -344,7 +344,7 @@ pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut Stri
   let mut k: usize = 0
   while k < STATES.length {
     run putKey(&mut out, stateName(STATES[k]))
-    run declarationTexts(&run shown(tree, id, STATES[k]), &mut out)
+    run declarationTexts((run shown(tree, id, STATES[k])).asSlice(), &mut out)
     k = k + 1
   }
   let node = tree.node(tree.slotOf(id))
@@ -363,7 +363,7 @@ pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut Stri
       first = false
       run writeString(&mut out, stateName(STATES[k]))
       run out.append(":")
-      run declarationTexts(&value.declarations, &mut out)
+      run declarationTexts(value.declarations.asSlice(), &mut out)
       if value.replace {
         run replacing.append(stateName(STATES[k]))
       }
@@ -401,6 +401,13 @@ pub effect fn styles(tree: &UiTree<'_>, request: &Value, id: u32, out: &mut Stri
       }
       run out.append("]")
     }
+  }
+  // What the adopted stylesheets gave the node: the winning declaration of each property the
+  // matched rules set, after var() substitution, and how many rules matched.
+  if let Option.Some { value: sheet } = node.sheetStyle() {
+    run putKey(&mut out, "stylesheets")
+    run declarationTexts(sheet.declarations.asSlice(), &mut out)
+    run putInt(&mut out, "matchedRules", usize.toU64(sheet.matches.length()))
   }
   run finish(&mut out)
 }
@@ -444,7 +451,7 @@ fn backdrop(tree: &UiTree<'_>, slot: u32) -> Option<Rgba<f32>> {
   let mut at = slot
   while at != NONE {
     let node = tree.node(at)
-    match node.computed.paint.background {
+    match node.computed().paint.background {
       Fill.Solid { color } => {
         if color.a >= 0.999 {
           return Option<Rgba<f32>>.Some { value: color }
@@ -458,7 +465,7 @@ fn backdrop(tree: &UiTree<'_>, slot: u32) -> Option<Rgba<f32>> {
       }
       Fill.None => {}
     }
-    if node.computed.paint.opacity < 0.999 {
+    if node.computed().paint.opacity < 0.999 {
       return Option<Rgba<f32>>.None
     }
     at = node.parent
@@ -578,11 +585,11 @@ pub effect fn audit(tree: &UiTree<'_>, request: &Value, top: u32, out: &mut Stri
       }
     }
     if node.kind == NodeKind.Text && node.text.ownedByteLength() != 0
-      && node.computed.text.color.a >= 0.999 {
+      && node.computed().text.color.a >= 0.999 {
       match backdrop(tree, slot) {
         Option<Rgba<f32>>.Some { value } => {
-          let ratio = contrast(node.computed.text.color, value)
-          let needed = if node.computed.text.size >= LARGE_TEXT {
+          let ratio = contrast(node.computed().text.color, value)
+          let needed = if node.computed().text.size >= LARGE_TEXT {
             CONTRAST_LARGE
           } else {
             CONTRAST

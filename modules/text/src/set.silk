@@ -14,6 +14,7 @@
 //! A family that has added or declared faces hides installed faces of the same name, as on
 //! the web. Generic families and the fallback for characters no requested family has use
 //! installed fonts only, as browsers do.
+import properties.census { Census }
 import font_collection.lib {
   FontCollection,
   FontMatcher,
@@ -25,7 +26,8 @@ import font_collection.lib {
   Range,
   ignoredForFallback
 }
-import faces.database { FontDatabase, FaceStyle }
+import faces.database { FontDatabase, FaceStyle, Fonts }
+import faces.matching
 import faces.names { same as sameName }
 import read_fonts.lib { FontRef, ReadError }
 import read_fonts.model.charmap { Charmap }
@@ -67,6 +69,46 @@ pub struct FaceRule {
   pub style: FaceStyle,
   /// `unicode-range`; empty means every code point.
   pub ranges: List<UnicodeRange>,
+  /// `font-display`.
+  pub display: FontDisplay,
+}
+
+/// CSS `font-display`: how long text waits for a loading face, invisible (the block period),
+/// then how long it shows a fallback the face can still replace (the swap period). After
+/// both, a face that loads is not used. Periods follow Chromium.
+pub enum FontDisplay {
+  /// As `block`.
+  Auto,
+  /// 3 s invisible, then swap whenever it loads.
+  Block,
+  /// No block period; swap whenever it loads.
+  Swap,
+  /// 100 ms invisible, then 3 s to swap.
+  Fallback,
+  /// 100 ms invisible, and no swap period.
+  Optional,
+}
+
+impl FontDisplay {
+  /// The block period, in seconds.
+  pub fn block(self: Self) -> f64 {
+    return match self {
+      FontDisplay.Auto => 3.0
+      FontDisplay.Block => 3.0
+      FontDisplay.Swap => 0.0
+      FontDisplay.Fallback => 0.1
+      FontDisplay.Optional => 0.1
+    }
+  }
+
+  /// When the swap period ends, in seconds from the load's start; negative when it never does.
+  pub fn swapEnd(self: Self) -> f64 {
+    return match self {
+      FontDisplay.Fallback => 3.1
+      FontDisplay.Optional => 0.1
+      _ => -1.0
+    }
+  }
 }
 
 impl FaceRule {
@@ -82,6 +124,7 @@ impl FaceRule {
       width: Range.point(100.0),
       style: FaceStyle.Normal,
       ranges: List<UnicodeRange>.make(),
+      display: FontDisplay.Auto,
     }
   }
 }
@@ -109,6 +152,11 @@ struct Declared {
   state: FaceState,
   /// The face in the set once ready, else `usize.MAX`.
   face: usize,
+  display: FontDisplay,
+  /// When text first asked for it, in the set's time; negative before.
+  since: f64,
+  /// Its file came after its swap period: it stays unused (`Failed`) and is not retried.
+  expired: bool,
 }
 
 /// One entry of the faces text in a style tries, in order: an installed face, or a member of
@@ -117,14 +165,32 @@ pub struct Link {
   pub selection: Selection,
   /// The declared face behind this link, or `usize.MAX` for an installed face.
   pub declared: usize,
+  /// The index of the requested family that gave this link.
+  pub family: usize,
 }
 
 impl Copy for Link {}
+
+struct FamilyFaces { family: Family, faces: List<usize> }
+
+fn sameFamily(left: &Family, right: &Family) -> bool {
+  return match &left.* {
+    Family.Named { name: wanted } => match &right.* {
+      Family.Named { name: found } => sameName(wanted.asSlice(), found.asSlice())
+      _ => false
+    }
+    Family.Generic { generic: wanted } => match &right.* {
+      Family.Generic { generic: found } => wanted == found
+      _ => false
+    }
+  }
+}
 
 /// Installed faces of a borrowed collection plus faces added at run time.
 pub struct FontSet<'a> {
   base: &'a FontCollection,
   installed: FontMatcher<'a>,
+  families: List<FamilyFaces>,
   /// Faces added at run time. Their font files are never changed or removed while the set
   /// lives, so borrows of them can carry `'a` (see `font`).
   local: FontDatabase,
@@ -135,6 +201,10 @@ pub struct FontSet<'a> {
   wanted: List<usize>,
   /// Counts changes to what font matching can return.
   pub generation: u64,
+  /// The time, in seconds, that `font-display` periods count in; the host sets it per frame.
+  pub now: f64,
+  /// For the bench census: fallback queries past the requested families.
+  pub fallbackQueries: usize,
 }
 
 fn covers(ranges: &[UnicodeRange], cp: u32) -> bool {
@@ -279,17 +349,35 @@ fn faceStyleOf(face: &Face) -> FaceStyle {
 }
 
 impl<'a> FontSet<'a> {
+  pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
+    run out.held("text.font-set.families", self.families.length(), self.families.capacity(), Intrinsic.layoutOf<FamilyFaces>().bytes)
+    run out.held("text.font-set.charmaps(one per face)", self.charmaps.length(), self.charmaps.capacity(), Intrinsic.layoutOf<Option<Charmap<'a>>>().bytes)
+    let mut loaded: usize = 0
+    let mut at: usize = 0
+    while at < self.loaded.length() {
+      if self.loaded.get(at) { loaded = loaded + 1 }
+      at = at + 1
+    }
+    run out.unit("text.font-set.faces", self.loaded.length())
+    run out.unit("text.font-set.faces-loaded", loaded)
+    run out.held("text.font-set.declared", self.declared.length(), self.declared.capacity(), Intrinsic.layoutOf<Declared>().bytes)
+    run out.work("text.font-set.fallback-queries", self.fallbackQueries)
+  }
+
   /// A set of the installed faces of `base` and no added ones.
   pub fn make(base: &'a FontCollection) -> FontSet<'a> {
     return FontSet {
       base: base,
       installed: FontMatcher.make(base),
+      families: List<FamilyFaces>.make(),
       local: FontDatabase.make(),
       charmaps: List<Option<Charmap<'a>>>.make(),
       loaded: List<bool>.make(),
       declared: List<Declared>.make(),
       wanted: List<usize>.make(),
       generation: 0,
+      now: 0.0,
+      fallbackQueries: 0,
     }
   }
 
@@ -393,6 +481,9 @@ impl<'a> FontSet<'a> {
         ranges: List<UnicodeRange>.make(),
         state: FaceState.Ready,
         face: installed + i,
+        display: FontDisplay.Swap,
+        since: -1.0,
+        expired: false,
       }
       run self.declared.append(move entry)
       i = i + 1
@@ -419,6 +510,9 @@ impl<'a> FontSet<'a> {
         ranges: move rule.ranges,
         state: FaceState.Unloaded,
         face: usize.MAX,
+        display: rule.display,
+        since: -1.0,
+        expired: false,
       },
     )
     self.generation = self.generation + 1
@@ -466,7 +560,8 @@ impl<'a> FontSet<'a> {
   }
 
   pub fn retry(self: &mut Self, declared: usize) -> bool {
-    if !self.active(declared) || self.declared.asSlice()[declared].state != FaceState.Failed { return false }
+    if !self.active(declared) || self.declared.asSlice()[declared].state != FaceState.Failed
+      || self.declared.asSlice()[declared].expired { return false }
     let entries = self.declared.asMutSlice()
     entries[declared].state = FaceState.Loading
     return true
@@ -481,7 +576,14 @@ impl<'a> FontSet<'a> {
     if declared >= self.declared.length() {
       return false
     }
-    if self.declared.asSlice()[declared].state == FaceState.Ready {
+    if self.declared.asSlice()[declared].state == FaceState.Ready || self.declared.asSlice()[declared].expired {
+      return true
+    }
+    if self.late(declared) {
+      // After the swap period the fallback stays: the file is not used, and not retried.
+      let entries = self.declared.asMutSlice()
+      entries[declared].state = FaceState.Failed
+      entries[declared].expired = true
       return true
     }
     let entry = &self.declared.asSlice()[declared]
@@ -517,6 +619,81 @@ impl<'a> FontSet<'a> {
       let entries = self.declared.asMutSlice()
       entries[declared].state = FaceState.Failed
     }
+  }
+
+  /// Whether declared face `declared`'s swap period is over.
+  fn late(self: &Self, declared: usize) -> bool {
+    let entry = &self.declared.asSlice()[declared]
+    let end = entry.display.swapEnd()
+    return end >= 0.0 && entry.since >= 0.0 && self.now - entry.since >= end
+  }
+
+  /// Whether declared face `declared` loaded after its swap period, so it is never used.
+  pub fn expired(self: &Self, declared: usize) -> bool {
+    return declared < self.declared.length() && self.declared.asSlice()[declared].expired
+  }
+
+  /// Whether text with `chain` is invisible now: a face of it is loading in its block period.
+  pub fn blocking(self: &Self, chain: &[Link]) -> bool {
+    let mut i: usize = 0
+    while i < chain.length {
+      let link = chain[i]
+      if link.declared == usize.MAX {
+        return false
+      }
+      let entry = &self.declared.asSlice()[link.declared]
+      if entry.active && entry.state == FaceState.Loading && entry.since >= 0.0
+        && self.now - entry.since < entry.display.block() {
+        return true
+      }
+      if entry.active && entry.state == FaceState.Ready {
+        return false
+      }
+      i = i + 1
+    }
+    return false
+  }
+
+  /// The next time a block or swap period ends, or a negative number when none runs.
+  pub fn nextDeadline(self: &Self) -> f64 {
+    let mut next: f64 = -1.0
+    let entries = self.declared.asSlice()
+    let mut i: usize = 0
+    while i < entries.length {
+      let entry = &entries[i]
+      if entry.active && entry.state == FaceState.Loading && entry.since >= 0.0 {
+        let block = entry.since + entry.display.block()
+        if block > self.now && (next < 0.0 || block < next) {
+          next = block
+        }
+        let swap = entry.display.swapEnd()
+        if swap >= 0.0 && entry.since + swap > self.now && (next < 0.0 || entry.since + swap < next) {
+          next = entry.since + swap
+        }
+      }
+      i = i + 1
+    }
+    return next
+  }
+
+  /// Gives up on faces still loading after their swap period: their fallback stays, and a
+  /// file that comes later is not used. True when one gave up.
+  pub fn expireLate(self: &mut Self) -> bool {
+    let mut changed = false
+    let mut i: usize = 0
+    while i < self.declared.length() {
+      if self.declared.asSlice()[i].state == FaceState.Loading && self.late(i) {
+        let entries = self.declared.asMutSlice()
+        entries[i].state = FaceState.Failed
+        entries[i].expired = true
+        changed = true
+      }
+      i = i + 1
+    }
+    if changed {
+      self.generation = self.generation + 1
+    }
+    return changed
   }
 
   /// The number of added and declared faces.
@@ -641,6 +818,7 @@ impl<'a> FontSet<'a> {
               syntheticBold: request.weight >= 600.0 && entry.weight.max < 600.0,
             },
             declared: j,
+            family: usize.MAX,
           },
         )
         let mut at = out.length() - 1
@@ -655,6 +833,26 @@ impl<'a> FontSet<'a> {
     }
   }
 
+  effect fn installedMatch(self: &Self, cache: &mut List<FamilyFaces>, family: &Family, request: Request) -> Option<Selection>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut index: usize = 0
+    while index < cache.length() {
+      if sameFamily(&cache.asSlice()[index].family, family) { break }
+      index = index + 1
+    }
+    if index == cache.length() {
+      let mut faces = List<usize>.make()
+      run self.base.familyFaces(family, &mut faces)
+      if index == 64 {
+        cache.clear()
+        index = 0
+      }
+      run cache.append(FamilyFaces { family: run family.copy(), faces: move faces })
+    }
+    let view = Fonts.make(&self.base.database)
+    return run matching.select(&view, cache.asSlice()[index].faces.asSlice(), request)
+  }
+
   /// The faces to try for text asking for `families`: per family, the members of an added
   /// family, or one CSS-matched installed face, without repeats.
   pub effect fn chain(
@@ -662,6 +860,25 @@ impl<'a> FontSet<'a> {
     families: &[Family],
     request: Request,
     out: &mut List<Link>,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut cache = List<FamilyFaces>.make()
+    run self.chainWith(families, request, &mut out, &mut cache)
+  }
+
+  pub effect fn cachedChain(
+    self: &mut Self, families: &[Family], request: Request, out: &mut List<Link>,
+  ) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut cache = Intrinsic.replace(self.families, List<FamilyFaces>.make())
+    run self.chainWith(families, request, &mut out, &mut cache)
+    self.families = move cache
+  }
+
+  effect fn chainWith(
+    self: &Self,
+    families: &[Family],
+    request: Request,
+    out: &mut List<Link>,
+    cache: &mut List<FamilyFaces>,
   ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -670,12 +887,20 @@ impl<'a> FontSet<'a> {
       let mut added = false
       if let Family.Named { name } = &families[index] {
         if self.hasFamily(Bytes.asSlice(&name)) {
+          let first = out.length()
           run self.matchAdded(Bytes.asSlice(&name), request, &mut out)
+          let links = out.asMutSlice()
+          let mut at = first
+          while at < links.length {
+            links[at].family = index
+            at = at + 1
+          }
           added = true
         }
       }
       if !added {
-        if let Option<Selection>.Some { value } = run self.base.matchFamily(
+        if let Option<Selection>.Some { value } = run self.installedMatch(
+          &mut cache,
           &families[index],
           request,
         ) {
@@ -688,7 +913,7 @@ impl<'a> FontSet<'a> {
             at = at + 1
           }
           if !seen {
-            run out.append(Link { selection: value, declared: usize.MAX })
+            run out.append(Link { selection: value, declared: usize.MAX, family: index })
           }
         }
       }
@@ -749,6 +974,7 @@ impl<'a> FontSet<'a> {
         } else if state == FaceState.Unloaded {
           let entries = self.declared.asMutSlice()
           entries[link.declared].state = FaceState.Loading
+          entries[link.declared].since = self.now
           run self.wanted.append(link.declared)
         }
       }
@@ -765,6 +991,7 @@ impl<'a> FontSet<'a> {
   pub effect fn fallback(self: &mut Self, request: Request, cp: u32, script: Script) -> Option<Selection>
     ! OutOfMemoryError
     ? &mut Allocator {
+    self.fallbackQueries = self.fallbackQueries + 1
     let none: [Selection; 0] = []
     return run self.installed.select(&none, request, cp, script)
   }

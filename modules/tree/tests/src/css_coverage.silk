@@ -24,7 +24,10 @@ import silk.text.string { String }
 import ui_tree.lib { Batch, Attribute, ProtocolError }
 import svg_css.compile { Options, CompileError }
 import svg_css.compile
-import ui_tree.legacy { CpuSnapshot }
+import ui_tree.legacy { CpuSnapshot, Mutation, TreeError as EngineError }
+import ui_tree.css_cursor { CursorImage }
+import ui_tree.resources { CursorPixels }
+import codec.image { Image, ImageError }
 import vector.geometry_error { GeometryError }
 
 /// A property and the styles that make its value matter: the root's, the leading sibling's,
@@ -45,6 +48,7 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"display:flex;height:100px", sample: b"align-items:center" },
     Row { root: b"display:flex;height:300px", lead: b"", setup: b"", sample: b"align-self:center" },
     Row { root: b"", lead: b"", setup: b"width:100px", sample: b"aspect-ratio:1" },
+    Row { root: b"", lead: b"", setup: b"width:20px;height:20px;background-color:red", sample: b"zoom:2" },
     Row { root: b"", lead: b"", setup: b"", sample: b"backdrop-filter:blur(4px)" },
     Row { root: b"", lead: b"", setup: b"", sample: b"background-color:red" },
     Row { root: b"", lead: b"", setup: b"", sample: b"background-image:linear-gradient(90deg, red, blue)" },
@@ -104,6 +108,8 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"", sample: b"font-variant-caps:small-caps" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font-kerning:none" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font-feature-settings:\"smcp\"" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-size-adjust:1" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"font-smooth:never" },
     Row { root: b"", lead: b"", setup: b"", sample: b"font-weight:700" },
     Row { root: b"", lead: b"", setup: b"display:flex", sample: b"gap:10px" },
     Row { root: b"", lead: b"", setup: b"", sample: b"height:50px" },
@@ -155,6 +161,13 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"text-decoration-line:underline", sample: b"text-decoration-color:red" },
     Row { root: b"", lead: b"", setup: b"text-decoration-line:underline", sample: b"text-decoration-style:wavy" },
     Row { root: b"", lead: b"", setup: b"", sample: b"text-indent:20px" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-emphasis:filled red" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"text-emphasis-style:dot" },
+    Row { root: b"", lead: b"", setup: b"text-emphasis-style:dot", sample: b"text-emphasis-color:red" },
+    Row { root: b"", lead: b"", setup: b"text-emphasis-style:dot", sample: b"text-emphasis-position:under" },
+    Row { root: b"", lead: b"", setup: b"line-height:40px", sample: b"text-box:trim-both cap alphabetic" },
+    Row { root: b"", lead: b"", setup: b"line-height:40px", sample: b"text-box-trim:trim-both" },
+    Row { root: b"", lead: b"", setup: b"line-height:40px;text-box-trim:trim-start", sample: b"text-box-edge:cap" },
     Row { root: b"", lead: b"", setup: b"text-align:justify;width:100px", sample: b"text-justify:inter-character" },
     Row { root: b"", lead: b"", setup: b"writing-mode:vertical-rl", sample: b"text-orientation:upright" },
     Row { root: b"", lead: b"", setup: b"width:50px", sample: b"text-wrap-mode:nowrap" },
@@ -260,6 +273,8 @@ fn row(at: usize) -> Option<Row> {
     Row { root: b"", lead: b"", setup: b"", sample: b"text-shadow:1px 1px red" },
     Row { root: b"", lead: b"", setup: b"", sample: b"clip-path:circle(40%)" },
     Row { root: b"", lead: b"", setup: b"", sample: b"mix-blend-mode:multiply" },
+    Row { root: b"", lead: b"", setup: b"background-color:lime;background-image:linear-gradient(red, blue)", sample: b"background-blend-mode:multiply" },
+    Row { root: b"", lead: b"", setup: b"", sample: b"-webkit-text-fill-color:red" },
     Row { root: b"", lead: b"", setup: b"background-image:linear-gradient(red, blue)", sample: b"background-position:10px 5px" },
     Row { root: b"", lead: b"", setup: b"background-image:linear-gradient(red, blue);background-size:20px 20px;background-repeat:no-repeat", sample: b"background-position-x:right 5px" },
     Row { root: b"", lead: b"", setup: b"background-image:linear-gradient(red, blue);background-size:20px 20px;background-repeat:no-repeat", sample: b"background-position-y:10px" },
@@ -281,11 +296,33 @@ fn row(at: usize) -> Option<Row> {
 
 /// What the tree leaves to others for now, with who owns it.
 fn unsupported(property: Property) -> bool {
-  return fragmentation(property) || svgOnly(property) || later(property) || throughChildren(property)
+  return fragmentation(property) || svgOnly(property) || later(property) || throughChildren(property) || anchoring(property)
+    || property == Property.InitialLetter || imageOnly(property)
+}
+
+/// Change how a bitmap scales, how a background follows scrolling, how mask layers combine or
+/// how a border image is cut, none of which the fixture has: `pixel_checks` covers them.
+fn imageOnly(property: Property) -> bool {
+  return property == Property.ImageRendering || property == Property.BackgroundAttachment
+    || property == Property.MaskMode || property == Property.MaskComposite
+    || property == Property.BorderImage || property == Property.BorderImageSource
+    || property == Property.BorderImageSlice || property == Property.BorderImageWidth
+    || property == Property.BorderImageOutset || property == Property.BorderImageRepeat
+    || property == Property.MaskBorder || property == Property.MaskBorderSource
+    || property == Property.MaskBorderMode || property == Property.MaskBorderSlice
+    || property == Property.MaskBorderWidth || property == Property.MaskBorderOutset
+    || property == Property.MaskBorderRepeat
 }
 
 /// Change how the children paint, not the box itself, which a row cannot show: the Can I use
 /// probes (`css-mixblendmode`, `will-change`) and `effects.silk` cover them.
+/// Anchor positioning needs an anchor and a positioned box together: css_anchor tests it.
+/// `initial-letter` styles only `::first-letter`, which first_letter tests.
+fn anchoring(property: Property) -> bool {
+  return property == Property.AnchorName || property == Property.PositionAnchor
+    || property == Property.PositionArea || property == Property.PositionTryFallbacks
+}
+
 fn throughChildren(property: Property) -> bool {
   return property == Property.Isolation || property == Property.WillChange
 }
@@ -331,17 +368,17 @@ fn svgOnly(property: Property) -> bool {
 fn later(property: Property) -> bool {
   // "Paint CSS effects in the tree".
   return property == Property.Clip
-    || property == Property.BackgroundBlendMode || property == Property.BackgroundAttachment || property == Property.MaskMode || property == Property.MaskComposite || property == Property.MaskBorder
-    || property == Property.MaskBorderSource || property == Property.MaskBorderMode
-    || property == Property.MaskBorderSlice || property == Property.MaskBorderWidth
-    || property == Property.MaskBorderOutset || property == Property.MaskBorderRepeat
-    || property == Property.ImageRendering || property == Property.ImageOrientation
+    || property == Property.ImageOrientation
     // "Add CSS transforms to the tree".
     || property == Property.Transform || property == Property.TransformOrigin
     || property == Property.Perspective || property == Property.PerspectiveOrigin
     || property == Property.TransformBox || property == Property.TransformStyle
     || property == Property.BackfaceVisibility || property == Property.Translate
     || property == Property.Rotate || property == Property.Scale
+    // Motion path moves the box through its transform too: motion_path.silk covers it.
+    || property == Property.OffsetPath || property == Property.OffsetDistance
+    || property == Property.OffsetRotate || property == Property.OffsetAnchor
+    || property == Property.OffsetPosition || property == Property.Offset
     // "Add CSS transitions, animations and vh units".
     || property == Property.Animation || property == Property.AnimationName
     || property == Property.AnimationDuration || property == Property.AnimationTimingFunction
@@ -350,7 +387,7 @@ fn later(property: Property) -> bool {
     || property == Property.AnimationPlayState
     // "Support all CSS properties on every backend": text and stacking.
     || property == Property.All
-    || property == Property.FontSizeAdjust || property == Property.FontVariantEastAsian
+    || property == Property.FontVariantEastAsian
     || property == Property.FontVariantAlternates || property == Property.FontVariantEmoji
     || property == Property.FontVariationSettings
     || property == Property.FontOpticalSizing || property == Property.FontLanguageOverride
@@ -362,9 +399,7 @@ fn later(property: Property) -> bool {
     || property == Property.TextUnderlinePosition
     || property == Property.TextRendering
     || property == Property.TextAlignAll || property == Property.TextCombineUpright
-    || property == Property.HangingPunctuation || property == Property.TextEmphasis
-    || property == Property.TextEmphasisStyle || property == Property.TextEmphasisColor
-    || property == Property.TextEmphasisPosition
+    || property == Property.HangingPunctuation
     || property == Property.WhiteSpaceTrim
     // "Add CSS transitions, animations and vh units", continued.
     || property == Property.Transition || property == Property.TransitionProperty
@@ -372,7 +407,8 @@ fn later(property: Property) -> bool {
     || property == Property.TransitionDelay || property == Property.TransitionBehavior
     // "Add missing CSS properties to lib-css": parsed, with nothing in the tree behind them
     // yet. The tree reads overscroll-behavior, scroll-behavior, scroll-margin and
-    // scroll-padding, but only when scrolling (interaction tests), not in layout or paint.
+    // scroll-padding, scroll snap and overflow-anchor, but only when scrolling (interaction,
+    // scroll_snap and scroll_anchor tests), not in layout or paint.
     || property == Property.UserSelect
     || property == Property.AccentColor || property == Property.Appearance
     || property == Property.Resize
@@ -408,12 +444,8 @@ fn later(property: Property) -> bool {
     || property == Property.CounterReset || property == Property.CounterIncrement
     || property == Property.CounterSet || property == Property.Content
     || property == Property.Quotes || property == Property.EmptyCells
-    || property == Property.BorderImageSource
-    || property == Property.BorderImageSlice || property == Property.BorderImageWidth
-    || property == Property.BorderImageOutset || property == Property.BorderImageRepeat
-    || property == Property.BorderImage || property == Property.ColorScheme
+    || property == Property.ColorScheme
     || property == Property.PrintColorAdjust || property == Property.ForcedColorAdjust
-    || property == Property.ShapeImageThreshold
     || property == Property.FieldSizing
     // Read, but without effect yet: no oblique synthesis without an italic face, overlay
     // scrollbars take no space, and a block's last baseline is not used for alignment.
@@ -427,6 +459,10 @@ fn later(property: Property) -> bool {
     // Shape the lines after a float, and the fixture has none after the target: the Can I use
     // probes of `css-shapes` cover them.
     || property == Property.ShapeOutside || property == Property.ShapeMargin
+    || property == Property.ShapeImageThreshold
+    // Need a positioned box with text around it: the Can I use probes of `css-exclusions`
+    // cover them, and lib-css's `exclusion-*` fixtures `wrap-through`.
+    || property == Property.WrapFlow || property == Property.WrapThrough
     // The fixture text has no soft hyphens: `hyphensAtSoftHyphens` covers them.
     || property == Property.Hyphens
 }
@@ -663,7 +699,7 @@ effect fn shownCursor(tree: &mut Tree<'_>) -> Cursor
 
 /// The CSS cursor of the hovered node shows; `auto` takes its ancestor's.
 effect fn cursorsFromStyle() -> ()
-  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static>
+  ! TreeError | EngineError | CssError | ImageError | OutOfMemoryError | AssertionError<'static>
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
   let mut tree = run Tree.make(&fonts)
@@ -696,10 +732,65 @@ effect fn cursorsFromStyle() -> ()
   run restyle(&mut tree, plain, b"height: 50px; cursor: col-resize")
   let column = run shownCursor(&mut tree)
   run Testing.expect(column == Cursor.ColumnResize, "col-resize is not ew-resize")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: cell")
+  let cell = run shownCursor(&mut tree)
+  run Testing.expect(cell == Cursor.Cell, "cell is not crosshair")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: no-drop")
+  let noDrop = run shownCursor(&mut tree)
+  run Testing.expect(noDrop == Cursor.NoDrop, "no-drop is not not-allowed")
+  run restyle(&mut tree, plain, b"height: 50px; cursor: ne-resize")
+  let corner = run shownCursor(&mut tree)
+  run Testing.expect(corner == Cursor.ResizeNorthEast, "ne-resize is one-sided")
+
+  // Images: the keyword shows until one loads; a failed one is skipped.
+  run restyle(&mut tree, plain, b"height: 50px; cursor: url(gone.png), url('hand.png') 3 4, pointer")
+  let waiting = run shownCursor(&mut tree)
+  run Testing.expect(waiting == Cursor.Pointer, "the keyword shows while the images load")
+  let engine = tree.engineMut()
+  run Testing.expect((run engine.cursorImage()).isNone(), "no image before it loads")
+  let loads = run engine.takeLoads()
+  run Testing.expect(loads.length() == 2, "every image of the list is asked for")
+  let mut gone: u32 = 0
+  let mut hand: u32 = 0
+  let list = loads.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if let Mutation.LoadImage { resource, url } = &list[i] {
+      if String.view(&url) == "gone.png" { gone = resource }
+      if String.view(&url) == "hand.png" { hand = resource }
+    }
+    i = i + 1
+  }
+  run engine.settleSource(gone, false)
+  let mut image = run Image.make(2, 2)
+  let pixels = image.dataMut()
+  let mut k: usize = 0
+  while k < pixels.length {
+    pixels[k] = if k % 4 == 3 { 128 } else if k % 4 == 0 { 64 } else { 0 }
+    k = k + 1
+  }
+  drop pixels
+  let mut batch = Batch.make()
+  run batch.decodedImage(hand, move image)
+  run engine.apply(run batch.take())
+  run engine.settleSource(hand, true)
+  match run engine.cursorImage() {
+    Option<CursorImage>.Some { value } => {
+      run Testing.expect(value.resource == hand && value.hot && value.hotX == 3.0 && value.hotY == 4.0, "the loaded image, with its hot spot")
+      match run engine.cursorPixels(value, 2.0) {
+        Option<CursorPixels>.Some { value: shown } => {
+          run Testing.expect(shown.width == 2 && shown.scale == 1.0, "a bitmap keeps its own size")
+          run Testing.expect(shown.pixels.asSlice()[0] == 128 && shown.pixels.asSlice()[3] == 128, "pixels are not premultiplied")
+        }
+        _ => { run Testing.expect(false, "cursor pixels") }
+      }
+    }
+    _ => { run Testing.expect(false, "a cursor image once one loads") }
+  }
 }
 
 test effect fn cssCoverageCursorsFromStyle() -> ()
-  ! TreeError | CssError | OutOfMemoryError | AssertionError<'static> {
+  ! TreeError | EngineError | CssError | ImageError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run cursorsFromStyle() |> Effect.provideMut<Allocator>(&mut allocator)
 }
@@ -805,8 +896,14 @@ effect fn sizesWithPercentages() -> ()
   run Testing.expect(run sameLook(b"width: clamp(50px, 50%, 90px)", b"width: 90px"), "clamp() holds a percentage under its maximum")
   run Testing.expect(run sameLook(b"width: clamp(250px, 50%, 300px)", b"width: 250px"), "and over its minimum")
   run Testing.expect(run sameLook(b"width: max(50px, min(50%, 90px))", b"width: 90px"), "max() of min() is a clamp")
-  run Testing.expect(run sameLook(b"width: clamp(50px, 50% + 10px, 90px)", b""), "a clamp() of a percentage with a length has no form and is dropped")
-  run Testing.expect(run sameLook(b"padding-left: max(10%, 30px)", b""), "padding has no such form and drops it")
+  run Testing.expect(run sameLook(b"width: clamp(50px, 50% + 10px, 250px)", b"width: 210px"), "clamp() holds a length plus a percentage")
+  run Testing.expect(run sameLook(b"width: calc(min(100%, 300px) - 2em)", b"width: 268px"), "a sum moves the bound of a min()")
+  run Testing.expect(run sameLook(b"padding-left: max(10%, 30px)", b"padding-left: 40px"), "padding compares them too")
+  run Testing.expect(run sameLook(b"margin-left: clamp(10px, 5%, 15px); padding-right: clamp(10px, 5%, 30px)", b"margin-left: 15px; padding-right: 20px"), "and margins, each with its own bounds")
+  run Testing.expect(run sameLook(b"display: flex; column-gap: min(5%, 30px)", b"display: flex; column-gap: 20px"), "and gaps")
+  run Testing.expect(run sameLook(b"position: relative; left: max(1em, 10% - 20px)", b"position: relative; left: 20px"), "and insets")
+  run Testing.expect(run sameLook(b"width: round(up, 6.3em, 10px)", b"width: 110px"), "round() steps a font length")
+  run Testing.expect(run sameLook(b"padding-left: min(10%, 5% + 20px)", b""), "two values that both need the basis are dropped")
 }
 
 test effect fn cssCoverageSizesWithPercentages() -> ()

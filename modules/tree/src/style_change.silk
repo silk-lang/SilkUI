@@ -5,6 +5,7 @@ import style { Computed }
 import container_watch
 import motion { Running }
 import animation { Playing }
+import animation
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
@@ -43,7 +44,7 @@ pub fn rendered(tree: &UiTree<'_>, slot: u32) -> bool {
 
 pub fn before(tree: &UiTree<'_>, slot: u32) -> Computed {
   let at = index(tree, slot)
-  return if at == usize.MAX { tree.node(slot).computed } else { tree.styleChanges.asSlice()[at].before }
+  return if at == usize.MAX { tree.node(slot).computed().* } else { tree.styleChanges.asSlice()[at].before }
 }
 
 pub fn begin(tree: &mut UiTree<'_>) {
@@ -58,7 +59,7 @@ pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, units: bool) ! OutOfMemo
   if at == usize.MAX {
     if !units && !container_watch.queries(&tree, slot) && (parent == NONE || !tracks(&tree, parent)) { return () }
     let node = tree.node(slot)
-    let mut change = Change { slot: slot, id: node.id, before: node.computed, rendered: node.rendered,
+    let mut change = Change { slot: slot, id: node.id, before: node.computed().*, rendered: node.rendered,
       transitions: List<Running>.make(), animations: List<Playing>.make(), events: List<Event>.make(), eventAt: tree.events.length() }
     let mut i: usize = 0
     while i < tree.transitions.length() {
@@ -66,10 +67,11 @@ pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, units: bool) ! OutOfMemo
       if item.slot == slot && item.id == node.id { run change.transitions.append(item) }
       i = i + 1
     }
-    i = 0
-    while i < tree.animations.length() {
+    let playing = animation.rangeOf(tree.animations.asSlice(), slot)
+    i = playing[0]
+    while i < playing[1] {
       let item = tree.animations.get(i)
-      if item.slot == slot && item.id == node.id { run change.animations.append(item) }
+      if item.id == node.id { run change.animations.append(item) }
       i = i + 1
     }
     let added = tree.styleChanges.length()
@@ -90,15 +92,10 @@ pub effect fn prepare(tree: &mut UiTree<'_>, slot: u32, units: bool) ! OutOfMemo
   }
   tree.transitions.truncate(kept)
   run tree.transitions.appendSlice(change.transitions.asSlice())
-  i = 0
-  kept = 0
-  while i < tree.animations.length() {
-    let item = tree.animations.get(i)
-    if item.slot != slot || item.id != change.id { tree.animations.set(kept, item) kept = kept + 1 }
-    i = i + 1
-  }
-  tree.animations.truncate(kept)
-  run tree.animations.appendSlice(change.animations.asSlice())
+  let restored = Intrinsic.replace(change.animations, List<Playing>.make())
+  run animation.replace(&mut tree, slot, restored.asSlice())
+  let again = tree.styleChanges.asMutSlice()
+  again[at].animations = move restored
 }
 
 pub effect fn event(tree: &mut UiTree<'_>, slot: u32, value: Event) ! OutOfMemoryError ? &mut Allocator {

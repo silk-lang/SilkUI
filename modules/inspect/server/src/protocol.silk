@@ -6,6 +6,9 @@
 //! that pick a node take a target: `node` (a client id) or the query members `role`, `name`,
 //! `label`, `text`, `testId`, `within`, `exact` and `hidden`, alone or inside a `query` object.
 //! See the README for each command.
+import shots { Done, Shot, Shots }
+import ui_tree.computed_style
+import ui_tree.engine { TreeError }
 import ui_inspect.query { Query, queryAll, queryFirst, hitPath, pick }
 import ui_inspect.overlay { BoxModel, Highlight, boxModels, compose, paintHighlight }
 import ui_inspect.view { InspectOptions, inspectNode }
@@ -91,6 +94,7 @@ import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
+import silk.collections.bytes { Bytes }
 import silk.geometry.rect { Rect }
 import silk.geometry.vector { Vector2 }
 import silk.json.value { Json, Value }
@@ -184,6 +188,11 @@ pub struct Protocol {
   pub hidden: List<u32>,
   /// The extensions frameworks registered (see `extension.silk`).
   pub extensions: Extensions,
+  /// The host reads its frames back from the GPU (`Inspector.liveFrames`): screenshots of
+  /// the window wait for the next frame it draws instead of drawing one on the CPU.
+  pub liveFrames: bool,
+  /// The screenshots waiting for a frame copy or being encoded (see `shots.silk`).
+  pub shots: Shots,
 }
 
 impl Protocol {
@@ -210,6 +219,8 @@ impl Protocol {
       changes: Changes.make(),
       hidden: List<u32>.make(),
       extensions: Extensions.make(),
+      liveFrames: false,
+      shots: Shots.make(),
     }
   }
 
@@ -302,6 +313,14 @@ impl Protocol {
     run tree.begin(&self.inputs.asSlice()[0])
     self.began = true
     return true
+  }
+
+  /// The input `beginNext` started, until `finishNext`.
+  pub fn begun(self: &Self) -> Option<&Input> {
+    if !self.began || self.inputs.length() == 0 {
+      return Option<&Input>.None
+    }
+    return Option<&Input>.Some { value: &self.inputs.asSlice()[0] }
   }
 
   /// The second half: the default action of the input `beginNext` started, unless
@@ -486,13 +505,13 @@ impl Protocol {
     } else if cmd == "query" {
       run self.query(&tree.*, request, &mut out)
     } else if cmd == "inspect" {
-      run inspect(&tree.*, self.hidden.asSlice(), request, &mut out)
+      run inspect(&mut tree, self.hidden.asSlice(), request, &mut out)
     } else if cmd == "pick" {
       run pickAt(&tree.*, request, &mut out)
     } else if cmd == "highlight" {
       run self.setHighlight(&tree.*, request, &mut out)
     } else if cmd == "screenshot" {
-      run self.screenshot(&mut tree, request, &mut out)
+      return run self.screenshot(&mut tree, request, &mut out)
     } else if cmd == "click" || cmd == "hover" || cmd == "scroll" || cmd == "pointer" {
       run self.pointer(&mut tree, cmd, request, &mut out)
     } else if cmd == "press" || cmd == "key" {
@@ -774,7 +793,7 @@ impl Protocol {
     run putInt(&mut out, "node", u32.toU64(id))
     run putText(&mut out, "state", stateName(state))
     run putKey(&mut out, "style")
-    run declarationTexts(&run shown(&tree.*, id, state), &mut out)
+    run declarationTexts((run shown(&tree.*, id, state)).asSlice(), &mut out)
     run putInt(&mut out, "edited", usize.toU64(tree.styleOverrides().length))
     run putKey(&mut out, "edits")
     run out.append("[")
@@ -1344,21 +1363,49 @@ impl Protocol {
     tree: &mut UiTree<'_>,
     request: &Value,
     out: &mut String,
-  ) -> ()
+  ) -> Outcome
     ! GeometryError | ImageError | OutOfMemoryError
     ? &mut Allocator {
     let maxWidth = idField(request, "maxWidth").unwrapOr(0)
     if has(request, "maxWidth") && (maxWidth < 1 || maxWidth > 4096) {
       run failure(&mut out, request, "maxWidth must be in 1..4096")
-      return ()
+      return Outcome.Done
     }
     let mut pixels = run Pixmap.make(1, 1)
     let mut target = NONE
     if run hasTarget(request) {
       target = run targetOf(&tree.*, self.hidden.asSlice(), request, &mut out)
       if target == NONE {
-        return ()
+        return Outcome.Done
       }
+    }
+    // The window shows the highlight when there is one, so a screenshot without it is drawn on
+    // the CPU; any other comes from the next frame the host draws, encoded off the UI thread.
+    let liveHighlight = !self.highlighting() || flagField(request, "highlight", true)
+    if self.liveFrames && liveHighlight && self.extensions.callerAnswered {
+      let mut head = String.make()
+      run begin(&mut head, request)
+      let mut crop: [u32; 4] = [0; 4]
+      if target != NONE {
+        if let Option<NodeInfo>.Some { value } = run info(&tree.*, target) {
+          crop = cropRect(value.bounds, tree.input.scale)
+        }
+      }
+      let mut heap = Allocator.systemAllocatorProvider()
+      let mut owned = String.make()
+      run owned.append(String.view(&head)) |> Effect.provideMut<Allocator>(&mut heap)
+      run self.shots.wait(
+        Shot {
+          session: self.extensions.caller,
+          head: move owned,
+          node: target,
+          crop: crop,
+          maxWidth: maxWidth,
+        },
+      )
+      return Outcome.Deferred
+    }
+    if target != NONE {
       if self.hasSurface {
         pixels = run self.snapshot.renderScene(&tree.*, &self.surface)
         if let Option<NodeInfo>.Some { value } = run info(&tree.*, target) {
@@ -1383,6 +1430,107 @@ impl Protocol {
     run begin(&mut out, request)
     if target != NONE {
       run putInt(&mut out, "node", u32.toU64(target))
+    }
+    run putInt(&mut out, "width", u32.toU64(pixels.width()))
+    run putInt(&mut out, "height", u32.toU64(pixels.height()))
+    run putNumber(
+      &mut out,
+      "scale",
+      tree.input.scale * u32.toF32(pixels.width()) / u32.toF32(sourceWidth),
+    )
+    run putInt(&mut out, "frame", tree.stats.frame)
+    run putKey(&mut out, "png")
+    run out.append("\"")
+    run writeBase64(&mut out, png.asSlice())
+    run out.append("\"")
+    run finish(&mut out)
+    return Outcome.Done
+  }
+
+  /// Hands the frame the host read back to the screenshots waiting for one; the worker
+  /// encodes them (see `shots.silk`). With `ok` false the window cannot be read back: the
+  /// waiting screenshots are drawn on the CPU now, and so are later ones.
+  pub effect fn frameCopy(
+    self: &mut Self,
+    tree: &UiTree<'_>,
+    rows: List<u8>,
+    stride: u32,
+    width: u32,
+    height: u32,
+    bgra: bool,
+    ok: bool,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if ok && run self.shots.frame(move rows, stride, width, height, bgra, tree.input.scale, tree.stats.frame) {
+      return ()
+    }
+    self.liveFrames = false
+    while self.shots.waiting.length() != 0 {
+      let shot = self.shots.waiting.remove(0)
+      let mut line = String.make()
+      let drawn = run Effect.result(self.cpuShot(tree, &shot, &mut line))
+      match move drawn {
+        Result<(), GeometryError | ImageError | OutOfMemoryError>.Success { .. } => {}
+        Result<(), GeometryError | ImageError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+          _ => {
+            line.clear()
+            let head = String.view(&shot.head)
+            run line.append(String.slice(head, 0, String.byteLength(head) - 4))
+            run line.append("false,\"error\":\"drawing the screenshot failed\"}")
+          }
+        }
+      }
+      run self.extensions.reply(shot.session, move line)
+    }
+  }
+
+  /// Moves the screenshots the worker finished to the replies sessions deliver. True when
+  /// there were any.
+  pub effect fn takeShots(self: &mut Self) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut done = List<Done>.make()
+    run self.shots.finished(&mut done)
+    let any = done.length() != 0
+    while done.length() != 0 {
+      let finished = done.remove(0)
+      run self.extensions.reply(finished.session, move finished.line)
+    }
+    return any
+  }
+
+  // A waiting screenshot drawn on the CPU from the last frame's scene.
+  effect fn cpuShot(self: &mut Self, tree: &UiTree<'_>, shot: &Shot, out: &mut String) -> ()
+    ! GeometryError | ImageError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut pixels = if self.hasSurface {
+      run self.snapshot.renderScene(tree, &self.surface)
+    } else {
+      run self.snapshot.render(tree)
+    }
+    if shot.crop[2] > shot.crop[0] && shot.crop[3] > shot.crop[1] {
+      let scale = tree.input.scale
+      let bounds = Rect<f32> {
+        xMin: u32.toF32(shot.crop[0]) / scale,
+        yMin: u32.toF32(shot.crop[1]) / scale,
+        xMax: u32.toF32(shot.crop[2]) / scale,
+        yMax: u32.toF32(shot.crop[3]) / scale,
+      }
+      pixels = run cropPixels(&pixels, bounds, scale)
+    }
+    let sourceWidth = pixels.width()
+    if shot.maxWidth > 0 && pixels.width() > shot.maxWidth {
+      pixels = run reduced(&pixels, shot.maxWidth)
+    }
+    let png = run encodePng(&pixels)
+    out.clear()
+    run out.append(String.view(&shot.head))
+    if shot.node != NONE {
+      run putInt(&mut out, "node", u32.toU64(shot.node))
     }
     run putInt(&mut out, "width", u32.toU64(pixels.width()))
     run putInt(&mut out, "height", u32.toU64(pixels.height()))
@@ -1693,23 +1841,25 @@ effect fn snapshot(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut
   run finish(&mut out)
 }
 
-effect fn inspect(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> ()
+effect fn inspect(tree: &mut UiTree<'_>, hidden: &[u32], request: &Value, out: &mut String) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   if !run hasTarget(request) {
     run failure(&mut out, request, "inspect needs a target node")
     return ()
   }
-  let target = run targetOf(tree, hidden, request, &mut out)
+  let target = run targetOf(&tree.*, hidden, request, &mut out)
   if target == NONE {
     return ()
   }
-  let options = InspectOptions {
-    patches: flagField(request, "patches", true),
-    computed: flagField(request, "computed", true),
-  }
+  let computed = flagField(request, "computed", true)
+  let options = InspectOptions { patches: flagField(request, "patches", true), computed: computed }
   let mut text = String.make()
-  run inspectNode(tree, target, move options, &mut text)
+  run inspectNode(&tree.*, target, move options, &mut text)
+  if computed {
+    run motionStyle(&mut tree, target, &mut text)
+  }
+  let tree = &tree.*
   let mut name = String.make()
   run begin(&mut out, request)
   run putKey(&mut out, "node")
@@ -1733,6 +1883,71 @@ effect fn inspect(tree: &UiTree<'_>, hidden: &[u32], request: &Value, out: &mut 
   }
   run putText(&mut out, "text", String.view(&text))
   run finish(&mut out)
+}
+
+/// The longhands that move a node or play its animations and transitions, which the computed
+/// block leaves out: `style motion { ... }`, each as `getComputedStyle` gives it, so a running
+/// animation or transition shows its current value. A text node has none.
+const MOTION_PROPERTIES: [&'static [u8]; 22] = [
+  b"transform",
+  b"transform-origin",
+  b"translate",
+  b"rotate",
+  b"scale",
+  b"perspective",
+  b"filter",
+  b"backdrop-filter",
+  b"animation-name",
+  b"animation-duration",
+  b"animation-timing-function",
+  b"animation-delay",
+  b"animation-iteration-count",
+  b"animation-direction",
+  b"animation-fill-mode",
+  b"animation-play-state",
+  b"transition-property",
+  b"transition-duration",
+  b"transition-timing-function",
+  b"transition-delay",
+  b"will-change",
+  b"z-index",
+]
+
+effect fn motionStyle(tree: &mut UiTree<'_>, id: u32, text: &mut String) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut block = String.make()
+  let mut value = Bytes.make()
+  let mut i: usize = 0
+  while i < MOTION_PROPERTIES.length {
+    value.clear()
+    let written = run Effect.result(computed_style.write(&mut tree, id, MOTION_PROPERTIES[i], &mut value))
+    let shown = match move written {
+      Result<bool, TreeError | OutOfMemoryError>.Success { value: answered } => answered
+      Result<bool, TreeError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+        TreeError failed => {
+          drop failed
+          false
+        }
+      }
+    }
+    if shown {
+      run block.append("  ")
+      run block.append(unsafe String.fromUtf8Unchecked(MOTION_PROPERTIES[i]))
+      run block.append(": ")
+      run block.append(unsafe String.fromUtf8Unchecked(value.asSlice()))
+      run block.append(";\n")
+    }
+    i = i + 1
+  }
+  if String.byteLength(String.view(&block)) != 0 {
+    run text.append("style motion {\n")
+    run text.append(String.view(&block))
+    run text.append("}\n")
+  }
 }
 
 /// `{"x":…,"y":…,"width":…,"height":…}`.
@@ -1933,6 +2148,42 @@ effect fn stats(tree: &UiTree<'_>, hidden: usize, request: &Value, out: &mut Str
   run putInt(&mut out, "fragments", usize.toU64(s.fragments))
   run putFlag(&mut out, "layoutSkipped", s.layoutSkipped)
   run putInt(&mut out, "styledNodes", usize.toU64(s.styledNodes))
+  // Since the tree was made, so the difference over an input counts the passes that layout
+  // reads in its handlers forced as well as the frame's.
+  let w = &tree.work
+  run putKey(&mut out, "style")
+  run out.append("{\"calls\":")
+  run writeIntTo(&mut out, usize.toU64(w.styleCalls))
+  run out.append(",\"passes\":")
+  run writeIntTo(&mut out, usize.toU64(w.stylePasses))
+  run out.append(",\"fullPasses\":")
+  run writeIntTo(&mut out, usize.toU64(w.fullStylePasses))
+  run out.append(",\"rootRestyles\":")
+  run writeIntTo(&mut out, usize.toU64(w.rootRestyles))
+  run out.append(",\"resolves\":")
+  run writeIntTo(&mut out, usize.toU64(w.resolves))
+  run out.append(",\"matches\":")
+  run writeIntTo(&mut out, usize.toU64(w.sheetMatches))
+  run out.append(",\"cacheHits\":")
+  run writeIntTo(&mut out, usize.toU64(w.sheetCacheHits))
+  run out.append(",\"twins\":")
+  run writeIntTo(&mut out, usize.toU64(w.sheetTwins))
+  // By the place in the tree that asked for a full pass (`UiTree.markStylesDirty`), nonzero ones.
+  run out.append(",\"fullCauses\":{")
+  let mut cause: usize = 0
+  let mut listed = false
+  while cause < 32 {
+    if w.dirtyCauses[cause] != 0 {
+      if listed { run out.append(",") }
+      run out.append("\"")
+      run writeIntTo(&mut out, usize.toU64(cause))
+      run out.append("\":")
+      run writeIntTo(&mut out, usize.toU64(w.dirtyCauses[cause]))
+      listed = true
+    }
+    cause = cause + 1
+  }
+  run out.append("}}")
   run putKey(&mut out, "layout")
   run out.append("{\"passes\":")
   run writeIntTo(&mut out, usize.toU64(s.layout.passes))
@@ -2102,6 +2353,16 @@ effect fn modifiersOf(request: &Value) -> u32
 }
 
 /// Crops a composed capture to a node's logical bounds, clamped to the viewport.
+/// Device pixels left, top, right and bottom of `bounds` at `scale`, as `cropPixels` cuts them.
+fn cropRect(bounds: Rect<f32>, scale: f32) -> [u32; 4] {
+  return [
+    f32.toU32(f32.max(0.0, f32.floor(bounds.xMin * scale))),
+    f32.toU32(f32.max(0.0, f32.floor(bounds.yMin * scale))),
+    f32.toU32(f32.max(0.0, f32.ceil(bounds.xMax * scale))),
+    f32.toU32(f32.max(0.0, f32.ceil(bounds.yMax * scale))),
+  ]
+}
+
 effect fn cropPixels(full: &Pixmap, bounds: Rect<f32>, scale: f32) -> Pixmap
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -2179,7 +2440,7 @@ effect fn clientValue(
 ) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
-  let client = patchOf(tree.node(tree.slotOf(id)), state).asSlice()
+  let client = patchOf(tree.node(tree.slotOf(id)), state)
   let mut name = String.make()
   let mut i: usize = 0
   while i < client.length {
@@ -2240,7 +2501,7 @@ effect fn changed(
     return ()
   }
   let mut left = List<String>.make()
-  let client = patchOf(tree.node(tree.slotOf(id)), state).asSlice()
+  let client = patchOf(tree.node(tree.slotOf(id)), state)
   let mut k: usize = 0
   while k < client.length {
     run parts(&client[k], &mut name, &mut value)

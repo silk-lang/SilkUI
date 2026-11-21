@@ -1,12 +1,15 @@
 import svg_css.element { PseudoTarget }
 //! The tree's node records and the per-frame data shared by the tree and its painter.
-import mutation { NodeKind, Declaration, Role, Cursor, CanvasCommand, TriState, Live, Orientation }
+import mutation { NodeKind, Declaration, Role, Cursor, CanvasCommand, TriState, Live, Orientation, NO_SURFACE }
 import style { Computed }
 import style_sheets { Resolved }
+import svg_css.variables { ScopeId }
 import silk.mem.frozen { Frozen }
 import style_identity { NodeIdentity }
 import edit { EditState }
+import live_svg { LiveSvg }
 import paint_css { Effects }
+import transform { Placement }
 import font_raster.face { FontFace }
 import atlas.atlas { AtlasTile }
 import layout.lib { LayoutStats }
@@ -14,11 +17,13 @@ pub import ui_protocol.record { Event, EventKind }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.core.option { Option }
-import silk.mem.box { Box }
+import thin { Thin }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
+import silk.num.f32
+import silk.num.f64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -83,6 +88,88 @@ impl FrameStats {
   }
 }
 
+/// Work the tree did since it was made, for the bench census (`UiTree.census`).
+pub struct Work {
+  pub mutations: usize,
+  pub creates: usize,
+  pub inserts: usize,
+  pub setStyles: usize,
+  pub styleDeclarations: usize,
+  pub setTexts: usize,
+  pub textBytes: usize,
+  pub attributes: usize,
+  pub listens: usize,
+  pub batches: usize,
+  /// `resolve` calls, and those that were a tick of the clock.
+  pub resolves: usize,
+  pub ticks: usize,
+  /// `resolveSheet`: text nodes and sheetless trees skipped, records taken from a twin,
+  /// matches run, and of those the ones the record cache answered.
+  pub sheetSkips: usize,
+  pub sheetTwins: usize,
+  pub sheetMatches: usize,
+  pub sheetCacheHits: usize,
+  /// Computed values copied from a lender instead of built.
+  pub lenders: usize,
+  /// Lent nodes that took their lender's whole result: its style, font and paint keys and its
+  /// layout style, with nothing built or keyed again.
+  pub sharedResults: usize,
+  /// Text nodes that took the style an equal parent's text child already had.
+  pub textInherits: usize,
+  pub styleShares: usize,
+  pub frames: usize,
+  pub styleFrames: usize,
+  pub layoutFrames: usize,
+  pub paintFrames: usize,
+  pub hoverRefreshes: usize,
+  pub paintedFragments: usize,
+  pub culledSubtrees: usize,
+  pub replayedSubtrees: usize,
+  pub repaintedSubtrees: usize,
+  pub replayedOperations: usize,
+  pub paintedGlyphs: usize,
+  /// css-layout's counters summed over every compute, and the passes that only moved scroll offsets.
+  pub layoutPasses: usize,
+  pub layoutFull: usize,
+  pub layoutProbes: usize,
+  pub layoutCacheHits: usize,
+  pub layoutReused: usize,
+  pub layoutMoves: usize,
+  pub fragmentsResolved: usize,
+  pub inlineLayouts: usize,
+  pub plainLines: usize,
+  pub linesEmitted: usize,
+  pub attributeBytes: usize,
+  /// `resolveStyles` calls, those that went past the early return, and the media conditions
+  /// evaluated and rules walked by the environment update each call makes first.
+  pub styleCalls: usize,
+  pub stylePasses: usize,
+  /// Passes that matched every node again, and the `restyle` calls that asked for one.
+  pub fullStylePasses: usize,
+  pub rootRestyles: usize,
+  /// Matches that watched more elements than a match context holds, and the last such node.
+  pub watchOverflows: usize,
+  pub lastOverflow: usize,
+  /// By the place that asked: requests for a full pass that found none due.
+  pub dirtyCauses: [usize; 32],
+  pub conditionsEvaluated: usize,
+  pub conditionRulesWalked: usize,
+  /// Calls JavaScript made into the host bindings, as the JS host last reported them.
+  pub bridgeCalls: usize,
+}
+
+impl Work {
+  pub fn zero() -> Work {
+    return Work {
+      mutations: 0, creates: 0, inserts: 0, setStyles: 0, styleDeclarations: 0, setTexts: 0, textBytes: 0, attributes: 0, listens: 0, batches: 0,
+      resolves: 0, ticks: 0, sheetSkips: 0, sheetTwins: 0, sheetMatches: 0, sheetCacheHits: 0, lenders: 0, sharedResults: 0, textInherits: 0, styleShares: 0,
+      frames: 0, styleFrames: 0, layoutFrames: 0, paintFrames: 0, hoverRefreshes: 0,
+      paintedFragments: 0, culledSubtrees: 0, replayedSubtrees: 0, repaintedSubtrees: 0, replayedOperations: 0, paintedGlyphs: 0,
+      layoutPasses: 0, layoutFull: 0, layoutProbes: 0, layoutCacheHits: 0, layoutReused: 0, layoutMoves: 0, fragmentsResolved: 0, inlineLayouts: 0, plainLines: 0, linesEmitted: 0, attributeBytes: 0, bridgeCalls: 0, styleCalls: 0, stylePasses: 0, fullStylePasses: 0, rootRestyles: 0, dirtyCauses: [0; 32], watchOverflows: 0, lastOverflow: 0, conditionsEvaluated: 0, conditionRulesWalked: 0,
+    }
+  }
+}
+
 /// The paint cache of a node: the operations its subtree added to the scene of frame `frame`.
 pub struct PaintCache {
   pub hash: u64,
@@ -111,6 +198,64 @@ impl PaintCache {
   }
 }
 
+/// The paint caches of the nodes that painted a box, apart from the nodes: text nodes and nodes
+/// never painted (most of a long document) hold none.
+pub struct PaintCaches {
+  entries: List<PaintCache>,
+  free: List<u32>,
+}
+
+impl PaintCaches {
+  pub fn make() -> PaintCaches {
+    return PaintCaches { entries: List<PaintCache>.make(), free: List<u32>.make() }
+  }
+
+  /// The cache at `index`, or the empty one for NONE.
+  pub fn get(self: &Self, index: u32) -> PaintCache {
+    if index == NONE { return PaintCache.empty() }
+    return self.entries.asSlice()[u32.toUsize(index)]
+  }
+
+  /// Writes `cache` at `index`, or into a new entry for NONE; returns the index.
+  pub effect fn put(self: &mut Self, index: u32, cache: PaintCache) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if index != NONE {
+      let entries = self.entries.asMutSlice()
+      entries[u32.toUsize(index)] = cache
+      return index
+    }
+    if self.free.length() != 0 {
+      let last = self.free.length() - 1
+      let at = self.free.get(last)
+      drop self.free.remove(last)
+      let entries = self.entries.asMutSlice()
+      entries[u32.toUsize(at)] = cache
+      return at
+    }
+    let at = usize.toU32(self.entries.length())
+    run self.entries.append(cache)
+    return at
+  }
+
+  /// The entry at `index` to change in place; it must exist.
+  pub fn at(self: &mut Self, index: u32) -> &mut PaintCache {
+    return &mut self.entries.asMutSlice()[u32.toUsize(index)]
+  }
+
+  /// Gives `index` back, when it is one.
+  pub effect fn release(self: &mut Self, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if index == NONE { return () }
+    let entries = self.entries.asMutSlice()
+    entries[u32.toUsize(index)] = PaintCache.empty()
+    run self.free.append(index)
+  }
+
+  /// Drops every entry; the nodes' indices must be reset with it.
+  pub fn clearAndFree(self: &mut Self) -> () {
+    self.entries.clearAndFree()
+    self.free.clearAndFree()
+  }
+}
+
 /// See `Node.styleWatch`.
 pub const WATCH_OUTSIDE: u32 = 8
 
@@ -125,23 +270,20 @@ pub struct Node {
   /// The parent slot, or NONE.
   pub parent: u32,
   pub base: List<Declaration>,
-  pub hover: List<Declaration>,
-  pub active: List<Declaration>,
-  pub focus: List<Declaration>,
-  pub focusVisible: List<Declaration>,
-  /// The `@starting-style` look (see `StyleState.Starting`).
-  pub starting: List<Declaration>,
-  pub computed: Computed,
+  /// The other looks, the transition text, the test id and the canvas commands: what most
+  /// nodes leave empty, on the heap (see `NodeExtras`).
+  pub extras: Thin<NodeExtras>,
+  /// The computed style, shared with every node whose values are the same (see `style_pool`).
+  /// Read it with [`Node.computed`]; `UiTree.setComputed` replaces it.
+  pub styled: Frozen<Computed>,
+  /// The computed style of a node an animation or a transition is moving, in place of
+  /// `styled`: it changes every frame and no other node has it, so the node holds it alone
+  /// and each frame writes it where it is (`UiTree.setMovingComputed`).
+  pub moving: Thin<Computed>,
   pub fontKey: usize,
   pub paintHash: u64,
   pub text: String,
   pub accessRole: Role,
-  pub hasValueRange: bool,
-  pub valueMin: f32,
-  pub valueMax: f32,
-  pub valueNow: f32,
-  pub label: String,
-  pub testId: String,
   pub tabIndex: i32,
   pub cursor: Cursor,
   pub disabled: bool,
@@ -155,8 +297,6 @@ pub struct Node {
   pub selected: bool,
   pub expanded: bool,
   pub listeners: u32,
-  pub layoutReported: bool,
-  pub reportedBounds: Rect<f32>,
   pub hovered: bool,
   pub pressed: bool,
   /// The node's own style inputs changed since it was last resolved.
@@ -167,6 +307,8 @@ pub struct Node {
   pub gridDeclared: bool,
   pub gridStyled: bool,
   pub styleNeedsContext: bool,
+  /// A [`Move`] of this frame names the node: it paints as a group the renderer moves.
+  pub sliding: bool,
   pub containerWatch: u32,
   pub styleChange: u32,
   pub generatedSuppressed: bool,
@@ -175,25 +317,27 @@ pub struct Node {
   /// The node and its ancestors were displayed at its last style resolve: it has a
   /// before-change style for transitions.
   pub rendered: bool,
-  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
-  pub transition: String,
-  /// The scroll offset of a scroll container, clamped to its range at the last frame.
-  pub scrollX: f32,
-  pub scrollY: f32,
+  /// What changed can reach the node's descendants through selectors (`UiTree.restyleLocal`):
+  /// its whole subtree resolves again, not only the children whose inherited values change.
+  pub styleSubtree: bool,
   pub resource: u32,
-  pub canvas: List<CanvasCommand>,
+  /// An icon node's live svg (`Mutation.SvgInsert`), on the heap: drawn instead of its resource.
+  pub svg: Thin<LiveSvg>,
   /// Bumped when the text, source or canvas changes, and for inputs when the caret, the
   /// selection or the composition does.
   pub content: u64,
   /// An input's editing state, on the heap: inputs get one when they are made, other nodes
   /// only when given an editing attribute (`Multiline`, `ReadOnly`, `Placeholder`).
-  pub editing: Option<Box<EditState>>,
+  pub editing: Thin<EditState>,
   /// The paint effects the node declares (`filter`, `mask`, background layers...), on the
   /// heap: only nodes that declare one get them.
-  pub effects: Option<Box<Effects>>,
+  pub effects: Thin<Effects>,
   /// The ARIA states and properties most nodes do not have, on the heap: a node gets them
   /// with the first such attribute.
-  pub semantics: Option<Box<Semantics>>,
+  pub semantics: Thin<Semantics>,
+  /// The label, the value range, the scroll offset and the other state few nodes have (see
+  /// `NodeRare`); read them through the node (`Node.label`, `Node.scrollX`, ...).
+  pub rare: Thin<NodeRare>,
   pub resolvedSheet: Option<Frozen<Resolved>>,
   /// Nodes with one class hold one record and had equal selector inputs and ancestors when they
   /// took it; zero is no class. See `style_share`.
@@ -207,8 +351,99 @@ pub struct Node {
   /// Names the computed values the node holds: a fresh number each time they are computed, the
   /// lender's when they are copied. Zero is none yet.
   pub computedStamp: u32,
-  pub selectorIdentity: Option<Box<NodeIdentity>>,
-  pub cache: PaintCache,
+  pub selectorIdentity: Thin<NodeIdentity>,
+  /// The node's entry in the tree's `PaintCaches`, or NONE: only boxes paint get one.
+  pub paintCache: u32,
+}
+
+/// What a node may hold and most do not: a node gets one with the first of these it is given.
+/// Each is a list or a text, whose header alone is 64 bytes, and a long document has tens of
+/// thousands of nodes; in the node they were half of it. Read them through the node
+/// (`Node.hover`, `Node.transition`, ...), which gives the empty value for a node without them.
+pub struct NodeExtras {
+  pub hover: List<Declaration>,
+  pub active: List<Declaration>,
+  pub focus: List<Declaration>,
+  pub focusVisible: List<Declaration>,
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub starting: List<Declaration>,
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub transition: String,
+  pub testId: String,
+  pub canvas: List<CanvasCommand>,
+  /// The GPU surface a canvas node shows (`Mutation.SetCanvasSurface`), or `NO_SURFACE`.
+  pub surface: CanvasSurface,
+}
+
+/// The GPU surface of a canvas node: the host's number for it, its natural size in CSS pixels
+/// and whether it is opaque.
+pub struct CanvasSurface {
+  pub id: u32,
+  pub width: u32,
+  pub height: u32,
+  pub opaque: bool,
+}
+
+impl Copy for CanvasSurface {}
+
+impl CanvasSurface {
+  pub fn none() -> CanvasSurface {
+    return CanvasSurface { id: NO_SURFACE, width: 0, height: 0, opaque: false }
+  }
+
+  pub fn isSome(self: Self) -> bool {
+    return self.id != NO_SURFACE
+  }
+}
+
+impl NodeExtras {
+  pub fn make() -> NodeExtras {
+    return NodeExtras {
+      hover: List<Declaration>.make(),
+      active: List<Declaration>.make(),
+      focus: List<Declaration>.make(),
+      focusVisible: List<Declaration>.make(),
+      starting: List<Declaration>.make(),
+      transition: String.make(),
+      testId: String.make(),
+      canvas: List<CanvasCommand>.make(),
+      surface: CanvasSurface.none(),
+    }
+  }
+}
+
+/// What only some nodes have, on the heap: a node gets one with the first of these it is given.
+pub struct NodeRare {
+  pub label: String,
+  pub hasValueRange: bool,
+  pub valueMin: f32,
+  pub valueMax: f32,
+  pub valueNow: f32,
+  /// The scroll offset of a scroll container, clamped to its range at the last frame.
+  pub scrollX: f32,
+  pub scrollY: f32,
+  /// The bounds the last `layout` event reported, once one was.
+  pub layoutReported: bool,
+  pub reportedBounds: Rect<f32>,
+  /// Where the node's `offset-path` puts it, from the last layout (see `offset_path.settle`).
+  pub offsetPlaced: Option<Placement>,
+}
+
+impl NodeRare {
+  pub fn make() -> NodeRare {
+    return NodeRare {
+      label: String.make(),
+      hasValueRange: false,
+      valueMin: 0.0,
+      valueMax: 0.0,
+      valueNow: 0.0,
+      scrollX: 0.0,
+      scrollY: 0.0,
+      layoutReported: false,
+      reportedBounds: Rect<f32>.new(0.0, 0.0, 0.0, 0.0),
+      offsetPlaced: Option<Placement>.None,
+    }
+  }
 }
 
 /// A node's rarer accessibility attributes, named and valued as their `Attribute`s.
@@ -268,6 +503,78 @@ impl Semantics {
 }
 
 impl Node {
+  /// The node's computed style.
+  @inlineAlways
+  pub fn computed(self: &Self) -> &Computed {
+    return match self.moving.get() {
+      Option<&Computed>.Some { value } => value
+      Option<&Computed>.None => self.styled.get()
+    }
+  }
+
+  /// The node's rarer parts, when it was given any (see `NodeExtras`).
+  pub fn extrasOf(self: &Self) -> Option<&NodeExtras> {
+    return self.extras.get()
+  }
+
+  /// The node's rarer parts to change, made on first use.
+  pub effect fn extrasMut(self: &mut Self) -> &mut NodeExtras ! OutOfMemoryError ? &mut Allocator {
+    return run self.extras.getOrMake(NodeExtras.make)
+  }
+
+  /// The node's rarer parts to change, when it has them.
+  pub fn extrasHeld(self: &mut Self) -> Option<&mut NodeExtras> {
+    return self.extras.getMut()
+  }
+
+  /// The `:hover` look.
+  pub fn hover(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.hover.asSlice() _ => &[] }
+  }
+
+  /// The `:active` look.
+  pub fn active(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.active.asSlice() _ => &[] }
+  }
+
+  /// The `:focus` look.
+  pub fn focus(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focus.asSlice() _ => &[] }
+  }
+
+  /// The `:focus-visible` look.
+  pub fn focusVisible(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.focusVisible.asSlice() _ => &[] }
+  }
+
+  /// The `@starting-style` look (see `StyleState.Starting`).
+  pub fn starting(self: &Self) -> &[Declaration] {
+    return match self.extrasOf() { Option.Some { value } => value.starting.asSlice() _ => &[] }
+  }
+
+  /// `Attribute.Transition`: CSS `transition` text applied under the base declarations.
+  pub fn transition(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.transition) _ => "" }
+  }
+
+  pub fn hasTransition(self: &Self) -> bool {
+    return match self.extrasOf() { Option.Some { value } => value.transition.ownedByteLength() != 0 _ => false }
+  }
+
+  pub fn testId(self: &Self) -> string {
+    return match self.extrasOf() { Option.Some { value } => String.view(&value.testId) _ => "" }
+  }
+
+  /// The drawing commands of a canvas node.
+  pub fn canvas(self: &Self) -> &[CanvasCommand] {
+    return match self.extrasOf() { Option.Some { value } => value.canvas.asSlice() _ => &[] }
+  }
+
+  /// The GPU surface of a canvas node, `CanvasSurface.none()` without one.
+  pub fn surface(self: &Self) -> CanvasSurface {
+    return match self.extrasOf() { Option.Some { value } => value.surface _ => CanvasSurface.none() }
+  }
+
   pub fn generatedOrigin(self: &Self) -> u32 {
     return match self.identity() { Option.Some { value } => value.generatedOrigin _ => NONE }
   }
@@ -292,98 +599,121 @@ impl Node {
     }
   }
 
-  pub fn identity(self: &Self) -> Option<&NodeIdentity> {
-    return match &self.selectorIdentity {
-      Option<Box<NodeIdentity>>.Some { value } => Option<&NodeIdentity>.some(&value.get()[0])
-      _ => Option<&NodeIdentity>.None
+  pub fn sheetScope(self: &Self) -> Option<ScopeId> {
+    return match &self.resolvedSheet {
+      Option<Frozen<Resolved>>.Some { value } => Option<ScopeId>.some(value.get().scope)
+      _ => Option<ScopeId>.None
     }
+  }
+
+  pub fn identity(self: &Self) -> Option<&NodeIdentity> {
+    return self.selectorIdentity.get()
   }
 
   pub effect fn identityMut(self: &mut Self) -> &mut NodeIdentity ! OutOfMemoryError ? &mut Allocator {
-    if self.selectorIdentity.isNone() {
-      self.selectorIdentity = Option<Box<NodeIdentity>>.some(run Box<NodeIdentity>.make(NodeIdentity.make()))
+    return run self.selectorIdentity.getOrMake(NodeIdentity.make)
+  }
+
+  /// The node's live svg, made empty on first use.
+  pub effect fn liveSvg(self: &mut Self) -> &mut LiveSvg ! OutOfMemoryError ? &mut Allocator {
+    if self.svg.isNone() {
+      self.svg.set(run Thin<LiveSvg>.make(run LiveSvg.make()))
     }
-    return match &mut self.selectorIdentity {
-      Option<Box<NodeIdentity>>.Some { value } => &mut value.getMut()[0]
-      _ => Intrinsic.trap("ui-tree: selector identity was just made")
-    }
+    return self.svg.expectMut()
+  }
+
+  /// Whether the node declares paint effects.
+  pub fn hasEffects(self: &Self) -> bool {
+    return self.effects.isSome()
   }
 
   /// The node's paint effects, when it declares any.
-  /// Whether the node declares paint effects.
-  pub fn hasEffects(self: &Self) -> bool {
-    return match &self.effects {
-      Option<Box<Effects>>.Some { .. } => true
-      Option<Box<Effects>>.None => false
-    }
-  }
-
   pub fn paintEffects(self: &Self) -> Option<&Effects> {
-    return match &self.effects {
-      Option<Box<Effects>>.Some { value } => Option<&Effects>.some(&value.get()[0])
-      Option<Box<Effects>>.None => Option<&Effects>.None
-    }
+    return self.effects.get()
   }
 
   /// Whether the node has editing state: every input does.
   pub fn hasEdit(self: &Self) -> bool {
-    return match &self.editing {
-      Option<Box<EditState>>.Some { .. } => true
-      Option<Box<EditState>>.None => false
-    }
+    return self.editing.isSome()
   }
 
   /// The editing state; the node must have one (`hasEdit`), as inputs do.
   pub fn edit(self: &Self) -> &EditState {
-    match &self.editing {
-      Option<Box<EditState>>.Some { value } => {
-        return &value.get()[0]
-      }
-      Option<Box<EditState>>.None => {
-        return Intrinsic.trap("ui-tree: the node has no editing state")
-      }
-    }
+    return self.editing.expect()
   }
 
   /// The editing state to change; the node must have one (`hasEdit`), as inputs do.
   pub fn editMut(self: &mut Self) -> &mut EditState {
-    match &mut self.editing {
-      Option<Box<EditState>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<EditState>>.None => {
-        return Intrinsic.trap("ui-tree: the node has no editing state")
-      }
-    }
+    return self.editing.expectMut()
   }
 
   /// The node's rarer accessibility attributes, when it was given any.
   pub fn semanticsOf(self: &Self) -> Option<&Semantics> {
-    return match &self.semantics {
-      Option<Box<Semantics>>.Some { value } => Option<&Semantics>.Some { value: &value.get()[0] }
-      Option<Box<Semantics>>.None => Option<&Semantics>.None
-    }
+    return self.semantics.get()
   }
 
   /// The node's rarer accessibility attributes to change, made on first use.
   pub effect fn semanticsMut(self: &mut Self) -> &mut Semantics ! OutOfMemoryError ? &mut Allocator {
-    if self.semantics.isNone() {
-      self.semantics = Option<Box<Semantics>>.Some { value: run Box<Semantics>.make(Semantics.make()) }
-    }
-    match &mut self.semantics {
-      Option<Box<Semantics>>.Some { value } => {
-        return &mut value.getMut()[0]
-      }
-      Option<Box<Semantics>>.None => {
-        return Intrinsic.trap("ui-tree: semantics were just made")
-      }
-    }
+    return run self.semantics.getOrMake(Semantics.make)
+  }
+
+  /// The label (`Attribute.Label`).
+  pub fn label(self: &Self) -> string {
+    return match self.rare.get() { Option.Some { value } => String.view(&value.label) _ => "" }
+  }
+
+  pub fn hasLabel(self: &Self) -> bool {
+    return match self.rare.get() { Option.Some { value } => value.label.ownedByteLength() != 0 _ => false }
+  }
+
+  /// Whether the node has a value range (`Attribute.ValueRange` or numeric ARIA).
+  pub fn hasValueRange(self: &Self) -> bool {
+    return match self.rare.get() { Option.Some { value } => value.hasValueRange _ => false }
+  }
+
+  pub fn valueMin(self: &Self) -> f32 {
+    return match self.rare.get() { Option.Some { value } => value.valueMin _ => 0.0 }
+  }
+
+  pub fn valueMax(self: &Self) -> f32 {
+    return match self.rare.get() { Option.Some { value } => value.valueMax _ => 0.0 }
+  }
+
+  pub fn valueNow(self: &Self) -> f32 {
+    return match self.rare.get() { Option.Some { value } => value.valueNow _ => 0.0 }
+  }
+
+  /// The scroll offset of a scroll container, clamped to its range at the last frame.
+  pub fn scrollX(self: &Self) -> f32 {
+    return match self.rare.get() { Option.Some { value } => value.scrollX _ => 0.0 }
+  }
+
+  pub fn scrollY(self: &Self) -> f32 {
+    return match self.rare.get() { Option.Some { value } => value.scrollY _ => 0.0 }
+  }
+
+  /// Where the node's `offset-path` puts it, from the last layout.
+  pub fn offsetPlaced(self: &Self) -> Option<Placement> {
+    return match self.rare.get() { Option.Some { value } => value.offsetPlaced _ => Option<Placement>.None }
+  }
+
+  /// The rarer state to change, made on first use.
+  pub effect fn rareMut(self: &mut Self) -> &mut NodeRare ! OutOfMemoryError ? &mut Allocator {
+    return run self.rare.getOrMake(NodeRare.make)
+  }
+
+  /// Sets the scroll offset; a node that never scrolled gets no record for a zero offset.
+  pub effect fn setScroll(self: &mut Self, x: f32, y: f32) -> () ! OutOfMemoryError ? &mut Allocator {
+    if x == 0.0 && y == 0.0 && self.rare.isNone() { return () }
+    let rare = run self.rareMut()
+    rare.scrollX = x
+    rare.scrollY = y
   }
 
   /// Gives the node editing state when it has none.
   pub effect fn ensureEdit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     if !self.hasEdit() {
-      self.editing = Option<Box<EditState>>.Some { value: run Box<EditState>.make(EditState.make()) }
+      self.editing.set(run Thin<EditState>.make(EditState.make()))
     }
   }
 }
@@ -461,5 +791,62 @@ impl Pending {
   pub fn clear(self: &mut Self) -> () {
     self.list.clear()
     self.data.clear()
+  }
+}
+
+/// The bit that marks the scroll link of a [`Move`]: the node's id with it set, so it never
+/// meets the id of a scroll container.
+pub const MOVE_LINK: u32 = 2147483648
+
+/// How many points of a [`Move`]'s easing are kept.
+pub const MOVE_CURVE: usize = 17
+
+/// A `translate` transition a renderer can run by itself: the node paints as a scroll group
+/// that follows link `node`, whose position is the node's translation, and the renderer puts
+/// it where the transition is at each frame it draws, new frame from the tree or not. So a
+/// screen keeps sliding while the thread that owns the tree is busy.
+pub struct Move {
+  /// The scroll link and position this move drives: [`MOVE_LINK`] with the node's id.
+  pub node: u32,
+  pub slot: u32,
+  /// The translation the transition starts at and ends at, in CSS pixels.
+  pub fromX: f32,
+  pub fromY: f32,
+  pub toX: f32,
+  pub toY: f32,
+  /// When the active phase starts, on the tree's frame clock: it names the transition, the
+  /// same from frame to frame.
+  pub began: f64,
+  /// Seconds of the active phase run when the frame was painted: negative during the delay.
+  pub elapsed: f64,
+  pub duration: f64,
+  /// The easing's output at [`MOVE_CURVE`] evenly spaced inputs from 0 to 1.
+  pub curve: [f32; 17],
+}
+
+impl Copy for Move {}
+
+impl Move {
+  /// The eased progress after `seconds` of the active phase.
+  pub fn eased(self: &Self, seconds: f64) -> f32 {
+    if seconds <= 0.0 {
+      return self.curve[0]
+    }
+    if self.duration <= 0.0 || seconds >= self.duration {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let at = f64.toF32(seconds / self.duration) * 16.0
+    let low = f32.floor(at)
+    let index = f32.toUsize(low)
+    if index + 1 >= MOVE_CURVE {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let part = at - low
+    return self.curve[index] + (self.curve[index + 1] - self.curve[index]) * part
+  }
+
+  /// Whether the transition is over after `seconds` of the active phase.
+  pub fn over(self: &Self, seconds: f64) -> bool {
+    return seconds >= self.duration
   }
 }

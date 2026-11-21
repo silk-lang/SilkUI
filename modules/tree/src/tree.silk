@@ -46,6 +46,8 @@ import event {
 }
 import input { Input as RawInput }
 import interact
+import text_selection
+import text_selection { SelectionOrder }
 import ui_protocol.options { RootOptions }
 import mutation {
   Mutation,
@@ -216,11 +218,11 @@ impl<'t, 'a> NodeView<'t, 'a> {
 
   /// The accessible name set with `Attribute.Label`.
   pub fn label(self: &Self) -> string<'t> {
-    return String.view(&self.node().label)
+    return self.node().label()
   }
 
   pub fn testId(self: &Self) -> string<'t> {
-    return String.view(&self.node().testId)
+    return self.node().testId()
   }
 
   /// The value of a text or input node.
@@ -421,11 +423,11 @@ impl<'t, 'a> NodeView<'t, 'a> {
   /// The numeric range set with `Attribute.ValueRange`.
   pub fn valueRange(self: &Self) -> Option<ValueRange> {
     let n = self.node()
-    if !n.hasValueRange {
+    if !n.hasValueRange() {
       return Option<ValueRange>.None
     }
     return Option<ValueRange>.Some {
-      value: ValueRange { min: n.valueMin, max: n.valueMax, value: n.valueNow },
+      value: ValueRange { min: n.valueMin(), max: n.valueMax(), value: n.valueNow() },
     }
   }
 
@@ -437,8 +439,8 @@ impl<'t, 'a> NodeView<'t, 'a> {
       pressed: n.pressed,
       focused: focused,
       focusVisible: focused && self.core.focusVisible,
-      scrollX: n.scrollX,
-      scrollY: n.scrollY,
+      scrollX: n.scrollX(),
+      scrollY: n.scrollY(),
     }
   }
 
@@ -452,17 +454,17 @@ impl<'t, 'a> NodeView<'t, 'a> {
     let n = self.node()
     return match state {
       StyleState.Base => n.base.asSlice()
-      StyleState.Hover => n.hover.asSlice()
-      StyleState.Active => n.active.asSlice()
-      StyleState.Focus => n.focus.asSlice()
-      StyleState.FocusVisible => n.focusVisible.asSlice()
-      StyleState.Starting => n.starting.asSlice()
+      StyleState.Hover => n.hover()
+      StyleState.Active => n.active()
+      StyleState.Focus => n.focus()
+      StyleState.FocusVisible => n.focusVisible()
+      StyleState.Starting => n.starting()
     }
   }
 
   /// The resolved style.
   pub fn computed(self: &Self) -> &'t Computed {
-    return &self.node().computed
+    return self.node().computed()
   }
 
   /// The union of the border boxes of the node's fragments in CSS pixels of the viewport,
@@ -491,6 +493,16 @@ impl<'t, 'a> NodeView<'t, 'a> {
 }
 
 /// The retained UI tree.
+/// A document text selection, by node id: see [`Tree.textSelection`].
+pub struct TextRange {
+  pub anchor: NodeId,
+  pub anchorOffset: usize,
+  pub focus: NodeId,
+  pub focusOffset: usize,
+}
+
+impl Copy for TextRange {}
+
 pub struct Tree<'a> {
   core: UiTree<'a>,
   nextId: u32,
@@ -781,6 +793,29 @@ impl<'a> Tree<'a> {
     run self.one(Mutation.SetCanvas { id: canvas.id().raw(), commands: move list })
   }
 
+  /// Makes `canvas` show GPU surface `surface`, `width` by `height` CSS pixels by nature (see
+  /// `Mutation.SetCanvasSurface`). `NO_SURFACE` gives the canvas back to its commands.
+  pub effect fn setCanvasSurface(
+    self: &mut Self,
+    canvas: CanvasNode,
+    surface: u32,
+    width: u32,
+    height: u32,
+    opaque: bool,
+  ) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.one(
+      Mutation.SetCanvasSurface {
+        id: canvas.id().raw(),
+        surface: surface,
+        width: width,
+        height: height,
+        opaque: opaque,
+      },
+    )
+  }
+
   // Attributes and listeners.
 
   pub effect fn setAttribute<N: Node>(self: &mut Self, node: N, attribute: Attribute) -> ()
@@ -878,6 +913,57 @@ impl<'a> Tree<'a> {
       return Option<NodeId>.None
     }
     return Option<NodeId>.Some { value: NodeId.of(self.core.node(self.core.focused).id) }
+  }
+
+  /// The document's text selection: where it was started (the anchor) and where it ends
+  /// now (the focus), as nodes with offsets (UTF-8 bytes in a text node, child indices in
+  /// an element). None when nothing is selected.
+  pub effect fn textSelection(self: &mut Self) -> Option<TextRange>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.refresh(&mut self.core)
+    let s = &self.core.textSelection
+    if !s.anchor.exists() {
+      return Option<TextRange>.None
+    }
+    return Option<TextRange>.Some {
+      value: TextRange {
+        anchor: NodeId.of(s.anchor.id),
+        anchorOffset: s.anchor.offset,
+        focus: NodeId.of(s.focus.id),
+        focusOffset: s.focus.offset,
+      }
+    }
+  }
+
+  /// Selects document text from `anchor` to `focus`. Offsets are clamped to the nodes.
+  pub effect fn selectText(self: &mut Self, range: TextRange) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    let a = self.core.slotOf(range.anchor.raw())
+    let f = self.core.slotOf(range.focus.raw())
+    if a == NONE || f == NONE {
+      fail TreeError.StaleNode { node: if a == NONE { range.anchor } else { range.focus } }
+    }
+    let anchor = text_selection.Point { slot: a, id: range.anchor.raw(), offset: range.anchorOffset }
+    let focus = text_selection.Point { slot: f, id: range.focus.raw(), offset: range.focusOffset }
+    run text_selection.select(&mut self.core, anchor, focus)
+  }
+
+  /// Clears the document's text selection.
+  pub effect fn clearTextSelection(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.clear(&mut self.core)
+  }
+
+  /// The selected document text as copying gives it: rendered white space, line breaks
+  /// between blocks, tabs between table cells, nothing from `user-select: none` text.
+  pub effect fn selectedText(self: &mut Self) -> String
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run text_selection.refresh(&mut self.core)
+    return run text_selection.text(&self.core)
   }
 
   /// Selects `selection` in the value of `input`. Offsets are clamped to the value and moved
@@ -1010,8 +1096,10 @@ impl<'a> Tree<'a> {
     }
   }
 
-  /// Places `popup` relative to `target` after each layout, flipping and shifting to stay in
-  /// the viewport.
+  /// Places `popup` relative to `target` with CSS anchor positioning: `position: fixed`,
+  /// `target` as its implicit anchor, `position-area: bottom span-right` (`span-left` with
+  /// `alignEnd`) and `position-try-fallbacks: flip-block`, staying 4px inside the viewport.
+  /// It follows scrolling and layout, and hides while `target` is not laid out.
   pub effect fn anchor<N: Node>(
     self: &mut Self,
     popup: BoxNode,
@@ -1205,6 +1293,22 @@ impl<'a> Tree<'a> {
     run self.core.finish(move pending.input, prevented)
   }
 
+  /// Begins the next input the tree queued for itself, and returns it for `finish`: the copy
+  /// or cut of a shortcut, the edit of a cut or paste, the paste a host's clipboard answer
+  /// queued. A client that decides per event runs these after each `finish` until none is
+  /// left, so a handler can prevent each one (`dispatch` runs them itself).
+  pub effect fn beginFollowUp(self: &mut Self) -> Option<PendingInput>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return match self.core.takeFollowUp() {
+      Option<RawInput>.Some { value } => {
+        run self.core.begin(&value)
+        Option<PendingInput>.some(PendingInput { input: move value })
+      }
+      Option<RawInput>.None => Option<PendingInput>.None
+    }
+  }
+
   /// Takes the queued event records, oldest first.
   pub effect fn events(self: &mut Self) -> List<EventRecord>
     ! OutOfMemoryError
@@ -1256,6 +1360,30 @@ impl<'a> Tree<'a> {
   /// Which modifier keys editing shortcuts use. The default is the platform's.
   pub fn setKeymap(self: &mut Self, keymap: Keymap) -> () {
     self.core.keymap = keymap
+  }
+
+  /// Whether text selections follow what is seen (the default) or tree order, as browsers do,
+  /// where flex, grid or positioning shows children out of tree order.
+  pub fn setSelectionOrder(self: &mut Self, order: SelectionOrder) -> () {
+    self.core.selectionOrder = order
+  }
+
+  /// Zooms the whole page, as a browser's page zoom does: lengths multiply by `zoom` (0.25 to
+  /// 5), text is laid out at the new size and the page reflows, with media queries and viewport
+  /// units reading a viewport `zoom` times smaller. Returns whether the zoom changed.
+  pub fn setPageZoom(self: &mut Self, zoom: f32) -> bool {
+    return self.core.setPageZoom(zoom)
+  }
+
+  /// The page zoom, 1 unless `setPageZoom` or a zoom key changed it.
+  pub fn pageZoom(self: &Self) -> f32 {
+    return self.core.pageZoom()
+  }
+
+  /// Whether Ctrl (Cmd on macOS) with `=`, `-` and `0` zooms the page when no handler prevents
+  /// the key. Off by default; native window hosts turn it on, browsers zoom on their own.
+  pub fn setZoomKeys(self: &mut Self, on: bool) -> () {
+    self.core.zoomKeys = on
   }
 
   // Frames.
@@ -1315,7 +1443,7 @@ impl<'a> Tree<'a> {
   pub effect fn lastFrame<'t>(self: &'t Self) -> Frame<'t>
     ! OutOfMemoryError
     ? &mut Allocator {
-    let blink = self.core.nextBlink()
+    let blink = self.core.nextWake()
     return Frame {
       scene: self.core.scene(),
       uploads: self.core.pendingUploads(),

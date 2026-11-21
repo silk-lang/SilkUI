@@ -16,6 +16,7 @@
 // window for a frame. Timers, animation frames, fetch, console and the clipboard are the
 // browser's own, so what an animation frame callback changes is painted in the next frame.
 import { runApp, unsupported } from '/ui/tree/window/browser/app-host.js';
+import { CANVAS_USAGE } from '/ui/tree/window/browser/page-canvases.mjs';
 
 export { unsupported };
 
@@ -25,7 +26,8 @@ const OP = {
   attribute: 9, valueRange: 10, focus: 11, remove: 12, destroy: 13, scrollTo: 14, select: 15,
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
-  virtualList: 29, virtualItems: 30, clearVirtualList: 31,
+  capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32, surface: 33, canvasFrame: 34,
+  virtualList: 35, virtualItems: 36, clearVirtualList: 37,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -34,6 +36,21 @@ const ATTRIBUTES = new Set([
   'element', 'tabIndex', 'disabled', 'focusTrap', 'multiline', 'readOnly', 'checked', 'selected', 'expanded',
   'indeterminate', 'label', 'testId', 'inert', 'id', 'class', 'className', 'lang', 'dir', 'placeholder', 'href', 'transition', 'cursor',
 ]);
+// HTML attributes the tree keeps as text for selectors (ui-protocol's `isHtmlAttribute`).
+for (const name of [
+  'abbr', 'accept', 'accept-charset', 'accesskey', 'action', 'align', 'allow', 'allowfullscreen', 'async',
+  'autocapitalize', 'autocomplete', 'autocorrect', 'autofocus', 'autoplay', 'bgcolor', 'border', 'charset',
+  'cite', 'color', 'cols', 'content', 'contenteditable', 'controls', 'coords', 'crossorigin', 'datetime',
+  'decoding', 'default', 'defer', 'dirname', 'download', 'draggable', 'enctype', 'enterkeyhint', 'face',
+  'for', 'form', 'formaction', 'formmethod', 'formnovalidate', 'formtarget', 'frameborder', 'headers',
+  'height', 'hidden', 'high', 'hreflang', 'http-equiv', 'inputmode', 'integrity', 'is', 'itemprop',
+  'itemscope', 'itemtype', 'kind', 'list', 'loading', 'loop', 'low', 'max', 'maxlength', 'media', 'method',
+  'min', 'minlength', 'multiple', 'muted', 'name', 'nomodule', 'novalidate', 'open', 'optimum', 'pattern',
+  'ping', 'playsinline', 'popover', 'popovertarget', 'poster', 'preload', 'referrerpolicy', 'rel',
+  'required', 'reversed', 'rows', 'sandbox', 'scope', 'scrolling', 'shape', 'size', 'sizes', 'slot',
+  'spellcheck', 'srcdoc', 'srclang', 'srcset', 'step', 'summary', 'target', 'title', 'translate', 'type',
+  'usemap', 'valign', 'width', 'wrap', 'xmlns', 'part', 'nowrap',
+]) ATTRIBUTES.add(name);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -97,6 +114,64 @@ class Calls {
   }
 }
 
+const NO_SURFACE = 0xffffffff;
+
+/**
+ * What `getContext("webgpu")` of a canvas node gives in the page: the browser's own context
+ * of a canvas that is not in the document. The application draws it with the browser's
+ * WebGPU on a device of its own, and the window's renderer shows the picture in the node
+ * (`PageCanvases` in app-host.js copies it across at the next frame).
+ */
+function canvasContext(host, node) {
+  const page = new OffscreenCanvas(Math.max(1, node.width | 0), Math.max(1, node.height | 0));
+  const context = page.getContext('webgpu');
+  if (!context) return null;
+  const surface = host.canvases.open(page);
+  let opaque = true;
+  let configured = false;
+  let announced = false;
+  const show = () => {
+    host.write(OP.surface, node.nodeId);
+    const calls = host.calls;
+    calls.u32(configured ? surface : NO_SURFACE); calls.u32(page.width); calls.u32(page.height); calls.byte(opaque ? 1 : 0);
+    announced = false;
+  };
+  const { configure, unconfigure, getCurrentTexture } = context;
+  // The node the context draws for, as `context.canvas` of a canvas element.
+  Object.defineProperty(context, 'canvas', { value: node, configurable: true });
+  context.configure = configuration => {
+    // The window's renderer may have to read the picture back (page-canvases.mjs).
+    configure.call(context, { ...configuration, usage: (configuration.usage ?? 0x10) | CANVAS_USAGE });
+    opaque = (configuration.alphaMode ?? 'opaque') === 'opaque';
+    configured = true;
+    host.canvases.configured(surface, configuration.device, configuration.format, opaque);
+    show();
+  };
+  context.unconfigure = () => {
+    unconfigure.call(context);
+    configured = false;
+    show();
+  };
+  context.getCurrentTexture = () => {
+    const texture = getCurrentTexture.call(context);
+    host.canvases.drawn(surface, texture);
+    // One call per turn has the window draw a frame with the new picture.
+    if (!announced) {
+      announced = true;
+      host.write(OP.canvasFrame, node.nodeId);
+      queueMicrotask(() => { announced = false; });
+    }
+    return texture;
+  };
+  // The node's `width` or `height` changed: the canvas takes the new size, which clears it.
+  context._resized = () => {
+    page.width = Math.max(1, node.width | 0);
+    page.height = Math.max(1, node.height | 0);
+    if (configured) show();
+  };
+  return context;
+}
+
 /**
  * The page's side of one application: the `__ui` functions and the `silkui` imports of the
  * wasm. Making one installs `globalThis.__ui`, so make it before the application's bundle runs.
@@ -108,11 +183,14 @@ export class JsHost {
   ran = null;
   wakeQueued = false;
   dispatched = false;
+  /** The page's GPU canvases (`PageCanvases` of app-host.js), once the app has started. */
+  canvases = null;
+  contexts = new WeakMap();
 
   constructor() {
     const calls = this.calls;
     const host = this;
-    const write = (code, id) => {
+    const write = this.write = (code, id) => {
       calls.op(code, id);
       host.queueWake();
     };
@@ -149,6 +227,7 @@ export class JsHost {
         return known ? true : undefined;
       },
       focus(id) { write(OP.focus, id); },
+      capture(id) { write(OP.capture, id); },
       remove(id) { write(OP.remove, id); },
       destroy(id) { write(OP.destroy, id); },
       scrollTo(id, x, y) { write(OP.scrollTo, id); calls.f64(x); calls.f64(y); },
@@ -164,6 +243,9 @@ export class JsHost {
       fontFamily(id, names) { write(OP.fontFamily, id); calls.text(names); },
       defineIcon(resource, markup) { write(OP.defineIcon, resource); calls.text(markup); },
       source(id, resource) { write(OP.source, id); calls.u32(resource); },
+      svgInsert(id, element, tag, parent, before) { write(OP.svgInsert, id); calls.u32(element); calls.text(tag); calls.u32(parent); calls.u32(before < 0 ? 0xffffffff : before); },
+      svgRemove(id, element) { write(OP.svgRemove, id); calls.u32(element); },
+      svgAttribute(id, element, name, value) { write(OP.svgAttribute, id); calls.u32(element); calls.text(name); calls.byte(typeof value === 'string' ? 1 : 0); calls.text(typeof value === 'string' ? value : ''); },
       load(resource, url, icon) { write(OP.load, resource); calls.text(url); calls.byte(icon ? 1 : 0); },
       release(resource) { write(OP.release, resource); },
       keyframe(offset, css) { calls.byte(OP.keyframe); calls.f64(offset); calls.text(css); host.queueWake(); },
@@ -174,10 +256,20 @@ export class JsHost {
       format(id, mark, on) { write(OP.format, id); calls.u32(mark); calls.byte(on ? 1 : 0); },
       insertAtom(id, start, end, atom) { write(OP.insertAtom, id); calls.u32(start); calls.u32(end); calls.text(atom); },
       markdown: (text, flags) => this.markdown(text, flags),
+      svgMeasure: (op, packed, distance) => this.svgMeasure(op, packed, distance),
+      // WebGPU is the browser's own (`navigator.gpu`); a canvas node asks here for its context.
+      gpuLoad: () => (this.canvases && navigator.gpu && typeof OffscreenCanvas === 'function' ? this.gpu : null),
       log(level, text) { (level >= 3 ? console.error : level === 2 ? console.warn : console.log)(text); },
       now: () => performance.now(),
       // The page's JavaScript heap has no standard measure: only the wasm tree's memory counts.
       memoryUsage: () => this.instance?.exports.memory.buffer.byteLength ?? 0,
+    };
+    this.gpu = {
+      context: node => {
+        let context = this.contexts.get(node);
+        if (context === undefined) this.contexts.set(node, (context = canvasContext(this, node)));
+        return context;
+      },
     };
     globalThis.__ui = this.ui;
     this.imports = {
@@ -258,6 +350,21 @@ export class JsHost {
     } finally { exports.webgpu_free(pointer, source.length); }
   }
 
+  svgMeasure(op, packed, distance) {
+    const exports = this.instance?.exports;
+    if (!exports?.silkui_svg_measure) return op === 1 ? '0' : op === 2 ? '0 0' : '0 0 0 0';
+    const source = encoder.encode(String(packed));
+    const pointer = exports.webgpu_alloc(source.length);
+    new Uint8Array(exports.memory.buffer, pointer, source.length).set(source);
+    const result = exports.silkui_svg_measure(pointer, source.length, op, Number(distance) || 0);
+    exports.webgpu_free(pointer, source.length);
+    if (!result) throw new Error('svg measuring ran out of memory');
+    const length = new DataView(exports.memory.buffer).getUint32(result, true);
+    const answer = decoder.decode(new Uint8Array(exports.memory.buffer, result + 4, length));
+    exports.webgpu_free(result, length + 4);
+    return answer;
+  }
+
   markdown(text, flags) {
     const exports = this.instance?.exports;
     if (!exports) throw new Error('parseMarkdown runs once the page has started the app');
@@ -285,9 +392,11 @@ export function runJsApp({ app, ...options }) {
   return runApp({
     ...options,
     imports: { ...options.imports, silkui: host.imports },
-    started: ({ instance, windowHost }) => {
+    started: ({ instance, windowHost, canvases }) => {
       host.instance = instance;
       host.windowHost = windowHost;
+      host.canvases = canvases;
+      canvases.wake = () => host.wake();
       // After `main` first suspends: `ready` waits for it.
       host.ran = Promise.resolve()
         .then(() => (typeof app === 'function' ? app() : import(new URL(app, location.href).href)))

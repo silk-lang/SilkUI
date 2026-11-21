@@ -61,6 +61,40 @@ It compiles JSX with this package's runtime, fixes a quadratic sibling walk in
 `react-reconciler` for long lists, and adds React Fast Refresh under the dev server.
 `react({ refresh: false })` turns Fast Refresh off.
 
+### Try local renderer sources
+
+To try an unpublished renderer in an app that already has its dependencies installed,
+add this `vite.local.config.mjs` beside the app's `vite.config.js`. Point `SILK_PACKAGES`
+at the checkout's `modules/js/packages` directory. Alias both packages, including the
+JSX runtime, so the app and renderer use the same core node registry. The app keeps its
+installed build plugins, React and reconciler; use versions compatible with the checkout.
+
+```js
+import { resolve } from "node:path";
+import { mergeConfig } from "vite";
+import app from "./vite.config.js";
+
+const source = (file) => resolve(process.env.SILK_PACKAGES, file);
+export default mergeConfig(app, {
+  resolve: {
+    alias: [
+      { find: /^@silkui\/core$/, replacement: source("core/src/index.js") },
+      { find: /^@silkui\/react$/, replacement: source("react/src/index.js") },
+      { find: /^@silkui\/react\/jsx-(?:dev-)?runtime$/, replacement: source("react/src/jsx-runtime.js") },
+    ],
+    dedupe: ["react", "react-reconciler", "scheduler"],
+  },
+});
+```
+
+From the app's web directory, build into a fresh directory. This builds the JS bundle
+and stylesheet only, without launching the app, installing packages or editing the lockfile.
+
+```sh
+SILK_PACKAGES=/absolute/path/to/SilkUI/modules/js/packages \
+  ./node_modules/.bin/vite build --configLoader runner --config vite.local.config.mjs --outDir "$(mktemp -d)"
+```
+
 ## API
 
 | Export | What it does |
@@ -69,6 +103,8 @@ It compiles JSX with this package's runtime, fixes a quadratic sibling walk in
 | `root.render(element)` | Renders and commits before it returns, so the window's first frame has the content |
 | `root.unmount()` | Unmounts what the root rendered |
 | `flushSync(callback)` | Runs `callback` and commits its updates before returning |
+| `createPortal(children, container)` | Renders `children` into another `@silkui/core` node |
+| `@silkui/react/dom` | `react-dom` and `react-dom/client` for code written for React DOM; the Vite plugin points both at it |
 | `@silkui/react/vite` | The Vite plugin above (`react(options?)`) |
 | `@silkui/react/jsx-runtime` | The JSX runtime, for `"jsxImportSource": "@silkui/react"` |
 
@@ -102,6 +138,19 @@ Host elements are the tree's node kinds, and strings in children become text nod
   To tint any other picture with the text color, use CSS `mask-image` over `background-color: currentColor`.
 - **Refs** are the `@silkui/core` nodes (`Node`, `Input`, `RichInput`, `Image`, `Svg`), for code that
   draws on the tree directly, such as animation on every frame.
+
+### HTML elements
+
+Apps and libraries written for React DOM render as they are: `<div>`, `<span>`, `<p>`,
+`<button>`, `<label>`, `<ul>`, `<table>` and every other HTML tag become tree nodes that know
+their tag, so type selectors, `:root`, implicit roles and the default stylesheet
+(`@silkui/react/html.css`, which the Vite plugin puts before the app's CSS) apply. Props are
+React DOM's: `className`, `style` with CSS custom properties, `onChange` on fields,
+`checked`, `htmlFor`, `hidden`, `autoFocus`, `dangerouslySetInnerHTML` and other attributes,
+which selectors see (`[type=checkbox]`, `details[open]`). `onFocus` and `onBlur` bubble as
+in React DOM. A click checks a checkbox or radio, passes from a label to its control, opens a
+`<details>` from its summary and submits a form from its button. `react({ html: false })`
+leaves out the stylesheet and the `react-dom` aliases.
 
 ### Timing
 

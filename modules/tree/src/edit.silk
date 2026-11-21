@@ -463,7 +463,7 @@ effect fn graphemesOf(text: string) -> List<usize>
 }
 
 /// The grapheme boundary before `at` (0 at the start).
-effect fn previousGrapheme(text: string, at: usize) -> usize
+pub effect fn previousGrapheme(text: string, at: usize) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let boundaries = run graphemesOf(text)
@@ -479,7 +479,7 @@ effect fn previousGrapheme(text: string, at: usize) -> usize
   return found
 }
 
-fn nextGrapheme(text: string, at: usize) -> usize {
+pub fn nextGrapheme(text: string, at: usize) -> usize {
   let length = String.byteLength(text)
   if at >= length {
     return length
@@ -509,7 +509,7 @@ effect fn wordsOf(text: string) -> List<usize>
 }
 
 /// The end of the word at or after `at` (the end of the text without one).
-effect fn nextWordEnd(text: string, at: usize) -> usize
+pub effect fn nextWordEnd(text: string, at: usize) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let boundaries = run wordsOf(text)
@@ -525,7 +525,7 @@ effect fn nextWordEnd(text: string, at: usize) -> usize
 }
 
 /// The start of the word before `at` (0 without one).
-effect fn previousWordStart(text: string, at: usize) -> usize
+pub effect fn previousWordStart(text: string, at: usize) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let boundaries = run wordsOf(text)
@@ -542,7 +542,7 @@ effect fn previousWordStart(text: string, at: usize) -> usize
 }
 
 /// The word segment holding `at` (the last one at the end), as a double click selects it.
-effect fn wordAt(text: string, at: usize) -> Span
+pub effect fn wordAt(text: string, at: usize) -> Span
   ! OutOfMemoryError
   ? &mut Allocator {
   let boundaries = run wordsOf(text)
@@ -612,7 +612,7 @@ pub effect fn collectOf(
   if node.edit().showsPlaceholder && placeholder.of(node).isSome() {
     // The empty value's caret and IME area keep the input font, even when the
     // placeholder uses a much larger face. Its ink is not editable text.
-    let input = node.computed.text
+    let input = node.computed().text
     let metrics = text.font(FontRequest { key: node.fontKey, writingMode: input.writingMode,
       textOrientation: input.textOrientation, direction: input.direction })
     let height = metrics.ascent + metrics.descent
@@ -645,7 +645,7 @@ pub effect fn piecesOf(tree: &UiTree<'_>, slot: u32) -> List<Piece>
   let list = pieces.asMutSlice()
   let mut i: usize = 0
   while i < list.length {
-    let shift = tree.shiftOf(list[i].line)
+    let shift = tree.shiftOf(list[i].fragment)
     list[i].x0 = list[i].x0 + shift.x
     list[i].x1 = list[i].x1 + shift.x
     list[i].top = list[i].top + shift.y
@@ -1022,7 +1022,8 @@ pub effect fn defineStyle(tree: &mut UiTree<'_>, slot: u32, atom: bool, key: u32
   } else {
     run rich.define(&mut e.markStyles, key, move declarations)
   }
-  tree.restyle(slot)
+  // Mark and atom styles dress the input's own runs.
+  tree.restyleLocal(slot)
 }
 
 /// The `Format` mutation: mark `mark` on or off over the selection, or for the text typed
@@ -1206,16 +1207,24 @@ pub effect fn textInput(tree: &mut UiTree<'_>, text: String) -> ()
   run insert(&mut tree, slot, String.view(&text), "insertText", GROUP_TYPING)
 }
 
-/// `Input.Paste`: the clipboard text a `ReadClipboard` request asked for.
-pub effect fn paste(tree: &mut UiTree<'_>, target: u32, text: String) -> ()
+/// `Input.Edit` that no `beforeinput` handler prevented: `text` replaces the selection of the
+/// focused input `slot`, as `inputType` (`insertFromPaste`, `deleteByCut`).
+pub effect fn applyEdit(tree: &mut UiTree<'_>, slot: u32, inputType: string, text: string) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let slot = focusedInput(&tree.*)
-  if !editable(&tree.*, slot) || tree.node(slot).id != target {
+  if !editable(&tree.*, slot) || slot != focusedInput(&tree.*) {
     return ()
   }
   run endComposition(&mut tree, slot)
-  run insert(&mut tree, slot, String.view(&text), "insertFromPaste", GROUP_NONE)
+  if String.byteLength(text) == 0 {
+    let lo = state(&tree.*, slot).low()
+    let hi = state(&tree.*, slot).high()
+    if lo != hi {
+      run replace(&mut tree, slot, lo, hi, "", inputType, GROUP_NONE)
+    }
+    return ()
+  }
+  run insert(&mut tree, slot, text, inputType, GROUP_NONE)
 }
 
 // Focus.
@@ -1249,12 +1258,13 @@ effect fn resetScroll(tree: &mut UiTree<'_>, slot: u32) -> ()
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
   let edited = node.editMut()
   edited.reveal = false
-  if node.scrollX == 0.0 && node.scrollY == 0.0 {
+  if node.scrollX() == 0.0 && node.scrollY() == 0.0 {
     return ()
   }
-  node.scrollX = 0.0
-  node.scrollY = 0.0
+  let travel = f32.abs(node.scrollX()) + f32.abs(node.scrollY())
+  run node.setScroll(0.0, 0.0)
   tree.scrolled = true
+  tree.skipTravel = tree.skipTravel + travel
 }
 
 // Pointer.
@@ -1583,7 +1593,9 @@ effect fn plainText(tree: &UiTree<'_>, slot: u32, lo: usize, hi: usize) -> Strin
   return move out
 }
 
-effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
+/// Copies the selection of input `slot` to the clipboard as plain text, as the default of a
+/// copy or cut does. Returns false when nothing is selected.
+pub effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let lo = state(&tree.*, slot).low()
@@ -1596,7 +1608,42 @@ effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   return true
 }
 
-fn letter(key: string, lower: string) -> bool {
+/// Whether input `slot` has a selection that is not a caret.
+pub fn hasSelection(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && state(tree, slot).low() != state(tree, slot).high()
+}
+
+/// The default of a cut in input `slot`: the selection goes to the clipboard. Returns whether
+/// it did, so the caller queues the `deleteByCut` edit.
+pub effect fn cutSelection(tree: &mut UiTree<'_>, slot: u32) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !editable(&tree.*, slot) {
+    return false
+  }
+  return run copySelection(&mut tree, slot)
+}
+
+/// Undo (`redo` false) or redo in input `slot`, from the Edit menu as from the shortcuts.
+pub effect fn undo(tree: &mut UiTree<'_>, slot: u32, redo: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !editable(&tree.*, slot) {
+    return ()
+  }
+  run endComposition(&mut tree, slot)
+  run history(&mut tree, slot, redo)
+}
+
+/// Selects all of input `slot`, from the Edit menu as from the shortcut.
+pub effect fn selectEverything(tree: &mut UiTree<'_>, slot: u32) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run endComposition(&mut tree, slot)
+  run selectAll(&mut tree, slot)
+}
+
+pub fn letter(key: string, lower: string) -> bool {
   if key == lower {
     return true
   }
@@ -1629,26 +1676,6 @@ pub effect fn keyDown(tree: &mut UiTree<'_>, slot: u32, key: &String, modifiers:
     if letter(k, "a") {
       run endComposition(&mut tree, slot)
       run selectAll(&mut tree, slot)
-      return true
-    }
-    if letter(k, "c") {
-      drop run copySelection(&mut tree, slot)
-      return true
-    }
-    if letter(k, "x") {
-      let copied = run copySelection(&mut tree, slot)
-      if copied && editableHere {
-        let lo = state(&tree.*, slot).low()
-        let hi = state(&tree.*, slot).high()
-        run replace(&mut tree, slot, lo, hi, "", "deleteByCut", GROUP_NONE)
-      }
-      return true
-    }
-    if letter(k, "v") {
-      if editableHere {
-        let id = tree.node(slot).id
-        run tree.requests.append(HostRequest.ReadClipboard { target: id })
-      }
       return true
     }
     if letter(k, "z") {
@@ -1840,9 +1867,9 @@ pub effect fn revealCaret(tree: &mut UiTree<'_>) -> bool
     return false
   }
   let port = contentBox(&f)
-  let range = rangeOf(&tree.node(slot).computed, &f)
-  let x = tree.node(slot).scrollX
-  let y = tree.node(slot).scrollY
+  let range = rangeOf(&tree.node(slot).computed().*, &f)
+  let x = tree.node(slot).scrollX()
+  let y = tree.node(slot).scrollY()
   let mut nx = x
   let mut ny = y
 
@@ -1864,10 +1891,11 @@ pub effect fn revealCaret(tree: &mut UiTree<'_>) -> bool
     return false
   }
   let node = &mut tree.nodes.asMutSlice()[u32.toUsize(slot)]
-  node.scrollX = nx
-  node.scrollY = ny
+  run node.setScroll(nx, ny)
   tree.scrolled = true
+  tree.skipTravel = tree.skipTravel + f32.abs(nx - x) + f32.abs(ny - y)
   tree.offsets = true
+  run tree.scrolledSlots.append(slot)
   return true
 }
 
@@ -1977,7 +2005,7 @@ pub effect fn paintCaret(p: &mut Painter<'_, '_>, slot: u32, index: usize, mask:
   let clauseEnd = start + e.preeditEnd
   let showCaret = e.caretOn && !e.readOnly && (e.anchor == e.focus || composing)
   let caretAt = e.caretDisplay()
-  let text = node.computed.text
+  let text = node.computed().text
   let s = p.scale
   let mut pieces = List<Piece>.make()
   run collectOf(p.output, p.text, index, node, &mut pieces)
