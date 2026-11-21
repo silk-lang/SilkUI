@@ -15,7 +15,8 @@
 import ui_js.lib { StylesheetCompiler, Natives, Bridge, Outcome, kindCode, numbersOf, firstString, secondString, thirdString, fourthString }
 import ui_js.bridge as bridge
 import ui_js_window.opener { Openers }
-import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS }
+import ui_js_window.lib { write, serveClipboard, ClipboardAnswer, CLIPBOARD_ROUNDS, presentCanvas2d }
+import ui_tree_window.canvas_frames { CanvasPresenter }
 import ui_js.lib { EncodedItem }
 import ui_js_window.shell { serveShell, shellEventOf, ShellAnswer, ShellEvent }
 import ui_js_window.natives { NativeJobs, Finished }
@@ -24,6 +25,7 @@ import ui_tree.lib { EventRecord }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.style_watch { SheetWatch }
 import ui_tree.legacy { FrameInput }
+import ui_tree.style_media { MediaState }
 import ui_tree.legacy { UiTree, TreeError, Mutation }
 import ui_tree.node { Event as RawEvent }
 import ui_tree_window.host { WindowClient, RunOptions, runWindow, environmentVariable }
@@ -142,13 +144,23 @@ pub struct NodeApp<'r, 'e, 'm, C> {
   status: i32,
   /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
   zoom: f32,
+  /// What 2D canvases show their bitmaps through, once the window gave it.
+  presenter: Option<CanvasPresenter>,
 }
 
 
 impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
+  /// Shows what 2D canvases drew since the last call. Says whether that changed the tree.
+  effect fn show2d(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    return match &self.presenter {
+      Option<CanvasPresenter>.Some { value } => run presentCanvas2d(&value, &mut tree)
+      Option<CanvasPresenter>.None => false
+    }
+  }
+
   /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
   pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0 }
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
@@ -460,6 +472,15 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     return prevented
   }
 
+  /// Takes the media of the frame about to be drawn, for `matchMedia`. When it differs,
+  /// `__ui.media()` runs, which sends the `change` events of the lists.
+  pub effect fn media(self: &mut Self, media: MediaState) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !self.bridge.media.differs(&media) { return }
+    self.bridge.media = media
+    let returned = run self.callReporting(b"media", &[])
+    self.release(move returned)
+  }
+
   /// Runs the animation frame callbacks when JavaScript asked for a frame.
   pub effect fn frame(self: &mut Self, seconds: f64) -> () ! OutOfMemoryError ? &mut Allocator {
     if !self.bridge.frame { return }
@@ -587,6 +608,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
   effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     state.bridge.attach(&mut tree)
+    run state.media(tree.mediaState(input))
     let root = tree.current
     drop run self.client.stylesheets.serve(&mut tree.*, root)
     run tree.frame(input)
@@ -601,6 +623,13 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     run tree.frameRoot(root, input)
     run state.observe(&mut tree)
     drop run self.client.load(&mut state, &mut tree)
+  }
+
+  effect fn canvases(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, presenter: CanvasPresenter) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    state.presenter = Option<CanvasPresenter>.some(move presenter)
+    state.bridge.canvas2dEnabled = true
   }
 
   fn configure(self: &Self, state: &NodeApp<'r, 'e, 'm, C>, options: &mut WindowOptions<'_>) -> () {
@@ -640,7 +669,8 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*, window)
     let natives = run state.natives(&mut self.client.jobs, &mut tree)
-    return clipboard || shell || natives
+    let drawn = run state.show2d(&mut tree)
+    return clipboard || shell || natives || drawn
   }
 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> ()
@@ -649,6 +679,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     state.bridge.attach(&mut tree)
     // The entry ran before the window opened; what it built is the first frame.
     drop run state.flush(&mut tree)
+    drop run state.show2d(&mut tree)
     drop run self.client.load(&mut state, &mut tree)
   }
 
@@ -692,12 +723,19 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     state.bridge.attach(&mut tree)
     run state.turn(seconds)
     let flushed = run state.flush(&mut tree)
+    let drawn = run state.show2d(&mut tree)
     let loaded = run self.client.load(&mut state, &mut tree)
-    return flushed || loaded
+    return flushed || drawn || loaded
   }
 
+  // A debug build serves it, so headless scripts run; a release build leaves it out. Asked
+  // here, not through `ui_inspect_server`, which a development host optimizes.
   fn servesInspector(self: &Self) -> bool {
-    return false
+    static if Intrinsic.profileText("optimization") == "none" {
+      return true
+    } else {
+      return false
+    }
   }
 
   effect fn pump(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> ()
@@ -724,6 +762,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     // Timers are the runtime's and run in `wait`; a frame runs the animation callbacks.
     if animation { run state.frame(time) }
     drop run state.flush(&mut tree)
+    drop run state.show2d(&mut tree)
     drop run self.client.load(&mut state, &mut tree)
   }
 

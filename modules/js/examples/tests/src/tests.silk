@@ -14,6 +14,9 @@ import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.testing.testing { Testing, AssertionError }
+import silk.io.writer_native { StderrWriter }
+import silk.io.writer { Writer }
+import silk.text.string { String }
 
 /// The size the demo host opens its window at: the counter is on screen without scrolling.
 fn viewport() -> Viewport {
@@ -119,7 +122,33 @@ effect fn foldkitCounter(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run Testing.expect(run shows(&tree.*, "CLICKED"), "and a click on it did not count")
 }
 
-effect fn withHost(foldkit: bool) -> ()
+/// React on `@silkui/core/globals`, written as for a page: it renders into `document.body`,
+/// a keydown that reaches the root goes on to a `document` listener, and the count goes to
+/// `localStorage`, the hash and the root's classes.
+effect fn browserGlobals(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let bundle = run platform.readFile(b"modules/js/examples/browser-globals/dist/app.js")
+  run host.module(bundle.asSlice(), b"app.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run Testing.expect(run shows(&tree.*, "keys 0"), "the first render is in the body")
+  run Testing.expect(run shows(&tree.*, "root even"), "the root has no class yet")
+  run Testing.expect(run shows(&tree.*, "body is an element"), "the body is an HTMLElement")
+
+  run host.input(&mut tree, run Input.key("a"))
+  // The key's render, then its effect's (the hash and the root's class) on React's scheduler.
+  run host.tick(0.1, true)
+  run host.tick(0.2, true)
+  run host.tick(0.3, true)
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.3)
+  run Testing.expect(run shows(&tree.*, "keys 1"), "a document keydown listener heard the key")
+  run Testing.expect(run shows(&tree.*, "hash #/keys/1"), "history.pushState moved the hash")
+  run Testing.expect(run shows(&tree.*, "root odd"), "documentElement.classList changed")
+}
+
+effect fn withHost(example: u32) -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static>
   ? &mut Allocator {
   let fonts = run fixtures.fonts()
@@ -128,26 +157,41 @@ effect fn withHost(foldkit: bool) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if foldkit {
+  let ran = if example == 1 {
     run Effect.result(foldkitCounter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if example == 2 {
+    run Effect.result(browserGlobals(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else {
     run Effect.result(reactCounter(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
   }
   run host.close() |> Effect.provideMut<Allocator>(&mut allocator)
   match move ran {
     Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Success { .. } => ()
-    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => { fail move error }
+    Result<(), TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>>.Failure { error } => {
+      // The example's exception, on stderr: the test runner shows only the error's kind.
+      match &error { JsError { message } => {
+        let mut writer = StderrWriter.make()
+        drop run Effect.result(Writer.writeString(String.view(&message))) |> Effect.provideMut<Writer>(&mut writer)
+      } _ => () }
+      fail move error
+    }
   }
 }
 
 test effect fn reactCounterRunsOnTheEmbeddedEngine() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  run withHost(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  run withHost(0) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn foldkitCounterRunsOnTheEmbeddedEngine() -> ()
   ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
-  run withHost(true) |> Effect.provideMut<Allocator>(&mut allocator)
+  run withHost(1) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn browserGlobalsRunOnTheEmbeddedEngine() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(2) |> Effect.provideMut<Allocator>(&mut allocator)
 }
