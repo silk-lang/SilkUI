@@ -60,6 +60,7 @@ import silk.io.writer { Writer }
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.text.string { String }
 import silk.num.f64
+import silk.num.f32
 
 /// A module given to [`JsApp.define`], kept to define it again after a reload.
 struct Defined {
@@ -90,6 +91,8 @@ pub struct JsApp<'m> {
   /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
   /// gave the handle canvases present through ([`JsApp.canvases`]).
   gpu: Option<GpuService>,
+  /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
+  zoom: f32,
   /// The web views JavaScript opened, each shown at its node.
   webViews: List<HostedView>,
   /// A layout moved a web view: the next turn places it.
@@ -111,11 +114,11 @@ struct HostedView {
   wanted: Placement,
 }
 
-/// `__ui.shell` op 14, show or hide a web view: view, 0 or 1. Served here, not by the views.
-const OP_SHOW: u32 = 14
+/// `__ui.shell` op 44, show or hide a web view: view, 0 or 1. Served here, not by the views.
+const OP_SHOW: u32 = 44
 
-/// `__ui.shell` op 15, quit: the exit code.
-const OP_QUIT: u32 = 15
+/// `__ui.shell` op 45, quit: the exit code.
+const OP_QUIT: u32 = 45
 
 /// `__ui.shellEvent` kind of a web view event: `a` the view, `x` its code, `text` its fields.
 const WEB_VIEW_EVENT: u32 = 20
@@ -269,6 +272,7 @@ impl<'m> JsApp<'m> {
       placesPending: false,
       nudge: Option<Nudge>.None,
       quitCode: Option<i32>.None,
+      zoom: 1.0,
     }
   }
 
@@ -698,11 +702,18 @@ impl<'m> JsApp<'m> {
     return true
   }
 
-  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
-  /// `platform`, and the calls their promise jobs made, then applies what it built. Says
-  /// whether there were calls.
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
+  /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
+  /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
+  /// there were calls.
   effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
+    let zoomed = tree.pageZoom() != self.zoom
+    if zoomed {
+      self.zoom = tree.pageZoom()
+      let told = run Effect.result(self.host.shellEvent(11, f32.toF64(self.zoom), 0.0, 0.0, "")) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
       let all = self.host.takeShell()
@@ -719,7 +730,7 @@ impl<'m> JsApp<'m> {
           run requests.append(move request)
         }
       }
-      let mut answers = run serveShell(move requests, &mut platform)
+      let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
       while early.length() > 0 { run answers.append(early.remove(0)) }
       while answers.length() > 0 {
         let ShellAnswer { call, value } = answers.remove(0)
@@ -728,7 +739,7 @@ impl<'m> JsApp<'m> {
       }
       round = round + 1
     }
-    if round == 0 { return false }
+    if round == 0 && !zoomed { return false }
     run self.host.flushRaw(&mut tree)
     return true
   }

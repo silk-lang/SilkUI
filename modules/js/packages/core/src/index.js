@@ -3980,7 +3980,11 @@ function dragTo(target, x, y) {
   if (target) dragEvent("dragover", target, x, y, []);
 }
 
-let trayMenu = new Map();
+// Menu item callbacks by action id. Each menu (the tray's, the app's, a context menu) owns
+// the ids it packed, and drops them when it is replaced or closes.
+const menuActions = new Map();
+const menuOwners = { tray: [], app: [], context: [] };
+let nextMenuAction = 0;
 let trayClick = null;
 const shortcuts = new Map();
 const shortcutIds = new Map();
@@ -4006,12 +4010,30 @@ native.shellEvent = function (kind, a, x, y, text) {
   } else if (kind === 5) {
     trayClick?.({ button: a });
   } else if (kind === 6) {
-    trayMenu.get(a)?.();
+    const run = menuActions.get(a);
+    if (menuOwners.context.includes(a)) closeContextMenu();
+    run?.();
   } else if (kind === 7) {
     const notification = notifications.get(a);
     if (!notification) return;
     notifications.delete(a);
     notification._fire("click");
+  } else if (kind === 8) {
+    const resolve = dialogs.get(a);
+    if (!resolve) return;
+    dialogs.delete(a);
+    resolve(text ? text.split("\n") : []);
+  } else if (kind === 9) {
+    closeContextMenu();
+  } else if (kind === 10) {
+    const fullScreen = a === 1;
+    if (fullScreen === appWindow.fullScreen) return;
+    appWindow.fullScreen = fullScreen;
+    appWindow._fire("fullscreenchange", { fullScreen });
+  } else if (kind === 11) {
+    if (a === appWindow.zoomFactor) return;
+    appWindow.zoomFactor = a;
+    appWindow._fire("zoomchange", { zoomFactor: a });
   } else if (kind === WEB_VIEW_EVENT) {
     webViewEvent(a, x, text);
   }
@@ -4087,20 +4109,86 @@ function hex(bytes) {
   return text;
 }
 
-function packMenu(items, lines) {
+// The roles the system implements, by `SystemItem` index; `about` and the others the
+// platform has no counterpart for are left out there.
+const SYSTEM_ROLES = {
+  about: 0, services: 1, hide: 2, hideothers: 3, unhide: 4, quit: 5, close: 6, minimize: 7, zoom: 8,
+  togglefullscreen: 9, front: 10, undo: 11, redo: 12, cut: 13, copy: 14, paste: 15, selectall: 16,
+};
+
+// Roles JavaScript does itself, with their usual labels and shortcuts.
+const SCRIPT_ROLES = {
+  resetzoom: { label: "Actual Size", accelerator: "Mod+0", click: () => appWindow.setZoomFactor(1) },
+  zoomin: { label: "Zoom In", accelerator: "Mod+Plus", click: () => appWindow.setZoomFactor(zoomStep(1)) },
+  zoomout: { label: "Zoom Out", accelerator: "Mod+-", click: () => appWindow.setZoomFactor(zoomStep(-1)) },
+};
+
+// Roles that stand for a whole menu, as Electron's.
+const MENU_ROLES = {
+  appmenu: () => [{ role: "about" }, { type: "separator" }, { role: "services" }, { type: "separator" }, { role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { type: "separator" }, { role: "quit" }],
+  filemenu: () => [{ role: IS_MAC ? "close" : "quit" }],
+  editmenu: () => [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }],
+  viewmenu: () => [{ role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }],
+  windowmenu: () => [{ role: "minimize" }, { role: "zoom" }, ...(IS_MAC ? [{ type: "separator" }, { role: "front" }] : [{ role: "close" }])],
+};
+
+const IS_MAC = /mac/i.test(globalThis.navigator?.platform ?? "") || globalThis.process?.platform === "darwin";
+
+// A menu shortcut as the host reads it: "" for none, else the key (`c` and a character, `n`
+// and a key name) and the modifier bits.
+function packAccelerator(accelerator) {
+  if (!accelerator) return ",0";
+  const parts = String(accelerator).split("+").map((part) => part.trim());
+  // "Mod+Plus" and "Mod++" both name the plus key.
+  if (parts.at(-1) === "" && parts.at(-2) === "") parts.splice(-2, 2, "+");
+  let bits = 0;
+  let key = "";
+  for (const part of parts) {
+    const modifier = MODIFIERS[part.toLowerCase()];
+    if (modifier !== undefined) bits |= modifier;
+    else if (part) key = part;
+  }
+  const lower = key.toLowerCase();
+  const named = { up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", esc: "Escape", escape: "Escape", return: "Enter", enter: "Enter", tab: "Tab", backspace: "Backspace", delete: "Delete", home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown" }[lower];
+  if (named) return "n" + named + "," + bits;
+  if (/^f([1-9]|1[0-9]|2[0-4])$/.test(lower)) return "nF" + lower.slice(1) + "," + bits;
+  if (lower === "plus") return "c+," + bits;
+  if (lower === "space") return "c ," + bits;
+  if ([...key].length === 1) return "c" + lower + "," + bits;
+  return "," + bits;
+}
+
+// `items` as the host's menu lines, with their callbacks kept under `owner`.
+function packMenu(items, lines, owner) {
   for (const item of items) {
+    if (!item || item.visible === false) continue;
+    const role = String(item.role ?? "").toLowerCase();
     if (item.type === "separator") lines.push("S");
-    else if (item.submenu) {
-      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
-      packMenu(item.submenu, lines);
+    else if (MENU_ROLES[role] && !item.submenu) {
+      lines.push("B" + String(item.label ?? role.replace(/menu$/, "").replace(/^./, (c) => c.toUpperCase())).replace(/\n/g, " "));
+      packMenu(MENU_ROLES[role](), lines, owner);
       lines.push("E");
+    } else if (item.submenu) {
+      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
+      packMenu(item.submenu, lines, owner);
+      lines.push("E");
+    } else if (SYSTEM_ROLES[role] !== undefined && !item.click) {
+      lines.push("R" + SYSTEM_ROLES[role]);
     } else {
-      const action = trayMenu.size + 1;
-      trayMenu.set(action, typeof item.click === "function" ? item.click : () => {});
-      const label = String(item.label ?? "").replace(/\n/g, " ");
-      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + label);
+      const known = SCRIPT_ROLES[role] ?? {};
+      const action = ++nextMenuAction;
+      const click = item.click ?? known.click;
+      menuActions.set(action, typeof click === "function" ? () => click(item) : () => {});
+      menuOwners[owner].push(action);
+      const label = String(item.label ?? known.label ?? "").replace(/\n/g, " ");
+      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + packAccelerator(item.accelerator ?? known.accelerator) + "," + label);
     }
   }
+}
+
+function dropMenu(owner) {
+  for (const action of menuOwners[owner]) menuActions.delete(action);
+  menuOwners[owner] = [];
 }
 
 /**
@@ -4115,17 +4203,17 @@ export function setTray({ icon, tooltip = "", template = false, menu = [], onCli
   if (!icon || !(icon.width > 0) || !(icon.height > 0) || icon.data?.length !== icon.width * icon.height * 4) {
     throw new TypeError("setTray needs an icon of RGBA pixels: { width, height, data }");
   }
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = typeof onClick === "function" ? onClick : null;
   const lines = [];
-  packMenu(menu, lines);
+  packMenu(menu, lines, "tray");
   const fields = [String(tooltip), icon.width, icon.height, template ? 1 : 0, hex(icon.data), lines.join("\n")];
   return shellCall(1, fields).then((shown) => shown === 1);
 }
 
 /** Takes the tray icon away. */
 export function removeTray() {
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = null;
   shellCall(2, []);
 }
@@ -4264,7 +4352,7 @@ export class WebView {
     webViews.set(this.id, this);
     const flags = (options.inspectable === false ? 0 : 1) | (options.askBeforeNavigating ? 2 : 0) | (options.transparent ? 4 : 0);
     /** Resolves to whether the view opened: there are web views only in a desktop window. */
-    this.opened = shellCall(10, [this.id, node.nodeId, this.url, options.profile ?? "", flags]).then((value) => {
+    this.opened = shellCall(40, [this.id, node.nodeId, this.url, options.profile ?? "", flags]).then((value) => {
       if (value !== 1) webViews.delete(this.id);
       return value === 1;
     });
@@ -4289,7 +4377,7 @@ export class WebView {
 
   #command(name, ...fields) {
     if (this.#closed) return;
-    shellCall(12, [this.id, name, ...fields]);
+    shellCall(42, [this.id, name, ...fields]);
   }
 
   #ask(name, ...fields) {
@@ -4319,7 +4407,7 @@ export class WebView {
   /** The color scheme the page sees: `"system"`, `"light"` or `"dark"`. */
   setColorScheme(scheme) { this.#command("scheme", scheme === "light" || scheme === "dark" ? scheme : "system"); }
   /** Shows or hides the view; a hidden view keeps its page. */
-  setShown(shown) { if (!this.#closed) shellCall(14, [this.id, shown ? 1 : 0]); }
+  setShown(shown) { if (!this.#closed) shellCall(44, [this.id, shown ? 1 : 0]); }
 
   /** Runs `script` in the page; resolves to its value (a promise is awaited), JSON-cloned. */
   evaluate(script) {
@@ -4373,7 +4461,7 @@ export class WebView {
   close() {
     if (this.#closed) return;
     this.#closed = true;
-    shellCall(11, [this.id]);
+    shellCall(41, [this.id]);
   }
 }
 
@@ -4394,7 +4482,7 @@ export function clearWebViewData({ profile = "", cookies = true, cache = true } 
   return new Promise((resolve) => {
     const request = ++nextWebRequest;
     dataClears.set(request, resolve);
-    shellCall(13, [request, cookies ? 1 : 0, cache ? 1 : 0, profile]);
+    shellCall(43, [request, cookies ? 1 : 0, cache ? 1 : 0, profile]);
   });
 }
 
@@ -4481,7 +4569,7 @@ function webViewEvent(id, code, text) {
 /** Stops the shortcut of `accelerator`. */
 /** Ends the app with an exit code once the current turn finishes. */
 export function quit(code = 0) {
-  shellCall(15, [String(code)]);
+  shellCall(45, [String(code)]);
 }
 
 export function unregisterShortcut(accelerator) {
@@ -4492,6 +4580,226 @@ export function unregisterShortcut(accelerator) {
   shortcuts.delete(id);
   shellCall(4, [id]);
 }
+
+// File dialogs waiting for `DialogClosed`, by dialog id.
+const dialogs = new Map();
+
+function extensionsOf(filters) {
+  const all = [];
+  for (const filter of filters ?? []) {
+    for (const extension of filter.extensions ?? []) {
+      if (extension === "*") return "";
+      all.push(String(extension).replace(/^\./, ""));
+    }
+  }
+  return all.join(",");
+}
+
+function dialog(op, fields) {
+  return shellCall(op, fields).then((id) => (id ? new Promise((resolve) => dialogs.set(id, resolve)) : []));
+}
+
+/**
+ * Opens the system's file dialog, as Electron's `dialog.showOpenDialog`: `properties` takes
+ * `openFile`, `openDirectory` and `multiSelections`; `filters` are `{ name, extensions }`
+ * without dots (`"*"` for every file). It attaches to the window as a sheet on macOS and never
+ * blocks. Resolves to `{ canceled, filePaths }`.
+ */
+export function showOpenDialog(options = {}) {
+  const properties = options.properties ?? ["openFile"];
+  const directories = properties.includes("openDirectory");
+  const files = properties.includes("openFile") || !directories;
+  const flags = (files ? 1 : 0) | (directories ? 2 : 0) | (properties.includes("multiSelections") ? 4 : 0);
+  return dialog(5, [String(options.title ?? ""), String(options.defaultPath ?? ""), flags, extensionsOf(options.filters)]).then(
+    (filePaths) => ({ canceled: filePaths.length === 0, filePaths }),
+  );
+}
+
+/**
+ * Opens the system's save dialog, as Electron's `dialog.showSaveDialog`. `defaultPath` may
+ * name a folder, a file, or both. Resolves to `{ canceled, filePath }`.
+ */
+export function showSaveDialog(options = {}) {
+  const path = String(options.defaultPath ?? "");
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const looksLikeFolder = slash === path.length - 1 || !/\.[^./\\]+$/.test(path.slice(slash + 1));
+  const directory = looksLikeFolder ? path : path.slice(0, Math.max(slash, 0));
+  const name = looksLikeFolder ? "" : path.slice(slash + 1);
+  return dialog(6, [String(options.title ?? ""), directory, name, extensionsOf(options.filters)]).then((paths) => ({
+    canceled: paths.length === 0,
+    filePath: paths[0] ?? "",
+  }));
+}
+
+/**
+ * Replaces the app's menu bar, as Electron's `Menu.setApplicationMenu(Menu.buildFromTemplate(t))`.
+ * Items are `{ label, click, accelerator, enabled, checked, type, role, submenu, visible }`.
+ * `accelerator` is `"Mod+Shift+K"` (`Mod`, `CmdOrCtrl`: Command on macOS, Control elsewhere).
+ * The system roles (`about`, `quit`, `undo`, `copy`, `togglefullscreen`, `minimize`, `front`
+ * and so on) are the system's own items; `zoomIn`, `zoomOut` and `resetZoom` zoom the page;
+ * `appMenu`, `fileMenu`, `editMenu`, `viewMenu` and `windowMenu` are whole menus. On macOS
+ * the first menu is the app menu. Edit shortcuts reach the focused node as keys first.
+ */
+export function setApplicationMenu(template) {
+  dropMenu("app");
+  const lines = [];
+  packMenu(template ?? [], lines, "app");
+  return shellCall(7, [lines.join("\n")]).then(() => undefined);
+}
+
+let contextMenuClosed = null;
+
+function closeContextMenu() {
+  dropMenu("context");
+  const closed = contextMenuClosed;
+  contextMenuClosed = null;
+  closed?.();
+}
+
+/**
+ * Opens a native context menu at `x`, `y` (CSS pixels in the window, a `MouseEvent`'s
+ * `clientX`/`clientY`), as Electron's `menu.popup()`. Items are as `setApplicationMenu`'s.
+ * Resolves when the menu closes, with or without a choice, to `true`; or at once to `false`
+ * when the system draws no context menus (Linux, the browser) and the app should draw its own.
+ */
+export function showContextMenu(template, { x = 0, y = 0 } = {}) {
+  closeContextMenu();
+  const lines = [];
+  packMenu(template ?? [], lines, "context");
+  const zoom = appWindow.zoomFactor || 1;
+  return shellCall(8, [x * zoom, y * zoom, lines.join("\n")]).then((shown) => {
+    if (shown !== 1) {
+      dropMenu("context");
+      return false;
+    }
+    return new Promise((resolve) => (contextMenuClosed = () => resolve(true)));
+  });
+}
+
+/** Puts `text` on the app's dock or taskbar icon (an unread count); `""` takes it off. */
+export function setBadge(text) {
+  return shellCall(9, [String(text ?? "")]).then((shown) => shown === 1);
+}
+
+/** Shows progress from 0 to 1 on the app's dock or taskbar icon; a negative number takes it off. */
+export function setProgress(fraction) {
+  return shellCall(10, [Number(fraction)]).then((shown) => shown === 1);
+}
+
+/** Opens `url` with the system's handler: a web page in the default browser, `mailto:` in the mail app. */
+export function openExternal(url) {
+  return shellCall(11, [String(url)]).then((opened) => opened === 1);
+}
+
+/** Shows the file or folder at `path` selected in Finder, Explorer or the file manager. */
+export function showItemInFolder(path) {
+  return shellCall(12, [String(path)]).then((shown) => shown === 1);
+}
+
+/**
+ * Drags the files at `paths` out of the window, as Electron's `webContents.startDrag`, so
+ * Finder, a mail draft or a terminal can take them. Call it from a `pointerdown` or
+ * `pointermove` listener while the button is down. Resolves to whether the drag started
+ * (macOS and Windows drag files out; Linux and the browser do not).
+ */
+export function startFileDrag(paths) {
+  const list = (Array.isArray(paths) ? paths : [paths]).map(String).filter(Boolean);
+  return shellCall(13, [list.join("\n")]).then((started) => started === 1);
+}
+
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+
+function zoomStep(direction) {
+  const now = appWindow.zoomFactor;
+  if (direction > 0) return ZOOM_STEPS.find((step) => step > now + 0.001) ?? now;
+  return ZOOM_STEPS.findLast((step) => step < now - 0.001) ?? now;
+}
+
+/**
+ * The window the app runs in. `fullScreen` and `zoomFactor` (the page zoom, as Electron's
+ * `webFrame.getZoomFactor()`; Mod with `=`, `-` and `0` change it too) are current, and
+ * `fullscreenchange` and `zoomchange` say when they change. The title bar is the app's
+ * configuration: a transparent one, with the window controls placed in it, comes from
+ * `TitleBar.transparent` in its `tasks.silk`.
+ */
+class AppWindow {
+  fullScreen = false;
+  zoomFactor = 1;
+  #listeners = new Map();
+
+  setFullScreen(on) {
+    if (!!on !== this.fullScreen) shellCall(14, [0]);
+  }
+
+  toggleFullScreen() {
+    shellCall(14, [0]);
+  }
+
+  minimize() {
+    shellCall(14, [1]);
+  }
+
+  /** Shows the window and brings it to the front with keyboard focus. */
+  focus() {
+    shellCall(14, [2]);
+  }
+
+  show() {
+    shellCall(14, [2]);
+  }
+
+  hide() {
+    shellCall(14, [3]);
+  }
+
+  setTitle(title) {
+    shellCall(14, [4, String(title)]);
+  }
+
+  /** Zooms the page, from 0.25 to 5. Resolves to the zoom now. */
+  setZoomFactor(zoom) {
+    return shellCall(15, [Math.min(5, Math.max(0.25, Number(zoom) || 1))]).then((now) => {
+      if (now !== this.zoomFactor) {
+        this.zoomFactor = now;
+        this._fire("zoomchange", { zoomFactor: now });
+      }
+      return now;
+    });
+  }
+
+  getZoomFactor() {
+    return this.zoomFactor;
+  }
+
+  isFullScreen() {
+    return this.fullScreen;
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (!list.includes(listener)) list.push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(type);
+    const index = list ? list.indexOf(listener) : -1;
+    if (index >= 0) list.splice(index, 1);
+  }
+
+  _fire(type, detail) {
+    const event = { type, target: this, ...detail };
+    for (const listener of (this.#listeners.get(type) ?? []).slice()) {
+      try {
+        listener.call(this, event);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
+}
+
+export const appWindow = new AppWindow();
 
 /**
  * The app's memory in bytes, as the system shows it to users: `phys_footprint` on macOS
