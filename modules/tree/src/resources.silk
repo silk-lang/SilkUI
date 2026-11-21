@@ -320,6 +320,8 @@ effect fn badUrl(error: UrlError) -> never
   fail ResourceError {}
 }
 
+const EMPTY_ICON: &'static [u8] = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'/>"
+
 effect fn badSvg(error: RenderError) -> never
   ! ResourceError {
   drop error
@@ -584,8 +586,17 @@ impl Resources {
     ? &mut Allocator {
     let host = hostOf(&self.host, black())
     let white = hostOf(&self.host, CssColor.srgb(1.0, 1.0, 1.0, 1.0))
-    let icon = run Effect.catch<RenderError>(self.icons.register(data, &host), badSvg)
+    // An SVG that draws nothing, such as a zero-sized sprite of symbols, is an empty icon.
+    let registered = run Effect.result(self.icons.register(data, &host))
       |> Effect.provideMut<Resolver>(&mut self.resolver)
+    let icon = match move registered {
+      Result<IconId, RenderError | OutOfMemoryError>.Success { value } => value
+      Result<IconId, RenderError | OutOfMemoryError>.Failure { error } => match move error {
+        OutOfMemoryError failure => { fail move failure }
+        RenderError _ => run Effect.catch<RenderError>(self.icons.register(EMPTY_ICON, &host), badSvg)
+          |> Effect.provideMut<Resolver>(&mut self.resolver)
+      }
+    }
     drop run Effect.catch<RenderError>(
       self.icons.classify(icon, CLASSIFY_SIZE, &host, &white),
       unclassified,

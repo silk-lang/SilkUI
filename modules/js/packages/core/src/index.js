@@ -1745,6 +1745,43 @@ function svgStyle(value) {
   return css;
 }
 
+// Elements of any svg by id, for `<use href="#id">` in another svg: icon sprites define
+// symbols in one hidden svg and every icon uses them.
+const SVG_IDS = new Map();
+
+function nameSvgElement(element, old, id) {
+  if (old !== undefined && SVG_IDS.get(old)?.deref() === element) SVG_IDS.delete(old);
+  if (id !== undefined) SVG_IDS.set(id, new WeakRef(element));
+}
+
+const REFERENCE = /href="#([^"]+)"/g;
+
+// The tree draws each svg as a document of its own, so the elements its `href="#id"`s name
+// in other svgs go into its markup, in a `<defs>`.
+function withReferences(markup) {
+  if (!markup.includes('href="#')) return markup;
+  const own = new Set();
+  for (const found of markup.matchAll(/\sid="([^"]+)"/g)) own.add(found[1]);
+  let defs = "";
+  let pending = markup;
+  while (pending) {
+    let next = "";
+    for (const found of pending.matchAll(REFERENCE)) {
+      const id = found[1];
+      if (own.has(id)) continue;
+      own.add(id);
+      const element = SVG_IDS.get(id)?.deref();
+      if (!element || element.getAttribute("id") !== id) continue;
+      const added = element._markup();
+      defs += added;
+      next += added;
+    }
+    pending = next;
+  }
+  if (!defs) return markup;
+  return markup.slice(0, markup.lastIndexOf("</svg>")) + "<defs>" + defs + "</defs></svg>";
+}
+
 // The children of an element of an `<svg>`: the markup they write, and how they move.
 const svgChildren = {
   insertBefore(child, before = null) {
@@ -1976,12 +2013,14 @@ export class SvgElement {
     }
     const text = name === "style" ? svgStyle(value) : String(value);
     if (this.#attributes.get(name) === text) return;
+    if (name === "id") nameSvgElement(this, this.#attributes.get(name), text);
     this.#attributes.set(name, text);
     this._written(name, text);
   }
 
   removeAttribute(name) {
     name = svgName(name);
+    if (name === "id" && this.#attributes.has(name)) nameSvgElement(this, this.#attributes.get(name), undefined);
     if (this.#attributes.delete(name)) this._written(name, null);
   }
 
@@ -2269,7 +2308,7 @@ export class Svg extends Node {
       this._goLive();
       return;
     }
-    const markup = this.outerHTML;
+    const markup = withReferences(this.outerHTML);
     if (markup === this.#markup) return;
     if (this.#markup && this.childNodes.every((child) => liveable(child))) {
       this._goLive();

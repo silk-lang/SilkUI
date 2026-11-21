@@ -467,6 +467,20 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   assert.throws(() => createNode("icon"), /no node kind 'icon'/);
 });
 
+test("a use of a sprite's symbol draws it: the symbol goes into the markup", () => {
+  mock.take();
+  const sprite = createBox();
+  sprite.innerHTML = '<svg width="0" height="0"><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></svg>';
+  mount(sprite);
+  const icon = createNode("svg");
+  icon.innerHTML = '<use href="#sprite-check"/>';
+  flushSvg();
+  const defined = mock.take().filter((call) => call[0] === "defineIcon").map((call) => call[2]);
+  const used = defined.find((markup) => markup.includes("<use"));
+  assert.ok(used.includes('<defs><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></defs></svg>'), used);
+  assert.ok(!defined.find((markup) => markup.includes('width="0"')).includes("<defs>"), "the sprite names its own ids");
+});
+
 test("an image src loads its address once while some node shows it", () => {
   mock.take();
   const png = "data:image/png;base64,iVBORw0KGgo=";
