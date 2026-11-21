@@ -8,8 +8,11 @@ sheet.replaceSync(css);
 const root = createElement("div");
 root.style.set({ width: 400, fontSize: 16 });
 root.innerHTML = '<p id="p">One <span id="s">two</span> three</p><div id="after">x</div><div hidden id="h">gone</div>'
-  + '<input type="checkbox" id="c"><h1 id="h1">T</h1>';
-root.adoptedStyleSheets.push(sheet);
+  + '<input type="checkbox" id="c"><h1 id="h1">T</h1><h2 id="h2">T</h2>';
+// An app's layered reset, as Tailwind's preflight in @layer base, beats the default sheet.
+const app = new CSSStyleSheet();
+app.replaceSync("@layer base { h2 { font-size: 10px; margin: 0 } }");
+root.adoptedStyleSheets.push(sheet, app);
 mount(root);
 
 globalThis.htmlAfterFrame = () => {
@@ -29,5 +32,6 @@ globalThis.htmlAfterFrame = () => {
   if (!by("c").matches("[type=checkbox]")) fail("attribute selectors see HTML attributes");
   if (!by("h1").matches("h1")) fail("type selectors see the tag");
   if (by("h1").getBoundingClientRect().height < 30) fail("h1 is 2em");
+  if (by("h2").getBoundingClientRect().height > 20) fail("a layered app rule beats the default sheet");
   globalThis.htmlChecked = true;
 };
