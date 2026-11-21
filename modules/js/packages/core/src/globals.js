@@ -188,11 +188,13 @@ function relay(type, on) {
 const windowTarget = new OuterTarget();
 
 // `<html>` is the tree's root, the size of the window; `<body>` fills it, as a page's does
-// with `height: 100%`. `<head>` is outside the tree.
+// with `height: 100%`. `<head>` is in the document, not shown, so its style elements apply.
 const documentElement = createElement("html");
 documentElement.style.set({ position: "absolute", top: 0, left: 0, right: 0, bottom: 0 });
 const head = createElement("head");
+head.style.set({ display: "none" });
 const body = createElement("body");
+documentElement.appendChild(head);
 documentElement.appendChild(body);
 
 // Text a `<title>` would hold. The window's title is the host's.

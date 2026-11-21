@@ -174,6 +174,12 @@ export class Node {
   dispatchEvent(event: globalThis.Event): boolean;
 }
 
+/** `<style>` (from `createElement("style")`): its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  /** The element's stylesheet while it is in the document, else null. */
+  readonly sheet: CSSStyleSheet | null;
+}
+
 /** A text leaf. It takes its look from its parent. */
 export class Text extends Node {
   constructor(data?: string);
