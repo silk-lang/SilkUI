@@ -519,6 +519,7 @@ export function flushSync(callback) {
   return reconciler.flushSyncFromReconciler(callback);
 }
 
+export { WebView } from "./webview.js";
 /** Renders `children` into `container`, a @silkui/core node outside this part of the tree. */
 export function createPortal(children, container, key = null) {
   return reconciler.createPortal(children, container, null, key == null ? null : String(key));

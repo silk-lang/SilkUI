@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { installMock } from "./mock.js";
 
 const mock = installMock();
-const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut, setApplicationMenu, showOpenDialog, showSaveDialog, showContextMenu, appWindow } = await import("../src/index.js");
+const { createBox, createText, createInput, createImage, createSvgElement, flushSvg, createRichInput, createNode, OBJECT, mount, nodeById, setErrorHandler, parseMarkdown, defineKeyframes, announce, Notification, setTray, registerShortcut, setApplicationMenu, showOpenDialog, showSaveDialog, showContextMenu, appWindow, createWebView, clearWebViewData } = await import("../src/index.js");
 
 test("nodes queue their mutations", () => {
   mock.take();
@@ -842,6 +842,53 @@ test("notifications, the tray and global shortcuts go to the host and come back"
   assert.equal(await held, false);
   mock.native.shellEvent(4, 1, 0, 0, "");
   assert.equal(pressed, 1);
+});
+
+test("web views go to the host as text and their events come back", async () => {
+  const box = createBox();
+  mock.take();
+  const view = createWebView(box, { url: "https://silk.test/", profile: "work" });
+  const [[, openCall, openOp, opened]] = mock.take();
+  assert.equal(openOp, 40);
+  assert.deepEqual(opened.split("\x1f"), [String(view.id), String(box.nodeId), "https://silk.test/", "work", "1"]);
+  mock.native.shellAnswer(openCall, 1);
+  assert.equal(await view.opened, true);
+
+  const titles = [];
+  view.addEventListener("titlechange", (event) => titles.push(event.title));
+  mock.native.shellEvent(20, view.id, 7, 0, "A\x1fB");
+  mock.native.shellEvent(20, view.id, 8, 0, "1\x1f0");
+  assert.deepEqual(titles, ["A\x1fB"]);
+  assert.equal(view.canGoBack, true);
+  assert.equal(view.canGoForward, false);
+
+  view.setZoom(1.25);
+  const [[, , zoomOp, zoom]] = mock.take();
+  assert.equal(zoomOp, 42);
+  assert.deepEqual(zoom.split("\x1f"), [String(view.id), "zoom", "1250"]);
+
+  const value = view.evaluate("1 + 1");
+  const [[, , , evaluated]] = mock.take();
+  const request = evaluated.split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 12, 0, request + "\x1f1\x1f{\"sum\":2}");
+  assert.deepEqual(await value, { sum: 2 });
+
+  const found = view.findInPage("needle", { newSession: true });
+  const findRequest = mock.take()[0][3].split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 20, 0, findRequest + "\x1f3\x1f1");
+  assert.deepEqual(await found, { matches: 3, activeMatchOrdinal: 1 });
+
+  const failed = view.clickElement("e9");
+  const clickRequest = mock.take()[0][3].split("\x1f")[2];
+  mock.native.shellEvent(20, view.id, 15, 0, clickRequest + "\x1f0\x1fno such ref");
+  await assert.rejects(failed, /no such ref/);
+
+  const cleared = clearWebViewData({ profile: "work", cache: false });
+  const [[, , clearOp, clear]] = mock.take();
+  assert.equal(clearOp, 43);
+  const [clearRequest] = clear.split("\x1f");
+  mock.native.shellEvent(20, 0, 21, 0, clearRequest);
+  await cleared;
 });
 
 test("menus, dialogs and the window go to the host and come back", async () => {
