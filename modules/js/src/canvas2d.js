@@ -35,6 +35,7 @@
   const HUGE = 1e9;
 
   let encoder = null;
+  const knownText = new Map();
   const utf8 = (text) => (encoder ??= new TextEncoder()).encode(text);
 
   class Writer {
@@ -55,17 +56,28 @@
       this.view = new DataView(grown);
     }
     u32(value) {
-      this.need(4);
+      if (this.at + 4 > this.buffer.byteLength) this.need(4);
       this.view.setUint32(this.at, value >>> 0, true);
       this.at += 4;
     }
     f64(value) {
-      this.need(8);
+      if (this.at + 8 > this.buffer.byteLength) this.need(8);
       this.view.setFloat64(this.at, +value, true);
       this.at += 8;
     }
     str(text) {
       const encoded = utf8(String(text));
+      this.u32(encoded.length);
+      this.raw(encoded);
+    }
+    // `str` for text that comes back often, such as fonts: encoded once.
+    known(text) {
+      let encoded = knownText.get(text);
+      if (!encoded) {
+        if (knownText.size > 256) knownText.clear();
+        encoded = utf8(text);
+        knownText.set(text, encoded);
+      }
       this.u32(encoded.length);
       this.raw(encoded);
     }
@@ -181,6 +193,9 @@
         }
       }
     }
+    if (found === undefined && native.canvas2dColor(value) === 4) {
+      found = [native.geometry(0), native.geometry(1), native.geometry(2), native.geometry(3)];
+    }
     found ??= null;
     if (colors.size > 4096) colors.clear();
     colors.set(text, found);
@@ -293,6 +308,7 @@
   const pathMethods = {
     _begin() {
       this._points = [];
+      this._box = null;
       this._open = false;
       this._last = [0, 0];
       this._first = [0, 0];
@@ -333,13 +349,24 @@
       this._last = this._first;
       pushPoint(this._points, this._transform(), MOVE, this._first);
     },
+    // As moveTo, three lineTo and closePath. A path that is only this rectangle under an
+    // axis-aligned transform keeps it in `_box`, so clip() need not find it in the points.
     rect(x, y, w, h) {
-      if (!finite(x, y, w, h)) return;
-      this.moveTo(x, y);
-      this.lineTo(x + w, y);
-      this.lineTo(x + w, y + h);
-      this.lineTo(x, y + h);
-      this.closePath();
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h))) return;
+      const m = this._transform();
+      const points = this._points;
+      const empty = points.length === 0;
+      const x0 = m[0] * x + m[2] * y + m[4], y0 = m[1] * x + m[3] * y + m[5];
+      const x1 = m[0] * (x + w) + m[2] * y + m[4], y1 = m[1] * (x + w) + m[3] * y + m[5];
+      const x2 = m[0] * (x + w) + m[2] * (y + h) + m[4], y2 = m[1] * (x + w) + m[3] * (y + h) + m[5];
+      const x3 = m[0] * x + m[2] * (y + h) + m[4], y3 = m[1] * x + m[3] * (y + h) + m[5];
+      points.push(MOVE, x0, y0, LINE, x1, y1, LINE, x2, y2, LINE, x3, y3, CLOSE, MOVE, x0, y0);
+      this._open = true;
+      this._last = this._first = [x, y];
+      if (empty && m[1] === 0 && m[2] === 0 && w !== 0 && h !== 0) {
+        this._box = [Math.min(x0, x2), Math.min(y0, y2), Math.max(x0, x2), Math.max(y0, y2)];
+        this._boxLength = points.length;
+      }
     },
     roundRect(x, y, w, h, radii = 0) {
       if (!finite(x, y, w, h)) return;
@@ -568,7 +595,7 @@
       const width = Math.max(1, this.canvas.width | 0);
       const height = Math.max(1, this.canvas.height | 0);
       this._state = initialState(width, height);
-      this._stack = [];
+      this._depth = 0;
       // The clip whose mask the host keeps for this canvas.
       this._sentClip = 0;
       this._begin();
@@ -594,11 +621,19 @@
       return false;
     }
 
+    // A saved state is the prototype of the current one, so save and restore copy nothing:
+    // setters only replace fields, never change a field's array in place.
     save() {
-      this._stack.push({ ...this._state, lineDash: this._state.lineDash.slice() });
+      this._depth++;
+      const saved = this._state;
+      this._state = Object.create(saved);
+      // Deep nesting would make every read walk the chain: copy the fields in now and then.
+      if (this._depth % 16 === 0) for (const name in saved) this._state[name] = saved[name];
     }
     restore() {
-      if (this._stack.length) this._state = this._stack.pop();
+      if (!this._depth) return;
+      this._depth--;
+      this._state = Object.getPrototypeOf(this._state);
     }
 
     get fillStyle() {
@@ -790,7 +825,7 @@
     clip(path, rule) {
       if (typeof path === "string") [path, rule] = [undefined, path];
       const points = this._pointsOf(path);
-      const rect = rectOf(points);
+      const rect = !(path instanceof Path2D) && this._box && this._boxLength === points.length ? this._box : rectOf(points);
       const bounds = rect ?? boundsOf(points);
       const s = this._state;
       const clip = s.clip;
@@ -842,18 +877,20 @@
       return [Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.max(a[0], b[0]), Math.max(a[1], b[1])];
     }
     fillRect(x, y, w, h) {
-      if (!finite(x, y, w, h) || w === 0 || h === 0) return;
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h)) || w === 0 || h === 0) return;
       if (!this._axisAligned()) {
         const path = new Path2D();
         path.rect(x, y, w, h);
         return this.fill(path);
       }
-      const alpha = this._effects(this._state.fillStyle);
+      const s = this._state;
+      const alpha = this._effects(s.fillStyle);
       if (alpha < 0) return;
-      const r = this._deviceRect(x, y, w, h);
+      const m = s.transform;
+      const ax = m[0] * x + m[4], ay = m[3] * y + m[5], bx = m[0] * (x + w) + m[4], by = m[3] * (y + h) + m[5];
       const writer = this._clipped(command(FILL_RECT, this._node));
-      writer.color(this._state.fill ?? WHITE, alpha);
-      writer.rect(r[0], r[1], r[2], r[3]);
+      writer.color(s.fill ?? WHITE, alpha);
+      writer.rect(Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by));
     }
     strokeRect(x, y, w, h) {
       if (!finite(x, y, w, h)) return;
@@ -885,14 +922,15 @@
       this._text(text, x, y, maxWidth, true);
     }
     _text(text, x, y, maxWidth, stroke) {
-      if (!finite(x, y)) return;
+      if (!(Number.isFinite(x) && Number.isFinite(y))) return;
       const s = this._state;
       const alpha = this._effects(stroke ? s.strokeStyle : s.fillStyle);
       if (alpha < 0) return;
       const w = this._clipped(command(FILL_TEXT, this._node));
       w.color((stroke ? s.stroke : s.fill) ?? WHITE, alpha);
-      w.str(s.fontKey);
-      w.str(String(text).replace(/[\t\n\f\r]/g, " "));
+      w.known(s.fontKey);
+      text = String(text);
+      w.str(/[\t\n\f\r]/.test(text) ? text.replace(/[\t\n\f\r]/g, " ") : text);
       w.f64(x);
       w.f64(y);
       for (const value of s.transform) w.f64(value);
