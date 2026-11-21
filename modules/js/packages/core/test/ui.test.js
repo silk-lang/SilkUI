@@ -411,6 +411,17 @@ test("unload destroys every node, for a reload", () => {
   assert.equal(nodeById(box.nodeId), null);
 });
 
+test("removing a listener from a destroyed node sends nothing", () => {
+  const child = createBox();
+  const box = createBox({}, child);
+  const listener = () => {};
+  child.addEventListener("click", listener);
+  box.destroy();
+  mock.take();
+  child.removeEventListener("click", listener);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "listen"), []);
+});
+
 test("a font family list is defined once and named by number", () => {
   mock.take();
   const a = createBox({ fontFamily: "monospace" });

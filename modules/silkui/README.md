@@ -74,8 +74,10 @@ optimization, `--optimize` selects an optimization mode, `--debug` controls debu
 and `--target` selects a native target triple. `--platform` selects the UI host. Only
 `App.dev` builds include the development tools (reload, the development server, the
 inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptimized, as
-`silk build` makes it. Development builds optimize the renderer, inspector server and runtime
-packages while keeping the application unoptimized.
+`silk build` makes it. A Loom app's development build optimizes the renderer, inspector server
+and runtime packages while keeping the application unoptimized. A JavaScript app's development
+host is all engine and renderer, so it is optimized whole, the standard library too, with the
+development tools bound on (`ui_inspect_server.devtools.enabled`).
 
 ### What a built JavaScript app starts from
 

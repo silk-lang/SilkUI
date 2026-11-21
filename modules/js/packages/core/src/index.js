@@ -197,6 +197,10 @@ function cssValue(name, value) {
 }
 
 const warned = new Set();
+// Style elements, and those in the document's sheets now (see `StyleElement`).
+const styleElements = new Set();
+let appliedStyles = [];
+let stylesPending = false;
 
 function warnOnce(message) {
   if (warned.has(message)) return;
@@ -487,7 +491,9 @@ function clearAdoptedSheets() {
 function syncAdoptedSheets() {
   if (!rootNode) return;
   clearAdoptedSheets();
-  const sheets = [...importedSheets.values(), ...(adoptedLists.get(rootNode)?.values ?? [])];
+  const sheets = [...importedSheets.values()];
+  for (const element of appliedStyles) if (element._styleSheet) sheets.push(element._styleSheet);
+  sheets.push(...(adoptedLists.get(rootNode)?.values ?? []));
   for (const sheet of sheets) {
     if (nextSheet >= 0x80000000) throw new RangeError("Too many stylesheet adoptions");
     const entry = { sheet, id: nextSheet++, live: false };
@@ -753,6 +759,7 @@ export class Node {
       native.append(this.nodeId, child.nodeId);
     }
     if (mutationObservers.size) childListRecord(this, child, null, child.previousSibling, before);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -785,6 +792,7 @@ export class Node {
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -805,6 +813,7 @@ export class Node {
     }
     native.destroy(this.nodeId);
     forget(this);
+    if (styleElements.size) stylesChanged();
   }
 
   /**
@@ -979,7 +988,10 @@ export class Node {
     const rare = this.#rare;
     const old = rare?.flags ?? 0;
     const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
-    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === old) return;
+    this.#more().flags = flags;
+    // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
@@ -1001,7 +1013,9 @@ export class Node {
       if (wanted) flags |= bit;
     }
     flags >>>= 0;
-    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === (this.#rare?.flags ?? 0)) return;
+    this.#more().flags = flags;
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   _keep(...types) {
@@ -1267,6 +1281,7 @@ export class Text extends Node {
     native.setText(this.nodeId, value);
     if (mutationObservers.size) characterDataRecord(this, old);
     if (this._svgText) svgChanged(this);
+    if (styleElements.size && this.parentNode instanceof StyleElement) stylesChanged();
   }
 
   /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
@@ -2815,6 +2830,71 @@ function buttonActivate() {
  * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
  * `@silkui/react`. `localName` and `tagName` give the tag.
  */
+// A style element in the document applies its text as a stylesheet, after the compiled
+// imports and before adopted sheets, in tree order. Changes apply together at the next microtask.
+
+function stylesChanged() {
+  if (stylesPending) return;
+  stylesPending = true;
+  queueMicrotask(applyStyleElements);
+}
+
+function applyStyleElements() {
+  stylesPending = false;
+  const live = [];
+  for (const element of styleElements) {
+    if (!nodes.has(element.nodeId)) styleElements.delete(element);
+    else if (inDocument(element)) live.push(element);
+  }
+  live.sort(treeOrder);
+  let changed = live.length !== appliedStyles.length;
+  for (let i = 0; i < live.length; i++) {
+    if (live[i]._compile()) changed = true;
+    if (live[i] !== appliedStyles[i]) changed = true;
+  }
+  appliedStyles = live;
+  if (changed) syncAdoptedSheets();
+}
+
+/** `<style>`: its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  _styleSheet = null;
+  #compiled = null;
+
+  constructor() {
+    super("box");
+    styleElements.add(this);
+  }
+
+  /** The element's stylesheet while it is in the document, else null. */
+  get sheet() {
+    return inDocument(this) ? this._styleSheet : null;
+  }
+
+  // Compiles changed text. True when the element gained its first sheet.
+  _compile() {
+    let text = "";
+    for (const child of this.childNodes) if (child.nodeType === 3) text += child.data;
+    if (text === this.#compiled) return false;
+    this.#compiled = text;
+    if (!native.compileStyleSheet) {
+      warnOnce("@silkui/core: a style element's CSS needs the host's CSS text compiler (App.runtimeStylesheets() in a release build)");
+      return false;
+    }
+    let bytes;
+    try {
+      bytes = native.compileStyleSheet(text);
+    } catch (error) {
+      console.warn("@silkui/core: a style element's CSS did not compile: " + (error?.message ?? error));
+      return false;
+    }
+    const first = this._styleSheet === null;
+    this._styleSheet ??= new CSSStyleSheet();
+    replaceSheet(this._styleSheet, bytes);
+    return first;
+  }
+}
+
 export function createElement(tag, options) {
   tag = String(tag).toLowerCase();
   const type = String(options?.type ?? "text").toLowerCase();
@@ -2826,6 +2906,7 @@ export function createElement(tag, options) {
   else if (tag === "img") node = new Image();
   else if (tag === "canvas") node = new Canvas();
   else if (tag === "br") return new LineBreak();
+  else if (tag === "style") node = new StyleElement();
   else node = new Node("box");
   node._tag = tag;
   native.attribute(node.nodeId, "element", tag);
@@ -3894,6 +3975,7 @@ export function mount(node) {
   rootNode = node;
   native.root(node.nodeId);
   syncAdoptedSheets();
+  if (styleElements.size) stylesChanged();
   return node;
 }
 
@@ -4822,6 +4904,8 @@ function follow(target) {
 // next realm starts on an empty tree.
 native.unload = function () {
   importedSheets.clear();
+  styleElements.clear();
+  appliedStyles = [];
   for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
   rootNode = null;
 };

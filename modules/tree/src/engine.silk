@@ -162,7 +162,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels, IconVariables }
 import svg_css.effect_values { Image }
 import repair { Repair, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
 import provider { Provider }
@@ -3741,6 +3741,93 @@ impl<'a> UiTree<'a> {
   /// Whether the node at `slot` is in the current root.
   pub fn holdsCurrent(self: &Self, slot: u32) -> bool {
     return self.root != NONE && self.topOf(slot) == self.root
+  }
+
+  /// The computed value of custom property `name` (`--gap`) on the node at `slot`, as
+  /// `getComputedStyle` reads it: the tokens of the declaration that won, inherited ones too,
+  /// with their own `var()`s substituted. False when the node has none.
+  pub effect fn customProperty(self: &Self, slot: u32, name: &[u8], out: &mut Bytes) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    let resolved = match self.node(slot).sheetStyle() {
+      Option<&Resolved>.Some { value } => value
+      Option<&Resolved>.None => { return false }
+    }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.rootOfTop(self.topOf(slot)))
+    if at == usize.MAX { return false }
+    let inputs = self.styleSheets.asSlice()[at].sheets.variableInputs()
+    if inputs.length == 0 { return false }
+    let mut reference = Bytes.make()
+    run reference.append(b"var(")
+    run reference.append(name)
+    run reference.append(b")")
+    let expanded = run Effect.result(style_sheets.substituteText(&inputs[0], resolved.scope, reference.asSlice()))
+    return match move expanded {
+      Result.Success { value: Option<Bytes>.Some { value } } => {
+        run out.append(value.asSlice())
+        true
+      }
+      Result.Success { value: _ } => false
+      Result.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        _ => false
+      }
+    }
+  }
+
+  // The custom properties each inline svg's markup reads, resolved for its node, for paint
+  // (`Resources.iconVariables`): an icon's resource has no cascade of its own. Their key is
+  // folded into the node's paint hash, so a change repaints it.
+  effect fn collectIconVariables(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.resources.variables.length() == 0 && !self.resources.readsVariables() { return () }
+    let old = Intrinsic.replace(self.resources.variables, List<IconVariables>.make())
+    let mut found = List<IconVariables>.make()
+    let count = self.nodes.length()
+    let mut slot: usize = 0
+    while slot < count {
+      if self.nodes.asSlice()[slot].kind == NodeKind.Icon {
+        let names = self.resources.markupVariables(self.nodes.asSlice()[slot].resource)
+        let mut css = List<u8>.make()
+        let mut i: usize = 0
+        while i < names.length {
+          let mut value = Bytes.make()
+          if run self.customProperty(usize.toU32(slot), names[i].asSlice(), &mut value) {
+            run css.appendSlice(names[i].asSlice())
+            run css.append(58)
+            run css.appendSlice(value.asSlice())
+            run css.append(59)
+          }
+          i = i + 1
+        }
+        let mut key: u64 = 0
+        let bytes = css.asSlice()
+        i = 0
+        while i < bytes.length {
+          key = Hash.combine(key, u8.toU64(bytes[i]))
+          i = i + 1
+        }
+        let current = self.nodes.asSlice()[slot].paintHash
+        // A restyle since the last frame wrote a fresh hash; otherwise it still holds the old key.
+        let mut base = current
+        let mut j: usize = 0
+        while j < old.length() {
+          let entry = &old.asSlice()[j]
+          if entry.slot == usize.toU32(slot) && entry.mixed == current { base = entry.base }
+          j = j + 1
+        }
+        let mixed = if bytes.length == 0 { base } else { Hash.combine(base, key) }
+        if mixed != current {
+          let target = self.nodeMut(usize.toU32(slot))
+          target.paintHash = mixed
+          run self.repair.nodes.append(usize.toU32(slot))
+          self.repair.pending = true
+        }
+        if bytes.length != 0 {
+          run found.append(IconVariables { slot: usize.toU32(slot), key: key, css: move css, base: base, mixed: mixed })
+        }
+      }
+      slot = slot + 1
+    }
+    self.resources.variables = move found
   }
 
   /// The id of the open root whose node is `top`, or NONE.
@@ -8401,6 +8488,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.loadFaces()
+    run self.collectIconVariables()
     run text_selection.refresh(&mut self)
     if run motion.slides(&mut self) {
       // A node that starts or stops being a move paints through another group.
@@ -8544,6 +8632,7 @@ impl<'a> UiTree<'a> {
   pub effect fn paintSubtree(self: &mut Self, slot: u32, scene: &mut Scene) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.collectIconVariables()
     // Between a layout pass and the refresh, stacking lists no roots to paint from.
     if self.repair.pending && !self.paintCachesStale { run self.refreshPaintCaches() }
     let window = ContentMask.new(
