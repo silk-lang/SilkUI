@@ -5302,7 +5302,7 @@ export class WebViewEvent {
  *
  * The view keeps the page's state as it reports it: `url`, `title`, `favicon`, `loading`,
  * `progress`, `canGoBack`, `canGoForward`, `focused`. Listen with `addEventListener(type,
- * listener)` for `loadstart`, `loadprogress`, `loadend` (`ok`, `error`), `urlchange`,
+ * listener)` for `loadstart`, `loadprogress`, `loadend` (`ok`, `error`, `errorCode`, a Chromium net error), `urlchange`,
  * `titlechange`, `faviconchange`, `historychange`, `navigationrequest` (answer it with
  * `answerNavigation`), `newwindow`, `focuschange`, `console` (`level`, `message`),
  * `unsupported` (`command`), `crashed` and `closed`.
@@ -5488,7 +5488,7 @@ function webViewEvent(id, code, text) {
       break;
     case 5:
       view.loading = false;
-      view._fire("loadend", { ok: parts[0] === "1", url: parts[1] ?? "", error: rest(2) });
+      view._fire("loadend", { ok: parts[0] === "1", errorCode: -Number(parts[1] ?? 0), url: parts[2] ?? "", error: rest(3) });
       break;
     case 6:
       view.url = rest(0);
