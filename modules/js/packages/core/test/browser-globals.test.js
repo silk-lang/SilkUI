@@ -60,6 +60,23 @@ test("style takes CSSOM's setProperty for custom properties and CSS names", () =
   assert.equal(root.className, "dark");
 });
 
+test("dataset maps camelCase names to data-* attributes", () => {
+  const root = document.documentElement;
+  root.dataset.themeId = "dusk";
+  assert.equal(root.getAttribute("data-theme-id"), "dusk");
+  assert.equal(root.dataset.themeId, "dusk");
+  assert.ok("themeId" in root.dataset);
+  assert.deepEqual(Object.keys(root.dataset), ["themeId"]);
+  assert.deepEqual({ ...root.dataset }, { themeId: "dusk" });
+  delete root.dataset.themeId;
+  assert.equal(root.hasAttribute("data-theme-id"), false);
+  assert.equal(root.dataset.themeId, undefined);
+  const tab = document.createElement("div");
+  tab.setAttribute("data-preview-tab", "3");
+  assert.equal(tab.dataset.previewTab, "3");
+  assert.equal(document.body.dataset, document.body.dataset);
+});
+
 test("MutationObserver records child lists, attributes and text", async () => {
   const box = document.createElement("div");
   document.body.appendChild(box);

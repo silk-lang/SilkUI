@@ -329,6 +329,39 @@ function classToken(value) {
 }
 
 /** A live token list backed by the node's class attribute. */
+// `element.dataset`: a DOMStringMap over the `data-*` attributes, `fooBar` for `data-foo-bar`.
+function datasetOf(element) {
+  const attribute = (key) => typeof key === "string" && !/-[a-z]/.test(key) ? "data-" + key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()) : null;
+  const keys = () => element.getAttributeNames().filter((name) => name.startsWith("data-")).map((name) => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()));
+  return new Proxy(Object.create(null), {
+    get(_, key) {
+      const name = attribute(key);
+      return name === null ? undefined : element.getAttribute(name) ?? undefined;
+    },
+    set(_, key, value) {
+      const name = attribute(key);
+      if (name === null) throw new (globalThis.DOMException ?? Error)("'" + String(key) + "' is not a valid dataset name", "SyntaxError");
+      element.setAttribute(name, String(value));
+      return true;
+    },
+    deleteProperty(_, key) {
+      const name = attribute(key);
+      if (name !== null) element.removeAttribute(name);
+      return true;
+    },
+    has(_, key) {
+      const name = attribute(key);
+      return name !== null && element.hasAttribute(name);
+    },
+    ownKeys: keys,
+    getOwnPropertyDescriptor(_, key) {
+      const name = attribute(key);
+      const value = name === null ? null : element.getAttribute(name);
+      return value === null ? undefined : { value, writable: true, enumerable: true, configurable: true };
+    },
+  });
+}
+
 export class ClassList {
   #node;
   constructor(node) { this.#node = node; }
@@ -541,6 +574,7 @@ class NodeState {
   kept = 0;
   attributes = null;
   classList = null;
+  dataset = null;
 }
 
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
@@ -809,6 +843,8 @@ export class Node {
   get className() { return this.getAttribute("class") ?? ""; }
   set className(value) { this.setAttribute("class", String(value)); }
   get classList() { return this.#more().classList ??= new ClassList(this); }
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  get dataset() { return this.#more().dataset ??= datasetOf(this); }
 
   getAttribute(name) {
     name = String(name);
@@ -1922,6 +1958,14 @@ export class SvgElement {
 
   hasAttribute(name) {
     return this.#attributes.has(svgName(name));
+  }
+
+  getAttributeNames() {
+    return [...this.#attributes.keys()];
+  }
+
+  get dataset() {
+    return (this._dataset ??= datasetOf(this));
   }
 
   setAttribute(name, value) {
