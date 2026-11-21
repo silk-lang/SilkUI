@@ -266,7 +266,10 @@ class Document extends OuterTarget {
   adoptNode(node) { node.remove?.(); return node; }
   exitFullscreen() { return Promise.resolve(); }
   exitPointerLock() {}
-  execCommand() { return false; }
+  execCommand(command, showUI, value) {
+    const run = exported("execCommand");
+    return typeof run === "function" ? run(command, showUI, value) : false;
+  }
   queryCommandSupported() { return false; }
   // The fonts the app's style sheets load are the host's, ready before the first frame.
   get fonts() { return fonts; }

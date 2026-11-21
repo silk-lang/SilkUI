@@ -35,6 +35,17 @@ test("the document is html > body at the tree's root, under document and window 
   assert.deepEqual(seen, [["window", true], ["button"], ["document", true, 3]]);
 });
 
+test("selectionchange reaches document listeners", () => {
+  const box = document.createElement("div");
+  document.body.appendChild(box);
+  let heard = 0;
+  const listener = () => heard++;
+  document.addEventListener("selectionchange", listener);
+  mock.native.dispatch(27, box.nodeId, 0, 0, 0, 0, 0);
+  document.removeEventListener("selectionchange", listener);
+  assert.equal(heard, 1);
+});
+
 test("style takes CSSOM's setProperty for custom properties and CSS names", () => {
   mock.take();
   const root = document.documentElement;

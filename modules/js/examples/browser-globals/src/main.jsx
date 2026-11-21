@@ -35,7 +35,6 @@ function App() {
       <box>{"hash " + (hash || "none")}</box>
       <box>{"root " + (document.documentElement.className || "even")}</box>
       <box>{body}</box>
-      <box>{"width " + (innerWidth > 0 ? "known" : "unknown")}</box>
     </box>
   );
 }

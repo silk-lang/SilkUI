@@ -3651,6 +3651,8 @@ function selectionRecord(target, start) {
   const event = new Event(start === 1 ? "selectstart" : "selectionchange", target);
   if (start !== 1) event.bubbles = false;
   dispatchEvent(event);
+  // As on the web, `selectionchange` is the document's event too.
+  if (start !== 1 && outerTargets.length) outerTargets[0].dispatchEvent?.(new Event("selectionchange", null));
   if (event.defaultPrevented) {
     const selection = getSelection();
     selection.removeAllRanges();
