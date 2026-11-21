@@ -14,14 +14,15 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starti
 
 // Event types by the kind number the host dispatches. Up to `selectionchange`, `pointerover`
 // and `pointerout` the kind is also the bit of the tree's LISTEN_* flags a node listens with;
-// copy, cut and paste share bit 30, and beforeinput has bit 31 (see `bitOf`).
+// `error` shares the bit of `load`, the touch kinds share bit 30, copy, cut, paste and
+// beforeinput bit 31, and the requests (closerequest, navigate) bit 18 (see `bitOf`).
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
   "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
-  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput",
+  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput", "closerequest", "navigate",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
@@ -45,8 +46,15 @@ const COPY = KIND_OF.get("copy");
 const CUT = KIND_OF.get("cut");
 const PASTE = KIND_OF.get("paste");
 const BEFORE_INPUT = KIND_OF.get("beforeinput");
-// The listen bit of a kind: the touch kinds share bit 30, copy, cut, paste and beforeinput bit 31.
-const bitOf = (kind) => (kind < TOUCH_START ? kind : kind < COPY ? 30 : 31);
+const LOAD = KIND_OF.get("load");
+const ERROR = KIND_OF.get("error");
+const CLOSE_REQUEST = KIND_OF.get("closerequest");
+const NAVIGATE = KIND_OF.get("navigate");
+// The listen bit of a kind: `error` shares the bit of `load`, the touch kinds share bit 30,
+// copy, cut, paste and beforeinput bit 31, and the two requests have the bit after `load`.
+const bitOf = (kind) =>
+  kind === ERROR ? LOAD : kind < TOUCH_START ? kind : kind < COPY ? 30 : kind < CLOSE_REQUEST ? 31 : LOAD + 1;
+const SHARES_BIT = (kind) => kind >= TOUCH_START || kind === LOAD || kind === ERROR;
 const KINDS_OF_BIT = (bit) => TYPES.map((_, kind) => kind).filter((kind) => bitOf(kind) === bit);
 // Compatibility mouse events, as the web fires them after pointer events: each listens
 // through the pointer kind it follows.
@@ -68,6 +76,7 @@ const NO_BUBBLE = new Set([
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
   "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart", "copy", "cut", "paste", "beforeinput",
+  "closerequest", "navigate",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -889,7 +898,7 @@ export class Node {
   #wanted(kind) {
     const listeners = this.#rare?.listeners;
     const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
-    if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
+    if (SHARES_BIT(kind)) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
     const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
@@ -4050,6 +4059,7 @@ function compatTap(click, target) {
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind >= CLOSE_REQUEST) return dispatchRequest(kind, target, a);
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
   if (kind === FOCUS) focusing(target);
@@ -4082,6 +4092,20 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   }
   return prevented;
 };
+
+// The tree's requests, raised after an Escape, a back key or a back mouse button that nothing
+// prevented: `closerequest` asks to close what is on top, as a web close watcher hears, and
+// `navigate` asks to go back or forward, with `navigationType` "traverse" and `direction`
+// "back" or "forward". The listener that acts stops the event; the tree does nothing itself.
+function dispatchRequest(kind, target, forward) {
+  const event = new Event(TYPES[kind], target);
+  if (kind === NAVIGATE) {
+    event.navigationType = "traverse";
+    event.direction = forward ? "forward" : "back";
+  }
+  dispatchEvent(event);
+  return event.defaultPrevented;
+}
 
 // Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
 // paste carries the clipboard's text, HTML and a PNG (bytes as a Latin-1 string). A copy or

@@ -9,6 +9,8 @@ import record { Event as RawEvent, EventKind }
 import input {
   Input as RawInput,
   EditCommand,
+  Request,
+  REQUEST_ANYWHERE,
   MOD_SHIFT,
   MOD_CONTROL,
   MOD_ALT,
@@ -174,6 +176,12 @@ pub union Input {
   /// fires first, and a handler that prevents it cancels the edit. The tree queues these
   /// after a cut or paste itself (`Tree.takeFollowUp`).
   Edit { pub target: NodeId, pub inputType: String, pub text: String },
+  /// A request the client answers: close what is on top, or go back or forward. The tree
+  /// queues one itself after an Escape, a back key or a back mouse button that no handler
+  /// prevented, and a host sends one for a system back gesture or button. It starts at
+  /// `target`, or where the tree chooses when there is none: the focused node, else the node
+  /// last pressed, else the topmost node that listens for requests.
+  Request { pub request: Request, pub target: Option<NodeId> },
 }
 
 /// The flavors of a clipboard, each empty when it has none: `text/plain`, `text/html`, and
@@ -204,6 +212,16 @@ impl Input {
   /// The primary release that ends [`Input.press`].
   pub fn release(x: f32, y: f32) -> Input {
     return Input.PointerUp { x: x, y: y, button: Button.Primary, modifiers: Modifiers.none() }
+  }
+
+  /// A request to go back, from wherever the tree chooses.
+  pub fn back() -> Input {
+    return Input.Request { request: Request.Back, target: Option<NodeId>.None }
+  }
+
+  /// A request to close what is on top, from wherever the tree chooses.
+  pub fn close() -> Input {
+    return Input.Request { request: Request.Close, target: Option<NodeId>.None }
   }
 
   /// A wheel scroll with no modifiers.
@@ -316,6 +334,13 @@ impl Input {
         target: target.raw(),
         inputType: move inputType,
         text: move text,
+      }
+      Input.Request { request, target } => RawInput.Request {
+        request: request,
+        target: match target {
+          Option.Some { value } => value.raw()
+          Option.None => REQUEST_ANYWHERE
+        },
       }
     }
   }
@@ -602,6 +627,12 @@ pub union Event {
   /// An edit is about to change the target input, as DOM `beforeinput`: `data` is the text it
   /// inserts. Preventing it cancels the edit.
   BeforeInput { pub inputType: InputType, pub data: String },
+  /// Something asked to close what is on top, as a browser's close request (Escape). The
+  /// listener that closes something stops the event there; the tree does nothing by itself.
+  CloseRequest,
+  /// Something asked to go back or forward (Alt+Left, Cmd+[, the back mouse button), as a
+  /// browser's `navigate` event for a history traversal.
+  Navigate { pub forward: bool },
 }
 
 /// What a transition or animation event is about: the CSS property of a transition or the
@@ -653,6 +684,8 @@ impl Event {
       Event.Cut => EventKind.Cut
       Event.Paste { .. } => EventKind.Paste
       Event.BeforeInput { .. } => EventKind.BeforeInput
+      Event.CloseRequest => EventKind.CloseRequest
+      Event.Navigate { .. } => EventKind.Navigate
     }
   }
 }
@@ -788,6 +821,8 @@ impl EventRecord {
         inputType: InputType.fromName(String.view(&raw.inputType)),
         data: run String.copy(String.view(&raw.value)),
       }
+      EventKind.CloseRequest => Event.CloseRequest
+      EventKind.Navigate => Event.Navigate { forward: raw.detail != 0 }
     }
     return EventRecord { target: NodeId.of(raw.target), path: move path, event: move event }
   }
@@ -896,7 +931,9 @@ pub fn listenFlag(kind: EventKind) -> u32 {
     EventKind.GotPointerCapture => 32768
     EventKind.LostPointerCapture => 65536
     EventKind.Load => 131072
-    EventKind.Error => 262144
+    EventKind.Error => 131072
+    EventKind.CloseRequest => 262144
+    EventKind.Navigate => 262144
     EventKind.TransitionRun => 524288
     EventKind.TransitionStart => 1048576
     EventKind.TransitionEnd => 2097152
