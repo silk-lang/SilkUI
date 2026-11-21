@@ -341,3 +341,34 @@ test("the window's size is the root's", () => {
   assert.equal(document.activeElement, document.body);
   assert.equal(document.getElementById("nothing"), null);
 });
+
+test("createImageBitmap decodes a Blob on the host and crops, resizes and flips pixels", async () => {
+  // A stand-in decoder: a 2 by 1 picture, red then half transparent green.
+  mock.native.imageDecode = (bytes) => (bytes[0] === 0x89 ? 2 : 0);
+  mock.native.geometry = (at) => [2, 1][at];
+  mock.native.imageTake = (into) => into.set([255, 0, 0, 255, 0, 255, 0, 128]);
+  const bitmap = await createImageBitmap(new Blob([new Uint8Array([0x89, 0x50])], { type: "image/png" }));
+  assert.ok(bitmap instanceof ImageBitmap);
+  assert.deepEqual([bitmap.width, bitmap.height], [2, 1]);
+  assert.deepEqual([...bitmap._pixels.data], [255, 0, 0, 255, 0, 255, 0, 128]);
+  await assert.rejects(createImageBitmap(new Blob(["<svg/>"])), { name: "InvalidStateError" });
+
+  const image = { width: 2, height: 2, data: new Uint8ClampedArray([1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 4, 4, 4, 255]) };
+  const copied = await createImageBitmap(image);
+  image.data[0] = 9;
+  assert.equal(copied._pixels.data[0], 1);
+  const cropped = await createImageBitmap(image, 1, -1, 2, 2);
+  assert.deepEqual([...cropped._pixels.data], [0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 255, 0, 0, 0, 0]);
+  const flipped = await createImageBitmap(copied, { imageOrientation: "flipY" });
+  assert.deepEqual([...flipped._pixels.data.slice(0, 4)], [3, 3, 3, 255]);
+  const shrunk = await createImageBitmap(copied, { resizeWidth: 1, resizeHeight: 1, resizeQuality: "high" });
+  assert.deepEqual([...shrunk._pixels.data], [3, 3, 3, 255]);
+  const grown = await createImageBitmap(copied, { resizeWidth: 4, resizeQuality: "pixelated" });
+  assert.deepEqual([grown.width, grown.height], [4, 4]);
+  assert.deepEqual([...grown._pixels.data.slice(0, 8)], [1, 1, 1, 255, 1, 1, 1, 255]);
+
+  copied.close();
+  assert.equal(copied.width, 0);
+  await assert.rejects(createImageBitmap(copied), { name: "InvalidStateError" });
+  assert.throws(() => new ImageBitmap(), TypeError);
+});
