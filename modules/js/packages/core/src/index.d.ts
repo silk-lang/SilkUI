@@ -849,6 +849,96 @@ export function removeTray(): void;
  * elsewhere) is pressed, whichever app has focus. Resolves to whether the system took it.
  */
 export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
+
+/** An event of a {@link WebView}; its other members depend on `type`. */
+export class WebViewEvent {
+  readonly type: string;
+  readonly url?: string;
+  readonly title?: string;
+  readonly ok?: boolean;
+  readonly error?: string;
+  readonly progress?: number;
+  readonly canGoBack?: boolean;
+  readonly canGoForward?: boolean;
+  readonly request?: number;
+  readonly userInitiated?: boolean;
+  readonly focused?: boolean;
+  readonly level?: "debug" | "log" | "info" | "warning" | "error";
+  readonly message?: string;
+  readonly command?: string;
+  readonly reason?: string;
+}
+
+export interface WebViewOptions {
+  url?: string;
+  /** A name keeps cookies and storage between runs; empty forgets them when the view closes. */
+  profile?: string;
+  /** Lets Web Inspector attach (default true). */
+  inspectable?: boolean;
+  /** Every main frame navigation waits for `answerNavigation`. */
+  askBeforeNavigating?: boolean;
+  /** The node's background shows until the page paints. */
+  transparent?: boolean;
+}
+
+export interface WebViewScreenshot {
+  width: number;
+  height: number;
+  /** RGBA, rows top first, device pixels. */
+  data: Uint8Array;
+}
+
+/** A real browser page shown over a node (WKWebView on macOS). */
+export class WebView {
+  readonly id: number;
+  readonly node: Node;
+  readonly opened: Promise<boolean>;
+  url: string;
+  title: string;
+  favicon: string;
+  loading: boolean;
+  progress: number;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  focused: boolean;
+  addEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  removeEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  navigate(url: string): void;
+  loadHtml(html: string, baseUrl?: string): void;
+  back(): void;
+  forward(): void;
+  reload(): void;
+  hardReload(): void;
+  stop(): void;
+  setZoom(factor: number): void;
+  focus(): void;
+  openDevTools(): void;
+  setAudioMuted(muted: boolean): void;
+  setColorScheme(scheme: "system" | "light" | "dark"): void;
+  setShown(shown: boolean): void;
+  evaluate(script: string): Promise<unknown>;
+  snapshot(): Promise<string>;
+  screenshot(): Promise<WebViewScreenshot>;
+  clickElement(ref: string): Promise<void>;
+  fillElement(ref: string, text: string): Promise<void>;
+  clickAt(x: number, y: number, options?: { button?: number; clickCount?: number; modifiers?: number }): void;
+  movePointer(x: number, y: number, options?: { modifiers?: number }): void;
+  scroll(x: number, y: number, deltaX: number, deltaY: number, options?: { modifiers?: number }): void;
+  typeText(text: string): void;
+  pressKey(key: string, modifiers?: number): void;
+  answerNavigation(request: number, allow: boolean): void;
+  findInPage(text: string, options?: { forward?: boolean; newSession?: boolean }): Promise<{ matches: number; activeMatchOrdinal: number }>;
+  stopFindInPage(): void;
+  close(): void;
+}
+
+/** Shows a web view over `node`; the page covers its border box and follows it. */
+export function createWebView(node: Node, options?: WebViewOptions): WebView;
+
+/** Clears what the pages of a profile stored: cookies and site storage, the cache, or both. */
+export function clearWebViewData(options?: { profile?: string; cookies?: boolean; cache?: boolean }): Promise<void>;
+
+export function quit(code?: number): void;
 export function unregisterShortcut(accelerator: string): void;
 
 /** The app's memory: `footprint` in bytes over `processes` processes. */

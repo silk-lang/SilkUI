@@ -360,3 +360,5 @@ export function createRoot(container) {
 export function flushSync(callback) {
   return reconciler.flushSyncFromReconciler(callback);
 }
+
+export { WebView } from "./webview.js";

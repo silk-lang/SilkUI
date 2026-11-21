@@ -4012,6 +4012,8 @@ native.shellEvent = function (kind, a, x, y, text) {
     if (!notification) return;
     notifications.delete(a);
     notification._fire("click");
+  } else if (kind === WEB_VIEW_EVENT) {
+    webViewEvent(a, x, text);
   }
 };
 
@@ -4173,7 +4175,315 @@ export function registerShortcut(accelerator, callback) {
   return shellCall(3, [id, code, bits]).then((held) => held === 1);
 }
 
+// Web views: a real browser page (WKWebView on macOS) shown over a node, which a person and
+// an agent can both use. The views live on the platform thread; calls go through `__ui.shell`
+// (ops 10 to 14) and their events come back through `__ui.shellEvent` kind 20, with the view,
+// an event code and the fields separated by U+001F (ui-webview's wire.silk).
+
+const WEB_VIEW_EVENT = 20;
+const webViews = new Map();
+let nextWebView = 0;
+let nextWebRequest = 0;
+const webRequests = new Map();
+const dataClears = new Map();
+
+const thousandths = (value) => String(Math.round(Number(value) * 1000));
+
+function webRequest(resolve, reject) {
+  const request = ++nextWebRequest;
+  webRequests.set(request, { resolve, reject });
+  return request;
+}
+
+function settleWebRequest(request, ok, value, error) {
+  const waiting = webRequests.get(request);
+  if (!waiting) return;
+  webRequests.delete(request);
+  if (ok) waiting.resolve(value);
+  else waiting.reject(error instanceof Error ? error : new Error(String(error)));
+}
+
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_VALUES = new Uint8Array(128);
+for (let i = 0; i < BASE64.length; i++) BASE64_VALUES[BASE64.charCodeAt(i)] = i;
+
+function decodeBase64(text) {
+  const clean = text.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let bits = 0;
+  let count = 0;
+  let at = 0;
+  for (let i = 0; i < clean.length; i++) {
+    bits = (bits << 6) | BASE64_VALUES[clean.charCodeAt(i)];
+    count += 6;
+    if (count >= 8) {
+      count -= 8;
+      out[at++] = (bits >> count) & 255;
+    }
+  }
+  return out;
+}
+
+const CONSOLE_LEVELS = ["debug", "log", "info", "warning", "error"];
+
+/** An event of a {@link WebView}: its `type` and the fields of what happened. */
+export class WebViewEvent {
+  constructor(type, fields) {
+    this.type = type;
+    Object.assign(this, fields);
+  }
+}
+
+/**
+ * A web view: a real browser page shown over a node. The page draws over the node's box
+ * (a native view of the system's engine), follows it as layout moves it, and hides when the
+ * node is not shown. Make one with {@link createWebView}.
+ *
+ * The view keeps the page's state as it reports it: `url`, `title`, `favicon`, `loading`,
+ * `progress`, `canGoBack`, `canGoForward`, `focused`. Listen with `addEventListener(type,
+ * listener)` for `loadstart`, `loadprogress`, `loadend` (`ok`, `error`), `urlchange`,
+ * `titlechange`, `faviconchange`, `historychange`, `navigationrequest` (answer it with
+ * `answerNavigation`), `newwindow`, `focuschange`, `console` (`level`, `message`),
+ * `unsupported` (`command`), `crashed` and `closed`.
+ */
+export class WebView {
+  #listeners = new Map();
+  #closed = false;
+
+  constructor(node, options) {
+    this.id = ++nextWebView;
+    this.node = node;
+    this.url = options.url ?? "";
+    this.title = "";
+    this.favicon = "";
+    this.loading = false;
+    this.progress = 0;
+    this.canGoBack = false;
+    this.canGoForward = false;
+    this.focused = false;
+    webViews.set(this.id, this);
+    const flags = (options.inspectable === false ? 0 : 1) | (options.askBeforeNavigating ? 2 : 0) | (options.transparent ? 4 : 0);
+    /** Resolves to whether the view opened: there are web views only in a desktop window. */
+    this.opened = shellCall(10, [this.id, node.nodeId, this.url, options.profile ?? "", flags]).then((value) => {
+      if (value !== 1) webViews.delete(this.id);
+      return value === 1;
+    });
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = new Set()));
+    list.add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  _fire(type, fields = {}) {
+    const event = new WebViewEvent(type, fields);
+    const handler = this["on" + type];
+    if (typeof handler === "function") handler.call(this, event);
+    for (const listener of this.#listeners.get(type) ?? []) listener.call(this, event);
+  }
+
+  #command(name, ...fields) {
+    if (this.#closed) return;
+    shellCall(12, [this.id, name, ...fields]);
+  }
+
+  #ask(name, ...fields) {
+    if (this.#closed) return Promise.reject(new Error("the web view is closed"));
+    return new Promise((resolve, reject) => {
+      const request = webRequest(resolve, reject);
+      this.#command(name, request, ...fields);
+    });
+  }
+
+  navigate(url) { this.url = String(url); this.#command("navigate", this.url); }
+  /** Shows `html` as if loaded from `baseUrl`. */
+  loadHtml(html, baseUrl = "") { this.#command("loadHtml", baseUrl, html); }
+  back() { this.#command("back"); }
+  forward() { this.#command("forward"); }
+  reload() { this.#command("reload"); }
+  /** Reloads bypassing the cache. */
+  hardReload() { this.#command("hardReload"); }
+  stop() { this.#command("stop"); }
+  /** Page zoom, 1 for 100%. */
+  setZoom(factor) { this.#command("zoom", thousandths(factor)); }
+  /** Gives the page keyboard focus. */
+  focus() { this.#command("focus"); }
+  /** Opens the engine's developer tools (Web Inspector on macOS). */
+  openDevTools() { this.#command("devtools"); }
+  setAudioMuted(muted) { this.#command("mute", muted ? 1 : 0); }
+  /** The color scheme the page sees: `"system"`, `"light"` or `"dark"`. */
+  setColorScheme(scheme) { this.#command("scheme", scheme === "light" || scheme === "dark" ? scheme : "system"); }
+  /** Shows or hides the view; a hidden view keeps its page. */
+  setShown(shown) { if (!this.#closed) shellCall(14, [this.id, shown ? 1 : 0]); }
+
+  /** Runs `script` in the page; resolves to its value (a promise is awaited), JSON-cloned. */
+  evaluate(script) {
+    return this.#ask("evaluate", String(script)).then((json) => (json === "" ? undefined : JSON.parse(json)));
+  }
+
+  /** A text outline of what the page shows, with refs (`[ref=e12]`) on what an agent can act on. */
+  snapshot() { return this.#ask("snapshot"); }
+
+  /** The page's pixels: `{ width, height, data }`, RGBA rows top first, in device pixels. */
+  screenshot() { return this.#ask("screenshot"); }
+
+  /** Scrolls element `ref` (a snapshot ref) into view and clicks it with real input. */
+  clickElement(ref) { return this.#ask("click", String(ref)); }
+
+  /** Focuses element `ref`, selects its value and types `text` over it with real input. */
+  fillElement(ref, text) { return this.#ask("fill", String(ref), String(text)); }
+
+  /** A click at a point of the page's viewport, in CSS pixels. */
+  clickAt(x, y, { button = 0, clickCount = 1, modifiers = 0 } = {}) {
+    this.#command("clickAt", thousandths(x), thousandths(y), button, clickCount, modifiers);
+  }
+
+  movePointer(x, y, { modifiers = 0 } = {}) { this.#command("move", thousandths(x), thousandths(y), modifiers); }
+
+  /** A wheel turn over a point, deltas in CSS pixels. */
+  scroll(x, y, deltaX, deltaY, { modifiers = 0 } = {}) {
+    this.#command("scroll", thousandths(x), thousandths(y), thousandths(deltaX), thousandths(deltaY), modifiers);
+  }
+
+  /** Types `text` into whatever has focus in the page. */
+  typeText(text) { this.#command("type", String(text)); }
+
+  /** Presses one key, by its DOM `key` value (`"Enter"`, `"a"`); modifiers shift 1, control 2, alt 4, meta 8. */
+  pressKey(key, modifiers = 0) { this.#command("key", modifiers, String(key)); }
+
+  /** Answers a `navigationrequest` event. */
+  answerNavigation(request, allow) { this.#command("answer", request, allow ? 1 : 0); }
+
+  /**
+   * Finds `text` in the page (case insensitive) and highlights the next match, or the previous
+   * one when `forward` is false; resolves to `{ matches, activeMatchOrdinal }`.
+   */
+  findInPage(text, { forward = true, newSession = false } = {}) {
+    return this.#ask("find", forward ? 1 : 0, newSession ? 1 : 0, String(text));
+  }
+
+  stopFindInPage() { this.#command("stopFind"); }
+
+  /** Closes the view; its page goes. */
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    shellCall(11, [this.id]);
+  }
+}
+
+/**
+ * Shows a web view over `node` (any node: the page covers its border box). Options: `url`,
+ * `profile` (a name keeps cookies and storage between runs; empty forgets them),
+ * `inspectable` (default true), `askBeforeNavigating`, `transparent`.
+ */
+export function createWebView(node, options = {}) {
+  return new WebView(node, options);
+}
+
+/**
+ * Clears what the pages of profile `profile` stored (an empty name: the views opened without
+ * one): `cookies` (cookies and site storage) and `cache`.
+ */
+export function clearWebViewData({ profile = "", cookies = true, cache = true } = {}) {
+  return new Promise((resolve) => {
+    const request = ++nextWebRequest;
+    dataClears.set(request, resolve);
+    shellCall(13, [request, cookies ? 1 : 0, cache ? 1 : 0, profile]);
+  });
+}
+
+function webViewEvent(id, code, text) {
+  const parts = text === "" ? [] : text.split("\x1f");
+  // The last field of each event may hold the separator itself.
+  const rest = (from) => parts.slice(from).join("\x1f");
+  if (code === 21) {
+    const request = Number(parts[0]);
+    const resolve = dataClears.get(request);
+    dataClears.delete(request);
+    resolve?.();
+    return;
+  }
+  const view = webViews.get(id);
+  if (!view) return;
+  switch (code) {
+    case 1: view._fire("created"); break;
+    case 2:
+      webViews.delete(id);
+      view._fire("closed");
+      break;
+    case 3:
+      view.loading = true;
+      view._fire("loadstart", { url: rest(0) });
+      break;
+    case 4:
+      view.progress = Number(parts[0]) / 1000;
+      view._fire("loadprogress", { progress: view.progress });
+      break;
+    case 5:
+      view.loading = false;
+      view._fire("loadend", { ok: parts[0] === "1", url: parts[1] ?? "", error: rest(2) });
+      break;
+    case 6:
+      view.url = rest(0);
+      view._fire("urlchange", { url: view.url });
+      break;
+    case 7:
+      view.title = rest(0);
+      view._fire("titlechange", { title: view.title });
+      break;
+    case 8:
+      view.canGoBack = parts[0] === "1";
+      view.canGoForward = parts[1] === "1";
+      view._fire("historychange", { canGoBack: view.canGoBack, canGoForward: view.canGoForward });
+      break;
+    case 9:
+      view._fire("navigationrequest", { request: Number(parts[0]), userInitiated: parts[1] === "1", url: rest(2) });
+      break;
+    case 10: view._fire("newwindow", { url: rest(0) }); break;
+    case 11:
+      view.focused = parts[0] === "1";
+      view._fire("focuschange", { focused: view.focused });
+      break;
+    case 12: settleWebRequest(Number(parts[0]), parts[1] === "1", rest(2), rest(2)); break;
+    case 13: settleWebRequest(Number(parts[0]), true, rest(1)); break;
+    case 14:
+      settleWebRequest(Number(parts[0]), true, {
+        width: Number(parts[1]),
+        height: Number(parts[2]),
+        data: decodeBase64(parts[3] ?? ""),
+      });
+      break;
+    case 15: settleWebRequest(Number(parts[0]), parts[1] === "1", undefined, rest(2) || "the action failed"); break;
+    case 16: view._fire("console", { level: CONSOLE_LEVELS[Number(parts[0])] ?? "log", message: rest(1) }); break;
+    case 17: {
+      const command = rest(1);
+      if (Number(parts[0])) settleWebRequest(Number(parts[0]), false, undefined, command + " is not supported here");
+      view._fire("unsupported", { command });
+      break;
+    }
+    case 18: view._fire("crashed", { reason: rest(0) }); break;
+    case 19:
+      view.favicon = rest(0);
+      view._fire("faviconchange", { url: view.favicon });
+      break;
+    case 20:
+      settleWebRequest(Number(parts[0]), true, { matches: Number(parts[1]), activeMatchOrdinal: Number(parts[2]) });
+      break;
+  }
+}
+
 /** Stops the shortcut of `accelerator`. */
+/** Ends the app with an exit code once the current turn finishes. */
+export function quit(code = 0) {
+  shellCall(15, [String(code)]);
+}
+
 export function unregisterShortcut(accelerator) {
   const { code, bits } = parseShortcut(accelerator);
   const id = shortcutIds.get(code + "+" + bits);
