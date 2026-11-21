@@ -13,6 +13,7 @@ import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.num.i32
 import silk.num.f64
+import silk.num.f32
 import silk.num.u8
 import silk.num.u16
 import silk.collections.slice { Slice }
@@ -59,12 +60,15 @@ import silkjs.js_bytecode_image as image
 import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
+import codec.decode
+import codec.image { Image }
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
 import ui_js_calls.supports as supports
 import ui_js_calls.natives { Natives, NativeCall, Reply }
 import ui_js_calls.gpu { GpuReply }
 import generated_webgpu_api { gpuApi }
+import generated_canvas2d_api { canvas2dApi }
 import silkjs.js_buffer_storage { ViewObject }
 import silkjs.js_buffer_storage as buffers
 import ui_js_calls.lib { Arg, Applied, setAttribute, nodeKind, styleState, declarationsOf, applyStyle, unpackMarks, unpackAtoms, same }
@@ -215,6 +219,25 @@ pub const UNOBSERVE: u32 = 571481 // nativeId(b"unobserve")
 pub const QUERY: u32 = 1055226 // nativeId(b"query")
 /// `__ui.webApis()`: the source of `web_apis.js`, which the prelude evaluates on first use.
 pub const WEB_APIS: u32 = 588983 // nativeId(b"webApis")
+/// `__ui.canvas2d(bytes)`: Canvas 2D commands (`canvas2d.js` wrote them into the typed array
+/// `bytes`, as `ui_tree.canvas2d` reads them), drawn into the canvases' bitmaps at once.
+pub const CANVAS2D: u32 = 939184 // nativeId(b"canvas2d")
+/// `__ui.canvas2dApi()`: the source of `canvas2d.js`, which the prelude evaluates on first use.
+pub const CANVAS2D_API: u32 = 348713 // nativeId(b"canvas2dApi")
+/// `__ui.canvas2dText(font, text)`: `measureText`. Returns 7 and leaves the advance, the font's
+/// ascent and descent and the ink's left, right, ascent and descent for `__ui.geometry(index)`.
+pub const CANVAS2D_TEXT: u32 = 1011478 // nativeId(b"canvas2dText")
+/// `__ui.canvas2dRead(node, x, y, width, height, into)`: `getImageData` into typed array `into`.
+pub const CANVAS2D_READ: u32 = 951167 // nativeId(b"canvas2dRead")
+/// `__ui.canvas2dEnabled()`: whether the host shows 2D canvases (`getContext("2d")` works).
+pub const CANVAS2D_ENABLED: u32 = 415108 // nativeId(b"canvas2dEnabled")
+/// `__ui.imageDecode(bytes)`: decodes the PNG or JPEG file in typed array `bytes`, for
+/// `createImageBitmap`. Returns 2 and leaves the width and height for `__ui.geometry`, or 0 for
+/// data it cannot decode. The pixels wait for `__ui.imageTake`.
+pub const IMAGE_DECODE: u32 = 137512 // nativeId(b"imageDecode")
+/// `__ui.imageTake(into)`: the last decoded image's pixels into typed array `into`, as straight
+/// (not premultiplied) RGBA as `ImageData` holds them, and forgets them.
+pub const IMAGE_TAKE: u32 = 361895 // nativeId(b"imageTake")
 /// `__ui.gpu(bytes)`: WebGPU commands (`webgpu.js` wrote them into the typed array `bytes`) for
 /// the host's GPU service, which takes them once the JavaScript turn ended.
 pub const GPU: u32 = 168108 // nativeId(b"gpu")
@@ -388,10 +411,14 @@ pub struct Bridge {
   pub battery: BatteryState,
   /// The numbers of the last layout read, for `__ui.geometry`.
   pub geometry: List<f64>,
+  /// The image `__ui.imageDecode` decoded last, until `__ui.imageTake` takes it.
+  pub decoded: Option<Image>,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
   /// Whether the host runs WebGPU commands.
   pub gpuEnabled: bool,
+  /// Whether the host shows what 2D canvases draw.
+  pub canvas2dEnabled: bool,
   /// The WebGPU commands JavaScript wrote since the host last took them (`__ui.gpu`).
   pub gpuCommands: List<u8>,
   /// What the host's GPU service answered, while `__ui.gpuReplies` reads them.
@@ -416,12 +443,24 @@ pub struct StartedNative {
 /// - 0, notify: title, body; answered with the notification's id, 0 when none was shown.
 /// - 1, set the tray: tooltip, width, height, template (0 or 1), RGBA pixels as hex, then the
 ///   menu, one entry per line: `B<title>` opens a submenu, `E` closes it, `S` is a separator
-///   and `A<action>,<enabled>,<checked>,<title>` an item. Answered with 1 when it shows.
+///   and `A<action>,<enabled>,<checked>,<key>,<modifiers>,<title>` an item (see 7). Answered
+///   with 1 when it shows.
 /// - 2, remove the tray.
 /// - 3, register a global shortcut: id, UI Events `code`, modifier bits (shift 1, control 2,
 ///   alt 4, meta 8, 16 for Command on macOS and Control elsewhere); answered with 1 when
 ///   the system took it.
 /// - 4, unregister a global shortcut: id.
+/// - 5, an open dialog: title, folder, flags (files 1, folders 2, several 4), extensions
+///   separated by commas; 6, a save dialog: title, folder, file name, extensions. Answered
+///   with the dialog's id; the paths come with its `shellEvent`.
+/// - 7, the menu bar, and 8, a context menu: x, y, then the menu, as the tray's with `R<n>`
+///   for a system item and items `A<action>,<enabled>,<checked>,<key>,<modifiers>,<title>`
+///   (key empty, `c` and a character, or `n` and a key name). The context menu answers 1
+///   when it shows.
+/// - 9, the badge: text; 10, progress: fraction; 11, open a URL; 12, reveal a path; 13, drag
+///   files out: paths, one per line. Answered with 1 when done.
+/// - 14, the window: 0 toggles full screen, 1 minimizes, 2 shows and focuses, 3 hides, 4 sets
+///   the title (the next field). 15, the page zoom: answered with the zoom now.
 pub struct ShellRequest {
   pub call: u32,
   pub op: u32,
@@ -579,8 +618,10 @@ impl Bridge {
       media: MediaState.initial(expectedScale()),
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
+      decoded: Option<Image>.None,
       observers: Observers.make(),
       gpuEnabled: false,
+      canvas2dEnabled: false,
       gpuCommands: List<u8>.make(),
       gpuReplies: List<GpuReply>.make(),
       calls: 0,
@@ -734,7 +775,14 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"source", arity: 2 },
     Native { name: b"style", arity: 3 },
     Native { name: b"caret", arity: 2 },
+    Native { name: b"canvas2d", arity: 1 },
+    Native { name: b"canvas2dApi", arity: 0 },
+    Native { name: b"canvas2dEnabled", arity: 0 },
+    Native { name: b"canvas2dRead", arity: 6 },
+    Native { name: b"canvas2dText", arity: 2 },
     Native { name: b"geometry", arity: 1 },
+    Native { name: b"imageDecode", arity: 1 },
+    Native { name: b"imageTake", arity: 1 },
     Native { name: b"gpu", arity: 1 },
     Native { name: b"gpuApi", arity: 0 },
     Native { name: b"gpuEnabled", arity: 0 },
@@ -998,6 +1046,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     let query = run text(argv.get(0))
     let media = bridge.media
     return Outcome.Returned { value: ValueBits.Bool { value: run media.matches(String.utf8Bytes(String.view(&query))) } }
+  } else if function == IMAGE_DECODE || function == IMAGE_TAKE {
+    return run imageCall(&mut bridge.*, function, argv)
   } else if function == GEOMETRY {
     let at = f64.toUsize(number(argv.get(0).view()))
     let value = if at < bridge.geometry.length() { bridge.geometry.get(at) } else { 0.0 }
@@ -1041,6 +1091,14 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     return Outcome.Returned { value: ValueBits.Bool { value: answer } }
   } else if function == QUERY {
     return run query(&mut bridge.*, first, id(argv.get(1).view()), argv.get(2))
+  } else if function == CANVAS2D || function == CANVAS2D_TEXT || function == CANVAS2D_READ {
+    return run canvas2d(&mut bridge.*, function, argv)
+  } else if function == CANVAS2D_API {
+    let made = run Effect.result(Strings.fromUtf8(canvas2dApi()))
+    return match move made {
+      Result.Success { value: text } => Outcome.Returned { value: text }
+      Result.Failure { .. } => { fail OutOfMemoryError {} }
+    }
   } else if function == GPU {
     if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
       let anchor: u8 = 0
@@ -1054,6 +1112,8 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     }
   } else if function == GPU_ENABLED {
     return Outcome.Returned { value: ValueBits.Bool { value: bridge.gpuEnabled } }
+  } else if function == CANVAS2D_ENABLED {
+    return Outcome.Returned { value: ValueBits.Bool { value: bridge.canvas2dEnabled } }
   } else if function == GPU_REPLY {
     let replies = bridge.gpuReplies.asSlice()
     let at = u32.toUsize(first)
@@ -1267,6 +1327,100 @@ effect fn geometry<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
         Outcome.TypeError { message: move message }
       }
     }
+  }
+}
+
+/// The Canvas 2D calls, which draw into and read the attached tree's canvas bitmaps.
+effect fn canvas2d<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.number(0.0) } }
+  let mut anchor: u8 = 0
+  let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+    &mut anchor,
+    unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+  )
+  if function == CANVAS2D {
+    if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
+      let anchor: u8 = 0
+      run tree.drawCanvas2d(unsafe Pointer.borrowMany<u8, u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(bytes.data), bytes.length))
+    }
+    return Outcome.Returned { value: ValueBits.Undefined }
+  }
+  if function == CANVAS2D_TEXT {
+    let font = run text(argv.get(0))
+    let value = run text(argv.get(1))
+    let m = run tree.measureCanvasText(String.utf8Bytes(String.view(&font)), String.utf8Bytes(String.view(&value)))
+    bridge.geometry.clear()
+    run bridge.geometry.append(f32.toF64(m.width))
+    run bridge.geometry.append(f32.toF64(m.ascent))
+    run bridge.geometry.append(f32.toF64(m.descent))
+    run bridge.geometry.append(f32.toF64(m.inkLeft))
+    run bridge.geometry.append(f32.toF64(m.inkRight))
+    run bridge.geometry.append(f32.toF64(m.inkAscent))
+    run bridge.geometry.append(f32.toF64(m.inkDescent))
+    return Outcome.Returned { value: ValueBits.number(7.0) }
+  }
+  if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(5)) {
+    let mut into: u8 = 0
+    let out = unsafe Pointer.borrowManyMut<u8, u8>(&mut into, bytes.data, bytes.length)
+    let x = f64.toI32(number(argv.get(1).view()))
+    let y = f64.toI32(number(argv.get(2).view()))
+    tree.canvas2d.read(id(argv.get(0).view()), x, y, id(argv.get(3).view()), id(argv.get(4).view()), &mut out)
+  }
+  return Outcome.Returned { value: ValueBits.Undefined }
+}
+
+effect fn imageCall<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if function == IMAGE_TAKE {
+    if let Option<Image>.Some { value: picture } = &bridge.decoded {
+      if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
+        let mut into: u8 = 0
+        let out = unsafe Pointer.borrowManyMut<u8, u8>(&mut into, bytes.data, bytes.length)
+        straightAlpha(picture.data(), &mut out)
+      }
+    }
+    bridge.decoded = Option<Image>.None
+    return Outcome.Returned { value: ValueBits.Undefined }
+  }
+  bridge.decoded = Option<Image>.None
+  let bytes = match move viewBytes(argv.get(0)) {
+    Option<ViewBytes>.Some { value } => move value
+    Option<ViewBytes>.None => { return Outcome.Returned { value: ValueBits.number(0.0) } }
+  }
+  let anchor: u8 = 0
+  let data = unsafe Pointer.borrowMany<u8, u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(bytes.data), bytes.length)
+  let picture = match move run Effect.result(decode.decodeSrgb(data)) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      OutOfMemoryError failure => { fail move failure }
+      _ => {
+        return Outcome.Returned { value: ValueBits.number(0.0) }
+      }
+    }
+  }
+  bridge.geometry.clear()
+  run bridge.geometry.append(u32.toF64(picture.width()))
+  run bridge.geometry.append(u32.toF64(picture.height()))
+  bridge.decoded = Option<Image>.some(move picture)
+  return Outcome.Returned { value: ValueBits.number(2.0) }
+}
+
+/// Premultiplied RGBA `from` as straight RGBA in `into`, as far as both reach.
+fn straightAlpha(from: &[u8], into: &mut [u8]) -> () {
+  let length = if from.length < into.length { from.length } else { into.length }
+  let mut i: usize = 0
+  while i + 3 < length {
+    let alpha = u8.toU32(from[i + 3])
+    if alpha == 255 || alpha == 0 {
+      into[i] = from[i]
+      into[i + 1] = from[i + 1]
+      into[i + 2] = from[i + 2]
+    } else {
+      into[i] = u32.toU8((u8.toU32(from[i]) * 255 + alpha / 2) / alpha)
+      into[i + 1] = u32.toU8((u8.toU32(from[i + 1]) * 255 + alpha / 2) / alpha)
+      into[i + 2] = u32.toU8((u8.toU32(from[i + 2]) * 255 + alpha / 2) / alpha)
+    }
+    into[i + 3] = from[i + 3]
+    i = i + 4
   }
 }
 

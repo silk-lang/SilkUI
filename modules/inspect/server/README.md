@@ -11,8 +11,9 @@ request, read the reply) and the MCP bridge (`mcp`) live here too, so both share
 
 It is off unless both hold:
 
-- the app is a debug build (`optimization = "none"`; `InspectorOptions.releaseBuilds` lifts this
-  for tests), and
+- the build has the development tools (`devtools.enabled`: on by default without optimization,
+  and bound on for a JavaScript app's optimized development host; `InspectorOptions.releaseBuilds`
+  lifts this for tests), and
 - `SILK_UI_INSPECT` is set:
   - `1`: the Unix socket `silk-ui-inspect.sock` in the working directory (TCP port 7357 on
     Windows, where std has no Unix sockets)
@@ -50,8 +51,30 @@ current), as `pick` and screenshots are about the current root.
 A thread accepts clients, and each connection gets a pump (`channel.bridge`, two threads: one
 reads the socket, one writes) that queues its lines for the UI thread. The frame loop only
 touches those queues: `poll` serves at most one waiting line per call, then yields to native
-input and timers, so neither waiting for clients nor a slow client ever blocks it. Screenshot
-rendering is synchronous.
+input and timers, so neither waiting for clients nor a slow client ever blocks it.
+
+### Screenshots without stopping the app
+
+Drawing a screenshot on the CPU stops the loop for as long as it takes, seconds in a debug
+build: every animation freezes, and timed captures sample a stalled app. A host that can read
+the frames it draws back from the GPU calls `inspector.liveFrames(true)`. A screenshot then
+waits for a copy of the next frame instead (`shots.silk`):
+
+```silk
+if let Option<Grab>.Some { value } = renderer.takeGrab() {      // the copy, a frame later
+  run inspector.frameCopy(&tree, move value.rows, value.stride, value.width, value.height, value.bgra, value.ok)
+}
+if run inspector.poll(&mut tree) { ... }
+if inspector.wantsFrameCopy() { renderer.grab() }             // copy the next frame drawn
+```
+
+The copy is unpacked, cropped to the target, reduced to `maxWidth` and encoded as PNG on a
+worker thread, and the reply goes to the session that asked when it is done (`pollInterval`
+is 5 ms while one is on its way). The UI thread only queues the copy. `frameCopy` with `ok`
+false (a surface that cannot be read back) answers the waiting screenshots on the CPU and
+turns `liveFrames` off. Screenshots without the highlight while one is shown, headless runs
+and in-process sessions still draw on the CPU, synchronously. A reply from a frame copy says
+`"source": "gpu"`. The window host in `modules/tree/window` does all of this.
 
 `inspector.wakeWith(wake)` hands the inspector a `Wake` (the window host passes its `Nudge`,
 the same one a `Poster` uses), and an arriving line ends the loop's wait for the next event;
@@ -164,7 +187,7 @@ Node objects in replies are `{"id", "kind", "role", "name", "testId", "x", "y", 
 | `inspect` | target, `patches`, `computed` | `node`, `text`: the devtools-style node view; `box`: the `margin`, `border`, `padding` and `content` rects of the first fragment and the `fragments` count (left out when the node has no box) |
 | `pick` | `x`, `y` | `node` (what the element picker selects), `path` (ids hit testing reaches) |
 | `highlight` | `nodes` (ids) or a target (all matches), washed and outlined; `selected` (ids), ringed; none clears it | `nodes` and `selected` highlighted |
-| `screenshot` | target (optional: that node alone, cropped), `highlight` (default true), `maxWidth` (optional 1–4096, reduce before encoding) | `png` (Base64), `width`, `height` (device pixels), `scale`, `frame`, `node` |
+| `screenshot` | target (optional: that node alone, cropped), `highlight` (default true), `maxWidth` (optional 1–4096, reduce before encoding) | `png` (Base64), `width`, `height` (device pixels), `scale`, `frame`, `node`; `source: "gpu"` when it is a copy of the frame the window drew (see Screenshots without stopping the app) |
 | `click` | target or `x`, `y`; `count`, `modifiers` | `node`, `x`, `y` |
 | `hover` | target or `x`, `y`; `modifiers` | `node`, `x`, `y` |
 | `scroll` | target or `x`, `y`; `dx`, `dy` (positive scrolls down); `modifiers` | `node`, `x`, `y` |
@@ -306,8 +329,10 @@ frame number identifies composition, not proof of physical screen presentation.
 Timed mosaics are a **client operation**, available through MCP `ui_capture` and CLI `capture`.
 The client takes repeated `screenshot` samples, preserving repeated source frame numbers and
 actual elapsed times. It waits outside the app and returns one PNG contact sheet; no sleeps
-are introduced into the app's event loop. CPU capture itself has a cost, so use the sequence
-to diagnose visual state changes, not to measure FPS.
+are introduced into the app's event loop. In a window, each sample is a frame the window drew,
+copied back from the GPU and encoded off the UI thread, so the app keeps animating while it is
+captured; elsewhere samples are CPU drawings with their own cost. Use the sequence to diagnose
+visual state changes, not to measure FPS.
 
 ```text
 $ SILK_UI_INSPECT=1 ui-tree-demo &

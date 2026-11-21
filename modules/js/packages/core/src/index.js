@@ -14,19 +14,23 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starti
 
 // Event types by the kind number the host dispatches. Up to `selectionchange`, `pointerover`
 // and `pointerout` the kind is also the bit of the tree's LISTEN_* flags a node listens with;
-// copy, cut and paste share bit 30, and beforeinput has bit 31 (see `bitOf`).
+// `error` shares the bit of `load`, the touch kinds share bit 30, copy, cut, paste and
+// beforeinput bit 31, and the requests (closerequest, navigate) bit 18 (see `bitOf`).
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
   "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
-  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput",
+  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput", "closerequest", "navigate",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
 // The live `Range`s (see Range below), held weakly: a range nobody holds stops being updated.
 const liveRanges = new Set();
+// The `MutationObserver`s observing a node (see MutationObserver below). While there are none
+// a mutation costs one size check.
+const mutationObservers = new Set();
 
 function eachLiveRange(update) {
   for (const ref of liveRanges) {
@@ -37,14 +41,23 @@ function eachLiveRange(update) {
 }
 
 const CLICK = KIND_OF.get("click");
+const FOCUS = KIND_OF.get("focus");
+const BLUR = KIND_OF.get("blur");
 const SELECTION_CHANGE = KIND_OF.get("selectionchange");
 const TOUCH_START = KIND_OF.get("touchstart");
 const COPY = KIND_OF.get("copy");
 const CUT = KIND_OF.get("cut");
 const PASTE = KIND_OF.get("paste");
 const BEFORE_INPUT = KIND_OF.get("beforeinput");
-// The listen bit of a kind: the touch kinds share bit 30, copy, cut, paste and beforeinput bit 31.
-const bitOf = (kind) => (kind < TOUCH_START ? kind : kind < COPY ? 30 : 31);
+const LOAD = KIND_OF.get("load");
+const ERROR = KIND_OF.get("error");
+const CLOSE_REQUEST = KIND_OF.get("closerequest");
+const NAVIGATE = KIND_OF.get("navigate");
+// The listen bit of a kind: `error` shares the bit of `load`, the touch kinds share bit 30,
+// copy, cut, paste and beforeinput bit 31, and the two requests have the bit after `load`.
+const bitOf = (kind) =>
+  kind === ERROR ? LOAD : kind < TOUCH_START ? kind : kind < COPY ? 30 : kind < CLOSE_REQUEST ? 31 : LOAD + 1;
+const SHARES_BIT = (kind) => kind >= TOUCH_START || kind === LOAD || kind === ERROR;
 const KINDS_OF_BIT = (bit) => TYPES.map((_, kind) => kind).filter((kind) => bitOf(kind) === bit);
 // Compatibility mouse events, as the web fires them after pointer events: each listens
 // through the pointer kind it follows.
@@ -66,6 +79,7 @@ const NO_BUBBLE = new Set([
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
   "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart", "copy", "cut", "paste", "beforeinput",
+  "closerequest", "navigate",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -78,6 +92,10 @@ const UNITLESS = new Set([
 ]);
 
 const nodes = new Map();
+// HTML boolean attributes that are also the tree's own.
+const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline"]);
+// The tag stylesheets match a tree node by, by its kind (see ui-tree's `SelectorTree`).
+const LOCAL_NAMES = { box: "div", input: "input", image: "img", canvas: "canvas", svg: "svg", text: "#text" };
 const NO_CHILDREN = Object.freeze([]);
 let nextId = 0;
 
@@ -92,6 +110,68 @@ function cssName(name) {
     CSS_NAMES.set(name, css);
   }
   return css;
+}
+
+// A CSS name as the camel case name looks take: `background-color` is `backgroundColor`,
+// `-webkit-line-clamp` is `WebkitLineClamp`; custom properties stay as they are.
+function camelName(name) {
+  if (name.startsWith("--") || !name.includes("-")) return name;
+  return name.replace(/^-ms-/, "ms-").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+// `color: red; --gap: 4px` as camel case properties. Semicolons inside parentheses or
+// quotes (`url("a;b")`) stay in their value.
+function parseDeclarations(text) {
+  const properties = {};
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  const take = (end) => {
+    const part = text.slice(start, end);
+    const colon = part.indexOf(":");
+    if (colon > 0) {
+      const name = part.slice(0, colon).trim();
+      const value = part.slice(colon + 1).trim();
+      if (name && value) properties[camelName(name.startsWith("--") ? name : name.toLowerCase())] = value;
+    }
+    start = end + 1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === ";" && depth <= 0) take(i);
+  }
+  take(text.length);
+  return properties;
+}
+
+// `element.style` of an HTML element: the base look, whose CSS properties also read and write
+// as fields (`style.height = "10px"`), as a CSSStyleDeclaration's do.
+const styleProxies = new WeakMap();
+function styleProxy(look) {
+  let proxy = styleProxies.get(look);
+  if (proxy) return proxy;
+  proxy = new Proxy(look, {
+    get(target, key) {
+      if (typeof key !== "string" || key in target) {
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return target.get(key) ?? "";
+    },
+    set(target, key, value) {
+      if (typeof key !== "string" || key in target) return Reflect.set(target, key, value, target);
+      target.set({ [key]: value });
+      return true;
+    },
+  });
+  styleProxies.set(look, proxy);
+  return proxy;
 }
 
 // The tree names font family lists by number: each `fontFamily` text is defined once, as a
@@ -117,6 +197,10 @@ function cssValue(name, value) {
 }
 
 const warned = new Set();
+// Style elements, and those in the document's sheets now (see `StyleElement`).
+const styleElements = new Set();
+let appliedStyles = [];
+let stylesPending = false;
 
 function warnOnce(message) {
   if (warned.has(message)) return;
@@ -195,6 +279,41 @@ class Look {
     return css;
   }
 
+  /** Replaces the look with declarations in CSS text, as `element.style.cssText`. */
+  set cssText(text) {
+    this.replace(parseDeclarations(String(text ?? "")));
+  }
+
+  get length() {
+    return Object.keys(this.#values).length;
+  }
+
+  item(index) {
+    const name = Object.keys(this.#values)[index];
+    return name === undefined ? "" : cssName(name);
+  }
+
+  // CSSStyleDeclaration's methods, which take CSS names (`background-color`, `--gap`).
+  setProperty(name, value, priority) {
+    const text = value === null || value === undefined ? "" : String(value) + (priority === "important" ? " !important" : "");
+    this.set({ [camelName(String(name))]: text });
+  }
+
+  removeProperty(name) {
+    const camel = camelName(String(name));
+    const old = this.get(camel) ?? "";
+    this.set({ [camel]: null });
+    return old;
+  }
+
+  getPropertyValue(name) {
+    return this.get(camelName(String(name))) ?? "";
+  }
+
+  getPropertyPriority() {
+    return "";
+  }
+
   _copyTo(look) {
     look.#values = Object.assign(Object.create(null), this.#values);
     const css = this.cssText;
@@ -214,6 +333,39 @@ function classToken(value) {
 }
 
 /** A live token list backed by the node's class attribute. */
+// `element.dataset`: a DOMStringMap over the `data-*` attributes, `fooBar` for `data-foo-bar`.
+function datasetOf(element) {
+  const attribute = (key) => typeof key === "string" && !/-[a-z]/.test(key) ? "data-" + key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()) : null;
+  const keys = () => element.getAttributeNames().filter((name) => name.startsWith("data-")).map((name) => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()));
+  return new Proxy(Object.create(null), {
+    get(_, key) {
+      const name = attribute(key);
+      return name === null ? undefined : element.getAttribute(name) ?? undefined;
+    },
+    set(_, key, value) {
+      const name = attribute(key);
+      if (name === null) throw new (globalThis.DOMException ?? Error)("'" + String(key) + "' is not a valid dataset name", "SyntaxError");
+      element.setAttribute(name, String(value));
+      return true;
+    },
+    deleteProperty(_, key) {
+      const name = attribute(key);
+      if (name !== null) element.removeAttribute(name);
+      return true;
+    },
+    has(_, key) {
+      const name = attribute(key);
+      return name !== null && element.hasAttribute(name);
+    },
+    ownKeys: keys,
+    getOwnPropertyDescriptor(_, key) {
+      const name = attribute(key);
+      const value = name === null ? null : element.getAttribute(name);
+      return value === null ? undefined : { value, writable: true, enumerable: true, configurable: true };
+    },
+  });
+}
+
 export class ClassList {
   #node;
   constructor(node) { this.#node = node; }
@@ -339,7 +491,9 @@ function clearAdoptedSheets() {
 function syncAdoptedSheets() {
   if (!rootNode) return;
   clearAdoptedSheets();
-  const sheets = [...importedSheets.values(), ...(adoptedLists.get(rootNode)?.values ?? [])];
+  const sheets = [...importedSheets.values()];
+  for (const element of appliedStyles) if (element._styleSheet) sheets.push(element._styleSheet);
+  sheets.push(...(adoptedLists.get(rootNode)?.values ?? []));
   for (const sheet of sheets) {
     if (nextSheet >= 0x80000000) throw new RangeError("Too many stylesheet adoptions");
     const entry = { sheet, id: nextSheet++, live: false };
@@ -426,6 +580,7 @@ class NodeState {
   kept = 0;
   attributes = null;
   classList = null;
+  dataset = null;
 }
 
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
@@ -481,9 +636,39 @@ export class Node {
     return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
   }
 
+  /** Whether the node is in the mounted tree. */
+  get isConnected() {
+    return inDocument(this);
+  }
+
   /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
   get nodeType() {
     return 1;
+  }
+
+  /**
+   * The element's tag: the HTML tag it was made with (see `createElement`), or for a tree
+   * node the tag stylesheets match it by (`div` for a box).
+   */
+  get localName() {
+    return this._tag ?? LOCAL_NAMES[this.kind] ?? "div";
+  }
+
+  set localName(value) {
+    this._tag = String(value);
+  }
+
+  /** The tag in upper case for HTML elements, as in the DOM. */
+  get tagName() {
+    const name = this.localName;
+    const namespace = this.namespaceURI;
+    return namespace === undefined || namespace === null || namespace === "http://www.w3.org/1999/xhtml" ? name.toUpperCase() : name;
+  }
+
+  set tagName(_value) {}
+
+  get nodeName() {
+    return this.tagName;
   }
 
   hasChildNodes() {
@@ -502,6 +687,7 @@ export class Node {
   }
 
   _shallowClone() {
+    if (this._tag !== undefined && this.constructor === Node) return createElement(this._tag);
     return new Node(this.kind);
   }
 
@@ -557,6 +743,7 @@ export class Node {
     if (old) {
       const index = old.childNodes.indexOf(child);
       if (liveRanges.size) eachLiveRange((range) => range._removing(child, old, index));
+      if (mutationObservers.size) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
       old.childNodes.splice(index, 1);
     }
     child.parentNode = this;
@@ -571,6 +758,8 @@ export class Node {
       this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
+    if (mutationObservers.size) childListRecord(this, child, null, child.previousSibling, before);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -599,9 +788,11 @@ export class Node {
     if (child.parentNode !== this) throw domError("NotFoundError", "the node to remove is not a child of this node");
     const index = this.childNodes.indexOf(child);
     if (liveRanges.size) eachLiveRange((range) => range._removing(child, this, index));
+    if (mutationObservers.size) childListRecord(this, null, child, this.childNodes[index - 1], this.childNodes[index + 1]);
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -616,11 +807,13 @@ export class Node {
     if (parent) {
       const index = parent.childNodes.indexOf(this);
       if (liveRanges.size) eachLiveRange((range) => range._removing(this, parent, index));
+      if (mutationObservers.size) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
       parent.childNodes.splice(index, 1);
       this.parentNode = null;
     }
     native.destroy(this.nodeId);
     forget(this);
+    if (styleElements.size) stylesChanged();
   }
 
   /**
@@ -628,11 +821,12 @@ export class Node {
    * `node.style = { ... }` replaces the look.
    */
   get style() {
-    return this.look("base");
+    return this._tag === undefined ? this.look("base") : styleProxy(this.look("base"));
   }
 
   set style(properties) {
-    this.look("base").replace(properties);
+    if (typeof properties === "string") this.look("base").cssText = properties;
+    else this.look("base").replace(properties);
   }
 
   /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
@@ -659,6 +853,8 @@ export class Node {
   get className() { return this.getAttribute("class") ?? ""; }
   set className(value) { this.setAttribute("class", String(value)); }
   get classList() { return this.#more().classList ??= new ClassList(this); }
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  get dataset() { return this.#more().dataset ??= datasetOf(this); }
 
   getAttribute(name) {
     name = String(name);
@@ -668,11 +864,34 @@ export class Node {
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
+
+  getAttributeNames() {
+    const names = this.#className === null ? [] : ["class"];
+    for (const name of this.#rare?.attributes?.keys() ?? []) names.push(name);
+    return names;
+  }
+
+  /** The children as HTML; setting it replaces them with nodes parsed from HTML. */
+  get innerHTML() {
+    let html = "";
+    for (const child of this.childNodes) html += markupOf(child);
+    return html;
+  }
+
+  set innerHTML(html) {
+    for (const child of this.childNodes.slice()) child.destroy();
+    parseHTML(String(html ?? ""), this);
+  }
+
+  get outerHTML() {
+    return markupOf(this);
+  }
   removeAttribute(name) { this.setAttribute(name, null); }
 
   setAttribute(name, value) {
     name = String(name);
-    const text = value == null ? null : String(value);
+    let text = value == null ? null : String(value);
+    if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
@@ -692,6 +911,25 @@ export class Node {
       else warnOnce("only an image has a src: it is ignored");
     } else if (name === "alt") {
       native.attribute(this.nodeId, "label", text ?? "");
+    } else if (this._tag !== undefined && (name === "tabindex" || name === "tabIndex")) {
+      this._keep("focus", "blur");
+      native.attribute(this.nodeId, "tabIndex", text === null ? -2147483648 : Number(text));
+    } else if (this._tag !== undefined && name === "style") {
+      this.style.cssText = text ?? "";
+    } else if (this._tag !== undefined && BOOLEAN_TREE_ATTRIBUTES.has(name)) {
+      // An HTML boolean attribute is on whatever its text, `disabled=""` included.
+      const on = value !== null && value !== undefined && value !== false;
+      text = on ? "" : null;
+      if (name === "checked" && "checked" in this) this.checked = on;
+      else native.attribute(this.nodeId, name === "readonly" ? "readOnly" : name, on);
+    } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
+      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`). One
+      // the tree does not know (React 19's `precedence`, a library's own) stays on the element.
+      try {
+        native.attribute(this.nodeId, name, text);
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -702,6 +940,38 @@ export class Node {
     }
     if (text === null) this.#rare?.attributes?.delete(name);
     else (this.#more().attributes ??= new Map()).set(name, text);
+    if (name === "contenteditable") this.#editableChanged();
+  }
+
+  // An editing host takes focus (as a tab stop, unless its tabindex says otherwise) and hears
+  // the tree's edits, which `hostEdit` makes.
+  #editableChanged() {
+    if (editableValue(this) === 1) {
+      this._keep("beforeinput", "focus", "blur");
+      if (!this.hasAttribute("tabindex")) native.attribute(this.nodeId, "tabIndex", 0);
+    } else if (!this.hasAttribute("tabindex") && !FOCUSABLE_TAGS.has(this._tag)) {
+      native.attribute(this.nodeId, "tabIndex", -2147483648);
+    }
+  }
+
+  /** "true", "false", "plaintext-only" or "inherit", from the `contenteditable` attribute. */
+  get contentEditable() {
+    const value = this.getAttribute("contenteditable");
+    if (value === null) return "inherit";
+    const lower = value.toLowerCase();
+    return lower === "" || lower === "true" ? "true" : lower === "false" || lower === "plaintext-only" ? lower : "inherit";
+  }
+
+  set contentEditable(value) {
+    const lower = String(value).toLowerCase();
+    if (lower === "inherit") this.removeAttribute("contenteditable");
+    else if (lower === "true" || lower === "false" || lower === "plaintext-only") this.setAttribute("contenteditable", lower);
+    else throw domError("SyntaxError", "contentEditable takes true, false, plaintext-only or inherit");
+  }
+
+  /** Whether the user can edit the element: it is in an editing host (see `contentEditable`). */
+  get isContentEditable() {
+    return editingHostOf(this) !== null;
   }
 
   // The `id` other nodes' relations name this node by.
@@ -718,16 +988,19 @@ export class Node {
     const rare = this.#rare;
     const old = rare?.flags ?? 0;
     const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
-    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === old) return;
+    this.#more().flags = flags;
+    // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
   #wanted(kind) {
     const listeners = this.#rare?.listeners;
     const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
-    if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
+    if (SHARES_BIT(kind)) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
-    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
+    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
     return [wanted, 1 << kind];
   }
@@ -740,7 +1013,9 @@ export class Node {
       if (wanted) flags |= bit;
     }
     flags >>>= 0;
-    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === (this.#rare?.flags ?? 0)) return;
+    this.#more().flags = flags;
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   _keep(...types) {
@@ -946,6 +1221,10 @@ export class Text extends Node {
     return 3;
   }
 
+  get nodeName() {
+    return "#text";
+  }
+
   get nodeValue() {
     return this.#data;
   }
@@ -1000,7 +1279,9 @@ export class Text extends Node {
     if (value === old && value !== "") return;
     this.#data = value;
     native.setText(this.nodeId, value);
+    if (mutationObservers.size) characterDataRecord(this, old);
     if (this._svgText) svgChanged(this);
+    if (styleElements.size && this.parentNode instanceof StyleElement) stylesChanged();
   }
 
   /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
@@ -1021,6 +1302,56 @@ export class Text extends Node {
 }
 
 Object.defineProperty(Text.prototype, "kind", { value: "text", writable: true, configurable: true });
+
+// `<br>`: to the tree a text node of U+2028, which breaks the line whatever `white-space`
+// says and gives an empty block its line, and to scripts an element with no children. Its
+// attributes stay here: the tree's text nodes have none.
+const LINE_BREAK = "\u2028";
+
+export class LineBreak extends Node {
+  #attributes = new Map();
+
+  constructor() {
+    super("text");
+    this.kind = "text";
+    this._tag = "br";
+    native.setText(this.nodeId, LINE_BREAK);
+  }
+
+  get nodeType() { return 1; }
+  get textContent() { return ""; }
+  set textContent(_value) {}
+  getAttribute(name) { return this.#attributes.get(String(name).toLowerCase()) ?? null; }
+  hasAttribute(name) { return this.#attributes.has(String(name).toLowerCase()); }
+  getAttributeNames() { return [...this.#attributes.keys()]; }
+  removeAttribute(name) { this.setAttribute(name, null); }
+
+  setAttribute(name, value) {
+    name = String(name).toLowerCase();
+    if (name === "classname") name = "class";
+    if (value == null) this.#attributes.delete(name);
+    else this.#attributes.set(name, String(value));
+  }
+
+  get className() { return this.getAttribute("class") ?? ""; }
+  set className(value) { this.setAttribute("class", value); }
+  appendChild() { throw domError("HierarchyRequestError", "a br has no children"); }
+  insertBefore() { throw domError("HierarchyRequestError", "a br has no children"); }
+
+  _shallowClone() {
+    const copy = new LineBreak();
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    return copy;
+  }
+
+  cloneNode() { return this._shallowClone(); }
+}
+
+// A point the tree has in a `<br>` (its text node), as a point in the br's parent.
+function fromTreePoint(node, offset) {
+  if (!(node instanceof LineBreak) || !node.parentNode) return [node, offset];
+  return [node.parentNode, indexIn(node) + (offset > 0 ? 1 : 0)];
+}
 
 /**
  * An editable text field. `value` follows what the user types. Selection offsets are UTF-16
@@ -1266,9 +1597,9 @@ export class Image extends Node {
 }
 
 /**
- * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
- * size of what is drawn in pixels (300 by 150 at first) and `getContext("webgpu")` gives a
- * `GPUCanvasContext`. The node lays out as an image of that size does: its style can
+ * A canvas the application draws with WebGPU or Canvas 2D, as a `<canvas>`: `width` and
+ * `height` are the size of what is drawn in pixels (300 by 150 at first), `getContext("webgpu")`
+ * gives a `GPUCanvasContext` and `getContext("2d")` a `CanvasRenderingContext2D`. The node lays out as an image of that size does: its style can
  * stretch it, and `objectFit` says how the drawing fits. Drawing happens on a GPU device of
  * the application's own, so a canvas that is slow to draw does not slow the rest of the window.
  */
@@ -1276,6 +1607,7 @@ export class Canvas extends Node {
   #width = 300;
   #height = 150;
   #context = null;
+  #kind = "";
 
   constructor() {
     super("canvas");
@@ -1303,12 +1635,17 @@ export class Canvas extends Node {
     this.#context?._resized();
   }
 
-  /** The canvas's `GPUCanvasContext` for "webgpu"; null for any other kind of context. */
-  getContext(kind) {
-    if (kind !== "webgpu") return null;
-    if (this.#context) return this.#context;
-    const api = native.gpuLoad?.();
-    return api ? (this.#context = api.context(this)) : null;
+  /**
+   * The canvas's `GPUCanvasContext` for "webgpu" or `CanvasRenderingContext2D` for "2d"; null
+   * for any other kind, or for a kind other than the one the canvas already has.
+   */
+  getContext(kind, options) {
+    if (kind !== "webgpu" && kind !== "2d") return null;
+    if (this.#context) return this.#kind === kind ? this.#context : null;
+    const api = kind === "2d" ? native.canvas2dLoad?.() : native.gpuLoad?.();
+    if (!api) return null;
+    this.#kind = kind;
+    return (this.#context = api.context(this, options));
   }
 
   setAttribute(name, value) {
@@ -1427,6 +1764,43 @@ function svgStyle(value) {
     css += cssName(name) + ":" + (typeof part === "number" && !UNITLESS.has(name) ? part + "px" : part) + ";";
   }
   return css;
+}
+
+// Elements of any svg by id, for `<use href="#id">` in another svg: icon sprites define
+// symbols in one hidden svg and every icon uses them.
+const SVG_IDS = new Map();
+
+function nameSvgElement(element, old, id) {
+  if (old !== undefined && SVG_IDS.get(old)?.deref() === element) SVG_IDS.delete(old);
+  if (id !== undefined) SVG_IDS.set(id, new WeakRef(element));
+}
+
+const REFERENCE = /href="#([^"]+)"/g;
+
+// The tree draws each svg as a document of its own, so the elements its `href="#id"`s name
+// in other svgs go into its markup, in a `<defs>`.
+function withReferences(markup) {
+  if (!markup.includes('href="#')) return markup;
+  const own = new Set();
+  for (const found of markup.matchAll(/\sid="([^"]+)"/g)) own.add(found[1]);
+  let defs = "";
+  let pending = markup;
+  while (pending) {
+    let next = "";
+    for (const found of pending.matchAll(REFERENCE)) {
+      const id = found[1];
+      if (own.has(id)) continue;
+      own.add(id);
+      const element = SVG_IDS.get(id)?.deref();
+      if (!element || element.getAttribute("id") !== id) continue;
+      const added = element._markup();
+      defs += added;
+      next += added;
+    }
+    pending = next;
+  }
+  if (!defs) return markup;
+  return markup.slice(0, markup.lastIndexOf("</svg>")) + "<defs>" + defs + "</defs></svg>";
 }
 
 // The children of an element of an `<svg>`: the markup they write, and how they move.
@@ -1644,6 +2018,14 @@ export class SvgElement {
     return this.#attributes.has(svgName(name));
   }
 
+  getAttributeNames() {
+    return [...this.#attributes.keys()];
+  }
+
+  get dataset() {
+    return (this._dataset ??= datasetOf(this));
+  }
+
   setAttribute(name, value) {
     name = svgName(name);
     if (value === null || value === undefined || value === false) {
@@ -1652,12 +2034,14 @@ export class SvgElement {
     }
     const text = name === "style" ? svgStyle(value) : String(value);
     if (this.#attributes.get(name) === text) return;
+    if (name === "id") nameSvgElement(this, this.#attributes.get(name), text);
     this.#attributes.set(name, text);
     this._written(name, text);
   }
 
   removeAttribute(name) {
     name = svgName(name);
+    if (name === "id" && this.#attributes.has(name)) nameSvgElement(this, this.#attributes.get(name), undefined);
     if (this.#attributes.delete(name)) this._written(name, null);
   }
 
@@ -1820,8 +2204,6 @@ export class Svg extends Node {
     // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
     super("icon");
     this.kind = "svg";
-    this.localName = "svg";
-    this.tagName = "svg";
     this.namespaceURI = SVG_NAMESPACE;
     svgChanged(this);
   }
@@ -1947,7 +2329,7 @@ export class Svg extends Node {
       this._goLive();
       return;
     }
-    const markup = this.outerHTML;
+    const markup = withReferences(this.outerHTML);
     if (markup === this.#markup) return;
     if (this.#markup && this.childNodes.every((child) => liveable(child))) {
       this._goLive();
@@ -2322,6 +2704,345 @@ export function createNode(kind) {
   if (kind === "image") return new Image();
   if (kind === "canvas") return new Canvas();
   return new Node(kind);
+}
+
+// `<input>` types that are not a text field.
+const BOX_INPUTS = new Set(["checkbox", "radio", "range", "color", "file", "hidden", "submit", "button", "reset", "image"]);
+// Tags that take focus without a tabindex, as on the web.
+const FOCUSABLE_TAGS = new Set(["button", "select", "summary", "iframe"]);
+
+/**
+ * `<input type="checkbox">` and `type="radio"`: a box a click checks, as on the web. It fires
+ * `input` and `change` when the click changes it.
+ */
+export class CheckInput extends Node {
+  #checked = false;
+
+  constructor(type = "checkbox") {
+    super("box");
+    this._tag = "input";
+    this.type = type;
+    this.value = "on";
+    this.defaultChecked = false;
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", type);
+    native.attribute(this.nodeId, "role", type === "radio" ? "radio" : "checkbox");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur");
+    this._relisten();
+  }
+
+  _shallowClone() {
+    const copy = new CheckInput(this.type);
+    copy.checked = this.#checked;
+    return copy;
+  }
+
+  get name() {
+    return this.getAttribute("name") ?? "";
+  }
+
+  get checked() {
+    return this.#checked;
+  }
+
+  set checked(value) {
+    value = !!value;
+    if (value === this.#checked) return;
+    this.#checked = value;
+    native.attribute(this.nodeId, "checked", value);
+    if (value && this.type === "radio" && this.name) {
+      let top = this;
+      while (top.parentNode) top = top.parentNode;
+      eachDescendant(top, (node) => {
+        if (node !== this && node instanceof CheckInput && node.type === "radio" && node.name === this.name) node.checked = false;
+      });
+    }
+  }
+
+  _activate() {
+    if (this.hasAttribute("disabled")) return true;
+    if (this.type === "radio" && this.#checked) return true;
+    this.checked = this.type === "radio" ? true : !this.#checked;
+    const input = new Event("input", this);
+    input.bubbles = true;
+    dispatchEvent(input);
+    const change = new Event("change", this);
+    change.bubbles = true;
+    dispatchEvent(change);
+    return true;
+  }
+}
+
+function eachDescendant(node, visit) {
+  for (const child of node.childNodes) {
+    visit(child);
+    if (child.childNodes.length) eachDescendant(child, visit);
+  }
+}
+
+function findById(id) {
+  for (const node of nodes.values()) if (node._elementId === id && (node.parentNode || node === rootNode)) return node;
+  return null;
+}
+
+// What a click on a label, summary or submit button does (see `activate`).
+function labelActivate() {
+  const id = this.getAttribute("for");
+  let control = id ? findById(id) : null;
+  if (!control) eachDescendant(this, (node) => {
+    if (!control && (node instanceof Input || node instanceof CheckInput)) control = node;
+  });
+  if (!control) return false;
+  if (control instanceof CheckInput) control._activate();
+  else control.focus();
+  return true;
+}
+
+function summaryActivate() {
+  const details = this.parentNode;
+  if (details?.localName !== "details") return false;
+  details.setAttribute("open", details.hasAttribute("open") ? null : "");
+  const toggle = new Event("toggle", details);
+  dispatchEvent(toggle);
+  return true;
+}
+
+function buttonActivate() {
+  if (this.hasAttribute("disabled")) return true;
+  const type = this.getAttribute("type") ?? "submit";
+  if (type !== "submit" && type !== "reset") return false;
+  let form = this.parentNode;
+  while (form && form.localName !== "form") form = form.parentNode;
+  if (!form) return false;
+  const event = new Event(type, form);
+  event.bubbles = true;
+  event.cancelable = true;
+  event.submitter = this;
+  dispatchEvent(event);
+  return true;
+}
+
+/**
+ * The node for HTML element `tag`, as `document.createElement` makes it: `<input>` and
+ * `<textarea>` are text fields (an `<input>` whose `type` is not a text field's is a box),
+ * `<img>` an image, `<canvas>` a canvas, `<svg>` inline SVG, and every other tag a box the
+ * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
+ * `@silkui/react`. `localName` and `tagName` give the tag.
+ */
+// A style element in the document applies its text as a stylesheet, after the compiled
+// imports and before adopted sheets, in tree order. Changes apply together at the next microtask.
+
+function stylesChanged() {
+  if (stylesPending) return;
+  stylesPending = true;
+  queueMicrotask(applyStyleElements);
+}
+
+function applyStyleElements() {
+  stylesPending = false;
+  const live = [];
+  for (const element of styleElements) {
+    if (!nodes.has(element.nodeId)) styleElements.delete(element);
+    else if (inDocument(element)) live.push(element);
+  }
+  live.sort(treeOrder);
+  let changed = live.length !== appliedStyles.length;
+  for (let i = 0; i < live.length; i++) {
+    if (live[i]._compile()) changed = true;
+    if (live[i] !== appliedStyles[i]) changed = true;
+  }
+  appliedStyles = live;
+  if (changed) syncAdoptedSheets();
+}
+
+/** `<style>`: its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  _styleSheet = null;
+  #compiled = null;
+
+  constructor() {
+    super("box");
+    styleElements.add(this);
+  }
+
+  /** The element's stylesheet while it is in the document, else null. */
+  get sheet() {
+    return inDocument(this) ? this._styleSheet : null;
+  }
+
+  // Compiles changed text. True when the element gained its first sheet.
+  _compile() {
+    let text = "";
+    for (const child of this.childNodes) if (child.nodeType === 3) text += child.data;
+    if (text === this.#compiled) return false;
+    this.#compiled = text;
+    if (!native.compileStyleSheet) {
+      warnOnce("@silkui/core: a style element's CSS needs the host's CSS text compiler (App.runtimeStylesheets() in a release build)");
+      return false;
+    }
+    let bytes;
+    try {
+      bytes = native.compileStyleSheet(text);
+    } catch (error) {
+      console.warn("@silkui/core: a style element's CSS did not compile: " + (error?.message ?? error));
+      return false;
+    }
+    const first = this._styleSheet === null;
+    this._styleSheet ??= new CSSStyleSheet();
+    replaceSheet(this._styleSheet, bytes);
+    return first;
+  }
+}
+
+export function createElement(tag, options) {
+  tag = String(tag).toLowerCase();
+  const type = String(options?.type ?? "text").toLowerCase();
+  let node;
+  if (tag === "svg") return new Svg();
+  if (tag === "input" && (type === "checkbox" || type === "radio")) return new CheckInput(type);
+  if (tag === "input" && !BOX_INPUTS.has(type)) node = new Input();
+  else if (tag === "textarea") node = new Input();
+  else if (tag === "img") node = new Image();
+  else if (tag === "canvas") node = new Canvas();
+  else if (tag === "br") return new LineBreak();
+  else if (tag === "style") node = new StyleElement();
+  else node = new Node("box");
+  node._tag = tag;
+  native.attribute(node.nodeId, "element", tag);
+  if (tag === "textarea") native.attribute(node.nodeId, "multiline", true);
+  if (tag === "input" && type !== "text") native.attribute(node.nodeId, "type", type);
+  if (node instanceof Input || FOCUSABLE_TAGS.has(tag)) {
+    if (!(node instanceof Input)) native.attribute(node.nodeId, "tabIndex", 0);
+    node._keep("focus", "blur");
+  }
+  if (tag === "label") node._activate = labelActivate;
+  else if (tag === "summary") node._activate = summaryActivate;
+  else if (tag === "button") node._activate = buttonActivate;
+  if (node._activate) node._relisten();
+  return node;
+}
+
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+// Elements whose content is not markup. Scripts and styles in parsed HTML are left out.
+const RAW_TAGS = new Set(["script", "style", "textarea", "title"]);
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", copy: "©", reg: "®", hellip: "…", mdash: "—", ndash: "–", laquo: "«", raquo: "»", times: "×", middot: "·", bull: "•" };
+const ATTRIBUTE = /\s*([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/y;
+
+function decodeEntities(text) {
+  if (!text.includes("&")) return text;
+  return text.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (whole, name) => {
+    if (name[0] === "#") {
+      const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+    }
+    return ENTITIES[name] ?? whole;
+  });
+}
+
+const escapeText = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/ /g, "&nbsp;");
+const escapeAttribute = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+
+function markupOf(node) {
+  if (node.nodeType === 3) return escapeText(node.data);
+  if (node instanceof Svg || node instanceof SvgElement) return node.outerHTML ?? node._markup();
+  if (node.nodeType === 11) return node.innerHTML;
+  const tag = node.localName;
+  let html = "<" + tag;
+  for (const name of node.getAttributeNames()) if (name !== "style") html += " " + name + '="' + escapeAttribute(node.getAttribute(name)) + '"';
+  const css = node.look("base").cssText;
+  if (css) html += ' style="' + escapeAttribute(css) + '"';
+  html += ">";
+  if (VOID_TAGS.has(tag)) return html;
+  if (node instanceof Input) html += escapeText(node.value);
+  else html += node.innerHTML;
+  return html + "</" + tag + ">";
+}
+
+/**
+ * Parses `html` and appends its nodes to `parent`, as `innerHTML` does: elements, text with
+ * character references, and `<svg>` markup. Comments, scripts and styles are left out.
+ */
+export function parseHTML(html, parent) {
+  const stack = [parent];
+  const top = () => stack[stack.length - 1];
+  const inSvg = () => top() instanceof Svg || top() instanceof SvgElement;
+  let i = 0;
+  const text = (data) => {
+    if (!data) return;
+    const value = decodeEntities(data);
+    top().appendChild(inSvg() ? new SvgText(value) : createText(value));
+  };
+  while (i < html.length) {
+    const open = html.indexOf("<", i);
+    if (open < 0) {
+      text(html.slice(i));
+      break;
+    }
+    text(html.slice(i, open));
+    if (html.startsWith("<!--", open)) {
+      const end = html.indexOf("-->", open + 4);
+      i = end < 0 ? html.length : end + 3;
+      continue;
+    }
+    if (html[open + 1] === "!" || html[open + 1] === "?") {
+      const end = html.indexOf(">", open);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    if (html[open + 1] === "/") {
+      const end = html.indexOf(">", open);
+      const name = html.slice(open + 2, end < 0 ? html.length : end).trim().toLowerCase();
+      i = end < 0 ? html.length : end + 1;
+      for (let at = stack.length - 1; at > 0; at--) {
+        if (stack[at].localName.toLowerCase() === name) {
+          stack.length = at;
+          break;
+        }
+      }
+      continue;
+    }
+    const nameMatch = /^[a-zA-Z][^\s\/>]*/.exec(html.slice(open + 1, open + 64));
+    if (!nameMatch) {
+      text("<");
+      i = open + 1;
+      continue;
+    }
+    const written = nameMatch[0];
+    const tag = inSvg() ? written : written.toLowerCase();
+    let at = open + 1 + written.length;
+    const attributes = [];
+    ATTRIBUTE.lastIndex = at;
+    for (let match; (match = ATTRIBUTE.exec(html)); ATTRIBUTE.lastIndex = at) {
+      at = ATTRIBUTE.lastIndex;
+      attributes.push([match[1], decodeEntities(match[2] ?? match[3] ?? match[4] ?? "")]);
+    }
+    while (at < html.length && html[at] !== ">") at++;
+    const selfClosing = html[at - 1] === "/";
+    i = at + 1;
+    if (RAW_TAGS.has(tag)) {
+      const close = html.toLowerCase().indexOf("</" + tag, i);
+      const content = html.slice(i, close < 0 ? html.length : close);
+      const end = close < 0 ? html.length : html.indexOf(">", close);
+      i = end < 0 ? html.length : end + 1;
+      if (tag === "script" || tag === "style") continue;
+      const node = createElement(tag);
+      for (const [name, value] of attributes) node.setAttribute(name, value);
+      if (tag === "textarea") node.value = decodeEntities(content);
+      else node.appendChild(createText(decodeEntities(content)));
+      top().appendChild(node);
+      continue;
+    }
+    const svg = inSvg() || tag === "svg";
+    const type = attributes.find(([name]) => name.toLowerCase() === "type")?.[1];
+    const node = svg ? createSvgElement(tag) : createElement(tag, { type });
+    for (const [name, value] of attributes) {
+      if (!svg && name.toLowerCase() === "value" && node instanceof Input) node.value = value;
+      else node.setAttribute(svg ? name : name.toLowerCase(), value);
+    }
+    top().appendChild(node);
+    if (!selfClosing && !(VOID_TAGS.has(tag) && !svg)) stack.push(node);
+  }
 }
 
 /** A box with `style` as its base look and `children` appended. */
@@ -2943,21 +3664,23 @@ export class Selection {
   #sync() {
     if (this.#pending) this.#flush();
     const count = native.selection?.() ?? 0;
-    const anchor = count ? nodes.get(geometry(0)) : null;
-    const focus = count ? nodes.get(geometry(2)) : null;
-    if (!anchor || !focus) {
+    const rawAnchor = count ? nodes.get(geometry(0)) : null;
+    const rawFocus = count ? nodes.get(geometry(2)) : null;
+    if (!rawAnchor || !rawFocus) {
       if (this.#anchor) this.#forget();
       return;
     }
+    const [anchor, anchorOffset] = fromTreePoint(rawAnchor, geometry(1));
+    const [focus, focusOffset] = fromTreePoint(rawFocus, geometry(3));
     const stretches = [];
     for (let i = 0; i < count; i++) {
       const at = 4 + 4 * i;
       const start = nodes.get(geometry(at));
       const end = nodes.get(geometry(at + 2));
-      if (start && end) stretches.push([start, geometry(at + 1), end, geometry(at + 3)]);
+      if (start && end) stretches.push([...fromTreePoint(start, geometry(at + 1)), ...fromTreePoint(end, geometry(at + 3))]);
     }
-    const same = anchor === this.#anchor && geometry(1) === this.#anchorOffset && focus === this.#focus
-      && geometry(3) === this.#focusOffset && stretches.length === this.#ranges.length
+    const same = anchor === this.#anchor && anchorOffset === this.#anchorOffset && focus === this.#focus
+      && focusOffset === this.#focusOffset && stretches.length === this.#ranges.length
       && stretches.every(([a, b, c, d], i) => {
         const range = this.#ranges[i];
         return range._startNode === a && range._startOffset === b && range._endNode === c && range._endOffset === d;
@@ -2965,9 +3688,9 @@ export class Selection {
     if (same) return;
     this.#unhook();
     this.#anchor = anchor;
-    this.#anchorOffset = geometry(1);
+    this.#anchorOffset = anchorOffset;
     this.#focus = focus;
-    this.#focusOffset = geometry(3);
+    this.#focusOffset = focusOffset;
     this.#backward = comparePoints(anchor, this.#anchorOffset, focus, this.#focusOffset) > 0;
     this.#ranges = stretches.map(([a, b, c, d]) => {
       const range = new Range();
@@ -3199,6 +3922,8 @@ function selectionRecord(target, start) {
   const event = new Event(start === 1 ? "selectstart" : "selectionchange", target);
   if (start !== 1) event.bubbles = false;
   dispatchEvent(event);
+  // As on the web, `selectionchange` is the document's event too.
+  if (start !== 1 && outerTargets.length) outerTargets[0].dispatchEvent?.(new Event("selectionchange", null));
   if (event.defaultPrevented) {
     const selection = getSelection();
     selection.removeAllRanges();
@@ -3209,6 +3934,16 @@ function selectionRecord(target, start) {
 }
 
 let rootNode = null;
+// What events pass above the root, outermost last: the document and the window of a DOM layer
+// over the tree (`@silkui/core/globals`). Each has `_run(event, capture)` as a node does.
+let outerTargets = [];
+// Events the web does not send on to the document and the window.
+const NOT_OUTER = new Set(["scroll", "layout", "load", "error"]);
+
+/** Has events that reach the root go on to `targets` (outermost last), as `@silkui/core/globals` does for `document` and `window`. */
+export function setOuterTargets(...targets) {
+  outerTargets = targets;
+}
 
 /** Makes `node` the root of the window's tree. */
 /**
@@ -3240,6 +3975,7 @@ export function mount(node) {
   rootNode = node;
   native.root(node.nodeId);
   syncAdoptedSheets();
+  if (styleElements.size) stylesChanged();
   return node;
 }
 
@@ -3333,6 +4069,8 @@ function reportError(error) {
 }
 
 /** An event of the tree, with the members of the DOM event it corresponds to. */
+const MODIFIER_FIELDS = { __proto__: null, Shift: "shiftKey", Control: "ctrlKey", Alt: "altKey", Meta: "metaKey" };
+
 export class Event {
   constructor(type, target) {
     this.type = type;
@@ -3359,10 +4097,19 @@ export class Event {
     this._immediate = true;
   }
 
+  /**
+   * Whether modifier `key` ("Shift", "Control", "Alt", "Meta") was down, for keyboard, mouse,
+   * pointer and touch events. Lock keys and others answer false.
+   */
+  getModifierState(key) {
+    return this[MODIFIER_FIELDS[key]] === true;
+  }
+
   /** The nodes the event passes, target first. */
   composedPath() {
     const path = [];
     for (let node = this.target; node; node = node.parentNode) path.push(node);
+    if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(this.type)) path.push(...outerTargets);
     return path;
   }
 }
@@ -3528,6 +4275,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
 export function dispatchEvent(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
+  if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
@@ -3612,10 +4360,13 @@ function compatTap(click, target) {
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind >= CLOSE_REQUEST) return dispatchRequest(kind, target, a);
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
+  if (kind === FOCUS) focusing(target);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
+  if (kind === FOCUS || kind === BLUR) event.relatedTarget = kind === FOCUS ? blurredNode : null;
   const live = target instanceof Svg && target._live && isPointerKind(kind);
   if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
   // A live svg sends pointer records on to the element under the pointer.
@@ -3625,7 +4376,12 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
     dispatchEvent(event);
     prevented = event.defaultPrevented;
   }
-  if (kind === CLICK && !prevented) follow(target);
+  if (kind === FOCUS) {
+    focusEvent("focusin", target, blurredNode);
+    blurredNode = null;
+  }
+  else if (kind === BLUR) blurring(target);
+  if (kind === CLICK && !prevented && !activate(target)) follow(target);
   if (kind !== CLICK && isPointerKind(kind)) {
     if (event.pointerType !== "touch") compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target);
     // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
@@ -3638,11 +4394,416 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   return prevented;
 };
 
+// The tree's requests, raised after an Escape, a back key or a back mouse button that nothing
+// prevented: `closerequest` asks to close what is on top, as a web close watcher hears, and
+// `navigate` asks to go back or forward, with `navigationType` "traverse" and `direction`
+// "back" or "forward". The listener that acts stops the event; the tree does nothing itself.
+function dispatchRequest(kind, target, forward) {
+  const event = new Event(TYPES[kind], target);
+  if (kind === NAVIGATE) {
+    event.navigationType = "traverse";
+    event.direction = forward ? "forward" : "back";
+  }
+  dispatchEvent(event);
+  return event.defaultPrevented;
+}
+
+// Editing hosts, as the HTML Standard's contenteditable has them. The tree sends a focused
+// host's typing, composition, deleting, line breaks and pastes as `beforeinput` records;
+// unless a listener prevents one, `hostEdit` makes the change in the host's nodes, moves
+// the selection after it and fires `input`, as a browser's editing does. Editors that keep
+// their own model (ProseMirror) prevent what they handle and read the rest back from the
+// nodes, through mutation observers.
+
+// 1 for an editable `contenteditable` ("", "true", "plaintext-only"), 2 for "false", else 0.
+function editableValue(node) {
+  const value = node.nodeType === 1 ? node.getAttribute("contenteditable") : null;
+  if (value === null) return 0;
+  const lower = value.toLowerCase();
+  return lower === "" || lower === "true" || lower === "plaintext-only" ? 1 : lower === "false" ? 2 : 0;
+}
+
+/** The editing host `node` is in (the outermost editable element up to a `contenteditable="false"`), or null. */
+export function editingHostOf(node) {
+  let host = null;
+  for (let at = node; at; at = at.parentNode) {
+    const value = editableValue(at);
+    if (value === 2) return host;
+    if (value === 1) host = at;
+  }
+  return host;
+}
+
+export class CompositionEvent extends Event {
+  constructor(type, init = {}) {
+    super(String(type), null);
+    this.bubbles = init.bubbles ?? true;
+    this.cancelable = !!init.cancelable;
+    this.composed = init.composed ?? true;
+    this.data = init.data ?? "";
+  }
+}
+
+globalThis.CompositionEvent ??= CompositionEvent;
+
+// Tags that start a block of their own, for joining and splitting paragraphs.
+const BLOCK_TAGS = new Set([
+  "address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "fieldset", "figcaption",
+  "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol",
+  "p", "pre", "section", "summary", "table", "td", "th", "tr", "ul",
+]);
+
+function isBlock(node) {
+  return node.nodeType === 1 && !(node instanceof LineBreak) && (BLOCK_TAGS.has(node.localName) || node.kind === "box" && node._tag === undefined);
+}
+
+// The block `node` is in, inside `host` (the host itself when there is none).
+function blockIn(host, node) {
+  for (let at = node; at && at !== host; at = at.parentNode) if (isBlock(at)) return at;
+  return host;
+}
+
+// What the caret steps over: text, `<br>`s and elements with no children (images).
+function isLeaf(node) {
+  return node.nodeType === 3 ? node.length > 0 : node.nodeType === 1 && node.childNodes.length === 0 && !isBlock(node);
+}
+
+// The leaf before (or after) the point (`container`, `offset`) in tree order, inside `host`.
+function leafBeside(host, container, offset, forward) {
+  let node;
+  if (container.nodeType === 3) node = container;
+  else if (forward) {
+    node = container.childNodes[offset];
+    if (!node) node = following(container, host, true);
+    else if (isLeaf(node)) return node;
+  } else {
+    node = container.childNodes[offset - 1];
+    if (node) {
+      while (node.lastChild) node = node.lastChild;
+      if (isLeaf(node)) return node;
+    } else node = container;
+  }
+  if (forward) {
+    for (let at = node === container && container.nodeType === 3 ? following(node, host, true) : node; at; at = following(at, host)) {
+      if (isLeaf(at)) return at;
+    }
+  } else {
+    for (let at = preceding(node, host); at; at = preceding(at, host)) if (isLeaf(at)) return at;
+  }
+  return null;
+}
+
+// The node before `node` in tree order (its previous sibling's last descendant, or its
+// parent), inside `within`.
+function preceding(node, within) {
+  if (node === within) return null;
+  let at = node.previousSibling;
+  if (!at) return node.parentNode === within ? null : node.parentNode;
+  while (at.lastChild) at = at.lastChild;
+  return at;
+}
+
+const segmenter = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter() : null;
+
+// The UTF-16 offset of the grapheme boundary before (or after) `offset` in `text`.
+function graphemeStep(text, offset, forward) {
+  if (segmenter) {
+    let last = 0;
+    for (const { index } of segmenter.segment(text)) {
+      if (forward && index > offset) return index;
+      if (!forward && index >= offset) return last;
+      last = index;
+    }
+    return forward ? text.length : last;
+  }
+  const code = forward ? text.charCodeAt(offset) : text.charCodeAt(offset - 1);
+  const pair = forward ? code >= 0xd800 && code < 0xdc00 : code >= 0xdc00 && code < 0xe000;
+  return forward ? Math.min(text.length, offset + (pair ? 2 : 1)) : Math.max(0, offset - (pair ? 2 : 1));
+}
+
+function wordStep(text, offset, forward) {
+  if (forward) {
+    const rest = /^\s*\S*/.exec(text.slice(offset))[0];
+    return offset + Math.max(rest.length, 1);
+  }
+  const before = /\S*\s*$/.exec(text.slice(0, offset))[0];
+  return offset - Math.max(before.length, 1);
+}
+
+// Makes (`node`, `offset`) a point between children: splits text there.
+function elementPoint(node, offset) {
+  if (node.nodeType !== 3) return [node, offset];
+  const parent = node.parentNode;
+  if (offset === 0) return [parent, indexIn(node)];
+  if (offset < node.length) node.splitText(offset);
+  return [parent, indexIn(node) + 1];
+}
+
+// Gives an empty block a `<br>`, so it keeps a line for the caret.
+function keepLine(block) {
+  for (let at = block.firstChild; at; at = following(at, block)) if (isLeaf(at)) return;
+  block.appendChild(new LineBreak());
+}
+
+// Moves `from`'s content to the end of `into` and removes `from`, as deleting the boundary
+// between two paragraphs does. Returns the point where they met.
+function joinBlocks(into, from) {
+  onlyBreak(into)?.remove();
+  if (leafBeside(into, into, 0, true)) onlyBreak(from)?.remove();
+  const point = into.lastChild?.nodeType === 3 ? [into.lastChild, into.lastChild.length] : [into, into.childNodes.length];
+  while (from.firstChild) into.appendChild(from.firstChild);
+  from.remove();
+  return point;
+}
+
+// The `<br>` that alone gives `block` its line, if that is all it holds.
+function onlyBreak(block) {
+  let found = null;
+  for (let at = block.firstChild; at; at = following(at, block)) {
+    if (!isLeaf(at)) continue;
+    if (found || !(at instanceof LineBreak)) return null;
+    found = at;
+  }
+  return found;
+}
+
+// Splits `block` at (`node`, `offset`): what follows goes to a copy of the block (and of each
+// element on the way) after it. Returns the copy.
+function splitBlock(block, node, offset) {
+  let [level, at] = elementPoint(node, offset);
+  let carried = null;
+  for (;;) {
+    const copy = level.cloneNode(false);
+    if (carried) copy.appendChild(carried);
+    while (level.childNodes.length > at) copy.appendChild(level.childNodes[at]);
+    if (level === block) {
+      block.parentNode.insertBefore(copy, block.nextSibling);
+      keepLine(block);
+      keepLine(copy);
+      return copy;
+    }
+    carried = copy;
+    at = indexIn(level) + 1;
+    level = level.parentNode;
+  }
+}
+
+// The first point in text (or the start) inside `node`.
+function startIn(node) {
+  for (let at = node; at; at = following(at, node)) {
+    if (at.nodeType === 3) return [at, 0];
+    if (at instanceof LineBreak) return [at.parentNode, indexIn(at)];
+  }
+  return [node, 0];
+}
+
+// Inserts `text` at the collapsed point (`node`, `offset`); returns the point after it.
+// Line breaks in it become `<br>`s.
+function insertText(node, offset, text) {
+  const lines = text.split(/\r\n|\r|\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      [node, offset] = elementPoint(node, offset);
+      node.insertBefore(new LineBreak(), node.childNodes[offset] ?? null);
+      offset += 1;
+    }
+    const line = lines[i];
+    if (!line) continue;
+    if (node.nodeType === 3) {
+      node.insertData(offset, line);
+      offset += line.length;
+      continue;
+    }
+    const before = node.childNodes[offset - 1];
+    const after = node.childNodes[offset];
+    if (before?.nodeType === 3) {
+      const at = before.length;
+      before.appendData(line);
+      [node, offset] = [before, at + line.length];
+    } else if (after?.nodeType === 3) {
+      after.insertData(0, line);
+      [node, offset] = [after, line.length];
+    } else {
+      const created = new Text(line);
+      node.insertBefore(created, after ?? null);
+      [node, offset] = [created, line.length];
+    }
+  }
+  return [node, offset];
+}
+
+// Deletes what `range` covers; paragraphs it crossed into become one. Returns the point
+// where the deleted content was.
+function deleteRange(host, range) {
+  const startBlock = blockIn(host, range.startContainer);
+  const endBlock = blockIn(host, range.endContainer);
+  range.deleteContents();
+  let point = [range.startContainer, range.startOffset];
+  if (startBlock !== endBlock && startBlock.isConnected !== false && endBlock.parentNode && host.contains(endBlock) && host.contains(startBlock)) {
+    point = joinBlocks(startBlock, endBlock);
+  }
+  if (startBlock !== host) keepLine(startBlock);
+  return point;
+}
+
+// Deletes one step (a grapheme, a word, to the line's edge) before or after the caret.
+function deleteStep(host, node, offset, forward, unit) {
+  if (node.nodeType === 3 && (forward ? offset < node.length : offset > 0)) {
+    const data = node.data;
+    const to = unit === "word" ? wordStep(data, offset, forward)
+      : unit === "line" ? (forward ? data.length : 0)
+        : graphemeStep(data, offset, forward);
+    const start = Math.min(offset, to);
+    node.deleteData(start, Math.abs(to - offset));
+    const block = blockIn(host, node);
+    if (block !== host) keepLine(block);
+    return [node, start];
+  }
+  const leaf = leafBeside(host, node, offset, forward);
+  if (!leaf) return [node, offset];
+  const here = blockIn(host, node);
+  const there = blockIn(host, leaf);
+  if (here === there || here === host || there === host) {
+    if (leaf.nodeType === 3) return deleteStep(host, leaf, forward ? 0 : leaf.length, forward, unit);
+    const parent = leaf.parentNode;
+    const index = indexIn(leaf);
+    leaf.remove();
+    if (here !== host) keepLine(here);
+    return [parent, index];
+  }
+  return forward ? joinBlocks(here, there) : joinBlocks(there, here);
+}
+
+const compositions = new WeakMap();
+
+function editEvent(type, host, inputType, data, isComposing, cancelable = true) {
+  const event = new InputEvent(type, { bubbles: true, cancelable, composed: true, inputType, data, isComposing });
+  event.target = host;
+  dispatchEvent(event);
+  return event;
+}
+
+function compositionEvent(type, host, data) {
+  const event = new CompositionEvent(type, { data });
+  event.target = host;
+  dispatchEvent(event);
+}
+
+// The edit `inputType` with `data` that the tree asked of `host`. Returns whether a listener
+// prevented it.
+function hostEdit(host, inputType, data) {
+  const plain = editableValue(host) === 1 && host.getAttribute("contenteditable").toLowerCase() === "plaintext-only";
+  const selection = getSelection();
+  let range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (range && (!host.contains(range.startContainer) || !host.contains(range.endContainer))) range = null;
+  const composing = compositions.get(host);
+
+  if (inputType === "insertCompositionText" || composing && inputType === "insertText") {
+    if (!composing && !data) return false;
+    let start;
+    if (!composing) {
+      compositionEvent("compositionstart", host, range ? range.toString() : "");
+      if (!range) return false;
+      start = range.collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+    } else {
+      start = [composing.node, composing.offset];
+    }
+    const committing = inputType === "insertText";
+    if (!committing) compositionEvent("compositionupdate", host, data);
+    editEvent("beforeinput", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
+    let [node, offset] = start;
+    if (composing && composing.node.isConnected !== false && composing.node.nodeType === 3) {
+      composing.node.deleteData(composing.offset, Math.min(composing.length, composing.node.length - composing.offset));
+    }
+    const end = data ? insertText(node, offset, data) : [node, offset];
+    // Text inserted into an element point lands in a text node: the composition starts there.
+    if (node.nodeType !== 3 && end[0].nodeType === 3) [node, offset] = [end[0], end[1] - data.length];
+    selection.collapse(end[0], end[1]);
+    editEvent("input", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
+    if (committing || !data) {
+      compositions.delete(host);
+      compositionEvent("compositionend", host, data);
+    } else {
+      compositions.set(host, { node, offset, length: data.length });
+    }
+    return false;
+  }
+
+  const event = editEvent("beforeinput", host, inputType, data || null, false);
+  if (event.defaultPrevented || !range) return event.defaultPrevented;
+  let point;
+  const collapsed = range.collapsed;
+  switch (inputType) {
+    case "insertText":
+    case "insertReplacementText":
+    case "insertFromPaste":
+    case "insertFromDrop": {
+      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+      point = insertText(point[0], point[1], data);
+      break;
+    }
+    case "insertLineBreak":
+    case "insertParagraph": {
+      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
+      const block = blockIn(host, point[0]);
+      if (inputType === "insertParagraph" && !plain && block !== host) {
+        point = startIn(splitBlock(block, point[0], point[1]));
+      } else {
+        const [parent, index] = elementPoint(point[0], point[1]);
+        parent.insertBefore(new LineBreak(), parent.childNodes[index] ?? null);
+        // A break that ends its block needs another after it for the new line to show.
+        if (!leafBeside(block, parent, index + 1, true)) parent.insertBefore(new LineBreak(), parent.childNodes[index + 1] ?? null);
+        point = [parent, index + 1];
+      }
+      break;
+    }
+    case "deleteByCut":
+    case "deleteByDrag":
+    case "deleteContent":
+      if (collapsed) return false;
+      point = deleteRange(host, range);
+      break;
+    default: {
+      const match = /^delete(Content|Word|SoftLine|HardLine)(Backward|Forward)$/.exec(inputType);
+      if (!match) return false;
+      if (!collapsed) point = deleteRange(host, range);
+      else {
+        const unit = match[1] === "Content" ? "grapheme" : match[1] === "Word" ? "word" : "line";
+        point = deleteStep(host, range.startContainer, range.startOffset, match[2] === "Forward", unit);
+      }
+    }
+  }
+  selection.collapse(point[0], point[1]);
+  editEvent("input", host, inputType, data || null, false, false);
+  return false;
+}
+
+/**
+ * The classic editing commands an editor may still call: `insertText`, `delete`,
+ * `forwardDelete`, `insertParagraph`, `insertLineBreak` and `selectAll`, in the focused
+ * editing host. Returns whether it ran.
+ */
+export function execCommand(command, _showUI = false, value = "") {
+  const selection = getSelection();
+  const node = selection.rangeCount ? selection.getRangeAt(0).startContainer : null;
+  const host = node ? editingHostOf(node) : null;
+  if (!host) return false;
+  if (command === "selectAll") {
+    selection.selectAllChildren(host);
+    return true;
+  }
+  const inputType = { insertText: "insertText", delete: "deleteContentBackward", forwardDelete: "deleteContentForward", insertParagraph: "insertParagraph", insertLineBreak: "insertLineBreak", insertHTML: "insertText" }[command];
+  if (!inputType) return false;
+  hostEdit(host, inputType, inputType === "insertText" ? String(value) : "");
+  return true;
+}
+
 // Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
 // paste carries the clipboard's text, HTML and a PNG (bytes as a Latin-1 string). A copy or
 // cut a listener prevented puts what it set on `clipboardData` on the clipboard; one it did
 // not prevent lets the tree copy the selection.
 function dispatchEditing(kind, target, first, second, third) {
+  if (kind === BEFORE_INPUT && !(target instanceof Input) && editingHostOf(target) === target) return hostEdit(target, second ?? "", first ?? "");
   let event;
   if (kind === BEFORE_INPUT) {
     event = new InputEvent("beforeinput", { bubbles: true, cancelable: true, composed: true, inputType: second ?? "", data: first ?? "" });
@@ -3684,6 +4845,57 @@ function writeClipboard(data) {
   Promise.resolve(written).catch(reportError);
 }
 
+// The focused node, as far as focus and blur records tell (HTML elements that can take focus
+// listen for both: see `createElement`).
+let focusedNode = null;
+// The node a blur record left, until the focus record that follows it.
+let blurredNode = null;
+let pendingFocusOut = null;
+
+/** The focused node, or null. */
+export function activeElement() {
+  return focusedNode?.parentNode || focusedNode === rootNode ? focusedNode : null;
+}
+
+function focusEvent(type, target, relatedTarget) {
+  const event = new Event(type, target);
+  event.bubbles = true;
+  event.relatedTarget = relatedTarget;
+  dispatchEvent(event);
+}
+
+// `focusout` waits for the focus record that follows a blur, so its `relatedTarget` is where
+// focus went, as on the web; with none, it goes out on its own.
+function blurring(target) {
+  if (focusedNode === target) focusedNode = null;
+  blurredNode = target;
+  pendingFocusOut = target;
+  queueMicrotask(() => {
+    if (pendingFocusOut !== target) return;
+    pendingFocusOut = null;
+    blurredNode = null;
+    focusEvent("focusout", target, null);
+  });
+}
+
+function focusing(target) {
+  focusedNode = target;
+  const left = pendingFocusOut;
+  pendingFocusOut = null;
+  if (left) focusEvent("focusout", left, target);
+  else blurredNode = null;
+}
+
+// HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its
+// control, a summary opens its details, a submit button submits its form. True when one ran.
+function activate(target) {
+  for (let node = target; node; node = node.parentNode) {
+    if (node._activate) return node._activate() !== false;
+    if (node._href) return false;
+  }
+  return false;
+}
+
 // The default action of a click: the nearest link around the target opens.
 function follow(target) {
   for (let node = target; node; node = node.parentNode) {
@@ -3702,6 +4914,8 @@ function follow(target) {
 // next realm starts on an empty tree.
 native.unload = function () {
   importedSheets.clear();
+  styleElements.clear();
+  appliedStyles = [];
   for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
   rootNode = null;
 };
@@ -3980,7 +5194,11 @@ function dragTo(target, x, y) {
   if (target) dragEvent("dragover", target, x, y, []);
 }
 
-let trayMenu = new Map();
+// Menu item callbacks by action id. Each menu (the tray's, the app's, a context menu) owns
+// the ids it packed, and drops them when it is replaced or closes.
+const menuActions = new Map();
+const menuOwners = { tray: [], app: [], context: [] };
+let nextMenuAction = 0;
 let trayClick = null;
 const shortcuts = new Map();
 const shortcutIds = new Map();
@@ -4006,12 +5224,32 @@ native.shellEvent = function (kind, a, x, y, text) {
   } else if (kind === 5) {
     trayClick?.({ button: a });
   } else if (kind === 6) {
-    trayMenu.get(a)?.();
+    const run = menuActions.get(a);
+    if (menuOwners.context.includes(a)) closeContextMenu();
+    run?.();
   } else if (kind === 7) {
     const notification = notifications.get(a);
     if (!notification) return;
     notifications.delete(a);
     notification._fire("click");
+  } else if (kind === 8) {
+    const resolve = dialogs.get(a);
+    if (!resolve) return;
+    dialogs.delete(a);
+    resolve(text ? text.split("\n") : []);
+  } else if (kind === 9) {
+    closeContextMenu();
+  } else if (kind === 10) {
+    const fullScreen = a === 1;
+    if (fullScreen === appWindow.fullScreen) return;
+    appWindow.fullScreen = fullScreen;
+    appWindow._fire("fullscreenchange", { fullScreen });
+  } else if (kind === 11) {
+    if (a === appWindow.zoomFactor) return;
+    appWindow.zoomFactor = a;
+    appWindow._fire("zoomchange", { zoomFactor: a });
+  } else if (kind === WEB_VIEW_EVENT) {
+    webViewEvent(a, x, text);
   }
 };
 
@@ -4085,20 +5323,86 @@ function hex(bytes) {
   return text;
 }
 
-function packMenu(items, lines) {
+// The roles the system implements, by `SystemItem` index; `about` and the others the
+// platform has no counterpart for are left out there.
+const SYSTEM_ROLES = {
+  about: 0, services: 1, hide: 2, hideothers: 3, unhide: 4, quit: 5, close: 6, minimize: 7, zoom: 8,
+  togglefullscreen: 9, front: 10, undo: 11, redo: 12, cut: 13, copy: 14, paste: 15, selectall: 16,
+};
+
+// Roles JavaScript does itself, with their usual labels and shortcuts.
+const SCRIPT_ROLES = {
+  resetzoom: { label: "Actual Size", accelerator: "Mod+0", click: () => appWindow.setZoomFactor(1) },
+  zoomin: { label: "Zoom In", accelerator: "Mod+Plus", click: () => appWindow.setZoomFactor(zoomStep(1)) },
+  zoomout: { label: "Zoom Out", accelerator: "Mod+-", click: () => appWindow.setZoomFactor(zoomStep(-1)) },
+};
+
+// Roles that stand for a whole menu, as Electron's.
+const MENU_ROLES = {
+  appmenu: () => [{ role: "about" }, { type: "separator" }, { role: "services" }, { type: "separator" }, { role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { type: "separator" }, { role: "quit" }],
+  filemenu: () => [{ role: IS_MAC ? "close" : "quit" }],
+  editmenu: () => [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }],
+  viewmenu: () => [{ role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }],
+  windowmenu: () => [{ role: "minimize" }, { role: "zoom" }, ...(IS_MAC ? [{ type: "separator" }, { role: "front" }] : [{ role: "close" }])],
+};
+
+const IS_MAC = /mac/i.test(globalThis.navigator?.platform ?? "") || globalThis.process?.platform === "darwin";
+
+// A menu shortcut as the host reads it: "" for none, else the key (`c` and a character, `n`
+// and a key name) and the modifier bits.
+function packAccelerator(accelerator) {
+  if (!accelerator) return ",0";
+  const parts = String(accelerator).split("+").map((part) => part.trim());
+  // "Mod+Plus" and "Mod++" both name the plus key.
+  if (parts.at(-1) === "" && parts.at(-2) === "") parts.splice(-2, 2, "+");
+  let bits = 0;
+  let key = "";
+  for (const part of parts) {
+    const modifier = MODIFIERS[part.toLowerCase()];
+    if (modifier !== undefined) bits |= modifier;
+    else if (part) key = part;
+  }
+  const lower = key.toLowerCase();
+  const named = { up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", esc: "Escape", escape: "Escape", return: "Enter", enter: "Enter", tab: "Tab", backspace: "Backspace", delete: "Delete", home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown" }[lower];
+  if (named) return "n" + named + "," + bits;
+  if (/^f([1-9]|1[0-9]|2[0-4])$/.test(lower)) return "nF" + lower.slice(1) + "," + bits;
+  if (lower === "plus") return "c+," + bits;
+  if (lower === "space") return "c ," + bits;
+  if ([...key].length === 1) return "c" + lower + "," + bits;
+  return "," + bits;
+}
+
+// `items` as the host's menu lines, with their callbacks kept under `owner`.
+function packMenu(items, lines, owner) {
   for (const item of items) {
+    if (!item || item.visible === false) continue;
+    const role = String(item.role ?? "").toLowerCase();
     if (item.type === "separator") lines.push("S");
-    else if (item.submenu) {
-      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
-      packMenu(item.submenu, lines);
+    else if (MENU_ROLES[role] && !item.submenu) {
+      lines.push("B" + String(item.label ?? role.replace(/menu$/, "").replace(/^./, (c) => c.toUpperCase())).replace(/\n/g, " "));
+      packMenu(MENU_ROLES[role](), lines, owner);
       lines.push("E");
+    } else if (item.submenu) {
+      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
+      packMenu(item.submenu, lines, owner);
+      lines.push("E");
+    } else if (SYSTEM_ROLES[role] !== undefined && !item.click) {
+      lines.push("R" + SYSTEM_ROLES[role]);
     } else {
-      const action = trayMenu.size + 1;
-      trayMenu.set(action, typeof item.click === "function" ? item.click : () => {});
-      const label = String(item.label ?? "").replace(/\n/g, " ");
-      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + label);
+      const known = SCRIPT_ROLES[role] ?? {};
+      const action = ++nextMenuAction;
+      const click = item.click ?? known.click;
+      menuActions.set(action, typeof click === "function" ? () => click(item) : () => {});
+      menuOwners[owner].push(action);
+      const label = String(item.label ?? known.label ?? "").replace(/\n/g, " ");
+      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + packAccelerator(item.accelerator ?? known.accelerator) + "," + label);
     }
   }
+}
+
+function dropMenu(owner) {
+  for (const action of menuOwners[owner]) menuActions.delete(action);
+  menuOwners[owner] = [];
 }
 
 /**
@@ -4113,17 +5417,17 @@ export function setTray({ icon, tooltip = "", template = false, menu = [], onCli
   if (!icon || !(icon.width > 0) || !(icon.height > 0) || icon.data?.length !== icon.width * icon.height * 4) {
     throw new TypeError("setTray needs an icon of RGBA pixels: { width, height, data }");
   }
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = typeof onClick === "function" ? onClick : null;
   const lines = [];
-  packMenu(menu, lines);
+  packMenu(menu, lines, "tray");
   const fields = [String(tooltip), icon.width, icon.height, template ? 1 : 0, hex(icon.data), lines.join("\n")];
   return shellCall(1, fields).then((shown) => shown === 1);
 }
 
 /** Takes the tray icon away. */
 export function removeTray() {
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = null;
   shellCall(2, []);
 }
@@ -4173,7 +5477,315 @@ export function registerShortcut(accelerator, callback) {
   return shellCall(3, [id, code, bits]).then((held) => held === 1);
 }
 
+// Web views: a real browser page (WKWebView on macOS) shown over a node, which a person and
+// an agent can both use. The views live on the platform thread; calls go through `__ui.shell`
+// (ops 10 to 14) and their events come back through `__ui.shellEvent` kind 20, with the view,
+// an event code and the fields separated by U+001F (ui-webview's wire.silk).
+
+const WEB_VIEW_EVENT = 20;
+const webViews = new Map();
+let nextWebView = 0;
+let nextWebRequest = 0;
+const webRequests = new Map();
+const dataClears = new Map();
+
+const thousandths = (value) => String(Math.round(Number(value) * 1000));
+
+function webRequest(resolve, reject) {
+  const request = ++nextWebRequest;
+  webRequests.set(request, { resolve, reject });
+  return request;
+}
+
+function settleWebRequest(request, ok, value, error) {
+  const waiting = webRequests.get(request);
+  if (!waiting) return;
+  webRequests.delete(request);
+  if (ok) waiting.resolve(value);
+  else waiting.reject(error instanceof Error ? error : new Error(String(error)));
+}
+
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_VALUES = new Uint8Array(128);
+for (let i = 0; i < BASE64.length; i++) BASE64_VALUES[BASE64.charCodeAt(i)] = i;
+
+function decodeBase64(text) {
+  const clean = text.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let bits = 0;
+  let count = 0;
+  let at = 0;
+  for (let i = 0; i < clean.length; i++) {
+    bits = (bits << 6) | BASE64_VALUES[clean.charCodeAt(i)];
+    count += 6;
+    if (count >= 8) {
+      count -= 8;
+      out[at++] = (bits >> count) & 255;
+    }
+  }
+  return out;
+}
+
+const CONSOLE_LEVELS = ["debug", "log", "info", "warning", "error"];
+
+/** An event of a {@link WebView}: its `type` and the fields of what happened. */
+export class WebViewEvent {
+  constructor(type, fields) {
+    this.type = type;
+    Object.assign(this, fields);
+  }
+}
+
+/**
+ * A web view: a real browser page shown over a node. The page draws over the node's box
+ * (a native view of the system's engine), follows it as layout moves it, and hides when the
+ * node is not shown. Make one with {@link createWebView}.
+ *
+ * The view keeps the page's state as it reports it: `url`, `title`, `favicon`, `loading`,
+ * `progress`, `canGoBack`, `canGoForward`, `focused`. Listen with `addEventListener(type,
+ * listener)` for `loadstart`, `loadprogress`, `loadend` (`ok`, `error`, `errorCode`, a Chromium net error), `urlchange`,
+ * `titlechange`, `faviconchange`, `historychange`, `navigationrequest` (answer it with
+ * `answerNavigation`), `newwindow`, `focuschange`, `console` (`level`, `message`),
+ * `unsupported` (`command`), `crashed` and `closed`.
+ */
+export class WebView {
+  #listeners = new Map();
+  #closed = false;
+
+  constructor(node, options) {
+    this.id = ++nextWebView;
+    this.node = node;
+    this.url = options.url ?? "";
+    this.title = "";
+    this.favicon = "";
+    this.loading = false;
+    this.progress = 0;
+    this.canGoBack = false;
+    this.canGoForward = false;
+    this.focused = false;
+    webViews.set(this.id, this);
+    const flags = (options.inspectable === false ? 0 : 1) | (options.askBeforeNavigating ? 2 : 0) | (options.transparent ? 4 : 0);
+    /** Resolves to whether the view opened: there are web views only in a desktop window. */
+    this.opened = shellCall(40, [this.id, node.nodeId, this.url, options.profile ?? "", flags]).then((value) => {
+      if (value !== 1) webViews.delete(this.id);
+      return value === 1;
+    });
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = new Set()));
+    list.add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  _fire(type, fields = {}) {
+    const event = new WebViewEvent(type, fields);
+    const handler = this["on" + type];
+    if (typeof handler === "function") handler.call(this, event);
+    for (const listener of this.#listeners.get(type) ?? []) listener.call(this, event);
+  }
+
+  #command(name, ...fields) {
+    if (this.#closed) return;
+    shellCall(42, [this.id, name, ...fields]);
+  }
+
+  #ask(name, ...fields) {
+    if (this.#closed) return Promise.reject(new Error("the web view is closed"));
+    return new Promise((resolve, reject) => {
+      const request = webRequest(resolve, reject);
+      this.#command(name, request, ...fields);
+    });
+  }
+
+  navigate(url) { this.url = String(url); this.#command("navigate", this.url); }
+  /** Shows `html` as if loaded from `baseUrl`. */
+  loadHtml(html, baseUrl = "") { this.#command("loadHtml", baseUrl, html); }
+  back() { this.#command("back"); }
+  forward() { this.#command("forward"); }
+  reload() { this.#command("reload"); }
+  /** Reloads bypassing the cache. */
+  hardReload() { this.#command("hardReload"); }
+  stop() { this.#command("stop"); }
+  /** Page zoom, 1 for 100%. */
+  setZoom(factor) { this.#command("zoom", thousandths(factor)); }
+  /** Gives the page keyboard focus. */
+  focus() { this.#command("focus"); }
+  /** Opens the engine's developer tools (Web Inspector on macOS). */
+  openDevTools() { this.#command("devtools"); }
+  setAudioMuted(muted) { this.#command("mute", muted ? 1 : 0); }
+  /** The color scheme the page sees: `"system"`, `"light"` or `"dark"`. */
+  setColorScheme(scheme) { this.#command("scheme", scheme === "light" || scheme === "dark" ? scheme : "system"); }
+  /** Shows or hides the view; a hidden view keeps its page. */
+  setShown(shown) { if (!this.#closed) shellCall(44, [this.id, shown ? 1 : 0]); }
+
+  /** Runs `script` in the page; resolves to its value (a promise is awaited), JSON-cloned. */
+  evaluate(script) {
+    return this.#ask("evaluate", String(script)).then((json) => (json === "" ? undefined : JSON.parse(json)));
+  }
+
+  /** A text outline of what the page shows, with refs (`[ref=e12]`) on what an agent can act on. */
+  snapshot() { return this.#ask("snapshot"); }
+
+  /** The page's pixels: `{ width, height, data }`, RGBA rows top first, in device pixels. */
+  screenshot() { return this.#ask("screenshot"); }
+
+  /** Scrolls element `ref` (a snapshot ref) into view and clicks it with real input. */
+  clickElement(ref) { return this.#ask("click", String(ref)); }
+
+  /** Focuses element `ref`, selects its value and types `text` over it with real input. */
+  fillElement(ref, text) { return this.#ask("fill", String(ref), String(text)); }
+
+  /** A click at a point of the page's viewport, in CSS pixels. */
+  clickAt(x, y, { button = 0, clickCount = 1, modifiers = 0 } = {}) {
+    this.#command("clickAt", thousandths(x), thousandths(y), button, clickCount, modifiers);
+  }
+
+  movePointer(x, y, { modifiers = 0 } = {}) { this.#command("move", thousandths(x), thousandths(y), modifiers); }
+
+  /** A wheel turn over a point, deltas in CSS pixels. */
+  scroll(x, y, deltaX, deltaY, { modifiers = 0 } = {}) {
+    this.#command("scroll", thousandths(x), thousandths(y), thousandths(deltaX), thousandths(deltaY), modifiers);
+  }
+
+  /** Types `text` into whatever has focus in the page. */
+  typeText(text) { this.#command("type", String(text)); }
+
+  /** Presses one key, by its DOM `key` value (`"Enter"`, `"a"`); modifiers shift 1, control 2, alt 4, meta 8. */
+  pressKey(key, modifiers = 0) { this.#command("key", modifiers, String(key)); }
+
+  /** Answers a `navigationrequest` event. */
+  answerNavigation(request, allow) { this.#command("answer", request, allow ? 1 : 0); }
+
+  /**
+   * Finds `text` in the page (case insensitive) and highlights the next match, or the previous
+   * one when `forward` is false; resolves to `{ matches, activeMatchOrdinal }`.
+   */
+  findInPage(text, { forward = true, newSession = false } = {}) {
+    return this.#ask("find", forward ? 1 : 0, newSession ? 1 : 0, String(text));
+  }
+
+  stopFindInPage() { this.#command("stopFind"); }
+
+  /** Closes the view; its page goes. */
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    shellCall(41, [this.id]);
+  }
+}
+
+/**
+ * Shows a web view over `node` (any node: the page covers its border box). Options: `url`,
+ * `profile` (a name keeps cookies and storage between runs; empty forgets them),
+ * `inspectable` (default true), `askBeforeNavigating`, `transparent`.
+ */
+export function createWebView(node, options = {}) {
+  return new WebView(node, options);
+}
+
+/**
+ * Clears what the pages of profile `profile` stored (an empty name: the views opened without
+ * one): `cookies` (cookies and site storage) and `cache`.
+ */
+export function clearWebViewData({ profile = "", cookies = true, cache = true } = {}) {
+  return new Promise((resolve) => {
+    const request = ++nextWebRequest;
+    dataClears.set(request, resolve);
+    shellCall(43, [request, cookies ? 1 : 0, cache ? 1 : 0, profile]);
+  });
+}
+
+function webViewEvent(id, code, text) {
+  const parts = text === "" ? [] : text.split("\x1f");
+  // The last field of each event may hold the separator itself.
+  const rest = (from) => parts.slice(from).join("\x1f");
+  if (code === 21) {
+    const request = Number(parts[0]);
+    const resolve = dataClears.get(request);
+    dataClears.delete(request);
+    resolve?.();
+    return;
+  }
+  const view = webViews.get(id);
+  if (!view) return;
+  switch (code) {
+    case 1: view._fire("created"); break;
+    case 2:
+      webViews.delete(id);
+      view._fire("closed");
+      break;
+    case 3:
+      view.loading = true;
+      view._fire("loadstart", { url: rest(0) });
+      break;
+    case 4:
+      view.progress = Number(parts[0]) / 1000;
+      view._fire("loadprogress", { progress: view.progress });
+      break;
+    case 5:
+      view.loading = false;
+      view._fire("loadend", { ok: parts[0] === "1", errorCode: -Number(parts[1] ?? 0), url: parts[2] ?? "", error: rest(3) });
+      break;
+    case 6:
+      view.url = rest(0);
+      view._fire("urlchange", { url: view.url });
+      break;
+    case 7:
+      view.title = rest(0);
+      view._fire("titlechange", { title: view.title });
+      break;
+    case 8:
+      view.canGoBack = parts[0] === "1";
+      view.canGoForward = parts[1] === "1";
+      view._fire("historychange", { canGoBack: view.canGoBack, canGoForward: view.canGoForward });
+      break;
+    case 9:
+      view._fire("navigationrequest", { request: Number(parts[0]), userInitiated: parts[1] === "1", url: rest(2) });
+      break;
+    case 10: view._fire("newwindow", { url: rest(0) }); break;
+    case 11:
+      view.focused = parts[0] === "1";
+      view._fire("focuschange", { focused: view.focused });
+      break;
+    case 12: settleWebRequest(Number(parts[0]), parts[1] === "1", rest(2), rest(2)); break;
+    case 13: settleWebRequest(Number(parts[0]), true, rest(1)); break;
+    case 14:
+      settleWebRequest(Number(parts[0]), true, {
+        width: Number(parts[1]),
+        height: Number(parts[2]),
+        data: decodeBase64(parts[3] ?? ""),
+      });
+      break;
+    case 15: settleWebRequest(Number(parts[0]), parts[1] === "1", undefined, rest(2) || "the action failed"); break;
+    case 16: view._fire("console", { level: CONSOLE_LEVELS[Number(parts[0])] ?? "log", message: rest(1) }); break;
+    case 17: {
+      const command = rest(1);
+      if (Number(parts[0])) settleWebRequest(Number(parts[0]), false, undefined, command + " is not supported here");
+      view._fire("unsupported", { command });
+      break;
+    }
+    case 18: view._fire("crashed", { reason: rest(0) }); break;
+    case 19:
+      view.favicon = rest(0);
+      view._fire("faviconchange", { url: view.favicon });
+      break;
+    case 20:
+      settleWebRequest(Number(parts[0]), true, { matches: Number(parts[1]), activeMatchOrdinal: Number(parts[2]) });
+      break;
+  }
+}
+
 /** Stops the shortcut of `accelerator`. */
+/** Ends the app with an exit code once the current turn finishes. */
+export function quit(code = 0) {
+  shellCall(45, [String(code)]);
+}
+
 export function unregisterShortcut(accelerator) {
   const { code, bits } = parseShortcut(accelerator);
   const id = shortcutIds.get(code + "+" + bits);
@@ -4182,6 +5794,226 @@ export function unregisterShortcut(accelerator) {
   shortcuts.delete(id);
   shellCall(4, [id]);
 }
+
+// File dialogs waiting for `DialogClosed`, by dialog id.
+const dialogs = new Map();
+
+function extensionsOf(filters) {
+  const all = [];
+  for (const filter of filters ?? []) {
+    for (const extension of filter.extensions ?? []) {
+      if (extension === "*") return "";
+      all.push(String(extension).replace(/^\./, ""));
+    }
+  }
+  return all.join(",");
+}
+
+function dialog(op, fields) {
+  return shellCall(op, fields).then((id) => (id ? new Promise((resolve) => dialogs.set(id, resolve)) : []));
+}
+
+/**
+ * Opens the system's file dialog, as Electron's `dialog.showOpenDialog`: `properties` takes
+ * `openFile`, `openDirectory` and `multiSelections`; `filters` are `{ name, extensions }`
+ * without dots (`"*"` for every file). It attaches to the window as a sheet on macOS and never
+ * blocks. Resolves to `{ canceled, filePaths }`.
+ */
+export function showOpenDialog(options = {}) {
+  const properties = options.properties ?? ["openFile"];
+  const directories = properties.includes("openDirectory");
+  const files = properties.includes("openFile") || !directories;
+  const flags = (files ? 1 : 0) | (directories ? 2 : 0) | (properties.includes("multiSelections") ? 4 : 0);
+  return dialog(5, [String(options.title ?? ""), String(options.defaultPath ?? ""), flags, extensionsOf(options.filters)]).then(
+    (filePaths) => ({ canceled: filePaths.length === 0, filePaths }),
+  );
+}
+
+/**
+ * Opens the system's save dialog, as Electron's `dialog.showSaveDialog`. `defaultPath` may
+ * name a folder, a file, or both. Resolves to `{ canceled, filePath }`.
+ */
+export function showSaveDialog(options = {}) {
+  const path = String(options.defaultPath ?? "");
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const looksLikeFolder = slash === path.length - 1 || !/\.[^./\\]+$/.test(path.slice(slash + 1));
+  const directory = looksLikeFolder ? path : path.slice(0, Math.max(slash, 0));
+  const name = looksLikeFolder ? "" : path.slice(slash + 1);
+  return dialog(6, [String(options.title ?? ""), directory, name, extensionsOf(options.filters)]).then((paths) => ({
+    canceled: paths.length === 0,
+    filePath: paths[0] ?? "",
+  }));
+}
+
+/**
+ * Replaces the app's menu bar, as Electron's `Menu.setApplicationMenu(Menu.buildFromTemplate(t))`.
+ * Items are `{ label, click, accelerator, enabled, checked, type, role, submenu, visible }`.
+ * `accelerator` is `"Mod+Shift+K"` (`Mod`, `CmdOrCtrl`: Command on macOS, Control elsewhere).
+ * The system roles (`about`, `quit`, `undo`, `copy`, `togglefullscreen`, `minimize`, `front`
+ * and so on) are the system's own items; `zoomIn`, `zoomOut` and `resetZoom` zoom the page;
+ * `appMenu`, `fileMenu`, `editMenu`, `viewMenu` and `windowMenu` are whole menus. On macOS
+ * the first menu is the app menu. Edit shortcuts reach the focused node as keys first.
+ */
+export function setApplicationMenu(template) {
+  dropMenu("app");
+  const lines = [];
+  packMenu(template ?? [], lines, "app");
+  return shellCall(7, [lines.join("\n")]).then(() => undefined);
+}
+
+let contextMenuClosed = null;
+
+function closeContextMenu() {
+  dropMenu("context");
+  const closed = contextMenuClosed;
+  contextMenuClosed = null;
+  closed?.();
+}
+
+/**
+ * Opens a native context menu at `x`, `y` (CSS pixels in the window, a `MouseEvent`'s
+ * `clientX`/`clientY`), as Electron's `menu.popup()`. Items are as `setApplicationMenu`'s.
+ * Resolves when the menu closes, with or without a choice, to `true`; or at once to `false`
+ * when the system draws no context menus (Linux, the browser) and the app should draw its own.
+ */
+export function showContextMenu(template, { x = 0, y = 0 } = {}) {
+  closeContextMenu();
+  const lines = [];
+  packMenu(template ?? [], lines, "context");
+  const zoom = appWindow.zoomFactor || 1;
+  return shellCall(8, [x * zoom, y * zoom, lines.join("\n")]).then((shown) => {
+    if (shown !== 1) {
+      dropMenu("context");
+      return false;
+    }
+    return new Promise((resolve) => (contextMenuClosed = () => resolve(true)));
+  });
+}
+
+/** Puts `text` on the app's dock or taskbar icon (an unread count); `""` takes it off. */
+export function setBadge(text) {
+  return shellCall(9, [String(text ?? "")]).then((shown) => shown === 1);
+}
+
+/** Shows progress from 0 to 1 on the app's dock or taskbar icon; a negative number takes it off. */
+export function setProgress(fraction) {
+  return shellCall(10, [Number(fraction)]).then((shown) => shown === 1);
+}
+
+/** Opens `url` with the system's handler: a web page in the default browser, `mailto:` in the mail app. */
+export function openExternal(url) {
+  return shellCall(11, [String(url)]).then((opened) => opened === 1);
+}
+
+/** Shows the file or folder at `path` selected in Finder, Explorer or the file manager. */
+export function showItemInFolder(path) {
+  return shellCall(12, [String(path)]).then((shown) => shown === 1);
+}
+
+/**
+ * Drags the files at `paths` out of the window, as Electron's `webContents.startDrag`, so
+ * Finder, a mail draft or a terminal can take them. Call it from a `pointerdown` or
+ * `pointermove` listener while the button is down. Resolves to whether the drag started
+ * (macOS and Windows drag files out; Linux and the browser do not).
+ */
+export function startFileDrag(paths) {
+  const list = (Array.isArray(paths) ? paths : [paths]).map(String).filter(Boolean);
+  return shellCall(13, [list.join("\n")]).then((started) => started === 1);
+}
+
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+
+function zoomStep(direction) {
+  const now = appWindow.zoomFactor;
+  if (direction > 0) return ZOOM_STEPS.find((step) => step > now + 0.001) ?? now;
+  return ZOOM_STEPS.findLast((step) => step < now - 0.001) ?? now;
+}
+
+/**
+ * The window the app runs in. `fullScreen` and `zoomFactor` (the page zoom, as Electron's
+ * `webFrame.getZoomFactor()`; Mod with `=`, `-` and `0` change it too) are current, and
+ * `fullscreenchange` and `zoomchange` say when they change. The title bar is the app's
+ * configuration: a transparent one, with the window controls placed in it, comes from
+ * `TitleBar.transparent` in its `tasks.silk`.
+ */
+class AppWindow {
+  fullScreen = false;
+  zoomFactor = 1;
+  #listeners = new Map();
+
+  setFullScreen(on) {
+    if (!!on !== this.fullScreen) shellCall(14, [0]);
+  }
+
+  toggleFullScreen() {
+    shellCall(14, [0]);
+  }
+
+  minimize() {
+    shellCall(14, [1]);
+  }
+
+  /** Shows the window and brings it to the front with keyboard focus. */
+  focus() {
+    shellCall(14, [2]);
+  }
+
+  show() {
+    shellCall(14, [2]);
+  }
+
+  hide() {
+    shellCall(14, [3]);
+  }
+
+  setTitle(title) {
+    shellCall(14, [4, String(title)]);
+  }
+
+  /** Zooms the page, from 0.25 to 5. Resolves to the zoom now. */
+  setZoomFactor(zoom) {
+    return shellCall(15, [Math.min(5, Math.max(0.25, Number(zoom) || 1))]).then((now) => {
+      if (now !== this.zoomFactor) {
+        this.zoomFactor = now;
+        this._fire("zoomchange", { zoomFactor: now });
+      }
+      return now;
+    });
+  }
+
+  getZoomFactor() {
+    return this.zoomFactor;
+  }
+
+  isFullScreen() {
+    return this.fullScreen;
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (!list.includes(listener)) list.push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(type);
+    const index = list ? list.indexOf(listener) : -1;
+    if (index >= 0) list.splice(index, 1);
+  }
+
+  _fire(type, detail) {
+    const event = { type, target: this, ...detail };
+    for (const listener of (this.#listeners.get(type) ?? []).slice()) {
+      try {
+        listener.call(this, event);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
+}
+
+export const appWindow = new AppWindow();
 
 /**
  * The app's memory in bytes, as the system shows it to users: `phys_footprint` on macOS
@@ -4607,8 +6439,25 @@ export function supports(conditionOrProperty, value) {
   return arguments.length > 1 ? native.supports(String(conditionOrProperty), String(value)) : native.supports(String(conditionOrProperty));
 }
 
+/** `CSS.escape(text)`: `text` as a CSS identifier, escaped as the CSSOM spec does. */
+export function cssEscape(value) {
+  const text = String(value);
+  let result = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const character = text[i];
+    if (code === 0) result += "\uFFFD";
+    else if ((code >= 0x1 && code <= 0x1f) || code === 0x7f || (i === 0 && code >= 0x30 && code <= 0x39) || (i === 1 && code >= 0x30 && code <= 0x39 && text.charCodeAt(0) === 0x2d)) result += "\\" + code.toString(16) + " ";
+    else if (i === 0 && text.length === 1 && code === 0x2d) result += "\\" + character;
+    else if (code >= 0x80 || code === 0x2d || code === 0x5f || (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) result += character;
+    else result += "\\" + character;
+  }
+  return result;
+}
+
 if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
 globalThis.CSS.supports ??= supports;
+globalThis.CSS.escape ??= cssEscape;
 
 let frameStatsSince = 0;
 
@@ -4634,4 +6483,117 @@ export function frameStats() {
     p99: native.frameStats(4),
     max: native.frameStats(5),
   };
+}
+
+// MutationObserver, as in the DOM Standard, for the tree's nodes: child lists, attributes and
+// text. Records are queued as the mutations happen and delivered in one microtask.
+
+class MutationRecord {
+  constructor(type, target, fields) {
+    this.type = type;
+    this.target = target;
+    this.addedNodes = fields.addedNodes ?? [];
+    this.removedNodes = fields.removedNodes ?? [];
+    this.previousSibling = fields.previousSibling ?? null;
+    this.nextSibling = fields.nextSibling ?? null;
+    this.attributeName = fields.attributeName ?? null;
+    this.attributeNamespace = null;
+    this.oldValue = fields.oldValue ?? null;
+  }
+}
+
+let mutationsQueued = false;
+
+function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
+  for (const observer of mutationObservers) {
+    let options = null;
+    for (let node = target; node; node = node.parentNode) {
+      const found = observer._targets.get(node);
+      if (found && (node === target || found.subtree) && found[wants]) {
+        if (filterName !== undefined && found.attributeFilter && !found.attributeFilter.includes(filterName)) continue;
+        options = found;
+        break;
+      }
+    }
+    if (!options) continue;
+    const record = new MutationRecord(type, target, fields);
+    if (oldValueOption && !options[oldValueOption]) record.oldValue = null;
+    observer._records.push(record);
+    if (!mutationsQueued) {
+      mutationsQueued = true;
+      queueMicrotask(deliverMutations);
+    }
+  }
+}
+
+function deliverMutations() {
+  mutationsQueued = false;
+  for (const observer of [...mutationObservers]) {
+    const records = observer.takeRecords();
+    if (records.length === 0) continue;
+    try {
+      observer._callback.call(observer, records, observer);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+}
+
+function childListRecord(parent, added, removed, previousSibling, nextSibling) {
+  queueRecord("childList", parent, {
+    addedNodes: added ? [added] : [],
+    removedNodes: removed ? [removed] : [],
+    previousSibling: previousSibling ?? null,
+    nextSibling: nextSibling ?? null,
+  }, "childList");
+}
+
+function attributeRecord(node, name, text) {
+  const old = node.getAttribute(name);
+  if (old === text) return;
+  queueRecord("attributes", node, { attributeName: name, oldValue: old }, "attributes", "attributeOldValue", name);
+}
+
+function characterDataRecord(node, old) {
+  queueRecord("characterData", node, { oldValue: old }, "characterData", "characterDataOldValue");
+}
+
+export class MutationObserver {
+  constructor(callback) {
+    if (typeof callback !== "function") throw new TypeError("MutationObserver needs a function");
+    this._callback = callback;
+    this._targets = new Map();
+    this._records = [];
+  }
+
+  observe(target, options = {}) {
+    if (!(target instanceof Node)) return;
+    const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined);
+    const characterData = options.characterData ?? options.characterDataOldValue !== undefined;
+    if (!options.childList && !attributes && !characterData) {
+      throw new TypeError("MutationObserver.observe needs childList, attributes or characterData");
+    }
+    this._targets.set(target, {
+      childList: !!options.childList,
+      attributes: !!attributes,
+      characterData: !!characterData,
+      subtree: !!options.subtree,
+      attributeOldValue: !!options.attributeOldValue,
+      characterDataOldValue: !!options.characterDataOldValue,
+      attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
+    });
+    mutationObservers.add(this);
+  }
+
+  disconnect() {
+    this._targets.clear();
+    this._records = [];
+    mutationObservers.delete(this);
+  }
+
+  takeRecords() {
+    const records = this._records;
+    this._records = [];
+    return records;
+  }
 }

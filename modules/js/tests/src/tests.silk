@@ -10,7 +10,7 @@ import ui_js_calls.gpu { GpuReply }
 import ui_js_calls.lib { Arg }
 import ui_js.bridge as bridge
 import ui_tree.style_media { MediaState }
-import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, StyleState, Role, Live, TriState, EditCommand, ClipboardData as ClipboardData2 }
+import ui_tree.lib { Tree, TreeError, ProtocolError, Viewport, NodeId, Input, Modifiers, StyleState, Role, Live, TriState, EditCommand, ClipboardData as ClipboardData2 }
 import ui_tree.legacy { HostRequest as HostRequestRaw }
 import ui_fixtures.fixtures as fixtures
 import silkjs.js_atomics_native { WaiterDomain, SynchronizationError }
@@ -170,6 +170,13 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
   run host.evaluate(b"if (typed !== 'hi|insertText|hi') throw new Error('typed was ' + typed)", b"test")
   run host.input(&mut tree, run Input.key("Escape"))
   run host.evaluate(b"if (lastKey !== 'Escape') throw new Error('key was ' + lastKey)", b"test")
+  // A prevented key drops only its own text: once it is up, typing reaches the field again.
+  run host.evaluate(b"app.field.value = ''; app.field.addEventListener('keydown', (event) => { if (event.key === 'Escape') event.preventDefault() })", b"test")
+  run host.flush(&mut tree)
+  run host.input(&mut tree, run Input.key("Escape"))
+  run host.input(&mut tree, Input.KeyUp { key: run String.copy("Escape"), code: run String.copy("Escape"), modifiers: Modifiers.none() })
+  run host.input(&mut tree, run Input.text("q"))
+  run host.evaluate(b"if (app.field.value !== 'q') throw new Error('after a prevented key the field took ' + JSON.stringify(app.field.value))", b"test")
 
   // Selection offsets are UTF-16 indices. The caret stops are the ones Chrome reports for
   // ArrowRight from Home over an emoji, a combining mark, CJK and a ZWJ family emoji.
@@ -244,6 +251,13 @@ effect fn library(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
     Option.None => false
   }
   run Testing.expect(semantics, "role and aria-* reached the tree")
+  run host.evaluate(b"app.button.setAttribute('role', 'scrollbar'); if (warnings.length !== 0) throw new Error('scrollbar warned')", b"test")
+  run host.flush(&mut tree)
+  let scrollbar = match tree.view(NodeId.of(3)) {
+    Option.Some { value } => value.accessRole() == Role.ScrollBar
+    Option.None => false
+  }
+  run Testing.expect(scrollbar, "the scrollbar role reached the tree")
   run host.evaluate(b"app.button.setAttribute('role', 'fancy'); if (warnings.length !== 1) throw new Error('an unknown role must warn')", b"test")
   run host.flush(&mut tree)
   let cleared = match tree.view(NodeId.of(3)) {
@@ -338,6 +352,13 @@ effect fn globals(host: &mut JsHost<'_>) -> ()
   run host.answerClipboard(next, Option<String>.none(), Option<EncodedItem>.None)
   run host.evaluate(b"if (copied.join() !== 'wrote undefined,read from the system,empty \"\"') throw new Error('clipboard calls settled as ' + copied.join())", b"test")
   run clipboardItems(&mut host)
+  run decodedImages(&mut host)
+}
+
+/// `__ui.imageDecode` and `__ui.imageTake` (createImageBitmap's decoder): a PNG's size, then its
+/// pixels as straight RGBA, and 0 for bytes that are no image.
+effect fn decodedImages(host: &mut JsHost<'_>) -> () ! OutOfMemoryError | JsError | AssertionError<'static> ? &mut Allocator {
+  run host.evaluate(b"{ const png = new Uint8Array([137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,2,0,0,0,1,8,6,0,0,0,244,34,127,138,0,0,0,15,73,68,65,84,120,156,99,248,207,192,240,31,8,27,0,16,121,3,126,125,99,206,215,0,0,0,0,73,69,78,68,174,66,96,130]); if (__ui.imageDecode(png) !== 2 || __ui.geometry(0) !== 2 || __ui.geometry(1) !== 1) throw new Error('decoded size'); const pixels = new Uint8ClampedArray(8); __ui.imageTake(pixels); if (pixels.join() !== '255,0,0,255,0,255,0,128') throw new Error('pixels were ' + pixels.join()); if (__ui.imageDecode(new Uint8Array([60, 115, 118, 103])) !== 0) throw new Error('decoded text') }", b"test")
 }
 
 /// `navigator.clipboard.write` and `read` move ClipboardItems through the host, bytes and all.
@@ -436,7 +457,11 @@ effect fn withHost(scenario: u32) -> ()
   let mut allocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
   let memory = run allocator.observe()
   let mut host = run JsHost.open(&memory, domain.handle()) |> Effect.provideMut<Allocator>(&mut allocator)
-  let ran = if scenario == 10 {
+  let ran = if scenario == 12 {
+    run Effect.result(contentEditable(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 11 {
+    run Effect.result(htmlElements(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
+  } else if scenario == 10 {
     run Effect.result(webgpuCommands(&mut host)) |> Effect.provideMut<Allocator>(&mut allocator)
   } else if scenario == 8 {
     run Effect.result(clipboardEvents(&mut host, &mut tree)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -657,6 +682,7 @@ test effect fn nativeIdsAreTheirNamesHashes() -> () ! AssertionError<'static> {
   run Testing.expect(bridge.GPU == bridge.nativeId(b"gpu"), "GPU")
   run Testing.expect(bridge.GPU_API == bridge.nativeId(b"gpuApi"), "GPU_API")
   run Testing.expect(bridge.GPU_ENABLED == bridge.nativeId(b"gpuEnabled"), "GPU_ENABLED")
+  run Testing.expect(bridge.CANVAS2D_ENABLED == bridge.nativeId(b"canvas2dEnabled"), "CANVAS2D_ENABLED")
   run Testing.expect(bridge.GPU_REPLY == bridge.nativeId(b"gpuReply"), "GPU_REPLY")
   run Testing.expect(bridge.GPU_REPLY_BYTES == bridge.nativeId(b"gpuReplyBytes"), "GPU_REPLY_BYTES")
   run Testing.expect(bridge.ATOM_STYLE == bridge.nativeId(b"atomStyle"), "ATOM_STYLE")
@@ -1000,6 +1026,75 @@ effect fn geometryReads(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
     i = i + 1
   }
   run host.evaluate(b"if (!globalThis.geometryChecked) throw new Error('the checks did not run')", b"test")
+}
+
+/// HTML elements from `@silkui/core` with @silkui/react's default stylesheet: inline
+/// formatting from tags, and HTML attributes in selectors.
+effect fn htmlElements(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  host.setStylesheetCompiler(runtimeStylesheets())
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  let css = run platform.readFile(b"modules/js/packages/react/src/html.css")
+  let mut module = List<u8>.make()
+  run module.appendSlice(b"export default String.raw`")
+  run module.appendSlice(css.asSlice())
+  run module.appendSlice(b"`;")
+  run host.define(b"html-css", module.asSlice())
+  host.attach(tree.engineMut())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/html.js")
+  run host.module(source.asSlice(), b"html.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run host.observe(tree.engineMut())
+  run host.evaluate(b"htmlAfterFrame()", b"test")
+  run host.evaluate(b"if (!globalThis.htmlChecked) throw new Error('the checks did not run')", b"test")
+}
+
+test effect fn htmlElementsLayOutWithTheDefaultStylesheet() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(11) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn contentEditable(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | platform.PlatformError | AssertionError<'static>
+  ? &mut Allocator {
+  let package = run platform.readFile(b"modules/js/packages/core/src/index.js")
+  run host.define(b"@silkui/core", package.asSlice())
+  host.attach(tree.engineMut())
+  let source = run platform.readFile(b"modules/js/tests/fixtures/editing.js")
+  run host.module(source.asSlice(), b"editing.js")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.0)
+  run host.input(&mut tree, Input.press(10.0, 12.0))
+  run host.input(&mut tree, Input.release(10.0, 12.0))
+  run host.evaluate(b"afterPress()", b"test")
+  run host.flush(&mut tree)
+  run host.input(&mut tree, run Input.text("!"))
+  run host.evaluate(b"afterTyping()", b"test")
+  run host.input(&mut tree, Input.ImePreedit { text: run String.copy("ka"), selectionStart: 2, selectionEnd: 2 })
+  run host.evaluate(b"afterPreedit()", b"test")
+  run host.input(&mut tree, run Input.text("か"))
+  run host.evaluate(b"afterComposing()", b"test")
+  run host.input(&mut tree, run Input.key("Backspace"))
+  run host.evaluate(b"afterBackspace()", b"test")
+  run host.input(&mut tree, run Input.key("Enter"))
+  run host.evaluate(b"afterEnter()", b"test")
+  run host.flush(&mut tree)
+  drop run tree.frame(viewport(), 0.1)
+  run host.input(&mut tree, run Input.key("ArrowDown"))
+  run host.evaluate(b"afterArrow()", b"test")
+  run host.evaluate(b"if (!globalThis.editingChecked) throw new Error('the checks did not run')", b"test")
+}
+
+/// contenteditable hosts on the real tree: focus and caret from a press, typing, the input
+/// method, Backspace, Enter and arrows, each changing the host's nodes from script.
+test effect fn contentEditableHostsEditTheirNodes() -> ()
+  ! TreeError | ProtocolError | OutOfMemoryError | JsError | SynchronizationError | platform.PlatformError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withHost(12) |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 effect fn selections(host: &mut JsHost<'_>, tree: &mut Tree<'_>) -> ()

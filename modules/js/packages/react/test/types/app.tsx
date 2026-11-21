@@ -45,7 +45,7 @@ function App() {
       {/* @ts-expect-error: a key event has no clientX */}
       <box onKeyDown={(event) => event.clientX} />
       {/* @ts-expect-error: no such element */}
-      <div />
+      <notanelement />
     </box>
   );
 }

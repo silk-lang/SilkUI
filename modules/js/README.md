@@ -372,11 +372,13 @@ what those mean:
   `JsHost.answerClipboard` settles each one. Both windows do them on the system clipboard
   once the code that asked has run, so a copy button works from any listener, timer or
   promise job. A host that has no clipboard leaves the promises pending.
-- Desktop calls from `@silkui/core` (`new Notification`, `setTray`, `registerShortcut`) go
+- Desktop calls from `@silkui/core` (`new Notification`, `setTray`, `registerShortcut`,
+  menus, dialogs, `appWindow`, `openExternal`, `startFileDrag`) go
   the same way: `JsHost.takeShell` hands them over (`ShellRequest` says how each packs its
   arguments) and `JsHost.answerShell` settles them. Both windows serve them on the
   platform (`ui_js_window.shell`). File drags, global shortcuts, tray clicks and
-  notification clicks come back through `JsHost.shellEvent`; the window aims a drag at the
+  notification clicks, menu choices, closed dialogs and context menus, full screen and page
+  zoom changes come back through `JsHost.shellEvent`; the window aims a drag at the
   node under it.
 
 `silk task embed-assets` regenerates `src/generated_prelude.silk` after an edit to
@@ -429,8 +431,11 @@ How it works:
 - A present of a `bgra8unorm` canvas (what `getPreferredCanvasFormat()` answers) stays on the
   GPU where both devices can share images (macOS): the canvas draws into a swap chain of
   IOSurfaces that the window's device samples after the application's fences
-  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). An `rgba8unorm` canvas, and every
-  canvas on other systems, copies the frame through the CPU.
+  ([gpu_canvas.silk](../tree/window/src/gpu_canvas.silk)). A canvas nothing covers, with a
+  rectangular clip, can also show in a compositor layer of its own, whose frames do not draw the
+  window ([canvas_layer_plan.silk](../tree/window/src/canvas_layer_plan.silk)). That is opt-in
+  for now: `SILK_UI_CANVAS_LAYERS=on`. An `rgba8unorm` canvas, and every canvas on other
+  systems, copies the frame through the CPU.
 
 What is not there yet: query sets, render bundles and external textures throw, compilation
 info is always empty, and `copyExternalImageToTexture` takes `ImageData` only. The canvas

@@ -12,6 +12,8 @@ of each app's framework (`versions`), and a free label (`--label`). The artifact
 | CPU per frame | `drivers.NAME.cpu_ms_per_frame` | CPU time of the whole tree (all threads) over the driver, per frame |
 | Frame intervals | `drivers.NAME.intervals` | The app's own frame-to-frame times: p50, p95, p99, max, and how many were over 8.3 and 16.7 ms |
 | FPS | 1000 / `frame_ms` | Uncapped runs only (below) |
+| Frames shown | `drivers.NAME.shown`, `shown_per_s`, `cpu_ms_per_shown` | Silk UI, gpu suite: frames the window showed during the driver (`silk-ui: frames shown N`, from `SILK_UI_TRACE_PRESENTS`), and the CPU of the driver over them. `frames` counts the app's frame callbacks. Capped, the two agree when no refresh is missed. Uncapped they differ by what never reached the screen |
+| Canvas frames shown | `drivers.NAME.canvas_shown`, `canvas_shown_per_s` | Silk UI, canvas scene: GPU canvas frames the renderer put on screen during the driver (`silk-ui: canvas shown N`, from `SILK_UI_TRACE_CANVAS`). Uncapped, a newer canvas frame replaces one not yet shown, so `frames` counts rAF callbacks and this counts what reached the screen. The path they took is `canvas_path` |
 | Idle CPU | `idle.NAME.cpu_pct` | Percent of one core between `idle-begin` and `idle-end` (windowed runs only) |
 
 Start time is the median of the warm runs; the cold run is reported on its own. On macOS the
@@ -42,7 +44,7 @@ Uncapped, a frame starts as soon as the last one is done, so frame time is the w
 and FPS is its inverse. Capped at the display (60 or 120 Hz), every app that keeps up shows the
 same FPS, and the numbers say nothing about how close it is to dropping a frame.
 
-Uncapped can mislead in two ways, and the suite covers both without a capped pass:
+Uncapped can mislead in three ways, and the suite covers them without a capped pass:
 
 1. **It hides per-frame CPU cost behind throughput.** A framework that pipelines (Chromium's
    compositor runs ahead of the main thread) can show a high FPS while spending more CPU per
@@ -51,6 +53,14 @@ Uncapped can mislead in two ways, and the suite covers both without a capped pas
    app with a 4 ms median and a 30 ms frame every second drops frames at 120 Hz. The suite
    reports p95, p99, max and the count over 8.3 and 16.7 ms of the app's own frame intervals,
    which are the frames that would miss a deadline when capped.
+
+3. **FPS counts frames produced, not frames shown.** A display at 120 Hz shows at most 120
+   pictures a second. Electron uncapped runs its frame callbacks without waiting for the screen,
+   so its FPS is how fast it can produce frames. Silk UI uncapped waits until the renderer has
+   taken the last frame, and on macOS the window server returns one or two drawables a refresh
+   depending on how it composites the window at that moment, so the same build and scene reads
+   about 120 or about 250 to 330 FPS from one run to the next. Compare CPU per frame, and for
+   Silk UI `shown_per_s`, not uncapped FPS.
 
 A capped run measures one more thing: energy and CPU at a fixed frame rate (how much of a core it
 takes to hold 120 Hz). That is the idle and battery question, and the idle steps already answer

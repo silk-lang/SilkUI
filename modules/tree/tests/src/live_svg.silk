@@ -1,6 +1,9 @@
 //! Live svg: an icon node whose svg elements the client writes one attribute at a time draws
 //! them as paths, and a frame rasterizes only the shapes whose geometry changed.
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Input, Event, BUTTON_PRIMARY }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot, Input, Event, BUTTON_PRIMARY, Attribute, Mutation, StyleState }
+import svg_css.compile { Options, CompileError }
+import svg_css.compile
+import silk.text.string { String }
 import ui_tree.live_svg as live
 import silk.collections.list { List }
 import silk.num.f32
@@ -273,4 +276,141 @@ effect fn measures() ! OutOfMemoryError | AssertionError<'static> ? &mut Allocat
 test effect fn liveSvgMeasuresBoxesAndLengths() ! OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run measures() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pagePaint() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  // As t3code's provider icons: fill="none" on the root, the fill from a class through a variable.
+  run batch.icon(1, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10' fill='none'><rect width='10' height='10'/></svg>")
+  let own = run written.declarations(b"display:block;width:50px;height:50px")
+  run batch.create(2, NodeKind.Icon)
+  run batch.append(1, 2)
+  run batch.style(2, own.asSlice())
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("fill-icon") })
+  run batch.source(2, 1)
+  // A live svg takes the root paint the same way.
+  run batch.create(3, NodeKind.Icon)
+  run batch.append(1, 3)
+  run batch.style(3, own.asSlice())
+  run batch.attribute(3, Attribute.ClassName { value: run String.copy("fill-icon") })
+  run batch.svgAttribute(3, 0, "viewBox", Option<string>.some("0 0 10 10"))
+  run batch.svgAttribute(3, 0, "fill", Option<string>.some("none"))
+  run batch.svgInsert(3, 1, "rect", 0, Option<u32>.None)
+  run batch.svgAttribute(3, 1, "width", Option<string>.some("10"))
+  run batch.svgAttribute(3, 1, "height", Option<string>.some("10"))
+  let sheet = run compile.compile(b".fill-icon{fill:var(--icon)}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 7, bytes.asSlice())
+  run batch.push(Mutation.SetCustomProperty { id: 2, state: StyleState.Base, name: run String.copy("--icon"), value: Option<String>.some(run String.copy("#0000ff")), important: false })
+  run batch.push(Mutation.SetCustomProperty { id: 3, state: StyleState.Base, name: run String.copy("--icon"), value: Option<String>.some(run String.copy("#0000ff")), important: false })
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 25, 25, 0, 0, 255), "page CSS fills an svg icon over its root's fill attribute")
+  run Testing.expect(color(&image, 25, 75, 0, 0, 255), "and a live svg")
+}
+
+test effect fn pageCssPaintsInlineSvg() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pagePaint() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// As t3code's sidebar backdrop: gradient stops take their color from page custom properties.
+effect fn markupVariables() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("stage") })
+  run batch.icon(1, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><defs><linearGradient id='g'><stop offset='0' style='stop-color: var(--tone)'/><stop offset='1' style='stop-color:var( --tone )'/></linearGradient></defs><rect width='10' height='10' fill='url(#g)'/></svg>")
+  let own = run written.declarations(b"display:block;width:50px;height:50px")
+  run batch.create(2, NodeKind.Icon)
+  run batch.append(1, 2)
+  run batch.style(2, own.asSlice())
+  run batch.source(2, 1)
+  let sheet = run compile.compile(b".stage{--tone:#0000ff}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 7, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 25, 25, 0, 0, 255), "an inherited custom property colors the stops of an svg's markup")
+  run batch.push(Mutation.SetCustomProperty { id: 1, state: StyleState.Base, name: run String.copy("--tone"), value: Option<String>.some(run String.copy("#ff0000")), important: false })
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let again = run rendered(&mut tree)
+  run Testing.expect(color(&again, 25, 25, 255, 0, 0), "and repaints when the property changes")
+}
+
+test effect fn customPropertiesReachSvgMarkup() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run markupVariables() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// As t3code's sidebar backdrop: a mask fades the box, and its ::after paints a gradient toward
+// a side through the background shorthand.
+effect fn backdropFade() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white;position:relative")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.ClassName { value: run String.copy("backdrop") })
+  let sheet = run compile.compile(b".backdrop{position:absolute;left:0;right:0;top:0;height:100px;background-color:#ff0000;--fade:#00ff00;mask-image:linear-gradient(to bottom, black 0%, black 55%, transparent 92%);&::after{content:\"\";position:absolute;inset:0;background:linear-gradient(to bottom, transparent 0%, transparent 28%, color-mix(in srgb, var(--fade) 50%, transparent) 50%, var(--fade) 93%)}}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 7, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 100, 10, 255, 0, 0), "the top shows the box")
+  let middle = image.pixel(100, 50)
+  run Testing.expect(middle.g > 80 && middle.r < 200, "the fade gradient paints over it")
+  run Testing.expect(color(&image, 100, 97, 255, 255, 255), "the mask hides the bottom")
+}
+
+test effect fn backdropFadePaints() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run backdropFade() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// As t3code's stage art: an inline svg's viewport is its box, so a very wide viewBox with
+// `xMinYMin slice` fills the height of a short box instead of shrinking to fit its width.
+effect fn slicedStageArt() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.icon(1, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8192 96' preserveAspectRatio='xMinYMin slice'><rect width='8192' height='96' fill='#0000ff'/><rect width='24' height='96' fill='#ff0000'/></svg>")
+  let own = run written.declarations(b"display:block;width:160px;height:80px")
+  run batch.create(2, NodeKind.Icon)
+  run batch.append(1, 2)
+  run batch.style(2, own.asSlice())
+  run batch.source(2, 1)
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 80, 4, 0, 0, 255) && color(&image, 80, 76, 0, 0, 255), "the art fills the box's height")
+  run Testing.expect(color(&image, 10, 40, 255, 0, 0) && color(&image, 30, 40, 0, 0, 255), "from its left edge, at the scale of the height")
+  run Testing.expect(color(&image, 80, 90, 255, 255, 255), "and is cut to the box")
+}
+
+test effect fn inlineSvgSlicesIntoItsBox() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run slicedStageArt() |> Effect.provideMut<Allocator>(&mut allocator)
 }

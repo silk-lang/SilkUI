@@ -35,6 +35,8 @@ import properties.keywords
 import silk.collections.hash { Hash, HashSeed }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.collections.bytes { Bytes }
 import silk.core.ownership { Copy }
 import silk.core.equal { Equal }
@@ -136,9 +138,107 @@ pub struct Computed {
   /// `user-select`: the declared keyword while the cascade runs, the used value after it
   /// (see `usedUserSelect`). One of the `SELECT_` constants.
   pub userSelect: u8,
+  /// `fill`, `stroke` and `stroke-width` from page CSS, which an inline `<svg>` draws with over
+  /// its root's presentation attributes. They inherit.
+  pub svg: SvgPaint,
 }
 
 impl Copy for Computed {}
+
+/// A paint `SvgPaint` has not got: the markup's own applies.
+pub const PAINT_UNSET: u8 = 0
+pub const PAINT_NONE: u8 = 1
+pub const PAINT_CURRENT: u8 = 2
+pub const PAINT_COLOR: u8 = 3
+
+/// SVG paint properties as CSS sets them, colors as RGBA8 (red in the high byte).
+pub struct SvgPaint {
+  pub fillKind: u8,
+  pub strokeKind: u8,
+  pub fill: u32,
+  pub stroke: u32,
+  /// In user units; negative when unset.
+  pub strokeWidth: f32,
+}
+
+impl Copy for SvgPaint {}
+
+impl SvgPaint {
+  pub fn initial() -> SvgPaint {
+    return SvgPaint { fillKind: PAINT_UNSET, strokeKind: PAINT_UNSET, fill: 0, stroke: 0, strokeWidth: -1.0 }
+  }
+
+  pub fn isSet(self: &Self) -> bool {
+    return self.fillKind != PAINT_UNSET || self.strokeKind != PAINT_UNSET || self.strokeWidth >= 0.0
+  }
+
+  /// A key for drawings of the same markup in this paint; 0 when unset.
+  pub fn key(self: &Self) -> u64 {
+    if !self.isSet() { return 0 }
+    let mut h = Hash.combine(u8.toU64(self.fillKind) * 4 + u8.toU64(self.strokeKind), u32.toU64(self.fill))
+    h = Hash.combine(h, u32.toU64(self.stroke))
+    h = floatHash(h, self.strokeWidth)
+    return if h == 0 { 1 } else { h }
+  }
+}
+
+impl SvgPaint {
+  /// The declarations for an SVG root's style, such as `fill:#ff0000ff;stroke-width:1.5;`.
+  pub effect fn css(self: &Self) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+    let mut out = List<u8>.make()
+    run paintCss(&mut out, b"fill:", self.fillKind, self.fill)
+    run paintCss(&mut out, b"stroke:", self.strokeKind, self.stroke)
+    if self.strokeWidth >= 0.0 {
+      run out.appendSlice(b"stroke-width:")
+      let thousandths = f32.toU64(f32.min(self.strokeWidth, 1000000.0) * 1000.0 + 0.5)
+      run decimal(&mut out, thousandths / 1000)
+      run out.append(46)
+      let fraction = thousandths % 1000
+      run out.append(u64.toU8(48 + fraction / 100))
+      run out.append(u64.toU8(48 + (fraction / 10) % 10))
+      run out.append(u64.toU8(48 + fraction % 10))
+      run out.append(59)
+    }
+    return move out
+  }
+}
+
+effect fn paintCss(out: &mut List<u8>, name: &[u8], kind: u8, color: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  if kind == PAINT_UNSET { return () }
+  run out.appendSlice(name)
+  if kind == PAINT_NONE {
+    run out.appendSlice(b"none")
+  } else if kind == PAINT_CURRENT {
+    run out.appendSlice(b"currentColor")
+  } else {
+    run out.append(35)
+    let digits = b"0123456789abcdef"
+    let mut shift: u32 = 28
+    let mut more = true
+    while more {
+      run out.append(digits[u32.toUsize(u32.bitAnd(u32.shiftRight(color, shift), 15))])
+      if shift == 0 { more = false } else { shift = shift - 4 }
+    }
+  }
+  run out.append(59)
+}
+
+effect fn decimal(out: &mut List<u8>, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value >= 10 { run decimal(&mut out, value / 10) }
+  run out.append(u64.toU8(48 + value % 10))
+}
+
+// A paint value: `none`, `currentColor` or a color. `url()` paints keep the markup's.
+fn setPaint(kind: &mut u8, color: &mut u32, value: &Value) -> () {
+  if convert.isKeyword(value, Keyword.None) {
+    kind.* = PAINT_NONE
+  } else if convert.isKeyword(value, Keyword.Currentcolor) {
+    kind.* = PAINT_CURRENT
+  } else if let Option.Some { value: found } = convert.color(value) {
+    kind.* = PAINT_COLOR
+    color.* = packColor(found)
+  }
+}
 
 pub const SELECT_AUTO: u8 = 0
 pub const SELECT_TEXT: u8 = 1
@@ -1342,6 +1442,7 @@ impl Computed {
       list: ListStyle.initial(),
       anchor: AnchorStyle.none(),
       userSelect: SELECT_AUTO,
+      svg: SvgPaint.initial(),
     }
   }
 
@@ -2698,6 +2799,13 @@ impl Computed {
           }
         }
       }
+      CssProperty.Fill => { setPaint(&mut self.svg.fillKind, &mut self.svg.fill, value) }
+      CssProperty.Stroke => { setPaint(&mut self.svg.strokeKind, &mut self.svg.stroke, value) }
+      CssProperty.StrokeWidth => {
+        if let Option.Some { value: found } = convert.length(value, &context) {
+          if found >= 0.0 { self.svg.strokeWidth = if context.zoom > 0.0 { found / context.zoom } else { found } }
+        }
+      }
       CssProperty.Opacity => {
         if let Option.Some { value: found } = alpha(value) {
           self.paint.opacity = f32.max(0.0, f32.min(1.0, found))
@@ -3068,6 +3176,7 @@ impl Computed {
       h = Hash.combine(h, borderStyleIndex(self.columnRule.style))
       h = if self.columnRule.current { Hash.combine(h, 5) } else { colorHash(h, self.columnRule.color) }
     }
+    h = Hash.combine(h, self.svg.key())
     h = floatHash(h, self.paint.opacity)
     h = floatHash(h, self.paint.backdropBlur)
     h = Hash.combine(Hash.combine(h, self.effects.hash), self.effects.shadowHash)

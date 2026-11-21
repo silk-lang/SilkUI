@@ -85,8 +85,23 @@ elements make it live from its first draw. The tree draws
 `g`, `path`, `rect`, `circle`, `ellipse`, `line`, `polyline`, `polygon`, `clipPath` and linear
 and radial gradients this way; anything else (text, masks, filters, `use`...) puts the `Svg`
 back to drawing its markup whole, which is right but slower. Browser libraries that build SVG
-with `document`, such as lottie-web, run after `import "@silkui/core/globals"`, which adds a
-minimal `window` and `document` where the realm has none.
+with `document`, such as lottie-web, run after `import "@silkui/core/globals"`.
+
+### Browser globals
+
+`import "@silkui/core/globals"`, first in the app, gives code written for a browser page the
+globals it expects. `document` has an `<html>` element as the tree's root and a `<body>` that
+fills it: render into `document.body`. Events that reach the root go on to `document` and
+`window` in both phases, so `document.addEventListener("keydown", ...)` works, and
+`document.documentElement.classList` and `style.setProperty("--name", value)` style `:root`.
+It also adds `document.activeElement`, `getElementById` and the query methods, `innerWidth`
+and `innerHeight` with `resize` events, `HTMLElement`, `Element`, `Node` and `Text` for
+`instanceof` (their prototypes are the nodes'), `MutationObserver`, `location`, `history` and `navigation`
+(entries in memory with `popstate` and `hashchange`, starting at `http://localhost/` or
+`globalThis.__silkLocation`), `localStorage` (a JSON file under `~/.silkui/storage/<app>` on
+the full runtime, or `$SILKUI_STORAGE_DIR`), `sessionStorage`, `indexedDB` (in memory, saved
+next to local storage on the full runtime), `Worker` on the full runtime (`@silkui/vite` puts a small `new Worker(new URL("x.js", import.meta.url))` worker into the bundle and leaves one over 256 KB in `assets/` beside it), and `navigator`'s
+platform and language. `fetch` resolves a relative address against `location` and serves an address of the window's own origin (`/x.wasm`) from the app's files beside the bundle; `EventSource` reads server-sent events with it. `SharedWorker` shares one worker per script and name, and `navigator.mediaDevices` has no devices. `createImageBitmap` decodes PNG and JPEG on the host (from a `Blob` or an image's address) and takes `ImageData`, canvases and other bitmaps, with cropping, `resizeWidth`/`resizeHeight` and `imageOrientation: "flipY"`; a 2D context draws the `ImageBitmap`. Workers have none. `customElements` makes a defined tag a node with its class's prototype, whose connection and observed-attribute callbacks come a microtask after the change. Globals the realm already has stay as they are.
 
 A node has `append`, `appendChild`, `insertBefore`, `removeChild`, `remove`, `contains`,
 `parentNode`, `childNodes`, `firstChild`, `lastChild` and the sibling getters, as in the DOM.
@@ -170,6 +185,42 @@ registerShortcut("Mod+Shift+B", build); // Mod is Command on macOS, Control else
 `setTray` and `registerShortcut` resolve to whether the system took them. A shortcut works
 whichever app has focus; another app may hold it, and Wayland has none. `removeTray()` and
 `unregisterShortcut(accelerator)` undo them.
+
+The rest of a desktop app's shell is direct calls too, shaped like Electron's so a desktop app
+moves over without an IPC layer. Everything runs in the app's own process.
+
+```ts
+import { setApplicationMenu, showContextMenu, showOpenDialog, appWindow } from "@silkui/core";
+
+setApplicationMenu([
+  { role: "appMenu" },
+  { label: "File", submenu: [{ label: "Open…", accelerator: "Mod+O", click: open }] },
+  { role: "editMenu" },
+  { role: "viewMenu" },
+  { role: "windowMenu" },
+]);
+node.addEventListener("contextmenu", (event) =>
+  showContextMenu([{ label: "Rename", click: rename }, { type: "separator" }, { label: "Delete", click: remove }], {
+    x: event.clientX,
+    y: event.clientY,
+  }),
+);
+const { canceled, filePaths } = await showOpenDialog({ properties: ["openDirectory"] });
+appWindow.addEventListener("fullscreenchange", ({ fullScreen }) => setInset(fullScreen ? 0 : 80));
+```
+
+| Call | Does |
+| --- | --- |
+| `setApplicationMenu(template)` | The menu bar. `role`s are the system's items (`quit`, `copy`, `togglefullscreen`, `front`), `zoomIn`/`zoomOut`/`resetZoom` zoom the page, `appMenu`, `editMenu`, `viewMenu`, `windowMenu` are whole menus |
+| `showContextMenu(template, { x, y })` | A native context menu; resolves to `true` when it closes, or at once to `false` where the system has none (Linux, the browser) |
+| `showOpenDialog({ properties, filters, defaultPath })`, `showSaveDialog(...)` | File and folder pickers; resolve to `{ canceled, filePaths }` and `{ canceled, filePath }` |
+| `openExternal(url)`, `showItemInFolder(path)` | The default browser (or mail app), and Finder or Explorer with the item selected |
+| `startFileDrag(paths)` | From a `pointerdown` or `pointermove`, drags the files out to other apps (macOS, Windows) |
+| `setBadge(text)`, `setProgress(fraction)` | The dock or taskbar icon's badge and progress |
+| `appWindow` | `setFullScreen`, `isFullScreen`, `minimize`, `focus`, `show`, `hide`, `setTitle`, `setZoomFactor`, `getZoomFactor`, and `fullscreenchange` and `zoomchange` events |
+
+A hidden title bar with the window controls inset is the app's configuration, not a call:
+`.titleBar(TitleBar.transparent(height).buttons(left, top))` in its `tasks.silk`.
 
 `memoryUsage()` is the app's memory as the system shows it to users, to put next to an
 Electron app's in Activity Monitor or Task Manager. It is synchronous and allocates almost

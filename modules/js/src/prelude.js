@@ -194,6 +194,23 @@
     });
   }
 
+  // Canvas 2D (canvas2d.js, evaluated on first use) in a host that shows canvases: a canvas node
+  // gets its "2d" context from `native.canvas2dLoad`.
+  let canvas2dApi = null;
+  const canvas2d = (native.canvas2dLoad = () => (native.canvas2dEnabled() ? (canvas2dApi ??= (0, eval)(native.canvas2dApi())(native)) : null));
+  for (const name of ["CanvasRenderingContext2D", "Path2D", "ImageData", "TextMetrics", "CanvasGradient", "CanvasPattern"]) {
+    if (name in globalThis) continue;
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = canvas2d()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
   globalThis.open = (url) => {

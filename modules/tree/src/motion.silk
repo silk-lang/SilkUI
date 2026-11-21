@@ -13,8 +13,9 @@ import style_change
 import style { Computed }
 import timing { EasingStops, Easing, TransitionLists, TransitionSpec, TransitionItem, TimingList, Span, ALL }
 import timing
-import node { NONE, Event, EventKind }
+import node { NONE, Event, EventKind, Move, MOVE_LINK, MOVE_CURVE }
 import mutation {
+  FIRST_ROOT,
   LISTEN_TRANSITION_RUN,
   LISTEN_TRANSITION_START,
   LISTEN_TRANSITION_END,
@@ -22,7 +23,11 @@ import mutation {
 }
 import transform
 import transform { TransformList, Op, Origin }
+import filter_motion { FilterList }
+import filter_motion
 import properties.computed { Fill, BoxShadow, Visibility, Dimension, SizeValue, DimensionKind, Display }
+import animation
+import silk.geometry.rect { Rect }
 import silk.collections.list { List }
 import silk.color.rgba { Rgba }
 import silk.core.option { Option }
@@ -69,6 +74,9 @@ pub const OFFSET_ROTATE: u32 = 52
 pub const OFFSET_ANCHOR: u32 = 53
 pub const OFFSET_POSITION: u32 = 54
 pub const FIELDS: u32 = 55
+/// `filter`, which lives in the node's paint effects rather than in `Computed`: the loops over
+/// `FIELDS` leave it out, and [`transitionFilter`] and `animation.applyFilters` ease it.
+pub const FILTER: u32 = 55
 
 
 /// The CSS longhand of field `field`, as transition records name it.
@@ -128,7 +136,8 @@ pub fn fieldName(field: u32) -> &'static [u8] {
     51 => b"offset-distance"
     52 => b"offset-rotate"
     53 => b"offset-anchor"
-    _ => b"offset-position"
+    54 => b"offset-position"
+    _ => b"filter"
   }
 }
 
@@ -147,7 +156,7 @@ pub fn propertyMask(name: &[u8]) -> u64 {
     return ALL
   }
   let mut field: u32 = 0
-  while field < FIELDS {
+  while field <= FILTER {
     if timing.named(name, fieldName(field)) {
       return bit(field)
     }
@@ -368,6 +377,8 @@ pub union Sample {
   /// An `offset-anchor` or `offset-position`, with its `transform.PLACE_*` kind (an anchor is
   /// `PLACE_AUTO` or `PLACE_SET`).
   Spot { pub value: Origin, pub kind: u8 },
+  /// A `filter` list ([`FILTER`]), read from the node's paint effects.
+  Filters { pub value: FilterList },
 }
 
 impl Copy for Sample {}
@@ -701,6 +712,10 @@ pub fn same(a: Sample, b: Sample) -> bool {
       Sample.Spot { value: other, kind: otherKind } => kind == otherKind && value.same(&other)
       _ => false
     }
+    Sample.Filters { value } => match b {
+      Sample.Filters { value: other } => filter_motion.same(&value, &other)
+      _ => false
+    }
   }
 }
 
@@ -754,6 +769,10 @@ pub fn interpolable(a: Sample, b: Sample) -> bool {
     }
     Sample.Distance { value } => match b {
       Sample.Distance { value: other } => value > 0.0 && other > 0.0
+      _ => false
+    }
+    Sample.Filters { value } => match b {
+      Sample.Filters { value: other } => filter_motion.interpolable(&value, &other)
       _ => false
     }
     _ => true
@@ -1017,6 +1036,12 @@ pub fn mix(field: u32, a: Sample, b: Sample, p: f32, width: f32, height: f32) ->
         _ => b
       }
     }
+    Sample.Filters { value } => {
+      return match b {
+        Sample.Filters { value: other } => Sample.Filters { value: filter_motion.mix(&value, &other, p) }
+        _ => b
+      }
+    }
   }
 }
 
@@ -1183,49 +1208,119 @@ pub effect fn transition(
       field = field + 1
       continue
     }
-    let after = sample(&target, field)
     let spec = lists.spec(field, &tree.easingStops)
-    let at = find(&tree.*, slot, id, field)
-    if at != usize.MAX {
-      let old = tree.transitions.asSlice()[at]
-      if same(old.to, after) {
-        // Still heading where it was.
-        write(&mut computed, field, old.at(now, &tree.easingStops))
-        field = field + 1
-        continue
-      }
-      let current = old.at(now, &tree.easingStops)
-      run cancel(&mut tree, at, now)
-      if hasBefore && spec.duration + spec.delay > 0.0 && !same(current, after)
-        && (spec.allowDiscrete || interpolable(current, after)) {
-        let mut next = startOf(&tree.*, slot, id, field, current, after, &spec, now)
-        if same(old.reversingFrom, after) {
-          // Reversing a transition part way takes as long as the part it undoes.
-          let output = old.easing.at(old.progress(now), &tree.easingStops)
-          let factor = f32.max(0.0, f32.min(1.0, f32.abs(output * old.factor + 1.0 - old.factor)))
-          next.reversingFrom = old.to
-          next.factor = factor
-          next.duration = next.duration * f32.toF64(factor)
-          if spec.delay < 0.0 {
-            next.start = now + f32.toF64(spec.delay * factor)
-          }
-        }
-        run begin(&mut tree, next, now, &mut computed)
-      }
-      field = field + 1
-      continue
-    }
-    if hasBefore && spec.duration + spec.delay > 0.0 {
-      let previous = sample(before, field)
-      if !same(previous, after) && (spec.allowDiscrete || interpolable(previous, after)) {
-        let next = startOf(&tree.*, slot, id, field, previous, after, &spec, now)
-        run begin(&mut tree, next, now, &mut computed)
-      }
+    let moved = run settle(&mut tree, slot, id, field, &spec, before, Option<Sample>.None, hasBefore, sample(&target, field), now)
+    if let Option<Sample>.Some { value } = moved {
+      write(&mut computed, field, value)
     }
     field = field + 1
   }
   if computed.layout.display.isNone() {
     run cancelAll(&mut tree, slot)
+  }
+}
+
+// The value field `field` of the node at `slot` shows when its after-change value is
+// `after`: a running transition's, a new one's, or None for `after` itself. `previous` is the
+// before-change value, `sample(before, field)` when None.
+effect fn settle(
+  tree: &mut UiTree<'_>,
+  slot: u32,
+  id: u32,
+  field: u32,
+  spec: &TransitionSpec,
+  before: &Computed,
+  previous: Option<Sample>,
+  hasBefore: bool,
+  after: Sample,
+  now: f64,
+) -> Option<Sample>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let at = find(&tree.*, slot, id, field)
+  if at != usize.MAX {
+    let old = tree.transitions.asSlice()[at]
+    if same(old.to, after) {
+      // Still heading where it was.
+      return Option<Sample>.some(old.at(now, &tree.easingStops))
+    }
+    let current = old.at(now, &tree.easingStops)
+    run cancel(&mut tree, at, now)
+    if hasBefore && spec.duration + spec.delay > 0.0 && !same(current, after)
+      && (spec.allowDiscrete || interpolable(current, after)) {
+      let mut next = startOf(&tree.*, slot, id, field, current, after, spec, now)
+      if same(old.reversingFrom, after) {
+        // Reversing a transition part way takes as long as the part it undoes.
+        let output = old.easing.at(old.progress(now), &tree.easingStops)
+        let factor = f32.max(0.0, f32.min(1.0, f32.abs(output * old.factor + 1.0 - old.factor)))
+        next.reversingFrom = old.to
+        next.factor = factor
+        next.duration = next.duration * f32.toF64(factor)
+        if spec.delay < 0.0 {
+          next.start = now + f32.toF64(spec.delay * factor)
+        }
+      }
+      return Option<Sample>.some(run begin(&mut tree, next, now))
+    }
+    return Option<Sample>.None
+  }
+  if hasBefore && spec.duration + spec.delay > 0.0 {
+    let from = match previous {
+      Option<Sample>.Some { value } => value
+      _ => sample(before, field)
+    }
+    if !same(from, after) && (spec.allowDiscrete || interpolable(from, after)) {
+      let next = startOf(&tree.*, slot, id, field, from, after, spec, now)
+      return Option<Sample>.some(run begin(&mut tree, next, now))
+    }
+  }
+  return Option<Sample>.None
+}
+
+/// Whether the node at `slot` eases its `filter`: an animation sets it (`animated`), a
+/// transition of it runs, or one may start because it showed a filter and `lists` transition it.
+pub fn filterMoves(tree: &UiTree<'_>, slot: u32, lists: &TransitionLists, animated: u64) -> bool {
+  if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(FILTER))) != 0 {
+    return true
+  }
+  if tree.transitions.length() != 0 && find(tree, slot, tree.node(slot).id, FILTER) != usize.MAX {
+    return true
+  }
+  if let Option.Some { value } = tree.node(slot).paintEffects() {
+    if value.filters.length() != 0 {
+      let spec = lists.spec(FILTER, &tree.easingStops)
+      return spec.duration + spec.delay > 0.0
+    }
+  }
+  return false
+}
+
+/// [`transition`] for `filter`, which `Computed` does not hold: `before` is the list the node
+/// showed, `after` the one its new style computes. Gives the list to show while a transition
+/// runs, None for `after` itself. `style` is the new style, for its `transition-*` lists.
+pub effect fn transitionFilter(
+  tree: &mut UiTree<'_>,
+  slot: u32,
+  style: &Computed,
+  before: FilterList,
+  hasBefore: bool,
+  after: FilterList,
+  animated: u64,
+) -> Option<FilterList>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let id = tree.node(slot).id
+  let now = tree.input.time
+  if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(FILTER))) != 0 || style.layout.display.isNone() {
+    let at = find(&tree.*, slot, id, FILTER)
+    if at != usize.MAX { run cancel(&mut tree, at, now) }
+    return Option<FilterList>.None
+  }
+  let spec = style.transition.spec(FILTER, &tree.easingStops)
+  let moved = run settle(&mut tree, slot, id, FILTER, &spec, style, Option<Sample>.some(Sample.Filters { value: before }), hasBefore, Sample.Filters { value: after }, now)
+  return match moved {
+    Option<Sample>.Some { value: Sample.Filters { value } } => Option<FilterList>.some(value)
+    _ => Option<FilterList>.None
   }
 }
 
@@ -1272,8 +1367,8 @@ fn startOf(
 }
 
 // Adds `next`, queues its `transitionrun` (and `transitionstart` when it has no delay left)
-// and writes its value now.
-effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64, computed: &mut Computed) -> ()
+// and gives its value now.
+effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64) -> Sample
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut added = next
@@ -1282,8 +1377,9 @@ effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64, computed: &mut C
     added.started = true
     run record(&mut tree, EventKind.TransitionStart, added.slot, added.field, added.elapsed(now))
   }
-  write(&mut computed, added.field, added.at(now, &tree.easingStops))
+  let value = added.at(now, &tree.easingStops)
   run tree.transitions.append(added)
+  return value
 }
 
 /// Advances the transitions of the current root to the frame clock: queues the records of
@@ -1319,6 +1415,12 @@ pub effect fn tick(tree: &mut UiTree<'_>) -> ()
       let mut ended = tree.node(slot).computed().*
       write(&mut ended, item.field, item.to)
       run tree.setComputed(slot, &ended)
+      if let Sample.Filters { value } = item.to {
+        // `filter` shows from the node's paint effects, which the next resolve eases from.
+        if let Option.Some { value: effects } = tree.nodeMut(slot).effects.getMut() {
+          run filter_motion.write(&value, &mut effects)
+        }
+      }
       drop tree.transitions.remove(i)
       run record(&mut tree, EventKind.TransitionEnd, slot, item.field, f64.toF32(item.duration))
       tree.restyleTick(slot)
@@ -1340,4 +1442,101 @@ pub fn animating(tree: &UiTree<'_>) -> bool {
     i = i + 1
   }
   return false
+}
+
+/// Whether another transition of `slot` moves how its transform maps, besides `translate`.
+fn turns(tree: &UiTree<'_>, slot: u32) -> bool {
+  let list = tree.transitions.asSlice()
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].slot == slot && list[i].field >= TRANSFORM && list[i].field <= OFFSET_POSITION
+      && list[i].field != TRANSLATE {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Finds the `translate` transitions a renderer can run by itself and writes them to
+/// `tree.moves` (see [`Move`]), for the frame about to be painted. Only when the host asked
+/// (`tree.compositedMoves`), and only for a node whose transform is a plain move at both ends
+/// with nothing else easing it. Returns whether the set of nodes changed since the last
+/// frame: those paint through another group.
+pub effect fn slides(tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.current != FIRST_ROOT {
+    // Only the first window's frames are drawn again by the renderer.
+    return false
+  }
+  let mut m: usize = 0
+  while m < tree.moves.length() {
+    let slot = tree.moves.get(m).slot
+    if u32.toUsize(slot) < tree.nodes.length() {
+      let nodes = tree.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].sliding = false
+    }
+    m = m + 1
+  }
+  tree.moves.clear()
+  let mut key: u64 = 0
+  if tree.compositedMoves && !animation.animating(&tree.*) {
+    let now = tree.input.time
+    let mut i: usize = 0
+    while i < tree.transitions.length() {
+      let item = tree.transitions.asSlice()[i]
+      i = i + 1
+      let slot = item.slot
+      if item.field != TRANSLATE || item.duration <= 0.0 || u32.toUsize(slot) >= tree.nodes.length()
+        || !tree.node(slot).live
+        || tree.node(slot).id != item.id
+        || !tree.holdsCurrent(slot)
+        || tree.node(slot).sliding
+        || turns(&tree.*, slot) {
+        continue
+      }
+      let shown = tree.node(slot).computed().*
+      if shown.transform.deep() || shown.transform.preserve3d || shown.transform.offset.path != transform.PATH_NONE {
+        continue
+      }
+      let size = boxSize(&tree.*, slot)
+      let box = Rect<f32>.new(0.0, 0.0, size[0], size[1])
+      let mut first = shown
+      write(&mut first, TRANSLATE, item.from)
+      let mut last = shown
+      write(&mut last, TRANSLATE, item.to)
+      let from = transform.flatten(transform.matrix(&first.transform, box))
+      let to = transform.flatten(transform.matrix(&last.transform, box))
+      if !transform.translation(&from) || !transform.translation(&to) {
+        continue
+      }
+      let mut curve: [f32; 17] = [0.0; 17]
+      let mut c: usize = 0
+      while c < MOVE_CURVE {
+        curve[c] = item.easing.at(usize.toF32(c) / 16.0, &tree.easingStops)
+        c = c + 1
+      }
+      run tree.moves.append(
+        Move {
+          node: u32.bitOr(MOVE_LINK, item.id),
+          slot: slot,
+          fromX: from.values[6],
+          fromY: from.values[7],
+          toX: to.values[6],
+          toY: to.values[7],
+          began: item.start,
+          elapsed: now - item.start,
+          duration: item.duration,
+          curve: curve,
+        },
+      )
+      let nodes = tree.nodes.asMutSlice()
+      nodes[u32.toUsize(slot)].sliding = true
+      key = u64.wrappingMultiply(key ^ (u32.toU64(item.id) + 1), 1099511628211)
+    }
+  }
+  let changed = key != tree.movesKey
+  tree.movesKey = key
+  return changed
 }
