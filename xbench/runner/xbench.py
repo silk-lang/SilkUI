@@ -282,6 +282,12 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 if shown:
                     state["shown"] = int(shown.group(1))
                     continue
+                # Silk UI with SILK_UI_TRACE_PRESENTS: the running total of frames the window showed.
+                # Uncapped, an app's frame callbacks can outrun what reaches the screen.
+                window = re.search(r"silk-ui: frames shown (\d+)", line)
+                if window:
+                    state["window_shown"] = int(window.group(1))
+                    continue
                 bench = re.search(r"bench: first frame start-to-layout-ms=([\d.e-]+) layout-ms=([\d.e-]+) paint-ms=([\d.e-]+) nodes=(\d+) fragments=(\d+)", line)
                 if bench:
                     record["silk_first_frame"] = {"start_to_layout_ms": float(bench.group(1)), "layout_ms": float(bench.group(2)),
@@ -308,7 +314,7 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 finally:
                     signal_tree(pids, signal.SIGCONT)
             elif ev == "begin":
-                state["begin"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)), state.get("shown"))
+                state["begin"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)), state.get("shown"), state.get("window_shown"))
             elif ev == "end":
                 name, frames = words[1], int(words[2])
                 b = state["begin"].pop(name, None)
@@ -324,6 +330,12 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                         shown_frames = (state.get("shown") or 0) - (b[2] or 0)
                         record["drivers"][name]["canvas_shown"] = shown_frames
                         record["drivers"][name]["canvas_shown_per_s"] = shown_frames * 1000 / wall if wall > 0 else None
+                    if state.get("window_shown") is not None:
+                        # The trace says at most a line a display frame: a few frames either way.
+                        window_frames = state["window_shown"] - (b[3] or 0)
+                        record["drivers"][name]["shown"] = window_frames
+                        record["drivers"][name]["shown_per_s"] = window_frames * 1000 / wall if wall > 0 else None
+                        record["drivers"][name]["cpu_ms_per_shown"] = cpu / window_frames if window_frames > 0 else None
             elif ev == "frames":
                 if not launch.fake_clock and len(words) > 2 and words[2]:
                     gaps = [float(x) for x in words[2].split(",") if x]
