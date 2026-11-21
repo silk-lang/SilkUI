@@ -913,8 +913,13 @@ export class Node {
       if (name === "checked" && "checked" in this) this.checked = on;
       else native.attribute(this.nodeId, name === "readonly" ? "readOnly" : name, on);
     } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
-      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`).
-      native.attribute(this.nodeId, name, text);
+      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`). One
+      // the tree does not know (React 19's `precedence`, a library's own) stays on the element.
+      try {
+        native.attribute(this.nodeId, name, text);
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
     } else {
       if (name === "href") {
         this._href = text || null;
