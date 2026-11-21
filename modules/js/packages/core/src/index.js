@@ -1517,9 +1517,9 @@ export class Image extends Node {
 }
 
 /**
- * A canvas the application draws with WebGPU, as a `<canvas>`: `width` and `height` are the
- * size of what is drawn in pixels (300 by 150 at first) and `getContext("webgpu")` gives a
- * `GPUCanvasContext`. The node lays out as an image of that size does: its style can
+ * A canvas the application draws with WebGPU or Canvas 2D, as a `<canvas>`: `width` and
+ * `height` are the size of what is drawn in pixels (300 by 150 at first), `getContext("webgpu")`
+ * gives a `GPUCanvasContext` and `getContext("2d")` a `CanvasRenderingContext2D`. The node lays out as an image of that size does: its style can
  * stretch it, and `objectFit` says how the drawing fits. Drawing happens on a GPU device of
  * the application's own, so a canvas that is slow to draw does not slow the rest of the window.
  */
@@ -1527,6 +1527,7 @@ export class Canvas extends Node {
   #width = 300;
   #height = 150;
   #context = null;
+  #kind = "";
 
   constructor() {
     super("canvas");
@@ -1554,12 +1555,17 @@ export class Canvas extends Node {
     this.#context?._resized();
   }
 
-  /** The canvas's `GPUCanvasContext` for "webgpu"; null for any other kind of context. */
-  getContext(kind) {
-    if (kind !== "webgpu") return null;
-    if (this.#context) return this.#context;
-    const api = native.gpuLoad?.();
-    return api ? (this.#context = api.context(this)) : null;
+  /**
+   * The canvas's `GPUCanvasContext` for "webgpu" or `CanvasRenderingContext2D` for "2d"; null
+   * for any other kind, or for a kind other than the one the canvas already has.
+   */
+  getContext(kind, options) {
+    if (kind !== "webgpu" && kind !== "2d") return null;
+    if (this.#context) return this.#kind === kind ? this.#context : null;
+    const api = kind === "2d" ? native.canvas2dLoad?.() : native.gpuLoad?.();
+    if (!api) return null;
+    this.#kind = kind;
+    return (this.#context = api.context(this, options));
   }
 
   setAttribute(name, value) {
