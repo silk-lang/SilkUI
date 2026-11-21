@@ -40,6 +40,8 @@ function eachLiveRange(update) {
 }
 
 const CLICK = KIND_OF.get("click");
+const FOCUS = KIND_OF.get("focus");
+const BLUR = KIND_OF.get("blur");
 const SELECTION_CHANGE = KIND_OF.get("selectionchange");
 const TOUCH_START = KIND_OF.get("touchstart");
 const COPY = KIND_OF.get("copy");
@@ -81,6 +83,10 @@ const UNITLESS = new Set([
 ]);
 
 const nodes = new Map();
+// HTML boolean attributes that are also the tree's own.
+const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline"]);
+// The tag stylesheets match a tree node by, by its kind (see ui-tree's `SelectorTree`).
+const LOCAL_NAMES = { box: "div", input: "input", image: "img", canvas: "canvas", svg: "svg", text: "#text" };
 const NO_CHILDREN = Object.freeze([]);
 let nextId = 0;
 
@@ -97,6 +103,68 @@ function cssName(name) {
   return css;
 }
 
+// A CSS name as the camel case name looks take: `background-color` is `backgroundColor`,
+// `-webkit-line-clamp` is `WebkitLineClamp`; custom properties stay as they are.
+function camelName(name) {
+  if (name.startsWith("--") || !name.includes("-")) return name;
+  return name.replace(/^-ms-/, "ms-").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+// `color: red; --gap: 4px` as camel case properties. Semicolons inside parentheses or
+// quotes (`url("a;b")`) stay in their value.
+function parseDeclarations(text) {
+  const properties = {};
+  let depth = 0;
+  let quote = "";
+  let start = 0;
+  const take = (end) => {
+    const part = text.slice(start, end);
+    const colon = part.indexOf(":");
+    if (colon > 0) {
+      const name = part.slice(0, colon).trim();
+      const value = part.slice(colon + 1).trim();
+      if (name && value) properties[camelName(name.startsWith("--") ? name : name.toLowerCase())] = value;
+    }
+    start = end + 1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      if (c === "\\") i++;
+      else if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === ";" && depth <= 0) take(i);
+  }
+  take(text.length);
+  return properties;
+}
+
+// `element.style` of an HTML element: the base look, whose CSS properties also read and write
+// as fields (`style.height = "10px"`), as a CSSStyleDeclaration's do.
+const styleProxies = new WeakMap();
+function styleProxy(look) {
+  let proxy = styleProxies.get(look);
+  if (proxy) return proxy;
+  proxy = new Proxy(look, {
+    get(target, key) {
+      if (typeof key !== "string" || key in target) {
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return target.get(key) ?? "";
+    },
+    set(target, key, value) {
+      if (typeof key !== "string" || key in target) return Reflect.set(target, key, value, target);
+      target.set({ [key]: value });
+      return true;
+    },
+  });
+  styleProxies.set(look, proxy);
+  return proxy;
+}
+
 // The tree names font family lists by number: each `fontFamily` text is defined once, as a
 // list of its own. The numbers start high, clear of the lists a host defines, and stay
 // small enough to be exact in the 32-bit float a style value is.
@@ -111,13 +179,6 @@ function familyOf(names) {
     native.fontFamily(id, names);
   }
   return String(id);
-}
-
-// The look's key for a CSS property name: camel case, and custom properties as written.
-function lookKey(name) {
-  name = String(name);
-  if (name.startsWith("--")) return name;
-  return name.replace(/^-(webkit|moz|ms)-/, "$1-").replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 }
 
 function cssValue(name, value) {
@@ -199,31 +260,45 @@ class Look {
     return value === undefined ? undefined : cssValue(name, value);
   }
 
-  // CSSOM's spellings, by CSS name (`background-color`, `--accent`), as `element.style` has.
-  setProperty(name, value, priority) {
-    const key = lookKey(name);
-    const text = value == null ? "" : String(value);
-    this.set({ [key]: text && priority === "important" ? text + " !important" : text });
-  }
-
-  getPropertyValue(name) {
-    return this.get(lookKey(name)) ?? "";
-  }
-
-  removeProperty(name) {
-    const old = this.getPropertyValue(name);
-    this.set({ [lookKey(name)]: null });
-    return old;
-  }
-
-  getPropertyPriority() {
-    return "";
-  }
-
   get cssText() {
     let css = "";
     for (const name in this.#values) css += cssName(name) + ":" + cssValue(name, this.#values[name]) + ";";
     return css;
+  }
+
+  /** Replaces the look with declarations in CSS text, as `element.style.cssText`. */
+  set cssText(text) {
+    this.replace(parseDeclarations(String(text ?? "")));
+  }
+
+  get length() {
+    return Object.keys(this.#values).length;
+  }
+
+  item(index) {
+    const name = Object.keys(this.#values)[index];
+    return name === undefined ? "" : cssName(name);
+  }
+
+  // CSSStyleDeclaration's methods, which take CSS names (`background-color`, `--gap`).
+  setProperty(name, value, priority) {
+    const text = value === null || value === undefined ? "" : String(value) + (priority === "important" ? " !important" : "");
+    this.set({ [camelName(String(name))]: text });
+  }
+
+  removeProperty(name) {
+    const camel = camelName(String(name));
+    const old = this.get(camel) ?? "";
+    this.set({ [camel]: null });
+    return old;
+  }
+
+  getPropertyValue(name) {
+    return this.get(camelName(String(name))) ?? "";
+  }
+
+  getPropertyPriority() {
+    return "";
   }
 
   _copyTo(look) {
@@ -522,6 +597,30 @@ export class Node {
     return 1;
   }
 
+  /**
+   * The element's tag: the HTML tag it was made with (see `createElement`), or for a tree
+   * node the tag stylesheets match it by (`div` for a box).
+   */
+  get localName() {
+    return this._tag ?? LOCAL_NAMES[this.kind] ?? "div";
+  }
+
+  set localName(value) {
+    this._tag = String(value);
+  }
+
+  /** The tag in upper case for HTML elements, as in the DOM. */
+  get tagName() {
+    const name = this.localName;
+    return this.namespaceURI === undefined ? name.toUpperCase() : name;
+  }
+
+  set tagName(_value) {}
+
+  get nodeName() {
+    return this.tagName;
+  }
+
   hasChildNodes() {
     return this.childNodes.length > 0;
   }
@@ -668,11 +767,12 @@ export class Node {
    * `node.style = { ... }` replaces the look.
    */
   get style() {
-    return this.look("base");
+    return this._tag === undefined ? this.look("base") : styleProxy(this.look("base"));
   }
 
   set style(properties) {
-    this.look("base").replace(properties);
+    if (typeof properties === "string") this.look("base").cssText = properties;
+    else this.look("base").replace(properties);
   }
 
   /** The look the tree lays over the base in `state`: hover, active, focus, focusVisible, or
@@ -708,11 +808,33 @@ export class Node {
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
+
+  getAttributeNames() {
+    const names = this.#className === null ? [] : ["class"];
+    for (const name of this.#rare?.attributes?.keys() ?? []) names.push(name);
+    return names;
+  }
+
+  /** The children as HTML; setting it replaces them with nodes parsed from HTML. */
+  get innerHTML() {
+    let html = "";
+    for (const child of this.childNodes) html += markupOf(child);
+    return html;
+  }
+
+  set innerHTML(html) {
+    for (const child of this.childNodes.slice()) child.destroy();
+    parseHTML(String(html ?? ""), this);
+  }
+
+  get outerHTML() {
+    return markupOf(this);
+  }
   removeAttribute(name) { this.setAttribute(name, null); }
 
   setAttribute(name, value) {
     name = String(name);
-    const text = value == null ? null : String(value);
+    let text = value == null ? null : String(value);
     if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
@@ -733,6 +855,20 @@ export class Node {
       else warnOnce("only an image has a src: it is ignored");
     } else if (name === "alt") {
       native.attribute(this.nodeId, "label", text ?? "");
+    } else if (this._tag !== undefined && (name === "tabindex" || name === "tabIndex")) {
+      this._keep("focus", "blur");
+      native.attribute(this.nodeId, "tabIndex", text === null ? -2147483648 : Number(text));
+    } else if (this._tag !== undefined && name === "style") {
+      this.style.cssText = text ?? "";
+    } else if (this._tag !== undefined && BOOLEAN_TREE_ATTRIBUTES.has(name)) {
+      // An HTML boolean attribute is on whatever its text, `disabled=""` included.
+      const on = value !== null && value !== undefined && value !== false;
+      text = on ? "" : null;
+      if (name === "checked" && "checked" in this) this.checked = on;
+      else native.attribute(this.nodeId, name === "readonly" ? "readOnly" : name, on);
+    } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
+      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`).
+      native.attribute(this.nodeId, name, text);
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -768,7 +904,7 @@ export class Node {
     const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
     if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
-    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && this._href)
+    const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
     return [wanted, 1 << kind];
   }
@@ -985,6 +1121,10 @@ export class Text extends Node {
 
   get nodeType() {
     return 3;
+  }
+
+  get nodeName() {
+    return "#text";
   }
 
   get nodeValue() {
@@ -1862,8 +2002,6 @@ export class Svg extends Node {
     // The tree's node for drawn SVG markup is an icon; to code it is an `svg`.
     super("icon");
     this.kind = "svg";
-    this.localName = "svg";
-    this.tagName = "svg";
     this.namespaceURI = SVG_NAMESPACE;
     svgChanged(this);
   }
@@ -2364,6 +2502,278 @@ export function createNode(kind) {
   if (kind === "image") return new Image();
   if (kind === "canvas") return new Canvas();
   return new Node(kind);
+}
+
+// `<input>` types that are not a text field.
+const BOX_INPUTS = new Set(["checkbox", "radio", "range", "color", "file", "hidden", "submit", "button", "reset", "image"]);
+// Tags that take focus without a tabindex, as on the web.
+const FOCUSABLE_TAGS = new Set(["button", "select", "summary", "iframe"]);
+
+/**
+ * `<input type="checkbox">` and `type="radio"`: a box a click checks, as on the web. It fires
+ * `input` and `change` when the click changes it.
+ */
+export class CheckInput extends Node {
+  #checked = false;
+
+  constructor(type = "checkbox") {
+    super("box");
+    this._tag = "input";
+    this.type = type;
+    this.value = "on";
+    this.defaultChecked = false;
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", type);
+    native.attribute(this.nodeId, "role", type === "radio" ? "radio" : "checkbox");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur");
+    this._relisten();
+  }
+
+  _shallowClone() {
+    const copy = new CheckInput(this.type);
+    copy.checked = this.#checked;
+    return copy;
+  }
+
+  get name() {
+    return this.getAttribute("name") ?? "";
+  }
+
+  get checked() {
+    return this.#checked;
+  }
+
+  set checked(value) {
+    value = !!value;
+    if (value === this.#checked) return;
+    this.#checked = value;
+    native.attribute(this.nodeId, "checked", value);
+    if (value && this.type === "radio" && this.name) {
+      let top = this;
+      while (top.parentNode) top = top.parentNode;
+      eachDescendant(top, (node) => {
+        if (node !== this && node instanceof CheckInput && node.type === "radio" && node.name === this.name) node.checked = false;
+      });
+    }
+  }
+
+  _activate() {
+    if (this.hasAttribute("disabled")) return true;
+    if (this.type === "radio" && this.#checked) return true;
+    this.checked = this.type === "radio" ? true : !this.#checked;
+    const input = new Event("input", this);
+    input.bubbles = true;
+    dispatchEvent(input);
+    const change = new Event("change", this);
+    change.bubbles = true;
+    dispatchEvent(change);
+    return true;
+  }
+}
+
+function eachDescendant(node, visit) {
+  for (const child of node.childNodes) {
+    visit(child);
+    if (child.childNodes.length) eachDescendant(child, visit);
+  }
+}
+
+function findById(id) {
+  for (const node of nodes.values()) if (node._elementId === id && (node.parentNode || node === rootNode)) return node;
+  return null;
+}
+
+// What a click on a label, summary or submit button does (see `activate`).
+function labelActivate() {
+  const id = this.getAttribute("for");
+  let control = id ? findById(id) : null;
+  if (!control) eachDescendant(this, (node) => {
+    if (!control && (node instanceof Input || node instanceof CheckInput)) control = node;
+  });
+  if (!control) return false;
+  if (control instanceof CheckInput) control._activate();
+  else control.focus();
+  return true;
+}
+
+function summaryActivate() {
+  const details = this.parentNode;
+  if (details?.localName !== "details") return false;
+  details.setAttribute("open", details.hasAttribute("open") ? null : "");
+  const toggle = new Event("toggle", details);
+  dispatchEvent(toggle);
+  return true;
+}
+
+function buttonActivate() {
+  if (this.hasAttribute("disabled")) return true;
+  const type = this.getAttribute("type") ?? "submit";
+  if (type !== "submit" && type !== "reset") return false;
+  let form = this.parentNode;
+  while (form && form.localName !== "form") form = form.parentNode;
+  if (!form) return false;
+  const event = new Event(type, form);
+  event.bubbles = true;
+  event.cancelable = true;
+  event.submitter = this;
+  dispatchEvent(event);
+  return true;
+}
+
+/**
+ * The node for HTML element `tag`, as `document.createElement` makes it: `<input>` and
+ * `<textarea>` are text fields (an `<input>` whose `type` is not a text field's is a box),
+ * `<img>` an image, `<canvas>` a canvas, `<svg>` inline SVG, and every other tag a box the
+ * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
+ * `@silkui/react`. `localName` and `tagName` give the tag.
+ */
+export function createElement(tag, options) {
+  tag = String(tag).toLowerCase();
+  const type = String(options?.type ?? "text").toLowerCase();
+  let node;
+  if (tag === "svg") return new Svg();
+  if (tag === "input" && (type === "checkbox" || type === "radio")) return new CheckInput(type);
+  if (tag === "input" && !BOX_INPUTS.has(type)) node = new Input();
+  else if (tag === "textarea") node = new Input();
+  else if (tag === "img") node = new Image();
+  else if (tag === "canvas") node = new Canvas();
+  else node = new Node("box");
+  node._tag = tag;
+  native.attribute(node.nodeId, "element", tag);
+  if (tag === "textarea") native.attribute(node.nodeId, "multiline", true);
+  if (tag === "input" && type !== "text") native.attribute(node.nodeId, "type", type);
+  if (node instanceof Input || FOCUSABLE_TAGS.has(tag)) {
+    if (!(node instanceof Input)) native.attribute(node.nodeId, "tabIndex", 0);
+    node._keep("focus", "blur");
+  }
+  if (tag === "label") node._activate = labelActivate;
+  else if (tag === "summary") node._activate = summaryActivate;
+  else if (tag === "button") node._activate = buttonActivate;
+  if (node._activate) node._relisten();
+  return node;
+}
+
+const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
+// Elements whose content is not markup. Scripts and styles in parsed HTML are left out.
+const RAW_TAGS = new Set(["script", "style", "textarea", "title"]);
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", copy: "©", reg: "®", hellip: "…", mdash: "—", ndash: "–", laquo: "«", raquo: "»", times: "×", middot: "·", bull: "•" };
+const ATTRIBUTE = /\s*([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/y;
+
+function decodeEntities(text) {
+  if (!text.includes("&")) return text;
+  return text.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (whole, name) => {
+    if (name[0] === "#") {
+      const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+    }
+    return ENTITIES[name] ?? whole;
+  });
+}
+
+const escapeText = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/ /g, "&nbsp;");
+const escapeAttribute = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+
+function markupOf(node) {
+  if (node.nodeType === 3) return escapeText(node.data);
+  if (node instanceof Svg || node instanceof SvgElement) return node.outerHTML ?? node._markup();
+  if (node.nodeType === 11) return node.innerHTML;
+  const tag = node.localName;
+  let html = "<" + tag;
+  for (const name of node.getAttributeNames()) if (name !== "style") html += " " + name + '="' + escapeAttribute(node.getAttribute(name)) + '"';
+  const css = node.look("base").cssText;
+  if (css) html += ' style="' + escapeAttribute(css) + '"';
+  html += ">";
+  if (VOID_TAGS.has(tag)) return html;
+  if (node instanceof Input) html += escapeText(node.value);
+  else html += node.innerHTML;
+  return html + "</" + tag + ">";
+}
+
+/**
+ * Parses `html` and appends its nodes to `parent`, as `innerHTML` does: elements, text with
+ * character references, and `<svg>` markup. Comments, scripts and styles are left out.
+ */
+export function parseHTML(html, parent) {
+  const stack = [parent];
+  const top = () => stack[stack.length - 1];
+  const inSvg = () => top() instanceof Svg || top() instanceof SvgElement;
+  let i = 0;
+  const text = (data) => {
+    if (!data) return;
+    const value = decodeEntities(data);
+    top().appendChild(inSvg() ? new SvgText(value) : createText(value));
+  };
+  while (i < html.length) {
+    const open = html.indexOf("<", i);
+    if (open < 0) {
+      text(html.slice(i));
+      break;
+    }
+    text(html.slice(i, open));
+    if (html.startsWith("<!--", open)) {
+      const end = html.indexOf("-->", open + 4);
+      i = end < 0 ? html.length : end + 3;
+      continue;
+    }
+    if (html[open + 1] === "!" || html[open + 1] === "?") {
+      const end = html.indexOf(">", open);
+      i = end < 0 ? html.length : end + 1;
+      continue;
+    }
+    if (html[open + 1] === "/") {
+      const end = html.indexOf(">", open);
+      const name = html.slice(open + 2, end < 0 ? html.length : end).trim().toLowerCase();
+      i = end < 0 ? html.length : end + 1;
+      for (let at = stack.length - 1; at > 0; at--) {
+        if (stack[at].localName.toLowerCase() === name) {
+          stack.length = at;
+          break;
+        }
+      }
+      continue;
+    }
+    const nameMatch = /^[a-zA-Z][^\s\/>]*/.exec(html.slice(open + 1, open + 64));
+    if (!nameMatch) {
+      text("<");
+      i = open + 1;
+      continue;
+    }
+    const written = nameMatch[0];
+    const tag = inSvg() ? written : written.toLowerCase();
+    let at = open + 1 + written.length;
+    const attributes = [];
+    ATTRIBUTE.lastIndex = at;
+    for (let match; (match = ATTRIBUTE.exec(html)); ATTRIBUTE.lastIndex = at) {
+      at = ATTRIBUTE.lastIndex;
+      attributes.push([match[1], decodeEntities(match[2] ?? match[3] ?? match[4] ?? "")]);
+    }
+    while (at < html.length && html[at] !== ">") at++;
+    const selfClosing = html[at - 1] === "/";
+    i = at + 1;
+    if (RAW_TAGS.has(tag)) {
+      const close = html.toLowerCase().indexOf("</" + tag, i);
+      const content = html.slice(i, close < 0 ? html.length : close);
+      const end = close < 0 ? html.length : html.indexOf(">", close);
+      i = end < 0 ? html.length : end + 1;
+      if (tag === "script" || tag === "style") continue;
+      const node = createElement(tag);
+      for (const [name, value] of attributes) node.setAttribute(name, value);
+      if (tag === "textarea") node.value = decodeEntities(content);
+      else node.appendChild(createText(decodeEntities(content)));
+      top().appendChild(node);
+      continue;
+    }
+    const svg = inSvg() || tag === "svg";
+    const type = attributes.find(([name]) => name.toLowerCase() === "type")?.[1];
+    const node = svg ? createSvgElement(tag) : createElement(tag, { type });
+    for (const [name, value] of attributes) {
+      if (!svg && name.toLowerCase() === "value" && node instanceof Input) node.value = value;
+      else node.setAttribute(svg ? name : name.toLowerCase(), value);
+    }
+    top().appendChild(node);
+    if (!selfClosing && !(VOID_TAGS.has(tag) && !svg)) stack.push(node);
+  }
 }
 
 /** A box with `style` as its base look and `children` appended. */
@@ -3668,8 +4078,10 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (!target) return false;
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
+  if (kind === FOCUS) focusing(target);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
+  if (kind === FOCUS || kind === BLUR) event.relatedTarget = kind === FOCUS ? blurredNode : null;
   const live = target instanceof Svg && target._live && isPointerKind(kind);
   if (kind === CLICK && event.pointerType === "touch" && event.isPrimary) compatTap(event, target);
   // A live svg sends pointer records on to the element under the pointer.
@@ -3679,7 +4091,12 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
     dispatchEvent(event);
     prevented = event.defaultPrevented;
   }
-  if (kind === CLICK && !prevented) follow(target);
+  if (kind === FOCUS) {
+    focusEvent("focusin", target, blurredNode);
+    blurredNode = null;
+  }
+  else if (kind === BLUR) blurring(target);
+  if (kind === CLICK && !prevented && !activate(target)) follow(target);
   if (kind !== CLICK && isPointerKind(kind)) {
     if (event.pointerType !== "touch") compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target);
     // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
@@ -3736,6 +4153,57 @@ function writeClipboard(data) {
     ? clipboard.writeText(item["text/plain"] ?? "")
     : clipboard.write([new globalThis.ClipboardItem(item)]);
   Promise.resolve(written).catch(reportError);
+}
+
+// The focused node, as far as focus and blur records tell (HTML elements that can take focus
+// listen for both: see `createElement`).
+let focusedNode = null;
+// The node a blur record left, until the focus record that follows it.
+let blurredNode = null;
+let pendingFocusOut = null;
+
+/** The focused node, or null. */
+export function activeElement() {
+  return focusedNode?.parentNode || focusedNode === rootNode ? focusedNode : null;
+}
+
+function focusEvent(type, target, relatedTarget) {
+  const event = new Event(type, target);
+  event.bubbles = true;
+  event.relatedTarget = relatedTarget;
+  dispatchEvent(event);
+}
+
+// `focusout` waits for the focus record that follows a blur, so its `relatedTarget` is where
+// focus went, as on the web; with none, it goes out on its own.
+function blurring(target) {
+  if (focusedNode === target) focusedNode = null;
+  blurredNode = target;
+  pendingFocusOut = target;
+  queueMicrotask(() => {
+    if (pendingFocusOut !== target) return;
+    pendingFocusOut = null;
+    blurredNode = null;
+    focusEvent("focusout", target, null);
+  });
+}
+
+function focusing(target) {
+  focusedNode = target;
+  const left = pendingFocusOut;
+  pendingFocusOut = null;
+  if (left) focusEvent("focusout", left, target);
+  else blurredNode = null;
+}
+
+// HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its
+// control, a summary opens its details, a submit button submits its form. True when one ran.
+function activate(target) {
+  for (let node = target; node; node = node.parentNode) {
+    if (node._activate) return node._activate() !== false;
+    if (node._href) return false;
+  }
+  return false;
 }
 
 // The default action of a click: the nearest link around the target opens.
@@ -4034,7 +4502,11 @@ function dragTo(target, x, y) {
   if (target) dragEvent("dragover", target, x, y, []);
 }
 
-let trayMenu = new Map();
+// Menu item callbacks by action id. Each menu (the tray's, the app's, a context menu) owns
+// the ids it packed, and drops them when it is replaced or closes.
+const menuActions = new Map();
+const menuOwners = { tray: [], app: [], context: [] };
+let nextMenuAction = 0;
 let trayClick = null;
 const shortcuts = new Map();
 const shortcutIds = new Map();
@@ -4060,12 +4532,32 @@ native.shellEvent = function (kind, a, x, y, text) {
   } else if (kind === 5) {
     trayClick?.({ button: a });
   } else if (kind === 6) {
-    trayMenu.get(a)?.();
+    const run = menuActions.get(a);
+    if (menuOwners.context.includes(a)) closeContextMenu();
+    run?.();
   } else if (kind === 7) {
     const notification = notifications.get(a);
     if (!notification) return;
     notifications.delete(a);
     notification._fire("click");
+  } else if (kind === 8) {
+    const resolve = dialogs.get(a);
+    if (!resolve) return;
+    dialogs.delete(a);
+    resolve(text ? text.split("\n") : []);
+  } else if (kind === 9) {
+    closeContextMenu();
+  } else if (kind === 10) {
+    const fullScreen = a === 1;
+    if (fullScreen === appWindow.fullScreen) return;
+    appWindow.fullScreen = fullScreen;
+    appWindow._fire("fullscreenchange", { fullScreen });
+  } else if (kind === 11) {
+    if (a === appWindow.zoomFactor) return;
+    appWindow.zoomFactor = a;
+    appWindow._fire("zoomchange", { zoomFactor: a });
+  } else if (kind === WEB_VIEW_EVENT) {
+    webViewEvent(a, x, text);
   }
 };
 
@@ -4139,20 +4631,86 @@ function hex(bytes) {
   return text;
 }
 
-function packMenu(items, lines) {
+// The roles the system implements, by `SystemItem` index; `about` and the others the
+// platform has no counterpart for are left out there.
+const SYSTEM_ROLES = {
+  about: 0, services: 1, hide: 2, hideothers: 3, unhide: 4, quit: 5, close: 6, minimize: 7, zoom: 8,
+  togglefullscreen: 9, front: 10, undo: 11, redo: 12, cut: 13, copy: 14, paste: 15, selectall: 16,
+};
+
+// Roles JavaScript does itself, with their usual labels and shortcuts.
+const SCRIPT_ROLES = {
+  resetzoom: { label: "Actual Size", accelerator: "Mod+0", click: () => appWindow.setZoomFactor(1) },
+  zoomin: { label: "Zoom In", accelerator: "Mod+Plus", click: () => appWindow.setZoomFactor(zoomStep(1)) },
+  zoomout: { label: "Zoom Out", accelerator: "Mod+-", click: () => appWindow.setZoomFactor(zoomStep(-1)) },
+};
+
+// Roles that stand for a whole menu, as Electron's.
+const MENU_ROLES = {
+  appmenu: () => [{ role: "about" }, { type: "separator" }, { role: "services" }, { type: "separator" }, { role: "hide" }, { role: "hideOthers" }, { role: "unhide" }, { type: "separator" }, { role: "quit" }],
+  filemenu: () => [{ role: IS_MAC ? "close" : "quit" }],
+  editmenu: () => [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }],
+  viewmenu: () => [{ role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }],
+  windowmenu: () => [{ role: "minimize" }, { role: "zoom" }, ...(IS_MAC ? [{ type: "separator" }, { role: "front" }] : [{ role: "close" }])],
+};
+
+const IS_MAC = /mac/i.test(globalThis.navigator?.platform ?? "") || globalThis.process?.platform === "darwin";
+
+// A menu shortcut as the host reads it: "" for none, else the key (`c` and a character, `n`
+// and a key name) and the modifier bits.
+function packAccelerator(accelerator) {
+  if (!accelerator) return ",0";
+  const parts = String(accelerator).split("+").map((part) => part.trim());
+  // "Mod+Plus" and "Mod++" both name the plus key.
+  if (parts.at(-1) === "" && parts.at(-2) === "") parts.splice(-2, 2, "+");
+  let bits = 0;
+  let key = "";
+  for (const part of parts) {
+    const modifier = MODIFIERS[part.toLowerCase()];
+    if (modifier !== undefined) bits |= modifier;
+    else if (part) key = part;
+  }
+  const lower = key.toLowerCase();
+  const named = { up: "ArrowUp", down: "ArrowDown", left: "ArrowLeft", right: "ArrowRight", esc: "Escape", escape: "Escape", return: "Enter", enter: "Enter", tab: "Tab", backspace: "Backspace", delete: "Delete", home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown" }[lower];
+  if (named) return "n" + named + "," + bits;
+  if (/^f([1-9]|1[0-9]|2[0-4])$/.test(lower)) return "nF" + lower.slice(1) + "," + bits;
+  if (lower === "plus") return "c+," + bits;
+  if (lower === "space") return "c ," + bits;
+  if ([...key].length === 1) return "c" + lower + "," + bits;
+  return "," + bits;
+}
+
+// `items` as the host's menu lines, with their callbacks kept under `owner`.
+function packMenu(items, lines, owner) {
   for (const item of items) {
+    if (!item || item.visible === false) continue;
+    const role = String(item.role ?? "").toLowerCase();
     if (item.type === "separator") lines.push("S");
-    else if (item.submenu) {
-      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
-      packMenu(item.submenu, lines);
+    else if (MENU_ROLES[role] && !item.submenu) {
+      lines.push("B" + String(item.label ?? role.replace(/menu$/, "").replace(/^./, (c) => c.toUpperCase())).replace(/\n/g, " "));
+      packMenu(MENU_ROLES[role](), lines, owner);
       lines.push("E");
+    } else if (item.submenu) {
+      lines.push("B" + String(item.label ?? "").replace(/\n/g, " "));
+      packMenu(item.submenu, lines, owner);
+      lines.push("E");
+    } else if (SYSTEM_ROLES[role] !== undefined && !item.click) {
+      lines.push("R" + SYSTEM_ROLES[role]);
     } else {
-      const action = trayMenu.size + 1;
-      trayMenu.set(action, typeof item.click === "function" ? item.click : () => {});
-      const label = String(item.label ?? "").replace(/\n/g, " ");
-      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + label);
+      const known = SCRIPT_ROLES[role] ?? {};
+      const action = ++nextMenuAction;
+      const click = item.click ?? known.click;
+      menuActions.set(action, typeof click === "function" ? () => click(item) : () => {});
+      menuOwners[owner].push(action);
+      const label = String(item.label ?? known.label ?? "").replace(/\n/g, " ");
+      lines.push("A" + action + "," + (item.enabled === false ? 0 : 1) + "," + (item.checked ? 1 : 0) + "," + packAccelerator(item.accelerator ?? known.accelerator) + "," + label);
     }
   }
+}
+
+function dropMenu(owner) {
+  for (const action of menuOwners[owner]) menuActions.delete(action);
+  menuOwners[owner] = [];
 }
 
 /**
@@ -4167,17 +4725,17 @@ export function setTray({ icon, tooltip = "", template = false, menu = [], onCli
   if (!icon || !(icon.width > 0) || !(icon.height > 0) || icon.data?.length !== icon.width * icon.height * 4) {
     throw new TypeError("setTray needs an icon of RGBA pixels: { width, height, data }");
   }
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = typeof onClick === "function" ? onClick : null;
   const lines = [];
-  packMenu(menu, lines);
+  packMenu(menu, lines, "tray");
   const fields = [String(tooltip), icon.width, icon.height, template ? 1 : 0, hex(icon.data), lines.join("\n")];
   return shellCall(1, fields).then((shown) => shown === 1);
 }
 
 /** Takes the tray icon away. */
 export function removeTray() {
-  trayMenu = new Map();
+  dropMenu("tray");
   trayClick = null;
   shellCall(2, []);
 }
@@ -4227,7 +4785,315 @@ export function registerShortcut(accelerator, callback) {
   return shellCall(3, [id, code, bits]).then((held) => held === 1);
 }
 
+// Web views: a real browser page (WKWebView on macOS) shown over a node, which a person and
+// an agent can both use. The views live on the platform thread; calls go through `__ui.shell`
+// (ops 10 to 14) and their events come back through `__ui.shellEvent` kind 20, with the view,
+// an event code and the fields separated by U+001F (ui-webview's wire.silk).
+
+const WEB_VIEW_EVENT = 20;
+const webViews = new Map();
+let nextWebView = 0;
+let nextWebRequest = 0;
+const webRequests = new Map();
+const dataClears = new Map();
+
+const thousandths = (value) => String(Math.round(Number(value) * 1000));
+
+function webRequest(resolve, reject) {
+  const request = ++nextWebRequest;
+  webRequests.set(request, { resolve, reject });
+  return request;
+}
+
+function settleWebRequest(request, ok, value, error) {
+  const waiting = webRequests.get(request);
+  if (!waiting) return;
+  webRequests.delete(request);
+  if (ok) waiting.resolve(value);
+  else waiting.reject(error instanceof Error ? error : new Error(String(error)));
+}
+
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const BASE64_VALUES = new Uint8Array(128);
+for (let i = 0; i < BASE64.length; i++) BASE64_VALUES[BASE64.charCodeAt(i)] = i;
+
+function decodeBase64(text) {
+  const clean = text.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let bits = 0;
+  let count = 0;
+  let at = 0;
+  for (let i = 0; i < clean.length; i++) {
+    bits = (bits << 6) | BASE64_VALUES[clean.charCodeAt(i)];
+    count += 6;
+    if (count >= 8) {
+      count -= 8;
+      out[at++] = (bits >> count) & 255;
+    }
+  }
+  return out;
+}
+
+const CONSOLE_LEVELS = ["debug", "log", "info", "warning", "error"];
+
+/** An event of a {@link WebView}: its `type` and the fields of what happened. */
+export class WebViewEvent {
+  constructor(type, fields) {
+    this.type = type;
+    Object.assign(this, fields);
+  }
+}
+
+/**
+ * A web view: a real browser page shown over a node. The page draws over the node's box
+ * (a native view of the system's engine), follows it as layout moves it, and hides when the
+ * node is not shown. Make one with {@link createWebView}.
+ *
+ * The view keeps the page's state as it reports it: `url`, `title`, `favicon`, `loading`,
+ * `progress`, `canGoBack`, `canGoForward`, `focused`. Listen with `addEventListener(type,
+ * listener)` for `loadstart`, `loadprogress`, `loadend` (`ok`, `error`), `urlchange`,
+ * `titlechange`, `faviconchange`, `historychange`, `navigationrequest` (answer it with
+ * `answerNavigation`), `newwindow`, `focuschange`, `console` (`level`, `message`),
+ * `unsupported` (`command`), `crashed` and `closed`.
+ */
+export class WebView {
+  #listeners = new Map();
+  #closed = false;
+
+  constructor(node, options) {
+    this.id = ++nextWebView;
+    this.node = node;
+    this.url = options.url ?? "";
+    this.title = "";
+    this.favicon = "";
+    this.loading = false;
+    this.progress = 0;
+    this.canGoBack = false;
+    this.canGoForward = false;
+    this.focused = false;
+    webViews.set(this.id, this);
+    const flags = (options.inspectable === false ? 0 : 1) | (options.askBeforeNavigating ? 2 : 0) | (options.transparent ? 4 : 0);
+    /** Resolves to whether the view opened: there are web views only in a desktop window. */
+    this.opened = shellCall(40, [this.id, node.nodeId, this.url, options.profile ?? "", flags]).then((value) => {
+      if (value !== 1) webViews.delete(this.id);
+      return value === 1;
+    });
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = new Set()));
+    list.add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    this.#listeners.get(type)?.delete(listener);
+  }
+
+  _fire(type, fields = {}) {
+    const event = new WebViewEvent(type, fields);
+    const handler = this["on" + type];
+    if (typeof handler === "function") handler.call(this, event);
+    for (const listener of this.#listeners.get(type) ?? []) listener.call(this, event);
+  }
+
+  #command(name, ...fields) {
+    if (this.#closed) return;
+    shellCall(42, [this.id, name, ...fields]);
+  }
+
+  #ask(name, ...fields) {
+    if (this.#closed) return Promise.reject(new Error("the web view is closed"));
+    return new Promise((resolve, reject) => {
+      const request = webRequest(resolve, reject);
+      this.#command(name, request, ...fields);
+    });
+  }
+
+  navigate(url) { this.url = String(url); this.#command("navigate", this.url); }
+  /** Shows `html` as if loaded from `baseUrl`. */
+  loadHtml(html, baseUrl = "") { this.#command("loadHtml", baseUrl, html); }
+  back() { this.#command("back"); }
+  forward() { this.#command("forward"); }
+  reload() { this.#command("reload"); }
+  /** Reloads bypassing the cache. */
+  hardReload() { this.#command("hardReload"); }
+  stop() { this.#command("stop"); }
+  /** Page zoom, 1 for 100%. */
+  setZoom(factor) { this.#command("zoom", thousandths(factor)); }
+  /** Gives the page keyboard focus. */
+  focus() { this.#command("focus"); }
+  /** Opens the engine's developer tools (Web Inspector on macOS). */
+  openDevTools() { this.#command("devtools"); }
+  setAudioMuted(muted) { this.#command("mute", muted ? 1 : 0); }
+  /** The color scheme the page sees: `"system"`, `"light"` or `"dark"`. */
+  setColorScheme(scheme) { this.#command("scheme", scheme === "light" || scheme === "dark" ? scheme : "system"); }
+  /** Shows or hides the view; a hidden view keeps its page. */
+  setShown(shown) { if (!this.#closed) shellCall(44, [this.id, shown ? 1 : 0]); }
+
+  /** Runs `script` in the page; resolves to its value (a promise is awaited), JSON-cloned. */
+  evaluate(script) {
+    return this.#ask("evaluate", String(script)).then((json) => (json === "" ? undefined : JSON.parse(json)));
+  }
+
+  /** A text outline of what the page shows, with refs (`[ref=e12]`) on what an agent can act on. */
+  snapshot() { return this.#ask("snapshot"); }
+
+  /** The page's pixels: `{ width, height, data }`, RGBA rows top first, in device pixels. */
+  screenshot() { return this.#ask("screenshot"); }
+
+  /** Scrolls element `ref` (a snapshot ref) into view and clicks it with real input. */
+  clickElement(ref) { return this.#ask("click", String(ref)); }
+
+  /** Focuses element `ref`, selects its value and types `text` over it with real input. */
+  fillElement(ref, text) { return this.#ask("fill", String(ref), String(text)); }
+
+  /** A click at a point of the page's viewport, in CSS pixels. */
+  clickAt(x, y, { button = 0, clickCount = 1, modifiers = 0 } = {}) {
+    this.#command("clickAt", thousandths(x), thousandths(y), button, clickCount, modifiers);
+  }
+
+  movePointer(x, y, { modifiers = 0 } = {}) { this.#command("move", thousandths(x), thousandths(y), modifiers); }
+
+  /** A wheel turn over a point, deltas in CSS pixels. */
+  scroll(x, y, deltaX, deltaY, { modifiers = 0 } = {}) {
+    this.#command("scroll", thousandths(x), thousandths(y), thousandths(deltaX), thousandths(deltaY), modifiers);
+  }
+
+  /** Types `text` into whatever has focus in the page. */
+  typeText(text) { this.#command("type", String(text)); }
+
+  /** Presses one key, by its DOM `key` value (`"Enter"`, `"a"`); modifiers shift 1, control 2, alt 4, meta 8. */
+  pressKey(key, modifiers = 0) { this.#command("key", modifiers, String(key)); }
+
+  /** Answers a `navigationrequest` event. */
+  answerNavigation(request, allow) { this.#command("answer", request, allow ? 1 : 0); }
+
+  /**
+   * Finds `text` in the page (case insensitive) and highlights the next match, or the previous
+   * one when `forward` is false; resolves to `{ matches, activeMatchOrdinal }`.
+   */
+  findInPage(text, { forward = true, newSession = false } = {}) {
+    return this.#ask("find", forward ? 1 : 0, newSession ? 1 : 0, String(text));
+  }
+
+  stopFindInPage() { this.#command("stopFind"); }
+
+  /** Closes the view; its page goes. */
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    shellCall(41, [this.id]);
+  }
+}
+
+/**
+ * Shows a web view over `node` (any node: the page covers its border box). Options: `url`,
+ * `profile` (a name keeps cookies and storage between runs; empty forgets them),
+ * `inspectable` (default true), `askBeforeNavigating`, `transparent`.
+ */
+export function createWebView(node, options = {}) {
+  return new WebView(node, options);
+}
+
+/**
+ * Clears what the pages of profile `profile` stored (an empty name: the views opened without
+ * one): `cookies` (cookies and site storage) and `cache`.
+ */
+export function clearWebViewData({ profile = "", cookies = true, cache = true } = {}) {
+  return new Promise((resolve) => {
+    const request = ++nextWebRequest;
+    dataClears.set(request, resolve);
+    shellCall(43, [request, cookies ? 1 : 0, cache ? 1 : 0, profile]);
+  });
+}
+
+function webViewEvent(id, code, text) {
+  const parts = text === "" ? [] : text.split("\x1f");
+  // The last field of each event may hold the separator itself.
+  const rest = (from) => parts.slice(from).join("\x1f");
+  if (code === 21) {
+    const request = Number(parts[0]);
+    const resolve = dataClears.get(request);
+    dataClears.delete(request);
+    resolve?.();
+    return;
+  }
+  const view = webViews.get(id);
+  if (!view) return;
+  switch (code) {
+    case 1: view._fire("created"); break;
+    case 2:
+      webViews.delete(id);
+      view._fire("closed");
+      break;
+    case 3:
+      view.loading = true;
+      view._fire("loadstart", { url: rest(0) });
+      break;
+    case 4:
+      view.progress = Number(parts[0]) / 1000;
+      view._fire("loadprogress", { progress: view.progress });
+      break;
+    case 5:
+      view.loading = false;
+      view._fire("loadend", { ok: parts[0] === "1", url: parts[1] ?? "", error: rest(2) });
+      break;
+    case 6:
+      view.url = rest(0);
+      view._fire("urlchange", { url: view.url });
+      break;
+    case 7:
+      view.title = rest(0);
+      view._fire("titlechange", { title: view.title });
+      break;
+    case 8:
+      view.canGoBack = parts[0] === "1";
+      view.canGoForward = parts[1] === "1";
+      view._fire("historychange", { canGoBack: view.canGoBack, canGoForward: view.canGoForward });
+      break;
+    case 9:
+      view._fire("navigationrequest", { request: Number(parts[0]), userInitiated: parts[1] === "1", url: rest(2) });
+      break;
+    case 10: view._fire("newwindow", { url: rest(0) }); break;
+    case 11:
+      view.focused = parts[0] === "1";
+      view._fire("focuschange", { focused: view.focused });
+      break;
+    case 12: settleWebRequest(Number(parts[0]), parts[1] === "1", rest(2), rest(2)); break;
+    case 13: settleWebRequest(Number(parts[0]), true, rest(1)); break;
+    case 14:
+      settleWebRequest(Number(parts[0]), true, {
+        width: Number(parts[1]),
+        height: Number(parts[2]),
+        data: decodeBase64(parts[3] ?? ""),
+      });
+      break;
+    case 15: settleWebRequest(Number(parts[0]), parts[1] === "1", undefined, rest(2) || "the action failed"); break;
+    case 16: view._fire("console", { level: CONSOLE_LEVELS[Number(parts[0])] ?? "log", message: rest(1) }); break;
+    case 17: {
+      const command = rest(1);
+      if (Number(parts[0])) settleWebRequest(Number(parts[0]), false, undefined, command + " is not supported here");
+      view._fire("unsupported", { command });
+      break;
+    }
+    case 18: view._fire("crashed", { reason: rest(0) }); break;
+    case 19:
+      view.favicon = rest(0);
+      view._fire("faviconchange", { url: view.favicon });
+      break;
+    case 20:
+      settleWebRequest(Number(parts[0]), true, { matches: Number(parts[1]), activeMatchOrdinal: Number(parts[2]) });
+      break;
+  }
+}
+
 /** Stops the shortcut of `accelerator`. */
+/** Ends the app with an exit code once the current turn finishes. */
+export function quit(code = 0) {
+  shellCall(45, [String(code)]);
+}
+
 export function unregisterShortcut(accelerator) {
   const { code, bits } = parseShortcut(accelerator);
   const id = shortcutIds.get(code + "+" + bits);
@@ -4236,6 +5102,226 @@ export function unregisterShortcut(accelerator) {
   shortcuts.delete(id);
   shellCall(4, [id]);
 }
+
+// File dialogs waiting for `DialogClosed`, by dialog id.
+const dialogs = new Map();
+
+function extensionsOf(filters) {
+  const all = [];
+  for (const filter of filters ?? []) {
+    for (const extension of filter.extensions ?? []) {
+      if (extension === "*") return "";
+      all.push(String(extension).replace(/^\./, ""));
+    }
+  }
+  return all.join(",");
+}
+
+function dialog(op, fields) {
+  return shellCall(op, fields).then((id) => (id ? new Promise((resolve) => dialogs.set(id, resolve)) : []));
+}
+
+/**
+ * Opens the system's file dialog, as Electron's `dialog.showOpenDialog`: `properties` takes
+ * `openFile`, `openDirectory` and `multiSelections`; `filters` are `{ name, extensions }`
+ * without dots (`"*"` for every file). It attaches to the window as a sheet on macOS and never
+ * blocks. Resolves to `{ canceled, filePaths }`.
+ */
+export function showOpenDialog(options = {}) {
+  const properties = options.properties ?? ["openFile"];
+  const directories = properties.includes("openDirectory");
+  const files = properties.includes("openFile") || !directories;
+  const flags = (files ? 1 : 0) | (directories ? 2 : 0) | (properties.includes("multiSelections") ? 4 : 0);
+  return dialog(5, [String(options.title ?? ""), String(options.defaultPath ?? ""), flags, extensionsOf(options.filters)]).then(
+    (filePaths) => ({ canceled: filePaths.length === 0, filePaths }),
+  );
+}
+
+/**
+ * Opens the system's save dialog, as Electron's `dialog.showSaveDialog`. `defaultPath` may
+ * name a folder, a file, or both. Resolves to `{ canceled, filePath }`.
+ */
+export function showSaveDialog(options = {}) {
+  const path = String(options.defaultPath ?? "");
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  const looksLikeFolder = slash === path.length - 1 || !/\.[^./\\]+$/.test(path.slice(slash + 1));
+  const directory = looksLikeFolder ? path : path.slice(0, Math.max(slash, 0));
+  const name = looksLikeFolder ? "" : path.slice(slash + 1);
+  return dialog(6, [String(options.title ?? ""), directory, name, extensionsOf(options.filters)]).then((paths) => ({
+    canceled: paths.length === 0,
+    filePath: paths[0] ?? "",
+  }));
+}
+
+/**
+ * Replaces the app's menu bar, as Electron's `Menu.setApplicationMenu(Menu.buildFromTemplate(t))`.
+ * Items are `{ label, click, accelerator, enabled, checked, type, role, submenu, visible }`.
+ * `accelerator` is `"Mod+Shift+K"` (`Mod`, `CmdOrCtrl`: Command on macOS, Control elsewhere).
+ * The system roles (`about`, `quit`, `undo`, `copy`, `togglefullscreen`, `minimize`, `front`
+ * and so on) are the system's own items; `zoomIn`, `zoomOut` and `resetZoom` zoom the page;
+ * `appMenu`, `fileMenu`, `editMenu`, `viewMenu` and `windowMenu` are whole menus. On macOS
+ * the first menu is the app menu. Edit shortcuts reach the focused node as keys first.
+ */
+export function setApplicationMenu(template) {
+  dropMenu("app");
+  const lines = [];
+  packMenu(template ?? [], lines, "app");
+  return shellCall(7, [lines.join("\n")]).then(() => undefined);
+}
+
+let contextMenuClosed = null;
+
+function closeContextMenu() {
+  dropMenu("context");
+  const closed = contextMenuClosed;
+  contextMenuClosed = null;
+  closed?.();
+}
+
+/**
+ * Opens a native context menu at `x`, `y` (CSS pixels in the window, a `MouseEvent`'s
+ * `clientX`/`clientY`), as Electron's `menu.popup()`. Items are as `setApplicationMenu`'s.
+ * Resolves when the menu closes, with or without a choice, to `true`; or at once to `false`
+ * when the system draws no context menus (Linux, the browser) and the app should draw its own.
+ */
+export function showContextMenu(template, { x = 0, y = 0 } = {}) {
+  closeContextMenu();
+  const lines = [];
+  packMenu(template ?? [], lines, "context");
+  const zoom = appWindow.zoomFactor || 1;
+  return shellCall(8, [x * zoom, y * zoom, lines.join("\n")]).then((shown) => {
+    if (shown !== 1) {
+      dropMenu("context");
+      return false;
+    }
+    return new Promise((resolve) => (contextMenuClosed = () => resolve(true)));
+  });
+}
+
+/** Puts `text` on the app's dock or taskbar icon (an unread count); `""` takes it off. */
+export function setBadge(text) {
+  return shellCall(9, [String(text ?? "")]).then((shown) => shown === 1);
+}
+
+/** Shows progress from 0 to 1 on the app's dock or taskbar icon; a negative number takes it off. */
+export function setProgress(fraction) {
+  return shellCall(10, [Number(fraction)]).then((shown) => shown === 1);
+}
+
+/** Opens `url` with the system's handler: a web page in the default browser, `mailto:` in the mail app. */
+export function openExternal(url) {
+  return shellCall(11, [String(url)]).then((opened) => opened === 1);
+}
+
+/** Shows the file or folder at `path` selected in Finder, Explorer or the file manager. */
+export function showItemInFolder(path) {
+  return shellCall(12, [String(path)]).then((shown) => shown === 1);
+}
+
+/**
+ * Drags the files at `paths` out of the window, as Electron's `webContents.startDrag`, so
+ * Finder, a mail draft or a terminal can take them. Call it from a `pointerdown` or
+ * `pointermove` listener while the button is down. Resolves to whether the drag started
+ * (macOS and Windows drag files out; Linux and the browser do not).
+ */
+export function startFileDrag(paths) {
+  const list = (Array.isArray(paths) ? paths : [paths]).map(String).filter(Boolean);
+  return shellCall(13, [list.join("\n")]).then((started) => started === 1);
+}
+
+const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+
+function zoomStep(direction) {
+  const now = appWindow.zoomFactor;
+  if (direction > 0) return ZOOM_STEPS.find((step) => step > now + 0.001) ?? now;
+  return ZOOM_STEPS.findLast((step) => step < now - 0.001) ?? now;
+}
+
+/**
+ * The window the app runs in. `fullScreen` and `zoomFactor` (the page zoom, as Electron's
+ * `webFrame.getZoomFactor()`; Mod with `=`, `-` and `0` change it too) are current, and
+ * `fullscreenchange` and `zoomchange` say when they change. The title bar is the app's
+ * configuration: a transparent one, with the window controls placed in it, comes from
+ * `TitleBar.transparent` in its `tasks.silk`.
+ */
+class AppWindow {
+  fullScreen = false;
+  zoomFactor = 1;
+  #listeners = new Map();
+
+  setFullScreen(on) {
+    if (!!on !== this.fullScreen) shellCall(14, [0]);
+  }
+
+  toggleFullScreen() {
+    shellCall(14, [0]);
+  }
+
+  minimize() {
+    shellCall(14, [1]);
+  }
+
+  /** Shows the window and brings it to the front with keyboard focus. */
+  focus() {
+    shellCall(14, [2]);
+  }
+
+  show() {
+    shellCall(14, [2]);
+  }
+
+  hide() {
+    shellCall(14, [3]);
+  }
+
+  setTitle(title) {
+    shellCall(14, [4, String(title)]);
+  }
+
+  /** Zooms the page, from 0.25 to 5. Resolves to the zoom now. */
+  setZoomFactor(zoom) {
+    return shellCall(15, [Math.min(5, Math.max(0.25, Number(zoom) || 1))]).then((now) => {
+      if (now !== this.zoomFactor) {
+        this.zoomFactor = now;
+        this._fire("zoomchange", { zoomFactor: now });
+      }
+      return now;
+    });
+  }
+
+  getZoomFactor() {
+    return this.zoomFactor;
+  }
+
+  isFullScreen() {
+    return this.fullScreen;
+  }
+
+  addEventListener(type, listener) {
+    let list = this.#listeners.get(type);
+    if (!list) this.#listeners.set(type, (list = []));
+    if (!list.includes(listener)) list.push(listener);
+  }
+
+  removeEventListener(type, listener) {
+    const list = this.#listeners.get(type);
+    const index = list ? list.indexOf(listener) : -1;
+    if (index >= 0) list.splice(index, 1);
+  }
+
+  _fire(type, detail) {
+    const event = { type, target: this, ...detail };
+    for (const listener of (this.#listeners.get(type) ?? []).slice()) {
+      try {
+        listener.call(this, event);
+      } catch (error) {
+        reportError(error);
+      }
+    }
+  }
+}
+
+export const appWindow = new AppWindow();
 
 /**
  * The app's memory in bytes, as the system shows it to users: `phys_footprint` on macOS

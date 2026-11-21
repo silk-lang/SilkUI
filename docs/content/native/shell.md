@@ -120,7 +120,7 @@ Files dragged in from another app come as the web's drag events on the page: `Fi
 subs.fileDrag(6, |drag| Message.Dragged { drag: move drag })
 ```
 
-JavaScript apps get the same through the web's names: `dragenter`, `dragover`, `dragleave` and `drop` on the node under the files, with `dataTransfer.files`, `new Notification(...)`, and `setTray` and `registerShortcut` from `@silkui/core`.
+JavaScript apps get the same through the web's names: `dragenter`, `dragover`, `dragleave` and `drop` on the node under the files, with `dataTransfer.files`, `new Notification(...)`, and `setTray` and `registerShortcut` from `@silkui/core`, which also has the menu bar, context menus, file dialogs and the window's state as direct calls shaped like Electron's (see its README).
 
 | | macOS | Windows | Linux X11 | Linux Wayland | Browser |
 | --- | --- | --- | --- | --- | --- |

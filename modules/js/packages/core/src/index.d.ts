@@ -856,7 +856,187 @@ export function removeTray(): void;
  * elsewhere) is pressed, whichever app has focus. Resolves to whether the system took it.
  */
 export function registerShortcut(accelerator: string, callback: () => void): Promise<boolean>;
+
+/** An event of a {@link WebView}; its other members depend on `type`. */
+export class WebViewEvent {
+  readonly type: string;
+  readonly url?: string;
+  readonly title?: string;
+  readonly ok?: boolean;
+  readonly error?: string;
+  readonly progress?: number;
+  readonly canGoBack?: boolean;
+  readonly canGoForward?: boolean;
+  readonly request?: number;
+  readonly userInitiated?: boolean;
+  readonly focused?: boolean;
+  readonly level?: "debug" | "log" | "info" | "warning" | "error";
+  readonly message?: string;
+  readonly command?: string;
+  readonly reason?: string;
+}
+
+export interface WebViewOptions {
+  url?: string;
+  /** A name keeps cookies and storage between runs; empty forgets them when the view closes. */
+  profile?: string;
+  /** Lets Web Inspector attach (default true). */
+  inspectable?: boolean;
+  /** Every main frame navigation waits for `answerNavigation`. */
+  askBeforeNavigating?: boolean;
+  /** The node's background shows until the page paints. */
+  transparent?: boolean;
+}
+
+export interface WebViewScreenshot {
+  width: number;
+  height: number;
+  /** RGBA, rows top first, device pixels. */
+  data: Uint8Array;
+}
+
+/** A real browser page shown over a node (WKWebView on macOS). */
+export class WebView {
+  readonly id: number;
+  readonly node: Node;
+  readonly opened: Promise<boolean>;
+  url: string;
+  title: string;
+  favicon: string;
+  loading: boolean;
+  progress: number;
+  canGoBack: boolean;
+  canGoForward: boolean;
+  focused: boolean;
+  addEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  removeEventListener(type: string, listener: (event: WebViewEvent) => void): void;
+  navigate(url: string): void;
+  loadHtml(html: string, baseUrl?: string): void;
+  back(): void;
+  forward(): void;
+  reload(): void;
+  hardReload(): void;
+  stop(): void;
+  setZoom(factor: number): void;
+  focus(): void;
+  openDevTools(): void;
+  setAudioMuted(muted: boolean): void;
+  setColorScheme(scheme: "system" | "light" | "dark"): void;
+  setShown(shown: boolean): void;
+  evaluate(script: string): Promise<unknown>;
+  snapshot(): Promise<string>;
+  screenshot(): Promise<WebViewScreenshot>;
+  clickElement(ref: string): Promise<void>;
+  fillElement(ref: string, text: string): Promise<void>;
+  clickAt(x: number, y: number, options?: { button?: number; clickCount?: number; modifiers?: number }): void;
+  movePointer(x: number, y: number, options?: { modifiers?: number }): void;
+  scroll(x: number, y: number, deltaX: number, deltaY: number, options?: { modifiers?: number }): void;
+  typeText(text: string): void;
+  pressKey(key: string, modifiers?: number): void;
+  answerNavigation(request: number, allow: boolean): void;
+  findInPage(text: string, options?: { forward?: boolean; newSession?: boolean }): Promise<{ matches: number; activeMatchOrdinal: number }>;
+  stopFindInPage(): void;
+  close(): void;
+}
+
+/** Shows a web view over `node`; the page covers its border box and follows it. */
+export function createWebView(node: Node, options?: WebViewOptions): WebView;
+
+/** Clears what the pages of a profile stored: cookies and site storage, the cache, or both. */
+export function clearWebViewData(options?: { profile?: string; cookies?: boolean; cache?: boolean }): Promise<void>;
+
+export function quit(code?: number): void;
 export function unregisterShortcut(accelerator: string): void;
+
+/** An item of `setApplicationMenu` or `showContextMenu`, as Electron's menu templates. */
+export interface MenuItem {
+  label?: string;
+  click?: (item: MenuItem) => void;
+  /** `"Mod+Shift+K"`, `"CmdOrCtrl+O"`, `"F5"`: `Mod` is Command on macOS, Control elsewhere. */
+  accelerator?: string;
+  enabled?: boolean;
+  checked?: boolean;
+  visible?: boolean;
+  type?: "normal" | "separator" | "checkbox" | "radio" | "submenu";
+  /**
+   * The system's own items (`about`, `services`, `hide`, `hideOthers`, `unhide`, `quit`,
+   * `close`, `minimize`, `zoom`, `togglefullscreen`, `front`, `undo`, `redo`, `cut`, `copy`,
+   * `paste`, `selectAll`), the page zoom (`zoomIn`, `zoomOut`, `resetZoom`), or a whole menu
+   * (`appMenu`, `fileMenu`, `editMenu`, `viewMenu`, `windowMenu`).
+   */
+  role?: string;
+  submenu?: MenuItem[];
+}
+
+/** Replaces the app's menu bar. On macOS the first menu is the app menu. */
+export function setApplicationMenu(template: MenuItem[]): Promise<void>;
+
+/**
+ * Opens a native context menu at `x`, `y` (CSS pixels in the window). Resolves to `true` when
+ * it closes, or at once to `false` where the system has none and the app draws its own.
+ */
+export function showContextMenu(template: MenuItem[], position?: { x?: number; y?: number }): Promise<boolean>;
+
+export interface FileFilter {
+  name?: string;
+  /** Without dots; `"*"` for every file. */
+  extensions: string[];
+}
+
+export interface OpenDialogOptions {
+  title?: string;
+  defaultPath?: string;
+  filters?: FileFilter[];
+  properties?: Array<"openFile" | "openDirectory" | "multiSelections" | "createDirectory" | "showHiddenFiles">;
+}
+
+export interface SaveDialogOptions {
+  title?: string;
+  /** A folder, a file name, or a path to a file. */
+  defaultPath?: string;
+  filters?: FileFilter[];
+}
+
+export function showOpenDialog(options?: OpenDialogOptions): Promise<{ canceled: boolean; filePaths: string[] }>;
+export function showSaveDialog(options?: SaveDialogOptions): Promise<{ canceled: boolean; filePath: string }>;
+
+/** Puts `text` on the dock or taskbar icon; `""` takes it off. Resolves to whether it shows. */
+export function setBadge(text: string): Promise<boolean>;
+/** Progress from 0 to 1 on the dock or taskbar icon; negative takes it off. */
+export function setProgress(fraction: number): Promise<boolean>;
+/** Opens `url` with the system's handler (the default browser for a web page). */
+export function openExternal(url: string): Promise<boolean>;
+/** Shows the file or folder at `path` selected in Finder, Explorer or the file manager. */
+export function showItemInFolder(path: string): Promise<boolean>;
+/**
+ * Drags the files at `paths` out to other apps; call it from `pointerdown` or `pointermove`
+ * while the button is down. Resolves to whether it started (macOS and Windows).
+ */
+export function startFileDrag(paths: string | string[]): Promise<boolean>;
+
+/** The window the app runs in. */
+export interface AppWindow {
+  readonly fullScreen: boolean;
+  /** The page zoom, 1 at 100%. */
+  readonly zoomFactor: number;
+  setFullScreen(on: boolean): void;
+  toggleFullScreen(): void;
+  isFullScreen(): boolean;
+  minimize(): void;
+  /** Shows the window and brings it to the front with keyboard focus. */
+  focus(): void;
+  show(): void;
+  hide(): void;
+  setTitle(title: string): void;
+  /** From 0.25 to 5; resolves to the zoom now. */
+  setZoomFactor(zoom: number): Promise<number>;
+  getZoomFactor(): number;
+  addEventListener(type: "fullscreenchange", listener: (event: { type: "fullscreenchange"; fullScreen: boolean }) => void): void;
+  addEventListener(type: "zoomchange", listener: (event: { type: "zoomchange"; zoomFactor: number }) => void): void;
+  removeEventListener(type: "fullscreenchange" | "zoomchange", listener: (event: never) => void): void;
+}
+
+export const appWindow: AppWindow;
 
 /** The app's memory: `footprint` in bytes over `processes` processes. */
 export interface MemoryUsage {

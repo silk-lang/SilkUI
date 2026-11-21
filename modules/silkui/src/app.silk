@@ -310,6 +310,8 @@ pub struct App {
   runtimeCss: bool,
   places: List<Target>,
   custom: string<'static>,
+  /// A bundle the app's own tools built (see [`App.prebuilt`]), relative to the project, or "".
+  prebuiltBundle: string<'static>,
   stylePaths: List<string<'static>>,
   bundled: String,
   compiledSheet: String,
@@ -665,6 +667,24 @@ effect fn bundle(app: &App, project: &Project) -> StepHandle
   return run Bundles.register(&run Path.make(web.view()))
 }
 
+/// The app's `app.js`: the prebuilt one, or the output of the bundle step.
+effect fn bundleFile(app: &App, project: &Project) -> Deferred<Path>
+  ! BuildError | TaskError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  if app.prebuiltBundle != "" {
+    let path = run prebuiltPath(app, project)
+    return run Deferred<Path>.external(path.view())
+  }
+  let step = run bundle(app, project)
+  return run step.output("bundle/app.js")
+}
+
+effect fn prebuiltPath(app: &App, project: &Project) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run fromRoot(project, app.prebuiltBundle)
+}
+
 /// Whether a build of `app` writes a bytecode image of its bundle for the window host: a
 /// JavaScript app on the SilkJS engine with a generated host, in a build that bundles
 /// (not `dev`, which runs what the development server sends). An image is written by a
@@ -683,7 +703,7 @@ fn imaged(app: &App, options: &Options, dev: bool) -> bool {
 effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   ! BuildError | TaskError
   ? &mut Allocator | &mut HostInput | &mut FileSystem {
-  let bundle = run bundle(app, project)
+  let bundled = run bundleFile(app, project)
   let source = run imageWriter()
   let files = run WriteFiles.make().text("main.silk", source.view())
   let generated = run files.register()
@@ -693,7 +713,7 @@ effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   let rooted = run writer.root(run generated.output("main.silk"))
   let configured = run rooted.unsandboxedTools(options.unsandboxedTools)
   let tool = run configured.artifact()
-  let reads = run Run.artifact(move tool).inputFile(run bundle.output("bundle/app.js"))
+  let reads = run Run.artifact(move tool).inputFile(move bundled)
   let writes = run (run reads.outputFile("app.bin")).outputFile("core.bin")
   return run writes.register()
 }
@@ -728,6 +748,7 @@ impl App {
       runtimeCss: false,
       places: List<Target>.make(),
       custom: "",
+      prebuiltBundle: "",
       stylePaths: List<string<'static>>.make(),
       bundled: String.make(),
       compiledSheet: String.make(),
@@ -792,6 +813,21 @@ impl App {
     ? R {
     let mut app = run move self
     app.custom = dir
+    return move app
+  }
+
+  /// Takes the bundle at `path` (relative to the project, such as `"web/dist/app.js"`) as the
+  /// app's instead of building one with npm and Vite: for a web project another tool builds,
+  /// such as one in a pnpm workspace. Its `app.sheet` beside it, when there is one, is the
+  /// compiled stylesheet. Build it with `@silkui/vite` before `silk task build`.
+  pub effect fn prebuilt<'env, E, ? R>(
+    self: once Effect<'env; App ! E ? R>,
+    path: string<'static>,
+  ) -> App
+    ! E
+    ? R {
+    let mut app = run move self
+    app.prebuiltBundle = path
     return move app
   }
 
@@ -1004,8 +1040,7 @@ impl App {
         }
       }
       let bundled = if self.custom == "" && plan.kind != Kind.Loom && !plan.dev {
-        let bundle = run bundle(self, &project)
-        let texted = run platform.embed("app_bundle", run bundle.output("bundle/app.js"))
+        let texted = run platform.embed("app_bundle", run bundleFile(self, &project))
         if plan.image {
           // Embedded, the image's bytes are part of the program for as long as it runs,
           // which is how long the engine reads them.
@@ -1157,10 +1192,20 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   if bundles {
     // The bundle is cached, so the compilations below reuse this build of it. Vite's
     // compiled stylesheet, when the app's Vite configuration makes one, is embedded too.
-    let producer = run bundle(&app, &project)
-    let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
-    let built = run graph.compile()
-    app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
+    if app.prebuiltBundle != "" {
+      app.bundled = run prebuiltPath(&app, &project)
+      if !run exists(app.bundled.view()) {
+        let mut message = run String.copy("silkui: the prebuilt bundle ")
+        run message.append(app.bundled.view())
+        run message.append(" does not exist; build the web project first")
+        run Task.abort(message.view())
+      }
+    } else {
+      let producer = run bundle(&app, &project)
+      let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
+      let built = run graph.compile()
+      app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
+    }
     let length = String.byteLength(app.bundled.view())
     let mut sheet = run String.copy(String.slice(app.bundled.view(), 0, length - 6))
     run sheet.append("app.sheet")

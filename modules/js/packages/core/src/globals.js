@@ -51,7 +51,17 @@ const inert = new Proxy({}, { get: (target, name) => (name in target ? target[na
 function createElement(tag) {
   tag = String(tag).toLowerCase();
   const html = exported("createElement");
-  if (typeof html === "function") return html(tag);
+  if (typeof html === "function") {
+    const node = html(tag);
+    // A 2d context the host cannot draw draws nothing, rather than failing a library's probe.
+    if (tag === "canvas" && typeof node.getContext === "function") {
+      const context = node.getContext;
+      node.getContext = function (type, ...rest) {
+        return context.call(this, type, ...rest) ?? (type === "2d" ? inert : null);
+      };
+    }
+    return node;
+  }
   if (tag === "canvas") return { localName: tag, width: 300, height: 150, style: {}, getContext: () => inert };
   const node = createNode(KIND_OF_TAG[tag] ?? "box");
   if (!("localName" in node)) Object.defineProperty(node, "localName", { value: tag, configurable: true });
