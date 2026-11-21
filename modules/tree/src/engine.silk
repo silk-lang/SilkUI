@@ -176,6 +176,7 @@ import font_raster.cache { GlyphCache }
 import font_raster.face { FontFace }
 import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
 import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollPosition }
 import ui_scene.primitives { ContentMask, Quad, GlyphSprite, ImageSprite, Shadow, PathSprite, Underline, LayerSprite }
 import ui_scene.path_cache { PathCache }
 import layout_table { LayoutTable, LayoutView }
@@ -954,6 +955,12 @@ pub struct UiTree<'a> {
   quietScrolls: usize,
   /// Frames whose paint was skipped because nothing changed since the last paint.
   pub paintsKept: u64,
+  /// Of those, the frames that only scrolled: the scene was kept and its scroll positions
+  /// moved (see `scrollsWithinLead`). A host draws such a frame by scrolling the last one.
+  pub scrollsKept: u64,
+  /// The scroll positions the last paint recorded, in device pixels: what its culling was
+  /// centered on. The scene's own positions move with the frames that keep it.
+  paintedScrolls: List<ScrollPosition>,
   pub stats: FrameStats,
   pub events: List<Event>,
   /// The node ids in the order the last frame painted them (replayed subtrees included).
@@ -997,6 +1004,11 @@ pub struct UiTree<'a> {
   /// The layout revision, scroll revision and viewport height `content-visibility: auto`
   /// elements were last reviewed at (see `reviewSkipped`).
   skipReview: [usize; 3],
+  /// How far, in CSS pixels, scroll offsets may move after that review before any
+  /// `content-visibility: auto` element could wake or be skipped, and how far they have moved
+  /// since (see `reviewSkipped`).
+  skipSlack: f32,
+  pub skipTravel: f32,
   /// The css nodes `wakeFor` woke this frame: they stay awake until the next one.
   heldAwake: List<u32>,
   /// Next fragment with the same CSS source, in arena order.
@@ -1505,6 +1517,8 @@ impl<'a> UiTree<'a> {
       quietRevision: usize.MAX,
       quietScrolls: usize.MAX,
       paintsKept: 0,
+      scrollsKept: 0,
+      paintedScrolls: List<ScrollPosition>.make(),
       stats: FrameStats.zero(),
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
@@ -1525,6 +1539,8 @@ impl<'a> UiTree<'a> {
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
       skipReview: [usize.MAX; 3],
+      skipSlack: 0.0,
+      skipTravel: 0.0,
       heldAwake: List<u32>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
@@ -4719,7 +4735,12 @@ impl<'a> UiTree<'a> {
   pub effect fn imeArea(self: &Self) -> ImeArea
     ! OutOfMemoryError
     ? &mut Allocator {
-    return run edit.imeArea(self)
+    let area = run edit.imeArea(self)
+    if area.enabled || text_selection.focusedHost(self) == NONE { return area }
+    // A focused editing host takes text too; the candidate window goes by its caret.
+    let mut rect = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    drop run text_selection.caretRect(self, &mut rect)
+    return ImeArea { enabled: true, rect: rect }
   }
 
   /// The time the focused caret blinks next, or -1 when no caret shows. Hosts that draw only
@@ -7200,14 +7221,43 @@ impl<'a> UiTree<'a> {
   /// picked up at paint (faces to load, a selection to rebuild). A frame asked for only by the
   /// host or the client (`requestAnimationFrame`, a canvas present) then skips its paint.
   fn quietFrame(self: &Self, input: FrameInput) -> bool {
+    return !self.needsFrame() && self.paintsAlike(input) && text_selection.settled(self)
+  }
+
+  /// [`quietFrame`] for a frame that only scrolled: scroll containers moved, by a `ScrollTo`,
+  /// a wheel or a scroll animation, and nothing else asks for a frame. Scrolling changes no
+  /// primitive of the scene, only where its scroll groups are drawn, so such a frame keeps
+  /// the scene while what it shows was painted (`scrollsWithinLead`). A scroll mutation moves
+  /// the tree's revision, so the selection is checked again in the frame, not here.
+  fn scrolledFrame(self: &Self, input: FrameInput) -> bool {
+    return (self.scrolled || cssom_view.scrollAnimating(self)) && !self.changesBesidesScroll()
+      && self.paintsAlike(input)
+  }
+
+  /// `needsFrame` without the reasons that are a scroll: an offset that moved, and a scroll
+  /// animation that moves one every frame.
+  fn changesBesidesScroll(self: &Self) -> bool {
+    return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty
+      || self.textSelection.scrolling
+      || scroll_snap.waiting(self)
+      || touch.animating(self)
+      || motion.animating(self)
+      || animation.animating(self)
+      || self.layout.revision() != self.laidOutRevision
+      || self.layout.scrollRevision() != self.laidOutScrolls
+      || self.reveal.length() != 0
+      || !self.replayable
+  }
+
+  /// Whether a paint at `input` now would draw what the last one drew, were nothing in the
+  /// tree to change: the second half of [`quietFrame`].
+  fn paintsAlike(self: &Self, input: FrameInput) -> bool {
     return self.paintedAt != 0
-      && !self.needsFrame()
       && input.width == self.quietInput.width && input.height == self.quietInput.height
       && input.scale == self.quietInput.scale
       && !self.facesDirty && !self.paintCachesStale && !self.paintDirty
       && self.fontBlockEnd < 0.0
       && edit.nextBlink(self) < 0.0
-      && text_selection.settled(self)
       && !self.resources.icons.anyAnimated()
   }
 
@@ -7217,6 +7267,7 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     // Asked before the frame clears its flags: whether nothing changed since the last paint.
     let quiet = self.quietFrame(input)
+    let scrolledOnly = self.scrolledFrame(input)
     self.frameNumber = self.frameNumber + 1
     self.heldAwake.clear()
     run self.trimNodes()
@@ -7281,13 +7332,32 @@ impl<'a> UiTree<'a> {
     }
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
+    if scrolledOnly {
+      // What paint does first: a selection that changed asks for paint (`paintDirty`).
+      run text_selection.refresh(&mut self)
+    }
     if quiet && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty && !self.scrolled
       && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls {
       // Nothing this frame did changed what paints either: the last scene is this frame's.
       self.paintsKept = self.paintsKept + 1
       self.stats.primitives = self.scene().primitiveCount()
+    } else if (scrolledOnly || quiet) && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty
+      && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls
+      && self.scrollsWithinLead() {
+      // The frame scrolled and changed nothing else, and the last paint reached everything
+      // the new offsets show: the last scene is this frame's, at the new offsets.
+      run self.moveSceneScrolls()
+      self.paintsKept = self.paintsKept + 1
+      self.scrollsKept = self.scrollsKept + 1
+      self.stats.primitives = self.scene().primitiveCount()
     } else {
       run self.paintFrame()
+      self.paintedScrolls.clear()
+      if self.flipped {
+        run self.paintedScrolls.appendSlice(self.sceneB.scrolls())
+      } else {
+        run self.paintedScrolls.appendSlice(self.sceneA.scrolls())
+      }
       self.quietInput = self.input
       self.quietRevision = self.layout.revision()
       self.quietScrolls = self.layout.scrollRevision()
@@ -7306,6 +7376,60 @@ impl<'a> UiTree<'a> {
     self.work.repaintedSubtrees = self.work.repaintedSubtrees + self.stats.repaintedSubtrees
     self.work.replayedOperations = self.work.replayedOperations + self.stats.replayedOperations
     self.work.paintedGlyphs = self.work.paintedGlyphs + self.stats.glyphs
+  }
+
+  /// Whether every scroll container the last paint recorded is still within the paint's lead
+  /// of where it was painted. Paint culls a scroll container's content to its scrollport and
+  /// a lead of one viewport height past it each way (`Painter.lead`), so offsets within that
+  /// lead show only content the scene holds. A container the paint did not record was culled
+  /// whole, with what it holds.
+  fn scrollsWithinLead(self: &Self) -> bool {
+    let scale = self.quietInput.scale
+    // A pixel short of the lead: device offsets are rounded where they are drawn.
+    let reach = self.quietInput.height * scale - 1.0
+    if reach <= 0.0 {
+      return false
+    }
+    let painted = self.paintedScrolls.asSlice()
+    let mut i: usize = 0
+    while i < painted.length {
+      let slot = self.slotOf(painted[i].node)
+      if slot == NONE {
+        return false
+      }
+      let node = self.node(slot)
+      if f32.abs(node.scrollX() * scale - painted[i].x) > reach
+        || f32.abs(node.scrollY() * scale - painted[i].y) > reach {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Moves the kept scene's scroll positions to the nodes' offsets now, so whoever draws the
+  /// scene draws this frame.
+  effect fn moveSceneScrolls(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let scale = self.quietInput.scale
+    let mut i: usize = 0
+    while i < self.paintedScrolls.length() {
+      let mut position = self.scene().scrolls()[i]
+      let slot = self.slotOf(position.node)
+      let x = self.node(slot).scrollX() * scale
+      let y = self.node(slot).scrollY() * scale
+      if position.x != x || position.y != y {
+        position.x = x
+        position.y = y
+        if self.flipped {
+          run self.sceneB.setScroll(position)
+        } else {
+          run self.sceneA.setScroll(position)
+        }
+      }
+      i = i + 1
+    }
   }
 
   /// Wakes the `content-visibility: auto` elements near the viewport, nearest first, and skips
@@ -7331,7 +7455,11 @@ impl<'a> UiTree<'a> {
     // Nothing moved since the last look that found nothing to change.
     let seen = [self.layout.revision(), self.layout.scrollRevision(), f32.toUsize(self.input.height)]
     // Scroll offsets move fragments while painting, without a layout revision: `scrolled`.
-    if !self.scrolled && seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2] { return false }
+    // A scroll moves each element by no more than the offsets moved: while that stays under the
+    // distance the nearest element was from waking or being skipped, none changes, and a
+    // scroll frame does not walk every element.
+    if seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2]
+      && (!self.scrolled || self.skipTravel < self.skipSlack) { return false }
     let mut automatic = List<u32>.make()
     run self.layout.automaticElements(&mut automatic)
     if automatic.length() == 0 { return false }
@@ -7340,6 +7468,7 @@ impl<'a> UiTree<'a> {
     let far = height * SKIP_FAR
     let mut wakes = List<u64>.make()
     let mut changed = false
+    let mut slack: f32 = far
     // Siblings under one parent fragment move by the same offset where the parent's chain only
     // translates them: one walk up for the first, the offset for the rest.
     let mut lastParent = NO_INDEX
@@ -7370,15 +7499,26 @@ impl<'a> UiTree<'a> {
         } else {
           lastParent = NO_INDEX
         }
+        // A scaled element moves farther than the scroll that moves it.
+        if !translated { slack = 0.0 }
       }
       let distance: f32 = if seen.yMax < 0.0 { 0.0 - seen.yMax } else if seen.yMin > height { seen.yMin - height } else { 0.0 }
       if self.layout.skipped(css) {
         if distance <= near {
           run wakes.append(u64.bitOr(u64.shiftLeft(f32.toU64(distance), 32), usize.toU64(css)))
+        } else {
+          slack = f32.min(slack, distance - near)
         }
-      } else if distance > far && !self.held(css) {
-        run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
-        changed = true
+      } else if distance > far {
+        if self.held(css) {
+          // Held awake for this frame only: the next review skips it.
+          slack = 0.0
+        } else {
+          run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
+          changed = true
+        }
+      } else {
+        slack = f32.min(slack, far - distance)
       }
     }
     run wakes.sort()
@@ -7390,6 +7530,8 @@ impl<'a> UiTree<'a> {
       at = at + 1
     }
     self.skipReview = if changed { [usize.MAX; 3] } else { seen }
+    self.skipSlack = if changed { 0.0 } else { slack }
+    self.skipTravel = 0.0
     return changed
   }
 
@@ -8260,6 +8402,8 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        caretSlot: self.textSelection.caret.slot,
+        caretOffset: self.textSelection.caret.offset,
         firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
@@ -8308,6 +8452,8 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        caretSlot: self.textSelection.caret.slot,
+        caretOffset: self.textSelection.caret.offset,
         firstOf: &self.fragmentOf,
         frame: self.frameNumber,
         previousFrame: self.paintedAt,
@@ -8387,6 +8533,8 @@ impl<'a> UiTree<'a> {
       stats: &mut stats,
       order: &mut order,
       selected: &self.textSelection.selected,
+      caretSlot: self.textSelection.caret.slot,
+      caretOffset: self.textSelection.caret.offset,
       firstOf: &self.fragmentOf,
       frame: self.frameNumber,
       previousFrame: self.paintedAt,

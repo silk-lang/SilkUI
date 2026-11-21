@@ -17,6 +17,9 @@ import ui_tree.legacy {
   MOD_SHIFT,
   MOD_CONTROL,
   BUTTON_PRIMARY,
+  LISTEN_BEFORE_INPUT,
+  Event,
+  EventKind,
   CpuSnapshot
 }
 import ui_tree.cssom_view as view
@@ -31,6 +34,7 @@ import vector.geometry_error { GeometryError }
 import vector.pixmap { Rgba8 }
 import font_collection.lib { FontCollection }
 import silk.collections.list { List }
+import silk.core.option { Option }
 import silk.num.f32
 import silk.num.f64
 import silk.num.u32
@@ -528,4 +532,140 @@ effect fn reordered() ! TreeError | CssError | CssomError | OutOfMemoryError | A
 test effect fn reorderedLayoutsSelectWhatIsSeen() ! TreeError | CssError | CssomError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run reordered() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// The edits the tree asked the client for since the last call, as `inputType:data` lines.
+effect fn edits(tree: &mut UiTree<'_>) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut events = List<Event>.make()
+  run tree.takeEvents(&mut events)
+  let mut out = String.make()
+  let mut i: usize = 0
+  while i < events.length() {
+    let event = &events.asSlice()[i]
+    if event.kind == EventKind.BeforeInput && event.target == 9 {
+      run out.append(String.view(&event.inputType))
+      run out.append(":")
+      run out.append(String.view(&event.value))
+      run out.append(";")
+    }
+    i = i + 1
+  }
+  return move out
+}
+
+effect fn caretIs(tree: &mut UiTree<'_>, expected: string, what: string<'static>) -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run text_selection.refresh(&mut tree)
+  let caret = tree.textSelection.caret
+  let mut out = String.make()
+  if caret.exists() {
+    run number(&mut out, u32.toUsize(caret.id))
+    run out.append("@")
+    run number(&mut out, caret.offset)
+  } else {
+    run out.append("none")
+  }
+  run Testing.expect(String.view(&out) == expected, what)
+}
+
+effect fn editingHosts() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run batch.create(9, NodeKind.Box)
+  run batch.append(1, 9)
+  run batch.attribute(9, Attribute.Named { name: run String.copy("contenteditable"), value: Option<String>.some(run String.copy("true")) })
+  run batch.attribute(9, Attribute.TabIndex { value: 0 })
+  run batch.listen(9, LISTEN_BEFORE_INPUT)
+  run paragraph(&mut batch, 9, 2, "Hello brave world")
+  run paragraph(&mut batch, 9, 3, "Second line")
+  run batch.create(4, NodeKind.Box)
+  run batch.append(9, 4)
+  run batch.attribute(4, Attribute.Named { name: run String.copy("contenteditable"), value: Option<String>.some(run String.copy("false")) })
+  run batch.text(4, 104, "Fixed")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  let mut snapshot = CpuSnapshot.make()
+  let plain = run snapshot.render(&tree)
+
+  run Testing.expect(text_selection.editingHost(&tree, tree.slotOf(102)) == tree.slotOf(9), "text in a contenteditable element is in its host")
+  run Testing.expect(text_selection.editingHost(&tree, tree.slotOf(104)) == 0xffffffff, "contenteditable=false inside a host is not editable")
+  run Testing.expect(!(run tree.imeArea()).enabled, "the input method is off while no host has focus")
+
+  // A press in the host focuses it and leaves a caret there, which paints.
+  run click(&mut tree, 102, 6, 1, 0)
+  run Testing.expect(tree.focused == tree.slotOf(9), "a press in the host focuses it")
+  run caretIs(&mut tree, "102@6", "the press leaves a caret where it landed")
+  run Testing.expect((run tree.imeArea()).enabled, "a focused host takes text from the input method")
+  run tree.frame(frame())
+  let caretShown = run snapshot.render(&tree)
+  let mut x: f32 = 0.0
+  let mut y: f32 = 0.0
+  run spot(&tree, 102, 6, &mut x, &mut y)
+  let column = f32.toU32(x) - 2
+  let row = f32.toU32(y)
+  let mut painted = false
+  let mut dx: u32 = 0
+  while dx < 4 {
+    if !same(caretShown.pixel(column + dx, row), plain.pixel(column + dx, row)) { painted = true }
+    dx = dx + 1
+  }
+  run Testing.expect(painted, "the caret paints at the press")
+
+  // Movement keys move the caret, kept in the host.
+  run press(&mut tree, "ArrowRight", 0)
+  run caretIs(&mut tree, "102@7", "Right moves the caret a character")
+  run press(&mut tree, "ArrowRight", MOD_CONTROL)
+  run caretIs(&mut tree, "102@11", "Ctrl+Right moves it to the word's end")
+  run press(&mut tree, "End", 0)
+  run caretIs(&mut tree, "102@17", "End moves it to the line's end")
+  run press(&mut tree, "ArrowDown", 0)
+  run expectSelection(&mut tree, "103@11 103@11", "", "Down moves it a line down, collapsed")
+  run press(&mut tree, "ArrowLeft", MOD_SHIFT)
+  run press(&mut tree, "ArrowLeft", MOD_SHIFT)
+  run expectSelection(&mut tree, "103@11 103@9", "ne", "Shift extends from the caret")
+  run press(&mut tree, "ArrowLeft", 0)
+  run expectSelection(&mut tree, "103@9 103@9", "", "Left collapses a selection to its start")
+  run press(&mut tree, "Home", MOD_CONTROL)
+  run caretIs(&mut tree, "102@0", "Ctrl+Home goes to the host's start")
+  run press(&mut tree, "a", MOD_CONTROL)
+  let all = run ends(&mut tree)
+  run Testing.expect(String.view(&all) == "9@0 9@3", "Ctrl+A selects the host's content")
+  let allText = run copied(&mut tree)
+  run Testing.expect(String.view(&allText) == "Hello brave world\n\nSecond line\n\nFixed\n", "select-all copies the host's text")
+  run caretIs(&mut tree, "none", "a selection shows no caret")
+  run click(&mut tree, 102, 5, 1, 0)
+  drop run edits(&mut tree)
+
+  // Typing, the input method and editing keys become edits for the client to make.
+  run tree.dispatch(Input.TextInput { text: run String.copy("abc") })
+  run tree.dispatch(Input.ImePreedit { text: run String.copy("ka"), selectionStart: 2, selectionEnd: 2 })
+  run tree.dispatch(Input.TextInput { text: run String.copy("か") })
+  run press(&mut tree, "Backspace", 0)
+  run press(&mut tree, "Delete", MOD_CONTROL)
+  run press(&mut tree, "Enter", 0)
+  run press(&mut tree, "Enter", MOD_SHIFT)
+  let got = run edits(&mut tree)
+  run Testing.expect(String.view(&got) == "insertText:abc;insertCompositionText:ka;insertText:か;deleteContentBackward:;deleteWordForward:;insertParagraph:;insertLineBreak:;", "keys and text in the host are edits")
+  run Testing.expect(String.view(&tree.node(tree.slotOf(102)).text) == "Hello brave world", "the tree changes nothing itself")
+
+  // A paste goes to the host as an edit too.
+  run tree.dispatch(Input.Paste { target: 9, text: run String.copy("pasted"), html: String.make(), image: List<u8>.make() })
+  let pasted = run edits(&mut tree)
+  run Testing.expect(String.view(&pasted) == "insertFromPaste:pasted;", "a paste in the host is an edit")
+
+  // Without focus the host takes nothing.
+  run batch.push(Mutation.Blur)
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run tree.dispatch(Input.TextInput { text: run String.copy("x") })
+  let none = run edits(&mut tree)
+  run Testing.expect(String.view(&none) == "", "text without a focused host goes nowhere")
+  run caretIs(&mut tree, "none", "a host without focus shows no caret")
+}
+
+test effect fn editingHostsTakeKeysAndTextAsEditsAndShowACaret() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run editingHosts() |> Effect.provideMut<Allocator>(&mut allocator)
 }
