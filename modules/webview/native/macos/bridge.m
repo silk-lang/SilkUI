@@ -122,7 +122,7 @@ static int32_t net_error(NSError *error) {
         case NSURLErrorNetworkConnectionLost: return -101;
         case NSURLErrorNotConnectedToInternet: return -106;
         case NSURLErrorBadServerResponse: return -320;
-        case NSURLErrorTooManyRedirects: return -310;
+        case NSURLErrorHTTPTooManyRedirects: return -310;
         case NSURLErrorFileDoesNotExist: return -6;
         case NSURLErrorSecureConnectionFailed: return -107;
         case NSURLErrorServerCertificateHasBadDate: return -201;
