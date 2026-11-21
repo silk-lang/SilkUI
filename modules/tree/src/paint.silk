@@ -14,7 +14,7 @@ import first_letter
 import properties.computed as computed_values
 import read_fonts.model.charmap { Charmap }
 import properties.computed { DecorationLine }
-import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache, PaintCaches }
+import node { NONE, NO_INDEX, Node, FaceSlot, FrameStats, PaintCache, PaintCaches, Move }
 import resources { Resources, Resource }
 import scrollbar { geometryOf, Thumb, rangeOf, scrolls, usedOverflow }
 import layers
@@ -173,6 +173,8 @@ pub struct Painter<'p, 'a> {
   /// Per css-layout node: its first fragment (`UiTree.fragmentOf`).
   pub firstOf: &'p List<usize>,
   pub frame: u64,
+  /// The `translate` transitions the renderer runs (`UiTree.moves`).
+  pub moves: &'p List<Move>,
   /// The frame the previous scene was painted at. Frames are numbered across the tree's roots,
   /// so a subtree cached then was cached by this root.
   pub previousFrame: u64,
@@ -2565,6 +2567,63 @@ fn layerShift(matrix: Matrix3<f32>, bounds: Rect<f32>, mask: Rect<f32>, width: f
   return [-f32.floor(visible.xMin), -f32.floor(visible.yMin)]
 }
 
+/// Paints fragment `index` as the group of its node's [`Move`], if it has one: a scroll group
+/// whose position is the translation now, which the renderer moves along the transition by
+/// itself. Paint keeps what shows at either end, so a renderer that runs the whole move alone
+/// has the content. False, painting nothing, when the node has no move.
+effect fn paintMove(p: &mut Painter<'_, '_>, index: usize, found: Option<Matrix3<f32>>, mask: ContentMask) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let f = &p.output.fragments.values.asSlice()[index]
+  if f.kind != FragmentKind.Box || !f.first || !f.last {
+    return false
+  }
+  let slot = slotIn(p.slotOfCss, f.source)
+  if slot == NONE || !p.nodes.asSlice()[u32.toUsize(slot)].sliding {
+    return false
+  }
+  let flat = found.unwrapOr(Matrix3<f32>.identity())
+  if !transform.translation(&flat) {
+    return false
+  }
+  let moves = p.moves.asSlice()
+  let mut at: usize = 0
+  while at < moves.length && moves[at].slot != slot {
+    at = at + 1
+  }
+  if at == moves.length {
+    return false
+  }
+  let slide = moves[at]
+  let s = p.scale
+  let dx = flat.values[6] * s
+  let dy = flat.values[7] * s
+  let follows = ScrollAxis { factor: 1.0, base: 0.0, low: -UNBOUNDED_INK, high: UNBOUNDED_INK }
+  run p.scene.setScroll(
+    ScrollPosition {
+      node: slide.node,
+      x: dx,
+      y: dy,
+      minX: -UNBOUNDED_INK,
+      maxX: UNBOUNDED_INK,
+      minY: -UNBOUNDED_INK,
+      maxY: UNBOUNDED_INK,
+    },
+  )
+  drop run p.scene.pushRoundedScrollGroup(ScrollLink { node: slide.node, x: follows, y: follows }, mask, mask.bounds)
+  let saved = p.cull
+  let now = Rect<f32>.new(saved.xMin - dx, saved.yMin - dy, saved.xMax - dx, saved.yMax - dy)
+  let first = Rect<f32>.new(
+    saved.xMin - slide.fromX * s, saved.yMin - slide.fromY * s, saved.xMax - slide.fromX * s, saved.yMax - slide.fromY * s)
+  let last = Rect<f32>.new(
+    saved.xMin - slide.toX * s, saved.yMin - slide.toY * s, saved.xMax - slide.toX * s, saved.yMax - slide.toY * s)
+  p.cull = unite(now, unite(first, last))
+  run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
+  p.cull = saved
+  run p.scene.popScrollGroup()
+  return true
+}
+
 /// Paints fragment `index` through its transform, if it has one: a plain move is a scroll group
 /// with a fixed offset, anything else a layer drawn through the matrix. Inside, the subtree
 /// paints in its own layout space with an unbounded mask, so its cached paint replays however
@@ -2577,6 +2636,9 @@ effect fn paintTransformed(p: &mut Painter<'_, '_>, index: usize, mask: ContentM
     return ()
   }
   let found = layers.flatOf(p.output, p.slotOfCss, &p.nodes.*, index)
+  if p.moves.length() != 0 && run paintMove(&mut p, index, found, mask) {
+    return ()
+  }
   if found.isNone() {
     run paintFragmentIn(&mut p, index, mask)
     return ()
@@ -3590,6 +3652,10 @@ fn placedHash(output: &LayoutTree, slots: &List<u32>, nodes: &List<Node>, index:
   let f = &output.fragments.values.asSlice()[index]
   if f.kind == FragmentKind.Box {
     let slot = slotIn(slots, f.source)
+    if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].sliding {
+      // A move paints through a group of its own, wherever its translation is now.
+      return Hash.combine(combined, 1397508421)
+    }
     if slot != NONE && nodes.asSlice()[u32.toUsize(slot)].computed().transform.any() {
       let mut placed = transform.placementHash(&nodes.asSlice()[u32.toUsize(slot)].computed().transform, combined)
       if let Option<transform.Placement>.Some { value: at } = nodes.asSlice()[u32.toUsize(slot)].offsetPlaced() {
