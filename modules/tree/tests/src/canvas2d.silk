@@ -1,7 +1,10 @@
 //! Canvas 2D bitmaps: commands draw into a bitmap that keeps what was drawn, text comes from
 //! the tree's fonts, a clear makes pixels transparent again, and effects paint gradients, clip
 //! to paths, cast shadows and composite with other operations.
-import ui_tree.legacy { UiTree, TreeError }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, FrameInput, CpuSnapshot }
+import svg_css.written
+import svg_css.tokens { CssError }
+import vector.geometry_error { GeometryError }
 import ui_tree.canvas2d { SIZE, FILL_RECT, CLEAR_RECT, FILL_TEXT, FILL_PATH, CLIP_MASK, EFFECTS }
 import ui_fixtures.fixtures as fixtures
 import vector.pixmap { Rgba8 }
@@ -334,4 +337,52 @@ test effect fn canvas2dDrawsIntoAKeptBitmap() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run body() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// A capture shows a canvas through the surface the window gave it, as the window does.
+effect fn captured() -> ()
+  ! AssertionError<'static> | TreeError | CssError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:400px;height:300px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(7, NodeKind.Canvas)
+  run batch.append(1, 7)
+  let own = run written.declarations(b"display:block;width:200px;height:100px")
+  run batch.style(7, own.asSlice())
+  run tree.apply(run batch.take())
+  let mut c = Commands.make()
+  run c.begin(SIZE, 7)
+  run c.word(200)
+  run c.word(100)
+  run c.word(0)
+  run c.begin(FILL_RECT, 7)
+  run c.rect(0.0, 0.0, 200.0, 100.0)
+  run c.color(0.0, 0.0, 1.0, 1.0)
+  run c.rect(0.0, 0.0, 200.0, 100.0)
+  c.end()
+  run tree.drawCanvas2d(c.bytes.asSlice())
+  let bitmaps = tree.canvas2d.drawn()
+  bitmaps[0].surface = 5
+  let mut shown = Batch.make()
+  run shown.canvasSurface(7, 5, 200, 100, false)
+  run tree.apply(run shown.take())
+  run tree.frame(FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 })
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+  let painted = run snapshot.render(&tree)
+  let inside = painted.pixel(100, 50)
+  run Testing.expect(inside.b > 200 && inside.r < 50 && inside.g < 50, "the capture shows the canvas's pixels")
+  let outside = painted.pixel(300, 200)
+  run Testing.expect(outside.r > 200 && outside.b > 200, "and the page around it")
+}
+
+test effect fn canvas2dShowsInCaptures() -> ()
+  ! AssertionError<'static> | TreeError | CssError | GeometryError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run captured() |> Effect.provideMut<Allocator>(&mut allocator)
 }
