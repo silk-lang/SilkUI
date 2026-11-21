@@ -1,5 +1,6 @@
-//! Desktop calls of a ui-js application (notifications, the tray, global shortcuts), served
-//! on the window's platform, and the platform's desktop events, handed to JavaScript.
+//! Desktop calls of a ui-js application (notifications, the tray, global shortcuts, menus,
+//! file dialogs, the window's state, opening URLs, dragging files out), served on the
+//! window's platform, and the platform's desktop events, handed to JavaScript.
 import ui_js.lib { JsHost, JsError, ShellRequest }
 import ui_tree.legacy { UiTree }
 import ui_tree.cssom_view { elementFromPoint }
@@ -7,7 +8,15 @@ import ui_tree_window.keys { codeName }
 import ui_tree_window.platform_thread { HostPlatform }
 import window.event { Event, Modifiers, MouseButton }
 import window.keys { KeyCode, keyCodeFromValue }
-import window.menu { MenuBar, Shortcut }
+import window.menu { MenuBar, OpenDialog, SaveDialog, Shortcut, ShortcutKey, SystemItem }
+import window.types { DialogId, WindowError, WindowId }
+import window.keys { NamedKey, namedKeyFromValue }
+import ui_tree_window.keys { keyName }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.f32
+import silk.num.f64
+import silk.num.usize
 import window.platform { Platform }
 import window.shell { Notification, Tray, TrayIcon }
 import silk.collections.list { List }
@@ -15,7 +24,7 @@ import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
-import silk.text.string { String }
+import silk.text.string { String, ScalarStep }
 
 /// Whether shortcuts take Command where other systems take Control.
 const COMMAND_KEY: bool = Intrinsic.targetOperatingSystem() == "darwin"
@@ -26,10 +35,14 @@ pub struct ShellAnswer {
   pub value: f64,
 }
 
-/// Does JavaScript's desktop calls `requests` on `platform`, oldest first.
-pub effect fn serveShell(requests: List<ShellRequest>, platform: &mut HostPlatform) -> List<
-  ShellAnswer
->
+/// Does JavaScript's desktop calls `requests` on `platform`, oldest first, for `window` and
+/// its `tree`.
+pub effect fn serveShell(
+  requests: List<ShellRequest>,
+  platform: &mut HostPlatform,
+  tree: &mut UiTree<'_>,
+  window: WindowId,
+) -> List<ShellAnswer>
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut rest = move requests
@@ -48,15 +61,7 @@ pub effect fn serveShell(requests: List<ShellRequest>, platform: &mut HostPlatfo
       0.0
     } else if request.op == 3 {
       let code = codeOf(field(&fields, 1))
-      let bits = number(field(&fields, 2))
-      let modifiers = Modifiers {
-        shift: (bits & 1) != 0,
-        control: (bits & 2) != 0 || ((bits & 16) != 0 && !COMMAND_KEY),
-        alt: (bits & 4) != 0,
-        meta: (bits & 8) != 0 || ((bits & 16) != 0 && COMMAND_KEY),
-        capsLock: false,
-        function: false,
-      }
+      let modifiers = modifiersOf(number(field(&fields, 2)))
       let held = code != KeyCode.Unidentified
         && run platform.registerShortcut(number(field(&fields, 0)), code, modifiers)
       if held {
@@ -67,6 +72,74 @@ pub effect fn serveShell(requests: List<ShellRequest>, platform: &mut HostPlatfo
     } else if request.op == 4 {
       Platform.unregisterShortcut(&mut platform.*, number(field(&fields, 0)))
       0.0
+    } else if request.op == 5 {
+      let flags = number(field(&fields, 2))
+      let options = OpenDialog {
+        title: field(&fields, 0),
+        directory: optional(field(&fields, 1)),
+        files: (flags & 1) != 0,
+        directories: (flags & 2) != 0,
+        multiple: (flags & 4) != 0,
+        extensions: field(&fields, 3),
+        parent: Option<WindowId>.some(window),
+      }
+      dialogAnswer(run Effect.result(platform.openFileDialog(&options)))
+    } else if request.op == 6 {
+      let options = SaveDialog {
+        title: field(&fields, 0),
+        directory: optional(field(&fields, 1)),
+        name: field(&fields, 2),
+        extensions: field(&fields, 3),
+        parent: Option<WindowId>.some(window),
+      }
+      dialogAnswer(run Effect.result(platform.saveFileDialog(&options)))
+    } else if request.op == 7 {
+      let mut bar = MenuBar.make()
+      run describeMenu(field(&fields, 0), &mut bar)
+      run platform.setMenuBar(&bar)
+      1.0
+    } else if request.op == 8 {
+      let mut menu = MenuBar.make()
+      run describeMenu(field(&fields, 2), &mut menu)
+      let x = decimal(field(&fields, 0))
+      let y = decimal(field(&fields, 1))
+      flag(run platform.showContextMenu(window, x, y, &menu))
+    } else if request.op == 9 {
+      flag(run platform.setBadge(field(&fields, 0)))
+    } else if request.op == 10 {
+      flag(run platform.setProgress(decimal(field(&fields, 0))))
+    } else if request.op == 11 {
+      flag(run platform.openUrl(field(&fields, 0)))
+    } else if request.op == 12 {
+      flag(run platform.revealPath(field(&fields, 0)))
+    } else if request.op == 13 {
+      let mut lines = List<string>.make()
+      run split(field(&fields, 0), 10, &mut lines)
+      let mut paths = List<String>.make()
+      let mut l: usize = 0
+      while l < lines.length() {
+        if String.byteLength(lines.get(l)) > 0 { run paths.append(run String.copy(lines.get(l))) }
+        l = l + 1
+      }
+      flag(run platform.startFileDrag(window, paths.asSlice()))
+    } else if request.op == 14 {
+      let what = number(field(&fields, 0))
+      if what == 0 {
+        Platform.toggleFullScreen(&mut platform.*, window)
+      } else if what == 1 {
+        Platform.minimize(&mut platform.*, window)
+      } else if what == 2 {
+        Platform.setVisible(&mut platform.*, window, true)
+        Platform.focus(&mut platform.*, window)
+      } else if what == 3 {
+        Platform.setVisible(&mut platform.*, window, false)
+      } else if what == 4 {
+        run platform.setTitle(window, field(&fields, 1))
+      }
+      0.0
+    } else if request.op == 15 {
+      drop tree.setPageZoom(f64.toF32(decimal(field(&fields, 0))))
+      f32.toF64(tree.pageZoom())
     } else {
       0.0
     }
@@ -91,59 +164,7 @@ effect fn setTray(fields: &List<string>, platform: &mut HostPlatform) -> f64
     return 0.0
   }
   let mut menu = MenuBar.make()
-  let mut lines = List<string>.make()
-  run split(field(fields, 5), 10, &mut lines)
-  let mut depth: u32 = 0
-  let mut l: usize = 0
-  while l < lines.length() {
-    let text = lines.get(l)
-    let line = String.utf8Bytes(text)
-    l = l + 1
-    if line.length == 0 {
-      continue
-    }
-    let rest = String.slice(text, 1, line.length - 1)
-    if line[0] == 66 {
-      run menu.begin(rest)
-      depth = depth + 1
-    } else if line[0] == 69 {
-      if depth > 0 {
-        run menu.end()
-        depth = depth - 1
-      }
-    } else if line[0] == 83 {
-      run menu.separator()
-    } else if line[0] == 65 {
-      let mut parts = List<string>.make()
-      run split(rest, 44, &mut parts)
-      if parts.length() < 4 {
-        continue
-      }
-
-      // The title is everything after the third comma; it may hold commas of its own.
-      let bytes = String.utf8Bytes(rest)
-      let mut start: usize = 0
-      let mut commas: u32 = 0
-      while start < bytes.length && commas < 3 {
-        if bytes[start] == 44 {
-          commas = commas + 1
-        }
-        start = start + 1
-      }
-      let title = String.slice(rest, start, bytes.length - start)
-      run menu.item(
-        title,
-        number(parts.get(0)),
-        Option<Shortcut>.None,
-        number(parts.get(1)) != 0,
-        number(parts.get(2)) != 0,
-      )
-    }
-  }
-  while depth > 0 {
-    run menu.end()
-    depth = depth - 1
-  }
+  run describeMenu(field(fields, 5), &mut menu)
   let tray = Tray {
     icon: TrayIcon {
       width: width,
@@ -158,6 +179,161 @@ effect fn setTray(fields: &List<string>, platform: &mut HostPlatform) -> f64
     1.0
   } else {
     0.0
+  }
+}
+
+/// Builds `menu` from the lines JavaScript packed it into: `B` title opens a submenu and `E`
+/// ends it, `S` is a separator, `R` a system item by its `SystemItem` index, and `A` an item:
+/// `Aaction,enabled,checked,key,modifiers,title`, where key is empty, `c` and a character,
+/// or `n` and a named key.
+effect fn describeMenu(text: string, menu: &mut MenuBar) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = List<string>.make()
+  run split(text, 10, &mut lines)
+  let mut depth: u32 = 0
+  let mut l: usize = 0
+  while l < lines.length() {
+    let line = lines.get(l)
+    let bytes = String.utf8Bytes(line)
+    l = l + 1
+    if bytes.length == 0 {
+      continue
+    }
+    let rest = String.slice(line, 1, bytes.length - 1)
+    if bytes[0] == 66 {
+      run menu.begin(rest)
+      depth = depth + 1
+    } else if bytes[0] == 69 {
+      if depth > 0 {
+        run menu.end()
+        depth = depth - 1
+      }
+    } else if bytes[0] == 83 {
+      run menu.separator()
+    } else if bytes[0] == 82 {
+      match systemItem(number(rest)) {
+        Option<SystemItem>.Some { value } => run menu.system(value)
+        Option<SystemItem>.None => {}
+      }
+    } else if bytes[0] == 65 {
+      let mut parts = List<string>.make()
+      run split(rest, 44, &mut parts)
+      if parts.length() < 6 {
+        continue
+      }
+
+      // The title is everything after the fifth comma; it may hold commas of its own.
+      let restBytes = String.utf8Bytes(rest)
+      let mut start: usize = 0
+      let mut commas: u32 = 0
+      while start < restBytes.length && commas < 5 {
+        if restBytes[start] == 44 {
+          commas = commas + 1
+        }
+        start = start + 1
+      }
+      let title = String.slice(rest, start, restBytes.length - start)
+      run menu.item(
+        title,
+        number(parts.get(0)),
+        shortcutOf(parts.get(3), number(parts.get(4))),
+        number(parts.get(1)) != 0,
+        number(parts.get(2)) != 0,
+      )
+    }
+  }
+  while depth > 0 {
+    run menu.end()
+    depth = depth - 1
+  }
+}
+
+/// The menu shortcut JavaScript wrote as `key` (`c` and a character, `n` and a key name) with
+/// the modifier bits of `registerShortcut`.
+fn shortcutOf(key: string, bits: u32) -> Option<Shortcut> {
+  let bytes = String.utf8Bytes(key)
+  if bytes.length < 2 {
+    return Option<Shortcut>.None
+  }
+  let rest = String.slice(key, 1, bytes.length - 1)
+  let shortcutKey = if bytes[0] == 99 {
+    match String.nextScalar(rest, String.scalarCursor()) {
+      Option<ScalarStep>.Some { value } => ShortcutKey.Character { character: String.scalarValue(&value) }
+      Option<ScalarStep>.None => {
+        return Option<Shortcut>.None
+      }
+    }
+  } else {
+    let named = namedOf(rest)
+    if named == NamedKey.Unidentified {
+      return Option<Shortcut>.None
+    }
+    ShortcutKey.Named { key: named }
+  }
+  return Option<Shortcut>.some(Shortcut { key: shortcutKey, modifiers: modifiersOf(bits) })
+}
+
+/// The modifiers of `registerShortcut`'s bits: shift 1, control 2, alt 4, meta 8, and 16 for
+/// the platform's command key.
+fn modifiersOf(bits: u32) -> Modifiers {
+  return Modifiers {
+    shift: (bits & 1) != 0,
+    control: (bits & 2) != 0 || ((bits & 16) != 0 && !COMMAND_KEY),
+    alt: (bits & 4) != 0,
+    meta: (bits & 8) != 0 || ((bits & 16) != 0 && COMMAND_KEY),
+    capsLock: false,
+    function: false,
+  }
+}
+
+fn systemItem(index: u32) -> Option<SystemItem> {
+  let items: [SystemItem; 17] = [
+    SystemItem.About,
+    SystemItem.Services,
+    SystemItem.Hide,
+    SystemItem.HideOthers,
+    SystemItem.ShowAll,
+    SystemItem.Quit,
+    SystemItem.CloseWindow,
+    SystemItem.Minimize,
+    SystemItem.Zoom,
+    SystemItem.ToggleFullScreen,
+    SystemItem.BringAllToFront,
+    SystemItem.Undo,
+    SystemItem.Redo,
+    SystemItem.Cut,
+    SystemItem.Copy,
+    SystemItem.Paste,
+    SystemItem.SelectAll,
+  ]
+  if u32.toUsize(index) >= items.length {
+    return Option<SystemItem>.None
+  }
+  return Option<SystemItem>.some(items[u32.toUsize(index)])
+}
+
+/// A dialog's id as the answer, 0 when it could not open.
+fn dialogAnswer(opened: Result<DialogId, WindowError | OutOfMemoryError>) -> f64 {
+  return match move opened {
+    Result<DialogId, WindowError | OutOfMemoryError>.Success { value } => u32.toF64(value.value)
+    _ => 0.0
+  }
+}
+
+fn flag(on: bool) -> f64 {
+  return if on {
+    1.0
+  } else {
+    0.0
+  }
+}
+
+fn optional<'a>(text: string<'a>) -> Option<string<'a>> {
+  return if String.byteLength(text) == 0 {
+    Option<string<'a>>.None
+  } else {
+    Option<string<'a>>.some(text)
   }
 }
 
@@ -231,6 +407,27 @@ pub effect fn shellEventOf(tree: &UiTree<'_>, event: &Event) -> Option<ShellEven
       y: 0.0,
       text: String.make(),
     }
+    Event.DialogClosed { dialog, paths } => ShellEvent {
+      kind: 8,
+      a: u32.toF64(dialog.value),
+      x: 0.0,
+      y: 0.0,
+      text: run lines(paths.asSlice()),
+    }
+    Event.ContextMenuClosed { .. } => ShellEvent {
+      kind: 9,
+      a: 0.0,
+      x: 0.0,
+      y: 0.0,
+      text: String.make(),
+    }
+    Event.FullScreenChanged { fullScreen, .. } => ShellEvent {
+      kind: 10,
+      a: flag(fullScreen),
+      x: 0.0,
+      y: 0.0,
+      text: String.make(),
+    }
     _ => {
       return Option<ShellEvent>.None
     }
@@ -300,6 +497,48 @@ fn number(text: string) -> u32 {
     i = i + 1
   }
   return value
+}
+
+/// `text` as a decimal number, with an optional sign and fraction; 0 when it is not one.
+fn decimal(text: string) -> f64 {
+  let bytes = String.utf8Bytes(text)
+  let mut i: usize = 0
+  let negative = bytes.length > 0 && bytes[0] == 45
+  if negative {
+    i = 1
+  }
+  let mut value: f64 = 0.0
+  while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+    value = value * 10.0 + u32.toF64(u8.toU32(bytes[i] - 48))
+    i = i + 1
+  }
+  if i < bytes.length && bytes[i] == 46 {
+    i = i + 1
+    let mut scale: f64 = 0.1
+    while i < bytes.length && bytes[i] >= 48 && bytes[i] <= 57 {
+      value = value + u32.toF64(u8.toU32(bytes[i] - 48)) * scale
+      scale = scale / 10.0
+      i = i + 1
+    }
+  }
+  return if negative {
+    -value
+  } else {
+    value
+  }
+}
+
+/// The named key whose `key` value is `name`.
+fn namedOf(name: string) -> NamedKey {
+  let mut value: u32 = 1
+  while value < 56 {
+    let key = namedKeyFromValue(value)
+    if keyName(key) == name {
+      return key
+    }
+    value = value + 1
+  }
+  return NamedKey.Unidentified
 }
 
 fn nibble(digit: u8) -> u8 {
