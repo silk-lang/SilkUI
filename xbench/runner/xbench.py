@@ -507,11 +507,11 @@ def main():
             unfit = [x for x in apps if x not in ("electron", "silk-react")]
             if a.suite != "gpu" or unfit:
                 raise SystemExit("the canvas scene runs in the gpu suite, with electron and silk-react only")
-        if scene.split("-")[0] == "chat":
-            # The chat scene exists for the two React apps only (LOG.md).
+        if scene.split("-")[0] in ("chat", "input"):
+            # The chat and input scenes exist for the two React apps only (LOG.md).
             unfit = [x for x in apps if x not in ("electron", "silk-react")]
             if unfit:
-                raise SystemExit("the chat scene runs with electron and silk-react only")
+                raise SystemExit(f"the {scene.split('-')[0]} scene runs with electron and silk-react only")
         for r in range(a.runs):
             # Interleaved: every app once per round, so drift (thermal, other load) hits all alike.
             order = apps if r % 2 == 0 else apps[::-1]
