@@ -455,6 +455,13 @@ pub interface WindowClient<S, E, ? R> {
     ! OutOfMemoryError
     ? &mut Allocator {}
 
+  /// Whether the last `quiet` call left work for another, as a step of a long job it does
+  /// in pieces: the host then calls `quiet` again after [`QUIET_AGAIN_SECONDS`], for as long
+  /// as the window stays quiet.
+  fn quietAgain(self: &Self, state: &S) -> bool {
+    return false
+  }
+
   /// Hears the frames the window presented since the last call: the milliseconds between
   /// presents, oldest first, and how many painted frames a newer one replaced before the GPU
   /// drew them.
@@ -542,6 +549,10 @@ const RELIEF_BOXES: usize = 4096
 /// hands back memory (`WindowClient.quiet`): past a pause in typing, before a reader moves on.
 pub const QUIET_SECONDS: f64 = 0.75
 
+/// How soon a client that left work in its quiet call gets the next
+/// (`WindowClient.quietAgain`): time for a frame or two of input to get in between.
+pub const QUIET_AGAIN_SECONDS: f64 = 0.05
+
 /// A tree that lost this many nodes since the last quiet call has freed a large subtree.
 pub const SHED_NODES: usize = 1000
 
@@ -567,6 +578,12 @@ impl QuietWatch {
     if nodes > self.peak {
       self.peak = nodes
     }
+  }
+
+  /// The client left work in its call at `now`: this spell gets another, soon.
+  fn again(self: &mut Self, now: f64) -> () {
+    self.told = false
+    self.since = now + QUIET_AGAIN_SECONDS - QUIET_SECONDS
   }
 
   /// When this spell's call is due, or a negative number when it had it.
@@ -1590,6 +1607,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if !check && quiet.due(now) && !content.wantsFrames(&state.*) && !content.needsFrame(&state.*, &tree) {
       let shed = quiet.take(tree.liveNodes())
       run content.quiet(&mut state, &mut tree, shed)
+      if content.quietAgain(&state.*) { quiet.again(now) }
     }
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
     if backgroundChanged {
@@ -2716,6 +2734,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       } else if quiet.due(time) && !content.needsFrame(&state.*, &tree) {
         let shed = quiet.take(tree.liveNodes())
         run content.quiet(&mut state, &mut tree, shed)
+        if content.quietAgain(&state.*) { quiet.again(time) }
       }
       if frame == 0 {
         StderrWriter.print(
