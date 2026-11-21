@@ -96,6 +96,29 @@ export default function silk(options = {}) {
       if (watching && options.host && child === null) startHost();
     },
   };
+  // `new Worker(new URL("./x.js", import.meta.url))`: Vite bundles the worker as a file of
+  // its own, which a Silk UI app carrying its bundle in memory does not have beside it. Its
+  // code goes into the bundle as a `data:` address instead.
+  const workerPlugin = {
+    name: "silk:workers",
+    apply: "build",
+    enforce: "post",
+    generateBundle: {
+      order: "post",
+      handler(_options, output) {
+        const app = output[fileName];
+        if (!app || app.type !== "chunk") return;
+        for (const item of Object.values(output)) {
+          if (item === app || !/\.[cm]?js$/.test(item.fileName)) continue;
+          const code = item.type === "chunk" ? item.code : typeof item.source === "string" ? item.source : new TextDecoder().decode(item.source);
+          const quoted = new RegExp(`(["'\`])[^"'\`]*?${escapeRegExp(item.fileName)}\\1`, "g");
+          if (!quoted.test(app.code)) continue;
+          app.code = app.code.replace(quoted, () => JSON.stringify("data:text/javascript," + encodeURIComponent(code)));
+          delete output[item.fileName];
+        }
+      },
+    },
+  };
   const apis = options.apis ?? "warn";
   const allow = new Set(options.allow ?? []);
   let root = "";
@@ -149,6 +172,8 @@ export default function silk(options = {}) {
 
     buildEnd(error) {
       if (browserGlobals) for (const name of PROVIDED_BY_GLOBALS) uses.delete(name);
+      // Its Worker runs on the full runtime's worker threads.
+      if (browserGlobals && node) uses.delete("Worker");
       if (error || serving || uses.size === 0) return;
       if (apis === "error") this.error(report(uses));
       this.warn(report(uses));
@@ -188,7 +213,7 @@ export default function silk(options = {}) {
       if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
     },
   };
-  const plugins = [buildPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
+  const plugins = [buildPlugin, workerPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }
@@ -221,6 +246,10 @@ const silkImports = {
 const NOT_IN_NODE = new Set(["dom", "storage", "workers"]);
 
 const BUILTINS = new Set(builtinModules);
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** `node:<name>` when `id` names a Node builtin, with or without the prefix. */
 function builtinOf(id) {

@@ -100,7 +100,7 @@ and `innerHeight` with `resize` events, `HTMLElement`, `Element`, `Node` and `Te
 (entries in memory with `popstate` and `hashchange`, starting at `http://localhost/` or
 `globalThis.__silkLocation`), `localStorage` (a JSON file under `~/.silkui/storage/<app>` on
 the full runtime, or `$SILKUI_STORAGE_DIR`), `sessionStorage`, `indexedDB` (in memory, saved
-next to local storage on the full runtime), `Worker` on the full runtime, and `navigator`'s
+next to local storage on the full runtime), `Worker` on the full runtime (`@silkui/vite` puts a `new Worker(new URL("x.js", import.meta.url))` worker into the bundle), and `navigator`'s
 platform and language. Globals the realm already has stay as they are.
 
 A node has `append`, `appendChild`, `insertBefore`, `removeChild`, `remove`, `contains`,
