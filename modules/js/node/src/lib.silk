@@ -69,6 +69,7 @@ import silk.mem.pointer { Pointer }
 import silk.mem.layout { Layout }
 import silk.core.ownership { Copy }
 import silk.num.f64
+import silk.num.f32
 import silk.num.u32
 import silk.num.usize
 import silk.text.string { String }
@@ -139,13 +140,15 @@ pub struct NodeApp<'r, 'e, 'm, C> {
   /// The runtime finished (process.exit): the window closes.
   finished: bool,
   status: i32,
+  /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
+  zoom: f32,
 }
 
 
 impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
   /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
   pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0 }
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0 }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
@@ -357,15 +360,25 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     return true
   }
 
-  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
-  /// `platform`, and the calls their promise jobs made, then applies what it built. Says
-  /// whether there were calls.
-  pub effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
+  /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
+  /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
+  /// there were calls.
+  pub effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let zoomed = tree.pageZoom() != self.zoom
+    if zoomed {
+      self.zoom = tree.pageZoom()
+      let value = run text(b"")
+      let arguments = [ValueBits.number(11.0), ValueBits.number(f32.toF64(self.zoom)), ValueBits.number(0.0), ValueBits.number(0.0), value.borrow().view()]
+      let returned = run self.callReporting(b"shellEvent", &arguments)
+      self.release(move returned)
+      self.release(move value)
+    }
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
       let requests = Intrinsic.replace(self.bridge.shell, List<bridge.ShellRequest>.make())
       if requests.length() == 0 { break }
-      let mut answers = run serveShell(move requests, &mut platform)
+      let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
       while answers.length() > 0 {
         let ShellAnswer { call, value } = answers.remove(0)
         let returned = run self.callReporting(b"shellAnswer", &[ValueBits.number(u32.toF64(call)), ValueBits.number(value)])
@@ -373,7 +386,7 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
       }
       round = round + 1
     }
-    if round == 0 { return false }
+    if round == 0 && !zoomed { return false }
     drop run self.flush(&mut tree)
     return true
   }
@@ -625,7 +638,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
       Platform.startWindowDrag(&mut platform.*, window)
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
-    let shell = run state.shell(&mut tree, &mut platform.*)
+    let shell = run state.shell(&mut tree, &mut platform.*, window)
     let natives = run state.natives(&mut self.client.jobs, &mut tree)
     return clipboard || shell || natives
   }

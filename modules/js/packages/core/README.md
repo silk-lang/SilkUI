@@ -171,6 +171,42 @@ registerShortcut("Mod+Shift+B", build); // Mod is Command on macOS, Control else
 whichever app has focus; another app may hold it, and Wayland has none. `removeTray()` and
 `unregisterShortcut(accelerator)` undo them.
 
+The rest of a desktop app's shell is direct calls too, shaped like Electron's so a desktop app
+moves over without an IPC layer. Everything runs in the app's own process.
+
+```ts
+import { setApplicationMenu, showContextMenu, showOpenDialog, appWindow } from "@silkui/core";
+
+setApplicationMenu([
+  { role: "appMenu" },
+  { label: "File", submenu: [{ label: "Open…", accelerator: "Mod+O", click: open }] },
+  { role: "editMenu" },
+  { role: "viewMenu" },
+  { role: "windowMenu" },
+]);
+node.addEventListener("contextmenu", (event) =>
+  showContextMenu([{ label: "Rename", click: rename }, { type: "separator" }, { label: "Delete", click: remove }], {
+    x: event.clientX,
+    y: event.clientY,
+  }),
+);
+const { canceled, filePaths } = await showOpenDialog({ properties: ["openDirectory"] });
+appWindow.addEventListener("fullscreenchange", ({ fullScreen }) => setInset(fullScreen ? 0 : 80));
+```
+
+| Call | Does |
+| --- | --- |
+| `setApplicationMenu(template)` | The menu bar. `role`s are the system's items (`quit`, `copy`, `togglefullscreen`, `front`), `zoomIn`/`zoomOut`/`resetZoom` zoom the page, `appMenu`, `editMenu`, `viewMenu`, `windowMenu` are whole menus |
+| `showContextMenu(template, { x, y })` | A native context menu; resolves to `true` when it closes, or at once to `false` where the system has none (Linux, the browser) |
+| `showOpenDialog({ properties, filters, defaultPath })`, `showSaveDialog(...)` | File and folder pickers; resolve to `{ canceled, filePaths }` and `{ canceled, filePath }` |
+| `openExternal(url)`, `showItemInFolder(path)` | The default browser (or mail app), and Finder or Explorer with the item selected |
+| `startFileDrag(paths)` | From a `pointerdown` or `pointermove`, drags the files out to other apps (macOS, Windows) |
+| `setBadge(text)`, `setProgress(fraction)` | The dock or taskbar icon's badge and progress |
+| `appWindow` | `setFullScreen`, `isFullScreen`, `minimize`, `focus`, `show`, `hide`, `setTitle`, `setZoomFactor`, `getZoomFactor`, and `fullscreenchange` and `zoomchange` events |
+
+A hidden title bar with the window controls inset is the app's configuration, not a call:
+`.titleBar(TitleBar.transparent(height).buttons(left, top))` in its `tasks.silk`.
+
 `memoryUsage()` is the app's memory as the system shows it to users, to put next to an
 Electron app's in Activity Monitor or Task Manager. It is synchronous and allocates almost
 nothing, so it can run every second.
