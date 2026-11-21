@@ -2,7 +2,7 @@
 //! capture, clicks, focus and tab order, keyboard clicks, and nested scrolling. Everything a
 //! client hears about comes out as `Event` records; nothing calls back into it.
 import engine { UiTree }
-import input { Input, EditCommand, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, BUTTON_SECONDARY, POINTER_TOUCH }
+import input { Input, EditCommand, Request, REQUEST_ANYWHERE, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_BACK, BUTTON_FORWARD, POINTER_TOUCH }
 import mutation { Overflow }
 import mutation {
   NodeKind,
@@ -25,6 +25,7 @@ import mutation {
   LISTEN_KEY_UP,
   LISTEN_SCROLL,
   LISTEN_POINTER_CANCEL,
+  LISTEN_REQUEST,
   LISTEN_GOT_POINTER_CAPTURE,
   LISTEN_LOST_POINTER_CAPTURE,
   LISTEN_POINTER_OVER,
@@ -1176,7 +1177,8 @@ effect fn moveFocus(tree: &mut UiTree<'_>, forward: bool) -> ()
   }
   if !tree.focusVisible && tree.focused != NONE {
     let focusedSlot = tree.focused
-    tree.restyle(focusedSlot)
+    // `:focus-visible` turns on: only what its rules reach from the focused node restyles.
+    tree.focusStyleChanged(focusedSlot)
   }
   tree.focusVisible = true
   if next == focused {
@@ -1935,6 +1937,8 @@ pub effect fn beginInput(tree: &mut UiTree<'_>, input: &Input) -> ()
         }
       }
       remember(&mut tree, hit)
+      tree.pressed = hit
+      tree.pressedId = tree.pendingTargetId
       if hit == NONE || disabledAt(&tree.*, hit) {
         return ()
       }
@@ -2024,12 +2028,102 @@ pub effect fn beginInput(tree: &mut UiTree<'_>, input: &Input) -> ()
       remember(&mut tree, slot)
       run clipboard.beginEdit(&mut tree, slot, &inputType, &text)
     }
+    Input.Request { request, target } => {
+      let slot = run requestTarget(&tree.*, target)
+      remember(&mut tree, slot)
+      if slot != NONE {
+        let kind = if request == Request.Close { EventKind.CloseRequest } else { EventKind.Navigate }
+        let mut event = run record(&tree.*, kind, slot)
+        event.detail = if request == Request.Forward { 1 } else { 0 }
+        run tree.queueEvent(move event)
+      }
+    }
     Input.TouchStart { .. } => {}
     Input.TouchMove { .. } => {}
     Input.TouchEnd { .. } => {}
     Input.TouchCancel { .. } => {}
     Input.Pinch { .. } => {}
   }
+}
+
+/// Whether a request can start at `slot`: it is in the tree, not inert, and it or a node
+/// above it listens for requests.
+fn hearsRequest(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && tree.node(slot).live && attached(tree, slot) && !inertAt(tree, slot)
+    && pathListens(tree, slot, LISTEN_REQUEST)
+}
+
+/// The node a request starts at (see `Input.Request`), or NONE when no node would hear it:
+/// node `target` if it names one, else the focused node, else the node last pressed, each
+/// only if a listener is on its path; otherwise the last node in tree order that listens and
+/// is not inert, which is the one on top.
+effect fn requestTarget(tree: &UiTree<'_>, target: u32) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if target != REQUEST_ANYWHERE {
+    let named = tree.slotOf(target)
+    if hearsRequest(tree, named) {
+      return named
+    }
+  }
+  if hearsRequest(tree, tree.focused) {
+    return tree.focused
+  }
+  if alive(tree, tree.pressed, tree.pressedId) && hearsRequest(tree, tree.pressed) {
+    return tree.pressed
+  }
+  return run lastListener(tree)
+}
+
+/// The last node in tree order that listens for requests and is not inert, or NONE.
+effect fn lastListener(tree: &UiTree<'_>) -> u32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = NONE
+  if tree.root == NONE {
+    return found
+  }
+  let mut stack = List<u32>.make()
+  let mut children = List<u32>.make()
+  run stack.append(tree.root)
+  while stack.length() != 0 {
+    let last = stack.length() - 1
+    let slot = stack.get(last)
+    stack.truncate(last)
+    if !tree.node(slot).inert {
+      if listens(tree, slot, LISTEN_REQUEST) {
+        found = slot
+      }
+      run tree.childSlots(slot, &mut children)
+      let mut i = children.length()
+      while i > 0 {
+        i = i - 1
+        run stack.append(children.get(i))
+      }
+    }
+  }
+  return found
+}
+
+/// The request key down `key` raises when nothing else took it: Escape closes, and the
+/// platform's back and forward keys navigate (Alt with the left and right arrows, Cmd with
+/// the brackets on a Mac, and the browser keys of a keyboard).
+fn requestOf(tree: &UiTree<'_>, key: string, modifiers: u32) -> Option<Request> {
+  let held = u32.bitAnd(modifiers, MOD_SHIFT + MOD_CONTROL + MOD_ALT + MOD_META)
+  if held == 0 {
+    if key == "Escape" { return Option<Request>.some(Request.Close) }
+    if key == "BrowserBack" { return Option<Request>.some(Request.Back) }
+    if key == "BrowserForward" { return Option<Request>.some(Request.Forward) }
+    return Option<Request>.None
+  }
+  if tree.keymap == Keymap.Mac {
+    if held == MOD_META && key == "[" { return Option<Request>.some(Request.Back) }
+    if held == MOD_META && key == "]" { return Option<Request>.some(Request.Forward) }
+    return Option<Request>.None
+  }
+  if held == MOD_ALT && key == "ArrowLeft" { return Option<Request>.some(Request.Back) }
+  if held == MOD_ALT && key == "ArrowRight" { return Option<Request>.some(Request.Forward) }
+  return Option<Request>.None
 }
 
 /// The second half of a dispatch: the default action of `input` and the records that follow
@@ -2115,7 +2209,8 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       let keepFocus = prevented || pathPrevents(&tree.*, hit, PREVENT_FOCUS)
       if tree.focusVisible && tree.focused != NONE {
         let focusedSlot = tree.focused
-        tree.restyle(focusedSlot)
+        // `:focus-visible` turns off: only what its rules reach from the focused node restyles.
+        tree.focusStyleChanged(focusedSlot)
       }
       tree.focusVisible = false
       if disabledAt(&tree.*, hit) {
@@ -2140,6 +2235,21 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       }
     }
     Input.PointerUp { x, y, button, modifiers } => {
+      if button == BUTTON_BACK || button == BUTTON_FORWARD {
+        // The back and forward buttons of a mouse ask to navigate from the node under the
+        // pointer, unless a listener prevented the release.
+        let hit = hitSlot(&tree.*, x, y)
+        let from = if hit == NONE { REQUEST_ANYWHERE } else { tree.node(hit).id }
+        if !prevented {
+          run tree.queueFollowUp(
+            Input.Request {
+              request: if button == BUTTON_BACK { Request.Back } else { Request.Forward },
+              target: from,
+            },
+          )
+        }
+        return ()
+      }
       if button != BUTTON_PRIMARY {
         return ()
       }
@@ -2247,6 +2357,14 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       if same && !editing && run text_selection.extend(&mut tree, String.view(&key), modifiers) {
         return ()
       }
+      if !repeat {
+        if let Option<Request>.Some { value: request } = requestOf(&tree.*, String.view(&key), modifiers) {
+          // The request starts at the node the key went to, when that is a real node.
+          let from = if target == tree.root { REQUEST_ANYWHERE } else { tree.node(target).id }
+          run tree.queueFollowUp(Input.Request { request: request, target: from })
+          return ()
+        }
+      }
       if plain && String.view(&key) == "Tab" {
         run moveFocus(&mut tree, u32.bitAnd(modifiers, MOD_SHIFT) == 0)
       } else if same && plain && target == tree.focused && run rove(&mut tree, target, String.utf8Bytes(String.view(&key))) {
@@ -2257,6 +2375,8 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
       }
     }
     Input.KeyUp { key, modifiers, .. } => {
+      // A prevented key drops only the text it types itself, which comes before it is up.
+      tree.suppressText = false
       let target = keyTarget(&tree.*)
       if target == NONE || prevented || pathPrevents(&tree.*, target, PREVENT_KEYS) {
         return ()
@@ -2297,6 +2417,8 @@ pub effect fn finishInput(tree: &mut UiTree<'_>, input: Input, prevented: bool) 
         run edit.applyEdit(&mut tree, slot, String.view(&inputType), String.view(&text))
       }
     }
+    // A request has no default in the tree: the client that hears it acts.
+    Input.Request { .. } => {}
     Input.TouchStart { .. } => {}
     Input.TouchMove { .. } => {}
     Input.TouchEnd { .. } => {}

@@ -14,19 +14,23 @@ const STATES = { base: 0, hover: 1, active: 2, focus: 3, focusVisible: 4, starti
 
 // Event types by the kind number the host dispatches. Up to `selectionchange`, `pointerover`
 // and `pointerout` the kind is also the bit of the tree's LISTEN_* flags a node listens with;
-// copy, cut and paste share bit 30, and beforeinput has bit 31 (see `bitOf`).
+// `error` shares the bit of `load`, the touch kinds share bit 30, copy, cut, paste and
+// beforeinput bit 31, and the requests (closerequest, navigate) bit 18 (see `bitOf`).
 const TYPES = [
   "pointerdown", "pointerup", "click", "pointermove", "pointerenter", "pointerleave", "wheel",
   "keydown", "keyup", "focus", "blur", "input", "scroll", "layout", "pointercancel",
   "gotpointercapture", "lostpointercapture", "load", "error", "transitionrun", "transitionstart",
   "transitionend", "transitioncancel", "animationstart", "animationiteration", "animationend",
   "animationcancel", "selectionchange", "pointerover", "pointerout", "touchstart", "touchmove",
-  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput",
+  "touchend", "touchcancel", "copy", "cut", "paste", "beforeinput", "closerequest", "navigate",
 ];
 const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
 // The live `Range`s (see Range below), held weakly: a range nobody holds stops being updated.
 const liveRanges = new Set();
+// The `MutationObserver`s observing a node (see MutationObserver below). While there are none
+// a mutation costs one size check.
+const mutationObservers = new Set();
 
 function eachLiveRange(update) {
   for (const ref of liveRanges) {
@@ -45,8 +49,15 @@ const COPY = KIND_OF.get("copy");
 const CUT = KIND_OF.get("cut");
 const PASTE = KIND_OF.get("paste");
 const BEFORE_INPUT = KIND_OF.get("beforeinput");
-// The listen bit of a kind: the touch kinds share bit 30, copy, cut, paste and beforeinput bit 31.
-const bitOf = (kind) => (kind < TOUCH_START ? kind : kind < COPY ? 30 : 31);
+const LOAD = KIND_OF.get("load");
+const ERROR = KIND_OF.get("error");
+const CLOSE_REQUEST = KIND_OF.get("closerequest");
+const NAVIGATE = KIND_OF.get("navigate");
+// The listen bit of a kind: `error` shares the bit of `load`, the touch kinds share bit 30,
+// copy, cut, paste and beforeinput bit 31, and the two requests have the bit after `load`.
+const bitOf = (kind) =>
+  kind === ERROR ? LOAD : kind < TOUCH_START ? kind : kind < COPY ? 30 : kind < CLOSE_REQUEST ? 31 : LOAD + 1;
+const SHARES_BIT = (kind) => kind >= TOUCH_START || kind === LOAD || kind === ERROR;
 const KINDS_OF_BIT = (bit) => TYPES.map((_, kind) => kind).filter((kind) => bitOf(kind) === bit);
 // Compatibility mouse events, as the web fires them after pointer events: each listens
 // through the pointer kind it follows.
@@ -68,6 +79,7 @@ const NO_BUBBLE = new Set([
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
   "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart", "copy", "cut", "paste", "beforeinput",
+  "closerequest", "navigate",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -185,6 +197,10 @@ function cssValue(name, value) {
 }
 
 const warned = new Set();
+// Style elements, and those in the document's sheets now (see `StyleElement`).
+const styleElements = new Set();
+let appliedStyles = [];
+let stylesPending = false;
 
 function warnOnce(message) {
   if (warned.has(message)) return;
@@ -317,6 +333,39 @@ function classToken(value) {
 }
 
 /** A live token list backed by the node's class attribute. */
+// `element.dataset`: a DOMStringMap over the `data-*` attributes, `fooBar` for `data-foo-bar`.
+function datasetOf(element) {
+  const attribute = (key) => typeof key === "string" && !/-[a-z]/.test(key) ? "data-" + key.replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()) : null;
+  const keys = () => element.getAttributeNames().filter((name) => name.startsWith("data-")).map((name) => name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()));
+  return new Proxy(Object.create(null), {
+    get(_, key) {
+      const name = attribute(key);
+      return name === null ? undefined : element.getAttribute(name) ?? undefined;
+    },
+    set(_, key, value) {
+      const name = attribute(key);
+      if (name === null) throw new (globalThis.DOMException ?? Error)("'" + String(key) + "' is not a valid dataset name", "SyntaxError");
+      element.setAttribute(name, String(value));
+      return true;
+    },
+    deleteProperty(_, key) {
+      const name = attribute(key);
+      if (name !== null) element.removeAttribute(name);
+      return true;
+    },
+    has(_, key) {
+      const name = attribute(key);
+      return name !== null && element.hasAttribute(name);
+    },
+    ownKeys: keys,
+    getOwnPropertyDescriptor(_, key) {
+      const name = attribute(key);
+      const value = name === null ? null : element.getAttribute(name);
+      return value === null ? undefined : { value, writable: true, enumerable: true, configurable: true };
+    },
+  });
+}
+
 export class ClassList {
   #node;
   constructor(node) { this.#node = node; }
@@ -442,7 +491,9 @@ function clearAdoptedSheets() {
 function syncAdoptedSheets() {
   if (!rootNode) return;
   clearAdoptedSheets();
-  const sheets = [...importedSheets.values(), ...(adoptedLists.get(rootNode)?.values ?? [])];
+  const sheets = [...importedSheets.values()];
+  for (const element of appliedStyles) if (element._styleSheet) sheets.push(element._styleSheet);
+  sheets.push(...(adoptedLists.get(rootNode)?.values ?? []));
   for (const sheet of sheets) {
     if (nextSheet >= 0x80000000) throw new RangeError("Too many stylesheet adoptions");
     const entry = { sheet, id: nextSheet++, live: false };
@@ -529,6 +580,7 @@ class NodeState {
   kept = 0;
   attributes = null;
   classList = null;
+  dataset = null;
 }
 
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
@@ -584,6 +636,11 @@ export class Node {
     return siblings ? siblings[siblings.indexOf(this) - 1] ?? null : null;
   }
 
+  /** Whether the node is in the mounted tree. */
+  get isConnected() {
+    return inDocument(this);
+  }
+
   /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
   get nodeType() {
     return 1;
@@ -604,7 +661,8 @@ export class Node {
   /** The tag in upper case for HTML elements, as in the DOM. */
   get tagName() {
     const name = this.localName;
-    return this.namespaceURI === undefined ? name.toUpperCase() : name;
+    const namespace = this.namespaceURI;
+    return namespace === undefined || namespace === null || namespace === "http://www.w3.org/1999/xhtml" ? name.toUpperCase() : name;
   }
 
   set tagName(_value) {}
@@ -685,6 +743,7 @@ export class Node {
     if (old) {
       const index = old.childNodes.indexOf(child);
       if (liveRanges.size) eachLiveRange((range) => range._removing(child, old, index));
+      if (mutationObservers.size) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
       old.childNodes.splice(index, 1);
     }
     child.parentNode = this;
@@ -699,6 +758,8 @@ export class Node {
       this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
+    if (mutationObservers.size) childListRecord(this, child, null, child.previousSibling, before);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -727,9 +788,11 @@ export class Node {
     if (child.parentNode !== this) throw domError("NotFoundError", "the node to remove is not a child of this node");
     const index = this.childNodes.indexOf(child);
     if (liveRanges.size) eachLiveRange((range) => range._removing(child, this, index));
+    if (mutationObservers.size) childListRecord(this, null, child, this.childNodes[index - 1], this.childNodes[index + 1]);
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
+    if (styleElements.size) stylesChanged();
     return child;
   }
 
@@ -744,11 +807,13 @@ export class Node {
     if (parent) {
       const index = parent.childNodes.indexOf(this);
       if (liveRanges.size) eachLiveRange((range) => range._removing(this, parent, index));
+      if (mutationObservers.size) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
       parent.childNodes.splice(index, 1);
       this.parentNode = null;
     }
     native.destroy(this.nodeId);
     forget(this);
+    if (styleElements.size) stylesChanged();
   }
 
   /**
@@ -788,6 +853,8 @@ export class Node {
   get className() { return this.getAttribute("class") ?? ""; }
   set className(value) { this.setAttribute("class", String(value)); }
   get classList() { return this.#more().classList ??= new ClassList(this); }
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  get dataset() { return this.#more().dataset ??= datasetOf(this); }
 
   getAttribute(name) {
     name = String(name);
@@ -824,6 +891,7 @@ export class Node {
   setAttribute(name, value) {
     name = String(name);
     let text = value == null ? null : String(value);
+    if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
@@ -855,8 +923,13 @@ export class Node {
       if (name === "checked" && "checked" in this) this.checked = on;
       else native.attribute(this.nodeId, name === "readonly" ? "readOnly" : name, on);
     } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
-      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`).
-      native.attribute(this.nodeId, name, text);
+      // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`). One
+      // the tree does not know (React 19's `precedence`, a library's own) stays on the element.
+      try {
+        native.attribute(this.nodeId, name, text);
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
     } else {
       if (name === "href") {
         this._href = text || null;
@@ -915,14 +988,17 @@ export class Node {
     const rare = this.#rare;
     const old = rare?.flags ?? 0;
     const flags = ((wanted ? old | bit : old & ~bit) | (rare?.kept ?? 0) | (this._extra ?? 0)) >>> 0;
-    if (flags !== old) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === old) return;
+    this.#more().flags = flags;
+    // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
   #wanted(kind) {
     const listeners = this.#rare?.listeners;
     const has = (type) => (listeners?.get(type)?.length ?? 0) > 0;
-    if (kind >= TOUCH_START) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
+    if (SHARES_BIT(kind)) return [KINDS_OF_BIT(bitOf(kind)).some((each) => has(TYPES[each])), (1 << bitOf(kind)) >>> 0];
     const type = TYPES[kind];
     const wanted = has(type) || (MOUSE_OF.has(type) && has(MOUSE_OF.get(type))) || (kind === CLICK && (this._href || this._activate))
       || (kind === SELECTION_CHANGE && has("selectstart"));
@@ -937,7 +1013,9 @@ export class Node {
       if (wanted) flags |= bit;
     }
     flags >>>= 0;
-    if (flags !== (this.#rare?.flags ?? 0)) native.listen(this.nodeId, (this.#more().flags = flags));
+    if (flags === (this.#rare?.flags ?? 0)) return;
+    this.#more().flags = flags;
+    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
   }
 
   _keep(...types) {
@@ -1201,7 +1279,9 @@ export class Text extends Node {
     if (value === old && value !== "") return;
     this.#data = value;
     native.setText(this.nodeId, value);
+    if (mutationObservers.size) characterDataRecord(this, old);
     if (this._svgText) svgChanged(this);
+    if (styleElements.size && this.parentNode instanceof StyleElement) stylesChanged();
   }
 
   /** Splits at `offset`: this keeps the text before it, and a new next sibling the rest. */
@@ -1686,6 +1766,43 @@ function svgStyle(value) {
   return css;
 }
 
+// Elements of any svg by id, for `<use href="#id">` in another svg: icon sprites define
+// symbols in one hidden svg and every icon uses them.
+const SVG_IDS = new Map();
+
+function nameSvgElement(element, old, id) {
+  if (old !== undefined && SVG_IDS.get(old)?.deref() === element) SVG_IDS.delete(old);
+  if (id !== undefined) SVG_IDS.set(id, new WeakRef(element));
+}
+
+const REFERENCE = /href="#([^"]+)"/g;
+
+// The tree draws each svg as a document of its own, so the elements its `href="#id"`s name
+// in other svgs go into its markup, in a `<defs>`.
+function withReferences(markup) {
+  if (!markup.includes('href="#')) return markup;
+  const own = new Set();
+  for (const found of markup.matchAll(/\sid="([^"]+)"/g)) own.add(found[1]);
+  let defs = "";
+  let pending = markup;
+  while (pending) {
+    let next = "";
+    for (const found of pending.matchAll(REFERENCE)) {
+      const id = found[1];
+      if (own.has(id)) continue;
+      own.add(id);
+      const element = SVG_IDS.get(id)?.deref();
+      if (!element || element.getAttribute("id") !== id) continue;
+      const added = element._markup();
+      defs += added;
+      next += added;
+    }
+    pending = next;
+  }
+  if (!defs) return markup;
+  return markup.slice(0, markup.lastIndexOf("</svg>")) + "<defs>" + defs + "</defs></svg>";
+}
+
 // The children of an element of an `<svg>`: the markup they write, and how they move.
 const svgChildren = {
   insertBefore(child, before = null) {
@@ -1901,6 +2018,14 @@ export class SvgElement {
     return this.#attributes.has(svgName(name));
   }
 
+  getAttributeNames() {
+    return [...this.#attributes.keys()];
+  }
+
+  get dataset() {
+    return (this._dataset ??= datasetOf(this));
+  }
+
   setAttribute(name, value) {
     name = svgName(name);
     if (value === null || value === undefined || value === false) {
@@ -1909,12 +2034,14 @@ export class SvgElement {
     }
     const text = name === "style" ? svgStyle(value) : String(value);
     if (this.#attributes.get(name) === text) return;
+    if (name === "id") nameSvgElement(this, this.#attributes.get(name), text);
     this.#attributes.set(name, text);
     this._written(name, text);
   }
 
   removeAttribute(name) {
     name = svgName(name);
+    if (name === "id" && this.#attributes.has(name)) nameSvgElement(this, this.#attributes.get(name), undefined);
     if (this.#attributes.delete(name)) this._written(name, null);
   }
 
@@ -2202,7 +2329,7 @@ export class Svg extends Node {
       this._goLive();
       return;
     }
-    const markup = this.outerHTML;
+    const markup = withReferences(this.outerHTML);
     if (markup === this.#markup) return;
     if (this.#markup && this.childNodes.every((child) => liveable(child))) {
       this._goLive();
@@ -2703,6 +2830,71 @@ function buttonActivate() {
  * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
  * `@silkui/react`. `localName` and `tagName` give the tag.
  */
+// A style element in the document applies its text as a stylesheet, after the compiled
+// imports and before adopted sheets, in tree order. Changes apply together at the next microtask.
+
+function stylesChanged() {
+  if (stylesPending) return;
+  stylesPending = true;
+  queueMicrotask(applyStyleElements);
+}
+
+function applyStyleElements() {
+  stylesPending = false;
+  const live = [];
+  for (const element of styleElements) {
+    if (!nodes.has(element.nodeId)) styleElements.delete(element);
+    else if (inDocument(element)) live.push(element);
+  }
+  live.sort(treeOrder);
+  let changed = live.length !== appliedStyles.length;
+  for (let i = 0; i < live.length; i++) {
+    if (live[i]._compile()) changed = true;
+    if (live[i] !== appliedStyles[i]) changed = true;
+  }
+  appliedStyles = live;
+  if (changed) syncAdoptedSheets();
+}
+
+/** `<style>`: its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  _styleSheet = null;
+  #compiled = null;
+
+  constructor() {
+    super("box");
+    styleElements.add(this);
+  }
+
+  /** The element's stylesheet while it is in the document, else null. */
+  get sheet() {
+    return inDocument(this) ? this._styleSheet : null;
+  }
+
+  // Compiles changed text. True when the element gained its first sheet.
+  _compile() {
+    let text = "";
+    for (const child of this.childNodes) if (child.nodeType === 3) text += child.data;
+    if (text === this.#compiled) return false;
+    this.#compiled = text;
+    if (!native.compileStyleSheet) {
+      warnOnce("@silkui/core: a style element's CSS needs the host's CSS text compiler (App.runtimeStylesheets() in a release build)");
+      return false;
+    }
+    let bytes;
+    try {
+      bytes = native.compileStyleSheet(text);
+    } catch (error) {
+      console.warn("@silkui/core: a style element's CSS did not compile: " + (error?.message ?? error));
+      return false;
+    }
+    const first = this._styleSheet === null;
+    this._styleSheet ??= new CSSStyleSheet();
+    replaceSheet(this._styleSheet, bytes);
+    return first;
+  }
+}
+
 export function createElement(tag, options) {
   tag = String(tag).toLowerCase();
   const type = String(options?.type ?? "text").toLowerCase();
@@ -2714,6 +2906,7 @@ export function createElement(tag, options) {
   else if (tag === "img") node = new Image();
   else if (tag === "canvas") node = new Canvas();
   else if (tag === "br") return new LineBreak();
+  else if (tag === "style") node = new StyleElement();
   else node = new Node("box");
   node._tag = tag;
   native.attribute(node.nodeId, "element", tag);
@@ -3729,6 +3922,8 @@ function selectionRecord(target, start) {
   const event = new Event(start === 1 ? "selectstart" : "selectionchange", target);
   if (start !== 1) event.bubbles = false;
   dispatchEvent(event);
+  // As on the web, `selectionchange` is the document's event too.
+  if (start !== 1 && outerTargets.length) outerTargets[0].dispatchEvent?.(new Event("selectionchange", null));
   if (event.defaultPrevented) {
     const selection = getSelection();
     selection.removeAllRanges();
@@ -3739,6 +3934,16 @@ function selectionRecord(target, start) {
 }
 
 let rootNode = null;
+// What events pass above the root, outermost last: the document and the window of a DOM layer
+// over the tree (`@silkui/core/globals`). Each has `_run(event, capture)` as a node does.
+let outerTargets = [];
+// Events the web does not send on to the document and the window.
+const NOT_OUTER = new Set(["scroll", "layout", "load", "error"]);
+
+/** Has events that reach the root go on to `targets` (outermost last), as `@silkui/core/globals` does for `document` and `window`. */
+export function setOuterTargets(...targets) {
+  outerTargets = targets;
+}
 
 /** Makes `node` the root of the window's tree. */
 /**
@@ -3770,6 +3975,7 @@ export function mount(node) {
   rootNode = node;
   native.root(node.nodeId);
   syncAdoptedSheets();
+  if (styleElements.size) stylesChanged();
   return node;
 }
 
@@ -3863,6 +4069,8 @@ function reportError(error) {
 }
 
 /** An event of the tree, with the members of the DOM event it corresponds to. */
+const MODIFIER_FIELDS = { __proto__: null, Shift: "shiftKey", Control: "ctrlKey", Alt: "altKey", Meta: "metaKey" };
+
 export class Event {
   constructor(type, target) {
     this.type = type;
@@ -3889,10 +4097,19 @@ export class Event {
     this._immediate = true;
   }
 
+  /**
+   * Whether modifier `key` ("Shift", "Control", "Alt", "Meta") was down, for keyboard, mouse,
+   * pointer and touch events. Lock keys and others answer false.
+   */
+  getModifierState(key) {
+    return this[MODIFIER_FIELDS[key]] === true;
+  }
+
   /** The nodes the event passes, target first. */
   composedPath() {
     const path = [];
     for (let node = this.target; node; node = node.parentNode) path.push(node);
+    if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(this.type)) path.push(...outerTargets);
     return path;
   }
 }
@@ -4058,6 +4275,7 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
 export function dispatchEvent(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
+  if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
@@ -4142,6 +4360,7 @@ function compatTap(click, target) {
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
   const target = nodes.get(id);
   if (!target) return false;
+  if (kind >= CLOSE_REQUEST) return dispatchRequest(kind, target, a);
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
   if (kind === FOCUS) focusing(target);
@@ -4174,6 +4393,20 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   }
   return prevented;
 };
+
+// The tree's requests, raised after an Escape, a back key or a back mouse button that nothing
+// prevented: `closerequest` asks to close what is on top, as a web close watcher hears, and
+// `navigate` asks to go back or forward, with `navigationType` "traverse" and `direction`
+// "back" or "forward". The listener that acts stops the event; the tree does nothing itself.
+function dispatchRequest(kind, target, forward) {
+  const event = new Event(TYPES[kind], target);
+  if (kind === NAVIGATE) {
+    event.navigationType = "traverse";
+    event.direction = forward ? "forward" : "back";
+  }
+  dispatchEvent(event);
+  return event.defaultPrevented;
+}
 
 // Editing hosts, as the HTML Standard's contenteditable has them. The tree sends a focused
 // host's typing, composition, deleting, line breaks and pastes as `beforeinput` records;
@@ -4681,6 +4914,8 @@ function follow(target) {
 // next realm starts on an empty tree.
 native.unload = function () {
   importedSheets.clear();
+  styleElements.clear();
+  appliedStyles = [];
   for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
   rootNode = null;
 };
@@ -6204,8 +6439,25 @@ export function supports(conditionOrProperty, value) {
   return arguments.length > 1 ? native.supports(String(conditionOrProperty), String(value)) : native.supports(String(conditionOrProperty));
 }
 
+/** `CSS.escape(text)`: `text` as a CSS identifier, escaped as the CSSOM spec does. */
+export function cssEscape(value) {
+  const text = String(value);
+  let result = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const character = text[i];
+    if (code === 0) result += "\uFFFD";
+    else if ((code >= 0x1 && code <= 0x1f) || code === 0x7f || (i === 0 && code >= 0x30 && code <= 0x39) || (i === 1 && code >= 0x30 && code <= 0x39 && text.charCodeAt(0) === 0x2d)) result += "\\" + code.toString(16) + " ";
+    else if (i === 0 && text.length === 1 && code === 0x2d) result += "\\" + character;
+    else if (code >= 0x80 || code === 0x2d || code === 0x5f || (code >= 0x30 && code <= 0x39) || (code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) result += character;
+    else result += "\\" + character;
+  }
+  return result;
+}
+
 if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
 globalThis.CSS.supports ??= supports;
+globalThis.CSS.escape ??= cssEscape;
 
 let frameStatsSince = 0;
 
@@ -6231,4 +6483,117 @@ export function frameStats() {
     p99: native.frameStats(4),
     max: native.frameStats(5),
   };
+}
+
+// MutationObserver, as in the DOM Standard, for the tree's nodes: child lists, attributes and
+// text. Records are queued as the mutations happen and delivered in one microtask.
+
+class MutationRecord {
+  constructor(type, target, fields) {
+    this.type = type;
+    this.target = target;
+    this.addedNodes = fields.addedNodes ?? [];
+    this.removedNodes = fields.removedNodes ?? [];
+    this.previousSibling = fields.previousSibling ?? null;
+    this.nextSibling = fields.nextSibling ?? null;
+    this.attributeName = fields.attributeName ?? null;
+    this.attributeNamespace = null;
+    this.oldValue = fields.oldValue ?? null;
+  }
+}
+
+let mutationsQueued = false;
+
+function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
+  for (const observer of mutationObservers) {
+    let options = null;
+    for (let node = target; node; node = node.parentNode) {
+      const found = observer._targets.get(node);
+      if (found && (node === target || found.subtree) && found[wants]) {
+        if (filterName !== undefined && found.attributeFilter && !found.attributeFilter.includes(filterName)) continue;
+        options = found;
+        break;
+      }
+    }
+    if (!options) continue;
+    const record = new MutationRecord(type, target, fields);
+    if (oldValueOption && !options[oldValueOption]) record.oldValue = null;
+    observer._records.push(record);
+    if (!mutationsQueued) {
+      mutationsQueued = true;
+      queueMicrotask(deliverMutations);
+    }
+  }
+}
+
+function deliverMutations() {
+  mutationsQueued = false;
+  for (const observer of [...mutationObservers]) {
+    const records = observer.takeRecords();
+    if (records.length === 0) continue;
+    try {
+      observer._callback.call(observer, records, observer);
+    } catch (error) {
+      reportError(error);
+    }
+  }
+}
+
+function childListRecord(parent, added, removed, previousSibling, nextSibling) {
+  queueRecord("childList", parent, {
+    addedNodes: added ? [added] : [],
+    removedNodes: removed ? [removed] : [],
+    previousSibling: previousSibling ?? null,
+    nextSibling: nextSibling ?? null,
+  }, "childList");
+}
+
+function attributeRecord(node, name, text) {
+  const old = node.getAttribute(name);
+  if (old === text) return;
+  queueRecord("attributes", node, { attributeName: name, oldValue: old }, "attributes", "attributeOldValue", name);
+}
+
+function characterDataRecord(node, old) {
+  queueRecord("characterData", node, { oldValue: old }, "characterData", "characterDataOldValue");
+}
+
+export class MutationObserver {
+  constructor(callback) {
+    if (typeof callback !== "function") throw new TypeError("MutationObserver needs a function");
+    this._callback = callback;
+    this._targets = new Map();
+    this._records = [];
+  }
+
+  observe(target, options = {}) {
+    if (!(target instanceof Node)) return;
+    const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined);
+    const characterData = options.characterData ?? options.characterDataOldValue !== undefined;
+    if (!options.childList && !attributes && !characterData) {
+      throw new TypeError("MutationObserver.observe needs childList, attributes or characterData");
+    }
+    this._targets.set(target, {
+      childList: !!options.childList,
+      attributes: !!attributes,
+      characterData: !!characterData,
+      subtree: !!options.subtree,
+      attributeOldValue: !!options.attributeOldValue,
+      characterDataOldValue: !!options.characterDataOldValue,
+      attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
+    });
+    mutationObservers.add(this);
+  }
+
+  disconnect() {
+    this._targets.clear();
+    this._records = [];
+    mutationObservers.delete(this);
+  }
+
+  takeRecords() {
+    const records = this._records;
+    this._records = [];
+    return records;
+  }
 }

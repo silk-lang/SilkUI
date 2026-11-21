@@ -1010,7 +1010,12 @@ impl App {
         }
         move styled
       }
-      let optimized = run initial.optimize(run Deferred<Optimize>.value(options.optimize))
+      // A JavaScript app's development host is all engine and renderer: it is optimized whole,
+      // the standard library too (code split across units of other settings is not inlined
+      // across them), and binds the development tools on (`ui_inspect_server.devtools`).
+      let wholeDev = self.custom == "" && target.id() == "window" && dev && plan.kind != Kind.Loom
+      let level = if wholeDev { Optimize.Speed } else { options.optimize }
+      let optimized = run initial.optimize(run Deferred<Optimize>.value(level))
       let debugged = run optimized.debug(run Deferred<bool>.value(options.debugInfo()))
       let configured = run debugged.unsandboxedTools(options.unsandboxedTools)
       let platform = if target.web() {
@@ -1054,28 +1059,15 @@ impl App {
         move platform
       }
 
-      // The app retains its requested mode; the engine, renderer, and inspector stay responsive.
-      let compilation = if self.custom == "" && target.id() == "window" && dev {
-        let alias = if plan.kind == Kind.Loom {
-          "silkui_window_loom"
-        } else if plan.kind == Kind.Node {
-          "silkui_window_node"
-        } else {
-          "silkui_window"
-        }
-        let optimizedHost = run bundled.package(alias, run speedPackage())
+      // A Loom app keeps its requested mode; its renderer and inspector stay responsive.
+      let compilation = if wholeDev {
+        let tools = run Package.make().set("devtools.silk", "enabled", run Deferred<bool>.value(true))
+        run bundled.package("ui_inspect_server", move tools)
+      } else if self.custom == "" && target.id() == "window" && dev {
+        let optimizedHost = run bundled.package("silkui_window_loom", run speedPackage())
         let renderer = run optimizedHost.package("ui_tree", run speedPackage())
         let host = run renderer.package("ui_inspect_server", run speedPackage())
-        if plan.kind == Kind.Loom {
-          run host.package("loom", run speedPackage())
-        } else {
-          let engine = run host.package("silkjs", run speedPackage())
-          if plan.kind == Kind.Node {
-            run engine.package("node_runtime", run speedPackage())
-          } else {
-            move engine
-          }
-        }
+        run host.package("loom", run speedPackage())
       } else {
         move bundled
       }

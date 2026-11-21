@@ -6,11 +6,12 @@ const check = (label, got, want) => {
   if (got !== want) throw new Error(label + ": got '" + got + "', want '" + want + "'");
 };
 
-const root = createBox({ width: "400px", fontSize: "10px", color: "rgb(0, 0, 255)" });
+const root = createBox({ width: "400px", fontSize: "10px", color: "rgb(0, 0, 255)", "--tone": "blue" });
 const sheet = new CSSStyleSheet();
 sheet.replaceSync(
   ".card { padding: 2em; margin-left: 5px; opacity: 0.5; cursor: pointer; border: 3px solid red;" +
-    " box-sizing: border-box; transform: translateX(10px); z-index: 4; position: relative }",
+    " box-sizing: border-box; transform: translateX(10px); z-index: 4; position: relative;" +
+    " --inset: 0.75; --gap: calc(var(--inset) * 2) }",
 );
 root.adoptedStyleSheets.push(sheet);
 const card = createBox({ height: "50px" });
@@ -39,6 +40,10 @@ check("getPropertyValue", style.getPropertyValue("font-size"), "10px");
 check("initial value", style.fontStyle, "normal");
 check("bracket kebab name", style["margin-left"], "5px");
 check("shorthand", style.margin, "");
+check("custom property", style.getPropertyValue("--inset"), "0.75");
+check("custom property with var()", style.getPropertyValue("--gap"), "calc(0.75 * 2)");
+check("inherited inline custom property", style.getPropertyValue("--tone"), "blue");
+check("missing custom property", style.getPropertyValue("--none"), "");
 check("unknown name", style.getPropertyValue("not-a-property"), "");
 check("pseudo-element", getComputedStyle(card, "::before").width, "");
 

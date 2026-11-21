@@ -96,6 +96,15 @@ test("listen flags follow the listeners", () => {
   assert.deepEqual(mock.take(), []);
 });
 
+test("a host keydown answers getModifierState from its modifier keys", () => {
+  const box = createBox();
+  const seen = [];
+  box.addEventListener("keydown", (event) => seen.push(["Shift", "Control", "Alt", "Meta", "CapsLock"].map((key) => event.getModifierState(key))));
+  // Shift (1) and Meta (8) down.
+  mock.native.dispatch(7, box.nodeId, 0, 0, 9, 0, 0, "Enter", "Enter");
+  assert.deepEqual(seen, [[true, false, false, true, false]]);
+});
+
 test("the app's own events go through the tree as on the web", () => {
   const outer = createBox();
   const inner = createBox();
@@ -118,6 +127,30 @@ test("the app's own events go through the tree as on the web", () => {
   log.length = 0;
   outer.dispatchEvent(new Event("ping"));
   assert.deepEqual(log, ["outer capture 2 false", "outer 2 true"]);
+});
+
+test("close and navigate requests are events that bubble, and load and error share a bit", () => {
+  const pane = createBox();
+  const inside = createBox();
+  pane.append(inside);
+  mock.calls.length = 0;
+  const seen = [];
+  pane.addEventListener("closerequest", (event) => seen.push(event.type));
+  const [call, node, flags] = mock.calls.at(-1);
+  assert.deepEqual([call, node, flags], ["listen", pane.nodeId, 1 << 18], "the requests listen with bit 18");
+  pane.addEventListener("navigate", (event) => {
+    seen.push(`${event.type} ${event.navigationType} ${event.direction}`);
+    event.preventDefault();
+  });
+  assert.equal(mock.native.dispatch(38, inside.nodeId, 0, 0, 0, 0, 0), false);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 0, 0, 0, 0, 0), true);
+  assert.equal(mock.native.dispatch(39, inside.nodeId, 1, 0, 0, 0, 0), true);
+  assert.deepEqual(seen, ["closerequest", "navigate traverse back", "navigate traverse forward"]);
+
+  const image = createBox();
+  mock.calls.length = 0;
+  image.addEventListener("error", () => {});
+  assert.deepEqual(mock.calls.at(-1), ["listen", image.nodeId, 1 << 17], "error listens with the bit of load");
 });
 
 test("preventDefault reaches the host for cancelable events only", () => {
@@ -387,6 +420,17 @@ test("unload destroys every node, for a reload", () => {
   assert.equal(nodeById(box.nodeId), null);
 });
 
+test("removing a listener from a destroyed node sends nothing", () => {
+  const child = createBox();
+  const box = createBox({}, child);
+  const listener = () => {};
+  child.addEventListener("click", listener);
+  box.destroy();
+  mock.take();
+  child.removeEventListener("click", listener);
+  assert.deepEqual(mock.take().filter((call) => call[0] === "listen"), []);
+});
+
 test("a font family list is defined once and named by number", () => {
   mock.take();
   const a = createBox({ fontFamily: "monospace" });
@@ -441,6 +485,20 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   calls = mock.take();
   assert.equal(calls.filter((call) => call[0] === "release").length, 1, "a went live when it changed, so only b held the markup");
   assert.throws(() => createNode("icon"), /no node kind 'icon'/);
+});
+
+test("a use of a sprite's symbol draws it: the symbol goes into the markup", () => {
+  mock.take();
+  const sprite = createBox();
+  sprite.innerHTML = '<svg width="0" height="0"><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></svg>';
+  mount(sprite);
+  const icon = createNode("svg");
+  icon.innerHTML = '<use href="#sprite-check"/>';
+  flushSvg();
+  const defined = mock.take().filter((call) => call[0] === "defineIcon").map((call) => call[2]);
+  const used = defined.find((markup) => markup.includes("<use"));
+  assert.ok(used.includes('<defs><symbol id="sprite-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol></defs></svg>'), used);
+  assert.ok(!defined.find((markup) => markup.includes('width="0"')).includes("<defs>"), "the sprite names its own ids");
 });
 
 test("an image src loads its address once while some node shows it", () => {

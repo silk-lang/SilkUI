@@ -22,6 +22,8 @@ import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
+import silk.num.f32
+import silk.num.f64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -109,6 +111,11 @@ pub struct Work {
   pub sheetCacheHits: usize,
   /// Computed values copied from a lender instead of built.
   pub lenders: usize,
+  /// Lent nodes that took their lender's whole result: its style, font and paint keys and its
+  /// layout style, with nothing built or keyed again.
+  pub sharedResults: usize,
+  /// Text nodes that took the style an equal parent's text child already had.
+  pub textInherits: usize,
   pub styleShares: usize,
   pub frames: usize,
   pub styleFrames: usize,
@@ -137,6 +144,14 @@ pub struct Work {
   /// evaluated and rules walked by the environment update each call makes first.
   pub styleCalls: usize,
   pub stylePasses: usize,
+  /// Passes that matched every node again, and the `restyle` calls that asked for one.
+  pub fullStylePasses: usize,
+  pub rootRestyles: usize,
+  /// Matches that watched more elements than a match context holds, and the last such node.
+  pub watchOverflows: usize,
+  pub lastOverflow: usize,
+  /// By the place that asked: requests for a full pass that found none due.
+  pub dirtyCauses: [usize; 32],
   pub conditionsEvaluated: usize,
   pub conditionRulesWalked: usize,
   /// Calls JavaScript made into the host bindings, as the JS host last reported them.
@@ -147,10 +162,10 @@ impl Work {
   pub fn zero() -> Work {
     return Work {
       mutations: 0, creates: 0, inserts: 0, setStyles: 0, styleDeclarations: 0, setTexts: 0, textBytes: 0, attributes: 0, listens: 0, batches: 0,
-      resolves: 0, ticks: 0, sheetSkips: 0, sheetTwins: 0, sheetMatches: 0, sheetCacheHits: 0, lenders: 0, styleShares: 0,
+      resolves: 0, ticks: 0, sheetSkips: 0, sheetTwins: 0, sheetMatches: 0, sheetCacheHits: 0, lenders: 0, sharedResults: 0, textInherits: 0, styleShares: 0,
       frames: 0, styleFrames: 0, layoutFrames: 0, paintFrames: 0, hoverRefreshes: 0,
       paintedFragments: 0, culledSubtrees: 0, replayedSubtrees: 0, repaintedSubtrees: 0, replayedOperations: 0, paintedGlyphs: 0,
-      layoutPasses: 0, layoutFull: 0, layoutProbes: 0, layoutCacheHits: 0, layoutReused: 0, layoutMoves: 0, fragmentsResolved: 0, inlineLayouts: 0, plainLines: 0, linesEmitted: 0, attributeBytes: 0, bridgeCalls: 0, styleCalls: 0, stylePasses: 0, conditionsEvaluated: 0, conditionRulesWalked: 0,
+      layoutPasses: 0, layoutFull: 0, layoutProbes: 0, layoutCacheHits: 0, layoutReused: 0, layoutMoves: 0, fragmentsResolved: 0, inlineLayouts: 0, plainLines: 0, linesEmitted: 0, attributeBytes: 0, bridgeCalls: 0, styleCalls: 0, stylePasses: 0, fullStylePasses: 0, rootRestyles: 0, dirtyCauses: [0; 32], watchOverflows: 0, lastOverflow: 0, conditionsEvaluated: 0, conditionRulesWalked: 0,
     }
   }
 }
@@ -292,6 +307,8 @@ pub struct Node {
   pub gridDeclared: bool,
   pub gridStyled: bool,
   pub styleNeedsContext: bool,
+  /// A [`Move`] of this frame names the node: it paints as a group the renderer moves.
+  pub sliding: bool,
   pub containerWatch: u32,
   pub styleChange: u32,
   pub generatedSuppressed: bool,
@@ -300,6 +317,9 @@ pub struct Node {
   /// The node and its ancestors were displayed at its last style resolve: it has a
   /// before-change style for transitions.
   pub rendered: bool,
+  /// What changed can reach the node's descendants through selectors (`UiTree.restyleLocal`):
+  /// its whole subtree resolves again, not only the children whose inherited values change.
+  pub styleSubtree: bool,
   pub resource: u32,
   /// An icon node's live svg (`Mutation.SvgInsert`), on the heap: drawn instead of its resource.
   pub svg: Thin<LiveSvg>,
@@ -771,5 +791,62 @@ impl Pending {
   pub fn clear(self: &mut Self) -> () {
     self.list.clear()
     self.data.clear()
+  }
+}
+
+/// The bit that marks the scroll link of a [`Move`]: the node's id with it set, so it never
+/// meets the id of a scroll container.
+pub const MOVE_LINK: u32 = 2147483648
+
+/// How many points of a [`Move`]'s easing are kept.
+pub const MOVE_CURVE: usize = 17
+
+/// A `translate` transition a renderer can run by itself: the node paints as a scroll group
+/// that follows link `node`, whose position is the node's translation, and the renderer puts
+/// it where the transition is at each frame it draws, new frame from the tree or not. So a
+/// screen keeps sliding while the thread that owns the tree is busy.
+pub struct Move {
+  /// The scroll link and position this move drives: [`MOVE_LINK`] with the node's id.
+  pub node: u32,
+  pub slot: u32,
+  /// The translation the transition starts at and ends at, in CSS pixels.
+  pub fromX: f32,
+  pub fromY: f32,
+  pub toX: f32,
+  pub toY: f32,
+  /// When the active phase starts, on the tree's frame clock: it names the transition, the
+  /// same from frame to frame.
+  pub began: f64,
+  /// Seconds of the active phase run when the frame was painted: negative during the delay.
+  pub elapsed: f64,
+  pub duration: f64,
+  /// The easing's output at [`MOVE_CURVE`] evenly spaced inputs from 0 to 1.
+  pub curve: [f32; 17],
+}
+
+impl Copy for Move {}
+
+impl Move {
+  /// The eased progress after `seconds` of the active phase.
+  pub fn eased(self: &Self, seconds: f64) -> f32 {
+    if seconds <= 0.0 {
+      return self.curve[0]
+    }
+    if self.duration <= 0.0 || seconds >= self.duration {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let at = f64.toF32(seconds / self.duration) * 16.0
+    let low = f32.floor(at)
+    let index = f32.toUsize(low)
+    if index + 1 >= MOVE_CURVE {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let part = at - low
+    return self.curve[index] + (self.curve[index + 1] - self.curve[index]) * part
+  }
+
+  /// Whether the transition is over after `seconds` of the active phase.
+  pub fn over(self: &Self, seconds: f64) -> bool {
+    return seconds >= self.duration
   }
 }

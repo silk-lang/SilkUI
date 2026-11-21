@@ -1,8 +1,10 @@
 import svg_css.adopted { StyleSheets }
-import svg_css.sheet { Sheet, Declaration, ConditionKind, NONE }
-import svg_css.selectors { DependencyKind, Sharing, SubjectKind }
+import svg_css.sheet { ConditionKind, NONE }
+import svg_css.selectors { Dependency, DependencyKind, Sharing, SubjectKind }
+import svg_css.ancestor_filter
+import svg_css.ancestor_filter { NameKind }
 import svg_css.element { PseudoTarget }
-import svg_css.tokens { equal, insensitive, TokenRange }
+import svg_css.tokens { equal, insensitive }
 import style_identity { Atoms }
 import node { Node }
 import mutation { StyleState }
@@ -84,35 +86,67 @@ impl States {
   pub fn make() -> States { return States { descendants: 0, siblings: 0, has: 0, any: 0, wide: false, attributes: false, derived: false } }
 }
 
-/// How far a change reaches: nothing, the element's subtree, its parent's subtree or the root.
-pub enum Reach { None, Subtree, Siblings, Root }
+/// How far a change reaches beyond the element itself: nothing, the descendants that carry one
+/// of `Extent.keys`, the element's subtree, its parent's subtree or the root.
+pub enum Reach { None, Descendants, Subtree, Siblings, Root }
 
-/// What a changed selector input restyles: `reach` from the element, and, when `anchors`, the
-/// `:has()` anchors that can see the element.
-pub struct Extent { pub reach: Reach, pub anchors: bool }
+const KEYS: u32 = 8
+
+/// What a changed selector input restyles: the element itself when `own`, `reach` from it, and,
+/// when `anchors`, the `:has()` anchors that can see the element. Keys are
+/// `ancestor_filter.key` values of the subjects a `Descendants` reach restyles.
+pub struct Extent { pub reach: Reach, pub anchors: bool, pub own: bool, pub count: u32, pub keys: [u32; 8] }
 impl Copy for Extent {}
 impl Extent {
-  pub fn none() -> Extent { return Extent { reach: Reach.None, anchors: false } }
+  pub fn none() -> Extent { return Extent { reach: Reach.None, anchors: false, own: false, count: 0, keys: [0; 8] } }
+  pub fn of(reach: Reach) -> Extent {
+    let mut result = Extent.none()
+    result.reach = reach
+    return result
+  }
+  pub fn itself() -> Extent {
+    let mut result = Extent.none()
+    result.own = true
+    return result
+  }
+
+  fn key(self: &mut Self, value: u32) -> () {
+    if rank(self.reach) > rank(Reach.Descendants) { return () }
+    let mut i: u32 = 0
+    while i < self.count {
+      if self.keys[u32.toUsize(i)] == value { return () }
+      i = i + 1
+    }
+    if self.count == KEYS {
+      self.reach = Reach.Subtree
+      return ()
+    }
+    self.keys[u32.toUsize(self.count)] = value
+    self.count = self.count + 1
+    self.reach = Reach.Descendants
+  }
+
   pub fn with(self: &Self, other: Extent) -> Extent {
-    return Extent { reach: wider(self.reach, other.reach), anchors: self.anchors || other.anchors }
+    let mut result = self.*
+    result.reach = wider(self.reach, other.reach)
+    result.anchors = self.anchors || other.anchors
+    result.own = self.own || other.own
+    if other.reach == Reach.Descendants {
+      let mut i: u32 = 0
+      while i < other.count {
+        result.key(other.keys[u32.toUsize(i)])
+        i = i + 1
+      }
+    }
+    return result
   }
 }
 
 fn rank(reach: Reach) -> u32 {
-  return match reach { Reach.None => 0 Reach.Subtree => 1 Reach.Siblings => 2 Reach.Root => 3 }
+  return match reach { Reach.None => 0 Reach.Descendants => 1 Reach.Subtree => 2 Reach.Siblings => 3 Reach.Root => 4 }
 }
 
 pub fn wider(a: Reach, b: Reach) -> Reach { return if rank(a) >= rank(b) { a } else { b } }
-
-/// Custom properties reach only the element's subtree: descendants inherit a new variable scope.
-fn declaresCustom(sheet: &Sheet, range: TokenRange) -> bool {
-  let mut i = range.start
-  while i < range.end {
-    if let Declaration.Custom { .. } = &sheet.declarations.asSlice()[i] { return true }
-    i = i + 1
-  }
-  return false
-}
 
 pub fn states(sheets: &StyleSheets) -> States {
   let mut result = States.make()
@@ -122,7 +156,6 @@ pub fn states(sheets: &StyleSheets) -> States {
     let rules = sheet.resolver.rules()
     let mut rule: usize = 0
     while rule < rules.length {
-      let custom = declaresCustom(sheet, rules[rule].declarations)
       let dependencies = sheet.resolver.invalidation(rule)
       let buffer = &sheet.buffers.asSlice()[rules[rule].buffer]
       let mut at: usize = 0
@@ -133,8 +166,10 @@ pub fn states(sheets: &StyleSheets) -> States {
           result.has = u32.bitOr(result.has, dependency.states)
           if dependency.siblings { result.wide = true }
         }
-        if dependency.siblings { result.siblings = u32.bitOr(result.siblings, dependency.states) }
-        if dependency.descendants || custom { result.descendants = u32.bitOr(result.descendants, dependency.states) }
+        // A state the subject reads restyles that element alone; variables it declares reach
+        // the subtree through the element's new scope.
+        if dependency.siblings && !dependency.subject { result.siblings = u32.bitOr(result.siblings, dependency.states) }
+        if dependency.descendants && !dependency.subject { result.descendants = u32.bitOr(result.descendants, dependency.states) }
         if dependency.kind == DependencyKind.Id || (dependency.kind == DependencyKind.Attribute && !insensitive(buffer.text(dependency.name), b"class")) {
           result.attributes = true
         }
@@ -211,8 +246,8 @@ fn touches(probe: &Probe<'_>, kind: DependencyKind, name: &[u8]) -> bool {
   return false
 }
 
-fn reach(sheets: &StyleSheets, probe: &Probe<'_>, least: Reach) -> Extent {
-  let mut change = Extent { reach: least, anchors: false }
+fn reach(sheets: &StyleSheets, probe: &Probe<'_>, least: Extent) -> Extent {
+  let mut change = least
   let mut i: usize = 0
   while i < sheets.sheets().length {
     let sheet = &sheets.sheets()[i].sheet
@@ -225,8 +260,7 @@ fn reach(sheets: &StyleSheets, probe: &Probe<'_>, least: Reach) -> Extent {
       while at < dependencies.length {
         let dependency = dependencies[at]
         if touches(probe, dependency.kind, buffer.text(dependency.name)) {
-          if dependency.ancestors { change.anchors = true }
-          change.reach = wider(change.reach, if dependency.siblings { Reach.Siblings } else { Reach.Subtree })
+          change = change.with(dependencyReach(&dependency, buffer.text(dependency.subjectName)))
         }
         at = at + 1
       }
@@ -237,13 +271,47 @@ fn reach(sheets: &StyleSheets, probe: &Probe<'_>, least: Reach) -> Extent {
   return change
 }
 
-/// A class change always restyles the element's subtree: descendants can name the class.
-pub fn classReach(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: &[usize]) -> Extent {
-  return reach(sheets, &Probe { classes: true, atoms: atoms, before: before, after: after, names: &[], ids: &[] }, Reach.Subtree)
+/// What a change of one selector input restyles. A test on the subject restyles the element
+/// alone; a test on an ancestor compound restyles the descendants that can be the subject
+/// (Blink's descendant invalidation sets, Stylo's invalidation map); `:has()` and sibling
+/// relations keep the coarse reach.
+fn dependencyReach(dependency: &Dependency, subject: &[u8]) -> Extent {
+  let mut extent = Extent.none()
+  if dependency.ancestors {
+    extent.anchors = true
+    if dependency.subject { extent.own = true }
+    else { extent.reach = if dependency.siblings { Reach.Siblings } else { Reach.Subtree } }
+    return extent
+  }
+  if dependency.subject {
+    extent.own = true
+    return extent
+  }
+  if dependency.siblings {
+    extent.reach = Reach.Siblings
+    return extent
+  }
+  extent.own = true
+  let kind = match dependency.subjectKind {
+    SubjectKind.Class => NameKind.Class
+    SubjectKind.Id => NameKind.Id
+    SubjectKind.LocalName => NameKind.Element
+    _ => {
+      extent.reach = Reach.Subtree
+      return extent
+    }
+  }
+  extent.key(ancestor_filter.key(kind, subject))
+  return extent
+}
+
+/// What a class change restyles besides `least`: the rules that name a class added or removed.
+pub fn classReach(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: &[usize], least: Extent) -> Extent {
+  return reach(sheets, &Probe { classes: true, atoms: atoms, before: before, after: after, names: &[], ids: &[] }, least)
 }
 
 /// What rules that read one of the attributes `names` reach; an empty name is skipped. `ids`
 /// are the element's id before and after, when `id` is among the names.
 pub fn attributeReach(sheets: &StyleSheets, atoms: &Atoms, names: &[&[u8]], ids: &[&[u8]]) -> Extent {
-  return reach(sheets, &Probe { classes: false, atoms: atoms, before: &[], after: &[], names: names, ids: ids }, Reach.None)
+  return reach(sheets, &Probe { classes: false, atoms: atoms, before: &[], after: &[], names: names, ids: ids }, Extent.none())
 }

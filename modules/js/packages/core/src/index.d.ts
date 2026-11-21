@@ -33,6 +33,11 @@ export interface Look {
   replace(properties: Style): void;
   /** A property as the tree got it, in CSS text (`"120px"`). */
   get(name: keyof Style): string | undefined;
+  /** CSSOM's: by CSS name (`background-color`) or custom property (`--accent`). */
+  setProperty(name: string, value: string | null, priority?: string): void;
+  getPropertyValue(name: string): string;
+  removeProperty(name: string): string;
+  getPropertyPriority(name: string): string;
   readonly cssText: string;
 }
 
@@ -72,6 +77,8 @@ export class Node {
   className: string;
   adoptedStyleSheets: CSSStyleSheet[];
   readonly classList: ClassList;
+  /** The `data-*` attributes by camelCase name, as `HTMLElement.dataset`. */
+  readonly dataset: Record<string, string | undefined>;
   readonly kind: NodeKind;
   readonly parentNode: Node | null;
   readonly childNodes: readonly Node[];
@@ -81,6 +88,8 @@ export class Node {
   readonly previousSibling: Node | null;
   /** 1 for an element, 3 for text, 11 for a document fragment, as in the DOM. */
   readonly nodeType: 1 | 3 | 11;
+  /** Whether the node is in the mounted tree. */
+  readonly isConnected: boolean;
   hasChildNodes(): boolean;
   /** A copy with the same looks and attributes, and with `deep` copies of the children. */
   cloneNode(deep?: boolean): this;
@@ -163,6 +172,12 @@ export class Node {
   removeEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
   /** Sends `event` through the tree from this node, as on the web. False when a listener prevented the default. */
   dispatchEvent(event: globalThis.Event): boolean;
+}
+
+/** `<style>` (from `createElement("style")`): its text is a stylesheet while it is in the document. */
+export class StyleElement extends Node {
+  /** The element's stylesheet while it is in the document, else null. */
+  readonly sheet: CSSStyleSheet | null;
 }
 
 /** A text leaf. It takes its look from its parent. */
@@ -584,6 +599,16 @@ export interface SelectionEvent<T extends Node = Input> extends Event {
   readonly selectionEnd: number;
 }
 
+/**
+ * A request to go back or forward (`navigate`), raised after Alt+Left, Cmd+[ or a mouse back
+ * button that nothing prevented. It bubbles from the focused node; the listener that acts
+ * stops it.
+ */
+export interface NavigateEvent extends Event {
+  readonly navigationType: "traverse";
+  readonly direction: "back" | "forward";
+}
+
 /** An edit about to change an input (`beforeinput`), as the web's `InputEvent`. Preventing it cancels the edit. */
 export interface BeforeInputEvent<T extends Node = Input> extends Event {
   readonly target: FieldOf<T>;
@@ -650,6 +675,9 @@ export interface EventMap {
   cut: ClipboardEvent;
   paste: ClipboardEvent;
   beforeinput: BeforeInputEvent;
+  /** A request to close what is on top, raised after an Escape that nothing prevented. */
+  closerequest: Event;
+  navigate: NavigateEvent;
   scroll: ScrollEvent;
   layout: LayoutEvent;
   gotpointercapture: Event;
@@ -1186,4 +1214,37 @@ export class ResizeObserver {
   observe(target: Observable, options?: { box?: "content-box" | "border-box" | "device-pixel-content-box" }): void;
   unobserve(target: Observable): void;
   disconnect(): void;
+}
+
+/** Has events that reach the root go on to `targets` (outermost last), each with `_run(event, capture)`, as `@silkui/core/globals` does for `document` and `window`. */
+export function setOuterTargets(...targets: { _run(event: Event, capture: boolean): void }[]): void;
+
+export interface MutationObserverInit {
+  childList?: boolean;
+  attributes?: boolean;
+  characterData?: boolean;
+  subtree?: boolean;
+  attributeOldValue?: boolean;
+  characterDataOldValue?: boolean;
+  attributeFilter?: string[];
+}
+
+export interface MutationRecord {
+  readonly type: "childList" | "attributes" | "characterData";
+  readonly target: Node;
+  readonly addedNodes: Node[];
+  readonly removedNodes: Node[];
+  readonly previousSibling: Node | null;
+  readonly nextSibling: Node | null;
+  readonly attributeName: string | null;
+  readonly attributeNamespace: null;
+  readonly oldValue: string | null;
+}
+
+/** As in the DOM, for the tree's nodes. Records come in one microtask after the mutations. */
+export class MutationObserver {
+  constructor(callback: (records: MutationRecord[], observer: MutationObserver) => void);
+  observe(target: Node, options?: MutationObserverInit): void;
+  disconnect(): void;
+  takeRecords(): MutationRecord[];
 }

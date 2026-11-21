@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test, afterEach } from 'node:test';
 import { installMock } from './mock.js';
 const mock = installMock();
-const { CSSStyleSheet, createBox, mount, updateStyleSheet } = await import('../src/index.js');
+const { CSSStyleSheet, createBox, createElement, createText, mount, updateStyleSheet } = await import('../src/index.js');
 const record = mock.native.styleSheet;
 mock.native.styleSheet = (operation, id, bytes) => {
   if (operation !== 3 && bytes === 'invalid') throw new TypeError('invalid compiled stylesheet');
@@ -79,4 +79,29 @@ test('CSS imports keep their order on replacement, precede constructed sheets an
   assert.deepEqual(operations().filter(call => call[1] === 1).map(call => call[3]), ['second', 'third']);
   root.destroy();
   assert.equal(operations().filter(call => call[1] === 3).length, 2);
+});
+
+test('style elements apply their text in tree order while in the document', async () => {
+  const root = createBox();
+  root.adoptedStyleSheets = [CSSStyleSheet.fromCompiled('adopted')];
+  mount(root);
+  operations();
+  const first = createElement('style');
+  first.appendChild(createText('.a{}'));
+  const second = createElement('style');
+  second.appendChild(createText('.b{}'));
+  root.appendChild(second);
+  root.insertBefore(first, second);
+  assert.equal(first.sheet, null);
+  await Promise.resolve();
+  const decoded = () => operations().filter(call => call[1] === 1).map(call => call[3] === 'adopted' ? 'adopted' : Buffer.from(call[3], 'base64').toString());
+  assert.deepEqual(decoded(), ['.a{}', '.b{}', 'adopted']);
+  assert.ok(first.sheet instanceof CSSStyleSheet);
+  first.firstChild.data = '.c{}';
+  await Promise.resolve();
+  assert.deepEqual(operations().map(call => [call[1], Buffer.from(call[3], 'base64').toString()]), [[0, '.c{}'], [2, '.c{}']]);
+  second.remove();
+  await Promise.resolve();
+  assert.deepEqual(decoded(), ['.c{}', 'adopted']);
+  assert.equal(second.sheet, null);
 });

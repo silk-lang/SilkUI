@@ -11,8 +11,13 @@
 // A draw that needs more than a color over the bitmap (a gradient or pattern, a clip shaped like
 // its path, a shadow, another composite operation) goes first with an EFFECTS command, and a clip
 // that is not a rectangle goes as a CLIP_MASK command the first time a draw uses it. Not drawn as
+<<<<<<< HEAD
 // in a browser: `filter`, `letterSpacing` and `wordSpacing`, and images other than 2D canvases
 // and `ImageData`.
+=======
+// in a browser: `filter`, `letterSpacing` and `wordSpacing`, and images other than 2D canvases,
+// `ImageData` and `ImageBitmap`.
+>>>>>>> origin/main
 //
 // Edit this, then run `silk task embed-assets` to regenerate generated_canvas2d_api.silk.
 (function (native) {
@@ -1045,8 +1050,18 @@
     if (!det || !Number.isFinite(det)) return null;
     return [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
   }
+<<<<<<< HEAD
   // What drawImage and createPattern take: another 2D canvas, or pixels such as ImageData.
   function imageSource(image) {
+=======
+  // What drawImage and createPattern take: another 2D canvas, or pixels such as ImageData or
+  // an ImageBitmap's (`createImageBitmap` in @silkui/core/globals).
+  function imageSource(image) {
+    if (image && Object.prototype.hasOwnProperty.call(image, "_pixels")) {
+      if (!image._pixels) throw new (globalThis.DOMException ?? Error)("The image bitmap is closed.", "InvalidStateError");
+      return image._pixels.width && image._pixels.height ? image._pixels : null;
+    }
+>>>>>>> origin/main
     const context = image?.getContext?.("2d");
     if (context instanceof CanvasRenderingContext2D) return { context, width: image.width, height: image.height };
     if (image?.data && image.width && image.height) return image;

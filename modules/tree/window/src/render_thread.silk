@@ -25,7 +25,8 @@
 //! Everything a frame carries lives in the process heap, never in a caller's arena: the copies
 //! are made with the system allocator, whatever allocator the caller provides.
 import ui_scene.scene { Scene }
-import ui_scene.scroll { Placements, ScrollGroup, ScrollPosition }
+import ui_scene.scroll { Placements, ScrollGroup, ScrollPosition, UNBOUNDED }
+import ui_tree.node { Move }
 import ui_scene.color as color
 import ui_tree.legacy { Pending }
 import atlas.atlas { Atlas, TextureInfo }
@@ -72,7 +73,7 @@ import silk.concurrency.thread { Transferable }
 import silk.concurrency.thread_native { JoinHandle, NativeThread, SpawnError }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
-import silk.core.ownership { Copy }
+import silk.core.ownership { Copy, Drop }
 import silk.core.result { Result }
 import console { StderrWriter }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -168,11 +169,19 @@ pub struct FastScroll {
   pub scrollers: List<ScrollerAxes>,
   /// Window rectangles, in device pixels, where a wheel listener must see the event first.
   pub blocked: List<Rect<f32>>,
+  /// The `translate` transitions of the frame (`UiTree.moves`), in device pixels: the render
+  /// thread puts each where its transition is at every frame it draws, and draws the frame
+  /// again by itself while one runs and the UI thread hands over no new frame.
+  pub moves: List<Move>,
 }
 
 impl FastScroll {
   pub fn make() -> FastScroll {
-    return FastScroll { scrollers: List<ScrollerAxes>.make(), blocked: List<Rect<f32>>.make() }
+    return FastScroll {
+      scrollers: List<ScrollerAxes>.make(),
+      blocked: List<Rect<f32>>.make(),
+      moves: List<Move>.make(),
+    }
   }
 
   fn axes(self: &Self, node: u32) -> ScrollerAxes {
@@ -759,6 +768,13 @@ impl RenderThread {
   }
 }
 
+// A host that fails before it gives the thread a surface drops it while it waits for one.
+impl Drop for RenderThread {
+  fn drop(self: &mut Self) -> () {
+    self.stop()
+  }
+}
+
 fn readyOrFailed(shared: &Arc<Mutex<State>>) -> bool {
   let guard = shared.get().lock()
   return guard.get().ready || Option<GpuError>.isSome(&guard.get().failure) || guard.get().quit
@@ -1018,7 +1034,7 @@ union Work {
 }
 
 /// Waits for the next work.
-fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresenter, poll: u64) -> Work {
+fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresenter, poll: u64, tick: u64) -> Work {
   while true {
     let taken = takeWork(shared, canvases)
     match move taken {
@@ -1026,6 +1042,14 @@ fn nextWork(shared: &Arc<Mutex<State>>, parker: &Parker, canvases: &CanvasPresen
         return move value
       }
       Option<Work>.None => {
+        if tick != 0 {
+          // A move runs: when the UI thread hands over no frame in time, the last one is
+          // drawn again with the move further along.
+          if !parker.parkTimeout(tick) {
+            return Work.Redraw
+          }
+          continue
+        }
         if poll != 0 {
           // Layers wait for fences or for the window server: look at them alone after `poll`.
           if !parker.parkTimeout(poll) {
@@ -1768,6 +1792,79 @@ effect fn adopt(shared: &Arc<Mutex<State>>, job: &mut FrameJob) -> ()
   }
 }
 
+/// A move of the frame on screen, with the time on the render thread's clock at which its
+/// transition's active phase starts.
+pub struct Motion {
+  pub slide: Move,
+  pub start: f64,
+}
+
+impl Copy for Motion {}
+
+/// How long the render thread waits for the UI thread's next frame of a running move before
+/// it draws alone, and how soon it draws again once it does, in nanoseconds. Presenting then
+/// waits for the display, so the pace only bounds a surface that does not.
+const MOVE_PATIENCE: u64 = 24000000
+const MOVE_PACE: u64 = 4000000
+
+/// Takes the moves of a frame handed over at `now`. A move the last frame already had keeps
+/// its start on this thread's clock.
+pub effect fn adoptMoves(motions: &mut List<Motion>, moves: &[Move], now: f64) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut next = List<Motion>.make()
+  let mut i: usize = 0
+  while i < moves.length {
+    let slide = moves[i]
+    let mut start = now - slide.elapsed
+    let old = motions.asSlice()
+    let mut o: usize = 0
+    while o < old.length {
+      let known = old[o].slide
+      if known.node == slide.node && known.began == slide.began {
+        // The same transition: the time painting took does not shift it, and a frame painted
+        // for a time long past (the UI thread was held) does not send it back.
+        start = old[o].start
+      }
+      o = o + 1
+    }
+    run next.append(Motion { slide: slide, start: start })
+    i = i + 1
+  }
+  motions.* = move next
+}
+
+/// Appends where each move is at `now` to `positions`, the offsets a frame is drawn with.
+/// Returns whether any still runs.
+pub effect fn placeMoves(motions: &List<Motion>, now: f64, positions: &mut List<ScrollPosition>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let list = motions.asSlice()
+  let mut running = false
+  let mut i: usize = 0
+  while i < list.length {
+    let slide = list[i].slide
+    let seconds = now - list[i].start
+    let eased = slide.eased(seconds)
+    run positions.append(
+      ScrollPosition {
+        node: slide.node,
+        x: slide.fromX + (slide.toX - slide.fromX) * eased,
+        y: slide.fromY + (slide.toY - slide.fromY) * eased,
+        minX: -UNBOUNDED,
+        maxX: UNBOUNDED,
+        minY: -UNBOUNDED,
+        maxY: UNBOUNDED,
+      },
+    )
+    if !slide.over(seconds) {
+      running = true
+    }
+    i = i + 1
+  }
+  return running
+}
+
 /// The compositor's offsets, to draw with.
 effect fn newerScrolls(shared: &Arc<Mutex<State>>, out: &mut List<ScrollPosition>) -> ()
   ! OutOfMemoryError
@@ -2029,8 +2126,12 @@ effect fn renderLoop(
   let mut layerPoll: u64 = 0
   // Frames of canvases drawn into the window since the last present, shown by the next one.
   let mut windowShown: u64 = 0
+  // The moves of the frame on screen, each with the time on this thread's clock its
+  // transition started at, and how long to wait for the UI thread before drawing alone.
+  let mut motions = List<Motion>.make()
+  let mut tick: u64 = 0
   while true {
-    let work = nextWork(shared, parker, canvases, layerPoll)
+    let work = nextWork(shared, parker, canvases, layerPoll, tick)
     let polling = match &work {
       Work.Poll => true
       _ => false
@@ -2084,6 +2185,8 @@ effect fn renderLoop(
         // The mailbox is free again: the UI thread may be waiting to fill it.
         wakeUi.unpark()
         let mut next = move job
+        let adopted = run seconds(&mut clock)
+        run adoptMoves(&mut motions, next.fast.moves.asSlice(), adopted)
         run adopt(shared, &mut next)
         // With layers off (and none left) nothing is planned: frames are as without layers.
         if layered.length() != 0 || canvasTextures.length() != 0 && layersAllowedOf(shared) {
@@ -2140,6 +2243,10 @@ effect fn renderLoop(
     let texture = run gpuSurface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run seconds(&mut clock)
+    let running = run placeMoves(&motions, acquired, &mut newer)
+    // The UI thread gets a frame and a half to hand over the next frame of a running move;
+    // once this thread draws alone it keeps the pace until a frame comes.
+    tick = if !running { 0 } else if fresh { MOVE_PATIENCE } else { MOVE_PACE }
     run renderer.setScrolls(newer.asSlice())
     if held && !fresh {
       renderer.reuseInstances()
