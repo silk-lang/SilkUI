@@ -275,6 +275,19 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 traced.append((round((now - t0) * 1000, 2), stream, line))
             at = line.find("XB ")
             if at < 0:
+                # Silk UI with SILK_UI_TRACE_CANVAS: the running total of canvas frames the renderer
+                # showed (in the window or in a layer), so a driver can count frames shown, not only
+                # frames its rAF loop presented.
+                shown = re.search(r"silk-ui: canvas shown (\d+)", line)
+                if shown:
+                    state["shown"] = int(shown.group(1))
+                    continue
+                # Silk UI with SILK_UI_TRACE_PRESENTS: the running total of frames the window showed.
+                # Uncapped, an app's frame callbacks can outrun what reaches the screen.
+                window = re.search(r"silk-ui: frames shown (\d+)", line)
+                if window:
+                    state["window_shown"] = int(window.group(1))
+                    continue
                 bench = re.search(r"bench: first frame start-to-layout-ms=([\d.e-]+) layout-ms=([\d.e-]+) paint-ms=([\d.e-]+) nodes=(\d+) fragments=(\d+)", line)
                 if bench:
                     record["silk_first_frame"] = {"start_to_layout_ms": float(bench.group(1)), "layout_ms": float(bench.group(2)),
@@ -301,7 +314,7 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                 finally:
                     signal_tree(pids, signal.SIGCONT)
             elif ev == "begin":
-                state["begin"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)))
+                state["begin"][words[1]] = (now, cpu_seconds(app_pids(proc.pid, launch)), state.get("shown"), state.get("window_shown"))
             elif ev == "end":
                 name, frames = words[1], int(words[2])
                 b = state["begin"].pop(name, None)
@@ -312,6 +325,17 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
                         "frames": frames, "wall_ms": wall, "cpu_ms": cpu,
                         "frame_ms": wall / max(frames, 1), "cpu_ms_per_frame": cpu / max(frames, 1),
                     })
+                    if b[2] is not None or state.get("shown") is not None:
+                        # Lines on stderr and stdout arrive on two pipes: a few frames either way.
+                        shown_frames = (state.get("shown") or 0) - (b[2] or 0)
+                        record["drivers"][name]["canvas_shown"] = shown_frames
+                        record["drivers"][name]["canvas_shown_per_s"] = shown_frames * 1000 / wall if wall > 0 else None
+                    if state.get("window_shown") is not None:
+                        # The trace says at most a line a display frame: a few frames either way.
+                        window_frames = state["window_shown"] - (b[3] or 0)
+                        record["drivers"][name]["shown"] = window_frames
+                        record["drivers"][name]["shown_per_s"] = window_frames * 1000 / wall if wall > 0 else None
+                        record["drivers"][name]["cpu_ms_per_shown"] = cpu / window_frames if window_frames > 0 else None
             elif ev == "frames":
                 if not launch.fake_clock and len(words) > 2 and words[2]:
                     gaps = [float(x) for x in words[2].split(",") if x]
@@ -360,6 +384,9 @@ def run_once(app, scene, suite, uncapped, kind, timeout, start_only, extra_files
     except OSError:
         pass
     proc.wait()
+    paths = [l.split("silk-ui: ", 1)[1] for l in lines if "silk-ui: canvas frames" in l]
+    if paths:
+        record["canvas_path"] = paths
     errors = [l for l in lines if "XB " not in l and re.search(r"error|panic|failed|exception", l, re.I) and "dbus" not in l]
     if errors:
         record["notes"] += errors[:5]
@@ -475,6 +502,16 @@ def main():
         for _ in range(a.prime):
             run_once(app, scenes[0], a.suite, a.uncapped or a.suite == "cpu", "warm", a.timeout, True, set())
     for scene in scenes:
+        if scene.split("-")[0] == "canvas":
+            # The canvas scene draws with WebGPU: a GPU and one of the two apps that have it.
+            unfit = [x for x in apps if x not in ("electron", "silk-react")]
+            if a.suite != "gpu" or unfit:
+                raise SystemExit("the canvas scene runs in the gpu suite, with electron and silk-react only")
+        if scene.split("-")[0] == "chat":
+            # The chat scene exists for the two React apps only (LOG.md).
+            unfit = [x for x in apps if x not in ("electron", "silk-react")]
+            if unfit:
+                raise SystemExit("the chat scene runs with electron and silk-react only")
         for r in range(a.runs):
             # Interleaved: every app once per round, so drift (thermal, other load) hits all alike.
             order = apps if r % 2 == 0 else apps[::-1]

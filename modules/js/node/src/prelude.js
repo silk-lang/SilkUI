@@ -31,20 +31,58 @@
     if (failure) throw failure.error;
   };
 
-  // Media queries answer for the window's last frame, as in the engine runtime.
+  // The window's pixels per CSS pixel in its last frame, as in the engine runtime.
+  if (native.scale && !("devicePixelRatio" in globalThis)) {
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      get: () => native.scale(),
+      set: (value) => Object.defineProperty(globalThis, "devicePixelRatio", { value, writable: true, configurable: true }),
+      configurable: true,
+    });
+  }
+
+  // Media queries answer for the window's last frame, as in the engine runtime. The host
+  // calls `native.media` when the media changes; lists with listeners send `change` then.
   if (native.matchMedia && globalThis.matchMedia === undefined) {
-    globalThis.matchMedia = (query) => {
-      const media = String(query);
-      return {
-        media,
-        get matches() { return native.matchMedia(media); },
-        onchange: null,
-        addEventListener() {},
-        removeEventListener() {},
-        addListener() {},
-        removeListener() {},
-        dispatchEvent() { return true; },
-      };
+    const watched = new Set();
+    class MediaQueryList extends EventTarget {
+      #media;
+      #last;
+      constructor(media) {
+        super();
+        this.#media = media;
+        this.#last = native.matchMedia(media);
+        this.onchange = null;
+      }
+      get media() { return this.#media; }
+      get matches() { return native.matchMedia(this.#media); }
+      addEventListener(type, listener, options) {
+        if (type === "change") {
+          this.#last = this.matches;
+          watched.add(this);
+        }
+        super.addEventListener(type, listener, options);
+      }
+      addListener(listener) { this.addEventListener("change", listener); }
+      removeListener(listener) { this.removeEventListener("change", listener); }
+      set onchange(handler) {
+        this._onchange = handler;
+        if (handler) watched.add(this);
+      }
+      get onchange() { return this._onchange ?? null; }
+      _changed() {
+        const matches = this.matches;
+        if (matches === this.#last) return;
+        this.#last = matches;
+        const event = new Event("change");
+        Object.defineProperties(event, { matches: { value: matches }, media: { value: this.#media } });
+        if (typeof this._onchange === "function") this._onchange.call(this, event);
+        this.dispatchEvent(event);
+      }
+    }
+    globalThis.MediaQueryList ??= MediaQueryList;
+    globalThis.matchMedia = (query) => new MediaQueryList(String(query));
+    native.media = () => {
+      for (const list of [...watched]) list._changed();
     };
   }
 

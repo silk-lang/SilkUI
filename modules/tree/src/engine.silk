@@ -53,6 +53,7 @@ import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
+  NO_SURFACE,
   FIRST_ROOT,
   FACE_ITALIC,
   FACE_OBLIQUE,
@@ -79,7 +80,7 @@ import css
 import properties.declare
 import properties.values
 import properties.convert
-import input { Input }
+import input { Input, REQUEST_ANYWHERE }
 import interact
 import touch
 import touch { TouchState }
@@ -101,6 +102,8 @@ import font_units
 import font_units { Source as FontSource }
 import motion
 import motion { Running }
+import filter_motion
+import filter_motion { FilterList }
 import animation
 import animation { Rule, Playing, KeptSamples }
 import timing
@@ -140,6 +143,8 @@ import live_svg
 import live_svg { LiveSvg }
 import thin { Thin }
 import node {
+  Move,
+  CanvasSurface,
   NodeRare,
   NONE,
   WATCH_OUTSIDE,
@@ -157,7 +162,7 @@ import node {
 }
 import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
 import stacking { Stacking }
-import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels }
+import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels, IconVariables }
 import svg_css.effect_values { Image }
 import repair { Repair, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
 import provider { Provider }
@@ -172,6 +177,7 @@ import font_raster.cache { GlyphCache }
 import font_raster.face { FontFace }
 import atlas.atlas { Atlas, AtlasOptions, AtlasTile }
 import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollPosition }
 import ui_scene.primitives { ContentMask, Quad, GlyphSprite, ImageSprite, Shadow, PathSprite, Underline, LayerSprite }
 import ui_scene.path_cache { PathCache }
 import layout_table { LayoutTable, LayoutView }
@@ -208,6 +214,7 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
+import canvas2d { Canvas2d, Measured as TextMeasured }
 
 /// An open root other than the current one: its share of the tree's state, kept while the
 /// current root is laid out, painted and given input. [`UiTree.useRoot`] swaps it in. The
@@ -269,6 +276,8 @@ pub struct RootState {
   suppressText: bool,
   pendingTarget: u32,
   pendingTargetId: u32,
+  pressed: u32,
+  pressedId: u32,
   pressCount: u32,
   thumbSlot: u32,
   thumbVertical: bool,
@@ -329,6 +338,8 @@ impl RootState {
       suppressText: false,
       pendingTarget: NONE,
       pendingTargetId: NONE,
+      pressed: NONE,
+      pressedId: NONE,
       pressCount: 0,
       thumbSlot: NONE,
       thumbVertical: true,
@@ -353,6 +364,7 @@ fn keyboardInput(input: &Input) -> bool {
     Input.Paste { .. } => true
     Input.Command { .. } => true
     Input.Edit { .. } => true
+    Input.Request { target, .. } => target == REQUEST_ANYWHERE
     _ => false
   }
 }
@@ -383,6 +395,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetGrid { id, .. } => id
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
+    Mutation.SetCanvasSurface { id, .. } => id
     Mutation.SvgInsert { id, .. } => id
     Mutation.SvgRemove { id, .. } => id
     Mutation.SvgAttribute { id, .. } => id
@@ -867,6 +880,8 @@ pub struct UiTree<'a> {
   faceSources: List<FaceSource>,
   nextHostFace: u32,
   pub faces: List<FaceSlot<'a>>,
+  /// The bitmaps of the canvas nodes JavaScript draws with Canvas 2D.
+  pub canvas2d: Canvas2d<'a>,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
   pub paths: PathCache,
@@ -938,8 +953,27 @@ pub struct UiTree<'a> {
   /// Whether Ctrl (Cmd on macOS) with `=`, `-` and `0` changes the page zoom. Hosts whose
   /// platform zooms on its own, a browser, leave it off.
   pub zoomKeys: bool,
+  /// Whether a mutation naming a node that no longer exists is skipped, and counted in
+  /// `staleSkipped`, instead of failing its batch: a script host whose page outlives one bad
+  /// mutation turns it on.
+  pub skipsStale: bool,
+  pub staleSkipped: u64,
   /// The frame the current root last painted at: its subtrees cached then can be replayed.
   paintedAt: u64,
+  /// The viewport and the layout and scroll revisions of the current root's last paint: a
+  /// frame where none of them changed and nothing else asked for paint keeps that scene
+  /// (see `quietFrame`). A width of -1 means no paint is known, as after a root switch.
+  quietInput: FrameInput,
+  quietRevision: usize,
+  quietScrolls: usize,
+  /// Frames whose paint was skipped because nothing changed since the last paint.
+  pub paintsKept: u64,
+  /// Of those, the frames that only scrolled: the scene was kept and its scroll positions
+  /// moved (see `scrollsWithinLead`). A host draws such a frame by scrolling the last one.
+  pub scrollsKept: u64,
+  /// The scroll positions the last paint recorded, in device pixels: what its culling was
+  /// centered on. The scene's own positions move with the frames that keep it.
+  paintedScrolls: List<ScrollPosition>,
   pub stats: FrameStats,
   pub events: List<Event>,
   /// The node ids in the order the last frame painted them (replayed subtrees included).
@@ -983,6 +1017,11 @@ pub struct UiTree<'a> {
   /// The layout revision, scroll revision and viewport height `content-visibility: auto`
   /// elements were last reviewed at (see `reviewSkipped`).
   skipReview: [usize; 3],
+  /// How far, in CSS pixels, scroll offsets may move after that review before any
+  /// `content-visibility: auto` element could wake or be skipped, and how far they have moved
+  /// since (see `reviewSkipped`).
+  skipSlack: f32,
+  pub skipTravel: f32,
   /// The css nodes `wakeFor` woke this frame: they stay awake until the next one.
   heldAwake: List<u32>,
   /// Next fragment with the same CSS source, in arena order.
@@ -1010,6 +1049,10 @@ pub struct UiTree<'a> {
   /// applies the default action to that node even when handlers changed the tree between.
   pub pendingTarget: u32,
   pub pendingTargetId: u32,
+  /// The node of the last pointer down, as a (slot, id) pair: where a request (close, back)
+  /// starts when nothing has focus.
+  pub pressed: u32,
+  pub pressedId: u32,
   /// The click count of the press, for its click record.
   pub pressCount: u32,
   /// A scrollbar thumb being dragged: the container slot (NONE when none), the axis, and the
@@ -1078,6 +1121,13 @@ pub struct UiTree<'a> {
   overrides: List<StyleOverride>,
   /// The running CSS transitions of every root (see `motion`).
   pub transitions: List<Running>,
+  /// Whether `translate` transitions are handed to the renderer as [`Move`]s. A host turns
+  /// it on when its renderer draws frames by itself (`motion.slides`).
+  pub compositedMoves: bool,
+  /// The moves of the frame painted last.
+  pub moves: List<Move>,
+  /// What `moves` named, to see when the set changes.
+  pub movesKey: u64,
   /// The points of the `linear()` easings styles have used.
   pub easingStops: EasingStops,
   /// The `@keyframes` rules the client defined (see `animation`).
@@ -1467,6 +1517,7 @@ impl<'a> UiTree<'a> {
       faceSources: List<FaceSource>.make(),
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
+      canvas2d: Canvas2d<'a>.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
       paths: PathCache.make(),
@@ -1507,7 +1558,15 @@ impl<'a> UiTree<'a> {
       unitsHeight: 0.0,
       pageZoomFactor: 1.0,
       zoomKeys: false,
+      skipsStale: false,
+      staleSkipped: 0,
       paintedAt: 0,
+      quietInput: FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 },
+      quietRevision: usize.MAX,
+      quietScrolls: usize.MAX,
+      paintsKept: 0,
+      scrollsKept: 0,
+      paintedScrolls: List<ScrollPosition>.make(),
       stats: FrameStats.zero(),
       events: List<Event>.make(),
       paintOrder: List<u32>.make(),
@@ -1528,6 +1587,8 @@ impl<'a> UiTree<'a> {
       uploads: Pending.make(),
       fragmentOf: List<usize>.make(),
       skipReview: [usize.MAX; 3],
+      skipSlack: 0.0,
+      skipTravel: 0.0,
       heldAwake: List<u32>.make(),
       nextSourceFragment: List<usize>.make(),
       paintIndexOf: List<u32>.make(),
@@ -1542,6 +1603,8 @@ impl<'a> UiTree<'a> {
       suppressText: false,
       pendingTarget: NONE,
       pendingTargetId: NONE,
+      pressed: NONE,
+      pressedId: NONE,
       pressCount: 0,
       thumbSlot: NONE,
       thumbVertical: true,
@@ -1578,6 +1641,9 @@ impl<'a> UiTree<'a> {
       empty: Scene.make(),
       overrides: List<StyleOverride>.make(),
       transitions: List<Running>.make(),
+      compositedMoves: false,
+      moves: List<Move>.make(),
+      movesKey: 0,
       easingStops: EasingStops.make(),
       keyframes: List<Rule>.make(),
       animations: List<Playing>.make(),
@@ -2253,7 +2319,21 @@ impl<'a> UiTree<'a> {
     let mut index: usize = 0
     while index < entries.length {
       let value = Intrinsic.replace(entries[index], Mutation.Blur)
-      run self.applyOne(index, move value)
+      if self.skipsStale {
+        let applied = run Effect.result(self.applyOne(index, move value))
+        match move applied {
+          Result<(), TreeError | OutOfMemoryError>.Success { .. } => ()
+          Result<(), TreeError | OutOfMemoryError>.Failure { error } => match move error {
+            OutOfMemoryError failure => { fail move failure }
+            TreeError failure => match failure {
+              TreeError.UnknownNode { .. } => { self.staleSkipped = self.staleSkipped + 1 }
+              _ => { fail failure }
+            }
+          }
+        }
+      } else {
+        run self.applyOne(index, move value)
+      }
       index = index + 1
     }
   }
@@ -2928,6 +3008,23 @@ impl<'a> UiTree<'a> {
         }
         node.content = node.content + 1
       }
+      Mutation.SetCanvasSurface { id, surface, width, height, opaque } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        let node = self.nodeMut(slot)
+        if surface != NO_SURFACE || node.extras.isSome() {
+          let extras = run node.extrasMut()
+          extras.surface = if surface == NO_SURFACE {
+            CanvasSurface.none()
+          } else {
+            CanvasSurface { id: surface, width: width, height: height, opaque: opaque }
+          }
+        }
+        node.content = node.content + 1
+        run self.updateNatural(slot)
+      }
       Mutation.SvgInsert { id, element, tag, parent, before } => {
         let slot = run self.requireSvg(index, id)
         let at = match before {
@@ -3210,6 +3307,7 @@ impl<'a> UiTree<'a> {
       gridDeclared: false,
       gridStyled: false,
       styleNeedsContext: false,
+      sliding: false,
       containerWatch: NONE,
       styleChange: NONE,
       generatedSuppressed: false,
@@ -3669,6 +3767,93 @@ impl<'a> UiTree<'a> {
     return self.root != NONE && self.topOf(slot) == self.root
   }
 
+  /// The computed value of custom property `name` (`--gap`) on the node at `slot`, as
+  /// `getComputedStyle` reads it: the tokens of the declaration that won, inherited ones too,
+  /// with their own `var()`s substituted. False when the node has none.
+  pub effect fn customProperty(self: &Self, slot: u32, name: &[u8], out: &mut Bytes) -> bool
+    ! OutOfMemoryError ? &mut Allocator {
+    let resolved = match self.node(slot).sheetStyle() {
+      Option<&Resolved>.Some { value } => value
+      Option<&Resolved>.None => { return false }
+    }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.rootOfTop(self.topOf(slot)))
+    if at == usize.MAX { return false }
+    let inputs = self.styleSheets.asSlice()[at].sheets.variableInputs()
+    if inputs.length == 0 { return false }
+    let mut reference = Bytes.make()
+    run reference.append(b"var(")
+    run reference.append(name)
+    run reference.append(b")")
+    let expanded = run Effect.result(style_sheets.substituteText(&inputs[0], resolved.scope, reference.asSlice()))
+    return match move expanded {
+      Result.Success { value: Option<Bytes>.Some { value } } => {
+        run out.append(value.asSlice())
+        true
+      }
+      Result.Success { value: _ } => false
+      Result.Failure { error } => match move error {
+        OutOfMemoryError allocation => { fail move allocation }
+        _ => false
+      }
+    }
+  }
+
+  // The custom properties each inline svg's markup reads, resolved for its node, for paint
+  // (`Resources.iconVariables`): an icon's resource has no cascade of its own. Their key is
+  // folded into the node's paint hash, so a change repaints it.
+  effect fn collectIconVariables(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    if self.resources.variables.length() == 0 && !self.resources.readsVariables() { return () }
+    let old = Intrinsic.replace(self.resources.variables, List<IconVariables>.make())
+    let mut found = List<IconVariables>.make()
+    let count = self.nodes.length()
+    let mut slot: usize = 0
+    while slot < count {
+      if self.nodes.asSlice()[slot].kind == NodeKind.Icon {
+        let names = self.resources.markupVariables(self.nodes.asSlice()[slot].resource)
+        let mut css = List<u8>.make()
+        let mut i: usize = 0
+        while i < names.length {
+          let mut value = Bytes.make()
+          if run self.customProperty(usize.toU32(slot), names[i].asSlice(), &mut value) {
+            run css.appendSlice(names[i].asSlice())
+            run css.append(58)
+            run css.appendSlice(value.asSlice())
+            run css.append(59)
+          }
+          i = i + 1
+        }
+        let mut key: u64 = 0
+        let bytes = css.asSlice()
+        i = 0
+        while i < bytes.length {
+          key = Hash.combine(key, u8.toU64(bytes[i]))
+          i = i + 1
+        }
+        let current = self.nodes.asSlice()[slot].paintHash
+        // A restyle since the last frame wrote a fresh hash; otherwise it still holds the old key.
+        let mut base = current
+        let mut j: usize = 0
+        while j < old.length() {
+          let entry = &old.asSlice()[j]
+          if entry.slot == usize.toU32(slot) && entry.mixed == current { base = entry.base }
+          j = j + 1
+        }
+        let mixed = if bytes.length == 0 { base } else { Hash.combine(base, key) }
+        if mixed != current {
+          let target = self.nodeMut(usize.toU32(slot))
+          target.paintHash = mixed
+          run self.repair.nodes.append(usize.toU32(slot))
+          self.repair.pending = true
+        }
+        if bytes.length != 0 {
+          run found.append(IconVariables { slot: usize.toU32(slot), key: key, css: move css, base: base, mixed: mixed })
+        }
+      }
+      slot = slot + 1
+    }
+    self.resources.variables = move found
+  }
+
   /// The id of the open root whose node is `top`, or NONE.
   fn rootOfTop(self: &Self, top: u32) -> u32 {
     if top == self.root && self.currentOpen {
@@ -3867,6 +4052,8 @@ impl<'a> UiTree<'a> {
       suppressText: Intrinsic.replace(self.suppressText, false),
       pendingTarget: Intrinsic.replace(self.pendingTarget, NONE),
       pendingTargetId: Intrinsic.replace(self.pendingTargetId, NONE),
+      pressed: Intrinsic.replace(self.pressed, NONE),
+      pressedId: Intrinsic.replace(self.pressedId, NONE),
       pressCount: Intrinsic.replace(self.pressCount, 0),
       thumbSlot: Intrinsic.replace(self.thumbSlot, NONE),
       thumbVertical: Intrinsic.replace(self.thumbVertical, true),
@@ -3904,6 +4091,8 @@ impl<'a> UiTree<'a> {
     self.layoutObserversDirty = s.layoutObserversDirty
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
+    // Another root's paint is not this one's: the next frame paints.
+    self.quietInput = FrameInput { width: -1.0, height: -1.0, scale: 0.0, time: 0.0 }
     self.output = Intrinsic.replace(s.output, LayoutTree.make())
     self.containerWatches = Intrinsic.replace(s.containerWatches, List<Watch>.make())
     self.sceneA = Intrinsic.replace(s.sceneA, Scene.make())
@@ -3928,6 +4117,8 @@ impl<'a> UiTree<'a> {
     self.suppressText = s.suppressText
     self.pendingTarget = s.pendingTarget
     self.pendingTargetId = s.pendingTargetId
+    self.pressed = s.pressed
+    self.pressedId = s.pressedId
     self.pressCount = s.pressCount
     self.thumbSlot = s.thumbSlot
     self.thumbVertical = s.thumbVertical
@@ -4703,7 +4894,12 @@ impl<'a> UiTree<'a> {
   pub effect fn imeArea(self: &Self) -> ImeArea
     ! OutOfMemoryError
     ? &mut Allocator {
-    return run edit.imeArea(self)
+    let area = run edit.imeArea(self)
+    if area.enabled || text_selection.focusedHost(self) == NONE { return area }
+    // A focused editing host takes text too; the candidate window goes by its caret.
+    let mut rect = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+    drop run text_selection.caretRect(self, &mut rect)
+    return ImeArea { enabled: true, rect: rect }
   }
 
   /// The time the focused caret blinks next, or -1 when no caret shows. Hosts that draw only
@@ -4897,8 +5093,20 @@ impl<'a> UiTree<'a> {
     let fontSize = self.node(slot).computed().text.size
     // Natural sizes scale with `zoom`, as replaced elements do in browsers.
     let zoom = self.node(slot).computed().text.zoom
-    let css = self.node(slot).css
     let mut natural = NaturalDimensions.none()
+    if kind == NodeKind.Canvas {
+      // A canvas showing a GPU surface is a replaced element of the surface's size, as a
+      // `<canvas>` is. One drawn with commands has no natural size.
+      let surface = self.node(slot).surface()
+      if surface.isSome() {
+        natural.size = OptionalSize.definite(u32.toF32(surface.width) * zoom, u32.toF32(surface.height) * zoom)
+        if surface.height != 0 {
+          natural.aspectRatio = u32.toF32(surface.width) / u32.toF32(surface.height)
+        }
+      }
+      run self.setNatural(slot, natural)
+      return ()
+    }
     if kind != NodeKind.Image && kind != NodeKind.Icon {
       return ()
     }
@@ -4936,6 +5144,14 @@ impl<'a> UiTree<'a> {
       natural.size = OptionalSize.definite(fontSize, fontSize)
       natural.aspectRatio = 1.0
     }
+    run self.setNatural(slot, natural)
+  }
+
+  /// Gives the layout the natural size of `slot` when it changed.
+  effect fn setNatural(self: &mut Self, slot: u32, natural: NaturalDimensions) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let css = self.node(slot).css
     let key = u32.toUsize(slot)
     let changed = key >= self.provider.naturals.length()
       || !sameNatural(self.provider.naturals.get(key), natural)
@@ -6699,6 +6915,7 @@ impl<'a> UiTree<'a> {
       computed.paint.pointerEvents = self.node(parent).computed().paint.pointerEvents
       computed.scroll.colors = self.node(parent).computed().scroll.colors
       computed.nearest = self.node(parent).computed().nearest
+      computed.svg = self.node(parent).computed().svg
     }
     computed.layout.display = defaultDisplay(if initialNode.isGenerated() { NodeKind.Text } else { initialNode.kind })
     if initialNode.kind == NodeKind.Input {
@@ -6766,9 +6983,13 @@ impl<'a> UiTree<'a> {
     let rendered = parentRendered && !computed.layout.display.isNone()
     let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).hasTransition()
       || self.node(slot).starting().length != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+    // What `filter`, which lives in the paint effects, eases with (see `moveFilters`).
+    let mut filterBefore = false
+    let mut motionAnimated: u64 = 0
     if needsMotion {
       let mut before = style_change.before(&self, slot)
       let mut hasBefore = style_change.rendered(&self, slot) && parentRendered
+      filterBefore = hasBefore
       let sheetStarting = match self.node(slot).sheetStyle() { Option.Some { value } => value.starting.isSome() _ => false }
       if !hasBefore && rendered && (sheetStarting || self.node(slot).starting().length != 0) {
         before = computed
@@ -6789,6 +7010,7 @@ impl<'a> UiTree<'a> {
       self.easingStops = move stops
       let underlyingFontSize = computed.text.size
       let animated = run animation.update(&mut self, slot, rendered, &computed)
+      motionAnimated = animated
       if self.node(slot).generatedSuppressed { run motion.cancelAll(&mut self, slot) }
       else { run motion.transition(&mut self, slot, &before, hasBefore, &mut computed, animated) }
       if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FONT_SIZE))) != 0 {
@@ -6868,7 +7090,7 @@ impl<'a> UiTree<'a> {
       computed.effects.shadowHash = above.shadowHash
     }
     let fontKey = if simpleStyles && kind == NodeKind.Text && parent != NONE { self.node(parent).fontKey } else { run self.fontKeyOf(computed.text) }
-    run self.resolveEffects(slot, &mut computed, fontKey)
+    run self.resolveEffects(slot, &mut computed, fontKey, needsMotion, filterBefore, motionAnimated)
     computed.finish(fontKey)
     let paintHash = computed.paintHash(&self.seed)
     let stamp = if lender == NONE { self.computedStamps + 1 } else { self.node(lender).computedStamp }
@@ -6918,15 +7140,26 @@ impl<'a> UiTree<'a> {
 
   /// Reads the effect properties of node `slot`'s active looks into its `Effects`, after the
   /// rest of its style is in `computed`, so `em` and `currentColor` see its font and color.
-  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize) -> ()
+  /// With `moving` (the node's style went through `motion`), its `filter` also eases: see
+  /// [`moveFilters`] for `hasBefore` and `animated`.
+  effect fn resolveEffects(self: &mut Self, slot: u32, computed: &mut Computed, fontKey: usize, moving: bool, hasBefore: bool, animated: u64) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let moves = moving && motion.filterMoves(&self, slot, &computed.transition, animated)
     if !computed.effects.declared {
-      if self.node(slot).effects.isSome() {
-        let target = self.nodeMut(slot)
-        target.effects.clear()
+      // A filter that eases away (or an animation's filter) still needs effects to paint.
+      let showing = match self.node(slot).paintEffects() {
+        Option.Some { value } => value.filters.length() != 0
+        _ => false
       }
-      return ()
+      let animatesFilter = u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FILTER))) != 0
+      if !moves || !(showing || animatesFilter) {
+        if self.node(slot).effects.isSome() {
+          let target = self.nodeMut(slot)
+          target.effects.clear()
+        }
+        return ()
+      }
     }
     let basis = font_units.paintBasis(&self, slot, &computed.*, fontKey)
     let mut effects = Effects.make()
@@ -6957,6 +7190,15 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+    if moves { run self.moveFilters(slot, &mut effects, &computed.*, basis, hasBefore, animated) }
+    if !computed.effects.declared && effects.filters.length() == 0 {
+      // Eased all the way to `none`, with nothing else declared.
+      if self.node(slot).effects.isSome() {
+        let target = self.nodeMut(slot)
+        target.effects.clear()
+      }
+      return ()
+    }
     computed.effects.hash = effects.hash
     computed.effects.layered = effects.layered()
     computed.effects.stacks = effects.stacks
@@ -6972,6 +7214,33 @@ impl<'a> UiTree<'a> {
     let boxed = run Thin<Effects>.make(move effects)
     let target = self.nodeMut(slot)
     target.effects.set(move boxed)
+  }
+
+  /// Eases the `filter` of `effects`, the paint effects node `slot`'s new style `computed`
+  /// computes: a `filter` transition from the list the node showed (when `hasBefore`, it had a
+  /// before-change style), then the animations that set it (bits of `animated`) over that.
+  effect fn moveFilters(self: &mut Self, slot: u32, effects: &mut Effects, computed: &Computed, basis: paint_css.Basis, hasBefore: bool, animated: u64) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let after = match filter_motion.of(&effects.*) {
+      Option.Some { value } => value
+      // Too long to ease: it shows as computed.
+      _ => { return () }
+    }
+    let showed = filter_motion.ofNode(self.node(slot).paintEffects())
+    let before = match showed { Option.Some { value } => value _ => FilterList.none() }
+    let mut shown = after
+    let mut moved = false
+    if let Option.Some { value } = run motion.transitionFilter(&mut self, slot, computed, before, hasBefore && showed.isSome(), after, animated) {
+      shown = value
+      moved = true
+    }
+    if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FILTER))) != 0 {
+      if let Option.Some { value } = run animation.applyFilters(&self, slot, shown, basis) {
+        shown = value
+        moved = true
+      }
+    }
+    if moved { run filter_motion.write(&shown, &mut effects.*) }
   }
 
   effect fn applyEffects(self: &Self, effects: &mut Effects, declarations: &[Declaration], parent: u32, basis: paint_css.Basis) -> ()
@@ -7258,10 +7527,60 @@ impl<'a> UiTree<'a> {
     return &self.sceneA
   }
 
+  /// Whether a frame at `input` can keep the last scene: the tree asks for no frame of its
+  /// own (no mutation, style, layout, scroll, animation or paint change since it was painted:
+  /// `needsFrame`), the viewport is the one painted, and nothing paints differently with time
+  /// alone (a blinking caret, an animated icon, a font block period ending) or waits to be
+  /// picked up at paint (faces to load, a selection to rebuild). A frame asked for only by the
+  /// host or the client (`requestAnimationFrame`, a canvas present) then skips its paint.
+  fn quietFrame(self: &Self, input: FrameInput) -> bool {
+    return !self.needsFrame() && self.paintsAlike(input) && text_selection.settled(self)
+  }
+
+  /// [`quietFrame`] for a frame that only scrolled: scroll containers moved, by a `ScrollTo`,
+  /// a wheel or a scroll animation, and nothing else asks for a frame. Scrolling changes no
+  /// primitive of the scene, only where its scroll groups are drawn, so such a frame keeps
+  /// the scene while what it shows was painted (`scrollsWithinLead`). A scroll mutation moves
+  /// the tree's revision, so the selection is checked again in the frame, not here.
+  fn scrolledFrame(self: &Self, input: FrameInput) -> bool {
+    return (self.scrolled || cssom_view.scrollAnimating(self)) && !self.changesBesidesScroll()
+      && self.paintsAlike(input)
+  }
+
+  /// `needsFrame` without the reasons that are a scroll: an offset that moved, and a scroll
+  /// animation that moves one every frame.
+  fn changesBesidesScroll(self: &Self) -> bool {
+    return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty
+      || self.textSelection.scrolling
+      || scroll_snap.waiting(self)
+      || touch.animating(self)
+      || motion.animating(self)
+      || animation.animating(self)
+      || self.layout.revision() != self.laidOutRevision
+      || self.layout.scrollRevision() != self.laidOutScrolls
+      || self.reveal.length() != 0
+      || !self.replayable
+  }
+
+  /// Whether a paint at `input` now would draw what the last one drew, were nothing in the
+  /// tree to change: the second half of [`quietFrame`].
+  fn paintsAlike(self: &Self, input: FrameInput) -> bool {
+    return self.paintedAt != 0
+      && input.width == self.quietInput.width && input.height == self.quietInput.height
+      && input.scale == self.quietInput.scale
+      && !self.facesDirty && !self.paintCachesStale && !self.paintDirty
+      && self.fontBlockEnd < 0.0
+      && edit.nextBlink(self) < 0.0
+      && !self.resources.icons.anyAnimated()
+  }
+
   /// Applies styles, lays out what changed and paints the frame.
   pub effect fn frame(self: &mut Self, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    // Asked before the frame clears its flags: whether nothing changed since the last paint.
+    let quiet = self.quietFrame(input)
+    let scrolledOnly = self.scrolledFrame(input)
     self.frameNumber = self.frameNumber + 1
     self.heldAwake.clear()
     run self.trimNodes()
@@ -7326,7 +7645,36 @@ impl<'a> UiTree<'a> {
     }
     edit.beginPaint(&mut self)
     self.scrollsStill = !self.scrolled
-    run self.paintFrame()
+    if scrolledOnly {
+      // What paint does first: a selection that changed asks for paint (`paintDirty`).
+      run text_selection.refresh(&mut self)
+    }
+    if quiet && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty && !self.scrolled
+      && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls {
+      // Nothing this frame did changed what paints either: the last scene is this frame's.
+      self.paintsKept = self.paintsKept + 1
+      self.stats.primitives = self.scene().primitiveCount()
+    } else if (scrolledOnly || quiet) && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty
+      && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls
+      && self.scrollsWithinLead() {
+      // The frame scrolled and changed nothing else, and the last paint reached everything
+      // the new offsets show: the last scene is this frame's, at the new offsets.
+      run self.moveSceneScrolls()
+      self.paintsKept = self.paintsKept + 1
+      self.scrollsKept = self.scrollsKept + 1
+      self.stats.primitives = self.scene().primitiveCount()
+    } else {
+      run self.paintFrame()
+      self.paintedScrolls.clear()
+      if self.flipped {
+        run self.paintedScrolls.appendSlice(self.sceneB.scrolls())
+      } else {
+        run self.paintedScrolls.appendSlice(self.sceneA.scrolls())
+      }
+      self.quietInput = self.input
+      self.quietRevision = self.layout.revision()
+      self.quietScrolls = self.layout.scrollRevision()
+    }
     self.fontBlockEnd = self.provider.text.fonts.set.nextDeadline()
     self.scrolled = false
     self.paintDirty = false
@@ -7341,6 +7689,60 @@ impl<'a> UiTree<'a> {
     self.work.repaintedSubtrees = self.work.repaintedSubtrees + self.stats.repaintedSubtrees
     self.work.replayedOperations = self.work.replayedOperations + self.stats.replayedOperations
     self.work.paintedGlyphs = self.work.paintedGlyphs + self.stats.glyphs
+  }
+
+  /// Whether every scroll container the last paint recorded is still within the paint's lead
+  /// of where it was painted. Paint culls a scroll container's content to its scrollport and
+  /// a lead of one viewport height past it each way (`Painter.lead`), so offsets within that
+  /// lead show only content the scene holds. A container the paint did not record was culled
+  /// whole, with what it holds.
+  fn scrollsWithinLead(self: &Self) -> bool {
+    let scale = self.quietInput.scale
+    // A pixel short of the lead: device offsets are rounded where they are drawn.
+    let reach = self.quietInput.height * scale - 1.0
+    if reach <= 0.0 {
+      return false
+    }
+    let painted = self.paintedScrolls.asSlice()
+    let mut i: usize = 0
+    while i < painted.length {
+      let slot = self.slotOf(painted[i].node)
+      if slot == NONE {
+        return false
+      }
+      let node = self.node(slot)
+      if f32.abs(node.scrollX() * scale - painted[i].x) > reach
+        || f32.abs(node.scrollY() * scale - painted[i].y) > reach {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+
+  /// Moves the kept scene's scroll positions to the nodes' offsets now, so whoever draws the
+  /// scene draws this frame.
+  effect fn moveSceneScrolls(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let scale = self.quietInput.scale
+    let mut i: usize = 0
+    while i < self.paintedScrolls.length() {
+      let mut position = self.scene().scrolls()[i]
+      let slot = self.slotOf(position.node)
+      let x = self.node(slot).scrollX() * scale
+      let y = self.node(slot).scrollY() * scale
+      if position.x != x || position.y != y {
+        position.x = x
+        position.y = y
+        if self.flipped {
+          run self.sceneB.setScroll(position)
+        } else {
+          run self.sceneA.setScroll(position)
+        }
+      }
+      i = i + 1
+    }
   }
 
   /// Wakes the `content-visibility: auto` elements near the viewport, nearest first, and skips
@@ -7366,7 +7768,11 @@ impl<'a> UiTree<'a> {
     // Nothing moved since the last look that found nothing to change.
     let seen = [self.layout.revision(), self.layout.scrollRevision(), f32.toUsize(self.input.height)]
     // Scroll offsets move fragments while painting, without a layout revision: `scrolled`.
-    if !self.scrolled && seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2] { return false }
+    // A scroll moves each element by no more than the offsets moved: while that stays under the
+    // distance the nearest element was from waking or being skipped, none changes, and a
+    // scroll frame does not walk every element.
+    if seen[0] == self.skipReview[0] && seen[1] == self.skipReview[1] && seen[2] == self.skipReview[2]
+      && (!self.scrolled || self.skipTravel < self.skipSlack) { return false }
     let mut automatic = List<u32>.make()
     run self.layout.automaticElements(&mut automatic)
     if automatic.length() == 0 { return false }
@@ -7375,6 +7781,7 @@ impl<'a> UiTree<'a> {
     let far = height * SKIP_FAR
     let mut wakes = List<u64>.make()
     let mut changed = false
+    let mut slack: f32 = far
     // Siblings under one parent fragment move by the same offset where the parent's chain only
     // translates them: one walk up for the first, the offset for the rest.
     let mut lastParent = NO_INDEX
@@ -7405,15 +7812,26 @@ impl<'a> UiTree<'a> {
         } else {
           lastParent = NO_INDEX
         }
+        // A scaled element moves farther than the scroll that moves it.
+        if !translated { slack = 0.0 }
       }
       let distance: f32 = if seen.yMax < 0.0 { 0.0 - seen.yMax } else if seen.yMin > height { seen.yMin - height } else { 0.0 }
       if self.layout.skipped(css) {
         if distance <= near {
           run wakes.append(u64.bitOr(u64.shiftLeft(f32.toU64(distance), 32), usize.toU64(css)))
+        } else {
+          slack = f32.min(slack, distance - near)
         }
-      } else if distance > far && !self.held(css) {
-        run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
-        changed = true
+      } else if distance > far {
+        if self.held(css) {
+          // Held awake for this frame only: the next review skips it.
+          slack = 0.0
+        } else {
+          run Effect.catchAll(self.layout.setSkipped(NodeId { index: css }, true, box.height()), layoutFailed)
+          changed = true
+        }
+      } else {
+        slack = f32.min(slack, far - distance)
       }
     }
     run wakes.sort()
@@ -7425,6 +7843,8 @@ impl<'a> UiTree<'a> {
       at = at + 1
     }
     self.skipReview = if changed { [usize.MAX; 3] } else { seen }
+    self.skipSlack = if changed { 0.0 } else { slack }
+    self.skipTravel = 0.0
     return changed
   }
 
@@ -8245,7 +8665,12 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.loadFaces()
+    run self.collectIconVariables()
     run text_selection.refresh(&mut self)
+    if run motion.slides(&mut self) {
+      // A node that starts or stops being a move paints through another group.
+      self.paintCachesStale = true
+    }
     if self.paintDirty {
       self.paintCachesStale = true
     }
@@ -8295,8 +8720,11 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        caretSlot: self.textSelection.caret.slot,
+        caretOffset: self.textSelection.caret.offset,
         firstOf: &self.fragmentOf,
         frame: self.frameNumber,
+        moves: &self.moves,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
         time: self.input.time,
@@ -8343,8 +8771,11 @@ impl<'a> UiTree<'a> {
         stats: &mut self.stats,
         order: &mut self.paintOrder,
         selected: &self.textSelection.selected,
+        caretSlot: self.textSelection.caret.slot,
+        caretOffset: self.textSelection.caret.offset,
         firstOf: &self.fragmentOf,
         frame: self.frameNumber,
+        moves: &self.moves,
         previousFrame: self.paintedAt,
         scale: self.input.scale,
         time: self.input.time,
@@ -8378,6 +8809,7 @@ impl<'a> UiTree<'a> {
   pub effect fn paintSubtree(self: &mut Self, slot: u32, scene: &mut Scene) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    run self.collectIconVariables()
     // Between a layout pass and the refresh, stacking lists no roots to paint from.
     if self.repair.pending && !self.paintCachesStale { run self.refreshPaintCaches() }
     let window = ContentMask.new(
@@ -8422,8 +8854,11 @@ impl<'a> UiTree<'a> {
       stats: &mut stats,
       order: &mut order,
       selected: &self.textSelection.selected,
+      caretSlot: self.textSelection.caret.slot,
+      caretOffset: self.textSelection.caret.offset,
       firstOf: &self.fragmentOf,
       frame: self.frameNumber,
+      moves: &self.moves,
       previousFrame: self.paintedAt,
       scale: self.input.scale,
       time: self.input.time,
@@ -8482,6 +8917,16 @@ impl<'a> UiTree<'a> {
 
   /// The atlas tiles allocated since the last [`UiTree.clearUploads`], with their pixels, for
   /// the renderer to copy into its textures.
+  /// Runs the Canvas 2D commands JavaScript wrote (see [`canvas2d`]).
+  pub effect fn drawCanvas2d(self: &mut Self, commands: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.canvas2d.draw(&mut self.provider.text, commands)
+  }
+
+  /// `measureText` of `value` in `font`, as [`canvas2d.Canvas2d.measure`] gives it.
+  pub effect fn measureCanvasText(self: &mut Self, font: &[u8], value: &[u8]) -> TextMeasured ! OutOfMemoryError ? &mut Allocator {
+    return run self.canvas2d.measure(&mut self.provider.text, font, value)
+  }
+
   pub fn pendingUploads(self: &Self) -> &Pending {
     return &self.uploads
   }
@@ -8878,3 +9323,4 @@ fn blankText(text: &[u8]) -> bool {
   }
   return true
 }
+

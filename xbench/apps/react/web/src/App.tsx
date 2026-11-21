@@ -1,17 +1,19 @@
 // The xbench scenes in React (SCENES.md). One scene per build: VITE_XB_SCENE names it
-// (feed, wall, stream, churn; a count after a dash changes the size: feed-3000).
+// (feed, wall, stream, churn, canvas, chat; a count after a dash changes the size: feed-3000).
 import { memo, useEffect, useRef, useState } from "react";
 import { flushSync } from "@silkui/react";
 import corpus from "../../../../content/corpus.txt?raw";
 import { parse, spans, type Block, type Item, type Span } from "./corpus";
 import { run, type Step } from "./driver";
 import { pictures } from "./pictures";
+import { stage } from "./stage";
+import { Chat } from "./Chat";
 
 const asked = (import.meta.env.VITE_XB_SCENE as string | undefined) ?? "feed";
 const [scene, sized] = asked.split("-");
 // VITE_XB_CONTENT_VISIBILITY=1: items get `content-visibility: auto` (style/bench.css).
 const FEED = import.meta.env.VITE_XB_CONTENT_VISIBILITY ? "feed lazy" : "feed";
-const DEFAULTS: Record<string, number> = { feed: 1000, wall: 0, stream: 300, churn: 1000 };
+const DEFAULTS: Record<string, number> = { feed: 1000, wall: 0, stream: 300, churn: 1000, canvas: 200, chat: 1000 };
 const SIZE = sized ? Number(sized) : DEFAULTS[scene];
 
 type Scroller = { scrollTop: number };
@@ -244,7 +246,39 @@ function Churn() {
   return <Frame title={`xbench churn-${SIZE}`} scroller={scroller}><box className={FEED}>{items.map((item) => <ItemView key={item.id} item={item} />)}</box></Frame>;
 }
 
+/** A WebGPU canvas that draws every frame, pinned over a feed (SCENES.md). */
+function Canvas() {
+  const [items] = useState(() => parse(corpus, 0, SIZE));
+  const scroller = useRef<Scroller>(null);
+  const canvas = useRef<any>(null);
+  useEffect(() => {
+    stage(canvas.current).then((draw) => {
+      let f = 0;
+      let top = 0;
+      draw(f++);
+      const steps: Step[] = [
+        { idle: "loaded", ms: 3000 },
+        { mark: "loaded" },
+        { driver: "draw", frames: 600, frame: () => { draw(f++); } },
+        { driver: "draw-scroll", frames: 600, frame: () => { draw(f++); top += 24; scroller.current!.scrollTop = top; } },
+        { idle: "end", ms: 3000 },
+        { mark: "end" },
+      ];
+      run(steps);
+    });
+  }, []);
+  return (
+    <box className="app">
+      <box className="bar">{`xbench canvas-${SIZE}`}</box>
+      <canvas className="stage" ref={canvas} width={1440} height={540} />
+      <box className="scroll" ref={scroller}><box className={FEED}>{items.map((item) => <ItemView key={item.id} item={item} />)}</box></box>
+    </box>
+  );
+}
+
 export function App() {
+  if (scene === "chat") return <Chat count={SIZE} lazy={!!import.meta.env.VITE_XB_CONTENT_VISIBILITY} />;
+  if (scene === "canvas") return <Canvas />;
   if (scene === "wall") return <Wall />;
   if (scene === "stream") return <Stream />;
   if (scene === "churn") return <Churn />;

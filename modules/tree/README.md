@@ -50,7 +50,7 @@ let records = run tree.events()
   `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
   with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
   properties inherit; the rest do not.
-- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setGrid`, `setAttribute`
+- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setCanvasSurface`, `setGrid`, `setAttribute`
   (role, label, test id, tab index, cursor, disabled, focus trap, checked, selected, expanded,
   and for inputs multiline, read-only and placeholder), with `setLabel`, `setTestId` and
   `setRole` for the common ones.
@@ -100,7 +100,7 @@ run tree.apply(run batch.take())
 - `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
   `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
   `SetSelection`, `SetListeners`, `OpenRoot`, `UpdateRoot`, `CloseRoot`, `Focus`, `Blur`,
-  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetGrid`, the virtual list and anchor
+  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetCanvasSurface`, `SetGrid`, the virtual list and anchor
   mutations, and the resource definitions.
 - Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
   and a node made with `tree.box` takes a number that is not in use.

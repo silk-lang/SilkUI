@@ -8,6 +8,7 @@
 //! `silk_browser#yield` import, which `browser/app-host.js` makes a JSPI suspending import; so
 //! the app's entry point must be called through `WebAssembly.promising`, as `app-host.js` does.
 import ui_scene.scene { Scene }
+import ui_scene.scroll { ScrollPosition }
 import ui_scene.color as color
 import ui_tree.legacy { Pending }
 import atlas.atlas { Atlas, TextureInfo }
@@ -16,21 +17,23 @@ import ui_renderer.compare { Tolerance, compare }
 import ui_renderer.readback { copyOut, isBgra, pickFormat, readbackSize, unpack }
 import ui_renderer.renderer { UiRenderer }
 import ui_renderer.text { TextSettings }
-import render_thread { FastScroll, RenderReport, RenderSettings }
+import render_thread { FastScroll, Grab, RenderReport, RenderSettings }
 import console { StderrWriter }
 import clock { Clock }
 import window.types { RawSurface, WindowId }
 import webgpu.runtime { Device, GpuError, Instance, RequestAdapterOptions }
 import webgpu.runtime as runtime
-import webgpu.resources { Queue, Texture, getQueue }
+import webgpu.resources { Queue, Texture, TextureView, getQueue }
 import webgpu.surface { Surface, SurfaceConfiguration, SurfaceTarget }
 import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor }
 import webgpu_sys.generated_webgpu as flags
+import webgpu_sys.generated_webgpu as sys
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.core.result { Result }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.text.string { String }
 import silk.num.u64
 import silk.num.usize
@@ -42,8 +45,43 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   fn pause() -> () {
     unsafe hostYield()
   }
+
+  // The page's GPU canvases (`PageCanvases` in browser/app-host.js). The page draws them on a
+  // device of its own; `canvas_sync` copies the ones drawn since the last frame into textures
+  // of the renderer's device and answers how many surfaces got a new texture or went away.
+  // `canvas_change` then gives the number of one of those and `canvas_view` its texture view,
+  // null for a surface that went away.
+  unsafe extern "C" fn hostCanvasSync(device: sys.WGPUDevice) -> u32 as "silk_browser#canvas_sync"
+  unsafe extern "C" fn hostCanvasChange() -> u32 as "silk_browser#canvas_change"
+  unsafe extern "C" fn hostCanvasView() -> sys.WGPUTextureView as "silk_browser#canvas_view"
+
+  /// Brings the textures of the page's GPU canvases up to date before a frame is drawn.
+  effect fn pageCanvases(device: &Device, renderer: &mut UiRenderer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut left = unsafe hostCanvasSync(unsafe device.raw())
+    while left != 0 {
+      let surface = unsafe hostCanvasChange()
+      let handle = unsafe hostCanvasView()
+      if Pointer.isNull(handle) {
+        renderer.removeSurface(surface)
+      } else {
+        // The page handed one reference over with the handle.
+        let view = unsafe TextureView.adopt(handle)
+        run renderer.setSurface(surface, &view)
+      }
+      left = left - 1
+    }
+  }
 } else {
   fn pause() -> () {}
+
+  effect fn pageCanvases(device: &Device, renderer: &mut UiRenderer) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    drop device
+    drop renderer
+  }
 }
 
 /// The canvas id modules/platform/window's browser backend gives window `handle`'s canvas.
@@ -220,6 +258,7 @@ impl InlineRenderer {
     let start = run self.clock.seconds()
     run self.upload(atlas, uploads) |> Effect.provideMut<Allocator>(&mut heap)
     let uploaded = run self.clock.seconds()
+    run pageCanvases(&self.device, &mut self.renderer) |> Effect.provideMut<Allocator>(&mut heap)
     let texture = run self.surface.getCurrentTexture()
     let view = run texture.texture.createView(&TextureViewDescriptor.default())
     let acquired = run self.clock.seconds()
@@ -469,6 +508,42 @@ impl InlineRenderer {
   /// Every frame is drawn inside `submit`: there is none to wait for.
   pub fn waitTaken(self: &mut Self) -> () {}
 
+  /// No frame is kept to draw again at new scroll offsets: the host submits a frame that only
+  /// scrolled like any other.
+  pub fn rescrolls(self: &Self) -> bool {
+    return false
+  }
+
+  /// Unused (see [`InlineRenderer.rescrolls`]).
+  pub effect fn rescroll(
+    self: &mut Self,
+    positions: &[ScrollPosition],
+    fastSeq: u64,
+    fast: FastScroll,
+    refast: bool,
+  ) -> u64
+    ! GpuError | OutOfMemoryError {
+    return fastSeq
+  }
+
+  /// Every frame is drawn inside `submit`: there is no redraw to wait for.
+  pub fn waitRedrawn(self: &mut Self) -> () {}
+
+  /// The browser has no inspector to take screenshots for: nothing is read back.
+  pub fn grab(self: &mut Self) -> () {}
+
+  /// Nothing is read back in the browser (see `grab`).
+  pub fn takeGrab(self: &mut Self) -> Option<Grab> {
+    return Option<Grab>.None
+  }
+  /// The browser composites page canvases itself.
+  pub fn allowCanvasLayers(self: &mut Self, on: bool) -> () {}
+
+  /// Page canvases are taken inside `submit`: nothing waits for a frame here.
+  pub fn beginFrame(self: &mut Self) -> () {}
+
+  pub fn endFrame(self: &mut Self) -> () {}
+
   /// Moves the milliseconds between the presents since the last call into `out`; no frame is
   /// ever replaced undrawn here.
   pub effect fn takePresented(self: &mut Self, out: &mut List<f64>) -> u64
@@ -481,6 +556,12 @@ impl InlineRenderer {
 
   /// Every frame is presented inside `submit`, so this returns the report at once.
   pub effect fn waitFrames(self: &mut Self, frames: u64) -> RenderReport
+    ! GpuError {
+    return self.last
+  }
+
+  /// As [`InlineRenderer.waitFrames`]: every frame here is one the UI thread painted.
+  pub effect fn waitPainted(self: &mut Self, frames: u64) -> RenderReport
     ! GpuError {
     return self.last
   }

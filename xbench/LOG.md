@@ -105,6 +105,24 @@ each one is driven. Read it before comparing two numbers.
 - Brushes are shared per colour, as an Avalonia app keeps them in resources.
 - First paint in a window: the second `request_animation_frame` callback.
 
+## The chat scene
+
+- `chat` exists for the two React apps only (`apps/react/web/src/Chat.tsx`). There is no
+  silk-direct, Loom or Rust version, and the runner refuses it for other apps.
+- It ports the chat page of the Silk UI CSS demo, which is styled with Tailwind; here the same
+  declarations are written out as plain CSS in `style/chat.css`, so Electron and Silk read the
+  same file and neither needs Tailwind. The demo's theme colours (oklch) are their hex values.
+  The fonts are the suite's: Inter and JetBrains Mono instead of the system fonts, bold instead of
+  semibold (Inter is bundled at 400 and 700 only), and no tabular figures in table cells.
+- The demo's own frame counter and endless auto-scroll are not in the scene: the runner measures
+  frames, and the idle before `rest` requests no frames.
+- The pictures are the corpus's four PNGs at 480 x 270 CSS px (`object-fit: cover`), not the
+  demo's.
+- The chat build loads `style/chat.css` after `bench.css` through the `xb-scene.css` alias in both
+  Vite configs. Every other scene resolves that alias to `bench.css` itself, so its CSS and Silk
+  sheet are byte for byte what they were; their JavaScript bundles carry the chat code (about
+  7.5 kB) without running it.
+
 ## Fake clocks
 
 Silk's windowless bench and the three Rust apps' cpu mode move their clock 1/120 s a frame and run

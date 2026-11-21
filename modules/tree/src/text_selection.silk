@@ -22,7 +22,9 @@ import cssom_view
 import interact
 import edit
 import edit { Keymap }
-import input { MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
+import input { Input, MOD_SHIFT, MOD_CONTROL, MOD_ALT, MOD_META }
+import style_identity { NodeIdentity }
+import silk.core.option { Option }
 import paint { paddingBox }
 import scrollbar { userScrolls, usedOverflow }
 import layout.lib { FragmentKind }
@@ -108,6 +110,9 @@ pub struct TextSelection {
   reported: u64,
   /// The node a press started a new selection in, for `selectstart`, or NONE.
   startedAt: u32,
+  /// Where the caret shows: the collapsed selection inside the focused editing host (see
+  /// `focusedHost`), as a point in text where there is one; none otherwise.
+  pub caret: Point,
 }
 
 impl TextSelection {
@@ -127,6 +132,7 @@ impl TextSelection {
       changes: 0,
       reported: 0,
       startedAt: NONE,
+      caret: Point.none(),
     }
   }
 
@@ -904,10 +910,19 @@ pub fn pointerUp(tree: &mut UiTree<'_>) -> () {
 
 /// Checks the ends against the tree and rebuilds what is covered when either changed. Ends in
 /// nodes that left the document clear the selection; text that got shorter pulls them in.
+/// Whether [`refresh`] has nothing to do: the selection did not move and was built at the
+/// tree's current revision.
+pub fn settled(tree: &UiTree<'_>) -> bool {
+  return !tree.textSelection.moved && tree.textSelection.builtAt == tree.revision
+}
+
 pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  if !tree.textSelection.moved && tree.textSelection.builtAt == tree.revision { return () }
+  if !tree.textSelection.moved && tree.textSelection.builtAt == tree.revision {
+    run placeCaret(&mut tree)
+    return ()
+  }
   let mut anchor = tree.textSelection.anchor
   let mut focus = tree.textSelection.focus
   if anchor.exists() || focus.exists() {
@@ -952,6 +967,7 @@ pub effect fn refresh(tree: &mut UiTree<'_>) -> ()
   tree.textSelection.selected = move next
   tree.textSelection.builtAt = tree.revision
   tree.textSelection.moved = false
+  run placeCaret(&mut tree)
 }
 
 /// Paints text node `slot` again: its fragments' hashes change, and the paint caches are
@@ -1562,7 +1578,22 @@ pub effect fn extend(tree: &mut UiTree<'_>, key: string, modifiers: u32) -> bool
   let s = &tree.textSelection
   if !s.anchor.exists() || !s.focus.exists() { return false }
   let anchor = s.anchor
-  let focus = s.focus
+  let mut next = s.focus
+  let host = focusedHost(&tree.*)
+  let edge = if host != NONE { host } else { tree.root }
+  if !run stepped(&mut tree, key, modifiers, edge, &mut next) { return false }
+  if next.exists() { run select(&mut tree, anchor, next) }
+  return true
+}
+
+/// Where an arrow, Home or End (or their Mac forms) takes the selection's focus: by character,
+/// word, line, to a line's edge or to the start or end of `edge` (the document, or an editing
+/// host). False for other keys.
+effect fn stepped(tree: &mut UiTree<'_>, key: string, modifiers: u32, edge: u32, next: &mut Point) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  // A point between elements moves from the text the caret shows in.
+  let focus = caretPoint(&tree.*, next.*)
   let mac = tree.keymap == Keymap.Mac
   let control = u32.bitAnd(modifiers, MOD_CONTROL) != 0
   let alt = u32.bitAnd(modifiers, MOD_ALT) != 0
@@ -1571,42 +1602,43 @@ pub effect fn extend(tree: &mut UiTree<'_>, key: string, modifiers: u32) -> bool
   let lineEdge = if mac { meta && !alt && (key == "ArrowLeft" || key == "ArrowRight") } else { !control && (key == "Home" || key == "End") }
   let documentEdge = if mac { meta && (key == "ArrowUp" || key == "ArrowDown") || key == "Home" || key == "End" } else { control && (key == "Home" || key == "End") }
   let forward = key == "ArrowRight" || key == "ArrowDown" || key == "End"
-  let mut next = focus
   if documentEdge {
-    let root = tree.root
-    next = if forward { at(&tree.*, root, childCount(&tree.*, root)) } else { at(&tree.*, root, 0) }
+    next.* = if forward { at(&tree.*, edge, childCount(&tree.*, edge)) } else { at(&tree.*, edge, 0) }
   } else if lineEdge {
     let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
     let mut x: f32 = 0.0
     if !run caretOf(&tree.*, focus, &mut piece, &mut x) { return false }
     let middle = (piece.lineTop + piece.lineBottom) * 0.5
-    next = run pointAt(&tree.*, if forward { 1000000.0 } else { -1000000.0 }, middle)
+    next.* = run pointAt(&tree.*, if forward { 1000000.0 } else { -1000000.0 }, middle)
   } else if key == "ArrowUp" || key == "ArrowDown" {
     let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
     let mut x: f32 = 0.0
     if !run caretOf(&tree.*, focus, &mut piece, &mut x) {
-      next = run characterStep(&tree.*, focus, forward)
+      next.* = run characterStep(&tree.*, focus, forward)
     } else {
       if tree.textSelection.hasPreferredX { x = tree.textSelection.preferredX }
       tree.textSelection.preferredX = x
       tree.textSelection.hasPreferredX = true
       let y = if forward { piece.lineBottom + 0.5 } else { piece.lineTop - 0.5 }
       // The last line down (or first up) goes to the document's edge, as a caret does.
-      next = run pointWith(&tree.*, x, y, false, !forward)
-      if next.same(focus) || (run compare(&tree.*, next, focus)) != (if forward { 1 } else { -1 }) {
-        next = run pointAt(&tree.*, x, y)
+      let mut found = run pointWith(&tree.*, x, y, false, !forward)
+      if found.same(focus) || (run compare(&tree.*, found, focus)) != (if forward { 1 } else { -1 }) {
+        found = run pointAt(&tree.*, x, y)
       }
-      if !next.exists() { next = focus }
+      next.* = if found.exists() { found } else { focus }
     }
-    run select(&mut tree, anchor, next)
     return true
   } else if key == "ArrowLeft" || key == "ArrowRight" {
-    next = if byWord { run wordStep(&tree.*, focus, forward) } else { run characterStep(&tree.*, focus, forward) }
+    let mut step = if byWord { run wordStep(&tree.*, focus, forward) } else { run characterStep(&tree.*, focus, forward) }
+    // A line break's text (a `<br>`) has no place after it: past it is the next line.
+    if lineBreak(&tree.*, step.slot) && step.offset > 0 {
+      step = if forward { run characterStep(&tree.*, step, true) } else { at(&tree.*, step.slot, 0) }
+    }
+    next.* = step
   } else {
     return false
   }
   tree.textSelection.hasPreferredX = false
-  if next.exists() { run select(&mut tree, anchor, next) }
   return true
 }
 
@@ -1763,4 +1795,207 @@ pub fn textPoint(tree: &UiTree<'_>, point: Point, start: bool) -> Point {
   }
   let found = if child != NONE { textBefore(tree, child) } else { textBeforeEnd(tree, point.slot) }
   return if found == NONE { Point.none() } else { at(tree, found, textLength(tree, found)) }
+}
+
+// Editing hosts: elements with `contenteditable`, edited by the client.
+//
+// The tree keeps no model of what a host holds: its content is the client's nodes. A key or
+// text for the focused host becomes an `Input.Edit` follow-up, whose `beforeinput` record the
+// client answers by changing its nodes (and the selection) itself, as a browser's editing
+// does. Movement keys move the document selection, and the caret is painted at it.
+
+/// What `contenteditable` on `slot` says: 1 editable, 2 not editable, 0 nothing.
+fn editableValue(tree: &UiTree<'_>, slot: u32) -> u32 {
+  if let Option<&NodeIdentity>.Some { value } = tree.node(slot).identity() {
+    let attributes = value.attributes()
+    let mut i: usize = 0
+    while i < attributes.length {
+      if String.view(&attributes[i].name) == "contenteditable" {
+        let text = String.view(&attributes[i].value)
+        if text == "" || text == "true" || text == "plaintext-only" { return 1 }
+        if text == "false" { return 2 }
+        return 0
+      }
+      i = i + 1
+    }
+  }
+  return 0
+}
+
+/// The editing host `slot` is in: the outermost element above it (or itself) with an editable
+/// `contenteditable`, up to one with `contenteditable="false"`. NONE when `slot` is not editable.
+pub fn editingHost(tree: &UiTree<'_>, slot: u32) -> u32 {
+  let mut host = NONE
+  let mut at = slot
+  while at != NONE {
+    let kind = tree.node(at).kind
+    if kind != NodeKind.Text && kind != NodeKind.Input {
+      let value = editableValue(tree, at)
+      if value == 2 { return host }
+      if value == 1 { host = at }
+    }
+    at = tree.node(at).parent
+  }
+  return host
+}
+
+/// The editing host that has focus, or NONE.
+pub fn focusedHost(tree: &UiTree<'_>) -> u32 {
+  let focused = tree.focused
+  if focused == NONE || u32.toUsize(focused) >= tree.nodes.length() { return NONE }
+  if !tree.node(focused).live || tree.node(focused).kind == NodeKind.Input { return NONE }
+  return editingHost(tree, focused)
+}
+
+/// Whether `slot` is text of one U+2028 line separator, as a client's `<br>` is.
+fn lineBreak(tree: &UiTree<'_>, slot: u32) -> bool {
+  return slot != NONE && isText(tree, slot) && String.view(&tree.node(slot).text) == "\u{2028}"
+}
+
+fn inside(tree: &UiTree<'_>, ancestor: u32, slot: u32) -> bool {
+  let mut at = slot
+  while at != NONE {
+    if at == ancestor { return true }
+    at = tree.node(at).parent
+  }
+  return false
+}
+
+/// Where the caret of a collapsed selection at `point` shows: in text where the point is in
+/// text or next to text in the same block; else the point itself (an empty block).
+fn caretPoint(tree: &UiTree<'_>, point: Point) -> Point {
+  if isText(tree, point.slot) { return point }
+  let child = childAt(tree, point.slot, point.offset)
+  let block = if child != NONE && !isText(tree, child) && blockLevel(tree, child) { child } else if blockLevel(tree, point.slot) { point.slot } else { blockOf(tree, point.slot) }
+  let after = textPoint(tree, point, true)
+  if after.exists() && inside(tree, block, after.slot) { return after }
+  let before = textPoint(tree, point, false)
+  if before.exists() && inside(tree, block, before.slot) { return before }
+  return point
+}
+
+/// Places `textSelection.caret`, and repaints the nodes it left and reached.
+effect fn placeCaret(tree: &mut UiTree<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let s = &tree.textSelection
+  let mut next = Point.none()
+  if s.anchor.exists() && s.anchor.same(s.focus) && valid(&tree.*, s.focus) {
+    let host = focusedHost(&tree.*)
+    if host != NONE && inside(&tree.*, host, s.focus.slot) { next = caretPoint(&tree.*, s.focus) }
+  }
+  let old = tree.textSelection.caret
+  if old.same(next) && old.id == next.id { return () }
+  tree.textSelection.caret = next
+  if old.exists() && u32.toUsize(old.slot) < tree.nodes.length() && tree.node(old.slot).live { run touch(&mut tree, old.slot) }
+  if next.exists() { run touch(&mut tree, next.slot) }
+}
+
+/// The caret's rectangle in CSS pixels of the viewport, for the input method; false when no
+/// host has a caret in text.
+pub effect fn caretRect(tree: &UiTree<'_>, rect: &mut Rect<f32>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let point = tree.textSelection.caret
+  if !point.exists() { return false }
+  let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
+  let mut x: f32 = 0.0
+  if run caretOf(tree, point, &mut piece, &mut x) {
+    rect.* = Rect<f32>.new(x, piece.top, x + 1.0, piece.bottom)
+    return true
+  }
+  let mut box = Rect<f32>.new(0.0, 0.0, 0.0, 0.0)
+  if boxOf(tree, point.slot, &mut box) {
+    let size = tree.node(point.slot).computed().text.size
+    rect.* = Rect<f32>.new(box.xMin, box.yMin, box.xMin + 1.0, box.yMin + size * 1.2)
+    return true
+  }
+  return false
+}
+
+/// Queues the edit `inputType` (with `text`) of host `slot`, for the client to make.
+effect fn hostEdit(tree: &mut UiTree<'_>, slot: u32, inputType: string, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  let id = tree.node(slot).id
+  run tree.queueFollowUp(Input.Edit { target: id, inputType: run String.copy(inputType), text: run String.copy(text) })
+}
+
+/// Text typed or composed while an editing host has focus: an `insertText` edit, or for the
+/// input method's composition an `insertCompositionText` one (empty text ends it). False
+/// when no host has focus.
+pub effect fn hostText(tree: &mut UiTree<'_>, text: string, composing: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE { return false }
+  if !composing && String.byteLength(text) == 0 { return true }
+  run hostEdit(&mut tree, host, if composing { "insertCompositionText" } else { "insertText" }, text)
+  return true
+}
+
+/// A paste's text for the focused editing host: an `insertFromPaste` edit, unless `slot` is
+/// not in it.
+pub effect fn hostPaste(tree: &mut UiTree<'_>, slot: u32, text: string) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE || slot == NONE || !inside(&tree.*, host, slot) { return false }
+  if String.byteLength(text) != 0 { run hostEdit(&mut tree, host, "insertFromPaste", text) }
+  return true
+}
+
+/// A cut in the focused editing host: copies the selection, then queues its `deleteByCut`.
+pub effect fn hostCut(tree: &mut UiTree<'_>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE { return false }
+  if run copy(&mut tree) { run hostEdit(&mut tree, host, "deleteByCut", "") }
+  return true
+}
+
+/// Selects all of the focused editing host. False when no host has focus.
+pub effect fn hostSelectAll(tree: &mut UiTree<'_>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE { return false }
+  let start = at(&tree.*, host, 0)
+  let end = at(&tree.*, host, childCount(&tree.*, host))
+  run select(&mut tree, start, end)
+  return true
+}
+
+/// The default of a key down in the focused editing host: deleting and line breaks become
+/// edits, movement keys move the caret (Shift extends, see `extend`). False for other keys,
+/// or when no host has focus.
+pub effect fn hostKey(tree: &mut UiTree<'_>, key: string, modifiers: u32) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE { return false }
+  let mac = tree.keymap == Keymap.Mac
+  let shift = u32.bitAnd(modifiers, MOD_SHIFT) != 0
+  let control = u32.bitAnd(modifiers, MOD_CONTROL) != 0
+  let alt = u32.bitAnd(modifiers, MOD_ALT) != 0
+  let meta = u32.bitAnd(modifiers, MOD_META) != 0
+  if key == "Backspace" || key == "Delete" {
+    let backward = key == "Backspace"
+    let byWord = if mac { alt && !meta && !control } else { control && !alt && !meta }
+    let byLine = mac && meta && !alt && !control
+    let kind = if byWord { if backward { "deleteWordBackward" } else { "deleteWordForward" } }
+      else if byLine { if backward { "deleteSoftLineBackward" } else { "deleteSoftLineForward" } }
+      else if backward { "deleteContentBackward" } else { "deleteContentForward" }
+    run hostEdit(&mut tree, host, kind, "")
+    return true
+  }
+  if key == "Enter" && !control && !alt && !meta {
+    run hostEdit(&mut tree, host, if shift { "insertLineBreak" } else { "insertParagraph" }, "")
+    return true
+  }
+  if shift { return run extend(&mut tree, key, modifiers) }
+  run refresh(&mut tree)
+  let anchor = tree.textSelection.anchor
+  let focus = tree.textSelection.focus
+  if !anchor.exists() || !focus.exists() { return false }
+  let byWord = if mac { alt && !meta && !control } else { control && !alt && !meta }
+  if !anchor.same(focus) && !byWord && !meta && (key == "ArrowLeft" || key == "ArrowRight") {
+    // A selection collapses to the end the arrow points at.
+    let mut start = Point.none()
+    let mut end = Point.none()
+    run ordered(&tree.*, &mut start, &mut end)
+    let to = if key == "ArrowLeft" { start } else { end }
+    tree.textSelection.hasPreferredX = false
+    run select(&mut tree, to, to)
+    return true
+  }
+  let mut next = focus
+  if !run stepped(&mut tree, key, modifiers, host, &mut next) { return false }
+  if next.exists() { run select(&mut tree, next, next) }
+  return true
 }

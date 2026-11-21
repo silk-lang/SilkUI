@@ -103,6 +103,8 @@ SILK_PACKAGES=/absolute/path/to/SilkUI/modules/js/packages \
 | `root.render(element)` | Renders and commits before it returns, so the window's first frame has the content |
 | `root.unmount()` | Unmounts what the root rendered |
 | `flushSync(callback)` | Runs `callback` and commits its updates before returning |
+| `createPortal(children, container)` | Renders `children` into another `@silkui/core` node |
+| `@silkui/react/dom` | `react-dom` and `react-dom/client` for code written for React DOM; the Vite plugin points both at it |
 | `@silkui/react/vite` | The Vite plugin above (`react(options?)`) |
 | `@silkui/react/jsx-runtime` | The JSX runtime, for `"jsxImportSource": "@silkui/react"` |
 
@@ -136,6 +138,19 @@ Host elements are the tree's node kinds, and strings in children become text nod
   To tint any other picture with the text color, use CSS `mask-image` over `background-color: currentColor`.
 - **Refs** are the `@silkui/core` nodes (`Node`, `Input`, `RichInput`, `Image`, `Svg`), for code that
   draws on the tree directly, such as animation on every frame.
+
+### HTML elements
+
+Apps and libraries written for React DOM render as they are: `<div>`, `<span>`, `<p>`,
+`<button>`, `<label>`, `<ul>`, `<table>` and every other HTML tag become tree nodes that know
+their tag, so type selectors, `:root`, implicit roles and the default stylesheet
+(`@silkui/react/html.css`, which the Vite plugin puts before the app's CSS) apply. Props are
+React DOM's: `className`, `style` with CSS custom properties, `onChange` on fields,
+`checked`, `htmlFor`, `hidden`, `autoFocus`, `dangerouslySetInnerHTML` and other attributes,
+which selectors see (`[type=checkbox]`, `details[open]`). `onFocus` and `onBlur` bubble as
+in React DOM. A click checks a checkbox or radio, passes from a label to its control, opens a
+`<details>` from its summary and submits a form from its button. `react({ html: false })`
+leaves out the stylesheet and the `react-dom` aliases.
 
 ### Timing
 

@@ -23,9 +23,35 @@ apps follow it step for step):
 | `stream` (stream-300) | 300 items, then a reply that grows | idle 3 s, mark `loaded`, `stream` (900 frames: 3 words a frame, a new paragraph every 60 words, a new item every 240, pinned to the end), idle 3 s, mark `streamed` | Growth: text appended at the end of a long document, re-laid out and scrolled to every frame (the chat case) |
 | `churn` (churn-1000) | an empty feed, then 1,000 items added 25 a frame, then cleared; three times, with other items each time | idle 1 s, mark `base`; three times: `grow-k` (40 frames), idle 1 s, mark `full-k`, `clear-k` (1 frame), idle 1.5 s, mark `empty-k` | Memory growth and eviction: `full-k` against `base`, `empty-k` against `base` (what is not given back), and whether `empty-3` creeps above `empty-1` (a leak) |
 
+## The canvas scene
+
+A fifth scene, for the two apps that have WebGPU in a canvas (Electron and Silk UI + React), in
+the gpu suite only:
+
+| Scene | What is on screen | Script | What it is for |
+| --- | --- | --- | --- |
+| `canvas` (canvas-200) | a canvas of 1,440 x 540 pixels shown at 720 x 270 CSS px, pinned over a feed of 200 items | idle 3 s, mark `loaded`, `draw` (600 frames: the canvas is drawn again, nothing else changes), `draw-scroll` (600 frames: the canvas is drawn and the feed scrolls 24 px), idle 3 s, mark `end` | What a WebGPU canvas costs beside an interface: the way its frames reach the window, and whether a canvas that draws every frame slows the interface's own frames |
+
+The drawing is 20,000 squares on orbits in one instanced draw (`apps/react/web/src/stage.ts`).
+Every position comes from the instance index and a time uniform, so a frame uploads 16 bytes:
+the scene measures the GPU and the canvas's way to the screen, not JavaScript.
+
+## The chat scene
+
+A sixth scene, for the two React apps (Electron and Silk UI + React), in either suite:
+
+| Scene | What is on screen | Script | What it is for |
+| --- | --- | --- | --- |
+| `chat` (chat-1000) | a chatbot's transcript of 1,000 messages in one rounded scroller: short messages from the person, long replies with paragraphs, tables, numbered lists, code and pictures | idle 3 s, mark `loaded`, `scroll` (600 frames of 24 px), `sweep` (720 px a frame to the end, then back to the top), idle 3 s, mark `swept`, `append` (300 frames: a new message every 10 frames, pinned to the end), idle 3 s, mark `rest` | A real page's markup and styling rather than the corpus feed: the Silk UI CSS demo's chat page (alpha colours, a gradient, a grid table, truncated cells), its cost when most of it is off screen, and memory once nothing runs: `rest` is a true rest, with no animation frames and no timers before it |
+
+The messages come from a seeded generator in `apps/react/web/src/Chat.tsx` (generated words, the
+same in every app and every run); the pictures are the corpus's four PNGs. The style is
+`style/chat.css`, plain CSS like bench.css, which only the chat build loads. A size after the
+dash sets the message count: `chat-200`, `chat-3000`.
+
 A size after a dash changes the item count: `feed-3000`, `stream-1000`, `churn-2000`.
 
-Idle memory is the mark after each idle (`loaded`, `swept`, `streamed`, `base`, `empty-k`).
+Idle memory is the mark after each idle (`loaded`, `swept`, `streamed`, `base`, `empty-k`, `rest`).
 
 ## Nothing is virtualized
 
@@ -36,8 +62,9 @@ costs when the app does not do that work.
 ## Offscreen release switch
 
 With the switch on, every item of `feed`, `stream` and `churn` gets `content-visibility: auto;
-contain-intrinsic-size: auto 400px` (`.lazy > .item` in style/bench.css): items far from the
-viewport skip their contents and keep their size. The app still holds every item; the
+contain-intrinsic-size: auto 400px` (`.lazy > .item` in style/bench.css), and every message of
+`chat` gets `content-visibility: auto; contain-intrinsic-size: auto 120px` (`.lazy > .msg` in
+style/chat.css): items far from the viewport skip their contents and keep their size. The app still holds every item; the
 framework decides what to lay out. The switch is `XB_CONTENT_VISIBILITY=1` at run time for
 silk-direct, and `VITE_XB_CONTENT_VISIBILITY=1` at build time for the React builds (silk-react,
 Electron). Off is the default, and results with it on are labelled so (`--label`).

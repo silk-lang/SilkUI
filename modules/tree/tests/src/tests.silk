@@ -8,6 +8,8 @@ import ui_tree.css { px }
 import record_sizes as _record_sizes
 import image_load as _image_load
 import canvas_view as _canvas_view
+import canvas_surface as _canvas_surface
+import canvas2d as _canvas2d
 import anchoring as _anchoring
 import virtual_lists as _virtual_lists
 import pagination as _pagination
@@ -194,17 +196,14 @@ effect fn replayBody() -> ()
   run Testing.expect(!tree.stats.layoutSkipped, "the first frame lays out")
   let painted = tree.stats.paintedFragments
 
-  // Nothing changed: the root's subtree is copied whole and layout is skipped.
+  // Nothing changed: layout is skipped and so is paint, the last scene is kept.
+  let kept = tree.paintsKept
   let second = run frame(&mut tree, &mut snapshot)
   run Testing.expect(tree.stats.layoutSkipped, "an unchanged frame skips layout")
   run Testing.expect(tree.stats.repaintedSubtrees == 0, "an unchanged frame repaints nothing")
-  // The faded card makes a stacking context, painted from the root context's lists.
-  run Testing.expect(
-    tree.stats.replayedSubtrees == 2,
-    "an unchanged frame replays the root and the faded card",
-  )
-  run Testing.expect(tree.stats.paintedFragments < painted, "replayed fragments are not visited")
-  run Testing.expect(samePixels(&first, &second), "a replayed frame draws the same pixels")
+  run Testing.expect(tree.paintsKept == kept + 1, "an unchanged frame keeps the last scene")
+  run Testing.expect(tree.stats.paintedFragments < painted, "a kept frame visits no fragment")
+  run Testing.expect(samePixels(&first, &second), "a kept frame draws the same pixels")
 
   // One card changes color: the root and that card are painted again, the other cards and
   // the card's own children are replayed.
@@ -240,6 +239,58 @@ test effect fn unchangedSubtreesAreReplayedNotRepainted() -> ()
     | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run replayBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn keptSceneBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run fixtures.cardList(&mut batch)
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 0, "the first frame paints")
+
+  // Frames asked for by the host alone (requestAnimationFrame, a canvas present) keep it.
+  drop run frame(&mut tree, &mut snapshot)
+  drop run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 2, "frames with nothing changed keep the scene")
+
+  // A mutation paints again, and the frame after it keeps the new scene.
+  run tree.apply(run background(fixtures.CARD + 10, 0xfee2e2))
+  let changed = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 2, "a mutation paints")
+  let expected = run freshCardList(&collection, run background(fixtures.CARD + 10, 0xfee2e2))
+  run Testing.expect(samePixels(&changed, &expected), "and paints the change")
+  let after = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.paintsKept == 3, "the frame after a change keeps its scene")
+  run Testing.expect(samePixels(&after, &expected), "which shows the change")
+
+  // A new viewport size or scale paints.
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(tree.paintsKept == 3, "a resize paints")
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 2.0, time: 0.0 })
+  run Testing.expect(tree.paintsKept == 3, "a scale change paints")
+  run tree.frame(FrameInput { width: 500.0, height: 400.0, scale: 2.0, time: 1.0 })
+  run Testing.expect(tree.paintsKept == 4, "a later time alone keeps the scene")
+}
+
+test effect fn framesWithNothingChangedKeepTheLastScene() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run keptSceneBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 effect fn textChangeBody() -> ()
@@ -1004,6 +1055,78 @@ test effect fn iconsPaintWithCurrentColor() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run iconColorsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn emptyIconsBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  // A page's hidden sprite: zero-sized, its symbols drawn by `<use>` elsewhere.
+  run batch.icon(1, b"<svg xmlns='http://www.w3.org/2000/svg' width='0' height='0'><symbol id='s' viewBox='0 0 24 24'><rect width='24' height='24'/></symbol></svg>")
+  run batch.icon(2, b"<svg xmlns='http://www.w3.org/2000/svg'><unclosed")
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(120.0)), css.height(px(60.0))])
+  run batch.create(2, NodeKind.Icon)
+  run batch.append(1, 2)
+  run batch.style(2, &[css.width(px(48.0)), css.height(px(48.0))])
+  run batch.source(2, 1)
+  run batch.create(3, NodeKind.Icon)
+  run batch.append(1, 3)
+  run batch.style(3, &[css.width(px(48.0)), css.height(px(48.0))])
+  run batch.source(3, 2)
+  // What @silkui/core sends for `<use href="#id">` of a sprite's symbol: the symbol in defs.
+  run batch.icon(3, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><use href='#s'/><defs><symbol id='s' viewBox='0 0 24 24'><rect width='24' height='24' fill='#0000ff'/></symbol></defs></svg>")
+  run batch.create(4, NodeKind.Icon)
+  run batch.append(1, 4)
+  run batch.style(4, &[css.width(px(24.0)), css.height(px(24.0))])
+  run batch.source(4, 3)
+  run tree.apply(run batch.take())
+  let mut snapshot = CpuSnapshot.make()
+  let pixels = run frame(&mut tree, &mut snapshot)
+  run Testing.expect(rgbAt(&pixels, 24, 24) == rgbAt(&pixels, 110, 50), "an icon that draws nothing shows nothing")
+  let mut blue: u32 = 0
+  let mut y: u32 = 0
+  while y < 60 {
+    let mut x: u32 = 96
+    while x < 120 {
+      if rgbAt(&pixels, x, y) == 0x0000ff { blue = blue + 1 }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  run Testing.expect(blue >= 400, "a symbol drawn by use")
+}
+
+test effect fn iconsThatDrawNothingAreEmpty() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run emptyIconsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn staleBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.skipsStale = true
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(9, &[css.width(px(10.0))])
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run tree.apply(run batch.take())
+  run Testing.expect(tree.staleSkipped == 1, "the mutation of a missing node is skipped and counted")
+  run Testing.expect(tree.nodes.length() >= 2, "and the rest of its batch applies")
+}
+
+test effect fn hostsMaySkipMutationsOfMissingNodes() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run staleBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 import stylesheets as _stylesheets

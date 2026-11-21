@@ -1,6 +1,6 @@
 import svg_css.element { PseudoTarget }
 //! The tree's node records and the per-frame data shared by the tree and its painter.
-import mutation { NodeKind, Declaration, Role, Cursor, CanvasCommand, TriState, Live, Orientation }
+import mutation { NodeKind, Declaration, Role, Cursor, CanvasCommand, TriState, Live, Orientation, NO_SURFACE }
 import style { Computed }
 import style_sheets { Resolved }
 import svg_css.variables { ScopeId }
@@ -22,6 +22,8 @@ import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u32
+import silk.num.f32
+import silk.num.f64
 import silk.num.usize
 import silk.text.string { String }
 
@@ -297,6 +299,8 @@ pub struct Node {
   pub gridDeclared: bool,
   pub gridStyled: bool,
   pub styleNeedsContext: bool,
+  /// A [`Move`] of this frame names the node: it paints as a group the renderer moves.
+  pub sliding: bool,
   pub containerWatch: u32,
   pub styleChange: u32,
   pub generatedSuppressed: bool,
@@ -356,6 +360,29 @@ pub struct NodeExtras {
   pub transition: String,
   pub testId: String,
   pub canvas: List<CanvasCommand>,
+  /// The GPU surface a canvas node shows (`Mutation.SetCanvasSurface`), or `NO_SURFACE`.
+  pub surface: CanvasSurface,
+}
+
+/// The GPU surface of a canvas node: the host's number for it, its natural size in CSS pixels
+/// and whether it is opaque.
+pub struct CanvasSurface {
+  pub id: u32,
+  pub width: u32,
+  pub height: u32,
+  pub opaque: bool,
+}
+
+impl Copy for CanvasSurface {}
+
+impl CanvasSurface {
+  pub fn none() -> CanvasSurface {
+    return CanvasSurface { id: NO_SURFACE, width: 0, height: 0, opaque: false }
+  }
+
+  pub fn isSome(self: Self) -> bool {
+    return self.id != NO_SURFACE
+  }
 }
 
 impl NodeExtras {
@@ -369,6 +396,7 @@ impl NodeExtras {
       transition: String.make(),
       testId: String.make(),
       canvas: List<CanvasCommand>.make(),
+      surface: CanvasSurface.none(),
     }
   }
 }
@@ -529,6 +557,11 @@ impl Node {
   /// The drawing commands of a canvas node.
   pub fn canvas(self: &Self) -> &[CanvasCommand] {
     return match self.extrasOf() { Option.Some { value } => value.canvas.asSlice() _ => &[] }
+  }
+
+  /// The GPU surface of a canvas node, `CanvasSurface.none()` without one.
+  pub fn surface(self: &Self) -> CanvasSurface {
+    return match self.extrasOf() { Option.Some { value } => value.surface _ => CanvasSurface.none() }
   }
 
   pub fn generatedOrigin(self: &Self) -> u32 {
@@ -747,5 +780,62 @@ impl Pending {
   pub fn clear(self: &mut Self) -> () {
     self.list.clear()
     self.data.clear()
+  }
+}
+
+/// The bit that marks the scroll link of a [`Move`]: the node's id with it set, so it never
+/// meets the id of a scroll container.
+pub const MOVE_LINK: u32 = 2147483648
+
+/// How many points of a [`Move`]'s easing are kept.
+pub const MOVE_CURVE: usize = 17
+
+/// A `translate` transition a renderer can run by itself: the node paints as a scroll group
+/// that follows link `node`, whose position is the node's translation, and the renderer puts
+/// it where the transition is at each frame it draws, new frame from the tree or not. So a
+/// screen keeps sliding while the thread that owns the tree is busy.
+pub struct Move {
+  /// The scroll link and position this move drives: [`MOVE_LINK`] with the node's id.
+  pub node: u32,
+  pub slot: u32,
+  /// The translation the transition starts at and ends at, in CSS pixels.
+  pub fromX: f32,
+  pub fromY: f32,
+  pub toX: f32,
+  pub toY: f32,
+  /// When the active phase starts, on the tree's frame clock: it names the transition, the
+  /// same from frame to frame.
+  pub began: f64,
+  /// Seconds of the active phase run when the frame was painted: negative during the delay.
+  pub elapsed: f64,
+  pub duration: f64,
+  /// The easing's output at [`MOVE_CURVE`] evenly spaced inputs from 0 to 1.
+  pub curve: [f32; 17],
+}
+
+impl Copy for Move {}
+
+impl Move {
+  /// The eased progress after `seconds` of the active phase.
+  pub fn eased(self: &Self, seconds: f64) -> f32 {
+    if seconds <= 0.0 {
+      return self.curve[0]
+    }
+    if self.duration <= 0.0 || seconds >= self.duration {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let at = f64.toF32(seconds / self.duration) * 16.0
+    let low = f32.floor(at)
+    let index = f32.toUsize(low)
+    if index + 1 >= MOVE_CURVE {
+      return self.curve[MOVE_CURVE - 1]
+    }
+    let part = at - low
+    return self.curve[index] + (self.curve[index + 1] - self.curve[index]) * part
+  }
+
+  /// Whether the transition is over after `seconds` of the active phase.
+  pub fn over(self: &Self, seconds: f64) -> bool {
+    return seconds >= self.duration
   }
 }

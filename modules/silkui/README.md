@@ -74,8 +74,10 @@ optimization, `--optimize` selects an optimization mode, `--debug` controls debu
 and `--target` selects a native target triple. `--platform` selects the UI host. Only
 `App.dev` builds include the development tools (reload, the development server, the
 inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptimized, as
-`silk build` makes it. Development builds optimize the renderer, inspector server and runtime
-packages while keeping the application unoptimized.
+`silk build` makes it. A Loom app's development build optimizes the renderer, inspector server
+and runtime packages while keeping the application unoptimized. A JavaScript app's development
+host is all engine and renderer, so it is optimized whole, the standard library too, with the
+development tools bound on (`ui_inspect_server.devtools.enabled`).
 
 ### What a built JavaScript app starts from
 
@@ -119,6 +121,7 @@ SILK_UI_TRACE_JS=1 dist/window/my-app
 | Setting | Choices | Notes |
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react(".")`, `Framework.foldkit(".")`, `Framework.js(".")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project's directory (`.` for the project root), whose config has `@silkui/vite`; silkui has it bundle into `.silk/bundle/` |
+| `App.prebuilt(path)` | The app's `app.js`, relative to the project | Takes a bundle another tool built (with `@silkui/vite`), with its `app.sheet` beside it, instead of running `npm ci` and Vite in a copy of the web project: for a pnpm workspace or a custom build script. Build it before `silk task build` |
 | `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the composable SilkJS runtime: web APIs, `fetch` and sockets, Web Crypto, TLS, compression streams and the files the user picks. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |

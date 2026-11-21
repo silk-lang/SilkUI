@@ -13,6 +13,12 @@ import { writeFileSync, rmSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { dirname, join, relative, resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
+
+// The modules of `@silkui/core/globals`, and the globals it defines.
+const CORE_GLOBALS = /[\\/](?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker|base|fetch)\.js$/;
+// Workers up to this size (characters) go into the bundle as data: addresses.
+const INLINE_WORKER_LIMIT = 256 * 1024;
+const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "navigation", "EventSource", "SharedWorker", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB"];
 import { devPlugins } from "./dev.js";
 import { resolveOptions } from "./resolve.js";
 import { compileStylesheet } from "./compiler.js";
@@ -92,12 +98,43 @@ export default function silk(options = {}) {
       if (watching && options.host && child === null) startHost();
     },
   };
+  // `new Worker(new URL("./x.js", import.meta.url))`: Vite bundles the worker as a file of
+  // its own, which a Silk UI app carrying its bundle in memory does not have beside it. A
+  // small worker's code goes into the bundle as a `data:` address instead; a large one stays a
+  // file, addressed from the bundle's own location, and must ship beside it.
+  const workerPlugin = {
+    name: "silk:workers",
+    apply: "build",
+    enforce: "post",
+    generateBundle: {
+      order: "post",
+      handler(_options, output) {
+        const app = output[fileName];
+        if (!app || app.type !== "chunk") return;
+        for (const item of Object.values(output)) {
+          if (item === app || !/\.[cm]?js$/.test(item.fileName)) continue;
+          const code = item.type === "chunk" ? item.code : typeof item.source === "string" ? item.source : new TextDecoder().decode(item.source);
+          const quoted = new RegExp(`(["'\`])[^"'\`]*?${escapeRegExp(item.fileName)}\\1`, "g");
+          if (!quoted.test(app.code)) continue;
+          // A large worker stays a file beside the bundle, which the host reads only when it
+          // starts the worker: inlined, every start of the app would read it too.
+          if (code.length > INLINE_WORKER_LIMIT) {
+            app.code = app.code.replace(quoted, () => JSON.stringify("./" + item.fileName));
+            continue;
+          }
+          app.code = app.code.replace(quoted, () => JSON.stringify("data:text/javascript," + encodeURIComponent(code)));
+          delete output[item.fileName];
+        }
+      },
+    },
+  };
   const apis = options.apis ?? "warn";
   const allow = new Set(options.allow ?? []);
   let root = "";
   let serving = false;
   /** name → { area, owners } */
   const uses = new Map();
+  let browserGlobals = false;
   const apiPlugin = {
     name: "silk:apis",
     enforce: "post",
@@ -109,6 +146,7 @@ export default function silk(options = {}) {
 
     buildStart() {
       uses.clear();
+      browserGlobals = false;
     },
 
     // After the other transforms, so what is scanned is JavaScript.
@@ -120,6 +158,12 @@ export default function silk(options = {}) {
       try {
         ast = this.parse(code);
       } catch {
+        return;
+      }
+      // `@silkui/core/globals` provides the browser globals, and its own modules test for what
+      // they use.
+      if (CORE_GLOBALS.test(id.split("?")[0])) {
+        browserGlobals ||= /globals\.js$/.test(id.split("?")[0]);
         return;
       }
       const owner = ownerOf(id, root);
@@ -136,6 +180,9 @@ export default function silk(options = {}) {
     },
 
     buildEnd(error) {
+      if (browserGlobals) for (const name of PROVIDED_BY_GLOBALS) uses.delete(name);
+      // Its Worker runs on the full runtime's worker threads.
+      if (browserGlobals && node) uses.delete("Worker");
       if (error || serving || uses.size === 0) return;
       if (apis === "error") this.error(report(uses));
       this.warn(report(uses));
@@ -175,7 +222,7 @@ export default function silk(options = {}) {
       if (!emittedStylesheet) rmSync(stylesheetPath, { force: true });
     },
   };
-  const plugins = [buildPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
+  const plugins = [buildPlugin, workerPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }
@@ -208,6 +255,10 @@ const silkImports = {
 const NOT_IN_NODE = new Set(["dom", "storage", "workers"]);
 
 const BUILTINS = new Set(builtinModules);
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** `node:<name>` when `id` names a Node builtin, with or without the prefix. */
 function builtinOf(id) {

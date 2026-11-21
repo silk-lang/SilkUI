@@ -21,7 +21,8 @@
 //! let status = run runWindow(&mut app, &fonts, List<Mutation>.make(), options, Inspector.off(), &mut client)
 //! run app.close()
 //! ```
-import ui_js.lib { JsHost, JsError, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
+import ui_js_calls.gpu { GpuReply }
+import ui_js.lib { JsHost, JsError, ShellRequest, ClipboardRequest, ClipboardData, EncodedItem, encodeItem, imageLoadable, imageBuild, engineBuild }
 import opener { Openers }
 import shell { serveShell, deliverShell, ShellAnswer }
 import natives { NativeJobs, Finished }
@@ -32,8 +33,20 @@ import ui_tree.census { Census }
 import ui_tree.legacy { UiTree, TreeError }
 import ui_tree_window.host { WindowClient, environmentVariable }
 import ui_tree_window.loader { Loader }
-import ui_tree_window.platform_thread { HostPlatform }
+import ui_tree_window.platform_thread { HostPlatform, Nudge }
+import ui_tree.cssom_view { getBoundingClientRect }
+import webview.types { Placement }
+import webview.wire { WireEvent, OP_OPEN, OP_CLOSE }
+import silk.geometry.rect { Rect }
+import silk.num.f32
+import silk.num.u8
+import silk.num.u32
 import ui_tree_window.console { StderrWriter }
+import ui_tree_window.canvas_frames { CanvasPresenter, CanvasFrame, SharedPicture }
+import ui_tree.canvas2d { Bitmap }
+import ui_tree.mutation { NO_SURFACE }
+import ui_js_gpu.service { GpuService }
+import ui_tree.legacy { Batch }
 import silkjs.js_atomics_native { Domain }
 import silkjs.runtime_memory { RuntimeAllocator, AllocationObserver }
 import window.types { WindowError, WindowId, WindowOptions, TitleBar }
@@ -49,6 +62,7 @@ import silk.io.writer { Writer }
 import silk.mem.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.text.string { String }
 import silk.num.f64
+import silk.num.f32
 
 /// A module given to [`JsApp.define`], kept to define it again after a reload.
 struct Defined {
@@ -76,7 +90,80 @@ pub struct JsApp<'m> {
   traced: bool,
   /// The bytes JavaScript used after the last [`JsApp.release`].
   settled: usize,
+  /// Runs JavaScript's WebGPU calls on the application's own GPU device, once the window
+  /// gave the handle canvases present through ([`JsApp.canvases`]).
+  gpu: Option<GpuService>,
+  /// Where the bitmaps of 2D canvases are shown from, the same handle the GPU canvases use.
+  presenter: Option<CanvasPresenter>,
+  /// The page zoom JavaScript last heard of, to tell it when a zoom key changes it.
+  zoom: f32,
+  /// The web views JavaScript opened, each shown at its node.
+  webViews: List<HostedView>,
+  /// A layout moved a web view: the next turn places it.
+  placesPending: bool,
+  /// Ends the window's wait, for a layout that moved a web view.
+  nudge: Option<Nudge>,
+  /// JavaScript's `quit(code)`: the window closes and the program exits with the code.
+  quitCode: Option<i32>,
 }
+
+/// A web view and the node it shows at.
+struct HostedView {
+  view: u32,
+  node: u32,
+  /// JavaScript's `shown`: a hidden view keeps its page.
+  shown: bool,
+  /// Where it was last placed, and where the last layout puts it.
+  placed: Placement,
+  wanted: Placement,
+}
+
+/// `__ui.shell` op 44, show or hide a web view: view, 0 or 1. Served here, not by the views.
+const OP_SHOW: u32 = 44
+
+/// `__ui.shell` op 45, quit: the exit code.
+const OP_QUIT: u32 = 45
+
+/// `__ui.shellEvent` kind of a web view event: `a` the view, `x` its code, `text` its fields.
+const WEB_VIEW_EVENT: u32 = 20
+
+fn samePlacement(a: &Placement, b: &Placement) -> bool {
+  return a.visible == b.visible && a.bounds.xMin == b.bounds.xMin && a.bounds.yMin == b.bounds.yMin
+    && a.bounds.xMax == b.bounds.xMax
+    && a.bounds.yMax == b.bounds.yMax
+    && a.clip.xMin == b.clip.xMin
+    && a.clip.yMin == b.clip.yMin
+    && a.clip.xMax == b.clip.xMax
+    && a.clip.yMax == b.clip.yMax
+}
+
+fn fieldNumber(text: string, at: usize) -> u32 {
+  let bytes = String.utf8Bytes(text)
+  let mut field: usize = 0
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 31 {
+      if field == at {
+        return value
+      }
+      field = field + 1
+      value = 0
+    } else if field == at && bytes[i] >= 48 && bytes[i] <= 57 {
+      value = value * 10 + u8.toU32(bytes[i] - 48)
+    }
+    i = i + 1
+  }
+  return if field == at {
+    value
+  } else {
+    0
+  }
+}
+
+/// How many rounds of WebGPU commands one turn serves: the promise jobs of one round's
+/// answers may write commands again, and the rest waits for the next turn.
+const GPU_ROUNDS: usize = 16
 
 /// A quiet moment collects garbage when JavaScript's memory moved this much since the last
 /// one: a launch, a screen built or taken down. Smaller changes are the engine's own business.
@@ -184,6 +271,13 @@ impl<'m> JsApp<'m> {
       image: b"",
       openers: Openers.make(),
       settled: 0,
+      gpu: Option<GpuService>.None,
+      presenter: Option<CanvasPresenter>.None,
+      webViews: List<HostedView>.make(),
+      placesPending: false,
+      nudge: Option<Nudge>.None,
+      quitCode: Option<i32>.None,
+      zoom: 1.0,
     }
   }
 
@@ -330,12 +424,20 @@ impl<'m> JsApp<'m> {
     let unloaded = run Effect.result(self.host.unload()) |> Effect.provideMut<Allocator>(&mut self.allocator)
     run self.settle(move unloaded)
     run self.host.flushRaw(&mut tree)
+    // The new realm reads the same clock: timers it sets before the next tick are due
+    // from now, not from the time the host started.
+    let clock = self.host.clock()
     run self.host.close() |> Effect.provideMut<Allocator>(&mut self.allocator)
     let opened = run Effect.result(JsHost.open(self.memory, self.domain)) |> Effect.provideMut<Allocator>(&mut self.allocator)
     match move opened {
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Success { value } => {
         self.host = move value
+        self.host.advance(clock)
         self.host.attach(&mut tree)
+        if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+          runner.reset()
+          self.host.enableGpu()
+        }
       }
       Result<JsHost<'m>, OutOfMemoryError | JsError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
@@ -408,6 +510,196 @@ impl<'m> JsApp<'m> {
     return true
   }
 
+  /// Runs web view call `op` with `text`'s fields: opening and closing keep the view's node here,
+  /// showing is served here, the rest goes to the platform's views.
+  effect fn webView(
+    self: &mut Self,
+    op: u32,
+    text: string,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> f64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = fieldNumber(text, 0)
+    if op == OP_QUIT {
+      self.quitCode = Option<i32>.some(u32.toI32(view))
+      return 0.0
+    }
+    if op == OP_SHOW {
+      let shown = fieldNumber(text, 1) != 0
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].view == view {
+          list[i].shown = shown
+          list[i].wanted.visible = shown && list[i].wanted.visible
+          self.placesPending = true
+        }
+        i = i + 1
+      }
+      return 0.0
+    }
+    let value = run platform.webView(op, window, text)
+    if op == OP_OPEN && value != 0.0 {
+      let hidden = Placement.hidden()
+      run self.webViews.append(
+        HostedView {
+          view: view,
+          node: fieldNumber(text, 1),
+          shown: true,
+          placed: hidden,
+          wanted: hidden,
+        },
+      )
+      self.placesPending = true
+    }
+    if op == OP_CLOSE {
+      let mut i: usize = 0
+      while i < self.webViews.length() {
+        if self.webViews.asSlice()[i].view == view {
+          drop self.webViews.remove(i)
+        } else {
+          i = i + 1
+        }
+      }
+    }
+    return value
+  }
+
+  /// Where the last layout puts each web view: its node's border box, in the window.
+  effect fn measureWebViews(self: &mut Self, tree: &UiTree<'_>, scale: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.webViews.length() == 0 {
+      return ()
+    }
+    let window = Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height)
+    let list = self.webViews.asMutSlice()
+    let mut moved = false
+    let mut i: usize = 0
+    while i < list.length {
+      let rect = run getBoundingClientRect(tree, list[i].node)
+      let x = f64.toF32(rect.x)
+      let y = f64.toF32(rect.y)
+      let bounds = Rect<f32>.new(x, y, x + f64.toF32(rect.width), y + f64.toF32(rect.height))
+      let wanted = Placement {
+        bounds: bounds,
+        clip: window,
+        visible: list[i].shown && rect.width > 0.0 && rect.height > 0.0,
+        scale: scale,
+      }
+      if !samePlacement(&wanted, &list[i].wanted) {
+        list[i].wanted = wanted
+        moved = true
+      }
+      i = i + 1
+    }
+    if moved {
+      self.placesPending = true
+      if let Option<Nudge>.Some { value } = &self.nudge {
+        value.nudge()
+      }
+    }
+  }
+
+  /// Places the web views a layout moved and hands what the views reported to JavaScript, then
+  /// applies what it built. Says whether there were events.
+  effect fn webViewTurn(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.placesPending {
+      self.placesPending = false
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if !samePlacement(&list[i].placed, &list[i].wanted) {
+          list[i].placed = list[i].wanted
+          run platform.placeWebView(list[i].view, list[i].wanted)
+        }
+        i = i + 1
+      }
+    }
+    let mut events = List<WireEvent>.make()
+    run platform.takeWebViewEvents(&mut events)
+    if events.length() == 0 {
+      return false
+    }
+    self.host.attach(&mut tree)
+    while events.length() != 0 {
+      let event = events.remove(0)
+      let told = run Effect.result(
+        self.host.shellEvent(
+          WEB_VIEW_EVENT,
+          u32.toF64(event.view),
+          u32.toF64(event.code),
+          0.0,
+          String.view(&event.text),
+        ),
+      )
+        |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
+    run self.host.flushRaw(&mut tree)
+    return true
+  }
+
+  /// The exit code JavaScript's `quit` asked for, 0 when it did not.
+  pub fn exitCode(self: &Self) -> i32 {
+    return match self.quitCode {
+      Option<i32>.Some { value } => value
+      Option<i32>.None => 0
+    }
+  }
+
+  /// Gives JavaScript `navigator.gpu`: its canvases present their frames through `presenter`.
+  pub fn canvases(self: &mut Self, presenter: CanvasPresenter) -> () {
+    self.presenter = Option<CanvasPresenter>.some(presenter.clone())
+    self.gpu = Option<GpuService>.some(GpuService.make(move presenter))
+    self.host.enableGpu()
+  }
+
+  /// Runs the WebGPU commands JavaScript wrote on the application's GPU device, presents the
+  /// canvases they drew, and settles the promises they answer. Says whether that changed the
+  /// tree or left commands for the next turn.
+  effect fn graphics(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let mut changed = run self.show2d(&mut tree)
+    let mut round: usize = 0
+    while round < GPU_ROUNDS {
+      let commands = self.host.takeGpuCommands()
+      if commands.length() == 0 { return changed }
+      let mut batch = Batch.make()
+      let mut replies = List<GpuReply>.make()
+      if let Option<GpuService>.Some { value: runner } = &mut self.gpu {
+        run runner.serve(commands.asSlice(), &mut batch)
+        replies = runner.takeReplies()
+      }
+      if self.traced {
+        StderrWriter.print("silkui: gpu, {} command bytes, {} answers\n", &(commands.length(), replies.length()))
+      }
+      if batch.length() != 0 {
+        run tree.apply(run batch.take())
+        changed = true
+      }
+      self.host.attach(&mut tree)
+      let answered = run Effect.result(self.host.answerGpu(move replies)) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move answered)
+      run self.host.flushRaw(&mut tree)
+      round = round + 1
+    }
+    return true
+  }
+
+  /// Shows the bitmaps Canvas 2D drew into since the last call, each as a frame of its canvas
+  /// node's surface, and closes the surfaces of canvases that are gone. Says whether that
+  /// changed the tree.
+  effect fn show2d(self: &mut Self, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+    return match &self.presenter {
+      Option<CanvasPresenter>.Some { value } => run presentCanvas2d(&value, &mut tree)
+      Option<CanvasPresenter>.None => false
+    }
+  }
+
   /// Starts JavaScript's `fn.async(...)` calls of exported Silk functions on threads, and
   /// settles the ones that ended, then applies what their promise jobs built. Says whether a
   /// call ended.
@@ -426,16 +718,36 @@ impl<'m> JsApp<'m> {
     return true
   }
 
-  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts) through
-  /// `platform`, and the calls their promise jobs made, then applies what it built. Says
-  /// whether there were calls.
-  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
+  /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
+  /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
+  /// there were calls.
+  effect fn shell(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform, window: WindowId) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
     self.host.attach(&mut tree)
+    let zoomed = tree.pageZoom() != self.zoom
+    if zoomed {
+      self.zoom = tree.pageZoom()
+      let told = run Effect.result(self.host.shellEvent(11, f32.toF64(self.zoom), 0.0, 0.0, "")) |> Effect.provideMut<Allocator>(&mut self.allocator)
+      run self.settle(move told)
+    }
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
-      let requests = self.host.takeShell()
-      if requests.length() == 0 { break }
-      let mut answers = run serveShell(move requests, &mut platform)
+      let all = self.host.takeShell()
+      if all.length() == 0 { break }
+      let mut requests = List<ShellRequest>.make()
+      let mut early = List<ShellAnswer>.make()
+      let mut taken = move all
+      while taken.length() != 0 {
+        let request = taken.remove(0)
+        if request.op >= OP_OPEN {
+          let value = run self.webView(request.op, String.view(&request.text), &mut platform, window)
+          run early.append(ShellAnswer { call: request.call, value: value })
+        } else {
+          run requests.append(move request)
+        }
+      }
+      let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
+      while early.length() > 0 { run answers.append(early.remove(0)) }
       while answers.length() > 0 {
         let ShellAnswer { call, value } = answers.remove(0)
         let answered = run Effect.result(self.host.answerShell(call, value)) |> Effect.provideMut<Allocator>(&mut self.allocator)
@@ -443,7 +755,7 @@ impl<'m> JsApp<'m> {
       }
       round = round + 1
     }
-    if round == 0 { return false }
+    if round == 0 && !zoomed { return false }
     run self.host.flushRaw(&mut tree)
     return true
   }
@@ -549,6 +861,7 @@ impl<T: JsTools> JsClient<T> {
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
     if run self.loader.serve(&mut tree) { drop run state.handle(&mut tree) }
+    drop run state.graphics(&mut tree)
   }
 }
 
@@ -572,6 +885,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     run tree.frame(input)
     run state.observe(&mut tree)
     run self.load(&mut state, &mut tree)
+    run state.measureWebViews(&tree.*, input.scale)
   }
 
   effect fn layoutRoot(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
@@ -580,6 +894,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     run tree.frameRoot(root, input)
     run state.observe(&mut tree)
     run self.load(&mut state, &mut tree)
+    run state.measureWebViews(&tree.*, input.scale)
   }
 
   fn configure(self: &Self, state: &JsApp<'m>, options: &mut WindowOptions<'_>) -> () {
@@ -616,9 +931,17 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
       Platform.startWindowDrag(&mut platform.*, window)
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
-    let shell = run state.shell(&mut tree, &mut platform.*)
+    let shell = run state.shell(&mut tree, &mut platform.*, window)
+    let views = run state.webViewTurn(&mut tree, &mut platform.*)
     let natives = run state.natives(&mut self.jobs, &mut tree)
-    return clipboard || shell || natives
+    let graphics = run state.graphics(&mut tree)
+    return clipboard || shell || views || natives || graphics
+  }
+
+  effect fn canvases(self: &mut Self, state: &mut JsApp<'m>, presenter: CanvasPresenter) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    state.canvases(move presenter)
   }
 
   effect fn start(self: &mut Self, state: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
@@ -631,6 +954,7 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
   effect fn opened(self: &mut Self, state: &mut JsApp<'m>, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
+    state.nudge = Option<Nudge>.some(platform.nudge())
     run self.tools.opened(&mut state, &platform.*)
   }
 
@@ -643,7 +967,8 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     let loaded = run self.loader.serve(&mut tree)
     if loaded { drop run state.handle(&mut tree) }
     let natives = run state.natives(&mut self.jobs, &mut tree)
-    return styled || polled || loaded || natives
+    let graphics = run state.graphics(&mut tree)
+    return styled || polled || loaded || natives || graphics
   }
 
   fn wakeAfter(self: &Self, state: &JsApp<'m>) -> Option<f64> {
@@ -695,6 +1020,10 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     return state.host.nextDeadline()
   }
 
+  fn quitting(self: &Self, state: &JsApp<'m>) -> bool {
+    return state.quitCode.isSome()
+  }
+
   fn wantsFrames(self: &Self, state: &JsApp<'m>) -> bool {
     return state.host.wantsFrame()
   }
@@ -710,4 +1039,57 @@ impl<'m, T: JsTools> WindowClient<JsApp<'m>, never, never> for JsClient<T> {
     ? &mut Allocator {
     run state.release(shed)
   }
+}
+
+/// Shows the 2D canvases of `tree` drawn into since the last call through `presenter`: a
+/// surface for each on its first frame and when it was resized, and a frame of its pixels. Forgets
+/// the bitmaps of canvases no longer in the tree. Says whether it changed the tree.
+pub effect fn presentCanvas2d(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool ! TreeError | OutOfMemoryError ? &mut Allocator {
+  let mut nodes = List<u32>.make()
+  let all = tree.canvas2d.drawn()
+  let mut i: usize = 0
+  while i < all.length {
+    run nodes.append(all[i].node)
+    i = i + 1
+  }
+  i = 0
+  while i < nodes.length() {
+    if !tree.contains(nodes.get(i)) {
+      if let Option<Bitmap>.Some { value } = tree.canvas2d.remove(nodes.get(i)) {
+        if value.surface != NO_SURFACE { run presenter.close(value.surface) }
+      }
+    }
+    i = i + 1
+  }
+  let mut batch = Batch.make()
+  let mut heap = Allocator.systemAllocatorProvider()
+  let bitmaps = tree.canvas2d.drawn()
+  i = 0
+  while i < bitmaps.length {
+    let bitmap = &mut bitmaps[i]
+    i = i + 1
+    if !bitmap.drawn { continue }
+    bitmap.drawn = false
+    let width = bitmap.pixels.width()
+    let height = bitmap.pixels.height()
+    if bitmap.surface == NO_SURFACE {
+      bitmap.surface = presenter.open()
+      bitmap.resized = true
+    }
+    if bitmap.resized {
+      bitmap.resized = false
+      run batch.canvasSurface(bitmap.node, bitmap.surface, width, height, bitmap.opaque)
+    }
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(bitmap.pixels.data()) |> Effect.provideMut<Allocator>(&mut heap)
+    if presenter.keeps() {
+      let mut kept = List<u8>.make()
+      run kept.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+      run presenter.keepPixels(bitmap.surface, width, height, move kept)
+    }
+    run presenter.present(CanvasFrame { surface: bitmap.surface, width: width, height: height, pixels: move pixels, shared: Option<SharedPicture>.None })
+  }
+  if batch.length() == 0 { return false }
+  run tree.apply(run batch.take())
+  return true
 }

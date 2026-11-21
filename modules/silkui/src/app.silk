@@ -33,7 +33,8 @@
 //! The steps run inside a task (`silk task`): they use the task's root as the project
 //! directory and its compiler for `silk build`.
 import stylesheets
-import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, webgpuExports, libm }
+import inspector_socket
+import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, inspectorWriter, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import bundle as Bundles
 import web { Server, site }
@@ -309,6 +310,8 @@ pub struct App {
   runtimeCss: bool,
   places: List<Target>,
   custom: string<'static>,
+  /// A bundle the app's own tools built (see [`App.prebuilt`]), relative to the project, or "".
+  prebuiltBundle: string<'static>,
   stylePaths: List<string<'static>>,
   bundled: String,
   compiledSheet: String,
@@ -664,6 +667,24 @@ effect fn bundle(app: &App, project: &Project) -> StepHandle
   return run Bundles.register(&run Path.make(web.view()))
 }
 
+/// The app's `app.js`: the prebuilt one, or the output of the bundle step.
+effect fn bundleFile(app: &App, project: &Project) -> Deferred<Path>
+  ! BuildError | TaskError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  if app.prebuiltBundle != "" {
+    let path = run prebuiltPath(app, project)
+    return run Deferred<Path>.external(path.view())
+  }
+  let step = run bundle(app, project)
+  return run step.output("bundle/app.js")
+}
+
+effect fn prebuiltPath(app: &App, project: &Project) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run fromRoot(project, app.prebuiltBundle)
+}
+
 /// Whether a build of `app` writes a bytecode image of its bundle for the window host: a
 /// JavaScript app on the SilkJS engine with a generated host, in a build that bundles
 /// (not `dev`, which runs what the development server sends). An image is written by a
@@ -682,7 +703,7 @@ fn imaged(app: &App, options: &Options, dev: bool) -> bool {
 effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   ! BuildError | TaskError
   ? &mut Allocator | &mut HostInput | &mut FileSystem {
-  let bundle = run bundle(app, project)
+  let bundled = run bundleFile(app, project)
   let source = run imageWriter()
   let files = run WriteFiles.make().text("main.silk", source.view())
   let generated = run files.register()
@@ -692,9 +713,25 @@ effect fn image(app: &App, project: &Project, options: &Options) -> StepHandle
   let rooted = run writer.root(run generated.output("main.silk"))
   let configured = run rooted.unsandboxedTools(options.unsandboxedTools)
   let tool = run configured.artifact()
-  let reads = run Run.artifact(move tool).inputFile(run bundle.output("bundle/app.js"))
+  let reads = run Run.artifact(move tool).inputFile(move bundled)
   let writes = run (run reads.outputFile("app.bin")).outputFile("core.bin")
   return run writes.register()
+}
+
+/// The inspector's command line program for a development window host (`<app>-inspect`),
+/// built from the app's manifest so that it always matches the inspector the host serves.
+effect fn inspectorProgram(app: &App, options: &Options) -> Compilation
+  ! BuildError | TaskError
+  ? &mut Allocator | &mut HostInput | &mut FileSystem {
+  let source = run inspectorWriter()
+  let files = run WriteFiles.make().text("main.silk", source.view())
+  let generated = run files.register()
+  let mut name = run String.copy(app.named)
+  run name.append("-inspect")
+  let program = run Compilation.executable(name.view(), "src/main.silk")
+  let rooted = run program.root(run generated.output("main.silk"))
+  let debugged = run rooted.debug(run Deferred<bool>.value(options.debugInfo()))
+  return run debugged.unsandboxedTools(options.unsandboxedTools)
 }
 
 // --- App: the definition ---
@@ -711,6 +748,7 @@ impl App {
       runtimeCss: false,
       places: List<Target>.make(),
       custom: "",
+      prebuiltBundle: "",
       stylePaths: List<string<'static>>.make(),
       bundled: String.make(),
       compiledSheet: String.make(),
@@ -778,6 +816,21 @@ impl App {
     return move app
   }
 
+  /// Takes the bundle at `path` (relative to the project, such as `"web/dist/app.js"`) as the
+  /// app's instead of building one with npm and Vite: for a web project another tool builds,
+  /// such as one in a pnpm workspace. Its `app.sheet` beside it, when there is one, is the
+  /// compiled stylesheet. Build it with `@silkui/vite` before `silk task build`.
+  pub effect fn prebuilt<'env, E, ? R>(
+    self: once Effect<'env; App ! E ? R>,
+    path: string<'static>,
+  ) -> App
+    ! E
+    ? R {
+    let mut app = run move self
+    app.prebuiltBundle = path
+    return move app
+  }
+
   /// Includes the CSS text compiler in a release native or canvas host. Development hosts always include it.
   pub effect fn runtimeStylesheets<'env, E, ? R>(self: once Effect<'env; App ! E ? R>) -> App
     ! E
@@ -810,6 +863,18 @@ impl App {
 
   pub fn targets(self: &App) -> &[Target] {
     return self.places.asSlice()
+  }
+
+  fn hasWindow(self: &App) -> bool {
+    let all = self.places.asSlice()
+    let mut at: usize = 0
+    while at < all.length {
+      if all[at].id() == "window" {
+        return true
+      }
+      at = at + 1
+    }
+    return false
   }
 
   fn sheetCount(self: &App) -> usize {
@@ -945,7 +1010,12 @@ impl App {
         }
         move styled
       }
-      let optimized = run initial.optimize(run Deferred<Optimize>.value(options.optimize))
+      // A JavaScript app's development host is all engine and renderer: it is optimized whole,
+      // the standard library too (code split across units of other settings is not inlined
+      // across them), and binds the development tools on (`ui_inspect_server.devtools`).
+      let wholeDev = self.custom == "" && target.id() == "window" && dev && plan.kind != Kind.Loom
+      let level = if wholeDev { Optimize.Speed } else { options.optimize }
+      let optimized = run initial.optimize(run Deferred<Optimize>.value(level))
       let debugged = run optimized.debug(run Deferred<bool>.value(options.debugInfo()))
       let configured = run debugged.unsandboxedTools(options.unsandboxedTools)
       let platform = if target.web() {
@@ -975,8 +1045,7 @@ impl App {
         }
       }
       let bundled = if self.custom == "" && plan.kind != Kind.Loom && !plan.dev {
-        let bundle = run bundle(self, &project)
-        let texted = run platform.embed("app_bundle", run bundle.output("bundle/app.js"))
+        let texted = run platform.embed("app_bundle", run bundleFile(self, &project))
         if plan.image {
           // Embedded, the image's bytes are part of the program for as long as it runs,
           // which is how long the engine reads them.
@@ -990,34 +1059,25 @@ impl App {
         move platform
       }
 
-      // The app retains its requested mode; the engine, renderer, and inspector stay responsive.
-      let compilation = if self.custom == "" && target.id() == "window" && dev {
-        let alias = if plan.kind == Kind.Loom {
-          "silkui_window_loom"
-        } else if plan.kind == Kind.Node {
-          "silkui_window_node"
-        } else {
-          "silkui_window"
-        }
-        let optimizedHost = run bundled.package(alias, run speedPackage())
+      // A Loom app keeps its requested mode; its renderer and inspector stay responsive.
+      let compilation = if wholeDev {
+        let tools = run Package.make().set("devtools.silk", "enabled", run Deferred<bool>.value(true))
+        run bundled.package("ui_inspect_server", move tools)
+      } else if self.custom == "" && target.id() == "window" && dev {
+        let optimizedHost = run bundled.package("silkui_window_loom", run speedPackage())
         let renderer = run optimizedHost.package("ui_tree", run speedPackage())
         let host = run renderer.package("ui_inspect_server", run speedPackage())
-        if plan.kind == Kind.Loom {
-          run host.package("loom", run speedPackage())
-        } else {
-          let engine = run host.package("silkjs", run speedPackage())
-          if plan.kind == Kind.Node {
-            run engine.package("node_runtime", run speedPackage())
-          } else {
-            move engine
-          }
-        }
+        run host.package("loom", run speedPackage())
       } else {
         move bundled
       }
       let previousGraph = move graph
       graph = run previousGraph.add(move compilation)
       at = at + 1
+    }
+    if dev && self.custom == "" && self.hasWindow() {
+      let previousGraph = move graph
+      graph = run previousGraph.add(run inspectorProgram(self, options))
     }
     return move graph
   }
@@ -1103,8 +1163,16 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   } else {
     Mode.Release
   }
+  // A socket an inspected app left behind when it was killed stops every walk of its
+  // directory, the bundle's and the fingerprints', so it goes before anything lists one.
+  if run inspector_socket.clear(String.view(&project.root)) {
+    tell("removed a stale inspector socket in the project")
+  }
   if app.writtenIn.dir() != "" {
     let web = run fromRoot(&project, app.writtenIn.dir())
+    if run inspector_socket.clear(web.view()) {
+      tell("removed a stale inspector socket in the web project")
+    }
     if mode == Mode.Dev && app.runsOn != Runtime.Node {
       run installed(web.view())
     }
@@ -1116,10 +1184,20 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   if bundles {
     // The bundle is cached, so the compilations below reuse this build of it. Vite's
     // compiled stylesheet, when the app's Vite configuration makes one, is embedded too.
-    let producer = run bundle(&app, &project)
-    let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
-    let built = run graph.compile()
-    app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
+    if app.prebuiltBundle != "" {
+      app.bundled = run prebuiltPath(&app, &project)
+      if !run exists(app.bundled.view()) {
+        let mut message = run String.copy("silkui: the prebuilt bundle ")
+        run message.append(app.bundled.view())
+        run message.append(" does not exist; build the web project first")
+        run Task.abort(message.view())
+      }
+    } else {
+      let producer = run bundle(&app, &project)
+      let graph = run (run Build.make()).addStep(move producer, "bundle/app.js")
+      let built = run graph.compile()
+      app.bundled = run Context.text(&built.artifacts.asSlice()[0].path)
+    }
     let length = String.byteLength(app.bundled.view())
     let mut sheet = run String.copy(String.slice(app.bundled.view(), 0, length - 6))
     run sheet.append("app.sheet")
@@ -1202,6 +1280,16 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
       run app.hosts.append(Host { target: target, dir: move directory, generated: true })
     } else {
       run artifacts.append(Artifact { target: target, path: move path, bytes: bytes })
+    }
+    at = at + 1
+  }
+  // The inspector's command line program follows the hosts in a development build.
+  while at < outputs.length {
+    let path = run Context.text(&outputs[at].path)
+    if String.endsWith(path.view(), "-inspect") || String.endsWith(path.view(), "-inspect.exe") {
+      let mut note = run String.copy("inspector command line: ")
+      run String.append(&mut note, relative(String.view(&project.root), path.view()))
+      run say(String.view(&note))
     }
     at = at + 1
   }

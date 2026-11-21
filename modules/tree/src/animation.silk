@@ -15,6 +15,10 @@ import style { Computed, TextStyle }
 import style
 import motion { Sample }
 import motion
+import filter_motion { FilterList }
+import filter_motion
+import paint_css { Effects }
+import paint_css
 import timing { Easing, EasingStops, AnimationSpec, AnimationLists }
 import timing
 import node { NONE, Event, EventKind }
@@ -714,6 +718,111 @@ effect fn applyOne(tree: &UiTree<'_>, playing: &Playing, now: f64, blocked: u64,
       w = w + 1
     }
   }
+}
+
+/// The `filter` the node's animations show at the frame clock over `underlying`, the list
+/// its style computes (`filter` lives in its paint effects, which `apply` does not reach).
+/// Later animations win. None when no animation sets it now, or a list has more functions
+/// than `filter_motion` eases. `basis` is what the keyframes' lengths and colors compute against.
+pub effect fn applyFilters(tree: &UiTree<'_>, slot: u32, underlying: FilterList, basis: paint_css.Basis) -> Option<FilterList>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if tree.animations.length() == 0 {
+    return Option<FilterList>.None
+  }
+  let bit = u64.shiftLeft(1, u32.toU64(motion.FILTER))
+  if u64.bitAnd(importantFields(tree, slot), bit) != 0 {
+    return Option<FilterList>.None
+  }
+  let id = tree.node(slot).id
+  let now = tree.input.time
+  let list = tree.animations.asSlice()
+  let range = rangeOf(list, slot)
+  let mut current = underlying
+  let mut moved = false
+  let mut i = range[0]
+  while i < range[1] {
+    if list[i].id == id {
+      if let Option<FilterList>.Some { value } = run filterOf(tree, &list[i], now, current, basis) {
+        current = value
+        moved = true
+      }
+    }
+    i = i + 1
+  }
+  return if moved { Option<FilterList>.some(current) } else { Option<FilterList>.None }
+}
+
+// One animation's `filter` at `now` over `base`, as `applyOne` eases the other fields.
+effect fn filterOf(tree: &UiTree<'_>, playing: &Playing, now: f64, base: FilterList, basis: paint_css.Basis) -> Option<FilterList>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut overall: f64 = 0.0
+  if !progressAt(playing, now, &mut overall) {
+    return Option<FilterList>.None
+  }
+  let rule = match named(tree, playing.slot, playing.name) {
+    Option.Some { value } => value
+    Option.None => { return Option<FilterList>.None }
+  }
+  let bit = u64.shiftLeft(1, u32.toU64(motion.FILTER))
+  if u64.bitAnd(rule.fields, bit) == 0 {
+    return Option<FilterList>.None
+  }
+  let p = directed(&playing.spec, overall)
+  let frames = rule.frames.asSlice()
+  // The frames around p that set it; a missing end is the underlying value.
+  let mut before = usize.MAX
+  let mut after = usize.MAX
+  let mut i: usize = 0
+  while i < frames.length {
+    if u64.bitAnd(frames[i].fields, bit) != 0 {
+      if frames[i].offset <= p {
+        before = i
+      } else if after == usize.MAX || frames[i].offset == frames[after].offset {
+        after = i
+      }
+    }
+    i = i + 1
+  }
+  let from = if before == usize.MAX { base } else {
+    match run frameFilters(&frames[before], basis) {
+      Option<FilterList>.Some { value } => value
+      _ => { return Option<FilterList>.None }
+    }
+  }
+  let to = if after == usize.MAX { base } else {
+    match run frameFilters(&frames[after], basis) {
+      Option<FilterList>.Some { value } => value
+      _ => { return Option<FilterList>.None }
+    }
+  }
+  let fromOffset: f32 = if before == usize.MAX { 0.0 } else { frames[before].offset }
+  let toOffset: f32 = if after == usize.MAX { 1.0 } else { frames[after].offset }
+  let easing = if before != usize.MAX && frames[before].eased {
+    frames[before].easing
+  } else {
+    playing.spec.easing
+  }
+  let span = toOffset - fromOffset
+  let t: f32 = if span <= 0.0 { 0.0 } else { f32.max(0.0, f32.min(1.0, (p - fromOffset) / span)) }
+  return Option<FilterList>.some(filter_motion.mix(&from, &to, easing.at(t, &tree.easingStops)))
+}
+
+// The `filter` keyframe `frame` sets.
+effect fn frameFilters(frame: &Frame, basis: paint_css.Basis) -> Option<FilterList>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut effects = Effects.make()
+  let declarations = frame.declarations.asSlice()
+  let mut i: usize = 0
+  while i < declarations.length {
+    if declarations[i].property == CssProperty.Filter {
+      run paint_css.apply(&mut effects, &declarations[i], basis)
+    }
+    i = i + 1
+  }
+  return filter_motion.of(&effects)
 }
 
 /// Queues the records of the current root's animations at the frame clock and restyles the

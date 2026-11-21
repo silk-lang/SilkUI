@@ -177,6 +177,40 @@
   Object.defineProperty(globalThis.navigator, "hardwareConcurrency", { value: native.cpus(), enumerable: true, configurable: true });
   Object.defineProperty(globalThis.navigator, "getBattery", { value: () => api().getBattery(), writable: true, configurable: true });
 
+  // WebGPU (webgpu.js, evaluated on first use): `navigator.gpu` and the GPU globals, in a host
+  // that runs WebGPU commands. A canvas node gets its "webgpu" context from `native.gpuLoad`.
+  let gpuApi = null;
+  const gpu = (native.gpuLoad = () => (native.gpuEnabled() ? (gpuApi ??= (0, eval)(native.gpuApi())(native)) : null));
+  Object.defineProperty(globalThis.navigator, "gpu", { get: () => gpu()?.gpu, enumerable: true, configurable: true });
+  for (const name of ["GPU", "GPUAdapter", "GPUAdapterInfo", "GPUDevice", "GPUQueue", "GPUBuffer", "GPUTexture", "GPUTextureView", "GPUSampler", "GPUBindGroupLayout", "GPUPipelineLayout", "GPUBindGroup", "GPUShaderModule", "GPUCompilationInfo", "GPURenderPipeline", "GPUComputePipeline", "GPUCommandEncoder", "GPUCommandBuffer", "GPURenderPassEncoder", "GPUComputePassEncoder", "GPUCanvasContext", "GPUSupportedFeatures", "GPUSupportedLimits", "GPUDeviceLostInfo", "GPUError", "GPUValidationError", "GPUOutOfMemoryError", "GPUInternalError", "GPUPipelineError", "GPUUncapturedErrorEvent", "GPURenderBundleEncoder", "GPURenderBundle", "GPUQuerySet", "GPUExternalTexture", "GPUBufferUsage", "GPUTextureUsage", "GPUShaderStage", "GPUMapMode", "GPUColorWrite"]) {
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = gpu()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
+  // Canvas 2D (canvas2d.js, evaluated on first use) in a host that shows canvases: a canvas node
+  // gets its "2d" context from `native.canvas2dLoad`.
+  let canvas2dApi = null;
+  const canvas2d = (native.canvas2dLoad = () => (native.canvas2dEnabled() ? (canvas2dApi ??= (0, eval)(native.canvas2dApi())(native)) : null));
+  for (const name of ["CanvasRenderingContext2D", "Path2D", "ImageData", "TextMetrics", "CanvasGradient", "CanvasPattern"]) {
+    if (name in globalThis) continue;
+    Object.defineProperty(globalThis, name, {
+      get: () => {
+        const value = canvas2d()?.globals[name];
+        if (value !== undefined) own(name, value);
+        return value;
+      },
+      set: (value) => own(name, value),
+      configurable: true,
+    });
+  }
+
   // As `window.open` in a browser, for an address outside the application: the host opens
   // it with the system's browser or mail program. Only http, https and mailto addresses go.
   globalThis.open = (url) => {
