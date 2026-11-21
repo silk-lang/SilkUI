@@ -52,8 +52,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     ! GpuError | OutOfMemoryError {
     drop cache
     let mut heap = Allocator.systemAllocatorProvider()
-    let canvases = run CanvasPresenter.detached()
-      |> Effect.provideMut<Allocator>(&mut heap)
+    let canvases = run CanvasPresenter.detached() |> Effect.provideMut<Allocator>(&mut heap)
     return EarlyRenderer { settings: settings, canvases: move canvases }
   }
 
@@ -157,10 +156,18 @@ pub effect fn headlessRequested() -> bool
   }
 }
 
-
 import platform_thread { HostPlatform, Launched }
 import vector.pixmap { Pixmap }
-import ui_inspect_server.lib { Inspector, InspectorOptions, Interaction, Startup, SLOW_INTERACTION_MS, interactionName, interactionTarget, slowLine }
+import ui_inspect_server.lib {
+  Inspector,
+  InspectorOptions,
+  Interaction,
+  Startup,
+  SLOW_INTERACTION_MS,
+  interactionName,
+  interactionTarget,
+  slowLine
+}
 import ui_inspect_server.server { debugBuild }
 import silk.core.result { Result }
 import silk.system.host_input { HostInput, HostInputError }
@@ -352,6 +359,10 @@ pub interface WindowClient<S, E, ? R> {
     ! TreeError | AtlasError | GeometryError | OutOfMemoryError
     ? &mut Allocator {}
 
+  /// The frame the last `frame` call made is on its way to the screen. `frame` alone does
+  /// not say so: a served inspector also asks for frames only it reads.
+  fn shown(self: &mut Self, state: &S) -> () {}
+
   /// Returns the completed tree scene or a client composition.
   fn scene<'s>(self: &'s Self, state: &'s S, tree: &'s UiTree<'_>) -> &'s Scene {
     return tree.scene()
@@ -512,8 +523,14 @@ pub interface WindowClient<S, E, ? R> {
 
 /// The scale the first window most likely opens at, before there is one to ask.
 static if Intrinsic.targetOperatingSystem() == "darwin" {
-  unsafe extern "C" fn mallocPressureRelief(zone: usize, goal: usize) -> usize as "malloc_zone_pressure_relief"
-  unsafe extern "C" fn threadQos(class: u32, relative: i32) -> i32 as "pthread_set_qos_class_self_np"
+  unsafe extern "C" fn mallocPressureRelief(
+    zone: usize,
+    goal: usize,
+  ) -> usize as "malloc_zone_pressure_relief"
+  unsafe extern "C" fn threadQos(
+    class: u32,
+    relative: i32,
+  ) -> i32 as "pthread_set_qos_class_self_np"
 }
 
 /// Asks macOS to schedule the calling thread as it does an app's main thread. The UI thread
@@ -566,7 +583,11 @@ impl QuietWatch {
 
   /// When this spell's call is due, or a negative number when it had it.
   fn dueAt(self: &Self) -> f64 {
-    return if self.told { -1.0 } else { self.since + QUIET_SECONDS }
+    return if self.told {
+      -1.0
+    } else {
+      self.since + QUIET_SECONDS
+    }
   }
 
   fn due(self: &Self, now: f64) -> bool {
@@ -1294,7 +1315,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   interactiveThread()
   static if Intrinsic.targetArchitecture() != "wasm32" {
     if !options.check {
-      if let Option<String>.Some { value: spec } = move run environmentVariable(headless.BENCH_VARIABLE) {
+      if let Option<String>.Some { value: spec } = move run environmentVariable(
+        headless.BENCH_VARIABLE,
+      ) {
         let x = match move run environmentVariable("SILK_UI_BENCH_X") {
           Option<String>.Some { value } => headless.number(String.view(&value))
           Option<String>.None => -1.0
@@ -1344,31 +1367,41 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   inspector.deferInput()
   let mut clock = Clock.make()
   let started = run seconds(&mut clock)
+
   // Debug builds time each interaction from its input to the frame that shows it, and say on
   // standard error when one is slow (see `performance` in modules/inspect/server).
   let watching = debugBuild() && !check
   let mut waiting = Waiting.none()
   let mut windowOpenAt: f64 = 0.0
   let mut gpuAt: f64 = 0.0
+
   // SILK_UI_TRACE_FRAMES prints a line on standard error as each frame is presented, for
   // benchmarks that time startup and input to pixels from outside the process.
   let tracing = !check && (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
+
   // SILK_UI_FRAME_STATS prints a line on standard error each second: the frames painted and the
   // average milliseconds of each step of one, on this thread and on the render thread.
   let timing = !check && (run environmentVariable("SILK_UI_FRAME_STATS")).isSome()
+
   // SILK_UI_UNCAPPED draws frames one after another instead of one per display refresh, and
   // presents them without waiting for the display: how many frames a second the app could
   // draw, for benchmarks. Frames may tear, and the app takes a whole processor core.
   let uncapped = !check && (run environmentVariable("SILK_UI_UNCAPPED")).isSome()
+
   // SILK_UI_TRACE_PRESENTS says the running total of frames the window showed on standard error
   // (`silk-ui: frames shown N`): uncapped, a benchmark's frame callbacks can outrun the display.
   let tracePresents = !check && (run environmentVariable("SILK_UI_TRACE_PRESENTS")).isSome()
   let mut shownTotal: u64 = 0
   let mut shownSaidAt: f64 = 0.0
+
+  // How far the clock of frame requests is ahead of this loop's `time`.
+  let mut frameClockAhead: f64 = 0.0
   let mut timed = FrameTimes.none()
+
   // The most nodes the tree has held since freed memory was last handed back, and the frames
   // in a row it has held under half of that.
   let mut heldNodes: usize = 0
+
   // Freed memory is handed back at `releaseAt` (seconds since the start, negative for never),
   // `releaseLeft` times with longer waits between: the scenes, the renderer and the script
   // engine each let go of what a busy screen needed some time after it is gone. By the
@@ -1380,6 +1413,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if tracing {
     StderrWriter.print("silk-ui: host started\n", &())
   }
+
   // The GPU starts first, unless the app started it already: on its own thread it takes longer
   // than everything up to the first frame on this one.
   let mut options = move options
@@ -1393,6 +1427,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     Option.None => run prepareGpu(check)
   }
   let mut tree = run UiTree.make(collection)
+
   // Ctrl/Cmd + and - zoom the page; a browser zooms a canvas page on its own.
   static if Intrinsic.targetArchitecture() != "wasm32" {
     tree.zoomKeys = true
@@ -1421,6 +1456,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   if !check {
     run companion.attach(&mut tree, &mut inspector)
+
     // The first frame's styles, layout and paint, while the window system starts (about
     // 100 ms on macOS): at the size asked for, the first real frame finds them done.
     let early = FrameInput {
@@ -1429,17 +1465,32 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       scale: f64.toF32(expectedScale()),
       time: (run seconds(&mut clock)) - started,
     }
+
     // In the appearance the window will open in: laid out in the default (light) one, a Mac
     // in dark mode restyled and laid out the whole page again on the first real frame.
     if let Option<Launched>.Some { value: launched } = &options.platform {
       drop tree.setStylePreferences(stylePreferences(launched.appearance() == Appearance.Dark))
     }
     run content.prepare(&mut state, &mut tree)
-    let startLayout = if tracing { run seconds(&mut clock) } else { 0.0 }
+    let startLayout = if tracing {
+      run seconds(&mut clock)
+    } else {
+      0.0
+    }
     run content.layout(&mut state, &mut tree, early)
     if tracing {
       let endLayout = run seconds(&mut clock)
-      StderrWriter.print("cold-layout-ms={} nodes={} boxes={} output-boxes={} fragments={} probes={}\n", &((endLayout - startLayout) * 1000.0, tree.nodes.length(), tree.stats.layout.fullLayouts, tree.output.boxes.length(), tree.output.fragments.values.length(), tree.stats.layout.sizeProbes))
+      StderrWriter.print(
+        "cold-layout-ms={} nodes={} boxes={} output-boxes={} fragments={} probes={}\n",
+        &(
+          (endLayout - startLayout) * 1000.0,
+          tree.nodes.length(),
+          tree.stats.layout.fullLayouts,
+          tree.output.boxes.length(),
+          tree.output.fragments.values.length(),
+          tree.stats.layout.sizeProbes
+        ),
+      )
     }
     run content.frame(&mut state, &mut tree, early, &inspector)
     if tracing {
@@ -1456,6 +1507,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let mut windowOptions = WindowOptions.make(options.title, options.width, options.height)
   windowOptions.minSize = Option<Size2<f64>>.some(Size2<f64>.new(240.0, 200.0))
   content.configure(&state.*, &mut windowOptions)
+
   // On macOS the window shows once its first frame is presented, so it never shows blank
   // (Electron's ready-to-show). AppKit sends no frames to a hidden window: this loop draws
   // that first frame without waiting for one.
@@ -1477,12 +1529,15 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
 
   // A request line for the inspector ends the wait for the next event, as a post does.
-  if serves { run inspector.wakeWith(platform.nudge()) }
+  if serves {
+    run inspector.wakeWith(platform.nudge())
+  }
   let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
 
   // The GPU lives on the render thread; frames go there as copies (see render_thread.silk).
   let mut renderer = run attachRenderer(move early, raw, owner)
+
   // Screenshots copy the frame the render thread drew instead of drawing one on the CPU.
   let mut grabbing = false
   if serves {
@@ -1492,6 +1547,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if tracing {
     StderrWriter.print("silk-ui: gpu ready\n", &())
   }
+
   // The Metal Performance HUD, when the app (`showMetalHud`) or SILK_UI_METAL_HUD asked.
   let hudAsked = match move run environmentVariable("SILK_UI_METAL_HUD") {
     Option<String>.Some { value } => String.view(&value) != "0" && String.view(&value) != ""
@@ -1500,6 +1556,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   if !check && (hudAsked || metal_hud.defaultOn()) {
     renderer.setMetalHud(true)
   }
+
   // GPU canvases may show in compositor layers of their own above the window
   // (canvas_layer_plan.silk), when SILK_UI_CANVAS_LAYERS=on asks for it.
   let layersOn = match move run environmentVariable("SILK_UI_CANVAS_LAYERS") {
@@ -1514,6 +1571,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   // With a platform thread, wheels scroll the frame on screen at once (render_thread.silk);
   // the tree takes the offsets on its next pass.
   let compositing = platform.threaded() && !check
+
   // The render thread also runs `translate` transitions by itself (`UiTree.moves`), so a
   // screen keeps sliding while this thread is busy. SILK_UI_COMPOSITED_MOVES=off leaves
   // them to this thread.
@@ -1529,6 +1587,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   }
   let mut fastScrolls = List<FastScrolled>.make()
   let mut fastSeq: u64 = 0
+
   // Whether the compositor's last frame has wheel listeners to leave alone: they move with a scroll.
   let mut wheelBlocked = false
   let mut intervals = List<f64>.make()
@@ -1551,10 +1610,18 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // The windows of the roots past the first, with those `start` opened.
   let mut others = List<RootWindow>.make()
-  if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock), companion.overlay()) {
+  if run syncWindows(
+    &mut tree,
+    &mut platform,
+    &mut renderer,
+    &mut others,
+    dockRoot(&dock),
+    companion.overlay(),
+  ) {
     run content.pump(&mut state, &mut tree)
   }
   let mut drawn: u64 = 0
+
   // The device size of the last frame submitted: a frame of another size is always submitted.
   let mut submittedWidth: u32 = 0
   let mut submittedHeight: u32 = 0
@@ -1563,7 +1630,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
   let first = clientSize(width, height, &dock)
   run content.resize(&mut state, &mut tree, f64.toF32(first.width), f64.toF32(first.height))
   platform.requestFrame(owner)
-  let mut mediaPreferences = if check { Preferences.desktop(false) } else { stylePreferences(platform.appearance() == Appearance.Dark) }
+  let mut mediaPreferences = if check {
+    Preferences.desktop(false)
+  } else {
+    stylePreferences(platform.appearance() == Appearance.Dark)
+  }
   while true {
     // The first root is current but while a window of another root is served.
     drop run tree.useRoot(FIRST_ROOT)
@@ -1578,9 +1649,16 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if releaseAt >= 0.0 && now >= releaseAt {
       releaseFreed()
       releaseLeft = releaseLeft - 1
-      releaseAt = if releaseLeft == 0 { -1.0 } else if releaseLeft == 2 { now + 4.0 } else { now + 12.0 }
+      releaseAt = if releaseLeft == 0 {
+        -1.0
+      } else if releaseLeft == 2 {
+        now + 4.0
+      } else {
+        now + 12.0
+      }
     }
-    if !check && quiet.due(now) && !content.wantsFrames(&state.*) && !content.needsFrame(&state.*, &tree) {
+    if !check && quiet.due(now) && !content.wantsFrames(&state.*)
+      && !content.needsFrame(&state.*, &tree) {
       let shed = quiet.take(tree.liveNodes())
       run content.quiet(&mut state, &mut tree, shed)
     }
@@ -1591,6 +1669,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if !check && content.quitting(&state.*) {
       break
     }
+
     // Uncapped, frames follow one another only while there is something to draw: an idle
     // window waits for events as a capped one does, instead of drawing the same frame.
     let flowing = uncapped && (content.wantsFrames(&state.*) || content.needsFrame(&state.*, &tree))
@@ -1631,12 +1710,17 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           deadline = due
         }
       }
+
       // A spell already due waits for the frame that is coming instead of spinning.
       let quietAt = quiet.dueAt()
       if quietAt > now && (deadline < 0.0 || quietAt - now < deadline) {
         deadline = quietAt - now
       }
-      match if serves { inspector.pollInterval() } else { Option<f64>.None } {
+      match if serves {
+        inspector.pollInterval()
+      } else {
+        Option<f64>.None
+      } {
         Option<f64>.Some { value } => Wait.Seconds {
           seconds: if deadline >= 0.0 && deadline < value {
             deadline
@@ -1661,8 +1745,13 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           Wait.Forever => -1.0
           Wait.Poll => 0.0
         }
+
         // A platform on this thread sees window events only in its own wait.
-        let bounded = if platform.threaded() || (limit >= 0.0 && limit < 0.008) { limit } else { 0.008 }
+        let bounded = if platform.threaded() || (limit >= 0.0 && limit < 0.008) {
+          limit
+        } else {
+          0.008
+        }
         if run content.wait(&mut state, &mut tree, bounded) {
           platform.requestFrame(owner)
         }
@@ -1682,7 +1771,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
     }
     static if Intrinsic.targetArchitecture() == "wasm32" {
-      if !check { mediaPreferences = stylePreferences(false) }
+      if !check {
+        mediaPreferences = stylePreferences(false)
+      }
     } else {
       if !check {
         if let Option<Event>.Some { value } = &next {
@@ -1736,6 +1827,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       let dropped = run renderer.takePresented(&mut intervals)
       if tracePresents && intervals.length() != 0 {
         shownTotal = shownTotal + usize.toU64(intervals.length())
+
         // At most a line a display frame, so the trace costs a benchmark nothing it can measure.
         if time - shownSaidAt >= 1.0 / 60.0 {
           shownSaidAt = time
@@ -1775,6 +1867,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           run inspector.finishNext(&mut tree, prevented)
         }
         run serve(&mut platform, owner, &mut tree, &mut host)
+
         // What the tree queued to follow the input (a copy, a close or back request), as
         // after window input.
         run followUps(
@@ -1865,6 +1958,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
             let behind = !check && !reveal && renderer.pending()
             if !behind && deviceSize(width, scale) > 0 && deviceSize(height, scale) > 0 {
               let area = clientSize(width, height, &dock)
+              frameClockAhead = targetTime - time
               let viewport = FrameInput {
                 width: f64.toF32(area.width),
                 height: f64.toF32(area.height),
@@ -1874,6 +1968,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if check && drawn == 1 {
                 run content.checkInput(&mut state, &mut tree, viewport, options.checkClick)
               }
+
               // A canvas the animation callbacks draw shows with this frame, not on its own.
               renderer.beginFrame()
               let tickStart = run seconds(&mut clock)
@@ -1907,6 +2002,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 run companion.layout(&mut tree, &mut inspector, docked.root, whole)
                 drop run tree.useRoot(FIRST_ROOT)
               }
+
               // The overlay goes over both, laid out at the client's part of the window, so
               // what it draws at the bottom stays clear of a dock.
               let overlay = companion.overlay()
@@ -1922,11 +2018,17 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               }
               let layered = dock.isSome() || overlay != NONE
               run serve(&mut platform, owner, &mut tree, &mut host)
-              if serves { run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree)) }
+              if serves {
+                run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
+              }
               if layered {
                 composed.clear()
                 run composed.replay(
-                  if serves { inspector.sceneWith(content.scene(&state.*, &tree)) } else { content.scene(&state.*, &tree) },
+                  if serves {
+                    inspector.sceneWith(content.scene(&state.*, &tree))
+                  } else {
+                    content.scene(&state.*, &tree)
+                  },
                   0,
                   usize.MAX,
                 )
@@ -1948,13 +2050,19 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               }
               let compared = checked && status == 0
               let reference = if compared {
-                let mut pixels = run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+                let mut pixels = run snapshot.renderSceneOver(
+                  &tree,
+                  content.scene(&state.*, &tree),
+                  color.white(),
+                )
+
                 // The CPU reference knows no GPU canvas: their newest frames are laid over it.
                 composeCanvases(&canvasFrames, content.scene(&state.*, &tree), &mut pixels)
                 move pixels
               } else {
                 run Pixmap.make(0, 0)
               }
+
               // A frame that would draw the window as it is goes nowhere (`submitsFrame`).
               let unchanged = !submitsFrame(
                 FrameSubmit {
@@ -1973,9 +2081,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   lastHeight: submittedHeight,
                 },
               )
+
               // The frame only scrolled and kept its scene: the render thread draws the last
               // frame again at the new offsets.
               let rescrolled = unchanged && tree.scrollsKept > scrollsKeptBefore
+
               // What the compositor may scroll is read from every node: only for a frame that
               // is handed over, or a scroll that moved the wheel listeners it must leave alone.
               let mut fast = if compositing && (!unchanged || rescrolled && wheelBlocked) {
@@ -2031,6 +2141,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                 submittedHeight = deviceHeight
               }
               renderer.endFrame()
+              content.shown(&state.*)
               tree.clearUploads()
               let submitted = run seconds(&mut clock)
               if watching {
@@ -2064,6 +2175,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               if tracing {
                 StderrWriter.print("silk-ui: frame {} submitted\n", &.(drawn))
               }
+
               // A tree under half its largest size, or a frame that laid out a great many
               // boxes, leaves freed memory behind (see `releaseFreed`).
               let nodes = tree.liveNodes()
@@ -2277,7 +2389,11 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                   redraw = tree.needsFrameOf(into) || (serves && inspector.wantsFrame())
                   drop run tree.useRoot(FIRST_ROOT)
                 } else {
-                  let handling = if watching { run waiting.begin(&tree, &input, &mut clock) } else { -1.0 }
+                  let handling = if watching {
+                    run waiting.begin(&tree, &input, &mut clock)
+                  } else {
+                    -1.0
+                  }
                   let prevented = run content.decide(&mut state, &mut tree)
                   run tree.finish(move input, prevented)
                   run serve(&mut platform, owner, &mut tree, &mut host)
@@ -2292,7 +2408,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
                     &mut host,
                     target,
                   )
-                  if serves { run inspector.observe(&tree) }
+                  if serves {
+                    run inspector.observe(&tree)
+                  }
                   run content.pump(&mut state, &mut tree)
                   if handling >= 0.0 {
                     waiting.handled = waiting.handled + (run seconds(&mut clock)) - handling
@@ -2321,7 +2439,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if !check && run content.update(&mut state, &mut tree, &mut platform, owner) {
       redraw = true
     }
-    if serves && inspector.enabled() && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
+    if serves && inspector.enabled()
+      && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
       let area = clientSize(width, height, &dock)
       run content.prepare(&mut state, &mut tree)
       run content.layout(
@@ -2331,7 +2450,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
           width: f64.toF32(area.width),
           height: f64.toF32(area.height),
           scale: f64.toF32(scale),
-          time: time,
+          // On the frames' clock: a transition this restyle starts is timed by them.
+          time: time + frameClockAhead,
         },
       )
       run serve(&mut platform, owner, &mut tree, &mut host)
@@ -2370,7 +2490,14 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     }
 
     // Windows open, change and close with their roots; each is framed when its root needs it.
-    if run syncWindows(&mut tree, &mut platform, &mut renderer, &mut others, dockRoot(&dock), companion.overlay()) {
+    if run syncWindows(
+      &mut tree,
+      &mut platform,
+      &mut renderer,
+      &mut others,
+      dockRoot(&dock),
+      companion.overlay(),
+    ) {
       run content.pump(&mut state, &mut tree)
       drop run tree.useRoot(FIRST_ROOT)
       redraw = redraw || content.needsFrame(&state.*, &tree)
@@ -2387,7 +2514,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       platform.requestFrame(owner)
     }
   }
-  if serves { run inspector.close() }
+  if serves {
+    run inspector.close()
+  }
   platform.clearCompositor()
   renderer.stop()
   while others.length() != 0 {
@@ -2432,6 +2561,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut tree = run UiTree.make(collection)
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
     tree.zoomKeys = true
+
     // A headless run draws on the CPU: canvas frames go nowhere.
     run content.canvases(&mut state, run CanvasPresenter.detached())
     run content.setup(&mut state, &mut tree)
@@ -2525,6 +2655,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       run content.prepare(&mut state, &mut tree)
       run content.layout(&mut state, &mut tree, viewport)
       run content.frame(&mut state, &mut tree, viewport, &inspector)
+      content.shown(&state.*)
       run serve(&mut platform, owner, &mut tree, &mut host)
       run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
       run snapshot.copyUploads(&tree)
@@ -2538,7 +2669,11 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         let pixels = run snapshot.renderSceneOver(&tree, &recorded, color.white())
         run script.frame(&pixels)
       } else if script.isRecording() {
-        let pixels = run snapshot.renderSceneOver(&tree, content.scene(&state.*, &tree), color.white())
+        let pixels = run snapshot.renderSceneOver(
+          &tree,
+          content.scene(&state.*, &tree),
+          color.white(),
+        )
         run script.frame(&pixels)
       } else {
         run overlay.tear(&mut tree, &mut inspector)
@@ -2604,9 +2739,12 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut inspector = move inspector
     inspector.deferInput()
     let mut clock = Clock.make()
+
     // SILK_UI_BENCH_PAUSE=<ms> spins that long before the clock starts, so a sampler started
     // with the process is attached before the first frame's work begins.
-    if let Option<String>.Some { value: pause } = move run environmentVariable("SILK_UI_BENCH_PAUSE") {
+    if let Option<String>.Some { value: pause } = move run environmentVariable(
+      "SILK_UI_BENCH_PAUSE",
+    ) {
       let until = (run seconds(&mut clock)) + headless.number(String.view(&pause)) / 1000.0
       while (run seconds(&mut clock)) < until {}
     }
@@ -2640,13 +2778,20 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       scale: 2.0,
       time: 0.0,
     }
+
     // `SILK_UI_VERIFY_CACHES=1`: every repair of the paint caches is compared with a rebuild.
     tree.repair.verify = (run environmentVariable("SILK_UI_VERIFY_CACHES")).isSome()
+
     // `SILK_UI_BOX_PATCH=off`: box changes match boxes generated afresh instead of patching
     // the kept ones (css-layout box_patch.silk), to compare the two.
-    if let Option<String>.Some { value: patch } = move run environmentVariable("SILK_UI_BOX_PATCH") {
-      if String.view(&patch) == "off" { tree.output.patching = false }
+    if let Option<String>.Some { value: patch } = move run environmentVariable(
+      "SILK_UI_BOX_PATCH",
+    ) {
+      if String.view(&patch) == "off" {
+        tree.output.patching = false
+      }
     }
+
     // `SILK_UI_BENCH_CENSUS=1`: see `printCensus`. A number above 1 also prints one every
     // that many frames (phase `every`), for a reader that wants the census at moments of its
     // own, such as xbench's marks (xbench/tools/census.py).
@@ -2667,6 +2812,7 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut quiet = QuietWatch.make()
     while frame < frames {
       let time = u32.toF64(frame) / 120.0
+
       // Work this frame: what the tree or the client asked for before it, and its layout.
       let mut worked = content.needsFrame(&state.*, &tree) || content.wantsFrames(&state.*)
       let tickStart = run seconds(&mut clock)
@@ -2679,7 +2825,9 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         run content.tick(&mut state, &mut tree, time, true)
       }
       if frame == frames / 2 && pointerX >= 0.0 && pointerY >= 0.0 {
-        run tree.dispatch(Input.PointerMove { x: f64.toF32(pointerX), y: f64.toF32(pointerY), modifiers: 0 })
+        run tree.dispatch(
+          Input.PointerMove { x: f64.toF32(pointerX), y: f64.toF32(pointerY), modifiers: 0 },
+        )
         run content.pump(&mut state, &mut tree)
         worked = true
         StderrWriter.print("bench: pointer moved in\n", &())
@@ -2688,16 +2836,23 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       if content.quitting(&state.*) {
         break
       }
-      let input = FrameInput { width: viewport.width, height: viewport.height, scale: viewport.scale, time: time }
+      let input = FrameInput {
+        width: viewport.width,
+        height: viewport.height,
+        scale: viewport.scale,
+        time: time,
+      }
       let layoutStart = run seconds(&mut clock)
       run content.prepare(&mut state, &mut tree)
       run content.layout(&mut state, &mut tree, input)
       let layoutEnd = run seconds(&mut clock)
       run content.frame(&mut state, &mut tree, input, &inspector)
+      content.shown(&state.*)
       let paintEnd = run seconds(&mut clock)
       run serve(&mut platform, owner, &mut tree, &mut host)
       tree.clearUploads()
       run content.pump(&mut state, &mut tree)
+
       // As the window does between frames: a quiet spell's call (`WindowClient.quiet`).
       if worked || !tree.stats.layoutSkipped || content.wantsFrames(&state.*) {
         quiet.busy(time, tree.liveNodes())
@@ -2718,9 +2873,15 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
         )
         StderrWriter.print(
           "bench: startup setup-ms={} start-ms={} open-to-layout-ms={}\n",
-          &((setupEnd - started) * 1000.0, (startEnd - setupEnd) * 1000.0, (layoutStart - startEnd) * 1000.0),
+          &(
+            (setupEnd - started) * 1000.0,
+            (startEnd - setupEnd) * 1000.0,
+            (layoutStart - startEnd) * 1000.0
+          ),
         )
-        if let Option<String>.Some { value: wanted } = move run environmentVariable("SILK_UI_BENCH_DIGEST") {
+        if let Option<String>.Some { value: wanted } = move run environmentVariable(
+          "SILK_UI_BENCH_DIGEST",
+        ) {
           run benchDigest(&tree, String.view(&wanted) == "dump")
         }
         if census {
@@ -2753,14 +2914,25 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
             ),
           )
         }
+
         // The steady state is measured between two marks: frames/2 - 60 (before the pointer
         // moves in) and the last frame.
         let mut mark = ""
-        if frame + 60 == frames / 2 { mark = "steady-a" }
-        if frame + 2 == frames / 2 { mark = "steady-b" }
-        if frame + 1 == frames / 2 + frames / 4 { mark = "inside-a" }
-        if frame + 1 == frames { mark = "last" }
-        if census && mark == "" && censusEvery > 1 && frame % censusEvery == 0 { mark = "every" }
+        if frame + 60 == frames / 2 {
+          mark = "steady-a"
+        }
+        if frame + 2 == frames / 2 {
+          mark = "steady-b"
+        }
+        if frame + 1 == frames / 2 + frames / 4 {
+          mark = "inside-a"
+        }
+        if frame + 1 == frames {
+          mark = "last"
+        }
+        if census && mark == "" && censusEvery > 1 && frame % censusEvery == 0 {
+          mark = "every"
+        }
         if census && mark != "" {
           let mut rows = Census.make()
           run tree.census(&mut rows)
@@ -2805,14 +2977,27 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
       }
       frame = frame + 1
     }
+
     // The digests again after the last frame, which retained layout reached by every change.
-    if let Option<String>.Some { value: wanted } = move run environmentVariable("SILK_UI_BENCH_DIGEST") {
-      StderrWriter.print("bench: last frame patches={} fallbacks={}\n", &(tree.output.patches, tree.output.patchFallbacks))
+    if let Option<String>.Some { value: wanted } = move run environmentVariable(
+      "SILK_UI_BENCH_DIGEST",
+    ) {
+      StderrWriter.print(
+        "bench: last frame patches={} fallbacks={}\n",
+        &(tree.output.patches, tree.output.patchFallbacks),
+      )
       run benchDigest(&tree, String.view(&wanted) == "dump")
     }
     StderrWriter.print(
       "bench: paint-caches repaired={} rebuilt={} (uncarried={} fragile={}) verify={} mismatches={}\n",
-      &(tree.repair.repairs, tree.repair.rebuilds, tree.repair.uncarried, tree.repair.fragileRebuilds, tree.repair.verify, tree.repair.mismatches),
+      &(
+        tree.repair.repairs,
+        tree.repair.rebuilds,
+        tree.repair.uncarried,
+        tree.repair.fragileRebuilds,
+        tree.repair.verify,
+        tree.repair.mismatches
+      ),
     )
     run benchHold("last frame")
     StderrWriter.print("bench: done\n", &())
@@ -2836,7 +3021,10 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
 effect fn printCensus(phase: string<'static>, frame: u32, rows: &Census) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  StderrWriter.print("census: phase={} frame={} footprint={}\n", &(phase, frame, process_memory.footprint()))
+  StderrWriter.print(
+    "census: phase={} frame={} footprint={}\n",
+    &(phase, frame, process_memory.footprint()),
+  )
   let names = rows.names.asSlice()
   let values = rows.values.asSlice()
   let mut index: usize = 0
@@ -2851,9 +3039,15 @@ effect fn printCensus(phase: string<'static>, frame: u32, rows: &Census) -> ()
         &(phase, frame, names[index], entries, capacity, each, entries * each, capacity * each),
       )
     } else if kind == UNIT {
-      StderrWriter.print("census: phase={} frame={} unit {} count={}\n", &(phase, frame, names[index], entries))
+      StderrWriter.print(
+        "census: phase={} frame={} unit {} count={}\n",
+        &(phase, frame, names[index], entries),
+      )
     } else if kind == WORK {
-      StderrWriter.print("census: phase={} frame={} work {} count={}\n", &(phase, frame, names[index], entries))
+      StderrWriter.print(
+        "census: phase={} frame={} work {} count={}\n",
+        &(phase, frame, names[index], entries),
+      )
     }
     index = index + 1
   }
@@ -2887,7 +3081,14 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
   let mut index: usize = 0
   while index < boxList.length() {
     let box = boxList.get(index)
-    boxes = digestMix(boxes, if box.inline { 2.0 } else { 1.0 })
+    boxes = digestMix(
+      boxes,
+      if box.inline {
+        2.0
+      } else {
+        1.0
+      },
+    )
     boxes = digestMix(digestMix(digestMix(digestMix(boxes, box.x), box.y), box.width), box.height)
     boxes = digestMix(digestMix(boxes, box.overflowWidth), box.overflowHeight)
     index = index + 1
@@ -2896,10 +3097,19 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
   while index < textList.length() {
     let text = textList.get(index)
     let mut mixed: u64 = seed
-    mixed = digestMix(digestMix(digestMix(mixed, usize.toF32(text.source)), usize.toF32(text.start)), usize.toF32(text.end))
-    mixed = digestMix(digestMix(digestMix(digestMix(mixed, text.x), text.y), text.width), text.height)
+    mixed = digestMix(
+      digestMix(digestMix(mixed, usize.toF32(text.source)), usize.toF32(text.start)),
+      usize.toF32(text.end),
+    )
+    mixed = digestMix(
+      digestMix(digestMix(digestMix(mixed, text.x), text.y), text.width),
+      text.height,
+    )
     mixed = digestMix(digestMix(digestMix(mixed, text.baseline), text.lineTop), text.lineHeight)
-    mixed = digestMix(digestMix(digestMix(mixed, usize.toF32(text.fontKey)), usize.toF32(text.kind)), usize.toF32(text.bidiLevel))
+    mixed = digestMix(
+      digestMix(digestMix(mixed, usize.toF32(text.fontKey)), usize.toF32(text.kind)),
+      usize.toF32(text.bidiLevel),
+    )
     let mut pen: f32 = 0.0
     let mut ids: u64 = 0
     let mut length: usize = 0
@@ -2909,11 +3119,24 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
       let mut glyph: usize = 0
       while glyph < glyphs.length {
         let entry = glyphs[glyph]
+
         // A glyph's cluster counts from its run's start: the offset in the text node is digested.
         let cluster = text.start + u32.toUsize(entry.cluster)
-        mixed = digestMix(digestMix(digestMix(digestMix(digestMix(mixed, u32.toF32(entry.glyph)), usize.toF32(cluster)), entry.x), entry.y), entry.advance)
+        mixed = digestMix(
+          digestMix(
+            digestMix(
+              digestMix(digestMix(mixed, u32.toF32(entry.glyph)), usize.toF32(cluster)),
+              entry.x,
+            ),
+            entry.y,
+          ),
+          entry.advance,
+        )
         let mut one: u64 = seed
-        one = digestMix(digestMix(digestMix(one, usize.toF32(text.source)), u32.toF32(entry.glyph)), usize.toF32(cluster))
+        one = digestMix(
+          digestMix(digestMix(one, usize.toF32(text.source)), u32.toF32(entry.glyph)),
+          usize.toF32(cluster),
+        )
         one = digestMix(one, f32.floor((text.x + entry.x) * 64.0 + 0.5))
         one = digestMix(one, f32.floor((text.y + text.baseline + entry.y) * 64.0 + 0.5))
         one = digestMix(one, f32.floor(entry.advance * 64.0 + 0.5))
@@ -2932,8 +3155,19 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
       StderrWriter.print(
         "T {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
         &(
-          text.source, text.start, text.end, text.fontKey,
-          text.x, text.y, text.width, text.height, text.lineTop, text.lineHeight, length, ids, pen,
+          text.source,
+          text.start,
+          text.end,
+          text.fontKey,
+          text.x,
+          text.y,
+          text.width,
+          text.height,
+          text.lineTop,
+          text.lineHeight,
+          length,
+          ids,
+          pen,
         ),
       )
     }
@@ -2946,8 +3180,17 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
   StderrWriter.print(
     "bench: fragments={} box={} inline={} line={} (empty={} plain={} single-run={}) text={} (in-plain-lines={}) records={} line-records={}\n",
     &(
-      counts.fragments, counts.boxes, counts.inlines, counts.lines, counts.emptyLines, counts.plainLines,
-      counts.singleLines, counts.textFragments, counts.plainTexts, counts.records, counts.lineRecords,
+      counts.fragments,
+      counts.boxes,
+      counts.inlines,
+      counts.lines,
+      counts.emptyLines,
+      counts.plainLines,
+      counts.singleLines,
+      counts.textFragments,
+      counts.plainTexts,
+      counts.records,
+      counts.lineRecords,
     ),
   )
 }
@@ -2955,7 +3198,13 @@ effect fn benchDigest(tree: &UiTree<'_>, dump: bool) -> ()
 static if Intrinsic.targetArchitecture() != "wasm32" {
   /// The platform events a headless script's desktop line stands for, for `window` of `width`
   /// by `height`.
-  effect fn desktopEvents(input: Desktop, window: WindowId, width: f64, height: f64, out: &mut List<Event>) -> ()
+  effect fn desktopEvents(
+    input: Desktop,
+    window: WindowId,
+    width: f64,
+    height: f64,
+    out: &mut List<Event>,
+  ) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
     match move input {
@@ -3101,11 +3350,16 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
   /// `SILK_UI_BENCH_HOLD=<ms>`: the bench sleeps that long after its first frame and after its
   /// last, so a memory tool (footprint, vmmap, heap, malloc_history) can look at the process at
   /// rest.
-  effect fn benchHold(phase: string) -> () ! OutOfMemoryError ? &mut Allocator {
-    if let Option<String>.Some { value: hold } = move run environmentVariable("SILK_UI_BENCH_HOLD") {
+  effect fn benchHold(phase: string) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if let Option<String>.Some { value: hold } = move run environmentVariable(
+      "SILK_UI_BENCH_HOLD",
+    ) {
       StderrWriter.print("bench: hold {} ms={}\n", &(phase, String.view(&hold)))
       let mut clock = OsMonotonicClock.make()
-      run Effect.sleep(f64.toU64(headless.number(String.view(&hold)) * 1000000.0)) |> Effect.provideMut<MonotonicClock>(&mut clock)
+      run Effect.sleep(f64.toU64(headless.number(String.view(&hold)) * 1000000.0))
+        |> Effect.provideMut<MonotonicClock>(&mut clock)
     }
   }
 }
@@ -3137,7 +3391,9 @@ impl Copy for FrameSubmit {}
 /// not, and the render thread draws only what changes there (a canvas frame, a scroll).
 pub fn submitsFrame(frame: FrameSubmit) -> bool {
   let same = !frame.check && !frame.inspector && !frame.layered && frame.submitted > 0 && frame.kept
-    && frame.uploads == 0 && frame.width == frame.lastWidth && frame.height == frame.lastHeight
+    && frame.uploads == 0
+    && frame.width == frame.lastWidth
+    && frame.height == frame.lastHeight
   return !same
 }
 
