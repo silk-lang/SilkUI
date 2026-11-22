@@ -78,9 +78,9 @@ inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptim
 and runtime packages while keeping the application unoptimized. A JavaScript app's development
 host is all engine and renderer, so it is optimized whole, the standard library too, with the
 development tools bound on (`ui_inspect_server.devtools.enabled`). To measure the build users
-get without a window, build it with `SILK_UI_BUILD_DEVTOOLS=1` in the environment: the host
-then carries the inspector too, so `SILK_UI_HEADLESS` scripts run on it. Do not ship that
-build.
+get without a window, build an app on `Runtime.node()` with `SILK_UI_BUILD_DEVTOOLS=1` in
+the environment: the host then carries the inspector too, so `SILK_UI_HEADLESS` scripts run
+on it. Do not ship that build.
 
 ### What a built JavaScript app starts from
 
@@ -110,6 +110,12 @@ text, which every host carries as well.
 SILK_UI_TRACE_JS=1 dist/window/my-app
 # silkui: JavaScript starts from its bytecode image (2299196 bytes, engine build 7816585738683590938)
 ```
+
+On an app on `Runtime.node()`, `SILK_UI_TRACE_JS` also prints a line for each quiet moment
+that collected or gave memory back (`silkui: quiet, javascript used A then B bytes, C
+released`), and `SILK_UI_TRACE_JS=census` follows each collection with the engine's census
+of the live heap, one `silkui: js census` line a row: cells by kind, objects and their
+slots, shapes, functions and their source text, atoms and the allocator's arenas.
 
 - `App.dev` writes no image: a development window runs what Vite sends, and a reload runs
   the new source.
