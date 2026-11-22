@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { build } from "vite";
+import { build, createServer } from "vite";
 import silk from "../src/index.js";
 import { ownerOf } from "../src/apis.js";
 
@@ -51,4 +51,33 @@ test("a module belongs to its package, or to the project by path", () => {
   assert.equal(ownerOf("/app/node_modules/@scope/pkg/dist/index.js", "/app"), "@scope/pkg");
   assert.equal(ownerOf("/app/node_modules/a/node_modules/b/index.js?v=1", "/app"), "b");
   assert.equal(ownerOf("/app/src/main.js", "/app"), "src/main.js");
+});
+
+// The dev server reports as it serves: an app that imports `@silkui/core/globals` hears
+// nothing about the globals it defines, from its own modules or the pre-bundled globals.
+test("the dev server leaves out what @silkui/core/globals provides", async () => {
+  const dir = mkdtempSync(join(fileURLToPath(new URL(".", import.meta.url)), ".apis-dev-"));
+  mkdirSync(join(dir, "src"));
+  writeFileSync(join(dir, "src/main.js"), 'import "@silkui/core/globals";\nimport "./view.js";\ndocument.title = String(new URL("a:b"));\n');
+  writeFileSync(join(dir, "src/view.js"), "export const seen = new MutationObserver(() => fetch(window.location.href));\n");
+  const warnings = [];
+  const server = await createServer({
+    root: dir,
+    configFile: false,
+    cacheDir: join(dir, ".vite"),
+    customLogger: { info() {}, warn: (message) => warnings.push(message), warnOnce: (message) => warnings.push(message), error() {}, clearScreen() {}, hasErrorLogged: () => false, hasWarned: false },
+    server: { middlewareMode: true, ws: false },
+    plugins: [silk({ entry: "src/main.js" })],
+  });
+  try {
+    const silkEnv = server.environments.silk;
+    await silkEnv.transformRequest("/src/main.js");
+    await silkEnv.transformRequest("/src/view.js");
+  } finally {
+    await server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  const text = warnings.join("\n");
+  assert.match(text, /fetch \(network\)/);
+  assert.doesNotMatch(text, /document|window|MutationObserver|URL/);
 });
