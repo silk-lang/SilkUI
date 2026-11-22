@@ -11,14 +11,20 @@ if (!packages) throw new Error("set SILK_PACKAGES to <silkui>/modules/js/package
 // (vite, react-reconciler) resolve to this app's.
 const { default: silk } = await import("@silkui/vite");
 const { default: react } = await import("@silkui/react/vite");
-// `xb-scene.css` (src/main.tsx) is style/chat.css in the chat build and bench.css, imported
+// `xb-scene.css` (src/main.tsx) is style/chat.css in the chat build, style/t3.css in the input build and bench.css, imported
 // already, in every other one: their CSS stays what it was.
-const sceneCss = fileURLToPath(new URL(`../../../style/${(process.env.VITE_XB_SCENE ?? "feed").split("-")[0] === "chat" ? "chat" : "bench"}.css`, import.meta.url));
+const sceneCss = fileURLToPath(new URL(`../../../style/${{ chat: "chat", input: "t3" }[(process.env.VITE_XB_SCENE ?? "feed").split("-")[0]] ?? "bench"}.css`, import.meta.url));
+
+const pageJson = fileURLToPath(new URL(`../../../content/${(process.env.VITE_XB_SCENE ?? "feed").split("-")[0] === "input" ? "t3-page" : "no-page"}.json`, import.meta.url));
 
 export default defineConfig({
   plugins: [silk({ entry: "src/main.tsx" }), react()],
   resolve: {
-    alias: [{ find: /^xb-scene\.css$/, replacement: sceneCss }],
+    alias: [
+      { find: /^xb-scene\.css$/, replacement: sceneCss },
+      // The input scene's page, in the input build only: other bundles stay as they were.
+      { find: /^xb-page\.json$/, replacement: pageJson },
+    ],
     dedupe: ["react", "react-reconciler", "scheduler"],
   },
   build: {

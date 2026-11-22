@@ -863,6 +863,34 @@ const eventClasses = {
   StorageEvent: global.StorageEvent ?? eventClass("StorageEvent", BaseEvent, { key: null, oldValue: null, newValue: null, url: "", storageArea: null }),
   PageTransitionEvent: global.PageTransitionEvent ?? eventClass("PageTransitionEvent", BaseEvent, { persisted: false }),
 };
+// The host's events are the runtime's own `Event`s; each answers `instanceof` for the classes
+// a browser gives its type.
+const POINTER_TYPES = ["pointerdown", "pointerup", "pointermove", "pointerover", "pointerout", "pointerenter", "pointerleave", "pointercancel", "gotpointercapture", "lostpointercapture", "click", "auxclick", "contextmenu"];
+const MOUSE_TYPES = [...POINTER_TYPES, "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "mouseenter", "mouseleave", "dblclick", "wheel", "dragstart", "drag", "dragenter", "dragover", "dragleave", "drop", "dragend"];
+const HOST_TYPES = {
+  KeyboardEvent: ["keydown", "keyup"],
+  MouseEvent: MOUSE_TYPES,
+  PointerEvent: POINTER_TYPES,
+  WheelEvent: ["wheel"],
+  DragEvent: ["dragstart", "drag", "dragenter", "dragover", "dragleave", "drop", "dragend"],
+  FocusEvent: ["focus", "blur", "focusin", "focusout"],
+  InputEvent: ["input", "beforeinput"],
+  TouchEvent: ["touchstart", "touchmove", "touchend", "touchcancel"],
+  AnimationEvent: ["animationstart", "animationiteration", "animationend", "animationcancel"],
+  TransitionEvent: ["transitionrun", "transitionstart", "transitionend", "transitioncancel"],
+};
+HOST_TYPES.UIEvent = [...MOUSE_TYPES, "keydown", "keyup", "focus", "blur", "focusin", "focusout", "input", "beforeinput", "touchstart", "touchmove", "touchend", "touchcancel"];
+for (const [name, types] of Object.entries(HOST_TYPES)) {
+  const Class = eventClasses[name];
+  const hosted = new Set(types);
+  const own = Function.prototype[Symbol.hasInstance];
+  Object.defineProperty(Class, Symbol.hasInstance, {
+    value(value) {
+      return own.call(this, value) || (value instanceof core.Event && hosted.has(value.type));
+    },
+    configurable: true,
+  });
+}
 for (const [name, value] of Object.entries(eventClasses)) if (global[name] === undefined) define(name, value);
 
 // Markup to nodes and back: an HTML or SVG string becomes a document whose root is the parsed

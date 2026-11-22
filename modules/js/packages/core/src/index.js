@@ -4245,9 +4245,13 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
     event.code = second;
     event.repeat = d !== 0;
   } else if (kind === 11) {
+    const before = event.target instanceof Input ? event.target._text() : null;
     event.value = first;
     event.inputType = second;
     event.target._changed?.(first, a, b, third, fourth, d);
+    event.data = insertedText(second, before, first);
+    event.isComposing = second === "insertCompositionText";
+    event.dataTransfer = null;
     if (event.target instanceof RichInput) event.document = event.target.document;
   } else if (kind === 12) {
     event.scrollLeft = a;
@@ -4267,6 +4271,17 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
     event.elapsedTime = a;
     event.pseudoElement = second ?? "";
   }
+}
+
+// An `input` event's `data`: the text an insertion put in, found by what `before` and `after`
+// share at their ends. Deletions and line breaks have none.
+function insertedText(inputType, before, after) {
+  if (before === null || !inputType?.startsWith("insert") || inputType === "insertLineBreak" || inputType === "insertParagraph") return null;
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let end = 0;
+  while (end < before.length - start && end < after.length - start && before[before.length - 1 - end] === after[after.length - 1 - end]) end++;
+  return after.slice(start, after.length - end);
 }
 
 /**
@@ -4342,7 +4357,10 @@ function compatMouse(kind, event, target) {
   if (kind === 0 && event.defaultPrevented && pointer) pointer.mute = true;
   const muted = pointer?.mute && (kind === 0 || kind === 1 || kind === 3);
   if (kind === 1 && pointer) pointer.mute = false;
-  if (!muted && event.isPrimary) dispatchEvent(mouseEvent(type, event, target));
+  if (muted || !event.isPrimary) return false;
+  const mouse = mouseEvent(type, event, target);
+  dispatchEvent(mouse);
+  return mouse.defaultPrevented;
 }
 
 // The finger whose prevented `pointerdown` mutes its tap's mouse events.
@@ -4385,7 +4403,10 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   else if (kind === BLUR) blurring(target);
   if (kind === CLICK && !prevented && !activate(target)) follow(target);
   if (kind !== CLICK && isPointerKind(kind)) {
-    if (event.pointerType !== "touch") compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target);
+    // A prevented mousedown keeps focus and the selection where they are, as on the web.
+    if (event.pointerType !== "touch") {
+      if (compatMouse(kind, event, live && event.target instanceof SvgElement ? event.target : target) && kind === 0) prevented = true;
+    }
     // A finger's defaults (pan, focus, the tap's click) follow its touch events, not its
     // pointer events, as on the web.
     else {

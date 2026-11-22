@@ -372,3 +372,35 @@ test("createImageBitmap decodes a Blob on the host and crops, resizes and flips 
   await assert.rejects(createImageBitmap(copied), { name: "InvalidStateError" });
   assert.throws(() => new ImageBitmap(), TypeError);
 });
+
+test("the host's events answer instanceof for their browser classes", () => {
+  const field = document.createElement("textarea");
+  document.body.appendChild(field);
+  const seen = [];
+  for (const type of ["keydown", "pointerdown", "mousedown", "input", "focus"]) {
+    field.addEventListener(type, (event) => seen.push([
+      type,
+      event instanceof KeyboardEvent,
+      event instanceof MouseEvent,
+      event instanceof PointerEvent,
+      event instanceof InputEvent,
+      event instanceof FocusEvent,
+      event instanceof UIEvent,
+    ]));
+  }
+  mock.native.dispatch(7, field.nodeId, 0, 0, 0, 0, 0, "a", "KeyA");
+  mock.native.dispatch(0, field.nodeId, 0, 0, 256 + 64, 0, 1);
+  mock.native.dispatch(1, field.nodeId, 0, 0, 256 + 64, 0, 0);
+  mock.input(field.nodeId, "a");
+  mock.native.dispatch(9, field.nodeId, 0, 0, 0, 0, 0);
+  assert.deepEqual(seen, [
+    ["keydown", true, false, false, false, false, true],
+    ["pointerdown", false, true, true, false, false, true],
+    ["mousedown", false, true, false, false, false, true],
+    ["input", false, false, false, true, false, true],
+    ["focus", false, false, false, false, true, true],
+  ]);
+  assert.ok(new KeyboardEvent("keydown") instanceof KeyboardEvent, "made events still answer");
+  assert.ok(!(new Event("keydown") instanceof KeyboardEvent));
+  field.remove();
+});
