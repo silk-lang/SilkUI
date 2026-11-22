@@ -38,6 +38,9 @@ import silk.system.filesystem { FileError }
 import silk.system.host_input { HostInputError }
 import silk.testing.testing { Testing, AssertionError }
 import silk.text.string { String }
+import svg_css.written
+import svg_css.tokens { CssError }
+import ui_tree.style { REGION_NONE, REGION_NO_DRAG }
 
 fn viewport() -> FrameInput {
   return fixtures.viewport(2)
@@ -388,6 +391,49 @@ test effect fn pointerHoverPressCaptureAndClick() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pointerBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Window drag regions.
+
+/// A 40px header (2) with `app-region: drag` holds a no-drag button (3, with an `inherit`
+/// child 7) and a plain label (4); below it, the body (5) holds a drag handle (6) whose child
+/// 8 sets `app-region: drag` and then `initial`.
+effect fn region(batch: &mut Batch, id: u32, parent: u32, declarations: &[u8]) -> () ! TreeError | CssError | OutOfMemoryError ? &mut Allocator {
+  run batch.create(id, NodeKind.Box)
+  if parent == 0 { run batch.root(id) } else { run batch.append(parent, id) }
+  let written = run written.declarations(declarations)
+  run batch.style(id, written.asSlice())
+}
+
+effect fn regionsBody() -> () ! AssertionError<'static> | TreeError | CssError | OutOfMemoryError ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run region(&mut batch, 1, 0, b"display:block;width:300px;height:100px")
+  run region(&mut batch, 2, 1, b"display:flex;height:40px;app-region:drag")
+  run region(&mut batch, 3, 2, b"display:block;width:50px;height:20px;-webkit-app-region:no-drag")
+  run region(&mut batch, 7, 3, b"display:block;width:10px;height:10px;-webkit-app-region:inherit")
+  run region(&mut batch, 4, 2, b"display:block;width:100px;height:40px")
+  run region(&mut batch, 5, 1, b"display:block;height:60px")
+  run region(&mut batch, 6, 5, b"display:block;width:40px;height:40px;app-region:drag")
+  run region(&mut batch, 8, 6, b"display:block;width:20px;height:20px;app-region:drag;app-region:initial")
+  run tree.apply(run batch.take())
+  run tree.frame(FrameInput { width: 300.0, height: 100.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(tree.dragsWindow(250.0, 10.0), "the drag header moves the window")
+  run Testing.expect(tree.dragsWindow(100.0, 10.0), "so does a child that sets no region")
+  run Testing.expect(!tree.dragsWindow(30.0, 15.0), "a no-drag button inside it takes the press")
+  run Testing.expect(!tree.dragsWindow(5.0, 5.0), "and so does its inheriting child")
+  run Testing.expect(tree.node(tree.slotOf(7)).computed().appRegion == REGION_NO_DRAG, "inherit copies the parent's region")
+  run Testing.expect(!tree.dragsWindow(200.0, 70.0), "a press outside any drag region is a click, whatever its height")
+  run Testing.expect(tree.dragsWindow(35.0, 75.0), "a drag region below the title bar moves the window")
+  run Testing.expect(tree.node(tree.slotOf(8)).computed().appRegion == REGION_NONE, "initial is none")
+  run Testing.expect(tree.dragsWindow(5.0, 45.0), "so its press falls to the drag ancestor")
+}
+
+test effect fn appRegionDecidesWhichPressesMoveTheWindow() -> ()
+  ! AssertionError<'static> | TreeError | CssError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run regionsBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 // Keyboard.

@@ -84,6 +84,18 @@ test("events run capture, target and bubble phases", () => {
   assert.deepEqual(log, ["root capture 1", "leaf 2 0", "middle 3"]);
 });
 
+test("window.event is the event being dispatched", () => {
+  const root = createBox();
+  const leaf = createBox();
+  root.append(leaf);
+  const seen = [];
+  leaf.addEventListener("click", (event) => seen.push(globalThis.event === event));
+  root.addEventListener("click", (event) => seen.push(globalThis.event === event));
+  mock.click(leaf.nodeId);
+  assert.deepEqual(seen, [true, true]);
+  assert.equal(globalThis.event, undefined);
+});
+
 test("listen flags follow the listeners", () => {
   const box = createBox();
   mock.take();

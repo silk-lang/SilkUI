@@ -4585,6 +4585,18 @@ function insertedText(inputType, before, after) {
  * listener prevented the default.
  */
 export function dispatchEvent(event) {
+  // `window.event` is the event being dispatched, as on the web. React DOM reads it to give
+  // updates from discrete events (input, keydown, click) sync priority.
+  const outer = globalThis.event;
+  globalThis.event = event;
+  try {
+    return dispatchThrough(event);
+  } finally {
+    globalThis.event = outer;
+  }
+}
+
+function dispatchThrough(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
   if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
