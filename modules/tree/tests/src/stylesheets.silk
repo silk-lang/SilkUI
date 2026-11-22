@@ -1215,6 +1215,52 @@ test effect fn manyWatchedAnchorsStayLocal() -> ()
   run manyAnchors() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+/// A style object or custom property changes no selector input: the node is restyled, and below
+/// it only the children whose inherited values or variables change. Before, every descendant was
+/// matched again: a scroll container's fade variables restyled its whole list on every scroll.
+effect fn styleObjectRestyles() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let mut row: u32 = 10
+  while row < 60 {
+    run nestedRow(&mut batch, row, "row")
+    row = row + 10
+  }
+  let bytes = run sheetBytes(b".row{height:20px}.cell{height:10px}.icon{width:var(--icon,8px)}.label{width:20px}")
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(0.0))
+  let moved = run written.declarations(b"position:relative;top:4px;transform:translate(0,3px)")
+  run batch.style(30, moved.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(1.0))
+  run Testing.expect(tree.node(tree.slotOf(30)).computed().layout.inset.top.value == 4.0 && tree.stats.styledNodes == 1,
+    "a style object of values that do not inherit restyles its node alone")
+  let colored = run written.declarations(b"color:blue")
+  run batch.style(20, colored.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(2.0))
+  run Testing.expect(tree.stats.styledNodes == 5, "an inherited value reaches the children")
+  run batch.customProperty(40, StyleState.Base, "--icon", Option<string>.some("12px"), false)
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(3.0))
+  run Testing.expect(rowWidth(&tree, 42) == 12.0 && rowWidth(&tree, 32) == 8.0, "a custom property reaches the subtree that reads it")
+  run batch.push(Mutation.ClearStyle { id: 30, state: StyleState.Base })
+  run tree.apply(run batch.take())
+  run tree.frame(motionFrame(4.0))
+  run Testing.expect(tree.node(tree.slotOf(30)).computed().layout.inset.top.value != 4.0 && tree.stats.styledNodes == 1, "a cleared style object restyles its node alone")
+}
+
+test effect fn styleObjectsRestyleOnlyWhatInherits() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run styleObjectRestyles() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 test effect fn changesRestyleOnlyWhatTheyReach() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()

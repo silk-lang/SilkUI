@@ -31,7 +31,7 @@ import ui_tree.battery
 import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
 import generated_clipboard { clipboardApi }
-import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, UiTree, TreeError }
+import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, VirtualOptions, VirtualItem, UiTree, TreeError }
 import ui_tree.computed_style
 import ui_tree.cssom_view
 import ui_tree.text_selection
@@ -701,6 +701,24 @@ impl Bridge {
   }
 }
 
+/// JS arguments for a changed mount request, including all independently retained rows.
+pub effect fn virtualRequest(tree: &UiTree<'_>, at: usize) -> List<ValueBits>
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut args = List<ValueBits>.make()
+  let list = &tree.virtualLists.asSlice()[at]
+  let wanted = match move run tree.changedVirtualIndices(at) {
+    Option.Some { value } => move value
+    _ => { return move args }
+  }
+  run args.append(ValueBits.number(u32.toF64(list.port)))
+  let mut i: usize = 0
+  while i < wanted.length() {
+    run args.append(ValueBits.number(usize.toF64(wanted.get(i))))
+    i = i + 1
+  }
+  return move args
+}
+
 /// The scale a window most likely opens at, until its first frame says.
 fn expectedScale() -> f64 {
   static if Intrinsic.targetOperatingSystem() == "darwin" {
@@ -813,6 +831,8 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"selection", arity: 0 },
     Native { name: b"setSelection", arity: 4 },
     Native { name: b"selectionText", arity: 0 },
+    Native { name: b"virtualList", arity: 6 },
+    Native { name: b"virtualItems", arity: 1 },
   ]
   if at < table.length { return Option<Native>.some(table[at]) }
   return Option<Native>.none()
@@ -980,6 +1000,23 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     run bridge.batch.push(Mutation.Destroy { id: first })
   } else if function == SCROLL_TO {
     run bridge.batch.scrollTo(first, f64.toF32(number(argv.get(1).view())), f64.toF32(number(argv.get(2).view())))
+  } else if function == nativeId(b"virtualList") {
+    if argv.length() == 1 {
+      run bridge.batch.clearVirtualList(first)
+    } else {
+      run bridge.batch.virtualList(first, f64.toUsize(number(argv.get(1).view())), VirtualOptions {
+        estimatedHeight: f64.toF32(number(argv.get(2).view())), overscan: f64.toF32(number(argv.get(3).view())),
+        gap: f64.toF32(number(argv.get(4).view())), revision: f64.toU64(number(argv.get(5).view())),
+      })
+    }
+  } else if function == nativeId(b"virtualItems") {
+    let mut rows = List<VirtualItem>.make()
+    let mut i: usize = 1
+    while i + 1 < argv.length() {
+      run rows.append(VirtualItem { index: f64.toUsize(number(argv.get(i).view())), id: id(argv.get(i + 1).view()) })
+      i = i + 2
+    }
+    run bridge.batch.virtualItems(first, rows.asSlice())
   } else if function == LOG {
     let line = run text(argv.get(1))
     run bridge.logs.append(LogEntry { level: first, text: move line })

@@ -17,6 +17,7 @@ export function installMock() {
     "richText", "mark", "atomStyle", "format", "insertAtom",
     "shell",
     "svgInsert", "svgRemove", "svgAttribute",
+    "virtualList", "virtualItems",
   ]) {
     native[name] = record(name);
   }

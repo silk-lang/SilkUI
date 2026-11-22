@@ -6,7 +6,7 @@ const ui = installMock();
 // Frames run when a test asks: Foldkit renders in one.
 let frames = [];
 globalThis.requestAnimationFrame = (callback) => frames.push(callback);
-const { HoverStyle } = await import("../src/index.js");
+const { HoverStyle, VirtualList, VirtualRows } = await import("../src/index.js");
 const { Schema } = await import("effect");
 const { Runtime } = await import("foldkit");
 const { defineMessageUnion } = await import("foldkit/message");
@@ -60,6 +60,26 @@ await settle();
 after(() => setImmediate(() => process.exit()));
 
 const tree = (id) => document.getElementById(id).node.nodeId;
+
+test("virtual list props bind keyed DOM children in native request order", async () => {
+  const port = document.createElement("div");
+  document.body.appendChild(port);
+  const config = VirtualList({ count: 1000, estimatedRowHeight: 32 }, indices => {
+    for (const index of indices) {
+      const row = document.createElement("li");
+      row.textContent = String(index);
+      port.appendChild(row);
+    }
+    const rows = VirtualRows(indices);
+    port[rows.key] = rows.value;
+  });
+  port[config.key] = config.value;
+  ui.native.virtualRequest(port.node.nodeId, 3, 105);
+  await Promise.resolve();
+  assert.deepEqual(calls("virtualItems").at(-1),
+    ["virtualItems", port.node.nodeId, 3, port.firstChild.node.nodeId, 105, port.lastChild.node.nodeId]);
+  document.body.removeChild(port);
+});
 
 test("the first render replaces #root with the view, made of tree nodes", () => {
   const page = document.getElementById("page");

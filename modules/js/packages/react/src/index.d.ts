@@ -56,3 +56,14 @@ export function WebView(props: WebViewProps): import("react").ReactElement;
 export function createPortal(children: ReactNode, container: Node, key?: string | null): ReactNode;
 
 export { createElement } from "react";
+export function VirtualList<T>(props: {
+  items: readonly T[];
+  itemKey: (item: T, index: number) => string | number;
+  children: (item: T, index: number) => ReactNode;
+  style?: import("@silkui/core").Style;
+  rowHeight?: number | ((item: T, index: number) => number | "auto");
+  estimatedRowHeight?: number;
+  overscan?: number;
+  gap?: number;
+  revision?: number;
+}): import("react").ReactElement;

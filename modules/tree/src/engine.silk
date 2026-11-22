@@ -25,6 +25,7 @@ import properties.values { Value }
 import layout.lib { Fragmentainers, computeFragmented, FontRequest, LineHeight }
 import virtual_list { VirtualList, VirtualRange }
 import virtual_list as virtual
+import style_relations
 import anchoring
 import anchoring { Anchored }
 import inspect
@@ -805,6 +806,9 @@ const SOURCE_PENDING: u8 = 0
 const SOURCE_LOADED: u8 = 1
 const SOURCE_FAILED: u8 = 2
 
+/// How long content must stay still after a scroll before hover follows the pointer again.
+pub const HOVER_SETTLE_SECONDS: f64 = 0.1
+
 /// The retained tree.
 ///
 /// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
@@ -826,6 +830,8 @@ const SOURCE_FAILED: u8 = 2
 pub struct UiTree<'a> {
   /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
   pub virtualLists: List<VirtualList>,
+  /// Client node under the host-reported accessibility browse cursor, independent of focus.
+  pub browseCursor: u32,
   /// Retained popup placement relationships. Configure them through SetAnchor.
   pub anchors: List<Anchored>,
   /// The tree css-layout lays out (see `layout_table`).
@@ -976,6 +982,9 @@ pub struct UiTree<'a> {
   quietScrolls: usize,
   /// Frames whose paint was skipped because nothing changed since the last paint.
   pub paintsKept: u64,
+  /// While content scrolls under a still pointer, the frame time at which hover follows it
+  /// again (see `followHover`); negative when no hover update waits.
+  hoverSettleAt: f64,
   /// Of those, the frames that only scrolled: the scene was kept and its scroll positions
   /// moved (see `scrollsWithinLead`). A host draws such a frame by scrolling the last one.
   pub scrollsKept: u64,
@@ -1486,6 +1495,7 @@ impl<'a> UiTree<'a> {
     let seed = Hash.seed(0x7569747265)
     return UiTree<'a> {
       virtualLists: List<VirtualList>.make(),
+      browseCursor: NONE,
       anchors: List<Anchored>.make(),
       layout: move layout,
       output: LayoutTree.make(),
@@ -1578,6 +1588,7 @@ impl<'a> UiTree<'a> {
       quietRevision: usize.MAX,
       quietScrolls: usize.MAX,
       paintsKept: 0,
+      hoverSettleAt: -1.0,
       scrollsKept: 0,
       paintedScrolls: List<ScrollPosition>.make(),
       stats: FrameStats.zero(),
@@ -2351,6 +2362,64 @@ impl<'a> UiTree<'a> {
     return virtual.request(&self, id)
   }
 
+  /// Complete ordered mount request, including independent accessibility pins.
+  pub effect fn virtualIndices(self: &Self, id: u32) -> List<usize>
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut indices = List<usize>.make()
+    if let Option.Some { value: range } = self.virtualRange(id) {
+      let active = run self.activeVirtualTarget()
+      let mut at = range.first
+      let mut v: usize = 0
+      while v < self.virtualLists.length() {
+        let list = &self.virtualLists.asSlice()[v]
+        v = v + 1
+        if list.port != id { continue }
+        let mut r: usize = 0
+        while r < list.rows.length() {
+          let row = list.rows.get(r)
+          r = r + 1
+          if row.index >= range.count || (row.index >= range.first && row.index < range.end) { continue }
+          let slot = self.slotOf(row.id)
+          if slot == NONE || !self.retainsVirtual(slot, active) { continue }
+          if row.index >= range.end {
+            while at < range.end { run indices.append(at) at = at + 1 }
+          }
+          run indices.append(row.index)
+        }
+      }
+      while at < range.end { run indices.append(at) at = at + 1 }
+    }
+    return move indices
+  }
+
+  /// A host only needs to cross into its frontend when the requested rows differ from the bindings.
+  pub effect fn changedVirtualIndices(self: &Self, at: usize) -> Option<List<usize>>
+    ! OutOfMemoryError ? &mut Allocator {
+    let list = &self.virtualLists.asSlice()[at]
+    let slot = self.slotOf(list.port)
+    if slot == NONE || !self.holdsCurrent(slot) { return Option.None }
+    let wanted = run self.virtualIndices(list.port)
+    let mut i: usize = 0
+    while i < wanted.length() && i < list.rows.length() && wanted.get(i) == list.rows.get(i).index { i = i + 1 }
+    if i == wanted.length() && i == list.rows.length() { return Option.None }
+    return Option.Some { value: move wanted }
+  }
+
+  effect fn activeVirtualTarget(self: &Self) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    if self.focused == NONE { return NONE }
+    if let Option.Some { value } = self.node(self.focused).semanticsOf() {
+      if let Option.Some { value: ids } = move run style_relations.literal(self, self.focused, "aria-activedescendant") {
+        return if ids.length() == 0 { NONE } else { self.slotOf(ids.get(0)) }
+      }
+      if value.activeDescendant.length() != 0 { return self.slotOf(value.activeDescendant.get(0)) }
+    }
+    return NONE
+  }
+
+  fn retainsVirtual(self: &Self, row: u32, active: u32) -> bool {
+    return self.within(self.focused, row) || self.within(active, row) || self.within(self.slotOf(self.browseCursor), row)
+  }
+
   /// The number of live nodes.
   pub fn nodeCount(self: &Self) -> usize {
     return self.ids.length()
@@ -2532,10 +2601,12 @@ impl<'a> UiTree<'a> {
       }
       Mutation.Remove { id } => {
         let slot = run self.require(index, id)
+        run self.checkVirtualUnmount(index, slot)
         run self.detach(index, slot)
       }
       Mutation.Destroy { id } => {
         let slot = run self.require(index, id)
+        run self.checkVirtualUnmount(index, slot)
         run self.destroy(index, slot)
       }
       Mutation.SetCustomProperty { id, state, name, value, important } => {
@@ -2559,7 +2630,7 @@ impl<'a> UiTree<'a> {
         run identity.setCustom(state, move name, move tokens, important)
         run self.enableInlineScope()
         // The node's variable scope changes: it and what inherits from it, and no selector.
-        self.restyleLocal(slot)
+        self.restyleSelf(slot)
       }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
@@ -2601,8 +2672,10 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        // A style object changes no selector input: only this node and what inherits from it.
-        self.restyleLocal(slot)
+        // A style object changes no selector input: only this node, and below it the children
+        // whose inherited values or variables change (a row's `top` or a thumb's `transform`
+        // restyles that node alone, not its subtree).
+        self.restyleSelf(slot)
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
@@ -2636,7 +2709,7 @@ impl<'a> UiTree<'a> {
         node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover())
           || style.requiresContext(node.active()) || style.requiresContext(node.focus())
           || style.requiresContext(node.focusVisible()) || style.requiresContext(node.starting())
-        self.restyleLocal(slot)
+        self.restyleSelf(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
         let slot = run self.requireInput(index, id)
@@ -3487,6 +3560,29 @@ impl<'a> UiTree<'a> {
     return false
   }
 
+  // Reject a stale eviction before touching layout, focus, or row bindings.
+  // Removing the list itself is teardown, not eviction of one of its rows.
+  effect fn checkVirtualUnmount(self: &Self, index: usize, slot: u32) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.virtualLists.length() == 0 { return () }
+    let parent = self.node(slot).parent
+    if parent == NONE { return () }
+    let port = self.node(parent).id
+    let mut v: usize = 0
+    while v < self.virtualLists.length() {
+      let list = &self.virtualLists.asSlice()[v]
+      v = v + 1
+      if list.port != port { continue }
+      if !self.retainsVirtual(slot, run self.activeVirtualTarget()) { return () }
+      let mut r: usize = 0
+      while r < list.rows.length() {
+        let row = list.rows.get(r)
+        r = r + 1
+        if row.id == self.node(slot).id { fail TreeError.BadVirtualList { index: index, id: port } }
+      }
+    }
+  }
+
   effect fn insertBefore(
     self: &mut Self,
     index: usize,
@@ -3498,6 +3594,9 @@ impl<'a> UiTree<'a> {
     ? &mut Allocator {
     let parentSlot = run self.require(index, parent)
     let childSlot = run self.require(index, child)
+    if self.node(childSlot).parent != parentSlot {
+      run self.checkVirtualUnmount(index, childSlot)
+    }
     if !UiTree.canHaveChildren(self.node(parentSlot).kind) {
       fail TreeError.WrongKind { index: index, id: parent }
     }
@@ -3653,6 +3752,7 @@ impl<'a> UiTree<'a> {
         self.inerts = self.inerts - 1
       }
       if !generated { drop self.ids.remove(Word { value: u32.toU64(id) }) }
+      if !generated && self.browseCursor == id { self.browseCursor = NONE }
       if trap {
         self.forgetReturn(id)
       }
@@ -7723,6 +7823,7 @@ impl<'a> UiTree<'a> {
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
+      || self.hoverSettleAt >= 0.0
       || cssom_view.scrollAnimating(self)
       || self.textSelection.scrolling
       || scroll_snap.waiting(self)
@@ -7842,11 +7943,12 @@ impl<'a> UiTree<'a> {
     }
 
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
-    // variant that changes layout is laid out in the same frame.
-    if !self.stats.layoutSkipped || self.scrolled {
+    // variant that changes layout is laid out in the same frame. While content scrolls, hover
+    // waits until the scroll settles (`followHover`).
+    if !self.stats.layoutSkipped || self.scrolled || self.hoverDue() {
       // The hit test prunes by ink and follows stacking when those are current.
-      if self.pointerInside && !self.paintDirty { run self.refreshPaintCaches() }
-      run interact.refreshHover(&mut self)
+      if self.pointerInside && !self.paintDirty && !self.scrolled { run self.refreshPaintCaches() }
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
     }
@@ -8128,7 +8230,7 @@ impl<'a> UiTree<'a> {
       if run interact.settleScrolls(&mut self) {
         run self.layoutFrame()
       }
-      run interact.refreshHover(&mut self)
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
       pass = pass + 1
@@ -8148,7 +8250,7 @@ impl<'a> UiTree<'a> {
       if run interact.settleScrolls(&mut self) {
         run self.layoutFrame()
       }
-      run interact.refreshHover(&mut self)
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
       pass = pass + 1
@@ -8236,6 +8338,38 @@ impl<'a> UiTree<'a> {
   /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
   pub fn layoutPending(self: &Self) -> bool {
     return self.stylesDirty || self.stylesPending || self.layout.revision() != self.laidOutRevision
+  }
+
+  /// Whether hover is held while content that scrolled under the pointer settles.
+  pub fn hoverHeld(self: &Self) -> bool {
+    return self.hoverSettleAt >= 0.0
+  }
+
+  /// Whether a hover update held back while content scrolled is due in this frame.
+  fn hoverDue(self: &Self) -> bool {
+    return self.hoverSettleAt >= 0.0 && self.input.time >= self.hoverSettleAt
+  }
+
+  /// Hit tests the pointer again after layout or scrolling moved content under it. While content
+  /// scrolls under a still pointer, hover waits until no scroll has moved it for
+  /// `HOVER_SETTLE_SECONDS`, as browsers hold hover during a scroll: each scrolled frame would
+  /// otherwise restyle the rows that slide under the pointer, run their pointer enter and leave
+  /// handlers (a row's tooltip opening and closing), and with them the layout reads those
+  /// handlers make.
+  effect fn followHover(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.pointerInside {
+      self.hoverSettleAt = -1.0
+      return ()
+    }
+    if self.scrolled {
+      self.hoverSettleAt = self.input.time + HOVER_SETTLE_SECONDS
+      return ()
+    }
+    if self.hoverSettleAt >= 0.0 && !self.hoverDue() { return () }
+    self.hoverSettleAt = -1.0
+    run interact.refreshHover(&mut self)
   }
 
   /// Resolves styles and lays out now, at the last frame's size, so geometry queries between
@@ -9446,6 +9580,18 @@ impl<'a> Backend for UiTree<'a> {
 
   fn range(self: &Self, id: u32) -> Option<VirtualRange> {
     return self.virtualRange(id)
+  }
+
+  effect fn indices(self: &Self, id: u32, out: &mut List<usize>) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    out.clear()
+    if self.virtualRange(id).isNone() {
+      return false
+    }
+    let wanted = run self.virtualIndices(id)
+    run out.appendSlice(wanted.asSlice())
+    return true
   }
 }
 
