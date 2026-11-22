@@ -35,6 +35,32 @@ test("the document is html > body at the tree's root, under document and window 
   assert.deepEqual(seen, [["window", true], ["button"], ["document", true, 3]]);
 });
 
+test("a scroll event passes the listeners above its target in the capture phase only", () => {
+  const scroller = document.createElement("div");
+  const holder = document.createElement("div");
+  holder.appendChild(scroller);
+  document.body.appendChild(holder);
+  const seen = [];
+  const note = (name) => (event) => seen.push(name + ":" + event.eventPhase);
+  window.addEventListener("scroll", note("window capture"), true);
+  window.addEventListener("scroll", note("window"));
+  document.addEventListener("scroll", note("document capture"), true);
+  document.addEventListener("scroll", note("document"));
+  holder.addEventListener("scroll", note("holder capture"), true);
+  holder.addEventListener("scroll", note("holder"));
+  scroller.addEventListener("scroll", note("target"));
+  mock.native.dispatch(12, scroller.nodeId, 0, 30, 0, 0, 0, undefined, undefined);
+  assert.deepEqual(seen, ["window capture:1", "document capture:1", "holder capture:1", "target:2"]);
+
+  // `load` stops at the document: the window is not on its path (DOM, get the parent).
+  const loads = [];
+  window.addEventListener("load", () => loads.push("window"), true);
+  document.addEventListener("load", () => loads.push("document"), true);
+  mock.native.dispatch(17, scroller.nodeId, 0, 0, 0, 0, 0, undefined, undefined);
+  assert.deepEqual(loads, ["document"]);
+  holder.remove();
+});
+
 test("selectionchange reaches document listeners", () => {
   const box = document.createElement("div");
   document.body.appendChild(box);

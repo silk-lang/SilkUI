@@ -128,6 +128,81 @@ test effect fn stylesheetInvalidationReachesSiblingsAncestorsAndNthFilters() -> 
   run relationalChanges() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
+fn laidHeight(tree: &UiTree<'_>, id: u32) -> f32 {
+  let node = tree.node(tree.slotOf(id))
+  return tree.output.fragments.values.asSlice()[tree.fragmentOf.get(node.css)].size.height
+}
+fn matched(tree: &UiTree<'_>) -> usize { return tree.work.sheetMatches + tree.work.sheetTwins }
+
+effect fn childListChanges() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run node(&mut batch, 1, 0, "host")
+  run node(&mut batch, 2, 1, "list")
+  run node(&mut batch, 10, 2, "row")
+  run node(&mut batch, 20, 10, "leaf")
+  run node(&mut batch, 11, 2, "row")
+  run node(&mut batch, 21, 11, "leaf")
+  run node(&mut batch, 12, 2, "pick")
+  let mut id: u32 = 100
+  while id < 140 {
+    run node(&mut batch, id, 2, "plain")
+    run node(&mut batch, id + 100, id, "cell")
+    id = id + 1
+  }
+  run sheet(&mut batch, b".host{display:block;width:400px}.list{display:block;width:300px}.row{display:block;width:100px;height:20px}.leaf{display:block;width:10px;height:5px}.plain{display:block;width:90px;height:4px}.cell{display:block;width:8px;height:2px}.pick{display:block;width:60px}.mark{display:block;height:3px}.mark+.row{width:130px}.row:nth-child(2){opacity:.5}.mark+.row>.leaf{width:17px}.pick:nth-child(3)::before{content:'';display:block;height:7px}")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 11) == 0.5 && width(&tree, 10) == 100.0 && width(&tree, 20) == 10.0 && laidHeight(&tree, 12) == 7.0, "initial places")
+
+  // A child put first moves every place after it: the rules that read a place answer anew,
+  // on the children, below them and on a pseudo-element, and nothing else restyles.
+  let mut before = matched(&tree)
+  run batch.create(50, NodeKind.Box)
+  run batch.attribute(50, Attribute.ClassName { value: run String.copy("mark") })
+  run batch.insertBefore(2, 50, 10)
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && !tree.node(tree.slotOf(2)).styleDirty && !tree.node(tree.slotOf(100)).styleDirty, "an inserted child does not restyle its parent's subtree")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 10) == 0.5 && opacity(&tree, 11) == 1.0, "nth-child follows the new places")
+  run Testing.expect(width(&tree, 10) == 130.0 && width(&tree, 20) == 17.0 && width(&tree, 21) == 10.0, "the next-sibling rules reach the child and what is below it")
+  run Testing.expect(laidHeight(&tree, 12) == 0.0, "a pseudo-element that read a place goes with it")
+  run Testing.expect(matched(&tree) - before <= 8, "only the nodes whose rules read a place matched again")
+
+  before = matched(&tree)
+  run batch.push(Mutation.Remove { id: 50 })
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.stylesDirty && !tree.node(tree.slotOf(2)).styleDirty, "a removed child does not restyle its parent's subtree")
+  run tree.frame(frame())
+  run Testing.expect(opacity(&tree, 10) == 1.0 && opacity(&tree, 11) == 0.5 && width(&tree, 10) == 100.0 && width(&tree, 20) == 10.0 && laidHeight(&tree, 12) == 7.0, "removing the child gives the places back")
+  run Testing.expect(matched(&tree) - before <= 8, "a removal matches the readers again, no more")
+
+  // Rows that mount at the end of a list, as a virtual list does while it scrolls.
+  before = matched(&tree)
+  id = 300
+  while id < 304 {
+    run batch.create(id, NodeKind.Box)
+    run batch.attribute(id, Attribute.ClassName { value: run String.copy("plain") })
+    run batch.create(id + 100, NodeKind.Box)
+    run batch.attribute(id + 100, Attribute.ClassName { value: run String.copy("cell") })
+    run batch.append(id, id + 100)
+    run batch.append(2, id)
+    id = id + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+  run Testing.expect(width(&tree, 303) == 90.0 && width(&tree, 403) == 8.0 && opacity(&tree, 11) == 0.5, "appended rows take their styles")
+  run Testing.expect(matched(&tree) - before <= 16, "appended rows match themselves and the readers")
+}
+
+test effect fn stylesheetChildListChangesRestyleOnlyThePlaceReaders() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run childListChanges() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 effect fn descendantsAndVariables() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
   let fonts = FontCollection.make()
