@@ -23,7 +23,7 @@ import font_raster.key { GlyphKey, PenPosition }
 import atlas.atlas { Atlas, AtlasOptions, Kind }
 import ui_scene.cpu { AtlasPixels, CpuRenderer }
 import ui_scene.path_cache { PathCache }
-import ui_scene.primitives { Background, ContentMask, GlyphSprite, ImageSprite, Quad }
+import ui_scene.primitives { Background, ContentMask, GlyphSprite, ImageSprite }
 import ui_scene.radii { Radii }
 import ui_scene.scene { Scene }
 import ui_text.fonts { TextStyle }
@@ -35,6 +35,8 @@ import font_collection.lib { Family, Style as FontStyle }
 import vector.geometry { Affine }
 import vector.path { Path }
 import vector.pixmap { Pixmap, Rgba8 }
+import vector.pixmap
+import ui_scene.color
 import vector.stroke { Stroke }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
@@ -457,13 +459,23 @@ impl<'a> Canvas2d<'a> {
       }
       return ()
     }
-    if self.open != node { run self.flush() }
-    self.open = node
     if op == FILL_RECT {
+      // Straight into the pixels: the scene's quads rasterize a rounded-rect path and test
+      // corners per pixel, which costs a terminal's row backgrounds most of a frame.
       let color = self.colorOf(r.color())
       let area = intersect(r.rect(), clip)
-      if nonEmpty(area) { drop run self.scene.quad(Quad.fill(area, mask, Background.solid(color))) }
-    } else if op == FILL_PATH || op == STROKE_PATH {
+      if !nonEmpty(area) { return () }
+      run self.flush()
+      if self.intoLayer {
+        fillArea(&mut self.layer, area, color)
+      } else {
+        fillArea(&mut self.bitmaps.asMutSlice()[at].pixels, area, color)
+      }
+      return ()
+    }
+    if self.open != node { run self.flush() }
+    self.open = node
+    if op == FILL_PATH || op == STROKE_PATH {
       let color = self.colorOf(r.color())
       let rule = u32.toU8(r.word())
       if op == FILL_PATH {
@@ -1077,6 +1089,36 @@ fn outerSpan(area: Rect<f32>, width: u32, height: u32) -> [u32; 4] {
   let x1 = minU(f32.toU32(f32.max(f32.ceil(area.xMax), 0.0)), width)
   let y1 = minU(f32.toU32(f32.max(f32.ceil(area.yMax), 0.0)), height)
   return [x0, y0, x1, y1]
+}
+
+/// Paints `fill` source-over on `area` of `pixels`, its partly covered edge pixels by the part
+/// it covers.
+fn fillArea(pixels: &mut Pixmap, area: Rect<f32>, fill: Rgba<f32>) -> () {
+  let span = outerSpan(area, pixels.width(), pixels.height())
+  let source = pixmap.pack(color.toPremultipliedRgba8(fill))
+  if source == 0 { return }
+  let stride = u32.toUsize(pixels.width()) * 4
+  let data = pixels.dataMut()
+  let mut y = span[1]
+  while y < span[3] {
+    let fy = u32.toF32(y)
+    let cy = f32.min(fy + 1.0, area.yMax) - f32.max(fy, area.yMin)
+    let row = u32.toUsize(y) * stride
+    let mut x = span[0]
+    while x < span[2] {
+      let fx = u32.toF32(x)
+      let cx = f32.min(fx + 1.0, area.xMax) - f32.max(fx, area.xMin)
+      let cover = cx * cy
+      let at = row + u32.toUsize(x) * 4
+      if cover >= 1.0 {
+        pixmap.overPacked(&mut data, at, source)
+      } else if cover > 0.0 {
+        pixmap.overPacked(&mut data, at, pixmap.scalePacked(source, f32.toU32(cover * 255.0 + 0.5)))
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
 }
 
 fn clearArea(pixels: &mut Pixmap, area: Rect<f32>, alpha: u8) -> () {
