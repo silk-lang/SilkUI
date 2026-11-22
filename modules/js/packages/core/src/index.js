@@ -860,6 +860,7 @@ export class Node {
   getAttribute(name) {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
+    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
     const aria = ariaName(name);
     return this.#rare?.attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
@@ -891,6 +892,8 @@ export class Node {
 
   setAttribute(name, value) {
     name = String(name);
+    // HTML attribute names have no case: React's `tabIndex` prop is the `tabindex` attribute.
+    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
     let text = value == null ? null : String(value);
     if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
