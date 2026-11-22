@@ -168,6 +168,8 @@ const GPU_ROUNDS: usize = 16
 /// A quiet moment collects garbage when JavaScript's memory moved this much since the last
 /// one: a launch, a screen built or taken down. Smaller changes are the engine's own business.
 const RELEASE_MOVED_BYTES: usize = 4194304
+/// The most idle memory a quiet moment leaves with the engine for what comes next.
+const RELEASE_RESERVE_BYTES: usize = 8388608
 
 effect fn deliverShellInto(host: &mut JsHost<'_>, tree: &UiTree<'_>, event: &Event, was: &mut bool) -> () ! OutOfMemoryError | JsError ? &mut Allocator {
   was.* = run deliverShell(&mut host, tree, event)
@@ -285,7 +287,8 @@ impl<'m> JsApp<'m> {
   /// (`WindowClient.quiet`): a full collection when its memory moved by
   /// [`RELEASE_MOVED_BYTES`] since the last one or `shed` says a large subtree went (its
   /// nodes' cycles are garbage only a collection finds), then the pooled arenas left wholly
-  /// idle go back to the system, keeping an eighth of what is in use for what comes next.
+  /// idle go back to the system, keeping an eighth of what is in use for what
+  /// comes next, [`RELEASE_RESERVE_BYTES`] at most.
   /// Otherwise it costs a few loads.
   pub effect fn release(self: &mut Self, shed: bool) -> () ? &mut Allocator {
     let used = self.memory.usedBytes()
@@ -295,7 +298,7 @@ impl<'m> JsApp<'m> {
       run self.host.collect() |> Effect.provideMut<Allocator>(&mut self.allocator)
     }
     let live = self.memory.usedBytes()
-    let released = self.host.releaseIdle(live / 8)
+    let released = self.host.releaseIdle(if live / 8 < RELEASE_RESERVE_BYTES { live / 8 } else { RELEASE_RESERVE_BYTES })
     self.settled = live
     if self.traced && (collected || released != 0) {
       StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
