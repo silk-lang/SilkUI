@@ -167,6 +167,38 @@ test("MutationObserver on the document or <html> with subtree sees changes anywh
   }
 });
 
+test("a deep clone keeps each element's tag and hands the tree only attributes it knows", () => {
+  const panel = document.createElement("div");
+  const make = (tag, type) => {
+    const element = document.createElement(tag);
+    if (type) element.setAttribute("type", type);
+    element.setAttribute("tabindex", "0");
+    element.setAttribute("data-slot", tag);
+    element.setAttribute("aria-label", tag);
+    panel.appendChild(element);
+    return element;
+  };
+  for (const tag of ["button", "input", "textarea", "img", "canvas", "svg"]) make(tag);
+  make("input", "checkbox");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("tabindex", "-1");
+  path.setAttribute("data-icon", "x");
+  panel.lastChild.previousSibling.appendChild(path);
+  mock.take();
+  const copy = panel.cloneNode(true);
+  const handed = mock.take().filter((call) => call[0] === "attribute").map((call) => call[2]);
+  assert.ok(!handed.includes("tabindex"), "the tree's attribute is tabIndex");
+  assert.deepEqual(copy.childNodes.map((node) => node.localName), panel.childNodes.map((node) => node.localName));
+  for (const [index, node] of copy.childNodes.entries()) {
+    assert.equal(node.getAttribute("tabindex"), "0");
+    assert.equal(node.getAttribute("data-slot"), panel.childNodes[index].localName);
+    assert.equal(node.getAttribute("aria-label"), panel.childNodes[index].localName);
+    assert.equal(node.constructor, panel.childNodes[index].constructor);
+  }
+  assert.equal(copy.lastChild.getAttribute("type"), "checkbox");
+  assert.equal(copy.childNodes[5].firstChild.getAttribute("data-icon"), "x");
+});
+
 test("history and location keep entries and send popstate and hashchange", async () => {
   assert.equal(location.href, "http://localhost/");
   const events = [];
