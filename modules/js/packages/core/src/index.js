@@ -2131,17 +2131,16 @@ export class SvgElement {
     this.parentNode?.removeChild(this);
   }
 
-  /** Takes the element out of its `<svg>`. It is plain markup, so nothing else is freed. */
-  destroy() {
-    this.remove();
-  }
-
-  /** A copy with the same attributes, and with `deep` copies of the children. */
   cloneNode(deep = false) {
     const copy = new SvgElement(this.localName);
     for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
     if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
     return copy;
+  }
+
+  /** Takes the element out of its `<svg>`. It is plain markup, so nothing else is freed. */
+  destroy() {
+    this.remove();
   }
 
   /**
@@ -4948,6 +4947,18 @@ function focusing(target) {
   pendingFocusOut = null;
   if (left) focusEvent("focusout", left, target);
   else blurredNode = null;
+  caretInto(target);
+}
+
+// An editing host that takes focus with the selection outside it gets a caret at its start,
+// as a browser gives one, so the first edit has a place (a click places its own after).
+function caretInto(target) {
+  if (target instanceof Input || editingHostOf(target) !== target) return;
+  const selection = getSelection();
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (range && target.contains(range.startContainer) && target.contains(range.endContainer)) return;
+  const [node, offset] = startIn(target);
+  selection.collapse(node, offset);
 }
 
 // HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its

@@ -20,6 +20,7 @@ native.setSelection = (anchor, anchorOffset, focus, focusOffset) => {
 const { createElement, createText, mount, getSelection, LineBreak } = await import("../src/index.js");
 
 const BEFORE_INPUT = 37;
+const FOCUS = 9;
 const LISTEN_BEFORE_INPUT = 2 ** 31;
 
 // The tree asking host `node` for edit `inputType` with `data`; returns whether it was prevented.
@@ -109,6 +110,15 @@ test("typing inserts text at the caret and fires beforeinput then input", () => 
   getSelection().setBaseAndExtent(text, 0, text, 6);
   edit(host, "insertText", "Bye");
   assert.equal(markup(host), "<p>Bye| world</p>");
+});
+
+test("a host focused with no selection inside takes typing at its start", () => {
+  const { host, heard } = editor("Hello");
+  tree.ends = null;
+  native.dispatch(FOCUS, host.nodeId, 0, 0, 0, 0, 0);
+  edit(host, "insertText", "> ");
+  assert.equal(markup(host), "<p>> |Hello</p>");
+  assert.deepEqual(heard, ["beforeinput:insertText", "input:insertText"]);
 });
 
 test("a prevented beforeinput changes nothing", () => {
