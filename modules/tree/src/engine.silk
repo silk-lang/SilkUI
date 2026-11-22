@@ -153,6 +153,8 @@ import node {
   NodeRare,
   NONE,
   WATCH_OUTSIDE,
+  WATCH_HAS_FOR_OTHERS,
+  WATCH_KEPT,
   NO_INDEX,
   FrameInput,
   FrameStats,
@@ -2157,18 +2159,22 @@ impl<'a> UiTree<'a> {
     let mut up = parent
     while true {
       while siblings && before != NONE {
-        if u32.bitAnd(self.node(before).styleWatch, css_element.WATCH_HAS_SIBLINGS) != 0 {
-          if wide { self.restyleSiblings(before) } else { self.restyleLocal(before) }
-        }
+        if u32.bitAnd(self.node(before).styleWatch, css_element.WATCH_HAS_SIBLINGS) != 0 { self.restyleAnchor(before, wide) }
         before = self.elementBeside(before, true)
       }
       if up == NONE { break }
-      if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_HAS) != 0 {
-        if wide { self.restyleSiblings(up) } else { self.restyleLocal(up) }
-      }
+      if u32.bitAnd(self.node(up).styleWatch, css_element.WATCH_HAS) != 0 { self.restyleAnchor(up, wide) }
       before = if siblings { self.elementBeside(up, true) } else { NONE }
       up = self.node(up).parent
     }
+  }
+
+  /// Restyles a `:has()` anchor whose argument may have changed: itself when only its own match
+  /// asked, else what other matches could read it from, below it or, when `wide`, beside it.
+  fn restyleAnchor(self: &mut Self, slot: u32, wide: bool) -> () {
+    if u32.bitAnd(self.node(slot).styleWatch, WATCH_HAS_FOR_OTHERS) == 0 { self.restyleSelf(slot) }
+    else if wide { self.restyleSiblings(slot) }
+    else { self.restyleLocal(slot) }
   }
 
   /// The first element child of `at`, or its next element sibling.
@@ -6085,7 +6091,7 @@ impl<'a> UiTree<'a> {
         node.movedScope = moved
         node.styleClass = class
         node.styleTwin = twin
-        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, css_element.WATCH_ASKED), watch)
+        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, WATCH_KEPT), watch)
         if askedUp != 0 { self.askUp(slot, askedUp) }
         self.work.sheetTwins = self.work.sheetTwins + 1
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
@@ -6098,7 +6104,7 @@ impl<'a> UiTree<'a> {
     let fresh = self.nodeMut(slot)
     fresh.styleClass = class
     fresh.styleTwin = NONE
-    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, css_element.WATCH_ASKED)
+    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, WATCH_KEPT)
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
@@ -6160,7 +6166,9 @@ impl<'a> UiTree<'a> {
     i = 0
     while i < watched.length {
       let at = watched[i].node
-      nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, watched[i].bits)
+      let mut bits = watched[i].bits
+      if at != u32.toUsize(slot) && u32.bitAnd(bits, css_element.WATCH_HAS) != 0 { bits = u32.bitOr(bits, WATCH_HAS_FOR_OTHERS) }
+      nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, bits)
       if u32.bitAnd(watched[i].bits, css_element.WATCH_HAS_SIBLINGS) != 0 { siblings = true }
       i = i + 1
     }
@@ -6207,7 +6215,7 @@ impl<'a> UiTree<'a> {
   /// context holds: combinators only step to parents and earlier siblings, so those are `slot`,
   /// its ancestors and the elements before each of them.
   fn watchAround(self: &mut Self, slot: u32) -> () {
-    let bits = css_element.WATCH_ASKED
+    let bits = WATCH_KEPT
     let mut up = slot
     while up != NONE {
       let mut beside = up
