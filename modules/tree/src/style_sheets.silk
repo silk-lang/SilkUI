@@ -32,6 +32,7 @@ import svg_css.values { Wide }
 import properties.catalog
 import silk.text.string { String, InvalidUtf8 }
 import silk.core.result { Result }
+import silk.num.u64
 import svg_css.input { Input, TokenRef }
 import svg_css.value_cursor { Cursor }
 import svg_css.declaration_values
@@ -93,6 +94,16 @@ impl RootSheets {
 pub struct Resolved {
   /// The result depends only on the cascade inputs and the parent, so equal nodes may share it.
   pub plain: bool,
+  /// The custom properties the values here mention, as name bits (`VariableMasks`): under a
+  /// parent scope that differs in none of them, the same match gives these declarations
+  /// again. Every bit is set when a container, an override, a starting style, an animation
+  /// or an inline value kept as text feeds the style.
+  pub variables: u64,
+  /// The custom properties it declares, as name bits.
+  pub declares: u64,
+  /// The candidates of its match that declare a custom property: with the node's inline
+  /// custom properties, what gives its scope under another parent (`movedScope`).
+  pub customs: List<Candidate>,
   /// What matching read about the node's siblings, index and descendants, and in the bits
   /// above `READS_ABOVE` about its ancestors': `MatchContext.reads`.
   pub reads: u32,
@@ -155,6 +166,11 @@ pub effect fn resolve(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   let frames = run keyframes(&sheets.*, &mut cache, system, tree, tree.node(slot).parent, &resolved.style, &mut stops)
   // Inherited animation names come from the parent's values, which the shared record does not key.
   if inheritsAnimation(resolved.style.declarations.asSlice()) { resolved.pending = Option<Pending>.None }
+  // Keyframes and a starting style are resolved in the node's scope too.
+  if enters || frames.length() != 0 {
+    let fed = &mut resolved.style
+    fed.variables = u64.MAX
+  }
   let style = &mut resolved.style
   style.keyframes = move frames
   return move resolved
@@ -173,6 +189,19 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
   tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolution
   ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   if target == PseudoTarget.None { return run resolve(&mut sheets, &mut cache, system, hasStarting, tree, origin, &mut stops) }
+  let resolved = run resolvePart(&mut sheets, &mut cache, system, hasStarting, tree, origin, target, states, rendered, &mut stops)
+  // The origin keeps no record of what its parts read: it only knows that one read something.
+  let reads = match &resolved.hit {
+    Option<Frozen<Resolved>>.Some { value } => u64.bitOr(value.get().variables, value.get().declares)
+    _ => u64.bitOr(resolved.style.variables, resolved.style.declares)
+  }
+  if reads != 0 { cache.variableUses = cache.variableUses + 1 }
+  return move resolved
+}
+
+effect fn resolvePart(sheets: &mut StyleSheets, cache: &mut Cache, system: [Color; 19], hasStarting: bool,
+  tree: &UiTree<'_>, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool, stops: &mut EasingStops) -> Resolution
+  ! ResolverError | RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
   let mut resolved = run resolveWith(&mut sheets, &mut cache, system, tree, origin, false, target, states, false)
   if target != PseudoTarget.Before && target != PseudoTarget.After { return move resolved }
   if !rendered && hasStarting {
@@ -184,6 +213,10 @@ pub effect fn resolvePseudo(sheets: &mut StyleSheets, cache: &mut Cache, system:
     resolved.containers = move before.containers
   }
   let frames = run keyframes(&sheets.*, &mut cache, system, tree, origin, &resolved.style, &mut stops)
+  if resolved.style.starting.isSome() || frames.length() != 0 {
+    let fed = &mut resolved.style
+    fed.variables = u64.MAX
+  }
   let style = &mut resolved.style
   style.keyframes = move frames
   return move resolved
@@ -251,9 +284,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   let watchAll = context.watchOverflow
   let mut parent = Option<ScopeId>.None
   if parentSlot != NONE {
-    if let Option<&Resolved>.Some { value } = tree.node(parentSlot).sheetStyle() {
-      parent = Option<ScopeId>.some(value.scope)
-    }
+    parent = tree.node(parentSlot).sheetScope()
   }
   let mut custom = List<InlineCustom<'_, '_>>.make()
   if target == PseudoTarget.None {
@@ -284,7 +315,7 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   if share {
     if let Option<Frozen<Resolved>>.Some { value } = move cache.find(scope, inherited, sheets.stateDependencies(), reads, sheets.candidates(), sheets.matches(), inline.asSlice()) {
       return Resolution { highlightBackground: Option<ColorProgram>.None, containers: List<ContainerDependency>.make(), hit: Option<Frozen<Resolved>>.some(move value), pending: Option<Pending>.None, watched: move watched, watchAll: watchAll,
-        style: Resolved { plain: false, reads: 0, states: 0, keyframes: List<Rule>.make(), overrides: List<Declaration>.make(), declarations: List<Declaration>.make(),
+        style: Resolved { plain: false, variables: u64.MAX, declares: u64.MAX, customs: List<Candidate>.make(), reads: 0, states: 0, keyframes: List<Rule>.make(), overrides: List<Declaration>.make(), declarations: List<Declaration>.make(),
           matches: List<MatchedRule>.make(), scope: scope, starting: Option<List<Declaration>>.None } }
     }
   }
@@ -327,6 +358,10 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
     }
     i = i + 1
   }
+  let masks = sheets.variableMasks(custom.asSlice())
+  let tracked = tree.styleOverrides().length == 0 && context.containers.length() == 0 && !keepsText(inline.asSlice())
+  let mut customs = List<Candidate>.make()
+  run sheets.customCandidates(&mut customs)
   let finished = run finish(move declarations, move ranks, move expressions, system, tree, parentSlot, Option<Color>.None, target == PseudoTarget.Selection)
   let mut pending = Option<Pending>.None
   if share {
@@ -337,7 +372,47 @@ effect fn resolveWith(sheets: &mut StyleSheets, cache: &mut Cache, system: [Colo
   let mut matches = List<MatchedRule>.make()
   run matches.appendSlice(sheets.matches())
   return Resolution { highlightBackground: move finished.highlightBackground, containers: move context.containers, hit: Option<Frozen<Resolved>>.None, pending: move pending, watched: move watched, watchAll: watchAll,
-    style: Resolved { plain: share, reads: reads, states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
+    style: Resolved { plain: share, variables: if tracked { masks.reads } else { u64.MAX }, declares: masks.declares, customs: move customs, reads: reads, states: sheets.stateDependencies(), keyframes: List<Rule>.make(), overrides: move finished.overrides, declarations: move finished.declarations, matches: move matches, scope: scope, starting: Option<List<Declaration>>.None } }
+}
+
+/// Whether an inline value is kept as text, to be substituted in the node's scope.
+fn keepsText(inline: &[Declaration]) -> bool {
+  let mut i: usize = 0
+  while i < inline.length {
+    if let Value.Text { .. } = &inline[i].value { return true }
+    i = i + 1
+  }
+  return false
+}
+
+/// The scope of the node at `slot` under its parent's scope as it is now, for a node that
+/// keeps the style of an earlier match: `customs` is that match's custom-property part.
+pub effect fn movedScope(sheets: &mut StyleSheets, tree: &UiTree<'_>, slot: u32, customs: &[Candidate]) -> ScopeId
+  ! RegistrationError | CssError | OutOfMemoryError ? &mut Allocator {
+  let node = tree.node(slot)
+  let parent = if node.parent != NONE { tree.node(node.parent).sheetScope() } else { Option<ScopeId>.None }
+  let mut custom = List<InlineCustom<'_, '_>>.make()
+  if let Option<&NodeIdentity>.Some { value: identity } = node.identity() {
+    let states = [StyleState.Base, StyleState.Hover, StyleState.Active, StyleState.Focus, StyleState.FocusVisible]
+    let mut stateIndex: usize = 0
+    while stateIndex < states.length {
+      let state = states[stateIndex]
+      if active(tree, slot, state) {
+        let mut at: usize = 0
+        while at < identity.custom().length {
+          let item = &identity.custom()[at]
+          if item.state == state {
+            let mut priority = Priority.make(Origin.Author, custom.length())
+            priority.important = item.important
+            run custom.append(InlineCustom<'_, '_> { name: String.utf8Bytes(String.view(&item.name)), tokens: &item.tokens, priority: priority })
+          }
+          at = at + 1
+        }
+      }
+      stateIndex = stateIndex + 1
+    }
+  }
+  return run sheets.variableScopeOf(parent, customs, custom.asSlice(), &Limits.make())
 }
 
 effect fn appendSheet(declarations: &mut List<Declaration>, expressions: &mut List<Expression>, sheets: &StyleSheets, memo: &mut Cache,

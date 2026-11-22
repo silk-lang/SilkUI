@@ -5,7 +5,7 @@
 //! time of one input and what the style system did for it.
 //!
 //!   restyle-bench [--runs N]
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Mutation }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Mutation, StyleState }
 import ui_tree.digest { DigestBox, DigestText, digestLayout }
 import silk.num.u64
 import silk.num.f32
@@ -46,6 +46,8 @@ struct Targets {
   editor: u32,
   editorText: u32,
   sidebarWrapper: u32,
+  /// A scroll area's viewport, or 0: the page's scroll position is written on it as variables.
+  scroller: u32,
   rows: List<u32>,
   menus: List<u32>,
 }
@@ -161,6 +163,7 @@ effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets, top: u32,
           } else {
             run batch.attribute(id, Attribute.Named { name: run String.copy(view(name)), value: Option<String>.some(run String.copy(view(value))) })
             if same(name, b"data-slot") && same(value, b"sidebar-wrapper") { targets.sidebarWrapper = id }
+            if same(name, b"data-slot") && same(value, b"scroll-area-viewport") && targets.scroller == 0 { targets.scroller = id }
             if same(name, b"data-thread-item") { run targets.rows.append(id) }
             if same(name, b"aria-haspopup") { run targets.menus.append(id) }
           }
@@ -179,18 +182,18 @@ effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets, top: u32,
   return next
 }
 
-pub enum Kind { Type, Sidebar, Panel, Menu, Mount }
+pub enum Kind { Type, Sidebar, Panel, Menu, Scroll, Mount }
 
 fn kindName(kind: Kind) -> string<'static> {
-  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" Kind.Mount => "mount a new copy of the page (thread switch)" }
+  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" Kind.Scroll => "scroll a scroll area (its viewport's overflow variables change)" Kind.Mount => "mount a new copy of the page (thread switch)" }
 }
 
-struct Counts { passes: usize, full: usize, resolves: usize, matches: usize, rootRestyles: usize, causes: [usize; 32] }
+struct Counts { passes: usize, full: usize, resolves: usize, matches: usize, moves: usize, rootRestyles: usize, causes: [usize; 32] }
 impl Copy for Counts {}
 
 fn counts(tree: &UiTree<'_>) -> Counts {
   let w = &tree.work
-  return Counts { passes: w.stylePasses, full: w.fullStylePasses, resolves: w.resolves, matches: w.sheetMatches, rootRestyles: w.rootRestyles, causes: w.dirtyCauses }
+  return Counts { passes: w.stylePasses, full: w.fullStylePasses, resolves: w.resolves, matches: w.sheetMatches, moves: w.scopeMoves, rootRestyles: w.rootRestyles, causes: w.dirtyCauses }
 }
 
 /// The mutations of input `n` of `kind`.
@@ -199,9 +202,16 @@ effect fn mutate(batch: &mut Batch, targets: &mut Targets, page: &[u8], kind: Ki
     Kind.Mount => {
       // A thread switch: the last view leaves and a new one mounts under the page's root.
       if targets.mounted != 0 { run batch.push(Mutation.Destroy { id: targets.mounted }) }
-      let mut copy = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, rows: List<u32>.make(), menus: List<u32>.make() }
+      let mut copy = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, scroller: 0, rows: List<u32>.make(), menus: List<u32>.make() }
       targets.nextId = run build(&mut batch, page, &mut copy, targets.top, targets.nextId)
       targets.mounted = copy.top
+    }
+    Kind.Scroll => {
+      // What a scroll area's script writes on each scroll event: how far the content overflows
+      // either edge, for the fade masks that read it.
+      let viewport = if targets.scroller != 0 { targets.scroller } else { targets.sidebarWrapper }
+      run batch.customProperty(viewport, StyleState.Base, "--scroll-area-overflow-y-start", Option<string>.some(if n % 2 == 0 { "24px" } else { "48px" }), false)
+      run batch.customProperty(viewport, StyleState.Base, "--scroll-area-overflow-y-end", Option<string>.some(if n % 2 == 0 { "300px" } else { "276px" }), false)
     }
     Kind.Type => {
       run typed.append(if n % 5 == 4 { " " } else { "a" })
@@ -258,9 +268,9 @@ effect fn measure(tree: &mut UiTree<'_>, targets: &mut Targets, page: &[u8], kin
   }
   let median = items[items.length / 2]
   let runs = RUNS
-  StderrWriter.print("{}: {} us per input; per input: {} style passes, {} full, {} root restyles, {} nodes styled, {} matched\n", &(
+  StderrWriter.print("{}: {} us per input; per input: {} style passes, {} full, {} root restyles, {} nodes styled, {} matched, {} kept under a new variable scope\n", &(
     kindName(kind), i64.toUsize(median / 1000), (after.passes - before.passes) / runs, (after.full - before.full) / runs,
-    (after.rootRestyles - before.rootRestyles) / runs, (after.resolves - before.resolves) / runs, (after.matches - before.matches) / runs))
+    (after.rootRestyles - before.rootRestyles) / runs, (after.resolves - before.resolves) / runs, (after.matches - before.matches) / runs, (after.moves - before.moves) / runs))
   let mut cause: usize = 0
   while cause < 32 {
     if after.causes[cause] != before.causes[cause] { StderrWriter.print("  full pass asked by cause {}: {} times\n", &(cause, after.causes[cause] - before.causes[cause])) }
@@ -324,7 +334,7 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
   let compiled = run compile.compile(Source.read("fixtures/t3.css"), &Options.make())
   let bytes = run compiled.encode()
   let mut batch = Batch.make()
-  let mut targets = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, rows: List<u32>.make(), menus: List<u32>.make() }
+  let mut targets = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, scroller: 0, rows: List<u32>.make(), menus: List<u32>.make() }
   let page = Source.read("fixtures/t3-page.tree")
   let nodes = run build(&mut batch, page, &mut targets, 0, 1)
   targets.nextId = nodes
@@ -339,7 +349,7 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
     u32.toUsize(nodes), i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000), targets.editor, targets.editorText, targets.sidebarWrapper, targets.rows.length(), targets.menus.length()))
   StderrWriter.print("watch overflows: {} (last at node {})\n", &(tree.work.watchOverflows, tree.work.lastOverflow))
   if targets.editorText == 0 || targets.sidebarWrapper == 0 || targets.rows.length() < 2 || targets.menus.length() == 0 { return 2 }
-  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Mount]
+  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Scroll, Kind.Mount]
   let mut k: usize = 0
   while k < kinds.length {
     run measure(&mut tree, &mut targets, page, kinds[k], &mut time)

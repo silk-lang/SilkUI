@@ -396,3 +396,91 @@ test effect fn generatedBoxesStayOutOfRangesAndVirtualBindings() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run generatedPublicBoundaries() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+import silk.collections.bytes { Bytes }
+
+effect fn classed(batch: &mut Batch, id: u32, parent: u32, classes: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  run batch.create(id, NodeKind.Box)
+  if parent == 0 { run batch.root(id) } else { run batch.append(parent, id) }
+  run batch.attribute(id, Attribute.ClassName { value: run String.copy(classes) })
+}
+
+fn boxWidth(tree: &UiTree<'_>, slot: u32) -> f32 { return tree.node(slot).computed().layout.width.value }
+
+effect fn variable(tree: &UiTree<'_>, id: u32, expected: &[u8]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut out = Bytes.make()
+  let found = run tree.customProperty(tree.slotOf(id), b"--w", &mut out)
+  return found && equal(out.asSlice(), expected)
+}
+
+/// A scroller (2) whose variable changes holds plain boxes (3, 5, 7), boxes that read the
+/// variable (4, and the `::before` of 6) and a box that declares its own (8, read by 9).
+effect fn movedScopes() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run classed(&mut batch, 1, 0, "top")
+  run classed(&mut batch, 2, 1, "plain")
+  run classed(&mut batch, 3, 2, "plain")
+  run classed(&mut batch, 4, 3, "reader")
+  run classed(&mut batch, 5, 3, "plain")
+  run classed(&mut batch, 6, 5, "mark")
+  run classed(&mut batch, 7, 5, "plain")
+  run classed(&mut batch, 8, 2, "setter")
+  run classed(&mut batch, 9, 8, "reader")
+  run classed(&mut batch, 12, 3, "other")
+  let mut row: u32 = 20
+  while row < 50 {
+    run classed(&mut batch, row, 3, "plain")
+    run classed(&mut batch, row + 1, row, "mark")
+    run classed(&mut batch, row + 2, row, "reader")
+    row = row + 10
+  }
+  let sheet = run compile.compile(b".top{display:block;width:400px}.plain{display:block;height:5px}.reader{display:block;width:var(--w,10px);height:2px}.mark{display:block}.mark::before{content:'';display:block;width:var(--w,10px);height:2px}.setter{display:block;--w:50px}.top{--unit:7px}.other{display:block;width:var(--unit);height:2px;--own:1px}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  let frame = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(frame)
+  let mark = pseudo(&tree, tree.slotOf(6), true)
+  run Testing.expect(mark != NONE && boxWidth(&tree, tree.slotOf(4)) == 10.0 && boxWidth(&tree, mark) == 10.0 && boxWidth(&tree, tree.slotOf(9)) == 50.0, "fallbacks and a nearer declaration apply")
+  let resolves = tree.work.resolves
+  run batch.customProperty(2, StyleState.Base, "--w", Option<string>.some("33px"), false)
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(boxWidth(&tree, tree.slotOf(4)) == 33.0 && boxWidth(&tree, pseudo(&tree, tree.slotOf(6), true)) == 33.0 && boxWidth(&tree, tree.slotOf(9)) == 50.0,
+    "boxes that read the variable take its new value, under boxes that kept their style")
+  run Testing.expect(tree.work.scopeMoves >= 6 && tree.work.resolves - resolves <= 16, "boxes that read no variable are not resolved again")
+  run Testing.expect(boxWidth(&tree, tree.slotOf(22)) == 33.0 && boxWidth(&tree, tree.slotOf(42)) == 33.0 && boxWidth(&tree, pseudo(&tree, tree.slotOf(21), true)) == 33.0
+    && boxWidth(&tree, pseudo(&tree, tree.slotOf(41), true)) == 33.0, "equal rows that kept their style hand the value to what reads it")
+  let shared = tree.node(tree.slotOf(20)).styleClass
+  run Testing.expect(shared != 0 && shared == tree.node(tree.slotOf(40)).styleClass && shared != tree.node(tree.slotOf(8)).styleClass
+    && tree.node(tree.slotOf(22)).styleClass == tree.node(tree.slotOf(42)).styleClass, "equal rows share one style after the move as before")
+  run Testing.expect(run variable(&tree, 7, b"33px"), "a box that kept its style holds the new variable")
+  run batch.customProperty(2, StyleState.Base, "--w", Option<string>.some("34px"), false)
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(boxWidth(&tree, tree.slotOf(4)) == 34.0 && boxWidth(&tree, pseudo(&tree, tree.slotOf(6), true)) == 34.0 && run variable(&tree, 7, b"34px"), "a box moves again with the next value")
+  run Testing.expect(boxWidth(&tree, tree.slotOf(12)) == 7.0 && tree.node(tree.slotOf(12)).movedScope != NONE && run variable(&tree, 12, b"34px"),
+    "a box that reads and declares other variables keeps its style too, under the new scope")
+  run classed(&mut batch, 11, 7, "reader")
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(boxWidth(&tree, tree.slotOf(11)) == 34.0, "a box added under one that moved reads the scope it moved to")
+  run batch.attribute(5, Attribute.ClassName { value: run String.copy("plain setter") })
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(boxWidth(&tree, tree.slotOf(11)) == 50.0 && boxWidth(&tree, pseudo(&tree, tree.slotOf(6), true)) == 50.0 && boxWidth(&tree, tree.slotOf(4)) == 34.0 && run variable(&tree, 7, b"50px"),
+    "a box that moved and then declares the variable hands its own down")
+  run batch.customProperty(2, StyleState.Base, "--w", Option<string<'static>>.None, false)
+  run tree.apply(run batch.take())
+  run tree.frame(frame)
+  run Testing.expect(boxWidth(&tree, tree.slotOf(4)) == 10.0 && boxWidth(&tree, tree.slotOf(11)) == 50.0 && boxWidth(&tree, tree.slotOf(9)) == 50.0, "removing the variable brings the fallback back")
+}
+
+test effect fn aVariableChangeResolvesOnlyTheBoxesThatReadIt() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run movedScopes() |> Effect.provideMut<Allocator>(&mut allocator)
+}
