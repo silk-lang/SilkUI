@@ -155,6 +155,7 @@ import node {
   WATCH_OUTSIDE,
   WATCH_HAS_FOR_OTHERS,
   WATCH_POINTER_FAR,
+  WATCH_PSEUDO_PLACE,
   WATCH_KEPT,
   NO_INDEX,
   FrameInput,
@@ -1080,6 +1081,11 @@ pub struct UiTree<'a> {
   pub scrolledSlots: List<u32>,
   /// Whether no scroll offset changed between the previous frame and this one.
   scrollsStill: bool,
+  /// The child lists `restylePlaceReaders` walked since styles last resolved (`placeTick` is
+  /// `Work.styleCalls` then): a slot and its node id.
+  placeWalked: [u64; 8],
+  placeCount: usize,
+  placeTick: usize,
   pub textInk: List<TextInk>,
   facesDirty: bool,
   pub uploads: Pending,
@@ -1680,6 +1686,9 @@ impl<'a> UiTree<'a> {
       scrolledSlots: List<u32>.make(),
       heldNodes: 0,
       scrollsStill: false,
+      placeWalked: [0; 8],
+      placeCount: 0,
+      placeTick: usize.MAX,
       textInk: List<TextInk>.make(),
       facesDirty: true,
       uploads: Pending.make(),
@@ -2152,13 +2161,86 @@ impl<'a> UiTree<'a> {
       return ()
     }
     if has { self.restyleAnchors(parent, previous) }
-    if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS | css_selectors.READS_EMPTY) != 0 {
+    // With no element on either side the parent may have been empty, or be so now.
+    if u32.bitAnd(reads, css_selectors.READS_EMPTY) != 0 && previous == NONE && next == NONE {
       self.restyleLocal(parent)
       return ()
+    }
+    if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS) != 0 {
+      self.restylePlaceReaders(parent)
     }
     if u32.bitAnd(reads, css_selectors.READS_EDGE) != 0 {
       if previous != NONE { self.restyleLocal(previous) }
       if next != NONE { self.restyleLocal(next) }
+    }
+  }
+
+  /// Restyles the nodes below `parent` whose match read the place of a child of `parent` among
+  /// its siblings: `+`, `~`, `:nth-*()` and the `*-of-type` classes. Each node's record says
+  /// what its own match read (`Resolved.reads`): a child of `parent` that read its own place,
+  /// and a node further down that read an ancestor's. A node with a pseudo-element whose match
+  /// read a place restyles too (`WATCH_PSEUDO_PLACE`). The other nodes matched without asking,
+  /// so a child that enters or leaves cannot change their styles.
+  ///
+  /// One walk serves every change to the same child list until styles resolve next: it marks
+  /// each reader there is, and a child that enters after it is restyled as new.
+  fn restylePlaceReaders(self: &mut Self, parent: u32) -> () {
+    let above = self.node(parent)
+    if above.styleDirty && above.styleSubtree { return () }
+    let key = u64.bitOr(u64.shiftLeft(u32.toU64(parent), 32), u32.toU64(above.id))
+    let top = above.css
+    if self.placeTick != self.work.styleCalls {
+      self.placeTick = self.work.styleCalls
+      self.placeCount = 0
+    }
+    let mut seen: usize = 0
+    while seen < self.placeCount {
+      if self.placeWalked[seen] == key { return () }
+      seen = seen + 1
+    }
+    if self.placeCount < 8 {
+      self.placeWalked[self.placeCount] = key
+      self.placeCount = self.placeCount + 1
+    }
+    let own = css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS
+    let up = u32.shiftLeft(own, css_selectors.READS_ABOVE)
+    let mut css = self.layout.firstChild(top)
+    let mut depth: usize = 1
+    while css != NO_INDEX {
+      let slot = self.slotOfCssNode(css)
+      let mut enter = false
+      if slot != NONE {
+        let node = self.node(slot)
+        // A subtree that restyles whole asks nothing more.
+        if !(node.styleDirty && node.styleSubtree) {
+          enter = true
+          if !node.styleDirty {
+            let read = match node.sheetStyle() { Option.Some { value } => value.reads _ => 0 }
+            if u32.bitAnd(read, if depth == 1 { own } else { up }) != 0 || u32.bitAnd(node.styleWatch, WATCH_PSEUDO_PLACE) != 0 {
+              self.restyleSelf(slot)
+            }
+          }
+        }
+      }
+      let child = if enter { self.layout.firstChild(css) } else { NO_INDEX }
+      if child != NO_INDEX {
+        css = child
+        depth = depth + 1
+        continue
+      }
+      while true {
+        let beside = self.layout.nextSibling(css)
+        if beside != NO_INDEX {
+          css = beside
+          break
+        }
+        css = self.layout.parent(css)
+        depth = depth - 1
+        if depth == 0 {
+          css = NO_INDEX
+          break
+        }
+      }
     }
   }
 
@@ -6112,6 +6194,15 @@ impl<'a> UiTree<'a> {
     return move resolved.style
   }
 
+  /// Records on `origin` that the match of one of its pseudo-elements read `reads`, when that
+  /// includes the place of an element among its siblings (`WATCH_PSEUDO_PLACE`).
+  fn notePseudoReads(self: &mut Self, origin: u32, reads: u32) -> () {
+    let place = css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS
+    if u32.bitAnd(reads, u32.bitOr(place, u32.shiftLeft(place, css_selectors.READS_ABOVE))) == 0 { return () }
+    let node = self.nodeMut(origin)
+    node.styleWatch = u32.bitOr(node.styleWatch, WATCH_PSEUDO_PLACE)
+  }
+
   pub effect fn resolvePseudoStyle(self: &mut Self, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool) -> Resolution
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
@@ -6127,6 +6218,7 @@ impl<'a> UiTree<'a> {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
         run container_watch.record(&mut self, origin, target, value.containers.asSlice())
         self.noteWatches(origin, value.watched.asSlice(), value.watchAll)
+        self.notePseudoReads(origin, value.style.reads)
         return move value
       }
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -6141,8 +6233,10 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX { return true }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
-    let result = run Effect.result(style_sheets.mayGenerate(&mut entries[at].sheets, &self, origin, target))
+    let mut read: u32 = 0
+    let result = run Effect.result(style_sheets.mayGenerate(&mut entries[at].sheets, &self, origin, target, &mut read))
     self.styleSheets = move roots
+    self.notePseudoReads(origin, read)
     match move result {
       Result<bool, ResolverError | CssError | OutOfMemoryError>.Success { value } => { return value }
       Result<bool, ResolverError | CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -8371,6 +8465,7 @@ impl<'a> UiTree<'a> {
       self.stats.primitives = self.scene().primitiveCount()
     } else {
       run self.paintFrame()
+      run self.placeSceneScrolls()
       self.paintedScrolls.clear()
       if self.flipped {
         run self.paintedScrolls.appendSlice(self.sceneB.scrolls())
@@ -8428,6 +8523,35 @@ impl<'a> UiTree<'a> {
 
   /// Moves the kept scene's scroll positions to the nodes' offsets now, so whoever draws the
   /// scene draws this frame.
+  /// Gives the scene just painted the offset of every scroll container it recorded. A subtree
+  /// that paint replayed says the offset it was first painted at, which is not the node's
+  /// when frames since then kept the scene and only moved its scroll positions
+  /// (`moveSceneScrolls`). What a replayed subtree draws does not depend on the offset: paint
+  /// replays it only where the cull the offset gives leaves it whole.
+  effect fn placeSceneScrolls(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let scale = self.input.scale
+    let mut i: usize = 0
+    while i < self.scene().scrolls().length {
+      let mut position = self.scene().scrolls()[i]
+      i = i + 1
+      let slot = self.slotOf(position.node)
+      if slot == NONE { continue }
+      let x = self.node(slot).scrollX() * scale
+      let y = self.node(slot).scrollY() * scale
+      if position.x != x || position.y != y {
+        position.x = x
+        position.y = y
+        if self.flipped {
+          run self.sceneB.setScroll(position)
+        } else {
+          run self.sceneA.setScroll(position)
+        }
+      }
+    }
+  }
+
   effect fn moveSceneScrolls(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -8704,6 +8828,7 @@ impl<'a> UiTree<'a> {
     edit.beginPaint(&mut self)
     self.scrollsStill = false
     run self.paintFrame()
+    run self.placeSceneScrolls()
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()

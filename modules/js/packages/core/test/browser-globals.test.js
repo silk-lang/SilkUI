@@ -35,6 +35,32 @@ test("the document is html > body at the tree's root, under document and window 
   assert.deepEqual(seen, [["window", true], ["button"], ["document", true, 3]]);
 });
 
+test("a scroll event passes the listeners above its target in the capture phase only", () => {
+  const scroller = document.createElement("div");
+  const holder = document.createElement("div");
+  holder.appendChild(scroller);
+  document.body.appendChild(holder);
+  const seen = [];
+  const note = (name) => (event) => seen.push(name + ":" + event.eventPhase);
+  window.addEventListener("scroll", note("window capture"), true);
+  window.addEventListener("scroll", note("window"));
+  document.addEventListener("scroll", note("document capture"), true);
+  document.addEventListener("scroll", note("document"));
+  holder.addEventListener("scroll", note("holder capture"), true);
+  holder.addEventListener("scroll", note("holder"));
+  scroller.addEventListener("scroll", note("target"));
+  mock.native.dispatch(12, scroller.nodeId, 0, 30, 0, 0, 0, undefined, undefined);
+  assert.deepEqual(seen, ["window capture:1", "document capture:1", "holder capture:1", "target:2"]);
+
+  // `load` stops at the document: the window is not on its path (DOM, get the parent).
+  const loads = [];
+  window.addEventListener("load", () => loads.push("window"), true);
+  document.addEventListener("load", () => loads.push("document"), true);
+  mock.native.dispatch(17, scroller.nodeId, 0, 0, 0, 0, 0, undefined, undefined);
+  assert.deepEqual(loads, ["document"]);
+  holder.remove();
+});
+
 test("selectionchange reaches document listeners", () => {
   const box = document.createElement("div");
   document.body.appendChild(box);
@@ -165,6 +191,49 @@ test("MutationObserver on the document or <html> with subtree sees changes anywh
     assert.equal(records[0].target, document.body);
     observer.disconnect();
   }
+});
+
+test("a deep clone keeps each element's tag and hands the tree only attributes it knows", () => {
+  const panel = document.createElement("div");
+  const make = (tag, type) => {
+    const element = document.createElement(tag);
+    if (type) element.setAttribute("type", type);
+    element.setAttribute("tabindex", "0");
+    element.setAttribute("data-slot", tag);
+    element.setAttribute("aria-label", tag);
+    panel.appendChild(element);
+    return element;
+  };
+  for (const tag of ["button", "input", "textarea", "img", "canvas", "svg"]) make(tag);
+  make("input", "checkbox");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("tabindex", "-1");
+  path.setAttribute("data-icon", "x");
+  panel.lastChild.previousSibling.appendChild(path);
+  mock.take();
+  const copy = panel.cloneNode(true);
+  const handed = mock.take().filter((call) => call[0] === "attribute").map((call) => call[2]);
+  assert.ok(!handed.includes("tabindex"), "the tree's attribute is tabIndex");
+  assert.deepEqual(copy.childNodes.map((node) => node.localName), panel.childNodes.map((node) => node.localName));
+  for (const [index, node] of copy.childNodes.entries()) {
+    assert.equal(node.getAttribute("tabindex"), "0");
+    assert.equal(node.getAttribute("data-slot"), panel.childNodes[index].localName);
+    assert.equal(node.getAttribute("aria-label"), panel.childNodes[index].localName);
+    assert.equal(node.constructor, panel.childNodes[index].constructor);
+  }
+  assert.equal(copy.lastChild.getAttribute("type"), "checkbox");
+  assert.equal(copy.childNodes[5].firstChild.getAttribute("data-icon"), "x");
+});
+
+test("host events are instances of the global Event, and only of their own subclasses", () => {
+  const image = document.createElement("img");
+  const load = new core.Event("load", image);
+  assert.ok(load instanceof Event);
+  assert.ok(load instanceof window.Event);
+  assert.ok(!(load instanceof ProgressEvent));
+  assert.ok(!(load instanceof MouseEvent));
+  assert.ok(new core.Event("click", image) instanceof MouseEvent);
+  assert.ok(new Event("x") instanceof Event);
 });
 
 test("history and location keep entries and send popstate and hashchange", async () => {

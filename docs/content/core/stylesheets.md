@@ -202,7 +202,7 @@ import "./app.css";
 
 `@silkui/vite` compiles Vite's processed CSS into `dist/app.sheet`; the app pipeline embeds it. Development CSS updates replace sheets in the running tree. React uses `className`, Foldkit uses `h.Class`, and core nodes expose `className`, `classList`, `id` and named attribute methods. In JavaScript, build conditional class strings as you would on the web, with template strings or a helper such as `clsx`; the same rule holds that each class appears whole in the source.
 
-To construct a sheet dynamically, enable `App.runtimeStylesheets()` for a release host. Development hosts already include the text compiler. After mounting a root:
+JavaScript hosts always include the text compiler, so a sheet can be constructed at any time. A Loom release host needs `App.runtimeStylesheets()` for it. After mounting a root:
 
 ```js
 import { CSSStyleSheet, root } from "@silkui/core";

@@ -838,6 +838,55 @@ effect fn scrollBody() -> ()
   )
 }
 
+effect fn scrollCaptureBody() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run inbox(&collection)
+  run tree.frame(viewport())
+  // The list no longer listens, the panel above it does: its capture listeners hear the
+  // list's scroll, so the record is still queued, at the list.
+  let mut quiet = Batch.make()
+  run quiet.listen(fixtures.INBOX_LIST, 0)
+  run tree.apply(run quiet.take())
+  run wheel(&mut tree, 100.0, 112.0, 30.0)
+  let above = run drain(&mut tree)
+  run Testing.expect(
+    count(&above, EventKind.Scroll, fixtures.INBOX_LIST) == 1,
+    "a listener above the scroller asks for its scroll record",
+  )
+  // Nothing on the path listens: no record.
+  let mut none = Batch.make()
+  run none.listen(fixtures.PANEL, 0)
+  run tree.apply(run none.take())
+  run wheel(&mut tree, 100.0, 112.0, 30.0)
+  let silent = run drain(&mut tree)
+  run Testing.expect(countKind(&silent, EventKind.Scroll) == 0, "with no listener on the path there is none")
+  // An offset before the start is the start (CSSOM View, "scroll an element": the position
+  // is clamped to the scrolling area).
+  let mut back = Batch.make()
+  run back.scrollTo(fixtures.INBOX_LIST, 0.0, -50.0)
+  run tree.apply(run back.take())
+  run tree.frame(viewport())
+  run Testing.expect(tree.node(tree.slotOf(fixtures.INBOX_LIST)).scrollY() == 0.0, "a negative offset clamps to zero")
+}
+
+test effect fn aScrollRecordIsQueuedForListenersAboveTheScroller() -> ()
+  ! AssertionError<'static>
+    | TreeError
+    | GeometryError
+    | FileError
+    | HostInputError
+    | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrollCaptureBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
 test effect fn wheelScrollsNestedContainersAndClamps() -> ()
   ! AssertionError<'static>
     | TreeError
@@ -909,6 +958,35 @@ effect fn scrolledSceneBody() -> ()
   let expectedAgain = run inboxScrolledTo(&collection, 44.0)
   run Testing.expect(samePixels(&again, &expectedAgain), "and draws the new offset")
 
+  // A change after the scroll, with no scroll of its own, paints: what it replays around the
+  // change is at the offsets the kept scene moved to, not those of the last paint.
+  let mut after = Batch.make()
+  run after.setText(fixtures.NEW_BUTTON + 1, "Later")
+  run tree.apply(run after.take())
+  let later = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(tree.scrollsKept == 2, "a change after a kept scroll paints")
+  let repainted = tree.stats.repaintedSubtrees
+  let mut freshLater = run inbox(&collection)
+  let mut laterChange = Batch.make()
+  run laterChange.setText(fixtures.NEW_BUTTON + 1, "Later")
+  run laterChange.scrollTo(fixtures.INBOX_LIST, 0.0, 44.0)
+  run freshLater.apply(run laterChange.take())
+  freshLater.invalidatePaint()
+  let mut laterSnapshot = CpuSnapshot.make()
+  let expectedLater = run drawnFrame(&mut freshLater, &mut laterSnapshot)
+  run Testing.expect(samePixels(&later, &expectedLater), "and draws the offset the scene was moved to")
+  // The list did not change: its paint is replayed, as it is with no scroll before.
+  let mut still = Batch.make()
+  run still.setText(fixtures.NEW_BUTTON + 1, "Again")
+  run tree.apply(run still.take())
+  drop run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(repainted == tree.stats.repaintedSubtrees, "a kept scroll before the change repaints nothing more")
+  let mut back = Batch.make()
+  run back.setText(fixtures.NEW_BUTTON + 1, "Later")
+  run tree.apply(run back.take())
+  let same = run drawnFrame(&mut tree, &mut snapshot)
+  run Testing.expect(samePixels(&same, &expectedLater), "and the offset holds through later paints")
+
   // A change with the scroll paints.
   let mut both = Batch.make()
   run both.scrollTo(fixtures.INBOX_LIST, 0.0, 10.0)
@@ -928,6 +1006,7 @@ effect fn scrolledSceneBody() -> ()
   }
   let mut freshFar = run inbox(&collection)
   let mut change = Batch.make()
+  run change.setText(fixtures.NEW_BUTTON + 1, "Later")
   run change.setText(fixtures.ROW + 11, "Changed")
   run change.scrollTo(fixtures.INBOX_LIST, 0.0, end)
   run freshFar.apply(run change.take())

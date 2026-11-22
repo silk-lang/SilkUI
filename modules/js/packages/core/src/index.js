@@ -714,8 +714,7 @@ export class Node {
   }
 
   _shallowClone() {
-    if (this._tag !== undefined && this.constructor === Node) return createElement(this._tag);
-    return new Node(this.kind);
+    return elementLike(this) ?? new Node(this.kind);
   }
 
   /** Joins adjacent text children and drops empty ones, in the whole subtree. */
@@ -886,7 +885,7 @@ export class Node {
   getAttribute(name) {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
-    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
+    if (name === "tabIndex" && (this._tag !== undefined || this.kind === "svg")) name = "tabindex";
     // The style attribute reflects the declarations, as CSSOM serializes them.
     if (name === "style" && this._tag !== undefined && this.#base?._touched) return this.#base.cssText;
     const aria = ariaName(name);
@@ -928,7 +927,7 @@ export class Node {
   setAttribute(name, value) {
     name = String(name);
     // HTML attribute names have no case: React's `tabIndex` prop is the `tabindex` attribute.
-    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
+    if (name === "tabIndex" && (this._tag !== undefined || this.kind === "svg")) name = "tabindex";
     let text = value == null ? null : String(value);
     if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
@@ -950,7 +949,7 @@ export class Node {
       else warnOnce("only an image has a src: it is ignored");
     } else if (name === "alt") {
       native.attribute(this.nodeId, "label", text ?? "");
-    } else if (this._tag !== undefined && (name === "tabindex" || name === "tabIndex")) {
+    } else if ((this._tag !== undefined || this.kind === "svg") && name === "tabindex") {
       this._keep("focus", "blur");
       native.attribute(this.nodeId, "tabIndex", text === null ? -2147483648 : Number(text));
     } else if (this._tag !== undefined && name === "style") {
@@ -1469,7 +1468,7 @@ export class Input extends Node {
   }
 
   _shallowClone() {
-    const copy = new this.constructor();
+    const copy = elementLike(this) ?? new this.constructor();
     copy.value = this.#value;
     return copy;
   }
@@ -1687,7 +1686,9 @@ export class Image extends Node {
   }
 
   _shallowClone() {
-    return new Image(this.#src);
+    const copy = elementLike(this) ?? new Image();
+    copy.src = this.#src;
+    return copy;
   }
 }
 
@@ -1756,7 +1757,7 @@ export class Canvas extends Node {
   }
 
   _shallowClone() {
-    const copy = new Canvas();
+    const copy = elementLike(this) ?? new Canvas();
     copy.width = this.#width;
     copy.height = this.#height;
     return copy;
@@ -3005,6 +3006,14 @@ export class StyleElement extends Node {
   }
 }
 
+// A fresh element of `node`'s tag and class, as `cloneNode` starts from; null for a node that
+// is not an HTML element.
+function elementLike(node) {
+  if (node._tag === undefined) return null;
+  const type = node instanceof CheckInput ? node.type : node instanceof Input ? undefined : node.getAttribute("type") ?? undefined;
+  return createElement(node._tag, { type });
+}
+
 export function createElement(tag, options) {
   tag = String(tag).toLowerCase();
   const type = String(options?.type ?? "text").toLowerCase();
@@ -4232,8 +4241,14 @@ let rootNode = null;
 // What events pass above the root, outermost last: the document and the window of a DOM layer
 // over the tree (`@silkui/core/globals`). Each has `_run(event, capture)` as a node does.
 let outerTargets = [];
-// Events the web does not send on to the document and the window.
-const NOT_OUTER = new Set(["scroll", "layout", "load", "error"]);
+// The targets above the root on the path of an event of `type`, as DOM's "get the parent"
+// gives them: the document for every event, and the window for all but `load`. An event that
+// does not bubble (`scroll`, `error`) still passes them in the capture phase. `layout` is the
+// tree's own and stays in it.
+function outerPath(type) {
+  if (type === "layout") return [];
+  return type === "load" ? outerTargets.slice(0, 1) : outerTargets;
+}
 
 /** Has events that reach the root go on to `targets` (outermost last), as `@silkui/core/globals` does for `document` and `window`. */
 export function setOuterTargets(...targets) {
@@ -4406,7 +4421,7 @@ export class Event {
   composedPath() {
     const path = [];
     for (let node = this.target; node; node = node.parentNode) path.push(node);
-    if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(this.type)) path.push(...outerTargets);
+    if (outerTargets.length && path[path.length - 1] === rootNode) path.push(...outerPath(this.type));
     return path;
   }
 }
@@ -4599,7 +4614,7 @@ export function dispatchEvent(event) {
 function dispatchThrough(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
-  if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
+  if (outerTargets.length && path[path.length - 1] === rootNode) path.push(...outerPath(event.type));
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
