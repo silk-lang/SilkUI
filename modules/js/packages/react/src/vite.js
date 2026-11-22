@@ -124,15 +124,20 @@ const htmlSheetPlugin = {
   },
 };
 
-// `react-dom` is the dom.js beside wherever `@silkui/react` resolves, so an app that points
-// `@silkui/react` at other sources (an alias) loads one copy of the renderer, not two.
+// `react-dom` is `@silkui/react/dom`, so the dev server pre-bundles it with the renderer. An
+// app that points `@silkui/react` at other sources (an alias) gets the dom.js beside them,
+// so it loads one copy of the renderer, not two.
 const domPlugin = {
   name: "silk:react-dom",
   enforce: "pre",
   async resolveId(id, importer, options) {
     if (id !== "react-dom" && id !== "react-dom/client") return;
-    const main = await this.resolve(IMPORT_SOURCE, importer, { ...options, skipSelf: true });
-    return main && !main.external ? join(dirname(main.id.split("?")[0]), "dom.js") : DOM;
+    options = { ...options, skipSelf: true };
+    const main = await this.resolve(IMPORT_SOURCE, importer, options);
+    if (!main || main.external) return DOM;
+    const path = main.id.split("?")[0];
+    if (/[/\\]node_modules[/\\]/.test(path)) return this.resolve(IMPORT_SOURCE + "/dom", importer, options);
+    return join(dirname(path), "dom.js");
   },
 };
 
