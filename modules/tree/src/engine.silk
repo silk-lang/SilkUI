@@ -986,6 +986,10 @@ pub struct UiTree<'a> {
   pub styleClasses: u32,
   /// The nodes that matched selectors themselves in this pass, by `style_share.modelKey`.
   pub styleModels: HashMap<u64, u32>,
+  /// The class nodes take in this pass when they keep their style under a changed variable
+  /// scope, by the class they held and their parent's new one: nodes that shared a class and
+  /// moved under parents of one class share one again (`UiTree.moveScope`).
+  pub movedClasses: HashMap<u64, u32>,
   /// The computed styles the nodes hold, each once.
   pub stylePool: StylePool,
   /// The style a text node takes under a parent, by the parent's stamp (see `TextInherit`).
@@ -1496,6 +1500,7 @@ impl<'a> UiTree<'a> {
     run out.work("style.rules-walked-for-conditions", w.conditionRulesWalked)
     run out.work("style.resolves", w.resolves)
     run out.work("style.resolves.ticks", w.ticks)
+    run out.work("style.scope-moves", w.scopeMoves)
     run out.work("style.sheet.skipped(text or no sheet)", w.sheetSkips)
     run out.work("style.sheet.from-twin", w.sheetTwins)
     run out.work("style.sheet.matched", w.sheetMatches)
@@ -1612,6 +1617,7 @@ impl<'a> UiTree<'a> {
       scrollAnchors: List<ScrollAnchor>.make(),
       styleClasses: 0,
       styleModels: HashMap<u64, u32>.make(Hash.seed(5399)),
+      movedClasses: HashMap<u64, u32>.make(Hash.seed(5407)),
       stylePool: StylePool.make(),
       textInherits: List<TextInherit>.make(),
       freshStyles: List<FreshStyle>.make(),
@@ -3556,6 +3562,8 @@ impl<'a> UiTree<'a> {
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
       styleTwin: NONE,
+      movedScope: NONE,
+      variableFree: false,
       styleWatch: 0,
       computedStamp: 0,
       selectorIdentity: Thin<NodeIdentity>.none(),
@@ -4033,9 +4041,9 @@ impl<'a> UiTree<'a> {
   /// with their own `var()`s substituted. False when the node has none.
   pub effect fn customProperty(self: &Self, slot: u32, name: &[u8], out: &mut Bytes) -> bool
     ! OutOfMemoryError ? &mut Allocator {
-    let resolved = match self.node(slot).sheetStyle() {
-      Option<&Resolved>.Some { value } => value
-      Option<&Resolved>.None => { return false }
+    let scope = match self.node(slot).sheetScope() {
+      Option<ScopeId>.Some { value } => value
+      Option<ScopeId>.None => { return false }
     }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.rootOfTop(self.topOf(slot)))
     if at == usize.MAX { return false }
@@ -4045,7 +4053,7 @@ impl<'a> UiTree<'a> {
     run reference.append(b"var(")
     run reference.append(name)
     run reference.append(b")")
-    let expanded = run Effect.result(style_sheets.substituteText(&inputs[0], resolved.scope, reference.asSlice()))
+    let expanded = run Effect.result(style_sheets.substituteText(&inputs[0], scope, reference.asSlice()))
     return match move expanded {
       Result.Success { value: Option<Bytes>.Some { value } } => {
         run out.append(value.asSlice())
@@ -6045,6 +6053,9 @@ impl<'a> UiTree<'a> {
   effect fn resolveSheet(self: &mut Self, slot: u32) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    // The record this installs carries the node's scope again.
+    let unmoved = self.nodeMut(slot)
+    unmoved.movedScope = NONE
     if at == usize.MAX || (self.styleSheets.asSlice()[at].sheets.length() == 0 && !self.styleSheets.asSlice()[at].inlineVariables) || self.node(slot).kind == NodeKind.Text {
       let node = self.nodeMut(slot)
       node.resolvedSheet = Option<Frozen<Resolved>>.None
@@ -6068,8 +6079,10 @@ impl<'a> UiTree<'a> {
         // An equal node is asked the same of itself; the twin's own match asked no other node.
         let watch = self.node(twin).styleWatch
         let askedUp = u32.shiftRight(watch, ASKED_UP_SHIFT)
+        let moved = self.node(twin).movedScope
         let node = self.nodeMut(slot)
         node.resolvedSheet = move shared
+        node.movedScope = moved
         node.styleClass = class
         node.styleTwin = twin
         node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, css_element.WATCH_ASKED), watch)
@@ -6920,6 +6933,7 @@ impl<'a> UiTree<'a> {
     }
     // Only a node styled earlier in this pass is known to hold its current match.
     self.styleModels.clear()
+    self.movedClasses.clear()
     let full = self.stylesDirty
     if full {
       self.work.fullStylePasses = self.work.fullStylePasses + 1
@@ -6946,22 +6960,44 @@ impl<'a> UiTree<'a> {
     // Each entry is a slot and whether its parent's inherited values changed.
     let mut stack = List<u64>.make()
     run stack.append(u32.toU64(self.root))
+    // For each entry, the custom properties that may differ in its parent's new scope, as name
+    // bits (`VariableMasks`): read where bit 34 is set.
+    let mut differing = List<u64>.make()
+    run differing.append(0)
     while stack.length() != 0 {
       let last = stack.length() - 1
       let entry = stack.get(last)
       stack.truncate(last)
+      let differs = differing.get(last)
+      differing.truncate(last)
       let slot = u64.toU32(u64.bitAnd(entry, 0xFFFFFFFF))
-      let forced = full || rootFontChanged || u64.bitAnd(entry, 0x100000000) != 0
       // Bit 33: an ancestor's change reaches this subtree through selectors.
       let reached = u64.bitAnd(entry, 0x200000000) != 0
+      // Bit 34: all that changed in the parent is its variable scope. A node that reads none
+      // of the variables that differ keeps its style and moves under the new scope.
+      let scoped = u64.bitAnd(entry, 0x400000000) != 0
+      let moves = scoped && !full && !rootFontChanged && !reached && u64.bitAnd(entry, 0x100000000) == 0 && self.movesScope(slot, differs)
+      // A node that cannot move takes the new scope as any other change of what it inherits.
+      let forced = full || rootFontChanged || u64.bitAnd(entry, 0x100000000) != 0 || (scoped && !moves)
+      let mut changed = full
+      // The change is the node's variable scope and nothing else its children inherit.
+      let mut scopeOnly = false
+      // The properties that may differ in this node's new scope, for its children.
+      let mut differBelow = differs
+      if moves {
+        changed = run self.moveScope(slot)
+        scopeOnly = changed
+        // Its children are not visited: what they share was taken under the class it held.
+        if !changed { run self.forgetShares(slot) }
+      }
       let node = self.node(slot)
-      let own = forced || reached || node.styleDirty
+      let own = !moves && (forced || reached || node.styleDirty)
       let tick = !forced && !reached && node.styleTick
       let below = node.subtreeDirty
-      let mut changed = full
       let mut subtree = false
       let mut forget = false
       if own {
+        let usesBefore = self.variableUses()
         let scopeBefore = node.sheetScope()
         let classBefore = node.styleClass
         let before = node.computed().text
@@ -7009,21 +7045,32 @@ impl<'a> UiTree<'a> {
         // A descendant's share class says its ancestors had equal selector inputs: those it
         // does not resolve again in this pass give it up.
         forget = classBefore != self.node(slot).styleClass && !subtree
-        changed = full || rootFontChanged || !sameScope(scopeBefore, self.node(slot).sheetScope()) || !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        let scopeChanged = !sameScope(scopeBefore, self.node(slot).sheetScope())
+        let valuesChanged = !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
           || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
+        changed = full || rootFontChanged || scopeChanged || valuesChanged
+        scopeOnly = !full && !rootFontChanged && scopeChanged && !valuesChanged
+        // What may differ below: what differed above, where that is known, and what the node's
+        // own declarations give another value now.
+        let known = scopeBefore.isSome() && !full && !rootFontChanged && (scoped || u64.bitAnd(entry, 0x100000000) == 0)
+        differBelow = if known { u64.bitOr(if scoped { differs } else { 0 }, self.scopesDiffer(scopeBefore, self.node(slot).sheetScope())) } else { u64.MAX }
+        let free = self.variableUses() == usesBefore
+        let flagged = self.nodeMut(slot)
+        flagged.variableFree = free
       }
-      if forget { run self.forgetShares(slot) }
+      // Under a change of scope alone every child is visited and takes a class again.
+      if forget && !scopeOnly { run self.forgetShares(slot) }
       let cleared = self.nodeMut(slot)
       cleared.styleDirty = false
       cleared.styleTick = false
       cleared.subtreeDirty = false
       cleared.styleSubtree = false
       if changed || below || subtree || own {
-        let flag: u64 = u64.bitOr(if changed { 0x100000000 } else { 0 }, if subtree { 0x200000000 } else { 0 })
+        let flag: u64 = u64.bitOr(u64.bitOr(if changed && !scopeOnly { 0x100000000 } else { 0 }, if subtree { 0x200000000 } else { 0 }), if scopeOnly { 0x400000000 } else { 0 })
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
@@ -7035,6 +7082,7 @@ impl<'a> UiTree<'a> {
           if found != NONE && (changed || below || subtree || self.node(found).styleDirty || explicitInherit(self.node(found))) {
             let extra: u64 = if own && !changed && explicitInherit(self.node(found)) { 0x100000000 } else { 0 }
             run stack.append(u64.bitOr(u32.toU64(found), u64.bitOr(flag, extra)))
+            run differing.append(differBelow)
           }
           child = layoutNodes.nextSibling(child)
         }
@@ -7062,6 +7110,78 @@ impl<'a> UiTree<'a> {
       if self.stylesPending { run self.resolveStyles() }
     }
     if self.listsUsed { run lists.update(&mut self) }
+  }
+
+  /// The styles of parts resolved so far that read a variable or declare one (`Cache.variableUses`).
+  fn variableUses(self: &Self) -> u64 {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return 0 }
+    return self.styleSheets.asSlice()[at].cache.variableUses
+  }
+
+  /// The custom properties two scopes of one node give different values of its own, as name bits.
+  fn scopesDiffer(self: &Self, before: Option<ScopeId>, after: Option<ScopeId>) -> u64 {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return u64.MAX }
+    return self.styleSheets.asSlice()[at].sheets.variablesDiffering(before, after)
+  }
+
+  /// Whether the node at `slot`, whose parent changed only its variable scope, can keep its
+  /// style: it is clean, its own style mentions none of the custom properties `differs` that
+  /// may differ in that scope, none of its parts reads a variable, and it holds no first
+  /// letter, whose style is resolved apart from the node's.
+  fn movesScope(self: &Self, slot: u32, differs: u64) -> bool {
+    let node = self.node(slot)
+    if node.styleDirty || !node.variableFree || node.parent == NONE { return false }
+    if node.kind == NodeKind.Text { return true }
+    let reads = match node.sheetStyle() { Option.Some { value } => value.variables _ => { return false } }
+    if u64.bitAnd(reads, differs) != 0 { return false }
+    return match node.identity() { Option.Some { value } => value.letterBox == NONE && !value.letterRules _ => true }
+  }
+
+  /// Moves the node at `slot` under its parent's new variable scope, keeping its style: the
+  /// scope its own custom properties give there. Returns whether its scope changed, which is
+  /// all its children can inherit of the change.
+  effect fn moveScope(self: &mut Self, slot: u32) -> bool
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    self.work.scopeMoves = self.work.scopeMoves + 1
+    let record = match &self.node(slot).resolvedSheet {
+      Option<Frozen<Resolved>>.Some { value } => value.clone()
+      _ => { return false }
+    }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return false }
+    let before = self.node(slot).sheetScope()
+    let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
+    let entries = roots.asMutSlice()
+    let rebuilt = run Effect.result(style_sheets.movedScope(&mut entries[at].sheets, &self, slot, record.get().customs.asSlice()))
+    self.styleSheets = move roots
+    let scope = match move rebuilt {
+      Result<ScopeId, RegistrationError | CssError | OutOfMemoryError>.Success { value } => value
+      Result<ScopeId, RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { fail TreeError.StyleSheet { index: 0, root: self.current, sheet: 0 } } }
+      }
+    }
+    // Nodes of one class under parents of one class still have equal ancestors.
+    let held = self.node(slot).styleClass
+    let parentClass = self.node(self.node(slot).parent).styleClass
+    let mut class: u32 = 0
+    if held != 0 && parentClass != 0 {
+      let key = u64.bitOr(u64.shiftLeft(u32.toU64(held), 32), u32.toU64(parentClass))
+      class = match self.movedClasses.get(key) {
+        Option.Some { value } => value
+        _ => {
+          let next = self.styleClasses + 1
+          self.styleClasses = next
+          drop run self.movedClasses.insert(key, next)
+          next
+        }
+      }
+    }
+    let node = self.nodeMut(slot)
+    node.movedScope = usize.toU32(scope.index)
+    node.styleClass = class
+    return !sameScope(before, Option<ScopeId>.some(scope))
   }
 
   /// Forgets what matching watched under the current root: a root restyle asks it all again.
