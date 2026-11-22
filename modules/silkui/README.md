@@ -78,9 +78,9 @@ inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptim
 and runtime packages while keeping the application unoptimized. A JavaScript app's development
 host is all engine and renderer, so it is optimized whole, the standard library too, with the
 development tools bound on (`ui_inspect_server.devtools.enabled`). To measure the build users
-get without a window, build it with `SILK_UI_BUILD_DEVTOOLS=1` in the environment: the host
-then carries the inspector too, so `SILK_UI_HEADLESS` scripts run on it. Do not ship that
-build.
+get without a window, build an app on `Runtime.node()` with `SILK_UI_BUILD_DEVTOOLS=1` in
+the environment: the host then carries the inspector too, so `SILK_UI_HEADLESS` scripts run
+on it. Do not ship that build.
 
 ### What a built JavaScript app starts from
 
