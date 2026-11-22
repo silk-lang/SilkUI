@@ -84,6 +84,18 @@ test("events run capture, target and bubble phases", () => {
   assert.deepEqual(log, ["root capture 1", "leaf 2 0", "middle 3"]);
 });
 
+test("window.event is the event being dispatched", () => {
+  const root = createBox();
+  const leaf = createBox();
+  root.append(leaf);
+  const seen = [];
+  leaf.addEventListener("click", (event) => seen.push(globalThis.event === event));
+  root.addEventListener("click", (event) => seen.push(globalThis.event === event));
+  mock.click(leaf.nodeId);
+  assert.deepEqual(seen, [true, true]);
+  assert.equal(globalThis.event, undefined);
+});
+
 test("listen flags follow the listeners", () => {
   const box = createBox();
   mock.take();
@@ -1199,4 +1211,23 @@ test("an empty node shares no list with another, and its looks read back as CSS"
   assert.deepEqual(b.childNodes, []);
   assert.equal(child.parentNode, null);
   assert.equal(heard, 0);
+});
+
+test("an svg clones deeply with its markup attributes, elements and text", () => {
+  const svg = createNode("svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("className", "size-4");
+  const path = createSvgElement("path");
+  path.setAttribute("d", "M5 12h14");
+  svg.appendChild(path);
+  const title = createSvgElement("title");
+  title.append("Model");
+  svg.appendChild(title);
+  const copy = svg.cloneNode(true);
+  assert.notEqual(copy, svg);
+  assert.equal(copy.outerHTML, svg.outerHTML);
+  assert.equal(copy.getAttribute("className"), svg.getAttribute("className"));
+  assert.equal(copy.getAttribute("viewBox"), "0 0 24 24");
+  assert.notEqual(copy.firstChild, path);
+  assert.equal(svg.cloneNode(false).childNodes.length, 0);
 });
