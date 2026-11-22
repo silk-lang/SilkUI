@@ -1,5 +1,9 @@
 //! Exercises virtualization through the retained-tree protocol, without loom.
 import ui_tree.css
+import ui_tree.node { NONE }
+import ui_tree.mutation { Role }
+import ui_tree.access { AccessTree, ActionOutcome, accessId, doAction }
+import accesskit.lib { Action, ActionRequest, TreeId }
 import ui_tree.css { px, percent, Keyword }
 import ui_tree.legacy {
   UiTree,
@@ -17,6 +21,7 @@ import ui_tree.legacy {
 }
 import ui_tree.inspect { info, NodeInfo }
 import ui_fixtures.fixtures as fixtures
+import ui_protocol.backend { Backend }
 import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.effect { Effect }
@@ -122,6 +127,7 @@ effect fn body() -> ()
   let mut batch = Batch.make()
   run batch.create(1, NodeKind.Box)
   run batch.root(1)
+  run batch.attribute(1, Attribute.Role { value: Role.Feed })
   run batch.style(
     1,
     &[
@@ -139,9 +145,42 @@ effect fn body() -> ()
   )
   run tree.apply(run batch.take())
   let mut current = List<VirtualItem>.make()
+  let geometry = &tree.virtualLists.asSlice()[0]
+  run Testing.expect(
+    geometry.heights.length() == 0 && geometry.prefix(9999) == 849915.0
+      && geometry.locate(849915.0) == 9999,
+    "an unmeasured list can seek directly without allocating any per-row heights",
+  )
   run mount(&mut tree, &mut current)
   run settle(&mut tree, &mut current, 400.0)
   run Testing.expect(tree.nodeCount() < 20, "a direct tree client mounts only requested rows")
+  let last = current.get(current.length() - 1)
+  run batch.text(last.id, 8, "buffered row")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport(400.0))
+  let mut publisher = AccessTree.make()
+  let mut revealable = false
+  if let Option.Some { value } = move run publisher.update(&tree) {
+    let mut n: usize = 0
+    while n < value.nodes.length() {
+      let entry = &value.nodes.asSlice()[n]
+      if entry.id.equals(accessId(1)) {
+        run Testing.expect(entry.node.sizeOfSet().unwrapOr(0) == 10000 && entry.node.children().length < 20,
+          "a virtual feed exposes the logical count without inventing accessible children")
+      }
+      if entry.id.equals(accessId(last.id)) { revealable = entry.node.supportsAction(Action.ScrollIntoView) }
+      n = n + 1
+    }
+  }
+  run Testing.expect(revealable, "the platform reader can request the last buffered row be revealed")
+  let reveal = ActionRequest { action: Action.ScrollIntoView, targetTree: TreeId.root(),
+    targetNode: accessId(8), data: Option.None }
+  run Testing.expect((run doAction(&mut tree, &reveal)) == ActionOutcome.Done, "reader reveal accepted")
+  run settle(&mut tree, &mut current, 400.0)
+  run Testing.expect(current.get(current.length() - 1).index > last.index, "reading advances the mount boundary")
+  run batch.scrollTo(1, 0.0, 0.0)
+  run tree.apply(run batch.take())
+  run settle(&mut tree, &mut current, 400.0)
   let mut invalidItems = List<VirtualItem>.make()
   run invalidItems.appendSlice(current.asSlice())
   invalidItems.set(1, VirtualItem { index: current.get(0).index, id: current.get(1).id })
@@ -171,9 +210,34 @@ effect fn body() -> ()
     "invalid estimates cannot corrupt an existing controller",
   )
   let focus = current.get(1).id
-  run batch.focus(focus)
+  run batch.box(focus, 9, &[])
+  run batch.attribute(9, Attribute.TabIndex { value: 0 })
+  run batch.focus(9)
+  let mut targets = List<u32>.make()
+  run targets.append(current.get(2).id)
+  run batch.attribute(9, Attribute.ActiveDescendant { ids: move targets })
+  tree.browseCursor = current.get(3).id
   run batch.scrollTo(1, 0.0, 200000.0)
   run tree.apply(run batch.take())
+  run tree.frame(viewport(400.0))
+  let wanted = run tree.virtualIndices(1)
+  run Testing.expect(wanted.get(0) == 1 && wanted.get(1) == 2 && wanted.get(2) == 3 && wanted.get(3) > 1000,
+    "focus, active descendant, and browse cursor retain three independent rows")
+  let mut through = List<usize>.make()
+  run Testing.expect(
+    (run Backend.indices(&tree, 1, &mut through)) && through.length() == wanted.length()
+      && through.get(0) == 1 && through.get(3) == wanted.get(3),
+    "protocol clients such as Loom read the same request",
+  )
+  run Testing.expect(!(run Backend.indices(&tree, 77, &mut through)) && through.length() == 0,
+    "a node with no list requests nothing")
+  run Testing.expect(run Effect.catch<TreeError>(
+    applied(&mut tree, Mutation.Destroy { id: current.get(2).id }), invalid), "active row cannot be recycled")
+  run Testing.expect(run Effect.catch<TreeError>(
+    applied(&mut tree, Mutation.Remove { id: current.get(3).id }), invalid), "browse row cannot be detached")
+  run batch.attribute(9, Attribute.ActiveDescendant { ids: List<u32>.make() })
+  run tree.apply(run batch.take())
+  tree.browseCursor = NONE
   run settle(&mut tree, &mut current, 400.0)
   let range = tree.virtualRange(1).unwrapOr(
     VirtualRange { count: 0, first: 0, end: 0, pinned: usize.MAX, pinnedId: 0 },
@@ -182,7 +246,15 @@ effect fn body() -> ()
     range.first > 1000 && range.pinnedId == focus,
     "tree owns distant range and focus retention",
   )
-  run Testing.expect(tree.node(tree.focused).id == focus, "focus survives client reconciliation")
+  run Testing.expect(
+    run Effect.catch<TreeError>(applied(&mut tree, Mutation.Destroy { id: focus }), invalid),
+    "even a stale frontend cannot recycle the row containing the focused control",
+  )
+  run Testing.expect(
+    run Effect.catch<TreeError>(applied(&mut tree, Mutation.Remove { id: focus }), invalid),
+    "detaching the pinned row is rejected too",
+  )
+  run Testing.expect(tree.node(tree.focused).id == 9, "the same nested control keeps focus")
   run Testing.expect(
     tree.nodeCount() < 20 && tree.layout.nodeCount() < 60,
     "UI and private spacer storage remain bounded",

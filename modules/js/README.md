@@ -95,6 +95,40 @@ mount(createBox({ width: 400, height: 300 }, button));
 - **Errors.** A listener that throws does not stop the dispatch. `setErrorHandler` receives
   the exception. Without a handler the host reports the first one after the input.
 
+### Virtual lists
+
+The tree requests **sorted logical indices**, including any separately retained
+focus, active-descendant or browse-cursor rows. Do not turn the first and last
+indices into a contiguous range. Give the list a bounded height. `overscan` is
+in CSS pixels above and below the viewport (JS default: 128).
+
+With React, return ordinary JSX for each requested item:
+
+```tsx
+import { VirtualList } from "@silkui/react";
+
+<VirtualList items={messages} itemKey={m => m.id} style={{ height: 480 }}
+  estimatedRowHeight={48} rowHeight={m => m.collapsed ? 32 : "auto"}>
+  {m => <box>{m.subject}</box>}
+</VirtualList>
+```
+
+`rowHeight={32}` styles every mounted wrapper at 32 px and supplies the tree's
+estimate. This uses the existing measured layout path, not a measurement bypass.
+Pass `revision` when reordering data or invalidating cached measurements.
+
+With plain JS, call `port.setVirtualList({ count, estimatedRowHeight, overscan,
+gap, revision }, onRange)` on a bounded, scrolling flex column. In `onRange`,
+reconcile direct child boxes by stable key, keep surviving nodes, then call
+`port.bindVirtualRows(indices)` in child order. Give each row `flexShrink: 0`
+and use `list`/`listitem` roles with logical position and total count. Pass
+`null` to clear the controller without deleting the children.
+
+Foldkit exposes `VirtualList(options, onRange)` and `VirtualRows(indices)` as
+properties for the scroll container. Send requested indices into your model;
+render one keyed child per index, and pass those same indices to `VirtualRows`
+so the adapter binds the boxes after Foldkit patches its children.
+
 ## @silkui/react
 
 [packages/react](packages/react) renders React components to the tree. Host elements are the
