@@ -50,9 +50,8 @@ check("const", true, () => {
   { const a = 2; if (a !== 2) return false; }
   try { syntax("(() => { const b = 1; b = 2; })()"); return false; } catch (error) { return error instanceof TypeError && a === 1; }
 });
-// Without Intl the method ignores its locales and options.
 check("date-tolocaledatestring", true, () => typeof new Date(0).toLocaleDateString() === "string");
-check("date-tolocaledatestring", NODE, () => new Date(Date.UTC(2020, 0, 15, 12)).toLocaleDateString("de-DE", { year: "numeric", month: "long", timeZone: "UTC" }) === "Januar 2020");
+check("date-tolocaledatestring", true, () => new Date(Date.UTC(2020, 0, 15, 12)).toLocaleDateString("de-DE", { year: "numeric", month: "long", timeZone: "UTC" }) === "Januar 2020");
 check("decorators", false, () => syntax("(() => { const tag = (value, context) => { context.addInitializer(function () { this.tagged = true; }); }; @tag class A {} return true; })()"));
 check("es5", true, () => {
   "use strict";
@@ -91,9 +90,9 @@ check("es6-module-dynamic-import", true, async () => (await import("@silkui/core
 check("es6-number", true, () => Number.EPSILON > 0 && Number.MAX_SAFE_INTEGER === 2 ** 53 - 1 && Number.isNaN(NaN) && !Number.isFinite(Infinity) &&
   Number.isSafeInteger(3) && Number.parseFloat("1.5") === 1.5);
 check("es6-string-includes", true, () => "Hello wide world".includes("wide") && !"abc".includes("d"));
-check("internationalization", NODE, () => new Intl.NumberFormat("de-DE").format(1234.5) === "1.234,5" &&
+check("internationalization", true, () => new Intl.NumberFormat("de-DE").format(1234.5) === "1.234,5" &&
   new Intl.Collator("de").compare("ä", "z") < 0 && new Intl.DateTimeFormat("en-US", { timeZone: "UTC" }).format(new Date(0)) === "1/1/1970");
-check("intl-pluralrules", NODE, () => new Intl.PluralRules("en-US").select(1) === "one" && new Intl.PluralRules("en-US", { type: "ordinal" }).select(2) === "two");
+check("intl-pluralrules", true, () => new Intl.PluralRules("en-US").select(1) === "one" && new Intl.PluralRules("en-US", { type: "ordinal" }).select(2) === "two");
 check("js-regexp-lookbehind", true, () => /(?<=\$)\d+/.exec("cost $42")[0] === "42" && /(?<!\$)\b\d+/.exec("$4 7")[0] === "7");
 check("json", true, () => JSON.stringify({ a: [1, "x", null] }) === '{"a":[1,"x",null]}' && JSON.parse('{"b":{"c":true}}').b.c === true);
 check("let", true, () => {
@@ -101,9 +100,8 @@ check("let", true, () => {
   for (let i = 0; i < 3; i++) seen.push(() => i);
   return seen.map((f) => f()).join() === "0,1,2";
 });
-// Without Intl the comparison is by UTF-16 code units, whatever the locale.
 check("localecompare", true, () => "a".localeCompare("b") < 0 && "b".localeCompare("a") > 0 && "a".localeCompare("a") === 0);
-check("localecompare", NODE, () => "ä".localeCompare("z", "de") < 0 && "a".localeCompare("A", "en", { sensitivity: "base" }) === 0);
+check("localecompare", true, () => "ä".localeCompare("z", "de") < 0 && "a".localeCompare("A", "en", { sensitivity: "base" }) === 0);
 check("object-entries", true, () => Object.entries({ a: 1, b: 2 }).map(([k, v]) => k + v).join() === "a1,b2");
 check("object-observe", false, () => typeof Object.observe === "function");
 check("object-values", true, () => Object.values({ a: 1, b: 2 }).join() === "1,2");
