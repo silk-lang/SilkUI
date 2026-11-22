@@ -66,8 +66,8 @@ It compiles JSX with this package's runtime, fixes a quadratic sibling walk in
 To try an unpublished renderer in an app that already has its dependencies installed,
 add this `vite.local.config.mjs` beside the app's `vite.config.js`. Point `SILK_PACKAGES`
 at the checkout's `modules/js/packages` directory. Alias both packages, including the
-core globals and the JSX runtime, so the app and renderer use the same core node
-registry. The app keeps its installed build plugins, React and reconciler; use versions
+core globals, `react-dom` and the JSX runtime, so the app and renderer use the same core
+node registry, even with an older installed `@silkui/react/vite`. The app keeps its installed build plugins, React and reconciler; use versions
 compatible with the checkout.
 
 ```js
@@ -82,7 +82,7 @@ export default mergeConfig(app, {
       { find: /^@silkui\/core$/, replacement: source("core/src/index.js") },
       { find: /^@silkui\/core\/globals$/, replacement: source("core/src/globals.js") },
       { find: /^@silkui\/react$/, replacement: source("react/src/index.js") },
-      { find: /^@silkui\/react\/dom$/, replacement: source("react/src/dom.js") },
+      { find: /^(?:@silkui\/react\/dom|react-dom(?:\/client)?)$/, replacement: source("react/src/dom.js") },
       { find: /^@silkui\/react\/jsx-(?:dev-)?runtime$/, replacement: source("react/src/jsx-runtime.js") },
     ],
     dedupe: ["react", "react-reconciler", "scheduler"],
