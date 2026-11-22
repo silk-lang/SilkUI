@@ -5,7 +5,8 @@
 //! time of one input and what the style system did for it.
 //!
 //!   restyle-bench [--runs N]
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Mutation, StyleState }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Input, Mutation, StyleState }
+import ui_tree.cssom_view { firstFragment }
 import ui_tree.digest { DigestBox, DigestText, digestLayout }
 import silk.num.u64
 import silk.num.f32
@@ -182,18 +183,18 @@ effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets, top: u32,
   return next
 }
 
-pub enum Kind { Type, Sidebar, Panel, Menu, Scroll, Mount }
+pub enum Kind { Type, Sidebar, Panel, Menu, Scroll, Hover, Mount }
 
 fn kindName(kind: Kind) -> string<'static> {
-  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" Kind.Scroll => "scroll a scroll area (its viewport's overflow variables change)" Kind.Mount => "mount a new copy of the page (thread switch)" }
+  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" Kind.Scroll => "scroll a scroll area (its viewport's overflow variables change)" Kind.Hover => "move the pointer to another sidebar thread, every fourth time to the composer" Kind.Mount => "mount a new copy of the page (thread switch)" }
 }
 
-struct Counts { passes: usize, full: usize, resolves: usize, matches: usize, moves: usize, rootRestyles: usize, causes: [usize; 32] }
+struct Counts { passes: usize, full: usize, resolves: usize, matches: usize, moves: usize, rootRestyles: usize, causes: [usize; 32], why: [usize; 12] }
 impl Copy for Counts {}
 
 fn counts(tree: &UiTree<'_>) -> Counts {
   let w = &tree.work
-  return Counts { passes: w.stylePasses, full: w.fullStylePasses, resolves: w.resolves, matches: w.sheetMatches, moves: w.scopeMoves, rootRestyles: w.rootRestyles, causes: w.dirtyCauses }
+  return Counts { passes: w.stylePasses, full: w.fullStylePasses, resolves: w.resolves, matches: w.sheetMatches, moves: w.scopeMoves, rootRestyles: w.rootRestyles, causes: w.dirtyCauses, why: w.resolveCauses }
 }
 
 /// The mutations of input `n` of `kind`.
@@ -213,6 +214,8 @@ effect fn mutate(batch: &mut Batch, targets: &mut Targets, page: &[u8], kind: Ki
       run batch.customProperty(viewport, StyleState.Base, "--scroll-area-overflow-y-start", Option<string>.some(if n % 2 == 0 { "24px" } else { "48px" }), false)
       run batch.customProperty(viewport, StyleState.Base, "--scroll-area-overflow-y-end", Option<string>.some(if n % 2 == 0 { "300px" } else { "276px" }), false)
     }
+    // The pointer moves in `measure`: no mutation.
+    Kind.Hover => {}
     Kind.Type => {
       run typed.append(if n % 5 == 4 { " " } else { "a" })
       run batch.setText(targets.editorText, String.view(&typed.*))
@@ -247,6 +250,13 @@ effect fn measure(tree: &mut UiTree<'_>, targets: &mut Targets, page: &[u8], kin
     // A handler changes the page, reads layout, changes it again, reads again; then the frame.
     run mutate(&mut batch, &mut targets, page, kind, n, &mut typed)
     run tree.apply(run batch.take())
+    if kind == Kind.Hover {
+      let over = if n % 4 == 3 { targets.editor } else { targets.rows.get(n % targets.rows.length()) }
+      let fragment = firstFragment(&tree.*, tree.slotOf(over))
+      if fragment == usize.MAX { n = n + 1 continue }
+      let box = tree.visualBounds(fragment)
+      run tree.dispatch(Input.PointerMove { x: (box.xMin + box.xMax) / 2.0, y: (box.yMin + box.yMax) / 2.0, modifiers: 0 })
+    }
     run tree.layoutNow()
     run tree.layoutNow()
     time.* = time.* + 1.0 / 60.0
@@ -271,6 +281,14 @@ effect fn measure(tree: &mut UiTree<'_>, targets: &mut Targets, page: &[u8], kin
   StderrWriter.print("{}: {} us per input; per input: {} style passes, {} full, {} root restyles, {} nodes styled, {} matched, {} kept under a new variable scope\n", &(
     kindName(kind), i64.toUsize(median / 1000), (after.passes - before.passes) / runs, (after.full - before.full) / runs,
     (after.rootRestyles - before.rootRestyles) / runs, (after.resolves - before.resolves) / runs, (after.matches - before.matches) / runs, (after.moves - before.moves) / runs))
+  let names = ["a full pass", "the root font changed", "the parent's inherited values changed", "reached through selectors", "their own change",
+    "a new variable scope, also dirty", "a new variable scope, a part reads variables", "a new variable scope, no sheet style", "a new variable scope, reads any variable",
+    "a new variable scope, reads a variable that differs", "a new variable scope, first letter", "a new variable scope, all variables may differ"]
+  let mut reason: usize = 0
+  while reason < 12 {
+    if after.why[reason] != before.why[reason] { StderrWriter.print("  styled for {}: {} per input\n", &(names[reason], (after.why[reason] - before.why[reason]) / runs)) }
+    reason = reason + 1
+  }
   let mut cause: usize = 0
   while cause < 32 {
     if after.causes[cause] != before.causes[cause] { StderrWriter.print("  full pass asked by cause {}: {} times\n", &(cause, after.causes[cause] - before.causes[cause])) }
@@ -311,6 +329,13 @@ effect fn signature(tree: &UiTree<'_>) -> List<u64> ! OutOfMemoryError ? &mut Al
 /// Restyles the whole page and says how many entries of the signature the incremental
 /// restyles left different from a full one.
 effect fn verify(tree: &mut UiTree<'_>, time: &mut f64) -> usize ! TreeError | OutOfMemoryError ? &mut Allocator {
+  // Transitions an input started run out first, so both signatures show the page at rest.
+  let mut rest: usize = 0
+  while rest < 120 {
+    time.* = time.* + 1.0 / 60.0
+    run tree.frame(frameInput(time.*))
+    rest = rest + 1
+  }
   let incremental = run signature(&tree.*)
   let root = tree.root
   tree.restyle(root)
@@ -349,7 +374,7 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
     u32.toUsize(nodes), i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000), targets.editor, targets.editorText, targets.sidebarWrapper, targets.rows.length(), targets.menus.length()))
   StderrWriter.print("watch overflows: {} (last at node {})\n", &(tree.work.watchOverflows, tree.work.lastOverflow))
   if targets.editorText == 0 || targets.sidebarWrapper == 0 || targets.rows.length() < 2 || targets.menus.length() == 0 { return 2 }
-  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Scroll, Kind.Mount]
+  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Scroll, Kind.Hover, Kind.Mount]
   let mut k: usize = 0
   while k < kinds.length {
     run measure(&mut tree, &mut targets, page, kinds[k], &mut time)
