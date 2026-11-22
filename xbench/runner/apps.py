@@ -56,6 +56,9 @@ def silk_launch(name, scene, suite, uncapped):
     env = {"SILK_UI_UNCAPPED": "1"} if uncapped else {}
     # The running total of frames the window showed, for drivers' `shown` (METRICS.md).
     env["SILK_UI_TRACE_PRESENTS"] = "1"
+    # macOS can report a window on screen as covered for a few seconds, which pauses its frames.
+    # Electron runs with occlusion throttling off (xbench/apps/electron/main.cjs); this is the same switch.
+    env["SILK_WINDOW_IGNORE_OCCLUSION"] = "1"
     if scene.startswith("canvas"):
         # One line on stderr says whether canvas frames reached the window without a copy
         # (the record keeps it as canvas_path).
