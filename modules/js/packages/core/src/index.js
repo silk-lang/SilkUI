@@ -681,6 +681,7 @@ export class Node {
     if (this.#base) this.#base._copyTo(copy.look("base"));
     const looks = this.#rare?.looks;
     for (const state in looks ?? {}) looks[state]._copyTo(copy.look(state));
+    if (this.#className !== null) copy.setAttribute("class", this.#className);
     for (const [name, value] of this.#rare?.attributes ?? []) copy.setAttribute(name, value);
     if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
     return copy;
@@ -2018,6 +2019,10 @@ export class SvgText {
   destroy() {
     this.remove();
   }
+
+  cloneNode() {
+    return new SvgText(this.#data);
+  }
 }
 
 /**
@@ -2124,6 +2129,13 @@ export class SvgElement {
 
   remove() {
     this.parentNode?.removeChild(this);
+  }
+
+  cloneNode(deep = false) {
+    const copy = new SvgElement(this.localName);
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
+    return copy;
   }
 
   /** Takes the element out of its `<svg>`. It is plain markup, so nothing else is freed. */
@@ -2237,7 +2249,9 @@ export class Svg extends Node {
   }
 
   _shallowClone() {
-    return new Svg();
+    const copy = new Svg();
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    return copy;
   }
 
   getAttribute(name) {
@@ -4933,6 +4947,18 @@ function focusing(target) {
   pendingFocusOut = null;
   if (left) focusEvent("focusout", left, target);
   else blurredNode = null;
+  caretInto(target);
+}
+
+// An editing host that takes focus with the selection outside it gets a caret at its start,
+// as a browser gives one, so the first edit has a place (a click places its own after).
+function caretInto(target) {
+  if (target instanceof Input || editingHostOf(target) !== target) return;
+  const selection = getSelection();
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (range && target.contains(range.startContainer) && target.contains(range.endContainer)) return;
+  const [node, offset] = startIn(target);
+  selection.collapse(node, offset);
 }
 
 // HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its

@@ -580,6 +580,32 @@ test("svg markup built from elements draws once as one node, then changes go liv
   svg.destroy();
 });
 
+test("a deep clone copies classes and an inline svg with its markup", () => {
+  const box = createBox();
+  box.setAttribute("class", "menu");
+  const svg = createNode("svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("class", "size-4");
+  const group = createSvgElement("g");
+  group.setAttribute("fill", "red");
+  const title = createSvgElement("title");
+  title.append("Logo");
+  group.appendChild(title);
+  svg.appendChild(group);
+  box.appendChild(svg);
+  const copy = createBox();
+  for (const child of Array.from(box.childNodes)) copy.appendChild(child.cloneNode(true));
+  flushSvg();
+  assert.equal(copy.firstChild.outerHTML, svg.outerHTML);
+  assert.equal(box.cloneNode().className, "menu");
+  assert.equal(copy.firstChild.className, svg.className);
+  assert.ok(svg.className.includes("size-4"), svg.className);
+  assert.notEqual(copy.firstChild.firstChild, group);
+  assert.equal(group.cloneNode().childNodes.length, 0, "a shallow clone has no children");
+  box.destroy();
+  copy.destroy();
+});
+
 test("a click inside a link opens its address unless a listener prevents it", () => {
   const opened = [];
   globalThis.open = (url) => opened.push(url);
