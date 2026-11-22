@@ -690,7 +690,8 @@ effect fn prebuiltPath(app: &App, project: &Project) -> String
 /// JavaScript app on the SilkJS engine with a generated host, in a build that bundles
 /// (not `dev`, which runs what the development server sends). An image is written by a
 /// program built for this machine, so a host built for another target starts from the
-/// bundle's text; so does an app on the SilkJS runtime, which has no image yet.
+/// bundle's text. An app on the SilkJS runtime gets its image another way: its host writes
+/// it once it is built ([`bundleImage`]).
 fn imaged(app: &App, options: &Options, dev: bool) -> bool {
   return app.writtenIn.dir() != "" && !dev && app.custom == "" && app.runsOn != Runtime.Node && options.target.length() == 0
 }
@@ -1386,6 +1387,7 @@ impl Built {
         if shipsBundleFiles(&built) {
           let files = run joined(String.view(&out), "app")
           run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), String.view(&out))
+          run bundleImage(&built, String.view(&program))
         }
         out = move program
       }
@@ -1470,6 +1472,7 @@ impl Built {
           while end > 0 && String.utf8Bytes(path)[end - 1] != 47 { end = end - 1 }
           let files = run joined(String.slice(path, 0, end), "app")
           run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), "")
+          run bundleImage(&built, path)
         }
         run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
       }
@@ -1513,6 +1516,43 @@ impl Built {
 /// files beside the bundle (wasm modules, workers, images) from `app/` beside itself.
 fn shipsBundleFiles(built: &Built) -> bool {
   return built.madeIn != Mode.Dev && built.source.runsOn == Runtime.Node && String.view(&built.source.bundled) != ""
+}
+
+/// Has the release host at `program` write the bytecode image of the bundle it embeds to
+/// `app.image` beside itself, which it then starts from: nothing is parsed at launch, and a
+/// function never called stays in the file. Only the host can write it, since an image
+/// loads in the engine build that wrote it; so a host built for another target gets none
+/// and starts from the bundle's text, as does one that could not write it.
+effect fn bundleImage(built: &Built, program: string) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput | &mut ChildProcess {
+  let mut end = String.byteLength(program)
+  while end > 0 && String.utf8Bytes(program)[end - 1] != 47 { end = end - 1 }
+  let image = run joined(String.slice(program, 0, end), "app.image")
+  let file = run Path.make(image.view())
+  if run FileSystem.exists(&file) {
+    run FileSystem.removeFile(&file)
+  }
+  if built.options.target.length() != 0 {
+    run say("no bytecode image: a host built for another target starts from the bundle's text")
+    return ()
+  }
+  run say("compiling the bundle into a bytecode image with the host's engine...")
+  let started = now()
+  let ran = run Effect.result(Task.exec(program, &["--silk-write-bundle-image", image.view()]))
+  match move ran {
+    Result.Success { .. } => {
+      done("wrote the bytecode image the window host starts from", started)
+      listArtifact(image.view(), run sizeOf(image.view()))
+    }
+    Result.Failure { error } => {
+      drop error
+      if run FileSystem.exists(&file) {
+        run FileSystem.removeFile(&file)
+      }
+      run say("no bytecode image: the host could not compile its bundle and starts from its text")
+    }
+  }
 }
 
 // --- Running ---
