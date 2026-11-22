@@ -498,7 +498,8 @@ from [window/dev](window/dev) (`ui-js-window-dev`): `DevTools.watch` for `--watc
 [demo](demo) is the starter page in plain JavaScript, the React example's twin. Its window
 has a transparent title bar (`JsClient.titleBar`, `titleBarHeight`): on macOS the page
 reaches the top edge and the window controls sit over the bar it draws; other systems keep
-their title bar.
+their title bar. A press moves the window where the pressed element or its nearest ancestor
+that sets `app-region` (or `-webkit-app-region`) says `drag`, as Electron decides.
 
 ```sh
 silk run --manifest-path modules/js/demo/silk.toml
