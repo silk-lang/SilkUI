@@ -15636,7 +15636,7 @@ let mutationsQueued = false;
 function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
   for (const observer of mutationObservers) {
     let options = null;
-    for (let node = target; node; node = node.parentNode) {
+    for (let node = target; node; node = observedParent(node)) {
       const found = observer._targets.get(node);
       if (found && (node === target || found.subtree) && found[wants]) {
         if (filterName !== undefined && found.attributeFilter && !found.attributeFilter.includes(filterName)) continue;
@@ -15653,6 +15653,11 @@ function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
       queueMicrotask(deliverMutations);
     }
   }
+}
+
+// The document sits above the root, as in event paths, so observing it with `subtree` sees the tree.
+function observedParent(node) {
+  return node.parentNode ?? (node === rootNode && outerTargets.length ? outerTargets[0] : null);
 }
 
 function deliverMutations() {
@@ -15696,7 +15701,7 @@ export class MutationObserver {
   }
 
   observe(target, options = {}) {
-    if (!(target instanceof Node)) return;
+    if (!(target instanceof Node) && !(outerTargets.length && target === outerTargets[0])) return;
     const attributes = options.attributes ?? (options.attributeOldValue !== undefined || options.attributeFilter !== undefined);
     const characterData = options.characterData ?? options.characterDataOldValue !== undefined;
     if (!options.childList && !attributes && !characterData) {
