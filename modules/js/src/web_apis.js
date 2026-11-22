@@ -1,4 +1,4 @@
-// The web APIs a ui-js realm has beyond the prelude's: Blob, base64, text encoding, crypto random
+// The web APIs a ui-js realm has beyond the prelude's: Blob, File, FormData, base64, text encoding, crypto random
 // values, events (and unhandledrejection on the global object), matchMedia, user timing, setImmediate, idle callbacks and the console's timers. The
 // prelude evaluates this on the first use of one of them, so realms that use none start as
 // fast as before. It is a function of `__ui` and the prelude's shared console state, and
@@ -582,5 +582,110 @@
   }
   Object.defineProperty(Blob.prototype, Symbol.toStringTag, { value: "Blob" });
 
-  return { Blob, AbortController, AbortSignal, BatteryManager, getBattery, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
+  // As the File API's File: a Blob with a name and a modification time.
+  class File extends Blob {
+    constructor(parts, name, options = {}) {
+      if (arguments.length < 2) throw new TypeError("File takes parts and a name");
+      super(parts, options);
+      Object.defineProperty(this, "name", { value: String(name), enumerable: true });
+      Object.defineProperty(this, "lastModified", { value: options?.lastModified === undefined ? Date.now() : Number(options.lastModified), enumerable: true });
+    }
+  }
+  Object.defineProperty(File.prototype, Symbol.toStringTag, { value: "File" });
+
+  // As XMLHttpRequest's FormData: an ordered list of names with strings or Files.
+  const formValue = (value, filename) => {
+    if (!(value instanceof Blob)) return String(value);
+    if (!(value instanceof File) || filename !== undefined) {
+      return new File([value], filename === undefined ? (value instanceof File ? value.name : "blob") : String(filename), { type: value.type, lastModified: value.lastModified });
+    }
+    return value;
+  };
+  // The form data set of a form element's controls (HTML's "constructing the entry list").
+  const formEntries = (form, submitter) => {
+    const entries = [];
+    const controls = form.elements ?? form.querySelectorAll("button, input, select, textarea");
+    for (const control of controls) {
+      const name = control.getAttribute?.("name") ?? control.name;
+      if (!name || control.disabled || control.hasAttribute?.("disabled")) continue;
+      const tag = String(control.localName ?? "").toLowerCase();
+      const type = String(control.type ?? control.getAttribute?.("type") ?? (tag === "button" ? "submit" : "text")).toLowerCase();
+      if (tag === "button" || type === "submit" || type === "button" || type === "reset" || type === "image") {
+        if (control === submitter && type !== "button" && type !== "reset") entries.push([String(name), String(control.value ?? control.getAttribute?.("value") ?? "")]);
+        continue;
+      }
+      if ((type === "checkbox" || type === "radio") && !control.checked) continue;
+      if (tag === "select") {
+        for (const option of control.options ?? control.querySelectorAll("option")) {
+          if (option.selected) entries.push([String(name), String(option.value ?? option.textContent ?? "")]);
+        }
+        continue;
+      }
+      if (type === "file") {
+        const files = [...(control.files ?? [])];
+        if (files.length === 0) entries.push([String(name), new File([], "", { type: "application/octet-stream" })]);
+        for (const file of files) entries.push([String(name), file instanceof Blob ? formValue(file) : file]);
+        continue;
+      }
+      const value = control.value ?? control.getAttribute?.("value") ?? ((type === "checkbox" || type === "radio") ? "on" : "");
+      entries.push([String(name), String(value)]);
+    }
+    return entries;
+  };
+  class FormData {
+    #entries = [];
+    constructor(form, submitter) {
+      if (form === undefined || form === null) return;
+      if (typeof form !== "object" || (form.elements === undefined && typeof form.querySelectorAll !== "function")) throw new TypeError("FormData takes a form element");
+      this.#entries = formEntries(form, submitter ?? null);
+    }
+    append(name, value, filename) {
+      this.#entries.push([String(name), formValue(value, filename)]);
+    }
+    set(name, value, filename) {
+      name = String(name);
+      const entry = [name, formValue(value, filename)];
+      const first = this.#entries.findIndex(([key]) => key === name);
+      if (first < 0) {
+        this.#entries.push(entry);
+        return;
+      }
+      this.#entries = this.#entries.filter(([key], index) => key !== name || index === first);
+      this.#entries[first] = entry;
+    }
+    get(name) {
+      name = String(name);
+      return this.#entries.find(([key]) => key === name)?.[1] ?? null;
+    }
+    getAll(name) {
+      name = String(name);
+      return this.#entries.filter(([key]) => key === name).map(([, value]) => value);
+    }
+    has(name) {
+      name = String(name);
+      return this.#entries.some(([key]) => key === name);
+    }
+    delete(name) {
+      name = String(name);
+      this.#entries = this.#entries.filter(([key]) => key !== name);
+    }
+    forEach(callback, thisArg) {
+      for (const [name, value] of this.#entries) callback.call(thisArg, value, name, this);
+    }
+    *entries() {
+      for (const [name, value] of this.#entries) yield [name, value];
+    }
+    *keys() {
+      for (const [name] of this.#entries) yield name;
+    }
+    *values() {
+      for (const [, value] of this.#entries) yield value;
+    }
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+  }
+  Object.defineProperty(FormData.prototype, Symbol.toStringTag, { value: "FormData" });
+
+  return { Blob, File, FormData, AbortController, AbortSignal, BatteryManager, getBattery, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })

@@ -199,6 +199,17 @@ test("a deep clone keeps each element's tag and hands the tree only attributes i
   assert.equal(copy.childNodes[5].firstChild.getAttribute("data-icon"), "x");
 });
 
+test("host events are instances of the global Event, and only of their own subclasses", () => {
+  const image = document.createElement("img");
+  const load = new core.Event("load", image);
+  assert.ok(load instanceof Event);
+  assert.ok(load instanceof window.Event);
+  assert.ok(!(load instanceof ProgressEvent));
+  assert.ok(!(load instanceof MouseEvent));
+  assert.ok(new core.Event("click", image) instanceof MouseEvent);
+  assert.ok(new Event("x") instanceof Event);
+});
+
 test("history and location keep entries and send popstate and hashchange", async () => {
   assert.equal(location.href, "http://localhost/");
   const events = [];

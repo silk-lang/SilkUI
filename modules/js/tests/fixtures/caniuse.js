@@ -264,7 +264,7 @@ check("eme", false, () => typeof navigator.requestMediaKeySystemAccess === "func
 check("eventsource", false, () => global("EventSource"));
 check("fetch", NODE, () => typeof fetch === "function" && new Request("http://localhost/x", { method: "POST" }).method === "POST" &&
   new Headers({ a: "1" }).get("a") === "1" && new Response("ok").status === 200);
-check("fileapi", NODE, async () => {
+check("fileapi", true, async () => {
   const file = new File(["Silk"], "a.txt", { type: "text/plain" });
   return file.name === "a.txt" && (await file.text()) === "Silk";
 });
