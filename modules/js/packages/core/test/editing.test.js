@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { installMock } from "./mock.js";
+import { computed } from "./wpt-editing/style.js";
 
 const mock = installMock();
 // The tree's document selection, as selection.test.js keeps it.
@@ -17,7 +18,12 @@ native.setSelection = (anchor, anchorOffset, focus, focusOffset) => {
   tree.ends = anchor === 0 ? null : [anchor, anchorOffset, focus, focusOffset];
   return 1;
 };
-const { createElement, createText, mount, getSelection, LineBreak } = await import("../src/index.js");
+// Computed style as the HTML rendering rules give it: the editing algorithms ask for display,
+// white-space and the like, which the tree answers in Silk UI.
+let core;
+native.computed = (id, name) => computed(core.nodeById(id), name);
+core = await import("../src/index.js");
+const { createElement, createText, mount, getSelection, LineBreak } = core;
 
 const BEFORE_INPUT = 37;
 const FOCUS = 9;
@@ -152,12 +158,14 @@ function targets(host) {
 function plainEditor(text) {
   const host = element("div", text);
   host.setAttribute("contenteditable", "plaintext-only");
+  // Line feeds show where white-space keeps them; elsewhere a line break is a <br>.
+  host.setAttribute("style", "white-space: pre-wrap");
   mount(element("div", host));
   mock.take();
   return host;
 }
 
-test("beforeinput carries the ranges the edit changes, as Chromium gives them", () => {
+test("beforeinput carries the ranges the edit changes", () => {
   const { host } = editor("Hello brave world", "a\u{1F44D}\u{1F3FD}b");
   const seen = targets(host);
   const text = host.firstChild.firstChild;
@@ -180,9 +188,9 @@ test("beforeinput carries the ranges the edit changes, as Chromium gives them", 
     'deleteContentForward "Hello brave world":0-"Hello brave world":1',
     'deleteWordBackward "ello brave world":5-"ello brave world":10',
     'deleteContentBackward "a\u{1F44D}\u{1F3FD}b":1-"a\u{1F44D}\u{1F3FD}b":5',
-    'deleteContentBackward "ello ' + NBSP + 'world":11-"ab":0',
+    'deleteContentBackward "ello' + NBSP + ' world":11-"ab":0',
   ]);
-  assert.equal(markup(host), "<p>ello " + NBSP + "world|ab</p>", "a word deleted between spaces keeps both showing");
+  assert.equal(markup(host), "<p>ello" + NBSP + " world|ab</p>", "a word deleted between spaces keeps both showing");
 });
 
 test("an edit that changes nothing fires beforeinput and no input", () => {
@@ -248,7 +256,8 @@ test("a selection across paragraphs deletes into one, and typing replaces it", (
   const other = editor("ab", "cd");
   getSelection().selectAllChildren(other.host);
   edit(other.host, "insertText", "x");
-  assert.equal(markup(other.host), "<p>x|</p>");
+  // The Editing spec's delete removes every paragraph the selection holds whole.
+  assert.equal(markup(other.host), "x|");
 });
 
 test("Enter splits the paragraph and Shift+Enter breaks the line", () => {
@@ -264,18 +273,20 @@ test("Enter splits the paragraph and Shift+Enter breaks the line", () => {
   assert.equal(markup(host), "<p>He<br>|llo</p><p>" + NBSP + "world</p><p><br></p>");
 });
 
-test("Enter makes paragraphs as Chromium does: divs in a bare host, out of an empty list item, after a heading", () => {
+test("Enter makes paragraphs: divs in a bare host, out of an empty list item, after a heading", () => {
   const bare = editor();
   bare.host.appendChild(createText("Hello"));
   getSelection().collapse(bare.host.firstChild, 2);
   edit(bare.host, "insertParagraph");
-  assert.equal(markup(bare.host), "He<div>|llo</div>");
+  assert.equal(markup(bare.host), "<div>He</div><div>|llo</div>");
 
   const empty = editor();
   getSelection().collapse(empty.host, 0);
   edit(empty.host, "insertParagraph");
   edit(empty.host, "insertParagraph");
-  assert.equal(markup(empty.host), "<div><br></div><div><br></div><div>|<br></div>");
+  // The first Enter wraps the empty host's line in a paragraph, as the Editing spec does when
+  // the line holds nothing.
+  assert.equal(markup(empty.host), "<div><br></div><div>|<br></div>");
 
   const list = editor();
   list.host.appendChild(element("ul", element("li", "ab"), element("li", new LineBreak())));
@@ -296,7 +307,7 @@ test("Enter makes paragraphs as Chromium does: divs in a bare host, out of an em
   bold.host.appendChild(element("p", element("b", "Hello")));
   getSelection().collapse(bold.host.firstChild.firstChild.firstChild, 2);
   edit(bold.host, "insertParagraph");
-  assert.equal(markup(bold.host), "<p><b>He</b></p><p><b>|llo</b></p>");
+  assert.equal(markup(bold.host), "<p><b>He</b></p><p>|<b>llo</b></p>");
 
   const pre = editor();
   pre.host.appendChild(element("pre", "Hello"));
@@ -313,13 +324,13 @@ test("spaces typed where white-space collapses show, as no-break spaces at the e
   assert.equal(text.data, "ab" + NBSP, "a space that ends the paragraph");
   edit(host, "insertText", " ");
   edit(host, "insertText", "c");
-  assert.equal(text.data, "ab " + NBSP + "c", "two spaces between words");
+  assert.equal(text.data, "ab" + NBSP + " c", "two spaces between words");
   edit(host, "insertText", " ");
   edit(host, "insertText", "d");
-  assert.equal(text.data, "ab " + NBSP + "c d", "one space between words is a space");
+  assert.equal(text.data, "ab" + NBSP + " c d", "one space between words is a space");
   getSelection().collapse(text, 0);
   edit(host, "insertText", " ");
-  assert.equal(text.data, NBSP + "ab " + NBSP + "c d", "a space that starts the paragraph");
+  assert.equal(text.data, NBSP + "ab" + NBSP + " c d", "a space that starts the paragraph");
 });
 
 test("a plain-text host takes line breaks as line feeds and pastes as text", () => {
@@ -350,7 +361,7 @@ test("a paste in a rich host carries the clipboard in dataTransfer and inserts i
   native.dispatch(PASTE, host.nodeId, 0, 0, 0, 0, 0, "X\nY", html);
   edit(host, "insertFromPaste", "X\nY");
   assert.deepEqual(seen, [[null, html]]);
-  assert.equal(markup(host), "<p>a<b>X</b></p><p>Y|b</p>");
+  assert.equal(markup(host), "<p>a<b>X</b></p><p>Y</p>|<p>b</p>");
   const bold = host.firstChild.childNodes[1];
   assert.equal(bold.getAttribute("style"), "color:red");
   assert.equal(bold.hasAttribute("onclick"), false);
@@ -368,7 +379,7 @@ test("a cut deletes the selection", () => {
   assert.equal(markup(host), "<p>a|d</p>");
 });
 
-test("composition text replaces itself until it is committed, with Chromium's events", () => {
+test("composition text replaces itself until it is committed, with the UI Events order", () => {
   const { host, heard } = editor("ab");
   const seen = targets(host);
   getSelection().collapse(host.firstChild.firstChild, 1);
@@ -379,9 +390,9 @@ test("composition text replaces itself until it is committed, with Chromium's ev
   edit(host, "insertText", "か");
   assert.equal(markup(host), "<p>aか|b</p>");
   assert.deepEqual(heard, [
-    "compositionstart:", "compositionupdate:k", "beforeinput:insertCompositionText", "input:insertCompositionText",
-    "compositionupdate:ka", "beforeinput:insertCompositionText", "input:insertCompositionText",
-    "compositionupdate:か", "beforeinput:insertCompositionText", "input:insertCompositionText", "compositionend:か",
+    "compositionstart:", "beforeinput:insertCompositionText", "compositionupdate:k", "input:insertCompositionText",
+    "beforeinput:insertCompositionText", "compositionupdate:ka", "input:insertCompositionText",
+    "beforeinput:insertCompositionText", "compositionupdate:か", "input:insertCompositionText", "compositionend:か",
   ]);
   assert.deepEqual(seen, [
     'insertCompositionText "ab":1-"ab":1', 'insertCompositionText "akb":1-"akb":2', 'insertCompositionText "akab":1-"akab":3',
@@ -390,7 +401,7 @@ test("composition text replaces itself until it is committed, with Chromium's ev
   edit(host, "insertCompositionText", "x");
   edit(host, "insertCompositionText", "");
   assert.equal(markup(host), "<p>aか|b</p>", "an empty composition removes what it showed");
-  assert.deepEqual(heard.slice(-4), ["compositionupdate:", "beforeinput:insertCompositionText", "input:insertCompositionText", "compositionend:"]);
+  assert.deepEqual(heard.slice(-4), ["beforeinput:insertCompositionText", "compositionupdate:", "input:insertCompositionText", "compositionend:"]);
 });
 
 test("undo and redo step back through edits, typing in a row as one step", () => {
@@ -450,11 +461,12 @@ test("formatting keys bold, italicize and underline a selection, and toggle back
   assert.deepEqual(heard.slice(-2), ["beforeinput:formatBold", "input:formatBold"]);
   edit(host, "formatItalic");
   edit(host, "formatUnderline");
-  assert.equal(markup(host), "<p>H<b><i><u>el|</u></i></b>lo</p>");
+  // The Editing spec wraps the selected element whole in each new style.
+  assert.equal(markup(host), "<p>H<u><i><b>el|</b></i></u>lo</p>");
   edit(host, "formatBold");
-  assert.equal(markup(host), "<p>H<i><u>el|</u></i>lo</p>");
+  assert.equal(markup(host), "<p>H<u><i>el|</i></u>lo</p>");
   edit(host, "historyUndo");
-  assert.equal(markup(host), "<p>H<b><i><u>el|</u></i></b>lo</p>");
+  assert.equal(markup(host), "<p>H<u><i><b>el|</b></i></u>lo</p>");
 
   const partial = editor();
   partial.host.appendChild(element("p", element("b", "abcd")));
@@ -487,29 +499,31 @@ test("a formatting key at a caret formats what is typed next there", () => {
   assert.equal(markup(moved.host), "<p>abcx|d</p>", "moving the caret forgets it");
 });
 
-test("execCommand edits without beforeinput, firing input with Chromium's input types", () => {
+test("execCommand fires beforeinput and input with the Editing spec's input types", () => {
   const { host, heard } = editor("abcd");
   const text = host.firstChild.firstChild;
   getSelection().setBaseAndExtent(text, 1, text, 3);
   assert.equal(execCommand("bold"), true);
   assert.equal(queryCommandState("bold"), true);
-  assert.equal(queryCommandValue("bold"), "true");
+  // The spec gives bold no value: Chromium's "true" is its own.
+  assert.equal(queryCommandValue("bold"), "");
   assert.equal(markup(host), "<p>a<b>bc|</b>d</p>");
   execCommand("bold");
   assert.equal(queryCommandState("bold"), false);
   execCommand("strikeThrough");
   execCommand("subscript");
-  assert.equal(markup(host), "<p>a<strike><sub>bc|</sub></strike>d</p>");
+  // The Editing spec strikes through with <s>, and nests each new style around the old.
+  assert.equal(markup(host), "<p>a<sub><s>bc|</s></sub>d</p>");
   execCommand("removeFormat");
   assert.equal(markup(host), "<p>abc|d</p>");
-  assert.deepEqual(heard, ["input:formatBold", "input:formatBold", "input:formatStrikeThrough", "input:formatSubscript", "input:formatRemove"]);
+  assert.deepEqual(heard, ["formatBold", "formatBold", "formatStrikeThrough", "formatSubscript", "formatRemove"].flatMap((type) => ["beforeinput:" + type, "input:" + type]));
   heard.length = 0;
   getSelection().collapse(host.firstChild.lastChild, 1);
   execCommand("insertText", false, "x\ny");
   assert.equal(markup(host), "<p>abcd</p><p>y|</p>".replace("abcd", "abcdx"));
   execCommand("delete");
   execCommand("insertLineBreak");
-  assert.deepEqual(heard, ["input:insertText", "input:deleteContentBackward", "input:insertLineBreak"]);
+  assert.deepEqual(heard, ["insertText", "deleteContentBackward", "insertLineBreak"].flatMap((type) => ["beforeinput:" + type, "input:" + type]));
   execCommand("undo");
   execCommand("undo");
   execCommand("undo");
@@ -532,9 +546,9 @@ test("execCommand links, unlinks, formats blocks and inserts markup", () => {
   const inserting = editor("abcd");
   getSelection().collapse(inserting.host.firstChild.firstChild, 2);
   execCommand("insertHTML", false, "<p>X</p><p>Y</p>");
-  assert.equal(markup(inserting.host), "<p>abX</p><p>Y|cd</p>");
+  assert.equal(markup(inserting.host), "<p>ab</p><p>X</p><p>Y</p>|<p>cd</p>");
   execCommand("insertHTML", false, "<i>q</i>");
-  assert.equal(markup(inserting.host), "<p>abX</p><p>Y<i>q|</i>cd</p>");
+  assert.equal(markup(inserting.host), "<p>ab</p><p>X</p><p>Y</p><i>q</i>|<p>cd</p>");
 });
 
 test("execCommand and queryCommand* answer for the selection's host", () => {
@@ -552,7 +566,8 @@ test("execCommand and queryCommand* answer for the selection's host", () => {
   getSelection().setBaseAndExtent(host.firstChild, 1, host.firstChild, 3);
   assert.equal(queryCommandEnabled("bold"), false, "a plain host takes no formatting");
   assert.equal(execCommand("bold"), false);
-  assert.equal(execCommand("insertHTML", false, "<b>q</b>"), true);
+  assert.equal(execCommand("insertHTML", false, "<b>q</b>"), false, "nor markup");
+  assert.equal(execCommand("insertText", false, "q"), true);
   assert.equal(textOf(host), "aqd");
   const { host: rich } = editor();
   rich.appendChild(element("p", element("b", "ab"), "cd"));
@@ -583,7 +598,7 @@ test("Selection.modify moves and extends by characters, words, paragraphs and th
   assert.equal(ends(selection.getRangeAt(0)), '"two":0-"two":0', "unknown values do nothing");
 });
 
-test("an editing host is focusable with tabIndex -1, as in Chromium", () => {
+test("an editing host is focusable with tabIndex -1, as HTML gives it", () => {
   const host = createElement("div");
   host.contentEditable = "true";
   assert.equal(host.tabIndex, -1);

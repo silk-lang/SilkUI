@@ -28,6 +28,8 @@ const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 
 // The live `Range`s (see Range below), held weakly: a range nobody holds stops being updated.
 const liveRanges = new Set();
+// Above zero while a move keeps the ranges itself (see moveNodePreservingRanges).
+let rangesPaused = 0;
 // The `MutationObserver`s observing a node (see MutationObserver below). While there are none
 // a mutation costs one size check.
 const mutationObservers = new Set();
@@ -190,6 +192,15 @@ function familyOf(names) {
   return String(id);
 }
 
+// A declared value as CSSOM serializes it: lengths given as numbers are pixels, and a color
+// written as hex, rgb() or hsl() reads as rgb() or rgba(), as CSS Color serializes it.
+function cssomValue(name, value) {
+  if (typeof value === "number") return !UNITLESS.has(name) && !name.startsWith("--") ? value + "px" : String(value);
+  const text = String(value);
+  if ((name === "color" || name.endsWith("Color")) && /^(#|rgba?\(|hsla?\()/i.test(text.trim())) return parseCssColor(text) ?? text;
+  return text;
+}
+
 function cssValue(name, value) {
   if (name.startsWith("--")) return String(value);
   if (name === "fontFamily") return familyOf(String(value));
@@ -224,6 +235,9 @@ class Look {
   // A number or string is kept as given, which the caller's style object holds too, and
   // turned into CSS text when it is read: no node keeps a string of its own per value.
   #values = Object.create(null);
+  // Whether CSSOM changed a declaration since the style attribute was set: the attribute
+  // reads as the declarations' serialization then.
+  _touched = false;
 
   constructor(node, state) {
     this.#node = node;
@@ -236,17 +250,20 @@ class Look {
    * take a property out.
    */
   set(properties) {
+    if (!this._touched && this.#state === 0 && this.#node._tag !== undefined) this.#node._styleAttributeAppeared();
     let css = "";
     let removed = false;
     for (const name of Object.keys(properties)) {
       const value = properties[name];
       if (value === null || value === undefined || value === "") {
         if (name in this.#values) {
+          this._touched = true;
           delete this.#values[name];
           removed = true;
         }
         continue;
       }
+      this._touched = true;
       if (this.#values[name] === value) continue;
       const text = cssValue(name, value);
       this.#values[name] = typeof value === "number" || typeof value === "string" ? value : text;
@@ -256,7 +273,7 @@ class Look {
       // The tree sets declarations over earlier ones, so taking one out means starting the
       // look again.
       native.clearStyle(this.#node.nodeId, this.#state);
-      css = this.cssText;
+      css = this.#nativeText();
     }
     if (css) native.style(this.#node.nodeId, css, this.#state);
   }
@@ -270,12 +287,20 @@ class Look {
 
   get(name) {
     const value = this.#values[name];
-    return value === undefined ? undefined : cssValue(name, value);
+    return value === undefined ? undefined : cssomValue(name, value);
   }
 
-  get cssText() {
+  // What the tree's style parser takes: font families go by their list's number.
+  #nativeText() {
     let css = "";
     for (const name in this.#values) css += cssName(name) + ":" + cssValue(name, this.#values[name]) + ";";
+    return css;
+  }
+
+  /** The declarations serialized as CSSOM serializes a declaration block: `color: red; width: 1px;`. */
+  get cssText() {
+    let css = "";
+    for (const name in this.#values) css += (css ? " " : "") + cssName(name) + ": " + cssomValue(name, this.#values[name]) + ";";
     return css;
   }
 
@@ -316,7 +341,8 @@ class Look {
 
   _copyTo(look) {
     look.#values = Object.assign(Object.create(null), this.#values);
-    const css = this.cssText;
+    look._touched = this._touched;
+    const css = this.#nativeText();
     if (css) native.style(look.#node.nodeId, css, look.#state);
   }
 }
@@ -743,12 +769,12 @@ export class Node {
     const old = child.parentNode;
     if (old) {
       const index = old.childNodes.indexOf(child);
-      if (liveRanges.size) eachLiveRange((range) => range._removing(child, old, index));
+      if (liveRanges.size && !rangesPaused) eachLiveRange((range) => range._removing(child, old, index));
       if (mutationObservers.size) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
       old.childNodes.splice(index, 1);
     }
     child.parentNode = this;
-    if (liveRanges.size) {
+    if (liveRanges.size && !rangesPaused) {
       const index = before ? this.childNodes.indexOf(before) : this.childNodes.length;
       eachLiveRange((range) => range._inserted(this, index));
     }
@@ -861,15 +887,24 @@ export class Node {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
     if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
+    // The style attribute reflects the declarations, as CSSOM serializes them.
+    if (name === "style" && this._tag !== undefined && this.#base?._touched) return this.#base.cssText;
     const aria = ariaName(name);
     return this.#rare?.attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
 
   hasAttribute(name) { return this.getAttribute(name) !== null; }
 
+  // CSSOM sets the style attribute when it changes a declaration: selectors see it then.
+  _styleAttributeAppeared() {
+    if (this.#rare?.attributes?.has("style")) return;
+    native.attribute(this.nodeId, "style", "");
+  }
+
   getAttributeNames() {
     const names = this.#className === null ? [] : ["class"];
     for (const name of this.#rare?.attributes?.keys() ?? []) names.push(name);
+    if (this._tag !== undefined && this.#base?._touched && !names.includes("style")) names.push("style");
     return names;
   }
 
@@ -920,6 +955,9 @@ export class Node {
       native.attribute(this.nodeId, "tabIndex", text === null ? -2147483648 : Number(text));
     } else if (this._tag !== undefined && name === "style") {
       this.style.cssText = text ?? "";
+      // The attribute keeps its own text until CSSOM changes a declaration.
+      this.#base._touched = false;
+      native.attribute(this.nodeId, "style", text);
     } else if (this._tag !== undefined && BOOLEAN_TREE_ATTRIBUTES.has(name)) {
       // An HTML boolean attribute is on whatever its text, `disabled=""` included.
       const on = value !== null && value !== undefined && value !== false;
@@ -950,7 +988,7 @@ export class Node {
   // An editing host takes focus (as a tab stop, unless its tabindex says otherwise) and hears
   // the tree's edits, which `hostEdit` makes.
   #editableChanged() {
-    if (editableValue(this) === 1) {
+    if (editableState(this) === "host") {
       this._keep("beforeinput", "focus", "blur");
       if (!this.hasAttribute("tabindex")) native.attribute(this.nodeId, "tabIndex", 0);
     } else if (!this.hasAttribute("tabindex") && !FOCUSABLE_TAGS.has(this._tag)) {
@@ -2997,32 +3035,55 @@ export function createElement(tag, options) {
 
 const VOID_TAGS = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"]);
 // Elements whose content is not markup. Scripts and styles in parsed HTML are left out.
-const RAW_TAGS = new Set(["script", "style", "textarea", "title"]);
-const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", copy: "©", reg: "®", hellip: "…", mdash: "—", ndash: "–", laquo: "«", raquo: "»", times: "×", middot: "·", bull: "•" };
+// Raw text and RCDATA elements: their text is not markup. RCDATA (textarea, title) still
+// decodes character references.
+const RAW_TAGS = new Set(["script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes"]);
+// Elements whose text children serialize as they are, unescaped.
+const RAW_TEXT_PARENTS = new Set(["style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext"]);
+// The HTML Standard's named character references (html.spec.whatwg.org/entities.json),
+// by name without the semicolon. LEGACY_ENTITIES may also appear without one.
+const ENTITIES = {AElig:"Æ",AMP:"&",Aacute:"Á",Abreve:"Ă",Acirc:"Â",Acy:"А",Afr:"𝔄",Agrave:"À",Alpha:"Α",Amacr:"Ā",And:"⩓",Aogon:"Ą",Aopf:"𝔸",ApplyFunction:"\u2061",Aring:"Å",Ascr:"𝒜",Assign:"≔",Atilde:"Ã",Auml:"Ä",Backslash:"∖",Barv:"⫧",Barwed:"⌆",Bcy:"Б",Because:"∵",Bernoullis:"ℬ",Beta:"Β",Bfr:"𝔅",Bopf:"𝔹",Breve:"˘",Bscr:"ℬ",Bumpeq:"≎",CHcy:"Ч",COPY:"©",Cacute:"Ć",Cap:"⋒",CapitalDifferentialD:"ⅅ",Cayleys:"ℭ",Ccaron:"Č",Ccedil:"Ç",Ccirc:"Ĉ",Cconint:"∰",Cdot:"Ċ",Cedilla:"¸",CenterDot:"·",Cfr:"ℭ",Chi:"Χ",CircleDot:"⊙",CircleMinus:"⊖",CirclePlus:"⊕",CircleTimes:"⊗",ClockwiseContourIntegral:"∲",CloseCurlyDoubleQuote:"”",CloseCurlyQuote:"’",Colon:"∷",Colone:"⩴",Congruent:"≡",Conint:"∯",ContourIntegral:"∮",Copf:"ℂ",Coproduct:"∐",CounterClockwiseContourIntegral:"∳",Cross:"⨯",Cscr:"𝒞",Cup:"⋓",CupCap:"≍",DD:"ⅅ",DDotrahd:"⤑",DJcy:"Ђ",DScy:"Ѕ",DZcy:"Џ",Dagger:"‡",Darr:"↡",Dashv:"⫤",Dcaron:"Ď",Dcy:"Д",Del:"∇",Delta:"Δ",Dfr:"𝔇",DiacriticalAcute:"´",DiacriticalDot:"˙",DiacriticalDoubleAcute:"˝",DiacriticalGrave:"`",DiacriticalTilde:"˜",Diamond:"⋄",DifferentialD:"ⅆ",Dopf:"𝔻",Dot:"¨",DotDot:"⃜",DotEqual:"≐",DoubleContourIntegral:"∯",DoubleDot:"¨",DoubleDownArrow:"⇓",DoubleLeftArrow:"⇐",DoubleLeftRightArrow:"⇔",DoubleLeftTee:"⫤",DoubleLongLeftArrow:"⟸",DoubleLongLeftRightArrow:"⟺",DoubleLongRightArrow:"⟹",DoubleRightArrow:"⇒",DoubleRightTee:"⊨",DoubleUpArrow:"⇑",DoubleUpDownArrow:"⇕",DoubleVerticalBar:"∥",DownArrow:"↓",DownArrowBar:"⤓",DownArrowUpArrow:"⇵",DownBreve:"̑",DownLeftRightVector:"⥐",DownLeftTeeVector:"⥞",DownLeftVector:"↽",DownLeftVectorBar:"⥖",DownRightTeeVector:"⥟",DownRightVector:"⇁",DownRightVectorBar:"⥗",DownTee:"⊤",DownTeeArrow:"↧",Downarrow:"⇓",Dscr:"𝒟",Dstrok:"Đ",ENG:"Ŋ",ETH:"Ð",Eacute:"É",Ecaron:"Ě",Ecirc:"Ê",Ecy:"Э",Edot:"Ė",Efr:"𝔈",Egrave:"È",Element:"∈",Emacr:"Ē",EmptySmallSquare:"◻",EmptyVerySmallSquare:"▫",Eogon:"Ę",Eopf:"𝔼",Epsilon:"Ε",Equal:"⩵",EqualTilde:"≂",Equilibrium:"⇌",Escr:"ℰ",Esim:"⩳",Eta:"Η",Euml:"Ë",Exists:"∃",ExponentialE:"ⅇ",Fcy:"Ф",Ffr:"𝔉",FilledSmallSquare:"◼",FilledVerySmallSquare:"▪",Fopf:"𝔽",ForAll:"∀",Fouriertrf:"ℱ",Fscr:"ℱ",GJcy:"Ѓ",GT:">",Gamma:"Γ",Gammad:"Ϝ",Gbreve:"Ğ",Gcedil:"Ģ",Gcirc:"Ĝ",Gcy:"Г",Gdot:"Ġ",Gfr:"𝔊",Gg:"⋙",Gopf:"𝔾",GreaterEqual:"≥",GreaterEqualLess:"⋛",GreaterFullEqual:"≧",GreaterGreater:"⪢",GreaterLess:"≷",GreaterSlantEqual:"⩾",GreaterTilde:"≳",Gscr:"𝒢",Gt:"≫",HARDcy:"Ъ",Hacek:"ˇ",Hat:"^",Hcirc:"Ĥ",Hfr:"ℌ",HilbertSpace:"ℋ",Hopf:"ℍ",HorizontalLine:"─",Hscr:"ℋ",Hstrok:"Ħ",HumpDownHump:"≎",HumpEqual:"≏",IEcy:"Е",IJlig:"Ĳ",IOcy:"Ё",Iacute:"Í",Icirc:"Î",Icy:"И",Idot:"İ",Ifr:"ℑ",Igrave:"Ì",Im:"ℑ",Imacr:"Ī",ImaginaryI:"ⅈ",Implies:"⇒",Int:"∬",Integral:"∫",Intersection:"⋂",InvisibleComma:"\u2063",InvisibleTimes:"\u2062",Iogon:"Į",Iopf:"𝕀",Iota:"Ι",Iscr:"ℐ",Itilde:"Ĩ",Iukcy:"І",Iuml:"Ï",Jcirc:"Ĵ",Jcy:"Й",Jfr:"𝔍",Jopf:"𝕁",Jscr:"𝒥",Jsercy:"Ј",Jukcy:"Є",KHcy:"Х",KJcy:"Ќ",Kappa:"Κ",Kcedil:"Ķ",Kcy:"К",Kfr:"𝔎",Kopf:"𝕂",Kscr:"𝒦",LJcy:"Љ",LT:"<",Lacute:"Ĺ",Lambda:"Λ",Lang:"⟪",Laplacetrf:"ℒ",Larr:"↞",Lcaron:"Ľ",Lcedil:"Ļ",Lcy:"Л",LeftAngleBracket:"⟨",LeftArrow:"←",LeftArrowBar:"⇤",LeftArrowRightArrow:"⇆",LeftCeiling:"⌈",LeftDoubleBracket:"⟦",LeftDownTeeVector:"⥡",LeftDownVector:"⇃",LeftDownVectorBar:"⥙",LeftFloor:"⌊",LeftRightArrow:"↔",LeftRightVector:"⥎",LeftTee:"⊣",LeftTeeArrow:"↤",LeftTeeVector:"⥚",LeftTriangle:"⊲",LeftTriangleBar:"⧏",LeftTriangleEqual:"⊴",LeftUpDownVector:"⥑",LeftUpTeeVector:"⥠",LeftUpVector:"↿",LeftUpVectorBar:"⥘",LeftVector:"↼",LeftVectorBar:"⥒",Leftarrow:"⇐",Leftrightarrow:"⇔",LessEqualGreater:"⋚",LessFullEqual:"≦",LessGreater:"≶",LessLess:"⪡",LessSlantEqual:"⩽",LessTilde:"≲",Lfr:"𝔏",Ll:"⋘",Lleftarrow:"⇚",Lmidot:"Ŀ",LongLeftArrow:"⟵",LongLeftRightArrow:"⟷",LongRightArrow:"⟶",Longleftarrow:"⟸",Longleftrightarrow:"⟺",Longrightarrow:"⟹",Lopf:"𝕃",LowerLeftArrow:"↙",LowerRightArrow:"↘",Lscr:"ℒ",Lsh:"↰",Lstrok:"Ł",Lt:"≪",Map:"⤅",Mcy:"М",MediumSpace:" ",Mellintrf:"ℳ",Mfr:"𝔐",MinusPlus:"∓",Mopf:"𝕄",Mscr:"ℳ",Mu:"Μ",NJcy:"Њ",Nacute:"Ń",Ncaron:"Ň",Ncedil:"Ņ",Ncy:"Н",NegativeMediumSpace:"\u200b",NegativeThickSpace:"\u200b",NegativeThinSpace:"\u200b",NegativeVeryThinSpace:"\u200b",NestedGreaterGreater:"≫",NestedLessLess:"≪",NewLine:"\u000a",Nfr:"𝔑",NoBreak:"\u2060",NonBreakingSpace:"\u00a0",Nopf:"ℕ",Not:"⫬",NotCongruent:"≢",NotCupCap:"≭",NotDoubleVerticalBar:"∦",NotElement:"∉",NotEqual:"≠",NotEqualTilde:"≂̸",NotExists:"∄",NotGreater:"≯",NotGreaterEqual:"≱",NotGreaterFullEqual:"≧̸",NotGreaterGreater:"≫̸",NotGreaterLess:"≹",NotGreaterSlantEqual:"⩾̸",NotGreaterTilde:"≵",NotHumpDownHump:"≎̸",NotHumpEqual:"≏̸",NotLeftTriangle:"⋪",NotLeftTriangleBar:"⧏̸",NotLeftTriangleEqual:"⋬",NotLess:"≮",NotLessEqual:"≰",NotLessGreater:"≸",NotLessLess:"≪̸",NotLessSlantEqual:"⩽̸",NotLessTilde:"≴",NotNestedGreaterGreater:"⪢̸",NotNestedLessLess:"⪡̸",NotPrecedes:"⊀",NotPrecedesEqual:"⪯̸",NotPrecedesSlantEqual:"⋠",NotReverseElement:"∌",NotRightTriangle:"⋫",NotRightTriangleBar:"⧐̸",NotRightTriangleEqual:"⋭",NotSquareSubset:"⊏̸",NotSquareSubsetEqual:"⋢",NotSquareSuperset:"⊐̸",NotSquareSupersetEqual:"⋣",NotSubset:"⊂⃒",NotSubsetEqual:"⊈",NotSucceeds:"⊁",NotSucceedsEqual:"⪰̸",NotSucceedsSlantEqual:"⋡",NotSucceedsTilde:"≿̸",NotSuperset:"⊃⃒",NotSupersetEqual:"⊉",NotTilde:"≁",NotTildeEqual:"≄",NotTildeFullEqual:"≇",NotTildeTilde:"≉",NotVerticalBar:"∤",Nscr:"𝒩",Ntilde:"Ñ",Nu:"Ν",OElig:"Œ",Oacute:"Ó",Ocirc:"Ô",Ocy:"О",Odblac:"Ő",Ofr:"𝔒",Ograve:"Ò",Omacr:"Ō",Omega:"Ω",Omicron:"Ο",Oopf:"𝕆",OpenCurlyDoubleQuote:"“",OpenCurlyQuote:"‘",Or:"⩔",Oscr:"𝒪",Oslash:"Ø",Otilde:"Õ",Otimes:"⨷",Ouml:"Ö",OverBar:"‾",OverBrace:"⏞",OverBracket:"⎴",OverParenthesis:"⏜",PartialD:"∂",Pcy:"П",Pfr:"𝔓",Phi:"Φ",Pi:"Π",PlusMinus:"±",Poincareplane:"ℌ",Popf:"ℙ",Pr:"⪻",Precedes:"≺",PrecedesEqual:"⪯",PrecedesSlantEqual:"≼",PrecedesTilde:"≾",Prime:"″",Product:"∏",Proportion:"∷",Proportional:"∝",Pscr:"𝒫",Psi:"Ψ",QUOT:"\"",Qfr:"𝔔",Qopf:"ℚ",Qscr:"𝒬",RBarr:"⤐",REG:"®",Racute:"Ŕ",Rang:"⟫",Rarr:"↠",Rarrtl:"⤖",Rcaron:"Ř",Rcedil:"Ŗ",Rcy:"Р",Re:"ℜ",ReverseElement:"∋",ReverseEquilibrium:"⇋",ReverseUpEquilibrium:"⥯",Rfr:"ℜ",Rho:"Ρ",RightAngleBracket:"⟩",RightArrow:"→",RightArrowBar:"⇥",RightArrowLeftArrow:"⇄",RightCeiling:"⌉",RightDoubleBracket:"⟧",RightDownTeeVector:"⥝",RightDownVector:"⇂",RightDownVectorBar:"⥕",RightFloor:"⌋",RightTee:"⊢",RightTeeArrow:"↦",RightTeeVector:"⥛",RightTriangle:"⊳",RightTriangleBar:"⧐",RightTriangleEqual:"⊵",RightUpDownVector:"⥏",RightUpTeeVector:"⥜",RightUpVector:"↾",RightUpVectorBar:"⥔",RightVector:"⇀",RightVectorBar:"⥓",Rightarrow:"⇒",Ropf:"ℝ",RoundImplies:"⥰",Rrightarrow:"⇛",Rscr:"ℛ",Rsh:"↱",RuleDelayed:"⧴",SHCHcy:"Щ",SHcy:"Ш",SOFTcy:"Ь",Sacute:"Ś",Sc:"⪼",Scaron:"Š",Scedil:"Ş",Scirc:"Ŝ",Scy:"С",Sfr:"𝔖",ShortDownArrow:"↓",ShortLeftArrow:"←",ShortRightArrow:"→",ShortUpArrow:"↑",Sigma:"Σ",SmallCircle:"∘",Sopf:"𝕊",Sqrt:"√",Square:"□",SquareIntersection:"⊓",SquareSubset:"⊏",SquareSubsetEqual:"⊑",SquareSuperset:"⊐",SquareSupersetEqual:"⊒",SquareUnion:"⊔",Sscr:"𝒮",Star:"⋆",Sub:"⋐",Subset:"⋐",SubsetEqual:"⊆",Succeeds:"≻",SucceedsEqual:"⪰",SucceedsSlantEqual:"≽",SucceedsTilde:"≿",SuchThat:"∋",Sum:"∑",Sup:"⋑",Superset:"⊃",SupersetEqual:"⊇",Supset:"⋑",THORN:"Þ",TRADE:"™",TSHcy:"Ћ",TScy:"Ц",Tab:"\u0009",Tau:"Τ",Tcaron:"Ť",Tcedil:"Ţ",Tcy:"Т",Tfr:"𝔗",Therefore:"∴",Theta:"Θ",ThickSpace:"  ",ThinSpace:" ",Tilde:"∼",TildeEqual:"≃",TildeFullEqual:"≅",TildeTilde:"≈",Topf:"𝕋",TripleDot:"⃛",Tscr:"𝒯",Tstrok:"Ŧ",Uacute:"Ú",Uarr:"↟",Uarrocir:"⥉",Ubrcy:"Ў",Ubreve:"Ŭ",Ucirc:"Û",Ucy:"У",Udblac:"Ű",Ufr:"𝔘",Ugrave:"Ù",Umacr:"Ū",UnderBar:"_",UnderBrace:"⏟",UnderBracket:"⎵",UnderParenthesis:"⏝",Union:"⋃",UnionPlus:"⊎",Uogon:"Ų",Uopf:"𝕌",UpArrow:"↑",UpArrowBar:"⤒",UpArrowDownArrow:"⇅",UpDownArrow:"↕",UpEquilibrium:"⥮",UpTee:"⊥",UpTeeArrow:"↥",Uparrow:"⇑",Updownarrow:"⇕",UpperLeftArrow:"↖",UpperRightArrow:"↗",Upsi:"ϒ",Upsilon:"Υ",Uring:"Ů",Uscr:"𝒰",Utilde:"Ũ",Uuml:"Ü",VDash:"⊫",Vbar:"⫫",Vcy:"В",Vdash:"⊩",Vdashl:"⫦",Vee:"⋁",Verbar:"‖",Vert:"‖",VerticalBar:"∣",VerticalLine:"|",VerticalSeparator:"❘",VerticalTilde:"≀",VeryThinSpace:" ",Vfr:"𝔙",Vopf:"𝕍",Vscr:"𝒱",Vvdash:"⊪",Wcirc:"Ŵ",Wedge:"⋀",Wfr:"𝔚",Wopf:"𝕎",Wscr:"𝒲",Xfr:"𝔛",Xi:"Ξ",Xopf:"𝕏",Xscr:"𝒳",YAcy:"Я",YIcy:"Ї",YUcy:"Ю",Yacute:"Ý",Ycirc:"Ŷ",Ycy:"Ы",Yfr:"𝔜",Yopf:"𝕐",Yscr:"𝒴",Yuml:"Ÿ",ZHcy:"Ж",Zacute:"Ź",Zcaron:"Ž",Zcy:"З",Zdot:"Ż",ZeroWidthSpace:"\u200b",Zeta:"Ζ",Zfr:"ℨ",Zopf:"ℤ",Zscr:"𝒵",aacute:"á",abreve:"ă",ac:"∾",acE:"∾̳",acd:"∿",acirc:"â",acute:"´",acy:"а",aelig:"æ",af:"\u2061",afr:"𝔞",agrave:"à",alefsym:"ℵ",aleph:"ℵ",alpha:"α",amacr:"ā",amalg:"⨿",amp:"&",and:"∧",andand:"⩕",andd:"⩜",andslope:"⩘",andv:"⩚",ang:"∠",ange:"⦤",angle:"∠",angmsd:"∡",angmsdaa:"⦨",angmsdab:"⦩",angmsdac:"⦪",angmsdad:"⦫",angmsdae:"⦬",angmsdaf:"⦭",angmsdag:"⦮",angmsdah:"⦯",angrt:"∟",angrtvb:"⊾",angrtvbd:"⦝",angsph:"∢",angst:"Å",angzarr:"⍼",aogon:"ą",aopf:"𝕒",ap:"≈",apE:"⩰",apacir:"⩯",ape:"≊",apid:"≋",apos:"'",approx:"≈",approxeq:"≊",aring:"å",ascr:"𝒶",ast:"*",asymp:"≈",asympeq:"≍",atilde:"ã",auml:"ä",awconint:"∳",awint:"⨑",bNot:"⫭",backcong:"≌",backepsilon:"϶",backprime:"‵",backsim:"∽",backsimeq:"⋍",barvee:"⊽",barwed:"⌅",barwedge:"⌅",bbrk:"⎵",bbrktbrk:"⎶",bcong:"≌",bcy:"б",bdquo:"„",becaus:"∵",because:"∵",bemptyv:"⦰",bepsi:"϶",bernou:"ℬ",beta:"β",beth:"ℶ",between:"≬",bfr:"𝔟",bigcap:"⋂",bigcirc:"◯",bigcup:"⋃",bigodot:"⨀",bigoplus:"⨁",bigotimes:"⨂",bigsqcup:"⨆",bigstar:"★",bigtriangledown:"▽",bigtriangleup:"△",biguplus:"⨄",bigvee:"⋁",bigwedge:"⋀",bkarow:"⤍",blacklozenge:"⧫",blacksquare:"▪",blacktriangle:"▴",blacktriangledown:"▾",blacktriangleleft:"◂",blacktriangleright:"▸",blank:"␣",blk12:"▒",blk14:"░",blk34:"▓",block:"█",bne:"=⃥",bnequiv:"≡⃥",bnot:"⌐",bopf:"𝕓",bot:"⊥",bottom:"⊥",bowtie:"⋈",boxDL:"╗",boxDR:"╔",boxDl:"╖",boxDr:"╓",boxH:"═",boxHD:"╦",boxHU:"╩",boxHd:"╤",boxHu:"╧",boxUL:"╝",boxUR:"╚",boxUl:"╜",boxUr:"╙",boxV:"║",boxVH:"╬",boxVL:"╣",boxVR:"╠",boxVh:"╫",boxVl:"╢",boxVr:"╟",boxbox:"⧉",boxdL:"╕",boxdR:"╒",boxdl:"┐",boxdr:"┌",boxh:"─",boxhD:"╥",boxhU:"╨",boxhd:"┬",boxhu:"┴",boxminus:"⊟",boxplus:"⊞",boxtimes:"⊠",boxuL:"╛",boxuR:"╘",boxul:"┘",boxur:"└",boxv:"│",boxvH:"╪",boxvL:"╡",boxvR:"╞",boxvh:"┼",boxvl:"┤",boxvr:"├",bprime:"‵",breve:"˘",brvbar:"¦",bscr:"𝒷",bsemi:"⁏",bsim:"∽",bsime:"⋍",bsol:"\\",bsolb:"⧅",bsolhsub:"⟈",bull:"•",bullet:"•",bump:"≎",bumpE:"⪮",bumpe:"≏",bumpeq:"≏",cacute:"ć",cap:"∩",capand:"⩄",capbrcup:"⩉",capcap:"⩋",capcup:"⩇",capdot:"⩀",caps:"∩\ufe00",caret:"⁁",caron:"ˇ",ccaps:"⩍",ccaron:"č",ccedil:"ç",ccirc:"ĉ",ccups:"⩌",ccupssm:"⩐",cdot:"ċ",cedil:"¸",cemptyv:"⦲",cent:"¢",centerdot:"·",cfr:"𝔠",chcy:"ч",check:"✓",checkmark:"✓",chi:"χ",cir:"○",cirE:"⧃",circ:"ˆ",circeq:"≗",circlearrowleft:"↺",circlearrowright:"↻",circledR:"®",circledS:"Ⓢ",circledast:"⊛",circledcirc:"⊚",circleddash:"⊝",cire:"≗",cirfnint:"⨐",cirmid:"⫯",cirscir:"⧂",clubs:"♣",clubsuit:"♣",colon:":",colone:"≔",coloneq:"≔",comma:",",commat:"@",comp:"∁",compfn:"∘",complement:"∁",complexes:"ℂ",cong:"≅",congdot:"⩭",conint:"∮",copf:"𝕔",coprod:"∐",copy:"©",copysr:"℗",crarr:"↵",cross:"✗",cscr:"𝒸",csub:"⫏",csube:"⫑",csup:"⫐",csupe:"⫒",ctdot:"⋯",cudarrl:"⤸",cudarrr:"⤵",cuepr:"⋞",cuesc:"⋟",cularr:"↶",cularrp:"⤽",cup:"∪",cupbrcap:"⩈",cupcap:"⩆",cupcup:"⩊",cupdot:"⊍",cupor:"⩅",cups:"∪\ufe00",curarr:"↷",curarrm:"⤼",curlyeqprec:"⋞",curlyeqsucc:"⋟",curlyvee:"⋎",curlywedge:"⋏",curren:"¤",curvearrowleft:"↶",curvearrowright:"↷",cuvee:"⋎",cuwed:"⋏",cwconint:"∲",cwint:"∱",cylcty:"⌭",dArr:"⇓",dHar:"⥥",dagger:"†",daleth:"ℸ",darr:"↓",dash:"‐",dashv:"⊣",dbkarow:"⤏",dblac:"˝",dcaron:"ď",dcy:"д",dd:"ⅆ",ddagger:"‡",ddarr:"⇊",ddotseq:"⩷",deg:"°",delta:"δ",demptyv:"⦱",dfisht:"⥿",dfr:"𝔡",dharl:"⇃",dharr:"⇂",diam:"⋄",diamond:"⋄",diamondsuit:"♦",diams:"♦",die:"¨",digamma:"ϝ",disin:"⋲",div:"÷",divide:"÷",divideontimes:"⋇",divonx:"⋇",djcy:"ђ",dlcorn:"⌞",dlcrop:"⌍",dollar:"$",dopf:"𝕕",dot:"˙",doteq:"≐",doteqdot:"≑",dotminus:"∸",dotplus:"∔",dotsquare:"⊡",doublebarwedge:"⌆",downarrow:"↓",downdownarrows:"⇊",downharpoonleft:"⇃",downharpoonright:"⇂",drbkarow:"⤐",drcorn:"⌟",drcrop:"⌌",dscr:"𝒹",dscy:"ѕ",dsol:"⧶",dstrok:"đ",dtdot:"⋱",dtri:"▿",dtrif:"▾",duarr:"⇵",duhar:"⥯",dwangle:"⦦",dzcy:"џ",dzigrarr:"⟿",eDDot:"⩷",eDot:"≑",eacute:"é",easter:"⩮",ecaron:"ě",ecir:"≖",ecirc:"ê",ecolon:"≕",ecy:"э",edot:"ė",ee:"ⅇ",efDot:"≒",efr:"𝔢",eg:"⪚",egrave:"è",egs:"⪖",egsdot:"⪘",el:"⪙",elinters:"⏧",ell:"ℓ",els:"⪕",elsdot:"⪗",emacr:"ē",empty:"∅",emptyset:"∅",emptyv:"∅",emsp:" ",emsp13:" ",emsp14:" ",eng:"ŋ",ensp:" ",eogon:"ę",eopf:"𝕖",epar:"⋕",eparsl:"⧣",eplus:"⩱",epsi:"ε",epsilon:"ε",epsiv:"ϵ",eqcirc:"≖",eqcolon:"≕",eqsim:"≂",eqslantgtr:"⪖",eqslantless:"⪕",equals:"=",equest:"≟",equiv:"≡",equivDD:"⩸",eqvparsl:"⧥",erDot:"≓",erarr:"⥱",escr:"ℯ",esdot:"≐",esim:"≂",eta:"η",eth:"ð",euml:"ë",euro:"€",excl:"!",exist:"∃",expectation:"ℰ",exponentiale:"ⅇ",fallingdotseq:"≒",fcy:"ф",female:"♀",ffilig:"ﬃ",fflig:"ﬀ",ffllig:"ﬄ",ffr:"𝔣",filig:"ﬁ",fjlig:"fj",flat:"♭",fllig:"ﬂ",fltns:"▱",fnof:"ƒ",fopf:"𝕗",forall:"∀",fork:"⋔",forkv:"⫙",fpartint:"⨍",frac12:"½",frac13:"⅓",frac14:"¼",frac15:"⅕",frac16:"⅙",frac18:"⅛",frac23:"⅔",frac25:"⅖",frac34:"¾",frac35:"⅗",frac38:"⅜",frac45:"⅘",frac56:"⅚",frac58:"⅝",frac78:"⅞",frasl:"⁄",frown:"⌢",fscr:"𝒻",gE:"≧",gEl:"⪌",gacute:"ǵ",gamma:"γ",gammad:"ϝ",gap:"⪆",gbreve:"ğ",gcirc:"ĝ",gcy:"г",gdot:"ġ",ge:"≥",gel:"⋛",geq:"≥",geqq:"≧",geqslant:"⩾",ges:"⩾",gescc:"⪩",gesdot:"⪀",gesdoto:"⪂",gesdotol:"⪄",gesl:"⋛\ufe00",gesles:"⪔",gfr:"𝔤",gg:"≫",ggg:"⋙",gimel:"ℷ",gjcy:"ѓ",gl:"≷",glE:"⪒",gla:"⪥",glj:"⪤",gnE:"≩",gnap:"⪊",gnapprox:"⪊",gne:"⪈",gneq:"⪈",gneqq:"≩",gnsim:"⋧",gopf:"𝕘",grave:"`",gscr:"ℊ",gsim:"≳",gsime:"⪎",gsiml:"⪐",gt:">",gtcc:"⪧",gtcir:"⩺",gtdot:"⋗",gtlPar:"⦕",gtquest:"⩼",gtrapprox:"⪆",gtrarr:"⥸",gtrdot:"⋗",gtreqless:"⋛",gtreqqless:"⪌",gtrless:"≷",gtrsim:"≳",gvertneqq:"≩\ufe00",gvnE:"≩\ufe00",hArr:"⇔",hairsp:" ",half:"½",hamilt:"ℋ",hardcy:"ъ",harr:"↔",harrcir:"⥈",harrw:"↭",hbar:"ℏ",hcirc:"ĥ",hearts:"♥",heartsuit:"♥",hellip:"…",hercon:"⊹",hfr:"𝔥",hksearow:"⤥",hkswarow:"⤦",hoarr:"⇿",homtht:"∻",hookleftarrow:"↩",hookrightarrow:"↪",hopf:"𝕙",horbar:"―",hscr:"𝒽",hslash:"ℏ",hstrok:"ħ",hybull:"⁃",hyphen:"‐",iacute:"í",ic:"\u2063",icirc:"î",icy:"и",iecy:"е",iexcl:"¡",iff:"⇔",ifr:"𝔦",igrave:"ì",ii:"ⅈ",iiiint:"⨌",iiint:"∭",iinfin:"⧜",iiota:"℩",ijlig:"ĳ",imacr:"ī",image:"ℑ",imagline:"ℐ",imagpart:"ℑ",imath:"ı",imof:"⊷",imped:"Ƶ",in:"∈",incare:"℅",infin:"∞",infintie:"⧝",inodot:"ı",int:"∫",intcal:"⊺",integers:"ℤ",intercal:"⊺",intlarhk:"⨗",intprod:"⨼",iocy:"ё",iogon:"į",iopf:"𝕚",iota:"ι",iprod:"⨼",iquest:"¿",iscr:"𝒾",isin:"∈",isinE:"⋹",isindot:"⋵",isins:"⋴",isinsv:"⋳",isinv:"∈",it:"\u2062",itilde:"ĩ",iukcy:"і",iuml:"ï",jcirc:"ĵ",jcy:"й",jfr:"𝔧",jmath:"ȷ",jopf:"𝕛",jscr:"𝒿",jsercy:"ј",jukcy:"є",kappa:"κ",kappav:"ϰ",kcedil:"ķ",kcy:"к",kfr:"𝔨",kgreen:"ĸ",khcy:"х",kjcy:"ќ",kopf:"𝕜",kscr:"𝓀",lAarr:"⇚",lArr:"⇐",lAtail:"⤛",lBarr:"⤎",lE:"≦",lEg:"⪋",lHar:"⥢",lacute:"ĺ",laemptyv:"⦴",lagran:"ℒ",lambda:"λ",lang:"⟨",langd:"⦑",langle:"⟨",lap:"⪅",laquo:"«",larr:"←",larrb:"⇤",larrbfs:"⤟",larrfs:"⤝",larrhk:"↩",larrlp:"↫",larrpl:"⤹",larrsim:"⥳",larrtl:"↢",lat:"⪫",latail:"⤙",late:"⪭",lates:"⪭\ufe00",lbarr:"⤌",lbbrk:"❲",lbrace:"{",lbrack:"[",lbrke:"⦋",lbrksld:"⦏",lbrkslu:"⦍",lcaron:"ľ",lcedil:"ļ",lceil:"⌈",lcub:"{",lcy:"л",ldca:"⤶",ldquo:"“",ldquor:"„",ldrdhar:"⥧",ldrushar:"⥋",ldsh:"↲",le:"≤",leftarrow:"←",leftarrowtail:"↢",leftharpoondown:"↽",leftharpoonup:"↼",leftleftarrows:"⇇",leftrightarrow:"↔",leftrightarrows:"⇆",leftrightharpoons:"⇋",leftrightsquigarrow:"↭",leftthreetimes:"⋋",leg:"⋚",leq:"≤",leqq:"≦",leqslant:"⩽",les:"⩽",lescc:"⪨",lesdot:"⩿",lesdoto:"⪁",lesdotor:"⪃",lesg:"⋚\ufe00",lesges:"⪓",lessapprox:"⪅",lessdot:"⋖",lesseqgtr:"⋚",lesseqqgtr:"⪋",lessgtr:"≶",lesssim:"≲",lfisht:"⥼",lfloor:"⌊",lfr:"𝔩",lg:"≶",lgE:"⪑",lhard:"↽",lharu:"↼",lharul:"⥪",lhblk:"▄",ljcy:"љ",ll:"≪",llarr:"⇇",llcorner:"⌞",llhard:"⥫",lltri:"◺",lmidot:"ŀ",lmoust:"⎰",lmoustache:"⎰",lnE:"≨",lnap:"⪉",lnapprox:"⪉",lne:"⪇",lneq:"⪇",lneqq:"≨",lnsim:"⋦",loang:"⟬",loarr:"⇽",lobrk:"⟦",longleftarrow:"⟵",longleftrightarrow:"⟷",longmapsto:"⟼",longrightarrow:"⟶",looparrowleft:"↫",looparrowright:"↬",lopar:"⦅",lopf:"𝕝",loplus:"⨭",lotimes:"⨴",lowast:"∗",lowbar:"_",loz:"◊",lozenge:"◊",lozf:"⧫",lpar:"(",lparlt:"⦓",lrarr:"⇆",lrcorner:"⌟",lrhar:"⇋",lrhard:"⥭",lrm:"\u200e",lrtri:"⊿",lsaquo:"‹",lscr:"𝓁",lsh:"↰",lsim:"≲",lsime:"⪍",lsimg:"⪏",lsqb:"[",lsquo:"‘",lsquor:"‚",lstrok:"ł",lt:"<",ltcc:"⪦",ltcir:"⩹",ltdot:"⋖",lthree:"⋋",ltimes:"⋉",ltlarr:"⥶",ltquest:"⩻",ltrPar:"⦖",ltri:"◃",ltrie:"⊴",ltrif:"◂",lurdshar:"⥊",luruhar:"⥦",lvertneqq:"≨\ufe00",lvnE:"≨\ufe00",mDDot:"∺",macr:"¯",male:"♂",malt:"✠",maltese:"✠",map:"↦",mapsto:"↦",mapstodown:"↧",mapstoleft:"↤",mapstoup:"↥",marker:"▮",mcomma:"⨩",mcy:"м",mdash:"—",measuredangle:"∡",mfr:"𝔪",mho:"℧",micro:"µ",mid:"∣",midast:"*",midcir:"⫰",middot:"·",minus:"−",minusb:"⊟",minusd:"∸",minusdu:"⨪",mlcp:"⫛",mldr:"…",mnplus:"∓",models:"⊧",mopf:"𝕞",mp:"∓",mscr:"𝓂",mstpos:"∾",mu:"μ",multimap:"⊸",mumap:"⊸",nGg:"⋙̸",nGt:"≫⃒",nGtv:"≫̸",nLeftarrow:"⇍",nLeftrightarrow:"⇎",nLl:"⋘̸",nLt:"≪⃒",nLtv:"≪̸",nRightarrow:"⇏",nVDash:"⊯",nVdash:"⊮",nabla:"∇",nacute:"ń",nang:"∠⃒",nap:"≉",napE:"⩰̸",napid:"≋̸",napos:"ŉ",napprox:"≉",natur:"♮",natural:"♮",naturals:"ℕ",nbsp:"\u00a0",nbump:"≎̸",nbumpe:"≏̸",ncap:"⩃",ncaron:"ň",ncedil:"ņ",ncong:"≇",ncongdot:"⩭̸",ncup:"⩂",ncy:"н",ndash:"–",ne:"≠",neArr:"⇗",nearhk:"⤤",nearr:"↗",nearrow:"↗",nedot:"≐̸",nequiv:"≢",nesear:"⤨",nesim:"≂̸",nexist:"∄",nexists:"∄",nfr:"𝔫",ngE:"≧̸",nge:"≱",ngeq:"≱",ngeqq:"≧̸",ngeqslant:"⩾̸",nges:"⩾̸",ngsim:"≵",ngt:"≯",ngtr:"≯",nhArr:"⇎",nharr:"↮",nhpar:"⫲",ni:"∋",nis:"⋼",nisd:"⋺",niv:"∋",njcy:"њ",nlArr:"⇍",nlE:"≦̸",nlarr:"↚",nldr:"‥",nle:"≰",nleftarrow:"↚",nleftrightarrow:"↮",nleq:"≰",nleqq:"≦̸",nleqslant:"⩽̸",nles:"⩽̸",nless:"≮",nlsim:"≴",nlt:"≮",nltri:"⋪",nltrie:"⋬",nmid:"∤",nopf:"𝕟",not:"¬",notin:"∉",notinE:"⋹̸",notindot:"⋵̸",notinva:"∉",notinvb:"⋷",notinvc:"⋶",notni:"∌",notniva:"∌",notnivb:"⋾",notnivc:"⋽",npar:"∦",nparallel:"∦",nparsl:"⫽⃥",npart:"∂̸",npolint:"⨔",npr:"⊀",nprcue:"⋠",npre:"⪯̸",nprec:"⊀",npreceq:"⪯̸",nrArr:"⇏",nrarr:"↛",nrarrc:"⤳̸",nrarrw:"↝̸",nrightarrow:"↛",nrtri:"⋫",nrtrie:"⋭",nsc:"⊁",nsccue:"⋡",nsce:"⪰̸",nscr:"𝓃",nshortmid:"∤",nshortparallel:"∦",nsim:"≁",nsime:"≄",nsimeq:"≄",nsmid:"∤",nspar:"∦",nsqsube:"⋢",nsqsupe:"⋣",nsub:"⊄",nsubE:"⫅̸",nsube:"⊈",nsubset:"⊂⃒",nsubseteq:"⊈",nsubseteqq:"⫅̸",nsucc:"⊁",nsucceq:"⪰̸",nsup:"⊅",nsupE:"⫆̸",nsupe:"⊉",nsupset:"⊃⃒",nsupseteq:"⊉",nsupseteqq:"⫆̸",ntgl:"≹",ntilde:"ñ",ntlg:"≸",ntriangleleft:"⋪",ntrianglelefteq:"⋬",ntriangleright:"⋫",ntrianglerighteq:"⋭",nu:"ν",num:"#",numero:"№",numsp:" ",nvDash:"⊭",nvHarr:"⤄",nvap:"≍⃒",nvdash:"⊬",nvge:"≥⃒",nvgt:">⃒",nvinfin:"⧞",nvlArr:"⤂",nvle:"≤⃒",nvlt:"<⃒",nvltrie:"⊴⃒",nvrArr:"⤃",nvrtrie:"⊵⃒",nvsim:"∼⃒",nwArr:"⇖",nwarhk:"⤣",nwarr:"↖",nwarrow:"↖",nwnear:"⤧",oS:"Ⓢ",oacute:"ó",oast:"⊛",ocir:"⊚",ocirc:"ô",ocy:"о",odash:"⊝",odblac:"ő",odiv:"⨸",odot:"⊙",odsold:"⦼",oelig:"œ",ofcir:"⦿",ofr:"𝔬",ogon:"˛",ograve:"ò",ogt:"⧁",ohbar:"⦵",ohm:"Ω",oint:"∮",olarr:"↺",olcir:"⦾",olcross:"⦻",oline:"‾",olt:"⧀",omacr:"ō",omega:"ω",omicron:"ο",omid:"⦶",ominus:"⊖",oopf:"𝕠",opar:"⦷",operp:"⦹",oplus:"⊕",or:"∨",orarr:"↻",ord:"⩝",order:"ℴ",orderof:"ℴ",ordf:"ª",ordm:"º",origof:"⊶",oror:"⩖",orslope:"⩗",orv:"⩛",oscr:"ℴ",oslash:"ø",osol:"⊘",otilde:"õ",otimes:"⊗",otimesas:"⨶",ouml:"ö",ovbar:"⌽",par:"∥",para:"¶",parallel:"∥",parsim:"⫳",parsl:"⫽",part:"∂",pcy:"п",percnt:"%",period:".",permil:"‰",perp:"⊥",pertenk:"‱",pfr:"𝔭",phi:"φ",phiv:"ϕ",phmmat:"ℳ",phone:"☎",pi:"π",pitchfork:"⋔",piv:"ϖ",planck:"ℏ",planckh:"ℎ",plankv:"ℏ",plus:"+",plusacir:"⨣",plusb:"⊞",pluscir:"⨢",plusdo:"∔",plusdu:"⨥",pluse:"⩲",plusmn:"±",plussim:"⨦",plustwo:"⨧",pm:"±",pointint:"⨕",popf:"𝕡",pound:"£",pr:"≺",prE:"⪳",prap:"⪷",prcue:"≼",pre:"⪯",prec:"≺",precapprox:"⪷",preccurlyeq:"≼",preceq:"⪯",precnapprox:"⪹",precneqq:"⪵",precnsim:"⋨",precsim:"≾",prime:"′",primes:"ℙ",prnE:"⪵",prnap:"⪹",prnsim:"⋨",prod:"∏",profalar:"⌮",profline:"⌒",profsurf:"⌓",prop:"∝",propto:"∝",prsim:"≾",prurel:"⊰",pscr:"𝓅",psi:"ψ",puncsp:" ",qfr:"𝔮",qint:"⨌",qopf:"𝕢",qprime:"⁗",qscr:"𝓆",quaternions:"ℍ",quatint:"⨖",quest:"?",questeq:"≟",quot:"\"",rAarr:"⇛",rArr:"⇒",rAtail:"⤜",rBarr:"⤏",rHar:"⥤",race:"∽̱",racute:"ŕ",radic:"√",raemptyv:"⦳",rang:"⟩",rangd:"⦒",range:"⦥",rangle:"⟩",raquo:"»",rarr:"→",rarrap:"⥵",rarrb:"⇥",rarrbfs:"⤠",rarrc:"⤳",rarrfs:"⤞",rarrhk:"↪",rarrlp:"↬",rarrpl:"⥅",rarrsim:"⥴",rarrtl:"↣",rarrw:"↝",ratail:"⤚",ratio:"∶",rationals:"ℚ",rbarr:"⤍",rbbrk:"❳",rbrace:"}",rbrack:"]",rbrke:"⦌",rbrksld:"⦎",rbrkslu:"⦐",rcaron:"ř",rcedil:"ŗ",rceil:"⌉",rcub:"}",rcy:"р",rdca:"⤷",rdldhar:"⥩",rdquo:"”",rdquor:"”",rdsh:"↳",real:"ℜ",realine:"ℛ",realpart:"ℜ",reals:"ℝ",rect:"▭",reg:"®",rfisht:"⥽",rfloor:"⌋",rfr:"𝔯",rhard:"⇁",rharu:"⇀",rharul:"⥬",rho:"ρ",rhov:"ϱ",rightarrow:"→",rightarrowtail:"↣",rightharpoondown:"⇁",rightharpoonup:"⇀",rightleftarrows:"⇄",rightleftharpoons:"⇌",rightrightarrows:"⇉",rightsquigarrow:"↝",rightthreetimes:"⋌",ring:"˚",risingdotseq:"≓",rlarr:"⇄",rlhar:"⇌",rlm:"\u200f",rmoust:"⎱",rmoustache:"⎱",rnmid:"⫮",roang:"⟭",roarr:"⇾",robrk:"⟧",ropar:"⦆",ropf:"𝕣",roplus:"⨮",rotimes:"⨵",rpar:")",rpargt:"⦔",rppolint:"⨒",rrarr:"⇉",rsaquo:"›",rscr:"𝓇",rsh:"↱",rsqb:"]",rsquo:"’",rsquor:"’",rthree:"⋌",rtimes:"⋊",rtri:"▹",rtrie:"⊵",rtrif:"▸",rtriltri:"⧎",ruluhar:"⥨",rx:"℞",sacute:"ś",sbquo:"‚",sc:"≻",scE:"⪴",scap:"⪸",scaron:"š",sccue:"≽",sce:"⪰",scedil:"ş",scirc:"ŝ",scnE:"⪶",scnap:"⪺",scnsim:"⋩",scpolint:"⨓",scsim:"≿",scy:"с",sdot:"⋅",sdotb:"⊡",sdote:"⩦",seArr:"⇘",searhk:"⤥",searr:"↘",searrow:"↘",sect:"§",semi:";",seswar:"⤩",setminus:"∖",setmn:"∖",sext:"✶",sfr:"𝔰",sfrown:"⌢",sharp:"♯",shchcy:"щ",shcy:"ш",shortmid:"∣",shortparallel:"∥",shy:"\u00ad",sigma:"σ",sigmaf:"ς",sigmav:"ς",sim:"∼",simdot:"⩪",sime:"≃",simeq:"≃",simg:"⪞",simgE:"⪠",siml:"⪝",simlE:"⪟",simne:"≆",simplus:"⨤",simrarr:"⥲",slarr:"←",smallsetminus:"∖",smashp:"⨳",smeparsl:"⧤",smid:"∣",smile:"⌣",smt:"⪪",smte:"⪬",smtes:"⪬\ufe00",softcy:"ь",sol:"/",solb:"⧄",solbar:"⌿",sopf:"𝕤",spades:"♠",spadesuit:"♠",spar:"∥",sqcap:"⊓",sqcaps:"⊓\ufe00",sqcup:"⊔",sqcups:"⊔\ufe00",sqsub:"⊏",sqsube:"⊑",sqsubset:"⊏",sqsubseteq:"⊑",sqsup:"⊐",sqsupe:"⊒",sqsupset:"⊐",sqsupseteq:"⊒",squ:"□",square:"□",squarf:"▪",squf:"▪",srarr:"→",sscr:"𝓈",ssetmn:"∖",ssmile:"⌣",sstarf:"⋆",star:"☆",starf:"★",straightepsilon:"ϵ",straightphi:"ϕ",strns:"¯",sub:"⊂",subE:"⫅",subdot:"⪽",sube:"⊆",subedot:"⫃",submult:"⫁",subnE:"⫋",subne:"⊊",subplus:"⪿",subrarr:"⥹",subset:"⊂",subseteq:"⊆",subseteqq:"⫅",subsetneq:"⊊",subsetneqq:"⫋",subsim:"⫇",subsub:"⫕",subsup:"⫓",succ:"≻",succapprox:"⪸",succcurlyeq:"≽",succeq:"⪰",succnapprox:"⪺",succneqq:"⪶",succnsim:"⋩",succsim:"≿",sum:"∑",sung:"♪",sup:"⊃",sup1:"¹",sup2:"²",sup3:"³",supE:"⫆",supdot:"⪾",supdsub:"⫘",supe:"⊇",supedot:"⫄",suphsol:"⟉",suphsub:"⫗",suplarr:"⥻",supmult:"⫂",supnE:"⫌",supne:"⊋",supplus:"⫀",supset:"⊃",supseteq:"⊇",supseteqq:"⫆",supsetneq:"⊋",supsetneqq:"⫌",supsim:"⫈",supsub:"⫔",supsup:"⫖",swArr:"⇙",swarhk:"⤦",swarr:"↙",swarrow:"↙",swnwar:"⤪",szlig:"ß",target:"⌖",tau:"τ",tbrk:"⎴",tcaron:"ť",tcedil:"ţ",tcy:"т",tdot:"⃛",telrec:"⌕",tfr:"𝔱",there4:"∴",therefore:"∴",theta:"θ",thetasym:"ϑ",thetav:"ϑ",thickapprox:"≈",thicksim:"∼",thinsp:" ",thkap:"≈",thksim:"∼",thorn:"þ",tilde:"˜",times:"×",timesb:"⊠",timesbar:"⨱",timesd:"⨰",tint:"∭",toea:"⤨",top:"⊤",topbot:"⌶",topcir:"⫱",topf:"𝕥",topfork:"⫚",tosa:"⤩",tprime:"‴",trade:"™",triangle:"▵",triangledown:"▿",triangleleft:"◃",trianglelefteq:"⊴",triangleq:"≜",triangleright:"▹",trianglerighteq:"⊵",tridot:"◬",trie:"≜",triminus:"⨺",triplus:"⨹",trisb:"⧍",tritime:"⨻",trpezium:"⏢",tscr:"𝓉",tscy:"ц",tshcy:"ћ",tstrok:"ŧ",twixt:"≬",twoheadleftarrow:"↞",twoheadrightarrow:"↠",uArr:"⇑",uHar:"⥣",uacute:"ú",uarr:"↑",ubrcy:"ў",ubreve:"ŭ",ucirc:"û",ucy:"у",udarr:"⇅",udblac:"ű",udhar:"⥮",ufisht:"⥾",ufr:"𝔲",ugrave:"ù",uharl:"↿",uharr:"↾",uhblk:"▀",ulcorn:"⌜",ulcorner:"⌜",ulcrop:"⌏",ultri:"◸",umacr:"ū",uml:"¨",uogon:"ų",uopf:"𝕦",uparrow:"↑",updownarrow:"↕",upharpoonleft:"↿",upharpoonright:"↾",uplus:"⊎",upsi:"υ",upsih:"ϒ",upsilon:"υ",upuparrows:"⇈",urcorn:"⌝",urcorner:"⌝",urcrop:"⌎",uring:"ů",urtri:"◹",uscr:"𝓊",utdot:"⋰",utilde:"ũ",utri:"▵",utrif:"▴",uuarr:"⇈",uuml:"ü",uwangle:"⦧",vArr:"⇕",vBar:"⫨",vBarv:"⫩",vDash:"⊨",vangrt:"⦜",varepsilon:"ϵ",varkappa:"ϰ",varnothing:"∅",varphi:"ϕ",varpi:"ϖ",varpropto:"∝",varr:"↕",varrho:"ϱ",varsigma:"ς",varsubsetneq:"⊊\ufe00",varsubsetneqq:"⫋\ufe00",varsupsetneq:"⊋\ufe00",varsupsetneqq:"⫌\ufe00",vartheta:"ϑ",vartriangleleft:"⊲",vartriangleright:"⊳",vcy:"в",vdash:"⊢",vee:"∨",veebar:"⊻",veeeq:"≚",vellip:"⋮",verbar:"|",vert:"|",vfr:"𝔳",vltri:"⊲",vnsub:"⊂⃒",vnsup:"⊃⃒",vopf:"𝕧",vprop:"∝",vrtri:"⊳",vscr:"𝓋",vsubnE:"⫋\ufe00",vsubne:"⊊\ufe00",vsupnE:"⫌\ufe00",vsupne:"⊋\ufe00",vzigzag:"⦚",wcirc:"ŵ",wedbar:"⩟",wedge:"∧",wedgeq:"≙",weierp:"℘",wfr:"𝔴",wopf:"𝕨",wp:"℘",wr:"≀",wreath:"≀",wscr:"𝓌",xcap:"⋂",xcirc:"◯",xcup:"⋃",xdtri:"▽",xfr:"𝔵",xhArr:"⟺",xharr:"⟷",xi:"ξ",xlArr:"⟸",xlarr:"⟵",xmap:"⟼",xnis:"⋻",xodot:"⨀",xopf:"𝕩",xoplus:"⨁",xotime:"⨂",xrArr:"⟹",xrarr:"⟶",xscr:"𝓍",xsqcup:"⨆",xuplus:"⨄",xutri:"△",xvee:"⋁",xwedge:"⋀",yacute:"ý",yacy:"я",ycirc:"ŷ",ycy:"ы",yen:"¥",yfr:"𝔶",yicy:"ї",yopf:"𝕪",yscr:"𝓎",yucy:"ю",yuml:"ÿ",zacute:"ź",zcaron:"ž",zcy:"з",zdot:"ż",zeetrf:"ℨ",zeta:"ζ",zfr:"𝔷",zhcy:"ж",zigrarr:"⇝",zopf:"𝕫",zscr:"𝓏",zwj:"\u200d",zwnj:"\u200c"};
+const LEGACY_ENTITIES = new Set("AElig AMP Aacute Acirc Agrave Aring Atilde Auml COPY Ccedil ETH Eacute Ecirc Egrave Euml GT Iacute Icirc Igrave Iuml LT Ntilde Oacute Ocirc Ograve Oslash Otilde Ouml QUOT REG THORN Uacute Ucirc Ugrave Uuml Yacute aacute acirc acute aelig agrave amp aring atilde auml brvbar ccedil cedil cent copy curren deg divide eacute ecirc egrave eth euml frac12 frac14 frac34 gt iacute icirc iexcl igrave iquest iuml laquo lt macr micro middot nbsp not ntilde oacute ocirc ograve ordf ordm oslash otilde ouml para plusmn pound quot raquo reg sect shy sup1 sup2 sup3 szlig thorn times uacute ucirc ugrave uml uuml yacute yen yuml".split(" "));
 const ATTRIBUTE = /\s*([^\s"'>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/y;
+// Numeric references to C1 controls mean the windows-1252 characters at those bytes.
+const C1_REFERENCES = { 0x80: 0x20ac, 0x82: 0x201a, 0x83: 0x192, 0x84: 0x201e, 0x85: 0x2026, 0x86: 0x2020, 0x87: 0x2021, 0x88: 0x2c6, 0x89: 0x2030, 0x8a: 0x160, 0x8b: 0x2039, 0x8c: 0x152, 0x8e: 0x17d, 0x91: 0x2018, 0x92: 0x2019, 0x93: 0x201c, 0x94: 0x201d, 0x95: 0x2022, 0x96: 0x2013, 0x97: 0x2014, 0x98: 0x2dc, 0x99: 0x2122, 0x9a: 0x161, 0x9b: 0x203a, 0x9c: 0x153, 0x9e: 0x17e, 0x9f: 0x178 };
 
-function decodeEntities(text) {
+// Character references as the HTML tokenizer reads them: numeric ones with or without the
+// semicolon, named ones by the longest name, and the legacy names without a semicolon,
+// except in an attribute value where the next character is "=" or alphanumeric.
+function decodeEntities(text, inAttribute = false) {
   if (!text.includes("&")) return text;
-  return text.replace(/&(#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (whole, name) => {
-    if (name[0] === "#") {
-      const code = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
+  return text.replace(/&(?:#([xX][0-9a-fA-F]+|[0-9]+);?|([a-zA-Z][a-zA-Z0-9]*;?))/g, (whole, number, name, at) => {
+    if (number !== undefined) {
+      let code = number[0] === "x" || number[0] === "X" ? parseInt(number.slice(1), 16) : parseInt(number, 10);
+      if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) || !Number.isFinite(code)) code = 0xfffd;
+      return String.fromCodePoint(C1_REFERENCES[code] ?? code);
     }
-    return ENTITIES[name] ?? whole;
+    if (name.endsWith(";") && Object.hasOwn(ENTITIES, name.slice(0, -1))) return ENTITIES[name.slice(0, -1)];
+    for (let length = Math.min(name.length, 6); length >= 2; length--) {
+      const prefix = name.slice(0, length);
+      if (!LEGACY_ENTITIES.has(prefix)) continue;
+      const next = text[at + 1 + length];
+      if (inAttribute && next !== undefined && /[=a-zA-Z0-9]/.test(next)) return whole;
+      return ENTITIES[prefix] + name.slice(length);
+    }
+    return whole;
   });
 }
 
-const escapeText = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/ /g, "&nbsp;");
-const escapeAttribute = (text) => text.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+// The HTML fragment serialization algorithm's escaping, in text and attribute modes.
+const escapeText = (text) => text.replace(/&/g, "&amp;").replace(/\u00a0/g, "&nbsp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const escapeAttribute = (text) => text.replace(/&/g, "&amp;").replace(/\u00a0/g, "&nbsp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 function markupOf(node) {
-  if (node.nodeType === 3) return escapeText(node.data);
+  if (node.nodeType === 3) return RAW_TEXT_PARENTS.has(node.parentNode?.localName) ? node.data : escapeText(node.data);
   if (node instanceof Svg || node instanceof SvgElement) return node.outerHTML ?? node._markup();
   if (node.nodeType === 11) return node.innerHTML;
   const tag = node.localName;
   let html = "<" + tag;
-  for (const name of node.getAttributeNames()) if (name !== "style") html += " " + name + '="' + escapeAttribute(node.getAttribute(name)) + '"';
-  const css = node.look("base").cssText;
+  const tagged = node._tag !== undefined;
+  for (const name of node.getAttributeNames()) if (tagged || name !== "style") html += " " + name + '="' + escapeAttribute(node.getAttribute(name)) + '"';
+  const css = tagged ? "" : node.look("base").cssText;
   if (css) html += ' style="' + escapeAttribute(css) + '"';
   html += ">";
   if (VOID_TAGS.has(tag)) return html;
@@ -3031,19 +3092,81 @@ function markupOf(node) {
   return html + "</" + tag + ">";
 }
 
+// The HTML Standard's tree construction sets, for the "in body" and "in table" modes.
+const SPECIAL_TAGS = new Set(("address applet area article aside base basefont bgsound blockquote body br button caption center col colgroup dd details dir div dl dt embed fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hgroup hr html iframe img input keygen li link listing main marquee menu meta nav noembed noframes noscript object ol p param plaintext pre script search section select source style summary table tbody td template textarea tfoot th thead title tr track ul wbr xmp").split(" "));
+const CLOSES_P = new Set(("address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer header hgroup main menu nav ol p search section summary ul h1 h2 h3 h4 h5 h6 pre listing form table hr xmp plaintext dd dt li").split(" "));
+const HEADINGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
+const IMPLIED_END = new Set(["dd", "dt", "li", "optgroup", "option", "p", "rb", "rp", "rt", "rtc"]);
+const SCOPE_TAGS = new Set(["applet", "caption", "html", "table", "td", "th", "marquee", "object", "template"]);
+const TABLE_ROWS = new Set(["tbody", "thead", "tfoot"]);
+const TABLE_CONTEXT = new Set(["table", "tbody", "thead", "tfoot", "tr"]);
+const TABLE_PARTS = new Set(["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"]);
+
 /**
  * Parses `html` and appends its nodes to `parent`, as `innerHTML` does: elements, text with
- * character references, and `<svg>` markup. Comments, scripts and styles are left out.
+ * character references, and `<svg>` markup, with the HTML Standard's implied end tags and
+ * table sections. Comments, scripts and styles are left out.
  */
 export function parseHTML(html, parent) {
   const stack = [parent];
   const top = () => stack[stack.length - 1];
   const inSvg = () => top() instanceof Svg || top() instanceof SvgElement;
+  const nameAt = (at) => (at === 0 ? null : stack[at] instanceof Svg || stack[at] instanceof SvgElement ? "svg:" + stack[at].localName : stack[at].localName);
+  // The stack position of `names` in scope, or -1: scopes stop at the fragment's parent too.
+  const inScope = (names, extra) => {
+    for (let at = stack.length - 1; at > 0; at--) {
+      const name = nameAt(at);
+      if (names.has(name)) return at;
+      if (SCOPE_TAGS.has(name) || extra?.has(name)) return -1;
+    }
+    return -1;
+  };
+  const BUTTON = new Set(["button"]);
+  const LIST = new Set(["ol", "ul"]);
+  const endImplied = (except) => {
+    while (stack.length > 1 && IMPLIED_END.has(nameAt(stack.length - 1)) && nameAt(stack.length - 1) !== except) stack.pop();
+  };
+  const closeTo = (at) => { if (at > 0) stack.length = at; };
+  const closeP = () => {
+    const at = inScope(new Set(["p"]), BUTTON);
+    if (at > 0) {
+      endImplied("p");
+      closeTo(at);
+    }
+  };
+  const tableScope = (names) => {
+    for (let at = stack.length - 1; at > 0; at--) {
+      const name = nameAt(at);
+      if (names.has(name)) return at;
+      if (name === "table" || name === "template" || name === "html") return -1;
+    }
+    return -1;
+  };
+  const insert = (node) => {
+    // Content other than table parts in a table goes before it ("foster parenting").
+    const at = top();
+    const name = at === parent ? null : at.localName;
+    if (TABLE_CONTEXT.has(name) && !(node instanceof Element && /^(caption|colgroup|col|tbody|thead|tfoot|tr|td|th|script|style|template)$/.test(node.localName))) {
+      for (let k = stack.length - 1; k > 0; k--) {
+        if (nameAt(k) === "table") {
+          const table = stack[k];
+          if (table.parentNode) table.parentNode.insertBefore(node, table);
+          else stack[k - 1].appendChild(node);
+          return;
+        }
+      }
+    }
+    at.appendChild(node);
+  };
   let i = 0;
   const text = (data) => {
     if (!data) return;
-    const value = decodeEntities(data);
-    top().appendChild(inSvg() ? new SvgText(value) : createText(value));
+    // "In body", a U+0000 character is a parse error and is dropped.
+    const value = inSvg() ? decodeEntities(data) : decodeEntities(data.replace(/\0/g, "")).replace(/\0/g, "");
+    if (!value) return;
+    if (inSvg()) top().appendChild(new SvgText(value));
+    else if (/^[\t\n\f\r ]*$/.test(value)) top().appendChild(createText(value));
+    else insert(createText(value));
   };
   while (i < html.length) {
     const open = html.indexOf("<", i);
@@ -3066,10 +3189,42 @@ export function parseHTML(html, parent) {
       const end = html.indexOf(">", open);
       const name = html.slice(open + 2, end < 0 ? html.length : end).trim().toLowerCase();
       i = end < 0 ? html.length : end + 1;
-      for (let at = stack.length - 1; at > 0; at--) {
-        if (stack[at].localName.toLowerCase() === name) {
-          stack.length = at;
-          break;
+      if (inSvg()) {
+        for (let at = stack.length - 1; at > 0; at--) {
+          if (stack[at].localName.toLowerCase() === name) {
+            stack.length = at;
+            break;
+          }
+        }
+        continue;
+      }
+      if (name === "p") {
+        if (inScope(new Set(["p"]), BUTTON) < 0) insert(createElement("p"));
+        else closeP();
+      } else if (name === "br") {
+        insert(createElement("br"));
+      } else if (name === "li") {
+        const at = inScope(new Set(["li"]), LIST);
+        if (at > 0) { endImplied("li"); closeTo(at); }
+      } else if (HEADINGS.has(name)) {
+        const at = inScope(HEADINGS);
+        if (at > 0) { endImplied(); closeTo(at); }
+      } else if (name === "table" || TABLE_ROWS.has(name) || name === "tr" || name === "td" || name === "th") {
+        const at = tableScope(new Set([name]));
+        if (at > 0) { endImplied(); closeTo(at); }
+      } else if (SPECIAL_TAGS.has(name) || CLOSES_P.has(name)) {
+        const at = inScope(new Set([name]));
+        if (at > 0) { endImplied(name); closeTo(at); }
+      } else {
+        // Any other end tag closes the nearest such element, unless a special element is nearer.
+        for (let at = stack.length - 1; at > 0; at--) {
+          const open = nameAt(at);
+          if (open === name) {
+            endImplied(name);
+            closeTo(at);
+            break;
+          }
+          if (SPECIAL_TAGS.has(open)) break;
         }
       }
       continue;
@@ -3087,7 +3242,7 @@ export function parseHTML(html, parent) {
     ATTRIBUTE.lastIndex = at;
     for (let match; (match = ATTRIBUTE.exec(html)); ATTRIBUTE.lastIndex = at) {
       at = ATTRIBUTE.lastIndex;
-      attributes.push([match[1], decodeEntities(match[2] ?? match[3] ?? match[4] ?? "")]);
+      attributes.push([match[1], decodeEntities(match[2] ?? match[3] ?? match[4] ?? "", true)]);
     }
     while (at < html.length && html[at] !== ">") at++;
     const selfClosing = html[at - 1] === "/";
@@ -3100,21 +3255,65 @@ export function parseHTML(html, parent) {
       if (tag === "script" || tag === "style") continue;
       const node = createElement(tag);
       for (const [name, value] of attributes) node.setAttribute(name, value);
-      if (tag === "textarea") node.value = decodeEntities(content);
-      else node.appendChild(createText(decodeEntities(content)));
+      const value = tag === "textarea" || tag === "title" ? decodeEntities(content) : content;
+      if (tag === "textarea") node.value = value;
+      else if (value) node.appendChild(createText(value));
       top().appendChild(node);
       continue;
     }
     const svg = inSvg() || tag === "svg";
+    if (!svg) {
+      if (tag === "li" || tag === "dd" || tag === "dt") {
+        const same = tag === "li" ? ["li"] : ["dd", "dt"];
+        for (let k = stack.length - 1; k > 0; k--) {
+          const open = nameAt(k);
+          if (same.includes(open)) {
+            endImplied(open);
+            closeTo(k);
+            break;
+          }
+          if (SPECIAL_TAGS.has(open) && open !== "address" && open !== "div" && open !== "p") break;
+        }
+      }
+      if (CLOSES_P.has(tag)) closeP();
+      if (HEADINGS.has(tag) && HEADINGS.has(nameAt(stack.length - 1))) stack.pop();
+      // Table parts outside a table are parse errors the tree builder ignores.
+      if (TABLE_PARTS.has(tag) && tableScope(new Set(["table"])) < 0) continue;
+      if (tag === "td" || tag === "th" || tag === "tr" || TABLE_ROWS.has(tag)) {
+        const current = () => nameAt(stack.length - 1);
+        if (tag === "td" || tag === "th") {
+          const cell = tableScope(new Set(["td", "th"]));
+          if (cell > 0) { endImplied(); closeTo(cell); }
+          if (TABLE_ROWS.has(current()) || current() === "table") {
+            if (current() === "table") stack.push(insertSection(top(), "tbody"));
+            stack.push(insertSection(top(), "tr"));
+          }
+        } else if (tag === "tr") {
+          const row = tableScope(new Set(["tr"]));
+          if (row > 0) closeTo(row);
+          if (current() === "table") stack.push(insertSection(top(), "tbody"));
+        } else {
+          const section = tableScope(new Set(["tbody", "thead", "tfoot"]));
+          if (section > 0) closeTo(section);
+        }
+      }
+    }
     const type = attributes.find(([name]) => name.toLowerCase() === "type")?.[1];
     const node = svg ? createSvgElement(tag) : createElement(tag, { type });
     for (const [name, value] of attributes) {
       if (!svg && name.toLowerCase() === "value" && node instanceof Input) node.value = value;
       else node.setAttribute(svg ? name : name.toLowerCase(), value);
     }
-    top().appendChild(node);
-    if (!selfClosing && !(VOID_TAGS.has(tag) && !svg)) stack.push(node);
+    if (svg) top().appendChild(node);
+    else insert(node);
+    if (!(VOID_TAGS.has(tag) && !svg) && !(selfClosing && svg)) stack.push(node);
   }
+}
+
+function insertSection(parent, tag) {
+  const node = createElement(tag);
+  parent.appendChild(node);
+  return node;
 }
 
 /** A box with `style` as its base look and `children` appended. */
@@ -3289,7 +3488,9 @@ export class Range extends AbstractRange {
     const home = rootNode ?? (rangeHome ??= new Node("box"));
     this._startNode = this._endNode = home;
     this._startOffset = this._endOffset = 0;
-    liveRanges.add(new WeakRef(this));
+    this._live = new WeakRef(this);
+    liveRanges.add(this._live);
+    if (commandRanges) commandRanges.push(this);
   }
 
   get commonAncestorContainer() {
@@ -3572,6 +3773,13 @@ export class Range extends AbstractRange {
   /** Copies the contents into a new fragment. */
   cloneContents() {
     return this.#contents(false);
+  }
+
+  /** The nodes `html` parses to, in a new fragment, as the DOM Parsing spec's createContextualFragment. */
+  createContextualFragment(html) {
+    const fragment = new DocumentFragment();
+    parseHTML(String(html), fragment);
+    return fragment;
   }
 
   /** Inserts `node` at the start of the range. */
@@ -4518,36 +4726,46 @@ function dispatchRequest(kind, target, forward) {
   return event.defaultPrevented;
 }
 
-// Editing hosts, as the HTML Standard's contenteditable and the Input Events spec have them,
-// with Chromium's editing where the specs leave it open. The tree sends a focused host's
-// typing, composition, deleting, line breaks, pastes, undo and formatting keys as `beforeinput`
-// records; unless a listener prevents one, `hostEdit` makes the change in the host's nodes,
-// moves the selection after it and fires `input`, as a browser's editing does. Editors that
-// keep their own model (ProseMirror) prevent what they handle and read the rest back from the
-// nodes, through mutation observers. `execCommand` runs the same edits without `beforeinput`.
+// Editing hosts, as the HTML Standard's contenteditable, the W3C Editing spec (execCommand)
+// and the Input Events and UI Events specs have them. The tree sends a focused host's typing,
+// composition, deleting, line breaks, pastes, undo and formatting keys as `beforeinput`
+// records; unless a listener prevents one, the edit runs the Editing spec's command for it
+// (typing is `insertText`, Enter `insertParagraph`, Backspace `delete`, as its "Additional
+// requirements" say), and `input` follows. Editors that keep their own model (ProseMirror)
+// prevent what they handle and read the rest back from the nodes, through mutation observers.
 
-// 1 for an editable `contenteditable` ("", "true", "plaintext-only"), 2 for "false", else 0.
-function editableValue(node) {
-  const value = node.nodeType === 1 ? node.getAttribute("contenteditable") : null;
-  if (value === null) return 0;
+// The state of the contenteditable attribute: "true" and "plaintext-only" for an editing host
+// keyword (the empty string is true), "false", or "inherit" (missing or invalid).
+function contentEditableState(node) {
+  const value = node.nodeType === 1 && typeof node.getAttribute === "function" ? node.getAttribute("contenteditable") : null;
+  if (value === null) return "inherit";
   const lower = value.toLowerCase();
-  return lower === "" || lower === "true" || lower === "plaintext-only" ? 1 : lower === "false" ? 2 : 0;
+  if (lower === "" || lower === "true") return "true";
+  if (lower === "plaintext-only" || lower === "false") return lower;
+  return "inherit";
+}
+
+// "host" for an editing host, "false" for a contenteditable="false" element, else "".
+function editableState(node) {
+  const state = contentEditableState(node);
+  if (state === "true" || state === "plaintext-only") return "host";
+  return state === "false" ? "false" : "";
 }
 
 /** The editing host `node` is in (the outermost editable element up to a `contenteditable="false"`), or null. */
 export function editingHostOf(node) {
   let host = null;
   for (let at = node; at; at = at.parentNode) {
-    const value = editableValue(at);
-    if (value === 2) return host;
-    if (value === 1) host = at;
+    const state = editableState(at);
+    if (state === "false") return host;
+    if (state === "host") host = at;
   }
   return host;
 }
 
-// A `contenteditable="plaintext-only"` host takes text alone: no markup, line breaks as "\n".
+// A `contenteditable="plaintext-only"` host takes raw text alone: rich formatting is off.
 function isPlain(host) {
-  return host.getAttribute("contenteditable")?.toLowerCase() === "plaintext-only";
+  return contentEditableState(host) === "plaintext-only";
 }
 
 export class CompositionEvent extends Event {
@@ -4562,16 +4780,13 @@ export class CompositionEvent extends Event {
 
 globalThis.CompositionEvent ??= CompositionEvent;
 
-// Tags that start a block of their own, for joining and splitting paragraphs.
-const BLOCK_TAGS = new Set([
-  "address", "article", "aside", "blockquote", "dd", "details", "div", "dl", "dt", "fieldset", "figcaption",
-  "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol",
-  "p", "pre", "section", "summary", "table", "td", "th", "tr", "ul",
-]);
-const HEADINGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
-
+// Caret steps, for the target ranges of deletes and for Selection.modify. A block here is an
+// element whose display is not inline.
 function isBlock(node) {
-  return node.nodeType === 1 && !(node instanceof LineBreak) && (BLOCK_TAGS.has(node.localName) || node.kind === "box" && node._tag === undefined);
+  if (node.nodeType !== 1 || node instanceof LineBreak) return false;
+  const display = typeof node.nodeId === "number" ? String(readComputed(node.nodeId, "display") ?? "") : "";
+  if (display) return !/^(inline|inline-block|inline-table|none|contents)$/.test(display);
+  return node.kind === "box" && node._tag === undefined;
 }
 
 // The block `node` is in, inside `host` (the host itself when there is none).
@@ -4586,7 +4801,7 @@ const REPLACED = new Set(["img", "svg", "video", "audio", "canvas", "iframe", "o
 
 function isAtom(node) {
   if (node.nodeType !== 1) return false;
-  return node instanceof LineBreak || editableValue(node) === 2 || node.kind !== "box" || REPLACED.has(node.localName);
+  return node instanceof LineBreak || editableState(node) === "false" || node.kind !== "box" || REPLACED.has(node.localName);
 }
 
 function isLeaf(node) {
@@ -4594,7 +4809,7 @@ function isLeaf(node) {
 }
 
 // The next node in tree order inside `within`, stepping over what is inside an atom.
-function nextNode(node, within) {
+function nextOutsideAtoms(node, within) {
   return following(node, within, isAtom(node));
 }
 
@@ -4613,7 +4828,7 @@ function leafBeside(host, container, offset, forward) {
   let at;
   if (forward) {
     at = container.nodeType === 3 ? following(container, host, true) : container.childNodes[offset] ?? following(container, host, true);
-    for (; at; at = nextNode(at, host)) if (isLeaf(at)) return at;
+    for (; at; at = nextOutsideAtoms(at, host)) if (isLeaf(at)) return at;
     return null;
   }
   at = container.nodeType === 3 ? null : container.childNodes[offset - 1];
@@ -4650,76 +4865,9 @@ function wordStep(text, offset, forward) {
   return offset - Math.max(before.length, 1);
 }
 
-// Makes (`node`, `offset`) a point between children: splits text there.
-function elementPoint(node, offset) {
-  if (node.nodeType !== 3) return [node, offset];
-  const parent = node.parentNode;
-  if (offset === 0) return [parent, indexIn(node)];
-  if (offset < node.length) node.splitText(offset);
-  return [parent, indexIn(node) + 1];
-}
-
-// Gives an empty block a `<br>`, so it keeps a line for the caret.
-function keepLine(block) {
-  for (let at = block.firstChild; at; at = nextNode(at, block)) if (isLeaf(at)) return;
-  block.appendChild(new LineBreak());
-}
-
-// Moves `from`'s content to the end of `into` and removes `from`, as deleting the boundary
-// between two paragraphs does. Returns the point where they met.
-function joinBlocks(into, from) {
-  onlyBreak(into)?.remove();
-  if (leafBeside(into, into, 0, true)) onlyBreak(from)?.remove();
-  const point = into.lastChild?.nodeType === 3 ? [into.lastChild, into.lastChild.length] : [into, into.childNodes.length];
-  while (from.firstChild) into.appendChild(from.firstChild);
-  from.remove();
-  return point;
-}
-
-// The `<br>` that alone gives `block` its line, if that is all it holds.
-function onlyBreak(block) {
-  let found = null;
-  for (let at = block.firstChild; at; at = nextNode(at, block)) {
-    if (!isLeaf(at)) continue;
-    if (found || !(at instanceof LineBreak)) return null;
-    found = at;
-  }
-  return found;
-}
-
-// Splits `ancestor` at (`node`, `offset`): what follows goes to a copy of it (and of each
-// element on the way) after it. Returns the copy. Each copy is in the tree before content
-// moves into it, so undo records every move.
-function splitAt(ancestor, node, offset) {
-  const [level, at] = elementPoint(node, offset);
-  const path = [];
-  for (let step = level; ; step = step.parentNode) {
-    path.unshift(step);
-    if (step === ancestor) break;
-  }
-  const top = ancestor.cloneNode(false);
-  ancestor.parentNode.insertBefore(top, ancestor.nextSibling);
-  let outer = null;
-  for (let i = 0; i < path.length; i++) {
-    const copy = i === 0 ? top : path[i].cloneNode(false);
-    if (outer) outer.insertBefore(copy, outer.firstChild);
-    const from = i === path.length - 1 ? at : indexIn(path[i + 1]) + 1;
-    while (path[i].childNodes.length > from) copy.appendChild(path[i].childNodes[from]);
-    outer = copy;
-  }
-  return top;
-}
-
-function splitBlock(block, node, offset) {
-  const copy = splitAt(block, node, offset);
-  keepLine(block);
-  keepLine(copy);
-  return copy;
-}
-
 // The first point in text (or the start) inside `node`.
 function startIn(node) {
-  for (let at = node; at; at = nextNode(at, node)) {
+  for (let at = node; at; at = nextOutsideAtoms(at, node)) {
     if (at.nodeType === 3) return [at, 0];
     if (at !== node && isAtom(at)) return [at.parentNode, indexIn(at)];
   }
@@ -4733,232 +4881,6 @@ function endIn(node) {
   if (at === node) return [node, node.childNodes.length];
   if (at.nodeType === 3) return [at, at.length];
   return [at.parentNode, indexIn(at) + (at instanceof LineBreak ? 0 : 1)];
-}
-
-// How `white-space` treats the text at `node`: whether it keeps runs of spaces, and line feeds.
-function whiteSpaceAt(node) {
-  const element = node.nodeType === 1 ? node : node.parentNode;
-  const id = element?.nodeId;
-  if (typeof id !== "number") return { spaces: false, lineFeeds: false };
-  const value = String(readComputed(id, "white-space") ?? "");
-  const collapse = String(readComputed(id, "white-space-collapse") ?? "");
-  const spaces = /^(pre|pre-wrap|break-spaces)\b/.test(value) || collapse === "preserve" || collapse === "break-spaces";
-  return { spaces, lineFeeds: spaces || /^pre-line\b/.test(value) || collapse === "preserve-breaks" };
-}
-
-const NBSP = " ";
-const isSpace = (c) => c === " " || c === NBSP;
-
-// Where `white-space` collapses spaces, the runs of spaces touching `from` to `to` in `text`
-// become spaces and no-break spaces that show as typed, as Chromium's editing rebalances them:
-// one at a paragraph's edge, or after another, is a no-break space.
-function rebalance(host, text, from, to) {
-  if (text.nodeType !== 3 || !text.parentNode) return;
-  const data = text.data;
-  let start = Math.max(0, Math.min(from, data.length));
-  let end = Math.min(data.length, Math.max(to, start));
-  while (start > 0 && isSpace(data[start - 1])) start--;
-  while (end < data.length && isSpace(data[end])) end++;
-  // Only spaces need the style read, which lays out pending changes.
-  if (!/[ \u00a0]/.test(data.slice(start, end)) || whiteSpaceAt(text).spaces) return;
-  const block = blockIn(host, text);
-  const edge = (forward) => {
-    const leaf = leafBeside(host, text, forward ? text.length : 0, forward);
-    return !leaf || leaf instanceof LineBreak || blockIn(host, leaf) !== block;
-  };
-  for (let i = start; i < end;) {
-    if (!isSpace(data[i])) {
-      i++;
-      continue;
-    }
-    let j = i;
-    while (j < end && isSpace(data[j])) j++;
-    const first = i === 0 && edge(false);
-    const last = j === data.length && edge(true);
-    let run = "";
-    let afterSpace = false;
-    for (let k = i; k < j; k++) {
-      if (afterSpace || k === i && first || k === j - 1 && last) {
-        run += NBSP;
-        afterSpace = false;
-      } else {
-        run += " ";
-        afterSpace = true;
-      }
-    }
-    if (run !== data.slice(i, j)) text.replaceData(i, j - i, run);
-    i = j;
-  }
-}
-
-// Inserts `text` (one line) at (`node`, `offset`); returns the point after it. Text typed into
-// a block that held only its placeholder `<br>` takes the place of the `<br>`.
-function insertRun(host, node, offset, text) {
-  if (!text) return [node, offset];
-  const placeholder = onlyBreak(blockIn(host, node));
-  let at;
-  if (node.nodeType === 3) {
-    node.insertData(offset, text);
-    at = [node, offset + text.length];
-  } else {
-    const before = node.childNodes[offset - 1];
-    const after = node.childNodes[offset];
-    if (before?.nodeType === 3) {
-      const end = before.length;
-      before.appendData(text);
-      at = [before, end + text.length];
-    } else if (after?.nodeType === 3) {
-      after.insertData(0, text);
-      at = [after, text.length];
-    } else {
-      const created = new Text(text);
-      node.insertBefore(created, after ?? null);
-      at = [created, text.length];
-    }
-  }
-  if (placeholder?.parentNode && placeholder !== at[0]) placeholder.remove();
-  rebalance(host, at[0], at[1] - text.length, at[1]);
-  return at;
-}
-
-// Inserts `text` at the point; each line feed in it breaks a paragraph, or in plain text (or
-// where `white-space` keeps line feeds) stays a line feed.
-function insertLines(host, node, offset, text) {
-  text = text.replace(/\r\n?/g, "\n");
-  if (isPlain(host) || whiteSpaceAt(node).lineFeeds) return insertRun(host, node, offset, text);
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) [node, offset] = paragraphBreak(host, node, offset);
-    [node, offset] = insertRun(host, node, offset, lines[i]);
-  }
-  return [node, offset];
-}
-
-// A line break at the point: a line feed in plain text or where `white-space` keeps them,
-// else a `<br>` (with a second one where it ends its block, so the new line shows).
-function lineBreak(host, node, offset) {
-  if (isPlain(host) || whiteSpaceAt(node).lineFeeds) {
-    const block = blockIn(host, node);
-    const point = insertRun(host, node, offset, "\n");
-    // A line feed that ends the text shows no line after it: give that line its own.
-    const next = leafBeside(host, point[0], point[1], true);
-    if (point[0].nodeType === 3 && point[1] === point[0].length && (!next || blockIn(host, next) !== block)) point[0].appendData("\n");
-    return point;
-  }
-  const block = blockIn(host, node);
-  const [parent, index] = elementPoint(node, offset);
-  parent.insertBefore(new LineBreak(), parent.childNodes[index] ?? null);
-  if (!leafBeside(block, parent, index + 1, true)) parent.insertBefore(new LineBreak(), parent.childNodes[index + 1] ?? null);
-  return [parent, index + 1];
-}
-
-// The run of inline content around the point directly in `host`, moved into a new paragraph
-// element (`defaultParagraphSeparator`, a `<div>`). Returns it.
-function wrapRun(host, node, offset) {
-  let index;
-  if (node === host) index = offset;
-  else {
-    let top = node;
-    while (top.parentNode !== host) top = top.parentNode;
-    index = indexIn(top);
-  }
-  const children = host.childNodes;
-  let start = index;
-  while (start > 0 && !isBlock(children[start - 1])) start--;
-  let end = node === host ? index : index + 1;
-  while (end < children.length && !isBlock(children[end])) end++;
-  const wrapper = createElement(paragraphSeparator);
-  host.insertBefore(wrapper, children[start] ?? null);
-  for (let i = start; i < end; i++) wrapper.appendChild(children[start + 1]);
-  return wrapper;
-}
-
-// Splits the paragraph at the point, as Enter does in Chromium. Returns the caret after it.
-function paragraphBreak(host, node, offset) {
-  if (isPlain(host)) return lineBreak(host, node, offset);
-  let block = blockIn(host, node);
-  if (block.localName === "pre") return lineBreak(host, node, offset);
-  if (block === host) {
-    const hostPoint = node === host;
-    const wrapper = wrapRun(host, node, offset);
-    if (hostPoint) [node, offset] = [wrapper, offset - indexIn(wrapper)];
-    const copy = splitBlock(wrapper, node, offset);
-    // What came before stays as it was, unless it was empty.
-    if (!onlyBreak(wrapper)) {
-      while (wrapper.firstChild) host.insertBefore(wrapper.firstChild, wrapper);
-      wrapper.remove();
-    }
-    return settled(host, wrapper.parentNode ? wrapper : copy.previousSibling, copy);
-  }
-  const empty = !leafBeside(block, block, 0, true) || onlyBreak(block);
-  if (block.localName === "li" && empty) return leaveList(block);
-  if (HEADINGS.has(block.localName) && !leafBeside(block, ...elementPoint(node, offset), true)) {
-    const next = createElement(paragraphSeparator);
-    next.appendChild(new LineBreak());
-    block.parentNode.insertBefore(next, block.nextSibling);
-    return [next, 0];
-  }
-  return settled(host, block, splitBlock(block, node, offset));
-}
-
-// The caret at the start of `after`, the second half of a split, with the spaces at the edges
-// of the two halves shown again.
-function settled(host, before, after) {
-  if (before?.nodeType === 3) rebalance(host, before, before.length, before.length);
-  else if (before) {
-    const [node, offset] = endIn(before);
-    rebalance(host, node, offset, offset);
-  }
-  const start = startIn(after);
-  rebalance(host, start[0], 0, 0);
-  return start;
-}
-
-// Enter in an empty list item ends the list there: the item becomes a paragraph after it.
-function leaveList(item) {
-  const list = item.parentNode;
-  const after = item.nextSibling ? splitAt(list, list, indexIn(item) + 1) : null;
-  item.remove();
-  const paragraph = createElement(paragraphSeparator);
-  paragraph.appendChild(new LineBreak());
-  list.parentNode.insertBefore(paragraph, list.nextSibling);
-  if (!list.firstChild) list.remove();
-  if (after && !after.firstChild) after.remove();
-  return [paragraph, 0];
-}
-
-// The element `defaultParagraphSeparator` names: what Enter makes outside other paragraphs.
-let paragraphSeparator = "div";
-
-// Deletes what the range from (`startNode`, `startOffset`) to (`endNode`, `endOffset`) covers;
-// paragraphs it crossed into become one. Returns the point where the content was.
-function deleteBetween(host, startNode, startOffset, endNode, endOffset) {
-  const range = new Range();
-  range.setStart(startNode, startOffset);
-  range.setEnd(endNode, endOffset);
-  const startBlock = blockIn(host, startNode);
-  const endBlock = blockIn(host, endNode);
-  range.deleteContents();
-  let point = [range.startContainer, range.startOffset];
-  range.detach?.();
-  if (startBlock !== endBlock && endBlock.parentNode && host.contains(endBlock) && host.contains(startBlock)) {
-    if (startBlock === host) {
-      // Inline content before a paragraph takes in what the paragraph held.
-      const [parent, index] = elementPoint(point[0], point[1]);
-      onlyBreak(endBlock)?.remove();
-      let at = index;
-      while (endBlock.firstChild) parent.insertBefore(endBlock.firstChild, parent.childNodes[at++] ?? null);
-      endBlock.remove();
-      point = [parent, index];
-    } else if (endBlock === host || endBlock.contains(startBlock)) {
-      keepLine(startBlock);
-    } else {
-      point = joinBlocks(startBlock, endBlock);
-    }
-  }
-  if (startBlock !== host && startBlock.parentNode) keepLine(startBlock);
-  if (point[0].nodeType === 3) rebalance(host, point[0], point[1], point[1]);
-  return point;
 }
 
 // The point one `unit` ("character", "word", "line" to the line's edge, "paragraph" to the
@@ -5012,9 +4934,10 @@ function editEvent(type, host, inputType, data, isComposing, cancelable, targetR
 }
 
 function compositionEvent(type, host, data) {
-  const event = new CompositionEvent(type, { data });
+  const event = new CompositionEvent(type, { data, cancelable: type === "compositionstart" });
   event.target = host;
   dispatchEvent(event);
+  return event;
 }
 
 // The selection's range when it is in `host`, else null.
@@ -5027,18 +4950,11 @@ function rangeIn(host) {
 const DELETES = /^delete(Content|Word|SoftLine|HardLine)(Backward|Forward)$/;
 const UNITS = { Content: "character", Word: "word", SoftLine: "line", HardLine: "paragraph" };
 
-// What edit `inputType` changes: the selection, or the step a collapsed delete takes. Null
-// without a selection in `host`.
+// What edit `inputType` changes, for its target ranges: the selection, or the step a
+// collapsed delete takes. Null without a selection in `host`.
 function targetOf(host, inputType, range) {
   if (!range) return null;
   const ends = [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
-  if (!range.collapsed) {
-    // Ends between blocks (select all) move in to the content, so the blocks themselves stay.
-    const first = ends[0].nodeType === 1 ? ends[0].childNodes[ends[1]] : null;
-    if (first && !isAtom(first)) [ends[0], ends[1]] = startIn(first);
-    const last = ends[2].nodeType === 1 ? ends[2].childNodes[ends[3] - 1] : null;
-    if (last && !isAtom(last)) [ends[2], ends[3]] = endIn(last);
-  }
   const match = range.collapsed && DELETES.exec(inputType);
   if (!match) return ends;
   const forward = match[2] === "Forward";
@@ -5046,8 +4962,30 @@ function targetOf(host, inputType, range) {
   return forward ? [ends[0], ends[1], node, offset] : [node, offset, ends[0], ends[1]];
 }
 
-/** Clipboard and drop edits carry their data in `dataTransfer` in a rich host, as `data` in a plain one. */
-const TRANSFERS = new Set(["insertFromPaste", "insertFromDrop", "insertReplacementText", "insertFromYank", "insertFromPasteAsQuotation"]);
+// Edits that carry their data in `dataTransfer` in a rich host, as `data` in a plain one.
+const TRANSFERS = new Set(["insertFromPaste", "insertFromDrop", "insertReplacementText", "insertFromYank", "insertFromPasteAsQuotation", "insertTranspose"]);
+
+// The Editing spec's command for each input type a user's edit has, with its value.
+const USER_COMMANDS = {
+  insertText: "inserttext", insertReplacementText: "inserttext", insertFromYank: "inserttext",
+  insertFromDrop: "inserttext", insertFromPaste: "inserttext", insertFromPasteAsQuotation: "inserttext",
+  insertTranspose: "inserttext", insertParagraph: "insertparagraph", insertLineBreak: "insertlinebreak",
+  insertOrderedList: "insertorderedlist", insertUnorderedList: "insertunorderedlist",
+  insertHorizontalRule: "inserthorizontalrule", insertLink: "createlink",
+  deleteContentBackward: "delete", deleteContentForward: "forwarddelete",
+  formatBold: "bold", formatItalic: "italic", formatUnderline: "underline",
+  formatStrikeThrough: "strikethrough", formatSuperscript: "superscript", formatSubscript: "subscript",
+  formatJustifyFull: "justifyfull", formatJustifyCenter: "justifycenter", formatJustifyRight: "justifyright",
+  formatJustifyLeft: "justifyleft", formatIndent: "indent", formatOutdent: "outdent", formatRemove: "removeformat",
+  formatBackColor: "backcolor", formatFontColor: "forecolor", formatFontName: "fontname",
+};
+// Rich formatting, which a plaintext-only host does not take.
+const RICH_COMMANDS = new Set([
+  "backcolor", "bold", "createlink", "fontname", "fontsize", "forecolor", "hilitecolor", "italic", "removeformat",
+  "strikethrough", "subscript", "superscript", "underline", "unlink", "formatblock", "indent", "outdent",
+  "inserthorizontalrule", "inserthtml", "insertimage", "insertorderedlist", "insertunorderedlist",
+  "justifycenter", "justifyfull", "justifyleft", "justifyright",
+]);
 
 // The edit `inputType` with `data` that the tree asked of `host`. Returns whether a listener
 // prevented it.
@@ -5071,191 +5009,147 @@ function hostEdit(host, inputType, data) {
     if (transfer) transfer._mode = "protected";
     return event.defaultPrevented;
   }
-  const changed = recorded(host, historyKind(inputType), () => perform(host, inputType, data, target, transfer));
+  const changed = recorded(host, historyKind(inputType), () => userEdit(host, inputType, data, target, transfer, plain));
   if (changed) editEvent("input", host, inputType, data || null, false, false, [], transfer);
   if (transfer) transfer._mode = "protected";
   return false;
 }
 
-// The input method's composition: its text replaces itself until it is committed (`insertText`
-// while composing) or cancelled (empty text), with the events around it in Chromium's order.
+// Runs the command for a user's edit over `target`. Returns whether it ran.
+function userEdit(host, inputType, data, target, transfer, plain) {
+  const selection = getSelection();
+  const collapsed = target[0] === target[2] && target[1] === target[3];
+  // Within a text node the target is the grapheme to delete. Across nodes, the delete commands
+  // take their step from the caret themselves, a non-editable island whole.
+  const fromCaret = selection.isCollapsed && target[0] !== target[2] && USER_COMMANDS[inputType] && DELETES.test(inputType);
+  if (!collapsed && !fromCaret && DELETES.test(inputType)) selection.setBaseAndExtent(target[0], target[1], target[2], target[3]);
+  if (inputType === "deleteByCut" || inputType === "deleteByDrag" || inputType === "deleteContent" || DELETES.test(inputType) && !USER_COMMANDS[inputType]) {
+    if (collapsed) return false;
+    return runCommand("delete", "");
+  }
+  let command = USER_COMMANDS[inputType];
+  if (!command) return false;
+  let value = data ?? "";
+  if (transfer) {
+    const html = inputType === "insertFromPaste" || inputType === "insertFromDrop" || inputType === "insertFromPasteAsQuotation" ? transfer.getData("text/html") : "";
+    if (html) {
+      command = "inserthtml";
+      value = pastedMarkup(html);
+    } else {
+      value = transfer.getData("text/plain");
+    }
+  }
+  if (plain) {
+    if (RICH_COMMANDS.has(command)) return false;
+    if (command === "insertparagraph" || command === "insertlinebreak") return plainLineBreak();
+    if (command === "inserttext") return plainText(value);
+  }
+  return runCommand(command, value);
+}
+
+// A line break in a plaintext-only host: a line feed where white-space keeps them, else a
+// `<br>`, which is how such text shows one.
+function plainLineBreak() {
+  const range = getActiveRange();
+  const at = range.startContainer.nodeType === 3 ? range.startContainer.parentNode : range.startContainer;
+  if (!/^(pre|pre-wrap|pre-line|break-spaces)/.test(getComputedStyle(at).whiteSpace)) return runCommand("insertlinebreak", "");
+  const changed = plainText("\n");
+  // As insertlinebreak follows a <br> that ends its block with a second: a line feed that ends
+  // the block shows no line after it, so another one gives the caret its line.
+  const { startContainer: node, startOffset: offset } = getActiveRange();
+  if (changed && node.nodeType === 3 && offset === node.length && endsBlock(node)) node.insertData(offset, "\n");
+  return changed;
+}
+
+// Whether nothing visible follows `node` in its block.
+function endsBlock(node) {
+  for (let at = node; at && !isBlockNode(at); at = at.parentNode) {
+    for (let next = at.nextSibling; next; next = next.nextSibling) if (isVisible(next)) return false;
+  }
+  return true;
+}
+
+// Text into a plaintext-only host: line feeds stay line feeds.
+function plainText(value) {
+  literalLineFeeds = true;
+  try {
+    return runCommand("inserttext", value);
+  } finally {
+    literalLineFeeds = false;
+  }
+}
+
+// Markup from the clipboard: the fragment between a page's StartFragment and EndFragment
+// marks, or its body, sanitized as the Clipboard API asks of a paste: no scripts, styles,
+// frames or event handler attributes, nor the classes and ids of the page it came from.
+const PASTE_STRIPPED = new Set(["script", "style", "meta", "title", "link", "head", "base", "iframe", "frame", "object", "embed", "template", "noscript"]);
+
+function pastedMarkup(html) {
+  const marked = /<!--StartFragment-->([\s\S]*?)<!--EndFragment-->/.exec(html);
+  const body = /<body[^>]*>([\s\S]*?)(<\/body>|$)/i.exec(html);
+  const holder = createElement("div");
+  holder.innerHTML = marked ? marked[1] : body ? body[1] : html;
+  const clean = (node) => {
+    for (const child of [...node.childNodes]) {
+      if (child.nodeType !== 1) continue;
+      if (PASTE_STRIPPED.has(child.localName)) {
+        child.remove();
+        continue;
+      }
+      for (const name of child.getAttributeNames()) {
+        if (/^on/i.test(name) || name === "class" || name === "id" || name === "contenteditable") child.removeAttribute(name);
+      }
+      clean(child);
+    }
+  };
+  clean(holder);
+  return holder.innerHTML;
+}
+
+// The input method's composition, as UI Events and Input Events order it: compositionstart,
+// then for each change of the text a beforeinput (not cancelable), compositionupdate and
+// input of insertCompositionText, then compositionend. Committing (`insertText` while
+// composing) keeps the text; an empty text cancels it.
 function compose(host, data, composing, committing) {
   const range = rangeIn(host);
   if (!composing) {
     if (!data || !range) return false;
     compositionEvent("compositionstart", host, range.toString());
   }
-  compositionEvent("compositionupdate", host, data);
-  const ranges = composing
-    ? [staticRange(composing.node, composing.offset, composing.node, composing.offset + composing.length)]
-    : [staticRange(range.startContainer, range.startOffset, range.endContainer, range.endOffset)];
-  editEvent("beforeinput", host, "insertCompositionText", data, true, false, ranges);
-  let next = null;
-  recorded(host, "typing", () => {
-    let node;
-    let offset;
-    if (composing) {
-      [node, offset] = [composing.node, composing.offset];
-      if (node.parentNode && node.nodeType === 3) node.deleteData(offset, Math.min(composing.length, node.length - offset));
-    } else {
-      [node, offset] = range.collapsed ? [range.startContainer, range.startOffset] : deleteBetween(host, range.startContainer, range.startOffset, range.endContainer, range.endOffset);
-    }
-    const end = data ? insertRun(host, node, offset, data) : [node, offset];
-    // Text inserted at an element point lands in a text node: the composition starts there.
-    if (data) [node, offset] = [end[0], end[1] - data.length];
-    getSelection().collapse(end[0], end[1]);
-    next = { node, offset, length: data.length };
-    return true;
-  });
-  editEvent("input", host, "insertCompositionText", data || null, true, false);
+  if (!committing || (composing && data !== composing.text)) {
+    const ranges = composing
+      ? [staticRange(composing.node, composing.offset, composing.node, composing.offset + composing.length)]
+      : [staticRange(range.startContainer, range.startOffset, range.endContainer, range.endOffset)];
+    editEvent("beforeinput", host, "insertCompositionText", data, true, false, ranges);
+    compositionEvent("compositionupdate", host, data);
+    let next = null;
+    recorded(host, "typing", () => {
+      if (composing && composing.node.parentNode && composing.node.nodeType === 3) {
+        const length = Math.min(composing.length, composing.node.length - composing.offset);
+        getSelection().setBaseAndExtent(composing.node, composing.offset, composing.node, composing.offset + length);
+      }
+      const selection = getSelection().getRangeAt(0);
+      if (!selection.collapsed) runCommand("delete", "");
+      const start = [getActiveRangeNow().startContainer, getActiveRangeNow().startOffset];
+      if (data) runCommand("inserttext", data);
+      const end = getActiveRangeNow();
+      const node = end.startContainer;
+      const offset = node.nodeType === 3 ? end.startOffset - data.length : start[1];
+      next = { node, offset: Math.max(0, offset), length: data.length, text: data };
+      return true;
+    });
+    editEvent("input", host, "insertCompositionText", data || null, true, false);
+    if (data) compositions.set(host, next);
+  }
   if (committing || !data) {
     compositions.delete(host);
     compositionEvent("compositionend", host, data);
-  } else {
-    compositions.set(host, next);
   }
   return false;
 }
 
-// The default of edit `inputType` over `target` (start node, offset, end node, offset). Returns
-// whether it changed anything.
-function perform(host, inputType, data, target, transfer) {
-  const selection = getSelection();
-  const collapsed = target[0] === target[2] && target[1] === target[3];
-  const remove = () => (collapsed ? [target[0], target[1]] : deleteBetween(host, ...target));
-  let point;
-  switch (inputType) {
-    case "insertText":
-    case "insertReplacementText":
-    case "insertFromDrop":
-    case "insertFromYank":
-    case "insertFromPaste":
-    case "insertFromPasteAsQuotation": {
-      const text = transfer ? transfer.getData("text/plain") : String(data ?? "");
-      const html = transfer && inputType !== "insertText" ? transfer.getData("text/html") : "";
-      const styled = inputType === "insertText" ? typingStyleAt(host, target) : null;
-      point = remove();
-      if (html) point = insertFragment(host, point[0], point[1], fragmentOf(html, true));
-      else if (text) {
-        point = insertLines(host, point[0], point[1], text);
-        if (styled && point[0].nodeType === 3 && !text.includes("\n")) point = applyTypingStyle(host, styled, [point[0], point[1] - text.length], point);
-      }
-      break;
-    }
-    case "insertHTML":
-      point = remove();
-      point = insertFragment(host, point[0], point[1], fragmentOf(String(data ?? ""), false));
-      break;
-    case "insertParagraph":
-      point = paragraphBreak(host, ...remove());
-      break;
-    case "insertLineBreak":
-      point = lineBreak(host, ...remove());
-      break;
-    case "deleteByCut":
-    case "deleteByDrag":
-    case "deleteContent":
-    default: {
-      if (FORMATS[inputType] || inputType === "formatRemove") return format(host, inputType, target);
-      if (inputType !== "deleteByCut" && inputType !== "deleteByDrag" && inputType !== "deleteContent" && !DELETES.test(inputType)) return false;
-      if (collapsed) return false;
-      point = deleteBetween(host, ...target);
-    }
-  }
-  selection.collapse(point[0], point[1]);
-  return true;
-}
-
-// Markup from a paste or `insertHTML`, parsed into a fragment. A paste keeps what shows: no
-// scripts, styles, frames, event handler attributes or classes, which belong to another page.
-const STRIPPED = new Set(["script", "style", "meta", "title", "link", "head", "base", "iframe", "frame", "object", "embed", "template", "noscript"]);
-
-function fragmentOf(html, paste) {
-  const holder = createElement("div");
-  if (paste) {
-    const body = /<body[^>]*>([\s\S]*?)(<\/body>|$)/i.exec(html);
-    if (body) html = body[1];
-    html = html.replace(/<!--(Start|End)Fragment-->/g, "");
-  }
-  parseHTML(html, holder);
-  if (paste) {
-    for (let at = holder.firstChild; at;) {
-      const next = following(at, holder, true);
-      if (at.nodeType === 1 && STRIPPED.has(at.localName)) {
-        at.remove();
-        at = next;
-        continue;
-      }
-      if (at.nodeType === 1) {
-        for (const name of at.getAttributeNames?.() ?? []) {
-          if (/^on/i.test(name) || name === "class" || name === "id" || name === "contenteditable") at.removeAttribute(name);
-        }
-      }
-      at = following(at, holder);
-    }
-  }
-  return holder;
-}
-
-// Inserts the children of `fragment` at the point. Inline content goes in where the caret is;
-// blocks split the paragraph there, the first one's content joining its start and the last
-// one's its end, as Chromium pastes. Returns the point after what was inserted.
-function insertFragment(host, node, offset, fragment) {
-  const items = [...fragment.childNodes];
-  if (!items.length) return [node, offset];
-  const block = blockIn(host, node);
-  const first = items.findIndex(isBlock);
-  if (first < 0 || block === host || items.length === 1) {
-    const inline = first < 0 || block === host ? items : [...items[0].childNodes];
-    const placeholder = onlyBreak(block);
-    let [parent, index] = elementPoint(node, offset);
-    for (const item of inline) parent.insertBefore(item, parent.childNodes[index++] ?? null);
-    if (placeholder?.parentNode && onlyBreak(block) !== placeholder) placeholder.remove();
-    return endAfter(parent, index);
-  }
-  let last = items.length - 1;
-  while (!isBlock(items[last])) last--;
-  const after = splitAt(block, node, offset);
-  // Inline content before the first block (else that block's content) joins the paragraph's
-  // start; inline content after the last block (else that block's content) joins its end.
-  const leading = first > 0 ? items.slice(0, first) : [...items[0].childNodes];
-  const from = first > 0 ? first : 1;
-  const trailing = last < items.length - 1 ? items.slice(last + 1) : last >= from ? [...items[last].childNodes] : [];
-  const to = last < items.length - 1 ? last + 1 : last >= from ? last : from;
-  const middle = items.slice(from, to);
-  if (leading.some(isLeafy)) onlyBreak(block)?.remove();
-  for (const item of leading) block.appendChild(item);
-  for (const item of middle) block.parentNode.insertBefore(item, after);
-  let point = middle.length ? endIn(middle[middle.length - 1]) : endIn(block);
-  if (trailing.length) {
-    if (trailing.some(isLeafy)) onlyBreak(after)?.remove();
-    const head = after.firstChild;
-    for (const item of trailing) after.insertBefore(item, head);
-    point = pointAfter(trailing[trailing.length - 1]);
-  }
-  keepLine(block);
-  keepLine(after);
-  return point;
-}
-
-// Whether `node` is or holds something the caret steps over.
-const isLeafy = (node) => isLeaf(node) || !!leafBeside(node, node, 0, true);
-
-const textIn = (node) => (node.nodeType === 3 ? node.data : node.childNodes.map(textIn).join(""));
-
-function pointAfter(node) {
-  return node.nodeType === 3 ? [node, node.length] : [node.parentNode, indexIn(node) + 1];
-}
-
-// The caret after the child before `index` of `parent`: at its text's end when it is text.
-function endAfter(parent, index) {
-  const before = parent.childNodes[index - 1];
-  if (before?.nodeType === 3) return [before, before.length];
-  if (before && !isAtom(before)) {
-    const end = endIn(before);
-    if (end[0] !== before) return end;
-  }
-  return [parent, index];
+function getActiveRangeNow() {
+  return getSelection().getRangeAt(0);
 }
 
 function pasted(host, text) {
@@ -5274,181 +5168,9 @@ function textTransfer(text) {
 // The paste whose `insertFromPaste` comes next, with the clipboard's markup.
 let lastPaste = null;
 
-// Inline formatting, as `formatBold` and the like (and `execCommand("bold")`) make it.
-const FORMATS = {
-  formatBold: { tag: "b", tags: ["b", "strong"], command: "bold" },
-  formatItalic: { tag: "i", tags: ["i", "em"], command: "italic" },
-  formatUnderline: { tag: "u", tags: ["u"], command: "underline" },
-  formatStrikeThrough: { tag: "strike", tags: ["strike", "s", "del"], command: "strikeThrough" },
-  formatSubscript: { tag: "sub", tags: ["sub"], command: "subscript" },
-  formatSuperscript: { tag: "sup", tags: ["sup"], command: "superscript" },
-};
-// What `removeFormat` unwraps.
-const FORMATTING = new Set([
-  "abbr", "acronym", "b", "bdi", "bdo", "big", "blink", "cite", "code", "dfn", "em", "font", "i", "ins", "kbd", "mark",
-  "nobr", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "tt", "u", "var",
-]);
-
-// The nearest element above `node` in `host` that `test` accepts, or null.
-function ancestorWhere(host, node, test) {
-  for (let at = node.nodeType === 3 ? node.parentNode : node; at && at !== host; at = at.parentNode) {
-    if (at.nodeType === 1 && test(at)) return at;
-  }
-  return null;
-}
-
-const formattedBy = (host, node, format) => ancestorWhere(host, node, (at) => format.tags.includes(at.localName));
-
-// The text nodes the range covers, split at its ends, in order. Text in atoms is left out.
-function textsIn(host, startNode, startOffset, endNode, endOffset) {
-  if (endNode.nodeType === 3 && endOffset > 0 && endOffset < endNode.length) endNode.splitText(endOffset);
-  if (startNode.nodeType === 3 && startOffset > 0 && startOffset < startNode.length) {
-    const rest = startNode.splitText(startOffset);
-    if (endNode === startNode) [endNode, endOffset] = [rest, endOffset - startOffset];
-    [startNode, startOffset] = [rest, 0];
-  }
-  const found = [];
-  for (let at = host.firstChild; at; at = nextNode(at, host)) {
-    if (at.nodeType !== 3 || !at.length) continue;
-    if (comparePoints(at, 0, startNode, startOffset) >= 0 && comparePoints(at, at.length, endNode, endOffset) <= 0) found.push(at);
-  }
-  return found;
-}
-
-// Takes `node` out of `ancestor`: what is before and after it stays in copies of `ancestor`,
-// and what is between `node` and `ancestor` stays around it.
-function unwrapAround(ancestor, node) {
-  const after = splitAt(ancestor, node.parentNode, indexIn(node) + 1);
-  unwrap(splitAt(ancestor, node.parentNode, indexIn(node)));
-  for (const part of [ancestor, after]) if (!leafBeside(part, part, 0, true)) part.remove();
-}
-
-function unwrap(element) {
-  const parent = element.parentNode;
-  while (element.firstChild) parent.insertBefore(element.firstChild, element);
-  element.remove();
-}
-
-// Wraps `node` in a new `tag` element, joined with one just before or after it.
-const bare = (node, tag) => node?.nodeType === 1 && node.localName === tag && node.getAttributeNames().length === 0;
-
-function wrapIn(node, tag) {
-  const before = node.previousSibling;
-  if (bare(before, tag)) {
-    before.appendChild(node);
-    if (bare(before.nextSibling, tag)) unwrapInto(before.nextSibling, before);
-    return;
-  }
-  const after = node.nextSibling;
-  if (bare(after, tag)) {
-    after.insertBefore(node, after.firstChild);
-    return;
-  }
-  const wrapper = createElement(tag);
-  node.parentNode.insertBefore(wrapper, node);
-  wrapper.appendChild(node);
-}
-
-function unwrapInto(from, into) {
-  while (from.firstChild) into.appendChild(from.firstChild);
-  from.remove();
-}
-
-// Whether every text the target covers has `format` (`state`), and whether some do (`some`).
-function formatState(host, target, format) {
-  const range = new Range();
-  range.setStart(target[0], target[1]);
-  range.setEnd(target[2], target[3]);
-  if (range.collapsed) {
-    const typed = typingStyle && typingStyle.host === host && typingStyle.node === target[0] && typingStyle.offset === target[1] ? typingStyle.formats.get(format) : undefined;
-    const on = typed ?? !!formattedBy(host, target[0], format);
-    return { state: on, some: on };
-  }
-  let all = true;
-  let some = false;
-  let any = false;
-  for (let at = host.firstChild; at; at = nextNode(at, host)) {
-    if (at.nodeType !== 3 || !at.length || !range.intersectsNode(at)) continue;
-    if (at === target[2] && target[3] === 0 || at === target[0] && target[1] === at.length) continue;
-    any = true;
-    if (formattedBy(host, at, format)) some = true;
-    else all = false;
-  }
-  return { state: any && all, some };
-}
-
-// Formatting `inputType` over the target. A collapsed target sets how the next typed text is
-// formatted, as Chromium does, and changes nothing yet.
-function format(host, inputType, target) {
-  if (isPlain(host)) return false;
-  const collapsed = target[0] === target[2] && target[1] === target[3];
-  if (inputType === "formatRemove") {
-    if (collapsed) return false;
-    const texts = textsIn(host, ...target);
-    for (const text of texts) {
-      let found;
-      while ((found = ancestorWhere(host, text, (at) => FORMATTING.has(at.localName)))) unwrapAround(found, text);
-    }
-    return select(texts);
-  }
-  const which = FORMATS[inputType];
-  if (collapsed) {
-    const { state } = formatState(host, target, which);
-    if (!typingStyle || typingStyle.host !== host || typingStyle.node !== target[0] || typingStyle.offset !== target[1]) {
-      typingStyle = { host, node: target[0], offset: target[1], formats: new Map() };
-    }
-    typingStyle.formats.set(which, !state);
-    return false;
-  }
-  const on = formatState(host, target, which).state;
-  const texts = textsIn(host, ...target);
-  for (const text of texts) {
-    if (on) {
-      let found;
-      while ((found = formattedBy(host, text, which))) unwrapAround(found, text);
-    } else if (!formattedBy(host, text, which)) wrapIn(text, which.tag);
-  }
-  return select(texts);
-}
-
-function select(texts) {
-  if (!texts.length) return false;
-  const last = texts[texts.length - 1];
-  getSelection().setBaseAndExtent(texts[0], 0, last, last.length);
-  return true;
-}
-
-// Formats a collapsed `formatBold` and the like asked for, for the text typed next at that caret.
-let typingStyle = null;
-
-function typingStyleAt(host, target) {
-  const style = typingStyle;
-  typingStyle = null;
-  return style && style.host === host && style.node === target[0] && style.offset === target[1] ? style : null;
-}
-
-// Gives the text typed from `start` to `end` the formats `style` asked for.
-function applyTypingStyle(host, style, start, end) {
-  const texts = textsIn(host, start[0], start[1], end[0], end[1]);
-  for (const [which, on] of style.formats) {
-    for (const text of texts) {
-      if (on && !formattedBy(host, text, which)) {
-        const wrapper = createElement(which.tag);
-        text.parentNode.insertBefore(wrapper, text);
-        wrapper.appendChild(text);
-      } else if (!on) {
-        let found;
-        while ((found = formattedBy(host, text, which))) unwrapAround(found, text);
-      }
-    }
-  }
-  const last = texts[texts.length - 1];
-  return last ? [last, last.length] : end;
-}
-
-// Undo and redo, as a browser keeps them for editing hosts: each default edit records its
-// changes (the mutation records of the host) with the selection before and after. Typing in a
-// row, and deleting in a row, undo as one step, until the caret moves elsewhere.
+// Undo and redo, as a browser keeps them for editing hosts: each edit records its changes
+// (the mutation records of the host) with the selection before and after. Typing in a row,
+// and deleting in a row, undo as one step, until the caret moves elsewhere.
 const histories = new WeakMap();
 const HISTORY_LIMIT = 100;
 
@@ -5465,20 +5187,19 @@ const selectionNow = () => getSelection()._ends();
 const sameSelection = (a, b) => a === b || !!a && !!b && a.every((value, i) => value === b[i]);
 
 // Runs `edit` with the host's changes recorded for undo (as `kind`, to join a run of them).
-// Returns what `edit` returns.
+// Returns whether `edit` changed the host.
 function recorded(host, kind, edit) {
   const recorder = new MutationObserver(() => {});
   recorder.observe(host, { childList: true, subtree: true, characterData: true, characterDataOldValue: true, attributes: true, attributeOldValue: true });
   const before = selectionNow();
-  let result;
   let records;
   try {
-    result = edit();
+    edit();
   } finally {
     records = recorder.takeRecords();
     recorder.disconnect();
   }
-  if (!records.length) return result;
+  if (!records.length) return false;
   let history = histories.get(host);
   if (!history) histories.set(host, (history = { undo: [], redo: [] }));
   const after = selectionNow();
@@ -5491,21 +5212,18 @@ function recorded(host, kind, edit) {
     if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
   }
   history.redo.length = 0;
-  return result;
+  return true;
 }
 
-// Undoes (or redoes) the host's last step; `events` fires `beforeinput` first, as keys and the
-// edit menu do (`execCommand` fires only `input`). Returns whether a listener prevented it.
+// Undoes (or redoes) the host's last step; `events` fires beforeinput and input, as keys and
+// the edit menu do (the Editing spec's undo and redo commands fire none). Returns whether a
+// listener prevented it.
 function historyStep(host, redo, events) {
   const history = histories.get(host);
   const stack = redo ? history?.redo : history?.undo;
   if (!stack?.length) return false;
   const inputType = redo ? "historyRedo" : "historyUndo";
-  if (events) {
-    const range = rangeIn(host);
-    const ranges = range ? [staticRange(range.startContainer, range.startOffset, range.endContainer, range.endOffset)] : [];
-    if (editEvent("beforeinput", host, inputType, null, false, true, ranges).defaultPrevented) return true;
-  }
+  if (events && editEvent("beforeinput", host, inputType, null, false, true, []).defaultPrevented) return true;
   const step = stack.pop();
   if (redo) for (const record of step.records) replay(record, true);
   else for (let i = step.records.length - 1; i >= 0; i--) replay(step.records[i], false);
@@ -5515,11 +5233,13 @@ function historyStep(host, redo, events) {
   if (ends && inDocument(ends[0]) && inDocument(ends[2])) {
     try {
       selection.setBaseAndExtent(ends[0], Math.min(ends[1], nodeLength(ends[0])), ends[2], Math.min(ends[3], nodeLength(ends[2])));
+      // The undo and redo commands end with this selection, not the active range they began with.
+      globalRange = null;
     } catch {
       // A node the step left behind has gone: the selection stays where it is.
     }
   }
-  editEvent("input", host, inputType, null, false, false);
+  if (events) editEvent("input", host, inputType, null, false, false);
   return false;
 }
 
@@ -5551,7 +5271,7 @@ function replay(record, forward) {
   }
 }
 
-/** Moves or extends the selection by `granularity` in `direction`, as `Selection.modify` does in Chromium. */
+/** Moves or extends the selection by `granularity` in `direction`, as the Selection API's `modify` does. */
 function modifySelection(selection, alter, direction, granularity) {
   alter = String(alter).toLowerCase();
   direction = String(direction).toLowerCase();
@@ -5606,214 +5326,8575 @@ function blockStep(host, [node, offset], forward) {
   return comparePoints(out[0], out[1], edge[0], edge[1]) === 0 ? edge : stepFrom(host, out[0], out[1], forward, "paragraph");
 }
 
-// The commands `execCommand` runs, by the `inputType` of their `input` event (Chromium's).
-const COMMANDS = new Map([
-  ["inserttext", "insertText"], ["inserthtml", ""], ["insertparagraph", "insertParagraph"],
-  ["insertlinebreak", "insertLineBreak"], ["delete", "deleteContentBackward"], ["forwarddelete", "deleteContentForward"],
-  ["bold", "formatBold"], ["italic", "formatItalic"], ["underline", "formatUnderline"],
-  ["strikethrough", "formatStrikeThrough"], ["subscript", "formatSubscript"], ["superscript", "formatSuperscript"],
-  ["removeformat", "formatRemove"], ["createlink", "insertLink"], ["unlink", ""], ["formatblock", ""],
-  ["undo", "historyUndo"], ["redo", "historyRedo"], ["selectall", null], ["defaultparagraphseparator", null],
-]);
-// Supported, never enabled for scripts: the clipboard belongs to the user.
-const CLIPBOARD_COMMANDS = new Set(["copy", "cut", "paste"]);
-const BLOCK_FORMATS = new Set(["address", "dd", "div", "dt", "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre", "blockquote"]);
+// execCommand and the queryCommand methods, as the Editing spec's "Methods to query and
+// execute commands" has them. The commands are below.
 
-// The editing host the selection is in, or (without a selection) the focused one.
-function commandHost() {
-  const range = getSelection().rangeCount ? getSelection().getRangeAt(0) : null;
-  const host = range ? editingHostOf(range.startContainer) : null;
-  if (host && host.contains(range.endContainer)) return host;
-  const focused = activeElement();
-  return !range && focused && editingHostOf(focused) === focused ? focused : null;
+// "Miscellaneous commands": no beforeinput or input of their own.
+const MISCELLANEOUS = new Set(["copy", "cut", "paste", "defaultparagraphseparator", "redo", "selectall", "stylewithcss", "undo", "usecss"]);
+
+// "To map an edit command to input type value". The table leaves out italic, underline,
+// subscript and removeFormat, which take the input types Input Events names for them.
+const COMMAND_INPUT_TYPES = {
+  italic: "formatItalic", underline: "formatUnderline", subscript: "formatSubscript", removeformat: "formatRemove",
+  backcolor: "formatBackColor", bold: "formatBold", createlink: "insertLink", fontname: "formatFontName",
+  forecolor: "formatFontColor", strikethrough: "formatStrikeThrough", superscript: "formatSuperscript",
+  delete: "deleteContentBackward", forwarddelete: "deleteContentForward", indent: "formatIndent",
+  inserthorizontalrule: "insertHorizontalRule", insertlinebreak: "insertLineBreak",
+  insertorderedlist: "insertOrderedList", insertparagraph: "insertParagraph", inserttext: "insertText",
+  insertunorderedlist: "insertUnorderedList", justifycenter: "formatJustifyCenter",
+  justifyfull: "formatJustifyFull", justifyleft: "formatJustifyLeft", justifyright: "formatJustifyRight",
+  outdent: "formatOutdent", cut: "deleteByCut", paste: "insertFromPaste", redo: "historyRedo", undo: "historyUndo",
+};
+
+// The editing host that holds both ends of the active range, and no other editing host that does.
+function affectedEditingHost() {
+  const range = getActiveRange();
+  if (!range) return null;
+  for (let at = range.commonAncestorContainer; at; at = at.parentNode) if (isEditingHost(at)) return at;
+  return null;
+}
+
+// Above zero while a command runs.
+let commandDepth = 0;
+
+// The ranges made while an editing command runs, or null.
+let commandRanges = null;
+
+// The selection as the command left the active range, when the command replaced the
+// selection's range on the way (some steps select a stand-in range while they split text).
+function selectActiveRange() {
+  const active = globalRange;
+  if (!active || !inDocument(active.startContainer) || !inDocument(active.endContainer)) return;
+  const selection = getSelection();
+  const now = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (now === active) return;
+  if (now && now.startContainer === active.startContainer && now.startOffset === active.startOffset
+    && now.endContainer === active.endContainer && now.endOffset === active.endOffset) return;
+  selection.setBaseAndExtent(active.startContainer, active.startOffset, active.endContainer, active.endOffset);
+}
+
+// Runs `action` as a command: nested commands share its active range.
+function withActiveRange(action) {
+  if (commandDepth === 0) {
+    globalRange = null;
+    commandRanges = [];
+  }
+  commandDepth++;
+  try {
+    return action();
+  } finally {
+    commandDepth--;
+    if (commandDepth === 0) {
+      selectActiveRange();
+      globalRange = null;
+      // The algorithms' own ranges are garbage once the command ends, but a WeakRef keeps
+      // each until a full collection, and every mutation walks the live ones: they leave
+      // now. A range the selection took (it hooks _changed) stays.
+      for (const range of commandRanges) if (!Object.hasOwn(range, "_changed")) liveRanges.delete(range._live);
+      commandRanges = null;
+    }
+  }
+}
+
+// Takes the action of `command` (supported and enabled) with `value`. Returns its result.
+function runCommand(command, value) {
+  return withActiveRange(() => {
+    if (!(command in commands) || !commandEnabled(command)) return false;
+    return commands[command].action(String(value)) === true;
+  });
+}
+
+function commandEnabled(command) {
+  if (!(command in commands)) return false;
+  if (command === "undo" || command === "redo" || command === "copy" || command === "defaultparagraphseparator" || command === "selectall" || command === "stylewithcss" || command === "usecss") return true;
+  const range = getActiveRange();
+  if (!range) return false;
+  const start = range.startContainer;
+  const end = range.endContainer;
+  if (!(isEditable(start) || isEditingHost(start)) || !(isEditable(end) || isEditingHost(end))) return false;
+  const host = affectedEditingHost();
+  if (!host) return false;
+  return !(isPlain(host) && RICH_COMMANDS.has(command));
 }
 
 /**
- * The classic editing commands, as Chromium runs them in the editing host the selection is in:
- * `insertText`, `insertHTML`, `insertParagraph`, `insertLineBreak`, `delete`, `forwardDelete`,
- * `bold`, `italic`, `underline`, `strikeThrough`, `subscript`, `superscript`, `removeFormat`,
- * `createLink`, `unlink`, `formatBlock`, `undo`, `redo`, `selectAll` and
- * `defaultParagraphSeparator`. They fire `input`, not `beforeinput`. Returns whether it ran.
+ * Runs editing command `command` with `value` on the selection, as the Editing spec's
+ * execCommand does: beforeinput first (a listener can cancel it), then the command, then
+ * input when the editing host changed. Returns whether the command ran.
  */
 export function execCommand(command, _showUI = false, value = "") {
-  const name = String(command).toLowerCase();
-  if (!COMMANDS.has(name)) return false;
-  if (name === "defaultparagraphseparator") {
-    const tag = String(value).toLowerCase();
-    if (tag !== "div" && tag !== "p") return false;
-    paragraphSeparator = tag;
-    return true;
-  }
-  const selection = getSelection();
-  if (name === "selectall") {
-    const host = commandHost();
-    if (host) selection.selectAllChildren(host);
-    else if (rootNode) selection.selectAllChildren(rootNode);
-    return true;
-  }
-  const host = commandHost();
-  if (!host) return false;
-  if (name === "undo" || name === "redo") {
-    historyStep(host, name === "redo", false);
-    return true;
-  }
-  const inputType = COMMANDS.get(name);
-  const plain = isPlain(host);
-  if (plain && (FORMATS[inputType] || inputType === "formatRemove" || name === "createlink" || name === "unlink" || name === "formatblock")) return false;
-  const range = rangeIn(host);
-  if (!range && name !== "inserttext" && name !== "inserthtml") return false;
-  const target = range ? targetOf(host, inputType, range) : [...startIn(host), ...startIn(host)];
-  let data = null;
-  const changed = recorded(host, historyKind(inputType), () => {
-    switch (name) {
-      case "inserttext":
-        data = String(value);
-        return perform(host, "insertText", data, target, null);
-      case "inserthtml":
-        // A plain host takes the markup's text, as Chromium does.
-        if (plain) return perform(host, "insertText", textIn(fragmentOf(String(value), true)), target, null);
-        return perform(host, "insertHTML", String(value), target, null);
-      case "createlink":
-        data = String(value);
-        return link(host, target, data);
-      case "unlink":
-        return unlink(host, target);
-      case "formatblock":
-        return formatBlock(host, target, value);
-      default:
-        return perform(host, inputType, null, target, null);
+  command = String(command).toLowerCase();
+  return withActiveRange(() => {
+    if (!commandEnabled(command)) return false;
+    let host = null;
+    const inputType = COMMAND_INPUT_TYPES[command] ?? "";
+    if (!MISCELLANEOUS.has(command)) {
+      host = affectedEditingHost();
+      if (editEvent("beforeinput", host, inputType, null, false, true, []).defaultPrevented) return false;
+      globalRange = null;
+      if (!commandEnabled(command)) return false;
+      host = affectedEditingHost();
     }
+    let result = false;
+    const changed = host
+      ? recorded(host, historyKind(inputType), () => { result = commands[command].action(String(value)) === true; })
+      : (result = commands[command].action(String(value)) === true, false);
+    if (!result) return false;
+    if (changed) editEvent("input", host, inputType, null, false, false);
+    return true;
   });
-  if (changed) editEvent("input", host, inputType, data, false, false);
-  return true;
-}
-
-function link(host, target, url) {
-  if (!url) return false;
-  const collapsed = target[0] === target[2] && target[1] === target[3];
-  if (collapsed) {
-    const anchor = createElement("a");
-    anchor.setAttribute("href", url);
-    anchor.appendChild(new Text(url));
-    const [parent, index] = elementPoint(target[0], target[1]);
-    parent.insertBefore(anchor, parent.childNodes[index] ?? null);
-    getSelection().selectAllChildren(anchor);
-    return true;
-  }
-  const texts = textsIn(host, ...target);
-  for (const text of texts) {
-    const existing = ancestorWhere(host, text, (at) => at.localName === "a");
-    if (existing) existing.setAttribute("href", url);
-    else {
-      wrapIn(text, "a");
-      text.parentNode.setAttribute("href", url);
-    }
-  }
-  // Joined runs of links that share the address are one link.
-  for (const text of texts) {
-    const anchor = text.parentNode;
-    const next = anchor?.nextSibling;
-    if (anchor?.localName === "a" && next?.nodeType === 1 && next.localName === "a" && next.getAttribute("href") === url) unwrapInto(next, anchor);
-  }
-  return select(texts);
-}
-
-function unlink(host, target) {
-  const collapsed = target[0] === target[2] && target[1] === target[3];
-  if (collapsed) return false;
-  const range = new Range();
-  range.setStart(target[0], target[1]);
-  range.setEnd(target[2], target[3]);
-  const anchors = [];
-  for (let at = host.firstChild; at; at = nextNode(at, host)) {
-    if (at.nodeType === 1 && at.localName === "a" && at.hasAttribute("href") && range.intersectsNode(at)) anchors.push(at);
-  }
-  const ends = [target[0], target[1], target[2], target[3]];
-  for (const anchor of anchors) unwrap(anchor);
-  if (anchors.length && inDocument(ends[0]) && inDocument(ends[2])) getSelection().setBaseAndExtent(...ends);
-  return anchors.length > 0;
-}
-
-function formatBlock(host, target, value) {
-  const tag = String(value).replace(/^<|>$/g, "").toLowerCase();
-  if (!BLOCK_FORMATS.has(tag)) return false;
-  const ends = [target[0], target[1], target[2], target[3]];
-  let start = blockIn(host, target[0]);
-  if (start === host) start = wrapRun(host, target[0], target[1]);
-  let end = blockIn(host, target[2]);
-  if (end === host) end = wrapRun(host, target[2], target[3]);
-  const blocks = [];
-  for (let at = start; at; at = following(at, host, true)) {
-    if (isBlock(at) && at !== host) blocks.push(at);
-    if (at === end || at.contains(end)) break;
-  }
-  let changed = false;
-  for (const block of blocks) {
-    if (block.localName === tag) continue;
-    // A block that holds blocks keeps them: only one holding text is renamed.
-    if ([...block.childNodes].some(isBlock)) continue;
-    const renamed = createElement(tag);
-    block.parentNode.insertBefore(renamed, block);
-    while (block.firstChild) renamed.appendChild(block.firstChild);
-    block.remove();
-    changed = true;
-  }
-  if (inDocument(ends[0]) && inDocument(ends[2])) getSelection().setBaseAndExtent(...ends);
-  return changed;
-}
-
-function commandTarget() {
-  const host = commandHost();
-  const range = host ? rangeIn(host) : null;
-  return range ? { host, target: [range.startContainer, range.startOffset, range.endContainer, range.endOffset] } : null;
 }
 
 /** Whether `execCommand` knows `command`. */
 export function queryCommandSupported(command) {
-  const name = String(command).toLowerCase();
-  return COMMANDS.has(name) || CLIPBOARD_COMMANDS.has(name);
+  return String(command).toLowerCase() in commands;
 }
 
-/** Whether `execCommand(command)` would run now: the selection is in an editing host that takes it. */
+/** Whether `command` is supported and enabled: the active range is in one editing host. */
 export function queryCommandEnabled(command) {
-  const name = String(command).toLowerCase();
-  if (!COMMANDS.has(name)) return false;
-  if (name === "selectall" || name === "defaultparagraphseparator") return true;
-  const host = commandHost();
-  if (!host) return false;
-  const inputType = COMMANDS.get(name);
-  return !(isPlain(host) && (FORMATS[inputType] || inputType === "formatRemove" || name === "createlink" || name === "unlink" || name === "formatblock"));
+  command = String(command).toLowerCase();
+  return withActiveRange(() => commandEnabled(command));
 }
 
-/** Whether the selection has the formatting of `command` (`bold` and the like). */
-export function queryCommandState(command) {
-  const which = FORMATS[COMMANDS.get(String(command).toLowerCase())];
-  const at = which && commandTarget();
-  return at ? formatState(at.host, at.target, which).state : false;
-}
-
-/** Whether only some of the selection has the formatting of `command`. */
+/** Whether `command` is indeterminate over the active range (some of it formatted, some not). */
 export function queryCommandIndeterm(command) {
-  const which = FORMATS[COMMANDS.get(String(command).toLowerCase())];
-  const at = which && commandTarget();
-  if (!at) return false;
-  const { state, some } = formatState(at.host, at.target, which);
-  return some && !state;
+  command = String(command).toLowerCase();
+  return withActiveRange(() => command in commands && "indeterm" in commands[command] ? !!commands[command].indeterm() : false);
 }
 
-/** The value of `command`: the block's tag for `formatBlock`, the state of `bold` and the like as "true" or "false". */
-export function queryCommandValue(command) {
-  const name = String(command).toLowerCase();
-  if (name === "defaultparagraphseparator") return paragraphSeparator;
-  const at = commandTarget();
-  if (name === "formatblock") {
-    if (!at) return "";
-    const block = blockIn(at.host, at.target[0]);
-    return block !== at.host && BLOCK_FORMATS.has(block.localName) ? block.localName : "";
-  }
-  if (FORMATS[COMMANDS.get(name)]) return String(queryCommandState(name));
-  return "";
+/** The state of `command` over the active range, as its state override has it when one is set. */
+export function queryCommandState(command) {
+  command = String(command).toLowerCase();
+  return withActiveRange(() => {
+    if (!(command in commands) || !("state" in commands[command])) return false;
+    if (getActiveRange() && getStateOverride(command) !== undefined) return getStateOverride(command);
+    return !!commands[command].state();
+  });
 }
+
+/** The value of `command` over the active range, as its value override has it when one is set. */
+export function queryCommandValue(command) {
+  command = String(command).toLowerCase();
+  return withActiveRange(() => {
+    if (!(command in commands) || !("value" in commands[command])) return "";
+    if (getActiveRange()) {
+      if (command === "fontsize" && getValueOverride("fontsize") !== undefined) return getLegacyFontSize(getValueOverride("fontsize"));
+      if (getValueOverride(command) !== undefined) return getValueOverride(command);
+    }
+    return commands[command].value();
+  });
+}
+
+// What the ported algorithms below take from the DOM.
+const DOM = {
+  ELEMENT_NODE: 1, TEXT_NODE: 3, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8, DOCUMENT_NODE: 9,
+  DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+  DOCUMENT_POSITION_DISCONNECTED: 1, DOCUMENT_POSITION_PRECEDING: 2, DOCUMENT_POSITION_FOLLOWING: 4,
+  DOCUMENT_POSITION_CONTAINS: 8, DOCUMENT_POSITION_CONTAINED_BY: 16,
+};
+
+// Node.compareDocumentPosition(a, b), for nodes in a tree.
+function documentPosition(a, b) {
+  if (a === b) return 0;
+  const chain = (node) => { const list = []; for (; node; node = node.parentNode) list.unshift(node); return list; };
+  const mine = chain(a);
+  const theirs = chain(b);
+  // Nodes in different trees: disconnected, in an order that stays the same both ways (no
+  // node, as some steps pass at the end of a walk, comes after everything).
+  if (mine[0] !== theirs[0]) {
+    return DOM.DOCUMENT_POSITION_DISCONNECTED | 32
+      | (!mine.length || !theirs.length || mine[0].nodeId < theirs[0].nodeId ? DOM.DOCUMENT_POSITION_FOLLOWING : DOM.DOCUMENT_POSITION_PRECEDING);
+  }
+  let depth = 0;
+  while (mine[depth] === theirs[depth]) depth++;
+  if (depth === mine.length) return DOM.DOCUMENT_POSITION_CONTAINED_BY | DOM.DOCUMENT_POSITION_FOLLOWING;
+  if (depth === theirs.length) return DOM.DOCUMENT_POSITION_CONTAINS | DOM.DOCUMENT_POSITION_PRECEDING;
+  const siblings = mine[depth - 1].childNodes;
+  return siblings.indexOf(theirs[depth]) > siblings.indexOf(mine[depth]) ? DOM.DOCUMENT_POSITION_FOLLOWING : DOM.DOCUMENT_POSITION_PRECEDING;
+}
+
+// An element's attributes, as Element.attributes lists them.
+function attributesOf(node) {
+  return (node.getAttributeNames?.() ?? []).map((name) => ({ name, value: node.getAttribute(name), namespaceURI: null }));
+}
+
+// The body element, else the root.
+function documentBody() {
+  return rootNode?.childNodes?.find?.((child) => child.localName === "body") ?? rootNode;
+}
+
+// The legacy font sizes 1 to 7 in pixels, as the HTML Standard's rendering maps them from a
+// medium of 16px.
+const LEGACY_FONT_PIXELS = {
+  "x-small": "10px", small: "13px", medium: "16px", large: "18px", "x-large": "24px", "xx-large": "32px", "xxx-large": "48px",
+};
+
+// An absolute CSS length in pixels.
+function cssLengthInPixels(length) {
+  const match = /^([0-9]+(?:\.[0-9]+)?)(cm|mm|in|pt|pc|px)$/.exec(length);
+  if (!match) return NaN;
+  const per = { px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4 }[match[2]];
+  return Number(match[1]) * per;
+}
+
+const NAMED_COLORS = Object.fromEntries(("aliceblue f0f8ff antiquewhite faebd7 aqua 00ffff aquamarine 7fffd4 azure f0ffff beige f5f5dc bisque ffe4c4 black 000000 blanchedalmond ffebcd blue 0000ff blueviolet 8a2be2 brown a52a2a burlywood deb887 cadetblue 5f9ea0 chartreuse 7fff00 chocolate d2691e coral ff7f50 cornflowerblue 6495ed cornsilk fff8dc crimson dc143c cyan 00ffff darkblue 00008b darkcyan 008b8b darkgoldenrod b8860b darkgray a9a9a9 darkgreen 006400 darkgrey a9a9a9 darkkhaki bdb76b darkmagenta 8b008b darkolivegreen 556b2f darkorange ff8c00 darkorchid 9932cc darkred 8b0000 darksalmon e9967a darkseagreen 8fbc8f darkslateblue 483d8b darkslategray 2f4f4f darkslategrey 2f4f4f darkturquoise 00ced1 darkviolet 9400d3 deeppink ff1493 deepskyblue 00bfff dimgray 696969 dimgrey 696969 dodgerblue 1e90ff firebrick b22222 floralwhite fffaf0 forestgreen 228b22 fuchsia ff00ff gainsboro dcdcdc ghostwhite f8f8ff gold ffd700 goldenrod daa520 gray 808080 green 008000 greenyellow adff2f grey 808080 honeydew f0fff0 hotpink ff69b4 indianred cd5c5c indigo 4b0082 ivory fffff0 khaki f0e68c lavender e6e6fa lavenderblush fff0f5 lawngreen 7cfc00 lemonchiffon fffacd lightblue add8e6 lightcoral f08080 lightcyan e0ffff lightgoldenrodyellow fafad2 lightgray d3d3d3 lightgreen 90ee90 lightgrey d3d3d3 lightpink ffb6c1 lightsalmon ffa07a lightseagreen 20b2aa lightskyblue 87cefa lightslategray 778899 lightslategrey 778899 lightsteelblue b0c4de lightyellow ffffe0 lime 00ff00 limegreen 32cd32 linen faf0e6 magenta ff00ff maroon 800000 mediumaquamarine 66cdaa mediumblue 0000cd mediumorchid ba55d3 mediumpurple 9370db mediumseagreen 3cb371 mediumslateblue 7b68ee mediumspringgreen 00fa9a mediumturquoise 48d1cc mediumvioletred c71585 midnightblue 191970 mintcream f5fffa mistyrose ffe4e1 moccasin ffe4b5 navajowhite ffdead navy 000080 oldlace fdf5e6 olive 808000 olivedrab 6b8e23 orange ffa500 orangered ff4500 orchid da70d6 palegoldenrod eee8aa palegreen 98fb98 paleturquoise afeeee palevioletred db7093 papayawhip ffefd5 peachpuff ffdab9 peru cd853f pink ffc0cb plum dda0dd powderblue b0e0e6 purple 800080 rebeccapurple 663399 red ff0000 rosybrown bc8f8f royalblue 4169e1 saddlebrown 8b4513 salmon fa8072 sandybrown f4a460 seagreen 2e8b57 seashell fff5ee sienna a0522d silver c0c0c0 skyblue 87ceeb slateblue 6a5acd slategray 708090 slategrey 708090 snow fffafa springgreen 00ff7f steelblue 4682b4 tan d2b48c teal 008080 thistle d8bfd8 tomato ff6347 turquoise 40e0d0 violet ee82ee wheat f5deb3 white ffffff whitesmoke f5f5f5 yellow ffff00 yellowgreen 9acd32")
+  .split(" ").reduce((pairs, word, index, words) => (index % 2 ? pairs : [...pairs, [word, words[index + 1]]]), []));
+
+// A CSS color as CSSOM serializes a computed one ("rgb(r, g, b)", or "rgba(r, g, b, a)" when
+// not opaque), or null for currentcolor and for what is not a color.
+function parseCssColor(text) {
+  const value = String(text).trim().toLowerCase();
+  if (value === "transparent") return "rgba(0, 0, 0, 0)";
+  const serialize = (r, g, b, a) => {
+    const [x, y, z] = [r, g, b].map((n) => Math.max(0, Math.min(255, Math.round(n))));
+    const alpha = Math.max(0, Math.min(1, a));
+    return alpha === 1 ? "rgb(" + x + ", " + y + ", " + z + ")" : "rgba(" + x + ", " + y + ", " + z + ", " + Math.round(alpha * 1000) / 1000 + ")";
+  };
+  let hex = NAMED_COLORS[value] ?? (/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(value)?.[1] ?? null);
+  if (hex) {
+    if (hex.length <= 4) hex = [...hex].map((c) => c + c).join("");
+    const parts = [0, 2, 4, 6].map((i) => parseInt(hex.slice(i, i + 2) || "ff", 16));
+    return serialize(parts[0], parts[1], parts[2], parts[3] / 255);
+  }
+  const call = /^(rgba?|hsla?)\((.*)\)$/.exec(value);
+  if (!call) return null;
+  const args = call[2].split(/\s*[,/]\s*|\s+/).filter(Boolean);
+  if (args.length < 3 || args.length > 4) return null;
+  const alpha = args[3] === undefined ? 1 : args[3].endsWith("%") ? parseFloat(args[3]) / 100 : parseFloat(args[3]);
+  if (Number.isNaN(alpha)) return null;
+  if (call[1].startsWith("rgb")) {
+    const channels = args.slice(0, 3).map((arg) => (arg.endsWith("%") ? parseFloat(arg) * 2.55 : parseFloat(arg)));
+    if (channels.some(Number.isNaN)) return null;
+    return serialize(channels[0], channels[1], channels[2], alpha);
+  }
+  const h = (((parseFloat(args[0]) % 360) + 360) % 360) / 360;
+  const s = parseFloat(args[1]) / 100;
+  const l = parseFloat(args[2]) / 100;
+  if ([h, s, l].some(Number.isNaN)) return null;
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+  const channel = (t) => {
+    t = (t + 1) % 1;
+    if (t < 1 / 6) return p + (q - p) * 6 * t;
+    if (t < 1 / 2) return q;
+    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+    return p;
+  };
+  return serialize(channel(h + 1 / 3) * 255, channel(h) * 255, channel(h - 1 / 3) * 255, alpha);
+}
+
+// Moves `node` to index `newIndex` of `newParent` (counted before it leaves its old place),
+// keeping every live range's boundary points with the content, as the Editing spec's "move
+// preserving ranges" has it instead of the usual range mutation rules.
+function moveNodePreservingRanges(node, newParent, newIndex) {
+  const oldParent = node.parentNode;
+  const oldIndex = oldParent ? indexIn(node) : -1;
+  const before = newParent.childNodes[newIndex] ?? null;
+  const moved = [];
+  const adjust = (point) => {
+    if (point[0] === newParent && point[1] > newIndex) point[1]++;
+    if (point[0] === oldParent && (point[1] === oldIndex || point[1] === oldIndex + 1)) {
+      point[0] = newParent;
+      point[1] += newIndex - oldIndex;
+    } else if (point[0] === oldParent && point[1] > oldIndex + 1) {
+      point[1]--;
+    }
+    return point;
+  };
+  eachLiveRange((range) => moved.push([range, adjust([range._startNode, range._startOffset]), adjust([range._endNode, range._endOffset])]));
+  rangesPaused++;
+  try {
+    if (before === node) newParent.insertBefore(node, node.nextSibling);
+    else newParent.insertBefore(node, before);
+  } finally {
+    rangesPaused--;
+  }
+  for (const [range, start, end] of moved) {
+    const changed = range._startNode !== start[0] || range._startOffset !== start[1] || range._endNode !== end[0] || range._endOffset !== end[1];
+    range._startNode = start[0];
+    range._startOffset = start[1];
+    range._endNode = end[0];
+    range._endOffset = end[1];
+    if (changed) range._changed();
+  }
+}
+
+// Text that insertText takes with its line feeds as text, for a plaintext-only host.
+let literalLineFeeds = false;
+
+// The Editing spec's algorithms and commands, after its reference implementation by Aryeh
+// Gregor (web-platform-tests editing/include/implementation.js, 3-Clause BSD License,
+// Copyright © web-platform-tests contributors). The quoted lines are the spec's steps.
+// Where the spec defines something by layout (a collapsed or extraneous line break), it is
+// read from the tree's structure and computed style instead.
+
+
+var htmlNamespace = "http://www.w3.org/1999/xhtml";
+
+var cssStylingFlag = false;
+
+var defaultSingleLineContainerName = "div";
+
+// This is bad :(
+var globalRange = null;
+
+// Commands are stored in a dictionary where we call their actions and such
+var commands = {};
+
+///////////////////////////////////////////////////////////////////////////////
+////////////////////////////// Utility functions //////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+//@{
+
+function nextNode(node) {
+    if (node.hasChildNodes()) {
+        return node.firstChild;
+    }
+    return nextNodeDescendants(node);
+}
+
+function previousNode(node) {
+    if (node.previousSibling) {
+        node = node.previousSibling;
+        while (node.hasChildNodes()) {
+            node = node.lastChild;
+        }
+        return node;
+    }
+    if (node.parentNode
+    && node.parentNode.nodeType == DOM.ELEMENT_NODE) {
+        return node.parentNode;
+    }
+    return null;
+}
+
+function nextNodeDescendants(node) {
+    while (node && !node.nextSibling) {
+        node = node.parentNode;
+    }
+    if (!node) {
+        return null;
+    }
+    return node.nextSibling;
+}
+
+/**
+ * Returns true if ancestor is an ancestor of descendant, false otherwise.
+ */
+function isAncestor(ancestor, descendant) {
+    return ancestor
+        && descendant
+        && Boolean(documentPosition(ancestor, descendant) & DOM.DOCUMENT_POSITION_CONTAINED_BY);
+}
+
+/**
+ * Returns true if ancestor is an ancestor of or equal to descendant, false
+ * otherwise.
+ */
+function isAncestorContainer(ancestor, descendant) {
+    return (ancestor || descendant)
+        && (ancestor == descendant || isAncestor(ancestor, descendant));
+}
+
+/**
+ * Returns true if descendant is a descendant of ancestor, false otherwise.
+ */
+function isDescendant(descendant, ancestor) {
+    return ancestor
+        && descendant
+        && Boolean(documentPosition(ancestor, descendant) & DOM.DOCUMENT_POSITION_CONTAINED_BY);
+}
+
+/**
+ * Returns true if node1 is before node2 in tree order, false otherwise.
+ */
+function isBefore(node1, node2) {
+    return Boolean(documentPosition(node1, node2) & DOM.DOCUMENT_POSITION_FOLLOWING);
+}
+
+/**
+ * Returns true if node1 is after node2 in tree order, false otherwise.
+ */
+function isAfter(node1, node2) {
+    return Boolean(documentPosition(node1, node2) & DOM.DOCUMENT_POSITION_PRECEDING);
+}
+
+function getAncestors(node) {
+    var ancestors = [];
+    while (node.parentNode) {
+        ancestors.unshift(node.parentNode);
+        node = node.parentNode;
+    }
+    return ancestors;
+}
+
+function getInclusiveAncestors(node) {
+    return getAncestors(node).concat(node);
+}
+
+function getDescendants(node) {
+    var descendants = [];
+    var stop = nextNodeDescendants(node);
+    while ((node = nextNode(node))
+    && node != stop) {
+        descendants.push(node);
+    }
+    return descendants;
+}
+
+function getInclusiveDescendants(node) {
+    return [node].concat(getDescendants(node));
+}
+
+function convertProperty(property) {
+    // Special-case for now
+    var map = {
+        "fontFamily": "font-family",
+        "fontSize": "font-size",
+        "fontStyle": "font-style",
+        "fontWeight": "font-weight",
+        "textDecoration": "text-decoration",
+    };
+    if (typeof map[property] != "undefined") {
+        return map[property];
+    }
+
+    return property;
+}
+
+// Return the <font size=X> value for the given CSS size, or undefined if there
+// is none.
+function cssSizeToLegacy(cssVal) {
+    return {
+        "x-small": 1,
+        "small": 2,
+        "medium": 3,
+        "large": 4,
+        "x-large": 5,
+        "xx-large": 6,
+        "xxx-large": 7
+    }[cssVal];
+}
+
+// Return the CSS size given a legacy size.
+function legacySizeToCss(legacyVal) {
+    return {
+        1: "x-small",
+        2: "small",
+        3: "medium",
+        4: "large",
+        5: "x-large",
+        6: "xx-large",
+        7: "xxx-large",
+    }[legacyVal];
+}
+
+// Opera 11 puts HTML elements in the null namespace, it seems.
+// Core's elements carry no namespaceURI of their own unless they are svg (globals.js gives
+// them the HTML one): undefined is the HTML namespace too.
+function isHtmlNamespace(ns) {
+    return ns === null
+        || ns === undefined
+        || ns === htmlNamespace;
+}
+
+// "the directionality" from HTML.  I don't bother caring about non-HTML
+// elements.
+//
+// "The directionality of an element is either 'ltr' or 'rtl', and is
+// determined as per the first appropriate set of steps from the following
+// list:"
+function getDirectionality(element) {
+    // "If the element's dir attribute is in the ltr state
+    //     The directionality of the element is 'ltr'."
+    if (element.dir == "ltr") {
+        return "ltr";
+    }
+
+    // "If the element's dir attribute is in the rtl state
+    //     The directionality of the element is 'rtl'."
+    if (element.dir == "rtl") {
+        return "rtl";
+    }
+
+    // "If the element's dir attribute is in the auto state
+    // "If the element is a bdi element and the dir attribute is not in a
+    // defined state (i.e. it is not present or has an invalid value)
+    //     [lots of complicated stuff]
+    //
+    // Skip this, since no browser implements it anyway.
+
+    // "If the element is a root element and the dir attribute is not in a
+    // defined state (i.e. it is not present or has an invalid value)
+    //     The directionality of the element is 'ltr'."
+    if (!isHtmlElement(element.parentNode)) {
+        return "ltr";
+    }
+
+    // "If the element has a parent element and the dir attribute is not in a
+    // defined state (i.e. it is not present or has an invalid value)
+    //     The directionality of the element is the same as the element's
+    //     parent element's directionality."
+    return getDirectionality(element.parentNode);
+}
+
+//@}
+
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////// DOM Range functions /////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+//@{
+
+function getNodeIndex(node) {
+    return indexIn(node);
+}
+
+// "The length of a Node node is the following, depending on node:
+//
+// ProcessingInstruction
+// DocumentType
+//   Always 0.
+// Text
+// Comment
+//   node's length.
+// Any other node
+//   node's childNodes's length."
+function getNodeLength(node) {
+    switch (node.nodeType) {
+        case DOM.PROCESSING_INSTRUCTION_NODE:
+        case DOM.DOCUMENT_TYPE_NODE:
+            return 0;
+
+        case DOM.TEXT_NODE:
+        case DOM.COMMENT_NODE:
+            return node.length;
+
+        default:
+            return node.childNodes.length;
+    }
+}
+
+/**
+ * The position of two boundary points relative to one another, as defined by
+ * DOM Range.
+ */
+function getPosition(nodeA, offsetA, nodeB, offsetB) {
+    // "If node A is the same as node B, return equal if offset A equals offset
+    // B, before if offset A is less than offset B, and after if offset A is
+    // greater than offset B."
+    if (nodeA == nodeB) {
+        if (offsetA == offsetB) {
+            return "equal";
+        }
+        if (offsetA < offsetB) {
+            return "before";
+        }
+        if (offsetA > offsetB) {
+            return "after";
+        }
+    }
+
+    // "If node A is after node B in tree order, compute the position of (node
+    // B, offset B) relative to (node A, offset A). If it is before, return
+    // after. If it is after, return before."
+    if (documentPosition(nodeB, nodeA) & DOM.DOCUMENT_POSITION_FOLLOWING) {
+        var pos = getPosition(nodeB, offsetB, nodeA, offsetA);
+        if (pos == "before") {
+            return "after";
+        }
+        if (pos == "after") {
+            return "before";
+        }
+    }
+
+    // "If node A is an ancestor of node B:"
+    if (documentPosition(nodeB, nodeA) & DOM.DOCUMENT_POSITION_CONTAINS) {
+        // "Let child equal node B."
+        var child = nodeB;
+
+        // "While child is not a child of node A, set child to its parent."
+        while (child.parentNode != nodeA) {
+            child = child.parentNode;
+        }
+
+        // "If the index of child is less than offset A, return after."
+        if (getNodeIndex(child) < offsetA) {
+            return "after";
+        }
+    }
+
+    // "Return before."
+    return "before";
+}
+
+/**
+ * Returns the furthest ancestor of a Node as defined by DOM Range.
+ */
+function getFurthestAncestor(node) {
+    var root = node;
+    while (root.parentNode != null) {
+        root = root.parentNode;
+    }
+    return root;
+}
+
+/**
+ * "contained" as defined by DOM Range: "A Node node is contained in a range
+ * range if node's furthest ancestor is the same as range's root, and (node, 0)
+ * is after range's start, and (node, length of node) is before range's end."
+ */
+function isContained(node, range) {
+    var pos1 = getPosition(node, 0, range.startContainer, range.startOffset);
+    var pos2 = getPosition(node, getNodeLength(node), range.endContainer, range.endOffset);
+
+    return getFurthestAncestor(node) == getFurthestAncestor(range.startContainer)
+        && pos1 == "after"
+        && pos2 == "before";
+}
+
+/**
+ * Return all nodes contained in range that the provided function returns true
+ * for, omitting any with an ancestor already being returned.
+ */
+function getContainedNodes(range, condition) {
+    if (typeof condition == "undefined") {
+        condition = function() { return true };
+    }
+    var node = range.startContainer;
+    if (node.hasChildNodes()
+    && range.startOffset < node.childNodes.length) {
+        // A child is contained
+        node = node.childNodes[range.startOffset];
+    } else if (range.startOffset == getNodeLength(node)) {
+        // No descendant can be contained
+        node = nextNodeDescendants(node);
+    } else {
+        // No children; this node at least can't be contained
+        node = nextNode(node);
+    }
+
+    var stop = range.endContainer;
+    if (stop.hasChildNodes()
+    && range.endOffset < stop.childNodes.length) {
+        // The node after the last contained node is a child
+        stop = stop.childNodes[range.endOffset];
+    } else {
+        // This node and/or some of its children might be contained
+        stop = nextNodeDescendants(stop);
+    }
+
+    var nodeList = [];
+    while (isBefore(node, stop)) {
+        if (isContained(node, range)
+        && condition(node)) {
+            nodeList.push(node);
+            node = nextNodeDescendants(node);
+            continue;
+        }
+        node = nextNode(node);
+    }
+    return nodeList;
+}
+
+/**
+ * As above, but includes nodes with an ancestor that's already been returned.
+ */
+function getAllContainedNodes(range, condition) {
+    if (typeof condition == "undefined") {
+        condition = function() { return true };
+    }
+    var node = range.startContainer;
+    if (node.hasChildNodes()
+    && range.startOffset < node.childNodes.length) {
+        // A child is contained
+        node = node.childNodes[range.startOffset];
+    } else if (range.startOffset == getNodeLength(node)) {
+        // No descendant can be contained
+        node = nextNodeDescendants(node);
+    } else {
+        // No children; this node at least can't be contained
+        node = nextNode(node);
+    }
+
+    var stop = range.endContainer;
+    if (stop.hasChildNodes()
+    && range.endOffset < stop.childNodes.length) {
+        // The node after the last contained node is a child
+        stop = stop.childNodes[range.endOffset];
+    } else {
+        // This node and/or some of its children might be contained
+        stop = nextNodeDescendants(stop);
+    }
+
+    var nodeList = [];
+    while (isBefore(node, stop)) {
+        if (isContained(node, range)
+        && condition(node)) {
+            nodeList.push(node);
+        }
+        node = nextNode(node);
+    }
+    return nodeList;
+}
+
+// Returns either null, or something of the form rgb(x, y, z), or something of
+// the form rgb(x, y, z, w) with w != 0.
+function normalizeColor(color) {
+    return parseCssColor(color);
+}
+
+// Returns either null, or something of the form #xxxxxx.
+function parseSimpleColor(color) {
+    color = normalizeColor(color);
+    var matches = /^rgb\(([0-9]+), ([0-9]+), ([0-9]+)\)$/.exec(color);
+    if (matches) {
+        return "#"
+            + parseInt(matches[1]).toString(16).replace(/^.$/, "0$&")
+            + parseInt(matches[2]).toString(16).replace(/^.$/, "0$&")
+            + parseInt(matches[3]).toString(16).replace(/^.$/, "0$&");
+    }
+    return null;
+}
+
+//@}
+
+//////////////////////////////////////////////////////////////////////////////
+/////////////////////////// Edit command functions ///////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////
+///// Methods of the HTMLDocument interface /////
+/////////////////////////////////////////////////
+//@{
+
+//////////////////////////////
+///// Common definitions /////
+//////////////////////////////
+//@{
+
+// "An HTML element is an Element whose namespace is the HTML namespace."
+//
+// I allow an extra argument to more easily check whether something is a
+// particular HTML element, like isHtmlElement(node, "OL").  It accepts arrays
+// too, like isHtmlElement(node, ["OL", "UL"]) to check if it's an ol or ul.
+function isHtmlElement(node, tags) {
+    if (typeof tags == "string") {
+        tags = [tags];
+    }
+    if (typeof tags == "object") {
+        tags = tags.map(function(tag) { return tag.toUpperCase() });
+    }
+    return node
+        && node.nodeType == DOM.ELEMENT_NODE
+        && isHtmlNamespace(node.namespaceURI)
+        && (typeof tags == "undefined" || tags.indexOf(node.tagName) != -1);
+}
+
+// "A prohibited paragraph child name is "address", "article", "aside",
+// "blockquote", "caption", "center", "col", "colgroup", "dd", "details",
+// "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer",
+// "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li",
+// "listing", "menu", "nav", "ol", "p", "plaintext", "pre", "section",
+// "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul", or
+// "xmp"."
+var prohibitedParagraphChildNames = ["address", "article", "aside",
+    "blockquote", "caption", "center", "col", "colgroup", "dd", "details",
+    "dir", "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer",
+    "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li",
+    "listing", "menu", "nav", "ol", "p", "plaintext", "pre", "section",
+    "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    "xmp"];
+
+// "A prohibited paragraph child is an HTML element whose local name is a
+// prohibited paragraph child name."
+function isProhibitedParagraphChild(node) {
+    return isHtmlElement(node, prohibitedParagraphChildNames);
+}
+
+// "A block node is either an Element whose "display" property does not have
+// resolved value "inline" or "inline-block" or "inline-table" or "none", or a
+// Document, or a DocumentFragment."
+function isBlockNode(node) {
+    return node
+        && ((node.nodeType == DOM.ELEMENT_NODE && ["inline", "inline-block", "inline-table", "none"].indexOf(getComputedStyle(node).display) == -1)
+        || node.nodeType == DOM.DOCUMENT_NODE
+        || node.nodeType == DOM.DOCUMENT_FRAGMENT_NODE);
+}
+
+// "An inline node is a node that is not a block node."
+function isInlineNode(node) {
+    return node && !isBlockNode(node);
+}
+
+// "An editing host is a node that is either an HTML element with a
+// contenteditable attribute set to the true state, or the HTML element child
+// of a Document whose designMode is enabled."
+// "An editing host is either an HTML element with its contenteditable
+// attribute in the true state or plaintext-only state, or a child HTML element
+// of a Document whose design mode enabled is true." (HTML)
+function isEditingHost(node) {
+    return node
+        && isHtmlElement(node)
+        && editableState(node) == "host";
+}
+
+// "Something is editable if it is a node; it is not an editing host; it does
+// not have a contenteditable attribute set to the false state; its parent is
+// an editing host or editable; and either it is an HTML element, or it is an
+// svg or math element, or it is not an Element and its parent is an HTML
+// element."
+function isEditable(node) {
+    return node
+        && !isEditingHost(node)
+        && (node.nodeType != DOM.ELEMENT_NODE || editableState(node) != "false")
+        && (isEditingHost(node.parentNode) || isEditable(node.parentNode))
+        && (isHtmlElement(node)
+        || (node.nodeType == DOM.ELEMENT_NODE && node.namespaceURI == "http://www.w3.org/2000/svg" && node.localName == "svg")
+        || (node.nodeType == DOM.ELEMENT_NODE && node.namespaceURI == "http://www.w3.org/1998/Math/MathML" && node.localName == "math")
+        || (node.nodeType != DOM.ELEMENT_NODE && isHtmlElement(node.parentNode)));
+}
+
+// Helper function, not defined in the spec
+function hasEditableDescendants(node) {
+    for (var i = 0; i < node.childNodes.length; i++) {
+        if (isEditable(node.childNodes[i])
+        || hasEditableDescendants(node.childNodes[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "The editing host of node is null if node is neither editable nor an editing
+// host; node itself, if node is an editing host; or the nearest ancestor of
+// node that is an editing host, if node is editable."
+function getEditingHostOf(node) {
+    if (isEditingHost(node)) {
+        return node;
+    } else if (isEditable(node)) {
+        var ancestor = node.parentNode;
+        while (!isEditingHost(ancestor)) {
+            ancestor = ancestor.parentNode;
+        }
+        return ancestor;
+    } else {
+        return null;
+    }
+}
+
+// "Two nodes are in the same editing host if the editing host of the first is
+// non-null and the same as the editing host of the second."
+function inSameEditingHost(node1, node2) {
+    return getEditingHostOf(node1)
+        && getEditingHostOf(node1) == getEditingHostOf(node2);
+}
+
+// "A collapsed line break is a br that begins a line box which has nothing
+// else in it, and therefore has zero height."
+// "A collapsed line break is a br that begins a line box which has nothing
+// else in it, and therefore has zero height." Nothing that takes room on a line
+// follows it before its block ends or another block starts.
+function isCollapsedLineBreak(br) {
+    // A br out of the document lays out on no line.
+    if (!isHtmlElement(br, "br") || !br.parentNode) {
+        return false;
+    }
+    var block = nearestBlock(br);
+    for (var node = nextNodeDescendants(br); node && isDescendant(node, block); ) {
+        if (isBlockNode(node)) {
+            return true;
+        }
+        if (node.nodeType == DOM.ELEMENT_NODE && getComputedStyle(node).display == "none") {
+            node = nextNodeDescendants(node);
+            continue;
+        }
+        if (takesRoomOnLine(node)) {
+            return false;
+        }
+        node = nextNode(node);
+    }
+    return true;
+}
+
+// The nearest ancestor of node whose display is not inline.
+function nearestBlock(node) {
+    var ref = node.parentNode;
+    while (ref.parentNode && getComputedStyle(ref).display == "inline") {
+        ref = ref.parentNode;
+    }
+    return ref;
+}
+
+// Whether node is a leaf that puts something on its line: text that does not
+// collapse away, a br, an img, or an inline-block.
+function takesRoomOnLine(node) {
+    if (node.nodeType == DOM.TEXT_NODE) {
+        return !isWhitespaceNode(node);
+    }
+    if (isHtmlElement(node, ["br", "img"])) {
+        return true;
+    }
+    return node.nodeType == DOM.ELEMENT_NODE
+        && ["inline-block", "inline-table"].indexOf(getComputedStyle(node).display) != -1;
+}
+
+// "An extraneous line break is a br that has no visual effect, in that
+// removing it from the DOM would not change layout, except that a br that is
+// the sole child of an li is not extraneous."
+//
+// FIXME: This doesn't work in IE, since IE ignores display: none in
+// contenteditable.
+// "An extraneous line break is a br that has no visual effect, in that
+// removing it from the DOM would not change layout, except that a br that is
+// the sole child of an li is not extraneous." That is a collapsed line break
+// that ends a line something else is on.
+function isExtraneousLineBreak(br) {
+    if (!isHtmlElement(br, "br") || !br.parentNode) {
+        return false;
+    }
+    if (isHtmlElement(br.parentNode, "li")
+    && br.parentNode.childNodes.length == 1) {
+        return false;
+    }
+    if (!isCollapsedLineBreak(br)) {
+        return false;
+    }
+    var block = nearestBlock(br);
+    for (var node = previousNode(br); node && node != block; node = previousNode(node)) {
+        // Going back in tree order meets a block's contents before the block: they are on
+        // lines of their own.
+        if (isBlockNode(node) || getAncestors(node).some(function(ancestor) {
+            return ancestor != block && isDescendant(ancestor, block) && isBlockNode(ancestor);
+        })) {
+            return false;
+        }
+        if (getAncestors(node).concat(node).some(function(ancestor) {
+            return ancestor.nodeType == DOM.ELEMENT_NODE && isDescendant(ancestor, block)
+                && getComputedStyle(ancestor).display == "none";
+        })) {
+            continue;
+        }
+        if (isHtmlElement(node, "br")) {
+            return false;
+        }
+        if (takesRoomOnLine(node)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// "A whitespace node is either a Text node whose data is the empty string; or
+// a Text node whose data consists only of one or more tabs (0x0009), line
+// feeds (0x000A), carriage returns (0x000D), and/or spaces (0x0020), and whose
+// parent is an Element whose resolved value for "white-space" is "normal" or
+// "nowrap"; or a Text node whose data consists only of one or more tabs
+// (0x0009), carriage returns (0x000D), and/or spaces (0x0020), and whose
+// parent is an Element whose resolved value for "white-space" is "pre-line"."
+function isWhitespaceNode(node) {
+    return node
+        && node.nodeType == DOM.TEXT_NODE
+        && (node.data == ""
+        || (
+            /^[\t\n\r ]+$/.test(node.data)
+            && node.parentNode
+            && node.parentNode.nodeType == DOM.ELEMENT_NODE
+            && ["normal", "nowrap"].indexOf(getComputedStyle(node.parentNode).whiteSpace) != -1
+        ) || (
+            /^[\t\r ]+$/.test(node.data)
+            && node.parentNode
+            && node.parentNode.nodeType == DOM.ELEMENT_NODE
+            && getComputedStyle(node.parentNode).whiteSpace == "pre-line"
+        ));
+}
+
+// "node is a collapsed whitespace node if the following algorithm returns
+// true:"
+function isCollapsedWhitespaceNode(node) {
+    // "If node is not a whitespace node, return false."
+    if (!isWhitespaceNode(node)) {
+        return false;
+    }
+
+    // "If node's data is the empty string, return true."
+    if (node.data == "") {
+        return true;
+    }
+
+    // "Let ancestor be node's parent."
+    var ancestor = node.parentNode;
+
+    // "If ancestor is null, return true."
+    if (!ancestor) {
+        return true;
+    }
+
+    // "If the "display" property of some ancestor of node has resolved value
+    // "none", return true."
+    if (getAncestors(node).some(function(ancestor) {
+        return ancestor.nodeType == DOM.ELEMENT_NODE
+            && getComputedStyle(ancestor).display == "none";
+    })) {
+        return true;
+    }
+
+    // "While ancestor is not a block node and its parent is not null, set
+    // ancestor to its parent."
+    while (!isBlockNode(ancestor)
+    && ancestor.parentNode) {
+        ancestor = ancestor.parentNode;
+    }
+
+    // "Let reference be node."
+    var reference = node;
+
+    // "While reference is a descendant of ancestor:"
+    while (reference != ancestor) {
+        // "Let reference be the node before it in tree order."
+        reference = previousNode(reference);
+
+        // "If reference is a block node or a br, return true."
+        if (isBlockNode(reference)
+        || isHtmlElement(reference, "br")) {
+            return true;
+        }
+
+        // "If reference is a Text node that is not a whitespace node, or is an
+        // img, break from this loop."
+        if ((reference.nodeType == DOM.TEXT_NODE && !isWhitespaceNode(reference))
+        || isHtmlElement(reference, "img")) {
+            break;
+        }
+    }
+
+    // "Let reference be node."
+    reference = node;
+
+    // "While reference is a descendant of ancestor:"
+    var stop = nextNodeDescendants(ancestor);
+    while (reference != stop) {
+        // "Let reference be the node after it in tree order, or null if there
+        // is no such node."
+        reference = nextNode(reference);
+
+        // "If reference is a block node or a br, return true."
+        if (isBlockNode(reference)
+        || isHtmlElement(reference, "br")) {
+            return true;
+        }
+
+        // "If reference is a Text node that is not a whitespace node, or is an
+        // img, break from this loop."
+        if ((reference && reference.nodeType == DOM.TEXT_NODE && !isWhitespaceNode(reference))
+        || isHtmlElement(reference, "img")) {
+            break;
+        }
+    }
+
+    // "Return false."
+    return false;
+}
+
+// "Something is visible if it is a node that either is a block node, or a Text
+// node that is not a collapsed whitespace node, or an img, or a br that is not
+// an extraneous line break, or any node with a visible descendant; excluding
+// any node with an ancestor container Element whose "display" property has
+// resolved value "none"."
+function isVisible(node) {
+    if (!node) {
+        return false;
+    }
+
+    if (getAncestors(node).concat(node)
+    .filter(function(node) { return node.nodeType == DOM.ELEMENT_NODE })
+    .some(function(node) { return getComputedStyle(node).display == "none" })) {
+        return false;
+    }
+
+    if (isBlockNode(node)
+    || (node.nodeType == DOM.TEXT_NODE && !isCollapsedWhitespaceNode(node))
+    || isHtmlElement(node, "img")
+    || (isHtmlElement(node, "br") && !isExtraneousLineBreak(node))) {
+        return true;
+    }
+
+    for (var i = 0; i < node.childNodes.length; i++) {
+        if (isVisible(node.childNodes[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// "Something is invisible if it is a node that is not visible."
+function isInvisible(node) {
+    return node && !isVisible(node);
+}
+
+// "A collapsed block prop is either a collapsed line break that is not an
+// extraneous line break, or an Element that is an inline node and whose
+// children are all either invisible or collapsed block props and that has at
+// least one child that is a collapsed block prop."
+function isCollapsedBlockProp(node) {
+    if (isCollapsedLineBreak(node)
+    && !isExtraneousLineBreak(node)) {
+        return true;
+    }
+
+    if (!isInlineNode(node)
+    || node.nodeType != DOM.ELEMENT_NODE) {
+        return false;
+    }
+
+    var hasCollapsedBlockPropChild = false;
+    for (var i = 0; i < node.childNodes.length; i++) {
+        if (!isInvisible(node.childNodes[i])
+        && !isCollapsedBlockProp(node.childNodes[i])) {
+            return false;
+        }
+        if (isCollapsedBlockProp(node.childNodes[i])) {
+            hasCollapsedBlockPropChild = true;
+        }
+    }
+
+    return hasCollapsedBlockPropChild;
+}
+
+// "The active range is the range of the selection given by calling
+// getSelection() on the context object. (Thus the active range may be null.)"
+//
+// We cheat and return globalRange if that's defined.  We also ensure that the
+// active range meets the requirements that selection boundary points are
+// supposed to meet, i.e., that the nodes are both Text or Element nodes that
+// descend from a Document.
+// "The active range is the range of the selection given by calling
+// getSelection() on the context object. (Thus the active range may be null.)"
+// While a command runs, the range it first read stays the active range: the algorithms
+// below move it alongside each change they make to the selection (as the reference
+// implementation does), and the selection takes it when the command ends.
+function getActiveRange() {
+    if (globalRange) {
+        return globalRange;
+    }
+    var selection = getSelection();
+    var range = selection.rangeCount ? selection.getRangeAt(0) : null;
+    if (commandDepth > 0) {
+        globalRange = range;
+    }
+    return range;
+}
+
+// "For some commands, each HTMLDocument must have a boolean state override
+// and/or a string value override. These do not change the command's state or
+// value, but change the way some algorithms behave, as specified in those
+// algorithms' definitions. Initially, both must be unset for every command.
+// Whenever the number of ranges in the Selection changes to something
+// different, and whenever a boundary point of the range at a given index in
+// the Selection changes to something different, the state override and value
+// override must be unset for every command."
+//
+// We implement this crudely by using setters and getters.  To verify that the
+// selection hasn't changed, we copy the active range and just check the
+// endpoints match.  This isn't really correct, but it's good enough for us.
+// Unset state/value overrides are undefined.  We put everything in a function
+// so no one can access anything except via the provided functions, since
+// otherwise callers might mistakenly use outdated overrides (if the selection
+// has changed).
+var getStateOverride, setStateOverride, unsetStateOverride,
+    getValueOverride, setValueOverride, unsetValueOverride;
+(function() {
+    var stateOverrides = {};
+    var valueOverrides = {};
+    var storedRange = null;
+
+    function resetOverrides() {
+        if (!storedRange
+        || storedRange.startContainer != getActiveRange().startContainer
+        || storedRange.endContainer != getActiveRange().endContainer
+        || storedRange.startOffset != getActiveRange().startOffset
+        || storedRange.endOffset != getActiveRange().endOffset) {
+            stateOverrides = {};
+            valueOverrides = {};
+            storedRange = getActiveRange().cloneRange();
+        }
+    }
+
+    getStateOverride = function(command) {
+        resetOverrides();
+        return stateOverrides[command];
+    };
+
+    setStateOverride = function(command, newState) {
+        resetOverrides();
+        stateOverrides[command] = newState;
+    };
+
+    unsetStateOverride = function(command) {
+        resetOverrides();
+        delete stateOverrides[command];
+    }
+
+    getValueOverride = function(command) {
+        resetOverrides();
+        return valueOverrides[command];
+    }
+
+    // "The value override for the backColor command must be the same as the
+    // value override for the hiliteColor command, such that setting one sets
+    // the other to the same thing and unsetting one unsets the other."
+    setValueOverride = function(command, newValue) {
+        resetOverrides();
+        valueOverrides[command] = newValue;
+        if (command == "backcolor") {
+            valueOverrides.hilitecolor = newValue;
+        } else if (command == "hilitecolor") {
+            valueOverrides.backcolor = newValue;
+        }
+    }
+
+    unsetValueOverride = function(command) {
+        resetOverrides();
+        delete valueOverrides[command];
+        if (command == "backcolor") {
+            delete valueOverrides.hilitecolor;
+        } else if (command == "hilitecolor") {
+            delete valueOverrides.backcolor;
+        }
+    }
+})();
+
+//@}
+
+/////////////////////////////
+///// Common algorithms /////
+/////////////////////////////
+
+///// Assorted common algorithms /////
+//@{
+
+// Magic array of extra ranges whose endpoints we want to preserve.
+var extraRanges = [];
+
+function movePreservingRanges(node, newParent, newIndex) {
+    // For convenience, I allow newIndex to be -1 to mean "insert at the end".
+    if (newIndex == -1) {
+        newIndex = newParent.childNodes.length;
+    }
+    moveNodePreservingRanges(node, newParent, newIndex);
+}
+
+function setTagName(element, newName) {
+    // "If element is an HTML element with local name equal to new name, return
+    // element."
+    if (isHtmlElement(element, newName.toUpperCase())) {
+        return element;
+    }
+
+    // "If element's parent is null, return element."
+    if (!element.parentNode) {
+        return element;
+    }
+
+    // "Let replacement element be the result of calling createElement(new
+    // name) on the ownerDocument of element."
+    var replacementElement = createElement(newName);
+
+    // "Insert replacement element into element's parent immediately before
+    // element."
+    element.parentNode.insertBefore(replacementElement, element);
+
+    // "Copy all attributes of element to replacement element, in order."
+    for (var i = 0; i < attributesOf(element).length; i++) {
+        replacementElement.setAttribute(attributesOf(element)[i].name, attributesOf(element)[i].value);
+    }
+
+    // "While element has children, append the first child of element as the
+    // last child of replacement element, preserving ranges."
+    while (element.childNodes.length) {
+        movePreservingRanges(element.firstChild, replacementElement, replacementElement.childNodes.length);
+    }
+
+    // "Remove element from its parent."
+    element.parentNode.removeChild(element);
+
+    // "Return replacement element."
+    return replacementElement;
+}
+
+function removeExtraneousLineBreaksBefore(node) {
+    // "Let ref be the previousSibling of node."
+    var ref = node.previousSibling;
+
+    // "If ref is null, abort these steps."
+    if (!ref) {
+        return;
+    }
+
+    // "While ref has children, set ref to its lastChild."
+    while (ref.hasChildNodes()) {
+        ref = ref.lastChild;
+    }
+
+    // "While ref is invisible but not an extraneous line break, and ref does
+    // not equal node's parent, set ref to the node before it in tree order."
+    while (isInvisible(ref)
+    && !isExtraneousLineBreak(ref)
+    && ref != node.parentNode) {
+        ref = previousNode(ref);
+    }
+
+    // "If ref is an editable extraneous line break, remove it from its
+    // parent."
+    if (isEditable(ref)
+    && isExtraneousLineBreak(ref)) {
+        ref.parentNode.removeChild(ref);
+    }
+}
+
+function removeExtraneousLineBreaksAtTheEndOf(node) {
+    // "Let ref be node."
+    var ref = node;
+
+    // "While ref has children, set ref to its lastChild."
+    while (ref.hasChildNodes()) {
+        ref = ref.lastChild;
+    }
+
+    // "While ref is invisible but not an extraneous line break, and ref does
+    // not equal node, set ref to the node before it in tree order."
+    while (isInvisible(ref)
+    && !isExtraneousLineBreak(ref)
+    && ref != node) {
+        ref = previousNode(ref);
+    }
+
+    // "If ref is an editable extraneous line break:"
+    if (isEditable(ref)
+    && isExtraneousLineBreak(ref)) {
+        // "While ref's parent is editable and invisible, set ref to its
+        // parent."
+        while (isEditable(ref.parentNode)
+        && isInvisible(ref.parentNode)) {
+            ref = ref.parentNode;
+        }
+
+        // "Remove ref from its parent."
+        ref.parentNode.removeChild(ref);
+    }
+}
+
+// "To remove extraneous line breaks from a node, first remove extraneous line
+// breaks before it, then remove extraneous line breaks at the end of it."
+function removeExtraneousLineBreaksFrom(node) {
+    removeExtraneousLineBreaksBefore(node);
+    removeExtraneousLineBreaksAtTheEndOf(node);
+}
+
+//@}
+///// Wrapping a list of nodes /////
+//@{
+
+function wrap(nodeList, siblingCriteria, newParentInstructions) {
+    // "If not provided, sibling criteria returns false and new parent
+    // instructions returns null."
+    if (typeof siblingCriteria == "undefined") {
+        siblingCriteria = function() { return false };
+    }
+    if (typeof newParentInstructions == "undefined") {
+        newParentInstructions = function() { return null };
+    }
+
+    // "If every member of node list is invisible, and none is a br, return
+    // null and abort these steps."
+    if (nodeList.every(isInvisible)
+    && !nodeList.some(function(node) { return isHtmlElement(node, "br") })) {
+        return null;
+    }
+
+    // "If node list's first member's parent is null, return null and abort
+    // these steps."
+    if (!nodeList[0].parentNode) {
+        return null;
+    }
+
+    // "If node list's last member is an inline node that's not a br, and node
+    // list's last member's nextSibling is a br, append that br to node list."
+    if (isInlineNode(nodeList[nodeList.length - 1])
+    && !isHtmlElement(nodeList[nodeList.length - 1], "br")
+    && isHtmlElement(nodeList[nodeList.length - 1].nextSibling, "br")) {
+        nodeList.push(nodeList[nodeList.length - 1].nextSibling);
+    }
+
+    // "While node list's first member's previousSibling is invisible, prepend
+    // it to node list."
+    while (isInvisible(nodeList[0].previousSibling)) {
+        nodeList.unshift(nodeList[0].previousSibling);
+    }
+
+    // "While node list's last member's nextSibling is invisible, append it to
+    // node list."
+    while (isInvisible(nodeList[nodeList.length - 1].nextSibling)) {
+        nodeList.push(nodeList[nodeList.length - 1].nextSibling);
+    }
+
+    // "If the previousSibling of the first member of node list is editable and
+    // running sibling criteria on it returns true, let new parent be the
+    // previousSibling of the first member of node list."
+    var newParent;
+    if (isEditable(nodeList[0].previousSibling)
+    && siblingCriteria(nodeList[0].previousSibling)) {
+        newParent = nodeList[0].previousSibling;
+
+    // "Otherwise, if the nextSibling of the last member of node list is
+    // editable and running sibling criteria on it returns true, let new parent
+    // be the nextSibling of the last member of node list."
+    } else if (isEditable(nodeList[nodeList.length - 1].nextSibling)
+    && siblingCriteria(nodeList[nodeList.length - 1].nextSibling)) {
+        newParent = nodeList[nodeList.length - 1].nextSibling;
+
+    // "Otherwise, run new parent instructions, and let new parent be the
+    // result."
+    } else {
+        newParent = newParentInstructions();
+    }
+
+    // "If new parent is null, abort these steps and return null."
+    if (!newParent) {
+        return null;
+    }
+
+    // "If new parent's parent is null:"
+    if (!newParent.parentNode) {
+        // "Insert new parent into the parent of the first member of node list
+        // immediately before the first member of node list."
+        nodeList[0].parentNode.insertBefore(newParent, nodeList[0]);
+
+        // "If any range has a boundary point with node equal to the parent of
+        // new parent and offset equal to the index of new parent, add one to
+        // that boundary point's offset."
+        //
+        // Only try to fix the global range.
+        if (globalRange.startContainer == newParent.parentNode
+        && globalRange.startOffset == getNodeIndex(newParent)) {
+            globalRange.setStart(globalRange.startContainer, globalRange.startOffset + 1);
+        }
+        if (globalRange.endContainer == newParent.parentNode
+        && globalRange.endOffset == getNodeIndex(newParent)) {
+            globalRange.setEnd(globalRange.endContainer, globalRange.endOffset + 1);
+        }
+    }
+
+    // "Let original parent be the parent of the first member of node list."
+    var originalParent = nodeList[0].parentNode;
+
+    // "If new parent is before the first member of node list in tree order:"
+    if (isBefore(newParent, nodeList[0])) {
+        // "If new parent is not an inline node, but the last visible child of
+        // new parent and the first visible member of node list are both inline
+        // nodes, and the last child of new parent is not a br, call
+        // createElement("br") on the ownerDocument of new parent and append
+        // the result as the last child of new parent."
+        if (!isInlineNode(newParent)
+        && isInlineNode([].filter.call(newParent.childNodes, isVisible).slice(-1)[0])
+        && isInlineNode(nodeList.filter(isVisible)[0])
+        && !isHtmlElement(newParent.lastChild, "BR")) {
+            newParent.appendChild(createElement("br"));
+        }
+
+        // "For each node in node list, append node as the last child of new
+        // parent, preserving ranges."
+        for (var i = 0; i < nodeList.length; i++) {
+            movePreservingRanges(nodeList[i], newParent, -1);
+        }
+
+    // "Otherwise:"
+    } else {
+        // "If new parent is not an inline node, but the first visible child of
+        // new parent and the last visible member of node list are both inline
+        // nodes, and the last member of node list is not a br, call
+        // createElement("br") on the ownerDocument of new parent and insert
+        // the result as the first child of new parent."
+        if (!isInlineNode(newParent)
+        && isInlineNode([].filter.call(newParent.childNodes, isVisible)[0])
+        && isInlineNode(nodeList.filter(isVisible).slice(-1)[0])
+        && !isHtmlElement(nodeList[nodeList.length - 1], "BR")) {
+            newParent.insertBefore(createElement("br"), newParent.firstChild);
+        }
+
+        // "For each node in node list, in reverse order, insert node as the
+        // first child of new parent, preserving ranges."
+        for (var i = nodeList.length - 1; i >= 0; i--) {
+            movePreservingRanges(nodeList[i], newParent, 0);
+        }
+    }
+
+    // "If original parent is editable and has no children, remove it from its
+    // parent."
+    if (isEditable(originalParent) && !originalParent.hasChildNodes()) {
+        originalParent.parentNode.removeChild(originalParent);
+    }
+
+    // "If new parent's nextSibling is editable and running sibling criteria on
+    // it returns true:"
+    if (isEditable(newParent.nextSibling)
+    && siblingCriteria(newParent.nextSibling)) {
+        // "If new parent is not an inline node, but new parent's last child
+        // and new parent's nextSibling's first child are both inline nodes,
+        // and new parent's last child is not a br, call createElement("br") on
+        // the ownerDocument of new parent and append the result as the last
+        // child of new parent."
+        if (!isInlineNode(newParent)
+        && isInlineNode(newParent.lastChild)
+        && isInlineNode(newParent.nextSibling.firstChild)
+        && !isHtmlElement(newParent.lastChild, "BR")) {
+            newParent.appendChild(createElement("br"));
+        }
+
+        // "While new parent's nextSibling has children, append its first child
+        // as the last child of new parent, preserving ranges."
+        while (newParent.nextSibling.hasChildNodes()) {
+            movePreservingRanges(newParent.nextSibling.firstChild, newParent, -1);
+        }
+
+        // "Remove new parent's nextSibling from its parent."
+        newParent.parentNode.removeChild(newParent.nextSibling);
+    }
+
+    // "Remove extraneous line breaks from new parent."
+    removeExtraneousLineBreaksFrom(newParent);
+
+    // "Return new parent."
+    return newParent;
+}
+
+
+//@}
+///// Allowed children /////
+//@{
+
+// "A name of an element with inline contents is "a", "abbr", "b", "bdi",
+// "bdo", "cite", "code", "dfn", "em", "h1", "h2", "h3", "h4", "h5", "h6", "i",
+// "kbd", "mark", "p", "pre", "q", "rp", "rt", "ruby", "s", "samp", "small",
+// "span", "strong", "sub", "sup", "u", "var", "acronym", "listing", "strike",
+// "xmp", "big", "blink", "font", "marquee", "nobr", or "tt"."
+var namesOfElementsWithInlineContents = ["a", "abbr", "b", "bdi", "bdo",
+    "cite", "code", "dfn", "em", "h1", "h2", "h3", "h4", "h5", "h6", "i",
+    "kbd", "mark", "p", "pre", "q", "rp", "rt", "ruby", "s", "samp", "small",
+    "span", "strong", "sub", "sup", "u", "var", "acronym", "listing", "strike",
+    "xmp", "big", "blink", "font", "marquee", "nobr", "tt"];
+
+// "An element with inline contents is an HTML element whose local name is a
+// name of an element with inline contents."
+function isElementWithInlineContents(node) {
+    return isHtmlElement(node, namesOfElementsWithInlineContents);
+}
+
+function isAllowedChild(child, parent_) {
+    // "If parent is "colgroup", "table", "tbody", "tfoot", "thead", "tr", or
+    // an HTML element with local name equal to one of those, and child is a
+    // Text node whose data does not consist solely of space characters, return
+    // false."
+    if ((["colgroup", "table", "tbody", "tfoot", "thead", "tr"].indexOf(parent_) != -1
+    || isHtmlElement(parent_, ["colgroup", "table", "tbody", "tfoot", "thead", "tr"]))
+    && typeof child == "object"
+    && child.nodeType == DOM.TEXT_NODE
+    && !/^[ \t\n\f\r]*$/.test(child.data)) {
+        return false;
+    }
+
+    // "If parent is "script", "style", "plaintext", or "xmp", or an HTML
+    // element with local name equal to one of those, and child is not a Text
+    // node, return false."
+    if ((["script", "style", "plaintext", "xmp"].indexOf(parent_) != -1
+    || isHtmlElement(parent_, ["script", "style", "plaintext", "xmp"]))
+    && (typeof child != "object" || child.nodeType != DOM.TEXT_NODE)) {
+        return false;
+    }
+
+    // "If child is a Document, DocumentFragment, or DocumentType, return
+    // false."
+    if (typeof child == "object"
+    && (child.nodeType == DOM.DOCUMENT_NODE
+    || child.nodeType == DOM.DOCUMENT_FRAGMENT_NODE
+    || child.nodeType == DOM.DOCUMENT_TYPE_NODE)) {
+        return false;
+    }
+
+    // "If child is an HTML element, set child to the local name of child."
+    if (isHtmlElement(child)) {
+        child = child.tagName.toLowerCase();
+    }
+
+    // "If child is not a string, return true."
+    if (typeof child != "string") {
+        return true;
+    }
+
+    // "If parent is an HTML element:"
+    if (isHtmlElement(parent_)) {
+        // "If child is "a", and parent or some ancestor of parent is an a,
+        // return false."
+        //
+        // "If child is a prohibited paragraph child name and parent or some
+        // ancestor of parent is an element with inline contents, return
+        // false."
+        //
+        // "If child is "h1", "h2", "h3", "h4", "h5", or "h6", and parent or
+        // some ancestor of parent is an HTML element with local name "h1",
+        // "h2", "h3", "h4", "h5", or "h6", return false."
+        var ancestor = parent_;
+        while (ancestor) {
+            if (child == "a" && isHtmlElement(ancestor, "a")) {
+                return false;
+            }
+            if (prohibitedParagraphChildNames.indexOf(child) != -1
+            && isElementWithInlineContents(ancestor)) {
+                return false;
+            }
+            if (/^h[1-6]$/.test(child)
+            && isHtmlElement(ancestor)
+            && /^H[1-6]$/.test(ancestor.tagName)) {
+                return false;
+            }
+            ancestor = ancestor.parentNode;
+        }
+
+        // "Let parent be the local name of parent."
+        parent_ = parent_.tagName.toLowerCase();
+    }
+
+    // "If parent is an Element or DocumentFragment, return true."
+    if (typeof parent_ == "object"
+    && (parent_.nodeType == DOM.ELEMENT_NODE
+    || parent_.nodeType == DOM.DOCUMENT_FRAGMENT_NODE)) {
+        return true;
+    }
+
+    // "If parent is not a string, return false."
+    if (typeof parent_ != "string") {
+        return false;
+    }
+
+    // "If parent is on the left-hand side of an entry on the following list,
+    // then return true if child is listed on the right-hand side of that
+    // entry, and false otherwise."
+    switch (parent_) {
+        case "colgroup":
+            return child == "col";
+        case "table":
+            return ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"].indexOf(child) != -1;
+        case "tbody":
+        case "thead":
+        case "tfoot":
+            return ["td", "th", "tr"].indexOf(child) != -1;
+        case "tr":
+            return ["td", "th"].indexOf(child) != -1;
+        case "dl":
+            return ["dt", "dd"].indexOf(child) != -1;
+        case "dir":
+        case "ol":
+        case "ul":
+            return ["dir", "li", "ol", "ul"].indexOf(child) != -1;
+        case "hgroup":
+            return /^h[1-6]$/.test(child);
+    }
+
+    // "If child is "body", "caption", "col", "colgroup", "frame", "frameset",
+    // "head", "html", "tbody", "td", "tfoot", "th", "thead", or "tr", return
+    // false."
+    if (["body", "caption", "col", "colgroup", "frame", "frameset", "head",
+    "html", "tbody", "td", "tfoot", "th", "thead", "tr"].indexOf(child) != -1) {
+        return false;
+    }
+
+    // "If child is "dd" or "dt" and parent is not "dl", return false."
+    if (["dd", "dt"].indexOf(child) != -1
+    && parent_ != "dl") {
+        return false;
+    }
+
+    // "If child is "li" and parent is not "ol" or "ul", return false."
+    if (child == "li"
+    && parent_ != "ol"
+    && parent_ != "ul") {
+        return false;
+    }
+
+    // "If parent is on the left-hand side of an entry on the following list
+    // and child is listed on the right-hand side of that entry, return false."
+    var table = [
+        [["a"], ["a"]],
+        [["dd", "dt"], ["dd", "dt"]],
+        [["h1", "h2", "h3", "h4", "h5", "h6"], ["h1", "h2", "h3", "h4", "h5", "h6"]],
+        [["li"], ["li"]],
+        [["nobr"], ["nobr"]],
+        [namesOfElementsWithInlineContents, prohibitedParagraphChildNames],
+        [["td", "th"], ["caption", "col", "colgroup", "tbody", "td", "tfoot", "th", "thead", "tr"]],
+    ];
+    for (var i = 0; i < table.length; i++) {
+        if (table[i][0].indexOf(parent_) != -1
+        && table[i][1].indexOf(child) != -1) {
+            return false;
+        }
+    }
+
+    // "Return true."
+    return true;
+}
+
+
+//@}
+
+//////////////////////////////////////
+///// Inline formatting commands /////
+//////////////////////////////////////
+
+///// Inline formatting command definitions /////
+//@{
+
+// "A node node is effectively contained in a range range if range is not
+// collapsed, and at least one of the following holds:"
+function isEffectivelyContained(node, range) {
+    if (range.collapsed) {
+        return false;
+    }
+
+    // "node is contained in range."
+    if (isContained(node, range)) {
+        return true;
+    }
+
+    // "node is range's start node, it is a Text node, and its length is
+    // different from range's start offset."
+    if (node == range.startContainer
+    && node.nodeType == DOM.TEXT_NODE
+    && getNodeLength(node) != range.startOffset) {
+        return true;
+    }
+
+    // "node is range's end node, it is a Text node, and range's end offset is
+    // not 0."
+    if (node == range.endContainer
+    && node.nodeType == DOM.TEXT_NODE
+    && range.endOffset != 0) {
+        return true;
+    }
+
+    // "node has at least one child; and all its children are effectively
+    // contained in range; and either range's start node is not a descendant of
+    // node or is not a Text node or range's start offset is zero; and either
+    // range's end node is not a descendant of node or is not a Text node or
+    // range's end offset is its end node's length."
+    if (node.hasChildNodes()
+    && [].every.call(node.childNodes, function(child) { return isEffectivelyContained(child, range) })
+    && (!isDescendant(range.startContainer, node)
+    || range.startContainer.nodeType != DOM.TEXT_NODE
+    || range.startOffset == 0)
+    && (!isDescendant(range.endContainer, node)
+    || range.endContainer.nodeType != DOM.TEXT_NODE
+    || range.endOffset == getNodeLength(range.endContainer))) {
+        return true;
+    }
+
+    return false;
+}
+
+// Like get(All)ContainedNodes(), but for effectively contained nodes.
+function getEffectivelyContainedNodes(range, condition) {
+    if (typeof condition == "undefined") {
+        condition = function() { return true };
+    }
+    var node = range.startContainer;
+    // A tree whose every node is in the range ends at its root: there is no parent above.
+    while (node.parentNode && isEffectivelyContained(node.parentNode, range)) {
+        node = node.parentNode;
+    }
+
+    var stop = nextNodeDescendants(range.endContainer);
+
+    var nodeList = [];
+    while (isBefore(node, stop)) {
+        if (isEffectivelyContained(node, range)
+        && condition(node)) {
+            nodeList.push(node);
+            node = nextNodeDescendants(node);
+            continue;
+        }
+        node = nextNode(node);
+    }
+    return nodeList;
+}
+
+function getAllEffectivelyContainedNodes(range, condition) {
+    if (typeof condition == "undefined") {
+        condition = function() { return true };
+    }
+    var node = range.startContainer;
+    // A tree whose every node is in the range ends at its root: there is no parent above.
+    while (node.parentNode && isEffectivelyContained(node.parentNode, range)) {
+        node = node.parentNode;
+    }
+
+    var stop = nextNodeDescendants(range.endContainer);
+
+    var nodeList = [];
+    while (isBefore(node, stop)) {
+        if (isEffectivelyContained(node, range)
+        && condition(node)) {
+            nodeList.push(node);
+        }
+        node = nextNode(node);
+    }
+    return nodeList;
+}
+
+// "A modifiable element is a b, em, i, s, span, strong, sub, sup, or u element
+// with no attributes except possibly style; or a font element with no
+// attributes except possibly style, color, face, and/or size; or an a element
+// with no attributes except possibly style and/or href."
+function isModifiableElement(node) {
+    if (!isHtmlElement(node)) {
+        return false;
+    }
+
+    if (["B", "EM", "I", "S", "SPAN", "STRIKE", "STRONG", "SUB", "SUP", "U"].indexOf(node.tagName) != -1) {
+        if (attributesOf(node).length == 0) {
+            return true;
+        }
+
+        if (attributesOf(node).length == 1
+        && node.hasAttribute("style")) {
+            return true;
+        }
+    }
+
+    if (node.tagName == "FONT" || node.tagName == "A") {
+        var numAttrs = attributesOf(node).length;
+
+        if (node.hasAttribute("style")) {
+            numAttrs--;
+        }
+
+        if (node.tagName == "FONT") {
+            if (node.hasAttribute("color")) {
+                numAttrs--;
+            }
+
+            if (node.hasAttribute("face")) {
+                numAttrs--;
+            }
+
+            if (node.hasAttribute("size")) {
+                numAttrs--;
+            }
+        }
+
+        if (node.tagName == "A"
+        && node.hasAttribute("href")) {
+            numAttrs--;
+        }
+
+        if (numAttrs == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function isSimpleModifiableElement(node) {
+    // "A simple modifiable element is an HTML element for which at least one
+    // of the following holds:"
+    if (!isHtmlElement(node)) {
+        return false;
+    }
+
+    // Only these elements can possibly be a simple modifiable element.
+    if (["A", "B", "EM", "FONT", "I", "S", "SPAN", "STRIKE", "STRONG", "SUB", "SUP", "U"].indexOf(node.tagName) == -1) {
+        return false;
+    }
+
+    // "It is an a, b, em, font, i, s, span, strike, strong, sub, sup, or u
+    // element with no attributes."
+    if (attributesOf(node).length == 0) {
+        return true;
+    }
+
+    // If it's got more than one attribute, everything after this fails.
+    if (attributesOf(node).length > 1) {
+        return false;
+    }
+
+    // "It is an a, b, em, font, i, s, span, strike, strong, sub, sup, or u
+    // element with exactly one attribute, which is style, which sets no CSS
+    // properties (including invalid or unrecognized properties)."
+    //
+    // Not gonna try for invalid or unrecognized.
+    if (node.hasAttribute("style")
+    && node.style.length == 0) {
+        return true;
+    }
+
+    // "It is an a element with exactly one attribute, which is href."
+    if (node.tagName == "A"
+    && node.hasAttribute("href")) {
+        return true;
+    }
+
+    // "It is a font element with exactly one attribute, which is either color,
+    // face, or size."
+    if (node.tagName == "FONT"
+    && (node.hasAttribute("color")
+    || node.hasAttribute("face")
+    || node.hasAttribute("size")
+    )) {
+        return true;
+    }
+
+    // "It is a b or strong element with exactly one attribute, which is style,
+    // and the style attribute sets exactly one CSS property (including invalid
+    // or unrecognized properties), which is "font-weight"."
+    if ((node.tagName == "B" || node.tagName == "STRONG")
+    && node.hasAttribute("style")
+    && node.style.length == 1
+    && node.style.fontWeight != "") {
+        return true;
+    }
+
+    // "It is an i or em element with exactly one attribute, which is style,
+    // and the style attribute sets exactly one CSS property (including invalid
+    // or unrecognized properties), which is "font-style"."
+    if ((node.tagName == "I" || node.tagName == "EM")
+    && node.hasAttribute("style")
+    && node.style.length == 1
+    && node.style.fontStyle != "") {
+        return true;
+    }
+
+    // "It is an a, font, or span element with exactly one attribute, which is
+    // style, and the style attribute sets exactly one CSS property (including
+    // invalid or unrecognized properties), and that property is not
+    // "text-decoration"."
+    if ((node.tagName == "A" || node.tagName == "FONT" || node.tagName == "SPAN")
+    && node.hasAttribute("style")
+    && node.style.length == 1
+    && node.style.textDecoration == "") {
+        return true;
+    }
+
+    // "It is an a, font, s, span, strike, or u element with exactly one
+    // attribute, which is style, and the style attribute sets exactly one CSS
+    // property (including invalid or unrecognized properties), which is
+    // "text-decoration", which is set to "line-through" or "underline" or
+    // "overline" or "none"."
+    //
+    // The weird extra node.style.length check is for Firefox, which as of
+    // 8.0a2 has annoying and weird behavior here.
+    if (["A", "FONT", "S", "SPAN", "STRIKE", "U"].indexOf(node.tagName) != -1
+    && node.hasAttribute("style")
+    && (node.style.length == 1
+        || (node.style.length == 4
+            && "MozTextBlink" in node.style
+            && "MozTextDecorationColor" in node.style
+            && "MozTextDecorationLine" in node.style
+            && "MozTextDecorationStyle" in node.style)
+        || (node.style.length == 4
+            && "MozTextBlink" in node.style
+            && "textDecorationColor" in node.style
+            && "textDecorationLine" in node.style
+            && "textDecorationStyle" in node.style)
+    )
+    && (node.style.textDecoration == "line-through"
+    || node.style.textDecoration == "underline"
+    || node.style.textDecoration == "overline"
+    || node.style.textDecoration == "none")) {
+        return true;
+    }
+
+    return false;
+}
+
+// "A formattable node is an editable visible node that is either a Text node,
+// an img, or a br."
+function isFormattableNode(node) {
+    return isEditable(node)
+        && isVisible(node)
+        && (node.nodeType == DOM.TEXT_NODE
+        || isHtmlElement(node, ["img", "br"]));
+}
+
+// "Two quantities are equivalent values for a command if either both are null,
+// or both are strings and they're equal and the command does not define any
+// equivalent values, or both are strings and the command defines equivalent
+// values and they match the definition."
+function areEquivalentValues(command, val1, val2) {
+    if (val1 === null && val2 === null) {
+        return true;
+    }
+
+    if (typeof val1 == "string"
+    && typeof val2 == "string"
+    && val1 == val2
+    && !("equivalentValues" in commands[command])) {
+        return true;
+    }
+
+    if (typeof val1 == "string"
+    && typeof val2 == "string"
+    && "equivalentValues" in commands[command]
+    && commands[command].equivalentValues(val1, val2)) {
+        return true;
+    }
+
+    return false;
+}
+
+// "Two quantities are loosely equivalent values for a command if either they
+// are equivalent values for the command, or if the command is the fontSize
+// command; one of the quantities is one of "x-small", "small", "medium",
+// "large", "x-large", "xx-large", or "xxx-large"; and the other quantity is
+// the resolved value of "font-size" on a font element whose size attribute has
+// the corresponding value set ("1" through "7" respectively)."
+function areLooselyEquivalentValues(command, val1, val2) {
+    if (areEquivalentValues(command, val1, val2)) {
+        return true;
+    }
+
+    if (command != "fontsize"
+    || typeof val1 != "string"
+    || typeof val2 != "string") {
+        return false;
+    }
+
+    return val1 === LEGACY_FONT_PIXELS[val2]
+        || val2 === LEGACY_FONT_PIXELS[val1];
+}
+
+//@}
+///// Assorted inline formatting command algorithms /////
+//@{
+
+function getEffectiveCommandValue(node, command) {
+    // "If neither node nor its parent is an Element, return null."
+    if (node.nodeType != DOM.ELEMENT_NODE
+    && (!node.parentNode || node.parentNode.nodeType != DOM.ELEMENT_NODE)) {
+        return null;
+    }
+
+    // "If node is not an Element, return the effective command value of its
+    // parent for command."
+    if (node.nodeType != DOM.ELEMENT_NODE) {
+        return getEffectiveCommandValue(node.parentNode, command);
+    }
+
+    // "If command is "createLink" or "unlink":"
+    if (command == "createlink" || command == "unlink") {
+        // "While node is not null, and is not an a element that has an href
+        // attribute, set node to its parent."
+        while (node
+        && (!isHtmlElement(node)
+        || node.tagName != "A"
+        || !node.hasAttribute("href"))) {
+            node = node.parentNode;
+        }
+
+        // "If node is null, return null."
+        if (!node) {
+            return null;
+        }
+
+        // "Return the value of node's href attribute."
+        return node.getAttribute("href");
+    }
+
+    // "If command is "backColor" or "hiliteColor":"
+    if (command == "backcolor"
+    || command == "hilitecolor") {
+        // "While the resolved value of "background-color" on node is any
+        // fully transparent value, and node's parent is an Element, set
+        // node to its parent."
+        //
+        // Another lame hack to avoid flawed APIs.
+        while ((getComputedStyle(node).backgroundColor == "rgba(0, 0, 0, 0)"
+        || getComputedStyle(node).backgroundColor === ""
+        || getComputedStyle(node).backgroundColor == "transparent")
+        && node.parentNode
+        && node.parentNode.nodeType == DOM.ELEMENT_NODE) {
+            node = node.parentNode;
+        }
+
+        // "Return the resolved value of "background-color" for node."
+        return getComputedStyle(node).backgroundColor;
+    }
+
+    // "If command is "subscript" or "superscript":"
+    if (command == "subscript" || command == "superscript") {
+        // "Let affected by subscript and affected by superscript be two
+        // boolean variables, both initially false."
+        var affectedBySubscript = false;
+        var affectedBySuperscript = false;
+
+        // "While node is an inline node:"
+        while (isInlineNode(node)) {
+            var verticalAlign = getComputedStyle(node).verticalAlign;
+
+            // "If node is a sub, set affected by subscript to true."
+            if (isHtmlElement(node, "sub")) {
+                affectedBySubscript = true;
+            // "Otherwise, if node is a sup, set affected by superscript to
+            // true."
+            } else if (isHtmlElement(node, "sup")) {
+                affectedBySuperscript = true;
+            }
+
+            // "Set node to its parent."
+            node = node.parentNode;
+        }
+
+        // "If affected by subscript and affected by superscript are both true,
+        // return the string "mixed"."
+        if (affectedBySubscript && affectedBySuperscript) {
+            return "mixed";
+        }
+
+        // "If affected by subscript is true, return "subscript"."
+        if (affectedBySubscript) {
+            return "subscript";
+        }
+
+        // "If affected by superscript is true, return "superscript"."
+        if (affectedBySuperscript) {
+            return "superscript";
+        }
+
+        // "Return null."
+        return null;
+    }
+
+    // "If command is "strikethrough", and the "text-decoration" property of
+    // node or any of its ancestors has resolved value containing
+    // "line-through", return "line-through". Otherwise, return null."
+    if (command == "strikethrough") {
+        do {
+            if (getComputedStyle(node).textDecoration.indexOf("line-through") != -1) {
+                return "line-through";
+            }
+            node = node.parentNode;
+        } while (node && node.nodeType == DOM.ELEMENT_NODE);
+        return null;
+    }
+
+    // "If command is "underline", and the "text-decoration" property of node
+    // or any of its ancestors has resolved value containing "underline",
+    // return "underline". Otherwise, return null."
+    if (command == "underline") {
+        do {
+            if (getComputedStyle(node).textDecoration.indexOf("underline") != -1) {
+                return "underline";
+            }
+            node = node.parentNode;
+        } while (node && node.nodeType == DOM.ELEMENT_NODE);
+        return null;
+    }
+
+    if (!("relevantCssProperty" in commands[command])) {
+        throw "Bug: no relevantCssProperty for " + command + " in getEffectiveCommandValue";
+    }
+
+    // "Return the resolved value for node of the relevant CSS property for
+    // command."
+    return getComputedStyle(node)[commands[command].relevantCssProperty];
+}
+
+function getSpecifiedCommandValue(element, command) {
+    // "If command is "backColor" or "hiliteColor" and element's display
+    // property does not have resolved value "inline", return null."
+    if ((command == "backcolor" || command == "hilitecolor")
+    && getComputedStyle(element).display != "inline") {
+        return null;
+    }
+
+    // "If command is "createLink" or "unlink":"
+    if (command == "createlink" || command == "unlink") {
+        // "If element is an a element and has an href attribute, return the
+        // value of that attribute."
+        if (isHtmlElement(element)
+        && element.tagName == "A"
+        && element.hasAttribute("href")) {
+            return element.getAttribute("href");
+        }
+
+        // "Return null."
+        return null;
+    }
+
+    // "If command is "subscript" or "superscript":"
+    if (command == "subscript" || command == "superscript") {
+        // "If element is a sup, return "superscript"."
+        if (isHtmlElement(element, "sup")) {
+            return "superscript";
+        }
+
+        // "If element is a sub, return "subscript"."
+        if (isHtmlElement(element, "sub")) {
+            return "subscript";
+        }
+
+        // "Return null."
+        return null;
+    }
+
+    // "If command is "strikethrough", and element has a style attribute set,
+    // and that attribute sets "text-decoration":"
+    if (command == "strikethrough"
+    && element.style.textDecoration != "") {
+        // "If element's style attribute sets "text-decoration" to a value
+        // containing "line-through", return "line-through"."
+        if (element.style.textDecoration.indexOf("line-through") != -1) {
+            return "line-through";
+        }
+
+        // "Return null."
+        return null;
+    }
+
+    // "If command is "strikethrough" and element is a s or strike element,
+    // return "line-through"."
+    if (command == "strikethrough"
+    && isHtmlElement(element, ["S", "STRIKE"])) {
+        return "line-through";
+    }
+
+    // "If command is "underline", and element has a style attribute set, and
+    // that attribute sets "text-decoration":"
+    if (command == "underline"
+    && element.style.textDecoration != "") {
+        // "If element's style attribute sets "text-decoration" to a value
+        // containing "underline", return "underline"."
+        if (element.style.textDecoration.indexOf("underline") != -1) {
+            return "underline";
+        }
+
+        // "Return null."
+        return null;
+    }
+
+    // "If command is "underline" and element is a u element, return
+    // "underline"."
+    if (command == "underline"
+    && isHtmlElement(element, "U")) {
+        return "underline";
+    }
+
+    // "Let property be the relevant CSS property for command."
+    var property = commands[command].relevantCssProperty;
+
+    // "If property is null, return null."
+    if (property === null) {
+        return null;
+    }
+
+    // "If element has a style attribute set, and that attribute has the
+    // effect of setting property, return the value that it sets property to."
+    if (element.style[property] != "") {
+        return element.style[property];
+    }
+
+    // "If element is a font element that has an attribute whose effect is
+    // to create a presentational hint for property, return the value that the
+    // hint sets property to.  (For a size of 7, this will be the non-CSS value
+    // "xxx-large".)"
+    if (isHtmlNamespace(element.namespaceURI)
+    && element.tagName == "FONT") {
+        if (property == "color" && element.hasAttribute("color")) {
+            return element.getAttribute("color");
+        }
+        if (property == "fontFamily" && element.hasAttribute("face")) {
+            return element.getAttribute("face");
+        }
+        if (property == "fontSize" && element.hasAttribute("size")) {
+            // This is not even close to correct in general.
+            var size = parseInt(element.getAttribute("size"));
+            if (size < 1) {
+                size = 1;
+            }
+            if (size > 7) {
+                size = 7;
+            }
+            return {
+                1: "x-small",
+                2: "small",
+                3: "medium",
+                4: "large",
+                5: "x-large",
+                6: "xx-large",
+                7: "xxx-large"
+            }[size];
+        }
+    }
+
+    // "If element is in the following list, and property is equal to the
+    // CSS property name listed for it, return the string listed for it."
+    //
+    // A list follows, whose meaning is copied here.
+    if (property == "fontWeight"
+    && (element.tagName == "B" || element.tagName == "STRONG")) {
+        return "bold";
+    }
+    if (property == "fontStyle"
+    && (element.tagName == "I" || element.tagName == "EM")) {
+        return "italic";
+    }
+
+    // "Return null."
+    return null;
+}
+
+function reorderModifiableDescendants(node, command, newValue) {
+    // "Let candidate equal node."
+    var candidate = node;
+
+    // "While candidate is a modifiable element, and candidate has exactly one
+    // child, and that child is also a modifiable element, and candidate is not
+    // a simple modifiable element or candidate's specified command value for
+    // command is not equivalent to new value, set candidate to its child."
+    while (isModifiableElement(candidate)
+    && candidate.childNodes.length == 1
+    && isModifiableElement(candidate.firstChild)
+    && (!isSimpleModifiableElement(candidate)
+    || !areEquivalentValues(command, getSpecifiedCommandValue(candidate, command), newValue))) {
+        candidate = candidate.firstChild;
+    }
+
+    // "If candidate is node, or is not a simple modifiable element, or its
+    // specified command value is not equivalent to new value, or its effective
+    // command value is not loosely equivalent to new value, abort these
+    // steps."
+    if (candidate == node
+    || !isSimpleModifiableElement(candidate)
+    || !areEquivalentValues(command, getSpecifiedCommandValue(candidate, command), newValue)
+    || !areLooselyEquivalentValues(command, getEffectiveCommandValue(candidate, command), newValue)) {
+        return;
+    }
+
+    // "While candidate has children, insert the first child of candidate into
+    // candidate's parent immediately before candidate, preserving ranges."
+    while (candidate.hasChildNodes()) {
+        movePreservingRanges(candidate.firstChild, candidate.parentNode, getNodeIndex(candidate));
+    }
+
+    // "Insert candidate into node's parent immediately after node."
+    node.parentNode.insertBefore(candidate, node.nextSibling);
+
+    // "Append the node as the last child of candidate, preserving ranges."
+    movePreservingRanges(node, candidate, -1);
+}
+
+function recordValues(nodeList) {
+    // "Let values be a list of (node, command, specified command value)
+    // triples, initially empty."
+    var values = [];
+
+    // "For each node in node list, for each command in the list "subscript",
+    // "bold", "fontName", "fontSize", "foreColor", "hiliteColor", "italic",
+    // "strikethrough", and "underline" in that order:"
+    nodeList.forEach(function(node) {
+        ["subscript", "bold", "fontname", "fontsize", "forecolor",
+        "hilitecolor", "italic", "strikethrough", "underline"].forEach(function(command) {
+            // "Let ancestor equal node."
+            var ancestor = node;
+
+            // "If ancestor is not an Element, set it to its parent."
+            if (ancestor.nodeType != DOM.ELEMENT_NODE) {
+                ancestor = ancestor.parentNode;
+            }
+
+            // "While ancestor is an Element and its specified command value
+            // for command is null, set it to its parent."
+            while (ancestor
+            && ancestor.nodeType == DOM.ELEMENT_NODE
+            && getSpecifiedCommandValue(ancestor, command) === null) {
+                ancestor = ancestor.parentNode;
+            }
+
+            // "If ancestor is an Element, add (node, command, ancestor's
+            // specified command value for command) to values. Otherwise add
+            // (node, command, null) to values."
+            if (ancestor && ancestor.nodeType == DOM.ELEMENT_NODE) {
+                values.push([node, command, getSpecifiedCommandValue(ancestor, command)]);
+            } else {
+                values.push([node, command, null]);
+            }
+        });
+    });
+
+    // "Return values."
+    return values;
+}
+
+function restoreValues(values) {
+    // "For each (node, command, value) triple in values:"
+    values.forEach(function(triple) {
+        var node = triple[0];
+        var command = triple[1];
+        var value = triple[2];
+
+        // "Let ancestor equal node."
+        var ancestor = node;
+
+        // "If ancestor is not an Element, set it to its parent."
+        if (!ancestor || ancestor.nodeType != DOM.ELEMENT_NODE) {
+            ancestor = ancestor.parentNode;
+        }
+
+        // "While ancestor is an Element and its specified command value for
+        // command is null, set it to its parent."
+        while (ancestor
+        && ancestor.nodeType == DOM.ELEMENT_NODE
+        && getSpecifiedCommandValue(ancestor, command) === null) {
+            ancestor = ancestor.parentNode;
+        }
+
+        // "If value is null and ancestor is an Element, push down values on
+        // node for command, with new value null."
+        if (value === null
+        && ancestor
+        && ancestor.nodeType == DOM.ELEMENT_NODE) {
+            pushDownValues(node, command, null);
+
+        // "Otherwise, if ancestor is an Element and its specified command
+        // value for command is not equivalent to value, or if ancestor is not
+        // an Element and value is not null, force the value of command to
+        // value on node."
+        } else if ((ancestor
+        && ancestor.nodeType == DOM.ELEMENT_NODE
+        && !areEquivalentValues(command, getSpecifiedCommandValue(ancestor, command), value))
+        || ((!ancestor || ancestor.nodeType != DOM.ELEMENT_NODE)
+        && value !== null)) {
+            forceValue(node, command, value);
+        }
+    });
+}
+
+
+//@}
+///// Clearing an element's value /////
+//@{
+
+function clearValue(element, command) {
+    // "If element is not editable, return the empty list."
+    if (!isEditable(element)) {
+        return [];
+    }
+
+    // "If element's specified command value for command is null, return the
+    // empty list."
+    if (getSpecifiedCommandValue(element, command) === null) {
+        return [];
+    }
+
+    // "If element is a simple modifiable element:"
+    if (isSimpleModifiableElement(element)) {
+        // "Let children be the children of element."
+        var children = Array.prototype.slice.call(element.childNodes);
+
+        // "For each child in children, insert child into element's parent
+        // immediately before element, preserving ranges."
+        for (var i = 0; i < children.length; i++) {
+            movePreservingRanges(children[i], element.parentNode, getNodeIndex(element));
+        }
+
+        // "Remove element from its parent."
+        element.parentNode.removeChild(element);
+
+        // "Return children."
+        return children;
+    }
+
+    // "If command is "strikethrough", and element has a style attribute that
+    // sets "text-decoration" to some value containing "line-through", delete
+    // "line-through" from the value."
+    if (command == "strikethrough"
+    && element.style.textDecoration.indexOf("line-through") != -1) {
+        if (element.style.textDecoration == "line-through") {
+            element.style.textDecoration = "";
+        } else {
+            element.style.textDecoration = element.style.textDecoration.replace("line-through", "");
+        }
+        if (element.getAttribute("style") == "") {
+            element.removeAttribute("style");
+        }
+    }
+
+    // "If command is "underline", and element has a style attribute that sets
+    // "text-decoration" to some value containing "underline", delete
+    // "underline" from the value."
+    if (command == "underline"
+    && element.style.textDecoration.indexOf("underline") != -1) {
+        if (element.style.textDecoration == "underline") {
+            element.style.textDecoration = "";
+        } else {
+            element.style.textDecoration = element.style.textDecoration.replace("underline", "");
+        }
+        if (element.getAttribute("style") == "") {
+            element.removeAttribute("style");
+        }
+    }
+
+    // "If the relevant CSS property for command is not null, unset the CSS
+    // property property of element."
+    if (commands[command].relevantCssProperty !== null) {
+        element.style[commands[command].relevantCssProperty] = '';
+        if (element.getAttribute("style") == "") {
+            element.removeAttribute("style");
+        }
+    }
+
+    // "If element is a font element:"
+    if (isHtmlNamespace(element.namespaceURI) && element.tagName == "FONT") {
+        // "If command is "foreColor", unset element's color attribute, if set."
+        if (command == "forecolor") {
+            element.removeAttribute("color");
+        }
+
+        // "If command is "fontName", unset element's face attribute, if set."
+        if (command == "fontname") {
+            element.removeAttribute("face");
+        }
+
+        // "If command is "fontSize", unset element's size attribute, if set."
+        if (command == "fontsize") {
+            element.removeAttribute("size");
+        }
+    }
+
+    // "If element is an a element and command is "createLink" or "unlink",
+    // unset the href property of element."
+    if (isHtmlElement(element, "A")
+    && (command == "createlink" || command == "unlink")) {
+        element.removeAttribute("href");
+    }
+
+    // "If element's specified command value for command is null, return the
+    // empty list."
+    if (getSpecifiedCommandValue(element, command) === null) {
+        return [];
+    }
+
+    // "Set the tag name of element to "span", and return the one-node list
+    // consisting of the result."
+    return [setTagName(element, "span")];
+}
+
+
+//@}
+///// Pushing down values /////
+//@{
+
+function pushDownValues(node, command, newValue) {
+    // "If node's parent is not an Element, abort this algorithm."
+    if (!node.parentNode
+    || node.parentNode.nodeType != DOM.ELEMENT_NODE) {
+        return;
+    }
+
+    // "If the effective command value of command is loosely equivalent to new
+    // value on node, abort this algorithm."
+    if (areLooselyEquivalentValues(command, getEffectiveCommandValue(node, command), newValue)) {
+        return;
+    }
+
+    // "Let current ancestor be node's parent."
+    var currentAncestor = node.parentNode;
+
+    // "Let ancestor list be a list of Nodes, initially empty."
+    var ancestorList = [];
+
+    // "While current ancestor is an editable Element and the effective command
+    // value of command is not loosely equivalent to new value on it, append
+    // current ancestor to ancestor list, then set current ancestor to its
+    // parent."
+    while (isEditable(currentAncestor)
+    && currentAncestor.nodeType == DOM.ELEMENT_NODE
+    && !areLooselyEquivalentValues(command, getEffectiveCommandValue(currentAncestor, command), newValue)) {
+        ancestorList.push(currentAncestor);
+        currentAncestor = currentAncestor.parentNode;
+    }
+
+    // "If ancestor list is empty, abort this algorithm."
+    if (!ancestorList.length) {
+        return;
+    }
+
+    // "Let propagated value be the specified command value of command on the
+    // last member of ancestor list."
+    var propagatedValue = getSpecifiedCommandValue(ancestorList[ancestorList.length - 1], command);
+
+    // "If propagated value is null and is not equal to new value, abort this
+    // algorithm."
+    if (propagatedValue === null && propagatedValue != newValue) {
+        return;
+    }
+
+    // "If the effective command value for the parent of the last member of
+    // ancestor list is not loosely equivalent to new value, and new value is
+    // not null, abort this algorithm."
+    if (newValue !== null
+    && !areLooselyEquivalentValues(command, getEffectiveCommandValue(ancestorList[ancestorList.length - 1].parentNode, command), newValue)) {
+        return;
+    }
+
+    // "While ancestor list is not empty:"
+    while (ancestorList.length) {
+        // "Let current ancestor be the last member of ancestor list."
+        // "Remove the last member from ancestor list."
+        var currentAncestor = ancestorList.pop();
+
+        // "If the specified command value of current ancestor for command is
+        // not null, set propagated value to that value."
+        if (getSpecifiedCommandValue(currentAncestor, command) !== null) {
+            propagatedValue = getSpecifiedCommandValue(currentAncestor, command);
+        }
+
+        // "Let children be the children of current ancestor."
+        var children = Array.prototype.slice.call(currentAncestor.childNodes);
+
+        // "If the specified command value of current ancestor for command is
+        // not null, clear the value of current ancestor."
+        if (getSpecifiedCommandValue(currentAncestor, command) !== null) {
+            clearValue(currentAncestor, command);
+        }
+
+        // "For every child in children:"
+        for (var i = 0; i < children.length; i++) {
+            var child = children[i];
+
+            // "If child is node, continue with the next child."
+            if (child == node) {
+                continue;
+            }
+
+            // "If child is an Element whose specified command value for
+            // command is neither null nor equivalent to propagated value,
+            // continue with the next child."
+            if (child.nodeType == DOM.ELEMENT_NODE
+            && getSpecifiedCommandValue(child, command) !== null
+            && !areEquivalentValues(command, propagatedValue, getSpecifiedCommandValue(child, command))) {
+                continue;
+            }
+
+            // "If child is the last member of ancestor list, continue with the
+            // next child."
+            if (child == ancestorList[ancestorList.length - 1]) {
+                continue;
+            }
+
+            // "Force the value of child, with command as in this algorithm
+            // and new value equal to propagated value."
+            forceValue(child, command, propagatedValue);
+        }
+    }
+}
+
+
+//@}
+///// Forcing the value of a node /////
+//@{
+
+function forceValue(node, command, newValue) {
+    // "If node's parent is null, abort this algorithm."
+    if (!node.parentNode) {
+        return;
+    }
+
+    // "If new value is null, abort this algorithm."
+    if (newValue === null) {
+        return;
+    }
+
+    // "If node is an allowed child of "span":"
+    if (isAllowedChild(node, "span")) {
+        // "Reorder modifiable descendants of node's previousSibling."
+        reorderModifiableDescendants(node.previousSibling, command, newValue);
+
+        // "Reorder modifiable descendants of node's nextSibling."
+        reorderModifiableDescendants(node.nextSibling, command, newValue);
+
+        // "Wrap the one-node list consisting of node, with sibling criteria
+        // returning true for a simple modifiable element whose specified
+        // command value is equivalent to new value and whose effective command
+        // value is loosely equivalent to new value and false otherwise, and
+        // with new parent instructions returning null."
+        wrap([node],
+            function(node) {
+                return isSimpleModifiableElement(node)
+                    && areEquivalentValues(command, getSpecifiedCommandValue(node, command), newValue)
+                    && areLooselyEquivalentValues(command, getEffectiveCommandValue(node, command), newValue);
+            },
+            function() { return null }
+        );
+    }
+
+    // "If node is invisible, abort this algorithm."
+    if (isInvisible(node)) {
+        return;
+    }
+
+    // "If the effective command value of command is loosely equivalent to new
+    // value on node, abort this algorithm."
+    if (areLooselyEquivalentValues(command, getEffectiveCommandValue(node, command), newValue)) {
+        return;
+    }
+
+    // "If node is not an allowed child of "span":"
+    if (!isAllowedChild(node, "span")) {
+        // "Let children be all children of node, omitting any that are
+        // Elements whose specified command value for command is neither null
+        // nor equivalent to new value."
+        var children = [];
+        for (var i = 0; i < node.childNodes.length; i++) {
+            if (node.childNodes[i].nodeType == DOM.ELEMENT_NODE) {
+                var specifiedValue = getSpecifiedCommandValue(node.childNodes[i], command);
+
+                if (specifiedValue !== null
+                && !areEquivalentValues(command, newValue, specifiedValue)) {
+                    continue;
+                }
+            }
+            children.push(node.childNodes[i]);
+        }
+
+        // "Force the value of each Node in children, with command and new
+        // value as in this invocation of the algorithm."
+        for (var i = 0; i < children.length; i++) {
+            forceValue(children[i], command, newValue);
+        }
+
+        // "Abort this algorithm."
+        return;
+    }
+
+    // "If the effective command value of command is loosely equivalent to new
+    // value on node, abort this algorithm."
+    if (areLooselyEquivalentValues(command, getEffectiveCommandValue(node, command), newValue)) {
+        return;
+    }
+
+    // "Let new parent be null."
+    var newParent = null;
+
+    // "If the CSS styling flag is false:"
+    if (!cssStylingFlag) {
+        // "If command is "bold" and new value is "bold", let new parent be the
+        // result of calling createElement("b") on the ownerDocument of node."
+        if (command == "bold" && (newValue == "bold" || newValue == "700")) {
+            newParent = createElement("b");
+        }
+
+        // "If command is "italic" and new value is "italic", let new parent be
+        // the result of calling createElement("i") on the ownerDocument of
+        // node."
+        if (command == "italic" && newValue == "italic") {
+            newParent = createElement("i");
+        }
+
+        // "If command is "strikethrough" and new value is "line-through", let
+        // new parent be the result of calling createElement("s") on the
+        // ownerDocument of node."
+        if (command == "strikethrough" && newValue == "line-through") {
+            newParent = createElement("s");
+        }
+
+        // "If command is "underline" and new value is "underline", let new
+        // parent be the result of calling createElement("u") on the
+        // ownerDocument of node."
+        if (command == "underline" && newValue == "underline") {
+            newParent = createElement("u");
+        }
+
+        // "If command is "foreColor", and new value is fully opaque with red,
+        // green, and blue components in the range 0 to 255:"
+        if (command == "forecolor" && parseSimpleColor(newValue)) {
+            // "Let new parent be the result of calling createElement("font")
+            // on the ownerDocument of node."
+            newParent = createElement("font");
+
+            // "Set the color attribute of new parent to the result of applying
+            // the rules for serializing simple color values to new value
+            // (interpreted as a simple color)."
+            newParent.setAttribute("color", parseSimpleColor(newValue));
+        }
+
+        // "If command is "fontName", let new parent be the result of calling
+        // createElement("font") on the ownerDocument of node, then set the
+        // face attribute of new parent to new value."
+        if (command == "fontname") {
+            newParent = createElement("font");
+            newParent.setAttribute("face", newValue);
+        }
+    }
+
+    // "If command is "createLink" or "unlink":"
+    if (command == "createlink" || command == "unlink") {
+        // "Let new parent be the result of calling createElement("a") on the
+        // ownerDocument of node."
+        newParent = createElement("a");
+
+        // "Set the href attribute of new parent to new value."
+        newParent.setAttribute("href", newValue);
+
+        // "Let ancestor be node's parent."
+        var ancestor = node.parentNode;
+
+        // "While ancestor is not null:"
+        while (ancestor) {
+            // "If ancestor is an a, set the tag name of ancestor to "span",
+            // and let ancestor be the result."
+            if (isHtmlElement(ancestor, "A")) {
+                ancestor = setTagName(ancestor, "span");
+            }
+
+            // "Set ancestor to its parent."
+            ancestor = ancestor.parentNode;
+        }
+    }
+
+    // "If command is "fontSize"; and new value is one of "x-small", "small",
+    // "medium", "large", "x-large", "xx-large", or "xxx-large"; and either the
+    // CSS styling flag is false, or new value is "xxx-large": let new parent
+    // be the result of calling createElement("font") on the ownerDocument of
+    // node, then set the size attribute of new parent to the number from the
+    // following table based on new value: [table omitted]"
+    if (command == "fontsize"
+    && ["x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"].indexOf(newValue) != -1
+    && (!cssStylingFlag || newValue == "xxx-large")) {
+        newParent = createElement("font");
+        newParent.setAttribute("size", cssSizeToLegacy(newValue));
+    }
+
+    // "If command is "subscript" or "superscript" and new value is
+    // "subscript", let new parent be the result of calling
+    // createElement("sub") on the ownerDocument of node."
+    if ((command == "subscript" || command == "superscript")
+    && newValue == "subscript") {
+        newParent = createElement("sub");
+    }
+
+    // "If command is "subscript" or "superscript" and new value is
+    // "superscript", let new parent be the result of calling
+    // createElement("sup") on the ownerDocument of node."
+    if ((command == "subscript" || command == "superscript")
+    && newValue == "superscript") {
+        newParent = createElement("sup");
+    }
+
+    // "If new parent is null, let new parent be the result of calling
+    // createElement("span") on the ownerDocument of node."
+    if (!newParent) {
+        newParent = createElement("span");
+    }
+
+    // "Insert new parent in node's parent before node."
+    node.parentNode.insertBefore(newParent, node);
+
+    // "If the effective command value of command for new parent is not loosely
+    // equivalent to new value, and the relevant CSS property for command is
+    // not null, set that CSS property of new parent to new value (if the new
+    // value would be valid)."
+    var property = commands[command].relevantCssProperty;
+    if (property !== null
+    && !areLooselyEquivalentValues(command, getEffectiveCommandValue(newParent, command), newValue)) {
+        newParent.style[property] = newValue;
+    }
+
+    // "If command is "strikethrough", and new value is "line-through", and the
+    // effective command value of "strikethrough" for new parent is not
+    // "line-through", set the "text-decoration" property of new parent to
+    // "line-through"."
+    if (command == "strikethrough"
+    && newValue == "line-through"
+    && getEffectiveCommandValue(newParent, "strikethrough") != "line-through") {
+        newParent.style.textDecoration = "line-through";
+    }
+
+    // "If command is "underline", and new value is "underline", and the
+    // effective command value of "underline" for new parent is not
+    // "underline", set the "text-decoration" property of new parent to
+    // "underline"."
+    if (command == "underline"
+    && newValue == "underline"
+    && getEffectiveCommandValue(newParent, "underline") != "underline") {
+        newParent.style.textDecoration = "underline";
+    }
+
+    // "Append node to new parent as its last child, preserving ranges."
+    movePreservingRanges(node, newParent, newParent.childNodes.length);
+
+    // "If node is an Element and the effective command value of command for
+    // node is not loosely equivalent to new value:"
+    if (node.nodeType == DOM.ELEMENT_NODE
+    && !areEquivalentValues(command, getEffectiveCommandValue(node, command), newValue)) {
+        // "Insert node into the parent of new parent before new parent,
+        // preserving ranges."
+        movePreservingRanges(node, newParent.parentNode, getNodeIndex(newParent));
+
+        // "Remove new parent from its parent."
+        newParent.parentNode.removeChild(newParent);
+
+        // "Let children be all children of node, omitting any that are
+        // Elements whose specified command value for command is neither null
+        // nor equivalent to new value."
+        var children = [];
+        for (var i = 0; i < node.childNodes.length; i++) {
+            if (node.childNodes[i].nodeType == DOM.ELEMENT_NODE) {
+                var specifiedValue = getSpecifiedCommandValue(node.childNodes[i], command);
+
+                if (specifiedValue !== null
+                && !areEquivalentValues(command, newValue, specifiedValue)) {
+                    continue;
+                }
+            }
+            children.push(node.childNodes[i]);
+        }
+
+        // "Force the value of each Node in children, with command and new
+        // value as in this invocation of the algorithm."
+        for (var i = 0; i < children.length; i++) {
+            forceValue(children[i], command, newValue);
+        }
+    }
+}
+
+
+//@}
+///// Setting the selection's value /////
+//@{
+
+function setSelectionValue(command, newValue) {
+    // "If there is no formattable node effectively contained in the active
+    // range:"
+    if (!getAllEffectivelyContainedNodes(getActiveRange())
+    .some(isFormattableNode)) {
+        // "If command has inline command activated values, set the state
+        // override to true if new value is among them and false if it's not."
+        if ("inlineCommandActivatedValues" in commands[command]) {
+            setStateOverride(command, commands[command].inlineCommandActivatedValues
+                .indexOf(newValue) != -1);
+        }
+
+        // "If command is "subscript", unset the state override for
+        // "superscript"."
+        if (command == "subscript") {
+            unsetStateOverride("superscript");
+        }
+
+        // "If command is "superscript", unset the state override for
+        // "subscript"."
+        if (command == "superscript") {
+            unsetStateOverride("subscript");
+        }
+
+        // "If new value is null, unset the value override (if any)."
+        if (newValue === null) {
+            unsetValueOverride(command);
+
+        // "Otherwise, if command is "createLink" or it has a value specified,
+        // set the value override to new value."
+        } else if (command == "createlink" || "value" in commands[command]) {
+            setValueOverride(command, newValue);
+        }
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If the active range's start node is an editable Text node, and its
+    // start offset is neither zero nor its start node's length, call
+    // splitText() on the active range's start node, with argument equal to the
+    // active range's start offset. Then set the active range's start node to
+    // the result, and its start offset to zero."
+    if (isEditable(getActiveRange().startContainer)
+    && getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+    && getActiveRange().startOffset != 0
+    && getActiveRange().startOffset != getNodeLength(getActiveRange().startContainer)) {
+        // Account for browsers not following range mutation rules
+        var newActiveRange = createRange();
+        var newNode;
+        if (getActiveRange().startContainer == getActiveRange().endContainer) {
+            var newEndOffset = getActiveRange().endOffset - getActiveRange().startOffset;
+            newNode = getActiveRange().startContainer.splitText(getActiveRange().startOffset);
+            newActiveRange.setEnd(newNode, newEndOffset);
+            getActiveRange().setEnd(newNode, newEndOffset);
+        } else {
+            newNode = getActiveRange().startContainer.splitText(getActiveRange().startOffset);
+        }
+        newActiveRange.setStart(newNode, 0);
+        getSelection().removeAllRanges();
+        getSelection().addRange(newActiveRange);
+
+        getActiveRange().setStart(newNode, 0);
+    }
+
+    // "If the active range's end node is an editable Text node, and its end
+    // offset is neither zero nor its end node's length, call splitText() on
+    // the active range's end node, with argument equal to the active range's
+    // end offset."
+    if (isEditable(getActiveRange().endContainer)
+    && getActiveRange().endContainer.nodeType == DOM.TEXT_NODE
+    && getActiveRange().endOffset != 0
+    && getActiveRange().endOffset != getNodeLength(getActiveRange().endContainer)) {
+        // IE seems to mutate the range incorrectly here, so we need correction
+        // here as well.  The active range will be temporarily in orphaned
+        // nodes, so calling getActiveRange() after splitText() but before
+        // fixing the range will throw an exception.
+        var activeRange = getActiveRange();
+        var newStart = [activeRange.startContainer, activeRange.startOffset];
+        var newEnd = [activeRange.endContainer, activeRange.endOffset];
+        activeRange.endContainer.splitText(activeRange.endOffset);
+        activeRange.setStart(newStart[0], newStart[1]);
+        activeRange.setEnd(newEnd[0], newEnd[1]);
+
+        getSelection().removeAllRanges();
+        getSelection().addRange(activeRange);
+    }
+
+    // "Let element list be all editable Elements effectively contained in the
+    // active range.
+    //
+    // "For each element in element list, clear the value of element."
+    getAllEffectivelyContainedNodes(getActiveRange(), function(node) {
+        return isEditable(node) && node.nodeType == DOM.ELEMENT_NODE;
+    }).forEach(function(element) {
+        clearValue(element, command);
+    });
+
+    // "Let node list be all editable nodes effectively contained in the active
+    // range.
+    //
+    // "For each node in node list:"
+    getAllEffectivelyContainedNodes(getActiveRange(), isEditable).forEach(function(node) {
+        // "Push down values on node."
+        pushDownValues(node, command, newValue);
+
+        // "If node is an allowed child of span, force the value of node."
+        if (isAllowedChild(node, "span")) {
+            forceValue(node, command, newValue);
+        }
+    });
+}
+
+
+//@}
+///// The backColor command /////
+//@{
+commands.backcolor = {
+    // Copy-pasted, same as hiliteColor
+    action: function(value) {
+        // Action is further copy-pasted, same as foreColor
+
+        // "If value is not a valid CSS color, prepend "#" to it."
+        //
+        // "If value is still not a valid CSS color, or if it is currentColor,
+        // return false."
+        //
+        // Cheap hack for testing, no attempt to be comprehensive.
+        if (/^([0-9a-fA-F]{3}){1,2}$/.test(value)) {
+            value = "#" + value;
+        }
+        if (!/^(rgba?|hsla?)\(.*\)$/.test(value)
+        && !parseSimpleColor(value)
+        && value.toLowerCase() != "transparent") {
+            return false;
+        }
+
+        // "Set the selection's value to value."
+        setSelectionValue("backcolor", value);
+
+        // "Return true."
+        return true;
+    }, standardInlineValueCommand: true, relevantCssProperty: "backgroundColor",
+    equivalentValues: function(val1, val2) {
+        // "Either both strings are valid CSS colors and have the same red,
+        // green, blue, and alpha components, or neither string is a valid CSS
+        // color."
+        return normalizeColor(val1) === normalizeColor(val2);
+    },
+};
+
+//@}
+///// The bold command /////
+//@{
+commands.bold = {
+    action: function() {
+        // "If queryCommandState("bold") returns true, set the selection's
+        // value to "normal". Otherwise set the selection's value to "bold".
+        // Either way, return true."
+        if (queryCommandState("bold")) {
+            setSelectionValue("bold", "normal");
+        } else {
+            setSelectionValue("bold", "bold");
+        }
+        return true;
+    }, inlineCommandActivatedValues: ["bold", "600", "700", "800", "900"],
+    relevantCssProperty: "fontWeight",
+    equivalentValues: function(val1, val2) {
+        // "Either the two strings are equal, or one is "bold" and the other is
+        // "700", or one is "normal" and the other is "400"."
+        return val1 == val2
+            || (val1 == "bold" && val2 == "700")
+            || (val1 == "700" && val2 == "bold")
+            || (val1 == "normal" && val2 == "400")
+            || (val1 == "400" && val2 == "normal");
+    },
+};
+
+//@}
+///// The createLink command /////
+//@{
+commands.createlink = {
+    action: function(value) {
+        // "If value is the empty string, return false."
+        if (value === "") {
+            return false;
+        }
+
+        // "For each editable a element that has an href attribute and is an
+        // ancestor of some node effectively contained in the active range, set
+        // that a element's href attribute to value."
+        //
+        // TODO: We don't actually do this in tree order, not that it matters
+        // unless you're spying with mutation events.
+        getAllEffectivelyContainedNodes(getActiveRange()).forEach(function(node) {
+            getAncestors(node).forEach(function(ancestor) {
+                if (isEditable(ancestor)
+                && isHtmlElement(ancestor, "a")
+                && ancestor.hasAttribute("href")) {
+                    ancestor.setAttribute("href", value);
+                }
+            });
+        });
+
+        // "Set the selection's value to value."
+        setSelectionValue("createlink", value);
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The fontName command /////
+//@{
+commands.fontname = {
+    action: function(value) {
+        // "Set the selection's value to value, then return true."
+        setSelectionValue("fontname", value);
+        return true;
+    }, standardInlineValueCommand: true, relevantCssProperty: "fontFamily"
+};
+
+//@}
+///// The fontSize command /////
+//@{
+
+// Helper function for fontSize's action plus queryOutputHelper.  It's just the
+// middle of fontSize's action, ripped out into its own function.  Returns null
+// if the size is invalid.
+function normalizeFontSize(value) {
+    // "Strip leading and trailing whitespace from value."
+    //
+    // Cheap hack, not following the actual algorithm.
+    value = value.trim();
+
+    // "If value is not a valid floating point number, and would not be a valid
+    // floating point number if a single leading "+" character were stripped,
+    // return false."
+    if (!/^[-+]?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$/.test(value)) {
+        return null;
+    }
+
+    var mode;
+
+    // "If the first character of value is "+", delete the character and let
+    // mode be "relative-plus"."
+    if (value[0] == "+") {
+        value = value.slice(1);
+        mode = "relative-plus";
+    // "Otherwise, if the first character of value is "-", delete the character
+    // and let mode be "relative-minus"."
+    } else if (value[0] == "-") {
+        value = value.slice(1);
+        mode = "relative-minus";
+    // "Otherwise, let mode be "absolute"."
+    } else {
+        mode = "absolute";
+    }
+
+    // "Apply the rules for parsing non-negative integers to value, and let
+    // number be the result."
+    //
+    // Another cheap hack.
+    var num = parseInt(value);
+
+    // "If mode is "relative-plus", add three to number."
+    if (mode == "relative-plus") {
+        num += 3;
+    }
+
+    // "If mode is "relative-minus", negate number, then add three to it."
+    if (mode == "relative-minus") {
+        num = 3 - num;
+    }
+
+    // "If number is less than one, let number equal 1."
+    if (num < 1) {
+        num = 1;
+    }
+
+    // "If number is greater than seven, let number equal 7."
+    if (num > 7) {
+        num = 7;
+    }
+
+    // "Set value to the string here corresponding to number:" [table omitted]
+    value = {
+        1: "x-small",
+        2: "small",
+        3: "medium",
+        4: "large",
+        5: "x-large",
+        6: "xx-large",
+        7: "xxx-large"
+    }[num];
+
+    return value;
+}
+
+commands.fontsize = {
+    action: function(value) {
+        value = normalizeFontSize(value);
+        if (value === null) {
+            return false;
+        }
+
+        // "Set the selection's value to value."
+        setSelectionValue("fontsize", value);
+
+        // "Return true."
+        return true;
+    }, indeterm: function() {
+        // "True if among formattable nodes that are effectively contained in
+        // the active range, there are two that have distinct effective command
+        // values.  Otherwise false."
+        return getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode)
+        .map(function(node) {
+            return getEffectiveCommandValue(node, "fontsize");
+        }).filter(function(value, i, arr) {
+            return arr.slice(0, i).indexOf(value) == -1;
+        }).length >= 2;
+    }, value: function() {
+        // "If the active range is null, return the empty string."
+        if (!getActiveRange()) {
+            return "";
+        }
+
+        // "Let pixel size be the effective command value of the first
+        // formattable node that is effectively contained in the active range,
+        // or if there is no such node, the effective command value of the
+        // active range's start node, in either case interpreted as a number of
+        // pixels."
+        var node = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode)[0];
+        if (node === undefined) {
+            node = getActiveRange().startContainer;
+        }
+        var pixelSize = getEffectiveCommandValue(node, "fontsize");
+
+        // "Return the legacy font size for pixel size."
+        return getLegacyFontSize(pixelSize);
+    }, relevantCssProperty: "fontSize"
+};
+
+function getLegacyFontSize(size) {
+    if (getLegacyFontSize.resultCache === undefined) {
+        getLegacyFontSize.resultCache = {};
+    }
+
+    if (getLegacyFontSize.resultCache[size] !== undefined) {
+        return getLegacyFontSize.resultCache[size];
+    }
+
+    // For convenience in other places in my code, I handle all sizes, not just
+    // pixel sizes as the spec says.  This means pixel sizes have to be passed
+    // in suffixed with "px", not as plain numbers.
+    if (normalizeFontSize(size) !== null) {
+        return getLegacyFontSize.resultCache[size] = cssSizeToLegacy(normalizeFontSize(size));
+    }
+
+    if (["x-small", "x-small", "small", "medium", "large", "x-large", "xx-large", "xxx-large"].indexOf(size) == -1
+    && !/^[0-9]+(\.[0-9]+)?(cm|mm|in|pt|pc|px)$/.test(size)) {
+        // There is no sensible legacy size for things like "2em".
+        return getLegacyFontSize.resultCache[size] = null;
+    }
+
+    var pixelSize = parseInt(LEGACY_FONT_PIXELS[size] ?? cssLengthInPixels(size));
+
+    // "Let returned size be 1."
+    var returnedSize = 1;
+
+    // "While returned size is less than 7:"
+    while (returnedSize < 7) {
+        // "Let lower bound be the resolved value of "font-size" in pixels
+        // of a font element whose size attribute is set to returned size."
+        var lowerBound = parseInt(LEGACY_FONT_PIXELS[legacySizeToCss(returnedSize)]);
+
+        // "Let upper bound be the resolved value of "font-size" in pixels
+        // of a font element whose size attribute is set to one plus
+        // returned size."
+        var upperBound = parseInt(LEGACY_FONT_PIXELS[legacySizeToCss(1 + returnedSize)]);
+
+        // "Let average be the average of upper bound and lower bound."
+        var average = (upperBound + lowerBound)/2;
+
+        // "If pixel size is less than average, return the one-element
+        // string consisting of the digit returned size."
+        if (pixelSize < average) {
+            return getLegacyFontSize.resultCache[size] = String(returnedSize);
+        }
+
+        // "Add one to returned size."
+        returnedSize++;
+    }
+
+    // "Return "7"."
+    return getLegacyFontSize.resultCache[size] = "7";
+}
+
+//@}
+///// The foreColor command /////
+//@{
+commands.forecolor = {
+    action: function(value) {
+        // Copy-pasted, same as backColor and hiliteColor
+
+        // "If value is not a valid CSS color, prepend "#" to it."
+        //
+        // "If value is still not a valid CSS color, or if it is currentColor,
+        // return false."
+        //
+        // Cheap hack for testing, no attempt to be comprehensive.
+        if (/^([0-9a-fA-F]{3}){1,2}$/.test(value)) {
+            value = "#" + value;
+        }
+        if (!/^(rgba?|hsla?)\(.*\)$/.test(value)
+        && !parseSimpleColor(value)
+        && value.toLowerCase() != "transparent") {
+            return false;
+        }
+
+        // "Set the selection's value to value."
+        setSelectionValue("forecolor", value);
+
+        // "Return true."
+        return true;
+    }, standardInlineValueCommand: true, relevantCssProperty: "color",
+    equivalentValues: function(val1, val2) {
+        // "Either both strings are valid CSS colors and have the same red,
+        // green, blue, and alpha components, or neither string is a valid CSS
+        // color."
+        return normalizeColor(val1) === normalizeColor(val2);
+    },
+};
+
+//@}
+///// The hiliteColor command /////
+//@{
+commands.hilitecolor = {
+    // Copy-pasted, same as backColor
+    action: function(value) {
+        // Action is further copy-pasted, same as foreColor
+
+        // "If value is not a valid CSS color, prepend "#" to it."
+        //
+        // "If value is still not a valid CSS color, or if it is currentColor,
+        // return false."
+        //
+        // Cheap hack for testing, no attempt to be comprehensive.
+        if (/^([0-9a-fA-F]{3}){1,2}$/.test(value)) {
+            value = "#" + value;
+        }
+        if (!/^(rgba?|hsla?)\(.*\)$/.test(value)
+        && !parseSimpleColor(value)
+        && value.toLowerCase() != "transparent") {
+            return false;
+        }
+
+        // "Set the selection's value to value."
+        setSelectionValue("hilitecolor", value);
+
+        // "Return true."
+        return true;
+    }, indeterm: function() {
+        // "True if among editable Text nodes that are effectively contained in
+        // the active range, there are two that have distinct effective command
+        // values.  Otherwise false."
+        return getAllEffectivelyContainedNodes(getActiveRange(), function(node) {
+            return isEditable(node) && node.nodeType == DOM.TEXT_NODE;
+        }).map(function(node) {
+            return getEffectiveCommandValue(node, "hilitecolor");
+        }).filter(function(value, i, arr) {
+            return arr.slice(0, i).indexOf(value) == -1;
+        }).length >= 2;
+    }, standardInlineValueCommand: true, relevantCssProperty: "backgroundColor",
+    equivalentValues: function(val1, val2) {
+        // "Either both strings are valid CSS colors and have the same red,
+        // green, blue, and alpha components, or neither string is a valid CSS
+        // color."
+        return normalizeColor(val1) === normalizeColor(val2);
+    },
+};
+
+//@}
+///// The italic command /////
+//@{
+commands.italic = {
+    action: function() {
+        // "If queryCommandState("italic") returns true, set the selection's
+        // value to "normal". Otherwise set the selection's value to "italic".
+        // Either way, return true."
+        if (queryCommandState("italic")) {
+            setSelectionValue("italic", "normal");
+        } else {
+            setSelectionValue("italic", "italic");
+        }
+        return true;
+    }, inlineCommandActivatedValues: ["italic", "oblique"],
+    relevantCssProperty: "fontStyle"
+};
+
+//@}
+///// The removeFormat command /////
+//@{
+commands.removeformat = {
+    action: function() {
+        // "A removeFormat candidate is an editable HTML element with local
+        // name "abbr", "acronym", "b", "bdi", "bdo", "big", "blink", "cite",
+        // "code", "dfn", "em", "font", "i", "ins", "kbd", "mark", "nobr", "q",
+        // "s", "samp", "small", "span", "strike", "strong", "sub", "sup",
+        // "tt", "u", or "var"."
+        function isRemoveFormatCandidate(node) {
+            return isEditable(node)
+                && isHtmlElement(node, ["abbr", "acronym", "b", "bdi", "bdo",
+                "big", "blink", "cite", "code", "dfn", "em", "font", "i",
+                "ins", "kbd", "mark", "nobr", "q", "s", "samp", "small",
+                "span", "strike", "strong", "sub", "sup", "tt", "u", "var"]);
+        }
+
+        // "Let elements to remove be a list of every removeFormat candidate
+        // effectively contained in the active range."
+        var elementsToRemove = getAllEffectivelyContainedNodes(getActiveRange(), isRemoveFormatCandidate);
+
+        // "For each element in elements to remove:"
+        elementsToRemove.forEach(function(element) {
+            // "While element has children, insert the first child of element
+            // into the parent of element immediately before element,
+            // preserving ranges."
+            while (element.hasChildNodes()) {
+                movePreservingRanges(element.firstChild, element.parentNode, getNodeIndex(element));
+            }
+
+            // "Remove element from its parent."
+            element.parentNode.removeChild(element);
+        });
+
+        // "If the active range's start node is an editable Text node, and its
+        // start offset is neither zero nor its start node's length, call
+        // splitText() on the active range's start node, with argument equal to
+        // the active range's start offset. Then set the active range's start
+        // node to the result, and its start offset to zero."
+        if (isEditable(getActiveRange().startContainer)
+        && getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().startOffset != 0
+        && getActiveRange().startOffset != getNodeLength(getActiveRange().startContainer)) {
+            // Account for browsers not following range mutation rules
+            if (getActiveRange().startContainer == getActiveRange().endContainer) {
+                var newEnd = getActiveRange().endOffset - getActiveRange().startOffset;
+                var newNode = getActiveRange().startContainer.splitText(getActiveRange().startOffset);
+                getActiveRange().setStart(newNode, 0);
+                getActiveRange().setEnd(newNode, newEnd);
+            } else {
+                getActiveRange().setStart(getActiveRange().startContainer.splitText(getActiveRange().startOffset), 0);
+            }
+        }
+
+        // "If the active range's end node is an editable Text node, and its
+        // end offset is neither zero nor its end node's length, call
+        // splitText() on the active range's end node, with argument equal to
+        // the active range's end offset."
+        if (isEditable(getActiveRange().endContainer)
+        && getActiveRange().endContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().endOffset != 0
+        && getActiveRange().endOffset != getNodeLength(getActiveRange().endContainer)) {
+            // IE seems to mutate the range incorrectly here, so we need
+            // correction here as well.  Have to be careful to set the range to
+            // something not including the text node so that getActiveRange()
+            // doesn't throw an exception due to a temporarily detached
+            // endpoint.
+            getActiveRange().endContainer.splitText(getActiveRange().endOffset);
+        }
+
+        // "Let node list consist of all editable nodes effectively contained
+        // in the active range."
+        //
+        // "For each node in node list, while node's parent is a removeFormat
+        // candidate in the same editing host as node, split the parent of the
+        // one-node list consisting of node."
+        getAllEffectivelyContainedNodes(getActiveRange(), isEditable).forEach(function(node) {
+            while (isRemoveFormatCandidate(node.parentNode)
+            && inSameEditingHost(node.parentNode, node)) {
+                splitParent([node]);
+            }
+        });
+
+        // "For each of the entries in the following list, in the given order,
+        // set the selection's value to null, with command as given."
+        [
+            "subscript",
+            "bold",
+            "fontname",
+            "fontsize",
+            "forecolor",
+            "hilitecolor",
+            "italic",
+            "strikethrough",
+            "underline",
+        ].forEach(function(command) {
+            setSelectionValue(command, null);
+        });
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The strikethrough command /////
+//@{
+commands.strikethrough = {
+    action: function() {
+        // "If queryCommandState("strikethrough") returns true, set the
+        // selection's value to null. Otherwise set the selection's value to
+        // "line-through".  Either way, return true."
+        if (queryCommandState("strikethrough")) {
+            setSelectionValue("strikethrough", null);
+        } else {
+            setSelectionValue("strikethrough", "line-through");
+        }
+        return true;
+    }, inlineCommandActivatedValues: ["line-through"]
+};
+
+//@}
+///// The subscript command /////
+//@{
+commands.subscript = {
+    action: function() {
+        // "Call queryCommandState("subscript"), and let state be the result."
+        var state = queryCommandState("subscript");
+
+        // "Set the selection's value to null."
+        setSelectionValue("subscript", null);
+
+        // "If state is false, set the selection's value to "subscript"."
+        if (!state) {
+            setSelectionValue("subscript", "subscript");
+        }
+
+        // "Return true."
+        return true;
+    }, indeterm: function() {
+        // "True if either among formattable nodes that are effectively
+        // contained in the active range, there is at least one with effective
+        // command value "subscript" and at least one with some other effective
+        // command value; or if there is some formattable node effectively
+        // contained in the active range with effective command value "mixed".
+        // Otherwise false."
+        var nodes = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode);
+        return (nodes.some(function(node) { return getEffectiveCommandValue(node, "subscript") == "subscript" })
+            && nodes.some(function(node) { return getEffectiveCommandValue(node, "subscript") != "subscript" }))
+            || nodes.some(function(node) { return getEffectiveCommandValue(node, "subscript") == "mixed" });
+    }, inlineCommandActivatedValues: ["subscript"],
+};
+
+//@}
+///// The superscript command /////
+//@{
+commands.superscript = {
+    action: function() {
+        // "Call queryCommandState("superscript"), and let state be the
+        // result."
+        var state = queryCommandState("superscript");
+
+        // "Set the selection's value to null."
+        setSelectionValue("superscript", null);
+
+        // "If state is false, set the selection's value to "superscript"."
+        if (!state) {
+            setSelectionValue("superscript", "superscript");
+        }
+
+        // "Return true."
+        return true;
+    }, indeterm: function() {
+        // "True if either among formattable nodes that are effectively
+        // contained in the active range, there is at least one with effective
+        // command value "superscript" and at least one with some other
+        // effective command value; or if there is some formattable node
+        // effectively contained in the active range with effective command
+        // value "mixed".  Otherwise false."
+        var nodes = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode);
+        return (nodes.some(function(node) { return getEffectiveCommandValue(node, "superscript") == "superscript" })
+            && nodes.some(function(node) { return getEffectiveCommandValue(node, "superscript") != "superscript" }))
+            || nodes.some(function(node) { return getEffectiveCommandValue(node, "superscript") == "mixed" });
+    }, inlineCommandActivatedValues: ["superscript"],
+};
+
+//@}
+///// The underline command /////
+//@{
+commands.underline = {
+    action: function() {
+        // "If queryCommandState("underline") returns true, set the selection's
+        // value to null. Otherwise set the selection's value to "underline".
+        // Either way, return true."
+        if (queryCommandState("underline")) {
+            setSelectionValue("underline", null);
+        } else {
+            setSelectionValue("underline", "underline");
+        }
+        return true;
+    }, inlineCommandActivatedValues: ["underline"]
+};
+
+//@}
+///// The unlink command /////
+//@{
+commands.unlink = {
+    action: function() {
+        // "Let hyperlinks be a list of every a element that has an href
+        // attribute and is contained in the active range or is an ancestor of
+        // one of its boundary points."
+        //
+        // As usual, take care to ensure it's tree order.  The correctness of
+        // the following is left as an exercise for the reader.
+        var range = getActiveRange();
+        var hyperlinks = [];
+        for (
+            var node = range.startContainer;
+            node;
+            node = node.parentNode
+        ) {
+            if (isHtmlElement(node, "A")
+            && node.hasAttribute("href")) {
+                hyperlinks.unshift(node);
+            }
+        }
+        for (
+            var node = range.startContainer;
+            node != nextNodeDescendants(range.endContainer);
+            node = nextNode(node)
+        ) {
+            if (isHtmlElement(node, "A")
+            && node.hasAttribute("href")
+            && (isContained(node, range)
+            || isAncestor(node, range.endContainer)
+            || node == range.endContainer)) {
+                hyperlinks.push(node);
+            }
+        }
+
+        // "Clear the value of each member of hyperlinks."
+        for (var i = 0; i < hyperlinks.length; i++) {
+            clearValue(hyperlinks[i], "unlink");
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+
+/////////////////////////////////////
+///// Block formatting commands /////
+/////////////////////////////////////
+
+///// Block formatting command definitions /////
+//@{
+
+// "An indentation element is either a blockquote, or a div that has a style
+// attribute that sets "margin" or some subproperty of it."
+function isIndentationElement(node) {
+    if (!isHtmlElement(node)) {
+        return false;
+    }
+
+    if (node.tagName == "BLOCKQUOTE") {
+        return true;
+    }
+
+    if (node.tagName != "DIV") {
+        return false;
+    }
+
+    for (var i = 0; i < node.style.length; i++) {
+        // Approximate check
+        if (/^(-[a-z]+-)?margin/.test(node.style[i])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// "A simple indentation element is an indentation element that has no
+// attributes except possibly
+//
+//   * "a style attribute that sets no properties other than "margin",
+//     "border", "padding", or subproperties of those; and/or
+//   * "a dir attribute."
+function isSimpleIndentationElement(node) {
+    if (!isIndentationElement(node)) {
+        return false;
+    }
+
+    for (var i = 0; i < attributesOf(node).length; i++) {
+        if (!isHtmlNamespace(attributesOf(node)[i].namespaceURI)
+        || ["style", "dir"].indexOf(attributesOf(node)[i].name) == -1) {
+            return false;
+        }
+    }
+
+    for (var i = 0; i < node.style.length; i++) {
+        // This is approximate, but it works well enough for my purposes.
+        if (!/^(-[a-z]+-)?(margin|border|padding)/.test(node.style[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// "A non-list single-line container is an HTML element with local name
+// "address", "div", "h1", "h2", "h3", "h4", "h5", "h6", "listing", "p", "pre",
+// or "xmp"."
+function isNonListSingleLineContainer(node) {
+    return isHtmlElement(node, ["address", "div", "h1", "h2", "h3", "h4", "h5",
+        "h6", "listing", "p", "pre", "xmp"]);
+}
+
+// "A single-line container is either a non-list single-line container, or an
+// HTML element with local name "li", "dt", or "dd"."
+function isSingleLineContainer(node) {
+    return isNonListSingleLineContainer(node)
+        || isHtmlElement(node, ["li", "dt", "dd"]);
+}
+
+function getBlockNodeOf(node) {
+    // "While node is an inline node, set node to its parent."
+    while (isInlineNode(node)) {
+        node = node.parentNode;
+    }
+
+    // "Return node."
+    return node;
+}
+
+//@}
+///// Assorted block formatting command algorithms /////
+//@{
+
+function fixDisallowedAncestors(node) {
+    // "If node is not editable, abort these steps."
+    if (!isEditable(node)) {
+        return;
+    }
+
+    // "If node is not an allowed child of any of its ancestors in the same
+    // editing host:"
+    if (getAncestors(node).every(function(ancestor) {
+        return !inSameEditingHost(node, ancestor)
+            || !isAllowedChild(node, ancestor)
+    })) {
+        // "If node is a dd or dt, wrap the one-node list consisting of node,
+        // with sibling criteria returning true for any dl with no attributes
+        // and false otherwise, and new parent instructions returning the
+        // result of calling createElement("dl") on the context object. Then
+        // abort these steps."
+        if (isHtmlElement(node, ["dd", "dt"])) {
+            wrap([node],
+                function(sibling) { return isHtmlElement(sibling, "dl") && !attributesOf(sibling).length },
+                function() { return createElement("dl") });
+            return;
+        }
+
+        // "If "p" is not an allowed child of the editing host of node, abort
+        // these steps."
+        if (!isAllowedChild("p", getEditingHostOf(node))) {
+            return;
+        }
+
+        // "If node is not a prohibited paragraph child, abort these steps."
+        if (!isProhibitedParagraphChild(node)) {
+            return;
+        }
+
+        // "Set the tag name of node to the default single-line container name,
+        // and let node be the result."
+        node = setTagName(node, defaultSingleLineContainerName);
+
+        // "Fix disallowed ancestors of node."
+        fixDisallowedAncestors(node);
+
+        // "Let children be node's children."
+        var children = [].slice.call(node.childNodes);
+
+        // "For each child in children, if child is a prohibited paragraph
+        // child:"
+        children.filter(isProhibitedParagraphChild)
+        .forEach(function(child) {
+            // "Record the values of the one-node list consisting of child, and
+            // let values be the result."
+            var values = recordValues([child]);
+
+            // "Split the parent of the one-node list consisting of child."
+            splitParent([child]);
+
+            // "Restore the values from values."
+            restoreValues(values);
+        });
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "Record the values of the one-node list consisting of node, and let
+    // values be the result."
+    var values = recordValues([node]);
+
+    // "While node is not an allowed child of its parent, split the parent of
+    // the one-node list consisting of node."
+    while (!isAllowedChild(node, node.parentNode)) {
+        splitParent([node]);
+    }
+
+    // "Restore the values from values."
+    restoreValues(values);
+}
+
+function normalizeSublists(item) {
+    // "If item is not an li or it is not editable or its parent is not
+    // editable, abort these steps."
+    if (!isHtmlElement(item, "LI")
+    || !isEditable(item)
+    || !isEditable(item.parentNode)) {
+        return;
+    }
+
+    // "Let new item be null."
+    var newItem = null;
+
+    // "While item has an ol or ul child:"
+    while ([].some.call(item.childNodes, function (node) { return isHtmlElement(node, ["OL", "UL"]) })) {
+        // "Let child be the last child of item."
+        var child = item.lastChild;
+
+        // "If child is an ol or ul, or new item is null and child is a Text
+        // node whose data consists of zero of more space characters:"
+        if (isHtmlElement(child, ["OL", "UL"])
+        || (!newItem && child.nodeType == DOM.TEXT_NODE && /^[ \t\n\f\r]*$/.test(child.data))) {
+            // "Set new item to null."
+            newItem = null;
+
+            // "Insert child into the parent of item immediately following
+            // item, preserving ranges."
+            movePreservingRanges(child, item.parentNode, 1 + getNodeIndex(item));
+
+        // "Otherwise:"
+        } else {
+            // "If new item is null, let new item be the result of calling
+            // createElement("li") on the ownerDocument of item, then insert
+            // new item into the parent of item immediately after item."
+            if (!newItem) {
+                newItem = createElement("li");
+                item.parentNode.insertBefore(newItem, item.nextSibling);
+            }
+
+            // "Insert child into new item as its first child, preserving
+            // ranges."
+            movePreservingRanges(child, newItem, 0);
+        }
+    }
+}
+
+function getSelectionListState() {
+    // "If the active range is null, return "none"."
+    if (!getActiveRange()) {
+        return "none";
+    }
+
+    // "Block-extend the active range, and let new range be the result."
+    var newRange = blockExtend(getActiveRange());
+
+    // "Let node list be a list of nodes, initially empty."
+    //
+    // "For each node contained in new range, append node to node list if the
+    // last member of node list (if any) is not an ancestor of node; node is
+    // editable; node is not an indentation element; and node is either an ol
+    // or ul, or the child of an ol or ul, or an allowed child of "li"."
+    var nodeList = getContainedNodes(newRange, function(node) {
+        return isEditable(node)
+            && !isIndentationElement(node)
+            && (isHtmlElement(node, ["ol", "ul"])
+            || isHtmlElement(node.parentNode, ["ol", "ul"])
+            || isAllowedChild(node, "li"));
+    });
+
+    // "If node list is empty, return "none"."
+    if (!nodeList.length) {
+        return "none";
+    }
+
+    // "If every member of node list is either an ol or the child of an ol or
+    // the child of an li child of an ol, and none is a ul or an ancestor of a
+    // ul, return "ol"."
+    if (nodeList.every(function(node) {
+        return isHtmlElement(node, "ol")
+            || isHtmlElement(node.parentNode, "ol")
+            || (isHtmlElement(node.parentNode, "li") && isHtmlElement(node.parentNode.parentNode, "ol"));
+    })
+    && !nodeList.some(function(node) { return isHtmlElement(node, "ul") || ("querySelector" in node && node.querySelector("ul")) })) {
+        return "ol";
+    }
+
+    // "If every member of node list is either a ul or the child of a ul or the
+    // child of an li child of a ul, and none is an ol or an ancestor of an ol,
+    // return "ul"."
+    if (nodeList.every(function(node) {
+        return isHtmlElement(node, "ul")
+            || isHtmlElement(node.parentNode, "ul")
+            || (isHtmlElement(node.parentNode, "li") && isHtmlElement(node.parentNode.parentNode, "ul"));
+    })
+    && !nodeList.some(function(node) { return isHtmlElement(node, "ol") || ("querySelector" in node && node.querySelector("ol")) })) {
+        return "ul";
+    }
+
+    var hasOl = nodeList.some(function(node) {
+        return isHtmlElement(node, "ol")
+            || isHtmlElement(node.parentNode, "ol")
+            || ("querySelector" in node && node.querySelector("ol"))
+            || (isHtmlElement(node.parentNode, "li") && isHtmlElement(node.parentNode.parentNode, "ol"));
+    });
+    var hasUl = nodeList.some(function(node) {
+        return isHtmlElement(node, "ul")
+            || isHtmlElement(node.parentNode, "ul")
+            || ("querySelector" in node && node.querySelector("ul"))
+            || (isHtmlElement(node.parentNode, "li") && isHtmlElement(node.parentNode.parentNode, "ul"));
+    });
+    // "If some member of node list is either an ol or the child or ancestor of
+    // an ol or the child of an li child of an ol, and some member of node list
+    // is either a ul or the child or ancestor of a ul or the child of an li
+    // child of a ul, return "mixed"."
+    if (hasOl && hasUl) {
+        return "mixed";
+    }
+
+    // "If some member of node list is either an ol or the child or ancestor of
+    // an ol or the child of an li child of an ol, return "mixed ol"."
+    if (hasOl) {
+        return "mixed ol";
+    }
+
+    // "If some member of node list is either a ul or the child or ancestor of
+    // a ul or the child of an li child of a ul, return "mixed ul"."
+    if (hasUl) {
+        return "mixed ul";
+    }
+
+    // "Return "none"."
+    return "none";
+}
+
+function getAlignmentValue(node) {
+    // "While node is neither null nor an Element, or it is an Element but its
+    // "display" property has resolved value "inline" or "none", set node to
+    // its parent."
+    while ((node && node.nodeType != DOM.ELEMENT_NODE)
+    || (node.nodeType == DOM.ELEMENT_NODE
+    && ["inline", "none"].indexOf(getComputedStyle(node).display) != -1)) {
+        node = node.parentNode;
+    }
+
+    // "If node is not an Element, return "left"."
+    if (!node || node.nodeType != DOM.ELEMENT_NODE) {
+        return "left";
+    }
+
+    var resolvedValue = getComputedStyle(node).textAlign
+        // Hack around browser non-standardness
+        .replace(/^-(moz|webkit)-/, "")
+        .replace(/^auto$/, "start");
+
+    // "If node's "text-align" property has resolved value "start", return
+    // "left" if the directionality of node is "ltr", "right" if it is "rtl"."
+    if (resolvedValue == "start") {
+        return getDirectionality(node) == "ltr" ? "left" : "right";
+    }
+
+    // "If node's "text-align" property has resolved value "end", return
+    // "right" if the directionality of node is "ltr", "left" if it is "rtl"."
+    if (resolvedValue == "end") {
+        return getDirectionality(node) == "ltr" ? "right" : "left";
+    }
+
+    // "If node's "text-align" property has resolved value "center", "justify",
+    // "left", or "right", return that value."
+    if (["center", "justify", "left", "right"].indexOf(resolvedValue) != -1) {
+        return resolvedValue;
+    }
+
+    // "Return "left"."
+    return "left";
+}
+
+function getNextEquivalentPoint(node, offset) {
+    // "If node's length is zero, return null."
+    if (getNodeLength(node) == 0) {
+        return null;
+    }
+
+    // "If offset is node's length, and node's parent is not null, and node is
+    // an inline node, return (node's parent, 1 + node's index)."
+    if (offset == getNodeLength(node)
+    && node.parentNode
+    && isInlineNode(node)) {
+        return [node.parentNode, 1 + getNodeIndex(node)];
+    }
+
+    // "If node has a child with index offset, and that child's length is not
+    // zero, and that child is an inline node, return (that child, 0)."
+    if (0 <= offset
+    && offset < node.childNodes.length
+    && getNodeLength(node.childNodes[offset]) != 0
+    && isInlineNode(node.childNodes[offset])) {
+        return [node.childNodes[offset], 0];
+    }
+
+    // "Return null."
+    return null;
+}
+
+function getPreviousEquivalentPoint(node, offset) {
+    // "If node's length is zero, return null."
+    if (getNodeLength(node) == 0) {
+        return null;
+    }
+
+    // "If offset is 0, and node's parent is not null, and node is an inline
+    // node, return (node's parent, node's index)."
+    if (offset == 0
+    && node.parentNode
+    && isInlineNode(node)) {
+        return [node.parentNode, getNodeIndex(node)];
+    }
+
+    // "If node has a child with index offset − 1, and that child's length is
+    // not zero, and that child is an inline node, return (that child, that
+    // child's length)."
+    if (0 <= offset - 1
+    && offset - 1 < node.childNodes.length
+    && getNodeLength(node.childNodes[offset - 1]) != 0
+    && isInlineNode(node.childNodes[offset - 1])) {
+        return [node.childNodes[offset - 1], getNodeLength(node.childNodes[offset - 1])];
+    }
+
+    // "Return null."
+    return null;
+}
+
+function getFirstEquivalentPoint(node, offset) {
+    // "While (node, offset)'s previous equivalent point is not null, set
+    // (node, offset) to its previous equivalent point."
+    var prev;
+    while (prev = getPreviousEquivalentPoint(node, offset)) {
+        node = prev[0];
+        offset = prev[1];
+    }
+
+    // "Return (node, offset)."
+    return [node, offset];
+}
+
+function getLastEquivalentPoint(node, offset) {
+    // "While (node, offset)'s next equivalent point is not null, set (node,
+    // offset) to its next equivalent point."
+    var next;
+    while (next = getNextEquivalentPoint(node, offset)) {
+        node = next[0];
+        offset = next[1];
+    }
+
+    // "Return (node, offset)."
+    return [node, offset];
+}
+
+//@}
+///// Block-extending a range /////
+//@{
+
+// "A boundary point (node, offset) is a block start point if either node's
+// parent is null and offset is zero; or node has a child with index offset −
+// 1, and that child is either a visible block node or a visible br."
+function isBlockStartPoint(node, offset) {
+    return (!node.parentNode && offset == 0)
+        || (0 <= offset - 1
+        && offset - 1 < node.childNodes.length
+        && isVisible(node.childNodes[offset - 1])
+        && (isBlockNode(node.childNodes[offset - 1])
+        || isHtmlElement(node.childNodes[offset - 1], "br")));
+}
+
+// "A boundary point (node, offset) is a block end point if either node's
+// parent is null and offset is node's length; or node has a child with index
+// offset, and that child is a visible block node."
+function isBlockEndPoint(node, offset) {
+    return (!node.parentNode && offset == getNodeLength(node))
+        || (offset < node.childNodes.length
+        && isVisible(node.childNodes[offset])
+        && isBlockNode(node.childNodes[offset]));
+}
+
+// "A boundary point is a block boundary point if it is either a block start
+// point or a block end point."
+function isBlockBoundaryPoint(node, offset) {
+    return isBlockStartPoint(node, offset)
+        || isBlockEndPoint(node, offset);
+}
+
+function blockExtend(range) {
+    // "Let start node, start offset, end node, and end offset be the start
+    // and end nodes and offsets of the range."
+    var startNode = range.startContainer;
+    var startOffset = range.startOffset;
+    var endNode = range.endContainer;
+    var endOffset = range.endOffset;
+
+    // "If some ancestor container of start node is an li, set start offset to
+    // the index of the last such li in tree order, and set start node to that
+    // li's parent."
+    var liAncestors = getAncestors(startNode).concat(startNode)
+        .filter(function(ancestor) { return isHtmlElement(ancestor, "li") })
+        .slice(-1);
+    if (liAncestors.length) {
+        startOffset = getNodeIndex(liAncestors[0]);
+        startNode = liAncestors[0].parentNode;
+    }
+
+    // "If (start node, start offset) is not a block start point, repeat the
+    // following steps:"
+    if (!isBlockStartPoint(startNode, startOffset)) do {
+        // "If start offset is zero, set it to start node's index, then set
+        // start node to its parent."
+        if (startOffset == 0) {
+            startOffset = getNodeIndex(startNode);
+            startNode = startNode.parentNode;
+
+        // "Otherwise, subtract one from start offset."
+        } else {
+            startOffset--;
+        }
+
+        // "If (start node, start offset) is a block boundary point, break from
+        // this loop."
+    } while (!isBlockBoundaryPoint(startNode, startOffset));
+
+    // "While start offset is zero and start node's parent is not null, set
+    // start offset to start node's index, then set start node to its parent."
+    while (startOffset == 0
+    && startNode.parentNode) {
+        startOffset = getNodeIndex(startNode);
+        startNode = startNode.parentNode;
+    }
+
+    // "If some ancestor container of end node is an li, set end offset to one
+    // plus the index of the last such li in tree order, and set end node to
+    // that li's parent."
+    var liAncestors = getAncestors(endNode).concat(endNode)
+        .filter(function(ancestor) { return isHtmlElement(ancestor, "li") })
+        .slice(-1);
+    if (liAncestors.length) {
+        endOffset = 1 + getNodeIndex(liAncestors[0]);
+        endNode = liAncestors[0].parentNode;
+    }
+
+    // "If (end node, end offset) is not a block end point, repeat the
+    // following steps:"
+    if (!isBlockEndPoint(endNode, endOffset)) do {
+        // "If end offset is end node's length, set it to one plus end node's
+        // index, then set end node to its parent."
+        if (endOffset == getNodeLength(endNode)) {
+            endOffset = 1 + getNodeIndex(endNode);
+            endNode = endNode.parentNode;
+
+        // "Otherwise, add one to end offset.
+        } else {
+            endOffset++;
+        }
+
+        // "If (end node, end offset) is a block boundary point, break from
+        // this loop."
+    } while (!isBlockBoundaryPoint(endNode, endOffset));
+
+    // "While end offset is end node's length and end node's parent is not
+    // null, set end offset to one plus end node's index, then set end node to
+    // its parent."
+    while (endOffset == getNodeLength(endNode)
+    && endNode.parentNode) {
+        endOffset = 1 + getNodeIndex(endNode);
+        endNode = endNode.parentNode;
+    }
+
+    // "Let new range be a new range whose start and end nodes and offsets
+    // are start node, start offset, end node, and end offset."
+    var newRange = createRange();
+    newRange.setStart(startNode, startOffset);
+    newRange.setEnd(endNode, endOffset);
+
+    // "Return new range."
+    return newRange;
+}
+
+function followsLineBreak(node) {
+    // "Let offset be zero."
+    var offset = 0;
+
+    // "While (node, offset) is not a block boundary point:"
+    while (!isBlockBoundaryPoint(node, offset)) {
+        // "If node has a visible child with index offset minus one, return
+        // false."
+        if (0 <= offset - 1
+        && offset - 1 < node.childNodes.length
+        && isVisible(node.childNodes[offset - 1])) {
+            return false;
+        }
+
+        // "If offset is zero or node has no children, set offset to node's
+        // index, then set node to its parent."
+        if (offset == 0
+        || !node.hasChildNodes()) {
+            offset = getNodeIndex(node);
+            node = node.parentNode;
+
+        // "Otherwise, set node to its child with index offset minus one, then
+        // set offset to node's length."
+        } else {
+            node = node.childNodes[offset - 1];
+            offset = getNodeLength(node);
+        }
+    }
+
+    // "Return true."
+    return true;
+}
+
+function precedesLineBreak(node) {
+    // "Let offset be node's length."
+    var offset = getNodeLength(node);
+
+    // "While (node, offset) is not a block boundary point:"
+    while (!isBlockBoundaryPoint(node, offset)) {
+        // "If node has a visible child with index offset, return false."
+        if (offset < node.childNodes.length
+        && isVisible(node.childNodes[offset])) {
+            return false;
+        }
+
+        // "If offset is node's length or node has no children, set offset to
+        // one plus node's index, then set node to its parent."
+        if (offset == getNodeLength(node)
+        || !node.hasChildNodes()) {
+            offset = 1 + getNodeIndex(node);
+            node = node.parentNode;
+
+        // "Otherwise, set node to its child with index offset and set offset
+        // to zero."
+        } else {
+            node = node.childNodes[offset];
+            offset = 0;
+        }
+    }
+
+    // "Return true."
+    return true;
+}
+
+//@}
+///// Recording and restoring overrides /////
+//@{
+
+function recordCurrentOverrides() {
+    // "Let overrides be a list of (string, string or boolean) ordered pairs,
+    // initially empty."
+    var overrides = [];
+
+    // "If there is a value override for "createLink", add ("createLink", value
+    // override for "createLink") to overrides."
+    if (getValueOverride("createlink") !== undefined) {
+        overrides.push(["createlink", getValueOverride("createlink")]);
+    }
+
+    // "For each command in the list "bold", "italic", "strikethrough",
+    // "subscript", "superscript", "underline", in order: if there is a state
+    // override for command, add (command, command's state override) to
+    // overrides."
+    ["bold", "italic", "strikethrough", "subscript", "superscript",
+    "underline"].forEach(function(command) {
+        if (getStateOverride(command) !== undefined) {
+            overrides.push([command, getStateOverride(command)]);
+        }
+    });
+
+    // "For each command in the list "fontName", "fontSize", "foreColor",
+    // "hiliteColor", in order: if there is a value override for command, add
+    // (command, command's value override) to overrides."
+    ["fontname", "fontsize", "forecolor",
+    "hilitecolor"].forEach(function(command) {
+        if (getValueOverride(command) !== undefined) {
+            overrides.push([command, getValueOverride(command)]);
+        }
+    });
+
+    // "Return overrides."
+    return overrides;
+}
+
+function recordCurrentStatesAndValues() {
+    // "Let overrides be a list of (string, string or boolean) ordered pairs,
+    // initially empty."
+    var overrides = [];
+
+    // "Let node be the first formattable node effectively contained in the
+    // active range, or null if there is none."
+    var node = getAllEffectivelyContainedNodes(getActiveRange())
+        .filter(isFormattableNode)[0];
+
+    // "If node is null, return overrides."
+    if (!node) {
+        return overrides;
+    }
+
+    // "Add ("createLink", node's effective command value for "createLink") to
+    // overrides."
+    overrides.push(["createlink", getEffectiveCommandValue(node, "createlink")]);
+
+    // "For each command in the list "bold", "italic", "strikethrough",
+    // "subscript", "superscript", "underline", in order: if node's effective
+    // command value for command is one of its inline command activated values,
+    // add (command, true) to overrides, and otherwise add (command, false) to
+    // overrides."
+    ["bold", "italic", "strikethrough", "subscript", "superscript",
+    "underline"].forEach(function(command) {
+        if (commands[command].inlineCommandActivatedValues
+        .indexOf(getEffectiveCommandValue(node, command)) != -1) {
+            overrides.push([command, true]);
+        } else {
+            overrides.push([command, false]);
+        }
+    });
+
+    // "For each command in the list "fontName", "foreColor", "hiliteColor", in
+    // order: add (command, command's value) to overrides."
+    ["fontname", "fontsize", "forecolor", "hilitecolor"].forEach(function(command) {
+        overrides.push([command, commands[command].value()]);
+    });
+
+    // "Add ("fontSize", node's effective command value for "fontSize") to
+    // overrides."
+    overrides.push(["fontsize", getEffectiveCommandValue(node, "fontsize")]);
+
+    // "Return overrides."
+    return overrides;
+}
+
+function restoreStatesAndValues(overrides) {
+    // "Let node be the first formattable node effectively contained in the
+    // active range, or null if there is none."
+    var node = getAllEffectivelyContainedNodes(getActiveRange())
+        .filter(isFormattableNode)[0];
+
+    // "If node is not null, then for each (command, override) pair in
+    // overrides, in order:"
+    if (node) {
+        for (var i = 0; i < overrides.length; i++) {
+            var command = overrides[i][0];
+            var override = overrides[i][1];
+
+            // "If override is a boolean, and queryCommandState(command)
+            // returns something different from override, take the action for
+            // command, with value equal to the empty string."
+            if (typeof override == "boolean"
+            && queryCommandState(command) != override) {
+                commands[command].action("");
+
+            // "Otherwise, if override is a string, and command is neither
+            // "createLink" nor "fontSize", and queryCommandValue(command)
+            // returns something not equivalent to override, take the action
+            // for command, with value equal to override."
+            } else if (typeof override == "string"
+            && command != "createlink"
+            && command != "fontsize"
+            && !areEquivalentValues(command, queryCommandValue(command), override)) {
+                commands[command].action(override);
+
+            // "Otherwise, if override is a string; and command is
+            // "createLink"; and either there is a value override for
+            // "createLink" that is not equal to override, or there is no value
+            // override for "createLink" and node's effective command value for
+            // "createLink" is not equal to override: take the action for
+            // "createLink", with value equal to override."
+            } else if (typeof override == "string"
+            && command == "createlink"
+            && (
+                (
+                    getValueOverride("createlink") !== undefined
+                    && getValueOverride("createlink") !== override
+                ) || (
+                    getValueOverride("createlink") === undefined
+                    && getEffectiveCommandValue(node, "createlink") !== override
+                )
+            )) {
+                commands.createlink.action(override);
+
+            // "Otherwise, if override is a string; and command is "fontSize";
+            // and either there is a value override for "fontSize" that is not
+            // equal to override, or there is no value override for "fontSize"
+            // and node's effective command value for "fontSize" is not loosely
+            // equivalent to override:"
+            } else if (typeof override == "string"
+            && command == "fontsize"
+            && (
+                (
+                    getValueOverride("fontsize") !== undefined
+                    && getValueOverride("fontsize") !== override
+                ) || (
+                    getValueOverride("fontsize") === undefined
+                    && !areLooselyEquivalentValues(command, getEffectiveCommandValue(node, "fontsize"), override)
+                )
+            )) {
+                // "Convert override to an integer number of pixels, and set
+                // override to the legacy font size for the result."
+                override = getLegacyFontSize(override);
+
+                // "Take the action for "fontSize", with value equal to
+                // override."
+                commands.fontsize.action(override);
+
+            // "Otherwise, continue this loop from the beginning."
+            } else {
+                continue;
+            }
+
+            // "Set node to the first formattable node effectively contained in
+            // the active range, if there is one."
+            node = getAllEffectivelyContainedNodes(getActiveRange())
+                .filter(isFormattableNode)[0]
+                || node;
+        }
+
+    // "Otherwise, for each (command, override) pair in overrides, in order:"
+    } else {
+        for (var i = 0; i < overrides.length; i++) {
+            var command = overrides[i][0];
+            var override = overrides[i][1];
+
+            // "If override is a boolean, set the state override for command to
+            // override."
+            if (typeof override == "boolean") {
+                setStateOverride(command, override);
+            }
+
+            // "If override is a string, set the value override for command to
+            // override."
+            if (typeof override == "string") {
+                setValueOverride(command, override);
+            }
+        }
+    }
+}
+
+//@}
+///// Deleting the selection /////
+//@{
+
+// The flags argument is a dictionary that can have blockMerging,
+// stripWrappers, and/or direction as keys.
+function deleteSelection(flags) {
+    if (flags === undefined) {
+        flags = {};
+    }
+
+    var blockMerging = "blockMerging" in flags ? Boolean(flags.blockMerging) : true;
+    var stripWrappers = "stripWrappers" in flags ? Boolean(flags.stripWrappers) : true;
+    var direction = "direction" in flags ? flags.direction : "forward";
+
+    // "If the active range is null, abort these steps and do nothing."
+    if (!getActiveRange()) {
+        return;
+    }
+
+    // "Canonicalize whitespace at the active range's start."
+    canonicalizeWhitespace(getActiveRange().startContainer, getActiveRange().startOffset);
+
+    // "Canonicalize whitespace at the active range's end."
+    canonicalizeWhitespace(getActiveRange().endContainer, getActiveRange().endOffset);
+
+    // "Let (start node, start offset) be the last equivalent point for the
+    // active range's start."
+    var start = getLastEquivalentPoint(getActiveRange().startContainer, getActiveRange().startOffset);
+    var startNode = start[0];
+    var startOffset = start[1];
+
+    // "Let (end node, end offset) be the first equivalent point for the active
+    // range's end."
+    var end = getFirstEquivalentPoint(getActiveRange().endContainer, getActiveRange().endOffset);
+    var endNode = end[0];
+    var endOffset = end[1];
+
+    // "If (end node, end offset) is not after (start node, start offset):"
+    if (getPosition(endNode, endOffset, startNode, startOffset) !== "after") {
+        // "If direction is "forward", call collapseToStart() on the context
+        // object's Selection."
+        //
+        // Here and in a few other places, we check rangeCount to work around a
+        // WebKit bug: it will sometimes incorrectly remove ranges from the
+        // selection if nodes are removed, so collapseToStart() will throw.
+        // This will break everything if we're using an actual selection, but
+        // if getActiveRange() is really just returning globalRange and that's
+        // all we care about, it will work fine.  I only add the extra check
+        // for errors I actually hit in testing.
+        if (direction == "forward") {
+            if (getSelection().rangeCount) {
+                getSelection().collapseToStart();
+            }
+            getActiveRange().collapse(true);
+
+        // "Otherwise, call collapseToEnd() on the context object's Selection."
+        } else {
+            getSelection().collapseToEnd();
+            getActiveRange().collapse(false);
+        }
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If start node is a Text node and start offset is 0, set start offset to
+    // the index of start node, then set start node to its parent."
+    if (startNode.nodeType == DOM.TEXT_NODE
+    && startOffset == 0) {
+        startOffset = getNodeIndex(startNode);
+        startNode = startNode.parentNode;
+    }
+
+    // "If end node is a Text node and end offset is its length, set end offset
+    // to one plus the index of end node, then set end node to its parent."
+    if (endNode.nodeType == DOM.TEXT_NODE
+    && endOffset == getNodeLength(endNode)) {
+        endOffset = 1 + getNodeIndex(endNode);
+        endNode = endNode.parentNode;
+    }
+
+    // "Call collapse(start node, start offset) on the context object's
+    // Selection."
+    getSelection().collapse(startNode, startOffset);
+    getActiveRange().setStart(startNode, startOffset);
+
+    // "Call extend(end node, end offset) on the context object's Selection."
+    getSelection().extend(endNode, endOffset);
+    getActiveRange().setEnd(endNode, endOffset);
+
+    // "Let start block be the active range's start node."
+    var startBlock = getActiveRange().startContainer;
+
+    // "While start block's parent is in the same editing host and start block
+    // is an inline node, set start block to its parent."
+    while (inSameEditingHost(startBlock, startBlock.parentNode)
+    && isInlineNode(startBlock)) {
+        startBlock = startBlock.parentNode;
+    }
+
+    // "If start block is neither a block node nor an editing host, or "span"
+    // is not an allowed child of start block, or start block is a td or th,
+    // set start block to null."
+    if ((!isBlockNode(startBlock) && !isEditingHost(startBlock))
+    || !isAllowedChild("span", startBlock)
+    || isHtmlElement(startBlock, ["td", "th"])) {
+        startBlock = null;
+    }
+
+    // "Let end block be the active range's end node."
+    var endBlock = getActiveRange().endContainer;
+
+    // "While end block's parent is in the same editing host and end block is
+    // an inline node, set end block to its parent."
+    while (inSameEditingHost(endBlock, endBlock.parentNode)
+    && isInlineNode(endBlock)) {
+        endBlock = endBlock.parentNode;
+    }
+
+    // "If end block is neither a block node nor an editing host, or "span" is
+    // not an allowed child of end block, or end block is a td or th, set end
+    // block to null."
+    if ((!isBlockNode(endBlock) && !isEditingHost(endBlock))
+    || !isAllowedChild("span", endBlock)
+    || isHtmlElement(endBlock, ["td", "th"])) {
+        endBlock = null;
+    }
+
+    // "Record current states and values, and let overrides be the result."
+    var overrides = recordCurrentStatesAndValues();
+
+    // "If start node and end node are the same, and start node is an editable
+    // Text node:"
+    if (startNode == endNode
+    && isEditable(startNode)
+    && startNode.nodeType == DOM.TEXT_NODE) {
+        // "Call deleteData(start offset, end offset − start offset) on start
+        // node."
+        startNode.deleteData(startOffset, endOffset - startOffset);
+
+        // "Canonicalize whitespace at (start node, start offset), with fix
+        // collapsed space false."
+        canonicalizeWhitespace(startNode, startOffset, false);
+
+        // "If direction is "forward", call collapseToStart() on the context
+        // object's Selection."
+        if (direction == "forward") {
+            if (getSelection().rangeCount) {
+                getSelection().collapseToStart();
+            }
+            getActiveRange().collapse(true);
+
+        // "Otherwise, call collapseToEnd() on the context object's Selection."
+        } else {
+            getSelection().collapseToEnd();
+            getActiveRange().collapse(false);
+        }
+
+        // "Restore states and values from overrides."
+        restoreStatesAndValues(overrides);
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If start node is an editable Text node, call deleteData() on it, with
+    // start offset as the first argument and (length of start node − start
+    // offset) as the second argument."
+    if (isEditable(startNode)
+    && startNode.nodeType == DOM.TEXT_NODE) {
+        startNode.deleteData(startOffset, getNodeLength(startNode) - startOffset);
+    }
+
+    // "Let node list be a list of nodes, initially empty."
+    //
+    // "For each node contained in the active range, append node to node list
+    // if the last member of node list (if any) is not an ancestor of node;
+    // node is editable; and node is not a thead, tbody, tfoot, tr, th, or td."
+    var nodeList = getContainedNodes(getActiveRange(),
+        function(node) {
+            return isEditable(node)
+                && !isHtmlElement(node, ["thead", "tbody", "tfoot", "tr", "th", "td"]);
+        }
+    );
+
+    // "For each node in node list:"
+    for (var i = 0; i < nodeList.length; i++) {
+        var node = nodeList[i];
+
+        // "Let parent be the parent of node."
+        var parent_ = node.parentNode;
+
+        // "Remove node from parent."
+        parent_.removeChild(node);
+
+        // "If the block node of parent has no visible children, and parent is
+        // editable or an editing host, call createElement("br") on the context
+        // object and append the result as the last child of parent."
+        if (![].some.call(getBlockNodeOf(parent_).childNodes, isVisible)
+        && (isEditable(parent_) || isEditingHost(parent_))) {
+            parent_.appendChild(createElement("br"));
+        }
+
+        // "If strip wrappers is true or parent is not an ancestor container of
+        // start node, while parent is an editable inline node with length 0,
+        // let grandparent be the parent of parent, then remove parent from
+        // grandparent, then set parent to grandparent."
+        if (stripWrappers
+        || (!isAncestor(parent_, startNode) && parent_ != startNode)) {
+            while (isEditable(parent_)
+            && isInlineNode(parent_)
+            && getNodeLength(parent_) == 0) {
+                var grandparent = parent_.parentNode;
+                grandparent.removeChild(parent_);
+                parent_ = grandparent;
+            }
+        }
+    }
+
+    // "If end node is an editable Text node, call deleteData(0, end offset) on
+    // it."
+    if (isEditable(endNode)
+    && endNode.nodeType == DOM.TEXT_NODE) {
+        endNode.deleteData(0, endOffset);
+    }
+
+    // "Canonicalize whitespace at the active range's start, with fix collapsed
+    // space false."
+    canonicalizeWhitespace(getActiveRange().startContainer, getActiveRange().startOffset, false);
+
+    // "Canonicalize whitespace at the active range's end, with fix collapsed
+    // space false."
+    canonicalizeWhitespace(getActiveRange().endContainer, getActiveRange().endOffset, false);
+
+    // "If block merging is false, or start block or end block is null, or
+    // start block is not in the same editing host as end block, or start block
+    // and end block are the same:"
+    if (!blockMerging
+    || !startBlock
+    || !endBlock
+    || !inSameEditingHost(startBlock, endBlock)
+    || startBlock == endBlock) {
+        // "If direction is "forward", call collapseToStart() on the context
+        // object's Selection."
+        if (direction == "forward") {
+            if (getSelection().rangeCount) {
+                getSelection().collapseToStart();
+            }
+            getActiveRange().collapse(true);
+
+        // "Otherwise, call collapseToEnd() on the context object's Selection."
+        } else {
+            if (getSelection().rangeCount) {
+                getSelection().collapseToEnd();
+            }
+            getActiveRange().collapse(false);
+        }
+
+        // "Restore states and values from overrides."
+        restoreStatesAndValues(overrides);
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If start block has one child, which is a collapsed block prop, remove
+    // its child from it."
+    if (startBlock.childNodes.filter(function(child) { return child.nodeType == DOM.ELEMENT_NODE }).length == 1
+    && isCollapsedBlockProp(startBlock.firstChild)) {
+        startBlock.removeChild(startBlock.firstChild);
+    }
+
+    // "If start block is an ancestor of end block:"
+    if (isAncestor(startBlock, endBlock)) {
+        // "Let reference node be end block."
+        var referenceNode = endBlock;
+
+        // "While reference node is not a child of start block, set reference
+        // node to its parent."
+        while (referenceNode.parentNode != startBlock) {
+            referenceNode = referenceNode.parentNode;
+        }
+
+        // "Call collapse() on the context object's Selection, with first
+        // argument start block and second argument the index of reference
+        // node."
+        getSelection().collapse(startBlock, getNodeIndex(referenceNode));
+        getActiveRange().setStart(startBlock, getNodeIndex(referenceNode));
+        getActiveRange().collapse(true);
+
+        // "If end block has no children:"
+        if (!endBlock.hasChildNodes()) {
+            // "While end block is editable and is the only child of its parent
+            // and is not a child of start block, let parent equal end block,
+            // then remove end block from parent, then set end block to
+            // parent."
+            while (isEditable(endBlock)
+            && endBlock.parentNode.childNodes.length == 1
+            && endBlock.parentNode != startBlock) {
+                var parent_ = endBlock;
+                parent_.removeChild(endBlock);
+                endBlock = parent_;
+            }
+
+            // "If end block is editable and is not an inline node, and its
+            // previousSibling and nextSibling are both inline nodes, call
+            // createElement("br") on the context object and insert it into end
+            // block's parent immediately after end block."
+            if (isEditable(endBlock)
+            && !isInlineNode(endBlock)
+            && isInlineNode(endBlock.previousSibling)
+            && isInlineNode(endBlock.nextSibling)) {
+                endBlock.parentNode.insertBefore(createElement("br"), endBlock.nextSibling);
+            }
+
+            // "If end block is editable, remove it from its parent."
+            if (isEditable(endBlock)) {
+                endBlock.parentNode.removeChild(endBlock);
+            }
+
+            // "Restore states and values from overrides."
+            restoreStatesAndValues(overrides);
+
+            // "Abort these steps."
+            return;
+        }
+
+        // "If end block's firstChild is not an inline node, restore states and
+        // values from overrides, then abort these steps."
+        if (!isInlineNode(endBlock.firstChild)) {
+            restoreStatesAndValues(overrides);
+            return;
+        }
+
+        // "Let children be a list of nodes, initially empty."
+        var children = [];
+
+        // "Append the first child of end block to children."
+        children.push(endBlock.firstChild);
+
+        // "While children's last member is not a br, and children's last
+        // member's nextSibling is an inline node, append children's last
+        // member's nextSibling to children."
+        while (!isHtmlElement(children[children.length - 1], "br")
+        && isInlineNode(children[children.length - 1].nextSibling)) {
+            children.push(children[children.length - 1].nextSibling);
+        }
+
+        // "Record the values of children, and let values be the result."
+        var values = recordValues(children);
+
+        // "While children's first member's parent is not start block, split
+        // the parent of children."
+        while (children[0].parentNode != startBlock) {
+            splitParent(children);
+        }
+
+        // "If children's first member's previousSibling is an editable br,
+        // remove that br from its parent."
+        if (isEditable(children[0].previousSibling)
+        && isHtmlElement(children[0].previousSibling, "br")) {
+            children[0].parentNode.removeChild(children[0].previousSibling);
+        }
+
+    // "Otherwise, if start block is a descendant of end block:"
+    } else if (isDescendant(startBlock, endBlock)) {
+        // "Call collapse() on the context object's Selection, with first
+        // argument start block and second argument start block's length."
+        getSelection().collapse(startBlock, getNodeLength(startBlock));
+        getActiveRange().setStart(startBlock, getNodeLength(startBlock));
+        getActiveRange().collapse(true);
+
+        // "Let reference node be start block."
+        var referenceNode = startBlock;
+
+        // "While reference node is not a child of end block, set reference
+        // node to its parent."
+        while (referenceNode.parentNode != endBlock) {
+            referenceNode = referenceNode.parentNode;
+        }
+
+        // "If reference node's nextSibling is an inline node and start block's
+        // lastChild is a br, remove start block's lastChild from it."
+        if (isInlineNode(referenceNode.nextSibling)
+        && isHtmlElement(startBlock.lastChild, "br")) {
+            startBlock.removeChild(startBlock.lastChild);
+        }
+
+        // "Let nodes to move be a list of nodes, initially empty."
+        var nodesToMove = [];
+
+        // "If reference node's nextSibling is neither null nor a block node,
+        // append it to nodes to move."
+        if (referenceNode.nextSibling
+        && !isBlockNode(referenceNode.nextSibling)) {
+            nodesToMove.push(referenceNode.nextSibling);
+        }
+
+        // "While nodes to move is nonempty and its last member isn't a br and
+        // its last member's nextSibling is neither null nor a block node,
+        // append its last member's nextSibling to nodes to move."
+        if (nodesToMove.length
+        && !isHtmlElement(nodesToMove[nodesToMove.length - 1], "br")
+        && nodesToMove[nodesToMove.length - 1].nextSibling
+        && !isBlockNode(nodesToMove[nodesToMove.length - 1].nextSibling)) {
+            nodesToMove.push(nodesToMove[nodesToMove.length - 1].nextSibling);
+        }
+
+        // "Record the values of nodes to move, and let values be the result."
+        var values = recordValues(nodesToMove);
+
+        // "For each node in nodes to move, append node as the last child of
+        // start block, preserving ranges."
+        nodesToMove.forEach(function(node) {
+            movePreservingRanges(node, startBlock, -1);
+        });
+
+    // "Otherwise:"
+    } else {
+        // "Call collapse() on the context object's Selection, with first
+        // argument start block and second argument start block's length."
+        getSelection().collapse(startBlock, getNodeLength(startBlock));
+        getActiveRange().setStart(startBlock, getNodeLength(startBlock));
+        getActiveRange().collapse(true);
+
+        // "If end block's firstChild is an inline node and start block's
+        // lastChild is a br, remove start block's lastChild from it."
+        if (isInlineNode(endBlock.firstChild)
+        && isHtmlElement(startBlock.lastChild, "br")) {
+            startBlock.removeChild(startBlock.lastChild);
+        }
+
+        // "Record the values of end block's children, and let values be the
+        // result."
+        var values = recordValues([].slice.call(endBlock.childNodes));
+
+        // "While end block has children, append the first child of end block
+        // to start block, preserving ranges."
+        while (endBlock.hasChildNodes()) {
+            movePreservingRanges(endBlock.firstChild, startBlock, -1);
+        }
+
+        // "While end block has no children, let parent be the parent of end
+        // block, then remove end block from parent, then set end block to
+        // parent."
+        while (!endBlock.hasChildNodes()) {
+            var parent_ = endBlock.parentNode;
+            parent_.removeChild(endBlock);
+            endBlock = parent_;
+        }
+    }
+
+    // "Let ancestor be start block."
+    var ancestor = startBlock;
+
+    // "While ancestor has an inclusive ancestor ol in the same editing host
+    // whose nextSibling is also an ol in the same editing host, or an
+    // inclusive ancestor ul in the same editing host whose nextSibling is also
+    // a ul in the same editing host:"
+    while (getInclusiveAncestors(ancestor).some(function(node) {
+        return inSameEditingHost(ancestor, node)
+            && (
+                (isHtmlElement(node, "ol") && isHtmlElement(node.nextSibling, "ol"))
+                || (isHtmlElement(node, "ul") && isHtmlElement(node.nextSibling, "ul"))
+            ) && inSameEditingHost(ancestor, node.nextSibling);
+    })) {
+        // "While ancestor and its nextSibling are not both ols in the same
+        // editing host, and are also not both uls in the same editing host,
+        // set ancestor to its parent."
+        while (!(
+            isHtmlElement(ancestor, "ol")
+            && isHtmlElement(ancestor.nextSibling, "ol")
+            && inSameEditingHost(ancestor, ancestor.nextSibling)
+        ) && !(
+            isHtmlElement(ancestor, "ul")
+            && isHtmlElement(ancestor.nextSibling, "ul")
+            && inSameEditingHost(ancestor, ancestor.nextSibling)
+        )) {
+            ancestor = ancestor.parentNode;
+        }
+
+        // "While ancestor's nextSibling has children, append ancestor's
+        // nextSibling's firstChild as the last child of ancestor, preserving
+        // ranges."
+        while (ancestor.nextSibling.hasChildNodes()) {
+            movePreservingRanges(ancestor.nextSibling.firstChild, ancestor, -1);
+        }
+
+        // "Remove ancestor's nextSibling from its parent."
+        ancestor.parentNode.removeChild(ancestor.nextSibling);
+    }
+
+    // "Restore the values from values."
+    restoreValues(values);
+
+    // "If start block has no children, call createElement("br") on the context
+    // object and append the result as the last child of start block."
+    if (!startBlock.hasChildNodes()) {
+        startBlock.appendChild(createElement("br"));
+    }
+
+    // "Remove extraneous line breaks at the end of start block."
+    removeExtraneousLineBreaksAtTheEndOf(startBlock);
+
+    // "Restore states and values from overrides."
+    restoreStatesAndValues(overrides);
+}
+
+
+//@}
+///// Splitting a node list's parent /////
+//@{
+
+function splitParent(nodeList) {
+    // "Let original parent be the parent of the first member of node list."
+    var originalParent = nodeList[0].parentNode;
+
+    // "If original parent is not editable or its parent is null, do nothing
+    // and abort these steps."
+    if (!isEditable(originalParent)
+    || !originalParent.parentNode) {
+        return;
+    }
+
+    // "If the first child of original parent is in node list, remove
+    // extraneous line breaks before original parent."
+    if (nodeList.indexOf(originalParent.firstChild) != -1) {
+        removeExtraneousLineBreaksBefore(originalParent);
+    }
+
+    // "If the first child of original parent is in node list, and original
+    // parent follows a line break, set follows line break to true. Otherwise,
+    // set follows line break to false."
+    var followsLineBreak_ = nodeList.indexOf(originalParent.firstChild) != -1
+        && followsLineBreak(originalParent);
+
+    // "If the last child of original parent is in node list, and original
+    // parent precedes a line break, set precedes line break to true.
+    // Otherwise, set precedes line break to false."
+    var precedesLineBreak_ = nodeList.indexOf(originalParent.lastChild) != -1
+        && precedesLineBreak(originalParent);
+
+    // "If the first child of original parent is not in node list, but its last
+    // child is:"
+    if (nodeList.indexOf(originalParent.firstChild) == -1
+    && nodeList.indexOf(originalParent.lastChild) != -1) {
+        // "For each node in node list, in reverse order, insert node into the
+        // parent of original parent immediately after original parent,
+        // preserving ranges."
+        for (var i = nodeList.length - 1; i >= 0; i--) {
+            movePreservingRanges(nodeList[i], originalParent.parentNode, 1 + getNodeIndex(originalParent));
+        }
+
+        // "If precedes line break is true, and the last member of node list
+        // does not precede a line break, call createElement("br") on the
+        // context object and insert the result immediately after the last
+        // member of node list."
+        if (precedesLineBreak_
+        && !precedesLineBreak(nodeList[nodeList.length - 1])) {
+            nodeList[nodeList.length - 1].parentNode.insertBefore(createElement("br"), nodeList[nodeList.length - 1].nextSibling);
+        }
+
+        // "Remove extraneous line breaks at the end of original parent."
+        removeExtraneousLineBreaksAtTheEndOf(originalParent);
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If the first child of original parent is not in node list:"
+    if (nodeList.indexOf(originalParent.firstChild) == -1) {
+        // "Let cloned parent be the result of calling cloneNode(false) on
+        // original parent."
+        var clonedParent = originalParent.cloneNode(false);
+
+        // "If original parent has an id attribute, unset it."
+        originalParent.removeAttribute("id");
+
+        // "Insert cloned parent into the parent of original parent immediately
+        // before original parent."
+        originalParent.parentNode.insertBefore(clonedParent, originalParent);
+
+        // "While the previousSibling of the first member of node list is not
+        // null, append the first child of original parent as the last child of
+        // cloned parent, preserving ranges."
+        while (nodeList[0].previousSibling) {
+            movePreservingRanges(originalParent.firstChild, clonedParent, clonedParent.childNodes.length);
+        }
+    }
+
+    // "For each node in node list, insert node into the parent of original
+    // parent immediately before original parent, preserving ranges."
+    for (var i = 0; i < nodeList.length; i++) {
+        movePreservingRanges(nodeList[i], originalParent.parentNode, getNodeIndex(originalParent));
+    }
+
+    // "If follows line break is true, and the first member of node list does
+    // not follow a line break, call createElement("br") on the context object
+    // and insert the result immediately before the first member of node list."
+    if (followsLineBreak_
+    && !followsLineBreak(nodeList[0])) {
+        nodeList[0].parentNode.insertBefore(createElement("br"), nodeList[0]);
+    }
+
+    // "If the last member of node list is an inline node other than a br, and
+    // the first child of original parent is a br, and original parent is not
+    // an inline node, remove the first child of original parent from original
+    // parent."
+    if (isInlineNode(nodeList[nodeList.length - 1])
+    && !isHtmlElement(nodeList[nodeList.length - 1], "br")
+    && isHtmlElement(originalParent.firstChild, "br")
+    && !isInlineNode(originalParent)) {
+        originalParent.removeChild(originalParent.firstChild);
+    }
+
+    // "If original parent has no children:"
+    if (!originalParent.hasChildNodes()) {
+        // "Remove original parent from its parent."
+        originalParent.parentNode.removeChild(originalParent);
+
+        // "If precedes line break is true, and the last member of node list
+        // does not precede a line break, call createElement("br") on the
+        // context object and insert the result immediately after the last
+        // member of node list."
+        if (precedesLineBreak_
+        && !precedesLineBreak(nodeList[nodeList.length - 1])) {
+            nodeList[nodeList.length - 1].parentNode.insertBefore(createElement("br"), nodeList[nodeList.length - 1].nextSibling);
+        }
+
+    // "Otherwise, remove extraneous line breaks before original parent."
+    } else {
+        removeExtraneousLineBreaksBefore(originalParent);
+    }
+
+    // "If node list's last member's nextSibling is null, but its parent is not
+    // null, remove extraneous line breaks at the end of node list's last
+    // member's parent."
+    if (!nodeList[nodeList.length - 1].nextSibling
+    && nodeList[nodeList.length - 1].parentNode) {
+        removeExtraneousLineBreaksAtTheEndOf(nodeList[nodeList.length - 1].parentNode);
+    }
+}
+
+// "To remove a node node while preserving its descendants, split the parent of
+// node's children if it has any. If it has no children, instead remove it from
+// its parent."
+function removePreservingDescendants(node) {
+    if (node.hasChildNodes()) {
+        splitParent([].slice.call(node.childNodes));
+    } else {
+        node.parentNode.removeChild(node);
+    }
+}
+
+
+//@}
+///// Canonical space sequences /////
+//@{
+
+function canonicalSpaceSequence(n, nonBreakingStart, nonBreakingEnd) {
+    // "If n is zero, return the empty string."
+    if (n == 0) {
+        return "";
+    }
+
+    // "If n is one and both non-breaking start and non-breaking end are false,
+    // return a single space (U+0020)."
+    if (n == 1 && !nonBreakingStart && !nonBreakingEnd) {
+        return " ";
+    }
+
+    // "If n is one, return a single non-breaking space (U+00A0)."
+    if (n == 1) {
+        return "\xa0";
+    }
+
+    // "Let buffer be the empty string."
+    var buffer = "";
+
+    // "If non-breaking start is true, let repeated pair be U+00A0 U+0020.
+    // Otherwise, let it be U+0020 U+00A0."
+    var repeatedPair;
+    if (nonBreakingStart) {
+        repeatedPair = "\xa0 ";
+    } else {
+        repeatedPair = " \xa0";
+    }
+
+    // "While n is greater than three, append repeated pair to buffer and
+    // subtract two from n."
+    while (n > 3) {
+        buffer += repeatedPair;
+        n -= 2;
+    }
+
+    // "If n is three, append a three-element string to buffer depending on
+    // non-breaking start and non-breaking end:"
+    if (n == 3) {
+        buffer +=
+            !nonBreakingStart && !nonBreakingEnd ? " \xa0 "
+            : nonBreakingStart && !nonBreakingEnd ? "\xa0\xa0 "
+            : !nonBreakingStart && nonBreakingEnd ? " \xa0\xa0"
+            : nonBreakingStart && nonBreakingEnd ? "\xa0 \xa0"
+            : "impossible";
+
+    // "Otherwise, append a two-element string to buffer depending on
+    // non-breaking start and non-breaking end:"
+    } else {
+        buffer +=
+            !nonBreakingStart && !nonBreakingEnd ? "\xa0 "
+            : nonBreakingStart && !nonBreakingEnd ? "\xa0 "
+            : !nonBreakingStart && nonBreakingEnd ? " \xa0"
+            : nonBreakingStart && nonBreakingEnd ? "\xa0\xa0"
+            : "impossible";
+    }
+
+    // "Return buffer."
+    return buffer;
+}
+
+function canonicalizeWhitespace(node, offset, fixCollapsedSpace) {
+    if (fixCollapsedSpace === undefined) {
+        // "an optional boolean argument fix collapsed space that defaults to
+        // true"
+        fixCollapsedSpace = true;
+    }
+
+    // "If node is neither editable nor an editing host, abort these steps."
+    if (!isEditable(node) && !isEditingHost(node)) {
+        return;
+    }
+
+    // "Let start node equal node and let start offset equal offset."
+    var startNode = node;
+    var startOffset = offset;
+
+    // "Repeat the following steps:"
+    while (true) {
+        // "If start node has a child in the same editing host with index start
+        // offset minus one, set start node to that child, then set start
+        // offset to start node's length."
+        if (0 <= startOffset - 1
+        && inSameEditingHost(startNode, startNode.childNodes[startOffset - 1])) {
+            startNode = startNode.childNodes[startOffset - 1];
+            startOffset = getNodeLength(startNode);
+
+        // "Otherwise, if start offset is zero and start node does not follow a
+        // line break and start node's parent is in the same editing host, set
+        // start offset to start node's index, then set start node to its
+        // parent."
+        } else if (startOffset == 0
+        && !followsLineBreak(startNode)
+        && inSameEditingHost(startNode, startNode.parentNode)) {
+            startOffset = getNodeIndex(startNode);
+            startNode = startNode.parentNode;
+
+        // "Otherwise, if start node is a Text node and its parent's resolved
+        // value for "white-space" is neither "pre" nor "pre-wrap" and start
+        // offset is not zero and the (start offset − 1)st element of start
+        // node's data is a space (0x0020) or non-breaking space (0x00A0),
+        // subtract one from start offset."
+        } else if (startNode.nodeType == DOM.TEXT_NODE
+        && ["pre", "pre-wrap"].indexOf(getComputedStyle(startNode.parentNode).whiteSpace) == -1
+        && startOffset != 0
+        && /[ \xa0]/.test(startNode.data[startOffset - 1])) {
+            startOffset--;
+
+        // "Otherwise, break from this loop."
+        } else {
+            break;
+        }
+    }
+
+    // "Let end node equal start node and end offset equal start offset."
+    var endNode = startNode;
+    var endOffset = startOffset;
+
+    // "Let length equal zero."
+    var length = 0;
+
+    // "Let collapse spaces be true if start offset is zero and start node
+    // follows a line break, otherwise false."
+    var collapseSpaces = startOffset == 0 && followsLineBreak(startNode);
+
+    // "Repeat the following steps:"
+    while (true) {
+        // "If end node has a child in the same editing host with index end
+        // offset, set end node to that child, then set end offset to zero."
+        if (endOffset < endNode.childNodes.length
+        && inSameEditingHost(endNode, endNode.childNodes[endOffset])) {
+            endNode = endNode.childNodes[endOffset];
+            endOffset = 0;
+
+        // "Otherwise, if end offset is end node's length and end node does not
+        // precede a line break and end node's parent is in the same editing
+        // host, set end offset to one plus end node's index, then set end node
+        // to its parent."
+        } else if (endOffset == getNodeLength(endNode)
+        && !precedesLineBreak(endNode)
+        && inSameEditingHost(endNode, endNode.parentNode)) {
+            endOffset = 1 + getNodeIndex(endNode);
+            endNode = endNode.parentNode;
+
+        // "Otherwise, if end node is a Text node and its parent's resolved
+        // value for "white-space" is neither "pre" nor "pre-wrap" and end
+        // offset is not end node's length and the end offsetth element of
+        // end node's data is a space (0x0020) or non-breaking space (0x00A0):"
+        } else if (endNode.nodeType == DOM.TEXT_NODE
+        && ["pre", "pre-wrap"].indexOf(getComputedStyle(endNode.parentNode).whiteSpace) == -1
+        && endOffset != getNodeLength(endNode)
+        && /[ \xa0]/.test(endNode.data[endOffset])) {
+            // "If fix collapsed space is true, and collapse spaces is true,
+            // and the end offsetth code unit of end node's data is a space
+            // (0x0020): call deleteData(end offset, 1) on end node, then
+            // continue this loop from the beginning."
+            if (fixCollapsedSpace
+            && collapseSpaces
+            && " " == endNode.data[endOffset]) {
+                endNode.deleteData(endOffset, 1);
+                continue;
+            }
+
+            // "Set collapse spaces to true if the end offsetth element of end
+            // node's data is a space (0x0020), false otherwise."
+            collapseSpaces = " " == endNode.data[endOffset];
+
+            // "Add one to end offset."
+            endOffset++;
+
+            // "Add one to length."
+            length++;
+
+        // "Otherwise, break from this loop."
+        } else {
+            break;
+        }
+    }
+
+    // "If fix collapsed space is true, then while (start node, start offset)
+    // is before (end node, end offset):"
+    if (fixCollapsedSpace) {
+        while (getPosition(startNode, startOffset, endNode, endOffset) == "before") {
+            // "If end node has a child in the same editing host with index end
+            // offset − 1, set end node to that child, then set end offset to end
+            // node's length."
+            if (0 <= endOffset - 1
+            && endOffset - 1 < endNode.childNodes.length
+            && inSameEditingHost(endNode, endNode.childNodes[endOffset - 1])) {
+                endNode = endNode.childNodes[endOffset - 1];
+                endOffset = getNodeLength(endNode);
+
+            // "Otherwise, if end offset is zero and end node's parent is in the
+            // same editing host, set end offset to end node's index, then set end
+            // node to its parent."
+            } else if (endOffset == 0
+            && inSameEditingHost(endNode, endNode.parentNode)) {
+                endOffset = getNodeIndex(endNode);
+                endNode = endNode.parentNode;
+
+            // "Otherwise, if end node is a Text node and its parent's resolved
+            // value for "white-space" is neither "pre" nor "pre-wrap" and end
+            // offset is end node's length and the last code unit of end node's
+            // data is a space (0x0020) and end node precedes a line break:"
+            } else if (endNode.nodeType == DOM.TEXT_NODE
+            && ["pre", "pre-wrap"].indexOf(getComputedStyle(endNode.parentNode).whiteSpace) == -1
+            && endOffset == getNodeLength(endNode)
+            && endNode.data[endNode.data.length - 1] == " "
+            && precedesLineBreak(endNode)) {
+                // "Subtract one from end offset."
+                endOffset--;
+
+                // "Subtract one from length."
+                length--;
+
+                // "Call deleteData(end offset, 1) on end node."
+                endNode.deleteData(endOffset, 1);
+
+            // "Otherwise, break from this loop."
+            } else {
+                break;
+            }
+        }
+    }
+
+    // "Let replacement whitespace be the canonical space sequence of length
+    // length. non-breaking start is true if start offset is zero and start
+    // node follows a line break, and false otherwise. non-breaking end is true
+    // if end offset is end node's length and end node precedes a line break,
+    // and false otherwise."
+    var replacementWhitespace = canonicalSpaceSequence(length,
+        startOffset == 0 && followsLineBreak(startNode),
+        endOffset == getNodeLength(endNode) && precedesLineBreak(endNode));
+
+    // "While (start node, start offset) is before (end node, end offset):"
+    while (getPosition(startNode, startOffset, endNode, endOffset) == "before") {
+        // "If start node has a child with index start offset, set start node
+        // to that child, then set start offset to zero."
+        if (startOffset < startNode.childNodes.length) {
+            startNode = startNode.childNodes[startOffset];
+            startOffset = 0;
+
+        // "Otherwise, if start node is not a Text node or if start offset is
+        // start node's length, set start offset to one plus start node's
+        // index, then set start node to its parent."
+        } else if (startNode.nodeType != DOM.TEXT_NODE
+        || startOffset == getNodeLength(startNode)) {
+            startOffset = 1 + getNodeIndex(startNode);
+            startNode = startNode.parentNode;
+
+        // "Otherwise:"
+        } else {
+            // "Remove the first element from replacement whitespace, and let
+            // element be that element."
+            var element = replacementWhitespace[0];
+            replacementWhitespace = replacementWhitespace.slice(1);
+
+            // "If element is not the same as the start offsetth element of
+            // start node's data:"
+            if (element != startNode.data[startOffset]) {
+                // "Call insertData(start offset, element) on start node."
+                startNode.insertData(startOffset, element);
+
+                // "Call deleteData(start offset + 1, 1) on start node."
+                startNode.deleteData(startOffset + 1, 1);
+            }
+
+            // "Add one to start offset."
+            startOffset++;
+        }
+    }
+}
+
+
+//@}
+///// Indenting and outdenting /////
+//@{
+
+function indentNodes(nodeList) {
+    // "If node list is empty, do nothing and abort these steps."
+    if (!nodeList.length) {
+        return;
+    }
+
+    // "Let first node be the first member of node list."
+    var firstNode = nodeList[0];
+
+    // "If first node's parent is an ol or ul:"
+    if (isHtmlElement(firstNode.parentNode, ["OL", "UL"])) {
+        // "Let tag be the local name of the parent of first node."
+        var tag = firstNode.parentNode.tagName;
+
+        // "Wrap node list, with sibling criteria returning true for an HTML
+        // element with local name tag and false otherwise, and new parent
+        // instructions returning the result of calling createElement(tag) on
+        // the ownerDocument of first node."
+        wrap(nodeList,
+            function(node) { return isHtmlElement(node, tag) },
+            function() { return createElement(tag) });
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "Wrap node list, with sibling criteria returning true for a simple
+    // indentation element and false otherwise, and new parent instructions
+    // returning the result of calling createElement("blockquote") on the
+    // ownerDocument of first node. Let new parent be the result."
+    var newParent = wrap(nodeList,
+        function(node) { return isSimpleIndentationElement(node) },
+        function() { return createElement("blockquote") });
+
+    // "Fix disallowed ancestors of new parent."
+    fixDisallowedAncestors(newParent);
+}
+
+function outdentNode(node) {
+    // "If node is not editable, abort these steps."
+    if (!isEditable(node)) {
+        return;
+    }
+
+    // "If node is a simple indentation element, remove node, preserving its
+    // descendants.  Then abort these steps."
+    if (isSimpleIndentationElement(node)) {
+        removePreservingDescendants(node);
+        return;
+    }
+
+    // "If node is an indentation element:"
+    if (isIndentationElement(node)) {
+        // "Unset the dir attribute of node, if any."
+        node.removeAttribute("dir");
+
+        // "Unset the margin, padding, and border CSS properties of node."
+        node.style.margin = "";
+        node.style.padding = "";
+        node.style.border = "";
+        if (node.getAttribute("style") == ""
+        // Crazy WebKit bug: https://bugs.webkit.org/show_bug.cgi?id=68551
+        || node.getAttribute("style") == "border-width: initial; border-color: initial; ") {
+            node.removeAttribute("style");
+        }
+
+        // "Set the tag name of node to "div"."
+        setTagName(node, "div");
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "Let current ancestor be node's parent."
+    var currentAncestor = node.parentNode;
+
+    // "Let ancestor list be a list of nodes, initially empty."
+    var ancestorList = [];
+
+    // "While current ancestor is an editable Element that is neither a simple
+    // indentation element nor an ol nor a ul, append current ancestor to
+    // ancestor list and then set current ancestor to its parent."
+    while (isEditable(currentAncestor)
+    && currentAncestor.nodeType == DOM.ELEMENT_NODE
+    && !isSimpleIndentationElement(currentAncestor)
+    && !isHtmlElement(currentAncestor, ["ol", "ul"])) {
+        ancestorList.push(currentAncestor);
+        currentAncestor = currentAncestor.parentNode;
+    }
+
+    // "If current ancestor is not an editable simple indentation element:"
+    if (!isEditable(currentAncestor)
+    || !isSimpleIndentationElement(currentAncestor)) {
+        // "Let current ancestor be node's parent."
+        currentAncestor = node.parentNode;
+
+        // "Let ancestor list be the empty list."
+        ancestorList = [];
+
+        // "While current ancestor is an editable Element that is neither an
+        // indentation element nor an ol nor a ul, append current ancestor to
+        // ancestor list and then set current ancestor to its parent."
+        while (isEditable(currentAncestor)
+        && currentAncestor.nodeType == DOM.ELEMENT_NODE
+        && !isIndentationElement(currentAncestor)
+        && !isHtmlElement(currentAncestor, ["ol", "ul"])) {
+            ancestorList.push(currentAncestor);
+            currentAncestor = currentAncestor.parentNode;
+        }
+    }
+
+    // "If node is an ol or ul and current ancestor is not an editable
+    // indentation element:"
+    if (isHtmlElement(node, ["OL", "UL"])
+    && (!isEditable(currentAncestor)
+    || !isIndentationElement(currentAncestor))) {
+        // "Unset the reversed, start, and type attributes of node, if any are
+        // set."
+        node.removeAttribute("reversed");
+        node.removeAttribute("start");
+        node.removeAttribute("type");
+
+        // "Let children be the children of node."
+        var children = [].slice.call(node.childNodes);
+
+        // "If node has attributes, and its parent is not an ol or ul, set the
+        // tag name of node to "div"."
+        if (attributesOf(node).length
+        && !isHtmlElement(node.parentNode, ["OL", "UL"])) {
+            setTagName(node, "div");
+
+        // "Otherwise:"
+        } else {
+            // "Record the values of node's children, and let values be the
+            // result."
+            var values = recordValues([].slice.call(node.childNodes));
+
+            // "Remove node, preserving its descendants."
+            removePreservingDescendants(node);
+
+            // "Restore the values from values."
+            restoreValues(values);
+        }
+
+        // "Fix disallowed ancestors of each member of children."
+        for (var i = 0; i < children.length; i++) {
+            fixDisallowedAncestors(children[i]);
+        }
+
+        // "Abort these steps."
+        return;
+    }
+
+    // "If current ancestor is not an editable indentation element, abort these
+    // steps."
+    if (!isEditable(currentAncestor)
+    || !isIndentationElement(currentAncestor)) {
+        return;
+    }
+
+    // "Append current ancestor to ancestor list."
+    ancestorList.push(currentAncestor);
+
+    // "Let original ancestor be current ancestor."
+    var originalAncestor = currentAncestor;
+
+    // "While ancestor list is not empty:"
+    while (ancestorList.length) {
+        // "Let current ancestor be the last member of ancestor list."
+        //
+        // "Remove the last member of ancestor list."
+        currentAncestor = ancestorList.pop();
+
+        // "Let target be the child of current ancestor that is equal to either
+        // node or the last member of ancestor list."
+        var target = node.parentNode == currentAncestor
+            ? node
+            : ancestorList[ancestorList.length - 1];
+
+        // "If target is an inline node that is not a br, and its nextSibling
+        // is a br, remove target's nextSibling from its parent."
+        if (isInlineNode(target)
+        && !isHtmlElement(target, "BR")
+        && isHtmlElement(target.nextSibling, "BR")) {
+            target.parentNode.removeChild(target.nextSibling);
+        }
+
+        // "Let preceding siblings be the preceding siblings of target, and let
+        // following siblings be the following siblings of target."
+        var precedingSiblings = [].slice.call(currentAncestor.childNodes, 0, getNodeIndex(target));
+        var followingSiblings = [].slice.call(currentAncestor.childNodes, 1 + getNodeIndex(target));
+
+        // "Indent preceding siblings."
+        indentNodes(precedingSiblings);
+
+        // "Indent following siblings."
+        indentNodes(followingSiblings);
+    }
+
+    // "Outdent original ancestor."
+    outdentNode(originalAncestor);
+}
+
+
+//@}
+///// Toggling lists /////
+//@{
+
+function toggleLists(tagName) {
+    // "Let mode be "disable" if the selection's list state is tag name, and
+    // "enable" otherwise."
+    var mode = getSelectionListState() == tagName ? "disable" : "enable";
+
+    var range = getActiveRange();
+    tagName = tagName.toUpperCase();
+
+    // "Let other tag name be "ol" if tag name is "ul", and "ul" if tag name is
+    // "ol"."
+    var otherTagName = tagName == "OL" ? "UL" : "OL";
+
+    // "Let items be a list of all lis that are ancestor containers of the
+    // range's start and/or end node."
+    //
+    // It's annoying to get this in tree order using functional stuff without
+    // doing getDescendants(document), which is slow, so I do it imperatively.
+    var items = [];
+    (function(){
+        for (
+            var ancestorContainer = range.endContainer;
+            ancestorContainer != range.commonAncestorContainer;
+            ancestorContainer = ancestorContainer.parentNode
+        ) {
+            if (isHtmlElement(ancestorContainer, "li")) {
+                items.unshift(ancestorContainer);
+            }
+        }
+        for (
+            var ancestorContainer = range.startContainer;
+            ancestorContainer;
+            ancestorContainer = ancestorContainer.parentNode
+        ) {
+            if (isHtmlElement(ancestorContainer, "li")) {
+                items.unshift(ancestorContainer);
+            }
+        }
+    })();
+
+    // "For each item in items, normalize sublists of item."
+    items.forEach(normalizeSublists);
+
+    // "Block-extend the range, and let new range be the result."
+    var newRange = blockExtend(range);
+
+    // "If mode is "enable", then let lists to convert consist of every
+    // editable HTML element with local name other tag name that is contained
+    // in new range, and for every list in lists to convert:"
+    if (mode == "enable") {
+        getAllContainedNodes(newRange, function(node) {
+            return isEditable(node)
+                && isHtmlElement(node, otherTagName);
+        }).forEach(function(list) {
+            // "If list's previousSibling or nextSibling is an editable HTML
+            // element with local name tag name:"
+            if ((isEditable(list.previousSibling) && isHtmlElement(list.previousSibling, tagName))
+            || (isEditable(list.nextSibling) && isHtmlElement(list.nextSibling, tagName))) {
+                // "Let children be list's children."
+                var children = [].slice.call(list.childNodes);
+
+                // "Record the values of children, and let values be the
+                // result."
+                var values = recordValues(children);
+
+                // "Split the parent of children."
+                splitParent(children);
+
+                // "Wrap children, with sibling criteria returning true for an
+                // HTML element with local name tag name and false otherwise."
+                wrap(children, function(node) { return isHtmlElement(node, tagName) });
+
+                // "Restore the values from values."
+                restoreValues(values);
+
+            // "Otherwise, set the tag name of list to tag name."
+            } else {
+                setTagName(list, tagName);
+            }
+        });
+    }
+
+    // "Let node list be a list of nodes, initially empty."
+    //
+    // "For each node node contained in new range, if node is editable; the
+    // last member of node list (if any) is not an ancestor of node; node
+    // is not an indentation element; and either node is an ol or ul, or its
+    // parent is an ol or ul, or it is an allowed child of "li"; then append
+    // node to node list."
+    var nodeList = getContainedNodes(newRange, function(node) {
+        return isEditable(node)
+        && !isIndentationElement(node)
+        && (isHtmlElement(node, ["OL", "UL"])
+        || isHtmlElement(node.parentNode, ["OL", "UL"])
+        || isAllowedChild(node, "li"));
+    });
+
+    // "If mode is "enable", remove from node list any ol or ul whose parent is
+    // not also an ol or ul."
+    if (mode == "enable") {
+        nodeList = nodeList.filter(function(node) {
+            return !isHtmlElement(node, ["ol", "ul"])
+                || isHtmlElement(node.parentNode, ["ol", "ul"]);
+        });
+    }
+
+    // "If mode is "disable", then while node list is not empty:"
+    if (mode == "disable") {
+        while (nodeList.length) {
+            // "Let sublist be an empty list of nodes."
+            var sublist = [];
+
+            // "Remove the first member from node list and append it to
+            // sublist."
+            sublist.push(nodeList.shift());
+
+            // "If the first member of sublist is an HTML element with local
+            // name tag name, outdent it and continue this loop from the
+            // beginning."
+            if (isHtmlElement(sublist[0], tagName)) {
+                outdentNode(sublist[0]);
+                continue;
+            }
+
+            // "While node list is not empty, and the first member of node list
+            // is the nextSibling of the last member of sublist and is not an
+            // HTML element with local name tag name, remove the first member
+            // from node list and append it to sublist."
+            while (nodeList.length
+            && nodeList[0] == sublist[sublist.length - 1].nextSibling
+            && !isHtmlElement(nodeList[0], tagName)) {
+                sublist.push(nodeList.shift());
+            }
+
+            // "Record the values of sublist, and let values be the result."
+            var values = recordValues(sublist);
+
+            // "Split the parent of sublist."
+            splitParent(sublist);
+
+            // "Fix disallowed ancestors of each member of sublist."
+            for (var i = 0; i < sublist.length; i++) {
+                fixDisallowedAncestors(sublist[i]);
+            }
+
+            // "Restore the values from values."
+            restoreValues(values);
+        }
+
+    // "Otherwise, while node list is not empty:"
+    } else {
+        while (nodeList.length) {
+            // "Let sublist be an empty list of nodes."
+            var sublist = [];
+
+            // "While either sublist is empty, or node list is not empty and
+            // its first member is the nextSibling of sublist's last member:"
+            while (!sublist.length
+            || (nodeList.length
+            && nodeList[0] == sublist[sublist.length - 1].nextSibling)) {
+                // "If node list's first member is a p or div, set the tag name
+                // of node list's first member to "li", and append the result
+                // to sublist. Remove the first member from node list."
+                if (isHtmlElement(nodeList[0], ["p", "div"])) {
+                    sublist.push(setTagName(nodeList[0], "li"));
+                    nodeList.shift();
+
+                // "Otherwise, if the first member of node list is an li or ol
+                // or ul, remove it from node list and append it to sublist."
+                } else if (isHtmlElement(nodeList[0], ["li", "ol", "ul"])) {
+                    sublist.push(nodeList.shift());
+
+                // "Otherwise:"
+                } else {
+                    // "Let nodes to wrap be a list of nodes, initially empty."
+                    var nodesToWrap = [];
+
+                    // "While nodes to wrap is empty, or node list is not empty
+                    // and its first member is the nextSibling of nodes to
+                    // wrap's last member and the first member of node list is
+                    // an inline node and the last member of nodes to wrap is
+                    // an inline node other than a br, remove the first member
+                    // from node list and append it to nodes to wrap."
+                    while (!nodesToWrap.length
+                    || (nodeList.length
+                    && nodeList[0] == nodesToWrap[nodesToWrap.length - 1].nextSibling
+                    && isInlineNode(nodeList[0])
+                    && isInlineNode(nodesToWrap[nodesToWrap.length - 1])
+                    && !isHtmlElement(nodesToWrap[nodesToWrap.length - 1], "br"))) {
+                        nodesToWrap.push(nodeList.shift());
+                    }
+
+                    // "Wrap nodes to wrap, with new parent instructions
+                    // returning the result of calling createElement("li") on
+                    // the context object. Append the result to sublist."
+                    sublist.push(wrap(nodesToWrap,
+                        undefined,
+                        function() { return createElement("li") }));
+                }
+            }
+
+            // "If sublist's first member's parent is an HTML element with
+            // local name tag name, or if every member of sublist is an ol or
+            // ul, continue this loop from the beginning."
+            if (isHtmlElement(sublist[0].parentNode, tagName)
+            || sublist.every(function(node) { return isHtmlElement(node, ["ol", "ul"]) })) {
+                continue;
+            }
+
+            // "If sublist's first member's parent is an HTML element with
+            // local name other tag name:"
+            if (isHtmlElement(sublist[0].parentNode, otherTagName)) {
+                // "Record the values of sublist, and let values be the
+                // result."
+                var values = recordValues(sublist);
+
+                // "Split the parent of sublist."
+                splitParent(sublist);
+
+                // "Wrap sublist, with sibling criteria returning true for an
+                // HTML element with local name tag name and false otherwise,
+                // and new parent instructions returning the result of calling
+                // createElement(tag name) on the context object."
+                wrap(sublist,
+                    function(node) { return isHtmlElement(node, tagName) },
+                    function() { return createElement(tagName) });
+
+                // "Restore the values from values."
+                restoreValues(values);
+
+                // "Continue this loop from the beginning."
+                continue;
+            }
+
+            // "Wrap sublist, with sibling criteria returning true for an HTML
+            // element with local name tag name and false otherwise, and new
+            // parent instructions being the following:"
+            // . . .
+            // "Fix disallowed ancestors of the previous step's result."
+            fixDisallowedAncestors(wrap(sublist,
+                function(node) { return isHtmlElement(node, tagName) },
+                function() {
+                    // "If sublist's first member's parent is not an editable
+                    // simple indentation element, or sublist's first member's
+                    // parent's previousSibling is not an editable HTML element
+                    // with local name tag name, call createElement(tag name)
+                    // on the context object and return the result."
+                    if (!isEditable(sublist[0].parentNode)
+                    || !isSimpleIndentationElement(sublist[0].parentNode)
+                    || !isEditable(sublist[0].parentNode.previousSibling)
+                    || !isHtmlElement(sublist[0].parentNode.previousSibling, tagName)) {
+                        return createElement(tagName);
+                    }
+
+                    // "Let list be sublist's first member's parent's
+                    // previousSibling."
+                    var list = sublist[0].parentNode.previousSibling;
+
+                    // "Normalize sublists of list's lastChild."
+                    normalizeSublists(list.lastChild);
+
+                    // "If list's lastChild is not an editable HTML element
+                    // with local name tag name, call createElement(tag name)
+                    // on the context object, and append the result as the last
+                    // child of list."
+                    if (!isEditable(list.lastChild)
+                    || !isHtmlElement(list.lastChild, tagName)) {
+                        list.appendChild(createElement(tagName));
+                    }
+
+                    // "Return the last child of list."
+                    return list.lastChild;
+                }
+            ));
+        }
+    }
+}
+
+
+//@}
+///// Justifying the selection /////
+//@{
+
+function justifySelection(alignment) {
+    // "Block-extend the active range, and let new range be the result."
+    var newRange = blockExtend(globalRange);
+
+    // "Let element list be a list of all editable Elements contained in new
+    // range that either has an attribute in the HTML namespace whose local
+    // name is "align", or has a style attribute that sets "text-align", or is
+    // a center."
+    var elementList = getAllContainedNodes(newRange, function(node) {
+        return node.nodeType == DOM.ELEMENT_NODE
+            && isEditable(node)
+            // Ignoring namespaces here
+            && (
+                node.hasAttribute("align")
+                || node.style.textAlign != ""
+                || isHtmlElement(node, "center")
+            );
+    });
+
+    // "For each element in element list:"
+    for (var i = 0; i < elementList.length; i++) {
+        var element = elementList[i];
+
+        // "If element has an attribute in the HTML namespace whose local name
+        // is "align", remove that attribute."
+        element.removeAttribute("align");
+
+        // "Unset the CSS property "text-align" on element, if it's set by a
+        // style attribute."
+        element.style.textAlign = "";
+        if (element.getAttribute("style") == "") {
+            element.removeAttribute("style");
+        }
+
+        // "If element is a div or span or center with no attributes, remove
+        // it, preserving its descendants."
+        if (isHtmlElement(element, ["div", "span", "center"])
+        && !attributesOf(element).length) {
+            removePreservingDescendants(element);
+        }
+
+        // "If element is a center with one or more attributes, set the tag
+        // name of element to "div"."
+        if (isHtmlElement(element, "center")
+        && attributesOf(element).length) {
+            setTagName(element, "div");
+        }
+    }
+
+    // "Block-extend the active range, and let new range be the result."
+    newRange = blockExtend(globalRange);
+
+    // "Let node list be a list of nodes, initially empty."
+    var nodeList = [];
+
+    // "For each node node contained in new range, append node to node list if
+    // the last member of node list (if any) is not an ancestor of node; node
+    // is editable; node is an allowed child of "div"; and node's alignment
+    // value is not alignment."
+    nodeList = getContainedNodes(newRange, function(node) {
+        return isEditable(node)
+            && isAllowedChild(node, "div")
+            && getAlignmentValue(node) != alignment;
+    });
+
+    // "While node list is not empty:"
+    while (nodeList.length) {
+        // "Let sublist be a list of nodes, initially empty."
+        var sublist = [];
+
+        // "Remove the first member of node list and append it to sublist."
+        sublist.push(nodeList.shift());
+
+        // "While node list is not empty, and the first member of node list is
+        // the nextSibling of the last member of sublist, remove the first
+        // member of node list and append it to sublist."
+        while (nodeList.length
+        && nodeList[0] == sublist[sublist.length - 1].nextSibling) {
+            sublist.push(nodeList.shift());
+        }
+
+        // "Wrap sublist. Sibling criteria returns true for any div that has
+        // one or both of the following two attributes and no other attributes,
+        // and false otherwise:"
+        //
+        //   * "An align attribute whose value is an ASCII case-insensitive
+        //     match for alignment.
+        //   * "A style attribute which sets exactly one CSS property
+        //     (including unrecognized or invalid attributes), which is
+        //     "text-align", which is set to alignment.
+        //
+        // "New parent instructions are to call createElement("div") on the
+        // context object, then set its CSS property "text-align" to alignment
+        // and return the result."
+        wrap(sublist,
+            function(node) {
+                return isHtmlElement(node, "div")
+                    && [].every.call(attributesOf(node), function(attr) {
+                        return (attr.name == "align" && attr.value.toLowerCase() == alignment)
+                            || (attr.name == "style" && node.style.length == 1 && node.style.textAlign == alignment);
+                    });
+            },
+            function() {
+                var newParent = createElement("div");
+                newParent.setAttribute("style", "text-align: " + alignment);
+                return newParent;
+            }
+        );
+    }
+}
+
+
+//@}
+///// Automatic linking /////
+//@{
+// "An autolinkable URL is a string of the following form:"
+var autolinkableUrlRegexp =
+    // "Either a string matching the scheme pattern from RFC 3986 section 3.1
+    // followed by the literal string ://, or the literal string mailto:;
+    // followed by"
+    //
+    // From the RFC: scheme      = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+    "([a-zA-Z][a-zA-Z0-9+.-]*://|mailto:)"
+    // "Zero or more characters other than space characters; followed by"
+    + "[^ \t\n\f\r]*"
+    // "A character that is not one of the ASCII characters !"'(),-.:;<>[]`{}."
+    + "[^!\"'(),\\-.:;<>[\\]`{}]";
+
+// "A valid e-mail address is a string that matches the ABNF production 1*(
+// atext / "." ) "@" ldh-str *( "." ldh-str ) where atext is defined in RFC
+// 5322 section 3.2.3, and ldh-str is defined in RFC 1034 section 3.5."
+//
+// atext: ALPHA / DIGIT / "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" /
+// "/" / "=" / "?" / "^" / "_" / "`" / "{" / "|" / "}" / "~"
+//
+//<ldh-str> ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+//<let-dig-hyp> ::= <let-dig> | "-"
+//<let-dig> ::= <letter> | <digit>
+var validEmailRegexp =
+    "[a-zA-Z0-9!#$%&'*+\\-/=?^_`{|}~.]+@[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*";
+
+function autolink(node, endOffset) {
+    // "While (node, end offset)'s previous equivalent point is not null, set
+    // it to its previous equivalent point."
+    while (getPreviousEquivalentPoint(node, endOffset)) {
+        var prev = getPreviousEquivalentPoint(node, endOffset);
+        node = prev[0];
+        endOffset = prev[1];
+    }
+
+    // "If node is not a Text node, or has an a ancestor, do nothing and abort
+    // these steps."
+    if (node.nodeType != DOM.TEXT_NODE
+    || getAncestors(node).some(function(ancestor) { return isHtmlElement(ancestor, "a") })) {
+        return;
+    }
+
+    // "Let search be the largest substring of node's data whose end is end
+    // offset and that contains no space characters."
+    var search = /[^ \t\n\f\r]*$/.exec(node.substringData(0, endOffset))[0];
+
+    // "If some substring of search is an autolinkable URL:"
+    if (new RegExp(autolinkableUrlRegexp).test(search)) {
+        // "While there is no substring of node's data ending at end offset
+        // that is an autolinkable URL, decrement end offset."
+        while (!(new RegExp(autolinkableUrlRegexp + "$").test(node.substringData(0, endOffset)))) {
+            endOffset--;
+        }
+
+        // "Let start offset be the start index of the longest substring of
+        // node's data that is an autolinkable URL ending at end offset."
+        var startOffset = new RegExp(autolinkableUrlRegexp + "$").exec(node.substringData(0, endOffset)).index;
+
+        // "Let href be the substring of node's data starting at start offset
+        // and ending at end offset."
+        var href = node.substringData(startOffset, endOffset - startOffset);
+
+    // "Otherwise, if some substring of search is a valid e-mail address:"
+    } else if (new RegExp(validEmailRegexp).test(search)) {
+        // "While there is no substring of node's data ending at end offset
+        // that is a valid e-mail address, decrement end offset."
+        while (!(new RegExp(validEmailRegexp + "$").test(node.substringData(0, endOffset)))) {
+            endOffset--;
+        }
+
+        // "Let start offset be the start index of the longest substring of
+        // node's data that is a valid e-mail address ending at end offset."
+        var startOffset = new RegExp(validEmailRegexp + "$").exec(node.substringData(0, endOffset)).index;
+
+        // "Let href be "mailto:" concatenated with the substring of node's
+        // data starting at start offset and ending at end offset."
+        var href = "mailto:" + node.substringData(startOffset, endOffset - startOffset);
+
+    // "Otherwise, do nothing and abort these steps."
+    } else {
+        return;
+    }
+
+    // "Let original range be the active range."
+    var originalRange = getActiveRange();
+
+    // "Create a new range with start (node, start offset) and end (node, end
+    // offset), and set the context object's selection's range to it."
+    var newRange = createRange();
+    newRange.setStart(node, startOffset);
+    newRange.setEnd(node, endOffset);
+    getSelection().removeAllRanges();
+    getSelection().addRange(newRange);
+    globalRange = newRange;
+
+    // "Take the action for "createLink", with value equal to href."
+    commands.createlink.action(href);
+
+    // "Set the context object's selection's range to original range."
+    getSelection().removeAllRanges();
+    getSelection().addRange(originalRange);
+    globalRange = originalRange;
+}
+//@}
+///// The delete command /////
+//@{
+commands["delete"] = {
+    preservesOverrides: true,
+    action: function() {
+        // "If the active range is not collapsed, delete the selection and
+        // return true."
+        if (!getActiveRange().collapsed) {
+            deleteSelection();
+            return true;
+        }
+
+        // "Canonicalize whitespace at the active range's start."
+        canonicalizeWhitespace(getActiveRange().startContainer, getActiveRange().startOffset);
+
+        // "Let node and offset be the active range's start node and offset."
+        var node = getActiveRange().startContainer;
+        var offset = getActiveRange().startOffset;
+
+        // "Repeat the following steps:"
+        while (true) {
+            // "If offset is zero and node's previousSibling is an editable
+            // invisible node, remove node's previousSibling from its parent."
+            if (offset == 0
+            && isEditable(node.previousSibling)
+            && isInvisible(node.previousSibling)) {
+                node.parentNode.removeChild(node.previousSibling);
+
+            // "Otherwise, if node has a child with index offset − 1 and that
+            // child is an editable invisible node, remove that child from
+            // node, then subtract one from offset."
+            } else if (0 <= offset - 1
+            && offset - 1 < node.childNodes.length
+            && isEditable(node.childNodes[offset - 1])
+            && isInvisible(node.childNodes[offset - 1])) {
+                node.removeChild(node.childNodes[offset - 1]);
+                offset--;
+
+            // "Otherwise, if offset is zero and node is an inline node, or if
+            // node is an invisible node, set offset to the index of node, then
+            // set node to its parent."
+            } else if ((offset == 0
+            && isInlineNode(node))
+            || isInvisible(node)) {
+                offset = getNodeIndex(node);
+                node = node.parentNode;
+
+            // "Otherwise, if node has a child with index offset − 1 and that
+            // child is an editable a, remove that child from node, preserving
+            // its descendants. Then return true."
+            } else if (0 <= offset - 1
+            && offset - 1 < node.childNodes.length
+            && isEditable(node.childNodes[offset - 1])
+            && isHtmlElement(node.childNodes[offset - 1], "a")) {
+                removePreservingDescendants(node.childNodes[offset - 1]);
+                return true;
+
+            // A non-editable element inside the editing host (an island) is
+            // removed whole. The spec does not define this case.
+            } else if (0 <= offset - 1
+            && offset - 1 < node.childNodes.length
+            && isEditable(node)
+            && node.childNodes[offset - 1].nodeType == DOM.ELEMENT_NODE
+            && !isEditable(node.childNodes[offset - 1])) {
+                node.removeChild(node.childNodes[offset - 1]);
+                getSelection().collapse(node, offset - 1);
+                getActiveRange().setStart(node, offset - 1);
+                getActiveRange().setEnd(node, offset - 1);
+                return true;
+
+            // "Otherwise, if node has a child with index offset − 1 and that
+            // child is not a block node or a br or an img, set node to that
+            // child, then set offset to the length of node."
+            } else if (0 <= offset - 1
+            && offset - 1 < node.childNodes.length
+            && !isBlockNode(node.childNodes[offset - 1])
+            && !isHtmlElement(node.childNodes[offset - 1], ["br", "img"])) {
+                node = node.childNodes[offset - 1];
+                offset = getNodeLength(node);
+
+            // "Otherwise, break from this loop."
+            } else {
+                break;
+            }
+        }
+
+        // "If node is a Text node and offset is not zero, or if node is a
+        // block node that has a child with index offset − 1 and that child is
+        // a br or hr or img:"
+        if ((node.nodeType == DOM.TEXT_NODE
+        && offset != 0)
+        || (isBlockNode(node)
+        && 0 <= offset - 1
+        && offset - 1 < node.childNodes.length
+        && isHtmlElement(node.childNodes[offset - 1], ["br", "hr", "img"]))) {
+            // "Call collapse(node, offset) on the context object's Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setEnd(node, offset);
+
+            // "Call extend(node, offset − 1) on the context object's
+            // Selection."
+            getSelection().extend(node, offset - 1);
+            getActiveRange().setStart(node, offset - 1);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Return true."
+            return true;
+        }
+
+        // "If node is an inline node, return true."
+        if (isInlineNode(node)) {
+            return true;
+        }
+
+        // "If node is an li or dt or dd and is the first child of its parent,
+        // and offset is zero:"
+        if (isHtmlElement(node, ["li", "dt", "dd"])
+        && node == node.parentNode.firstChild
+        && offset == 0) {
+            // "Let items be a list of all lis that are ancestors of node."
+            //
+            // Remember, must be in tree order.
+            var items = [];
+            for (var ancestor = node.parentNode; ancestor; ancestor = ancestor.parentNode) {
+                if (isHtmlElement(ancestor, "li")) {
+                    items.unshift(ancestor);
+                }
+            }
+
+            // "Normalize sublists of each item in items."
+            for (var i = 0; i < items.length; i++) {
+                normalizeSublists(items[i]);
+            }
+
+            // "Record the values of the one-node list consisting of node, and
+            // let values be the result."
+            var values = recordValues([node]);
+
+            // "Split the parent of the one-node list consisting of node."
+            splitParent([node]);
+
+            // "Restore the values from values."
+            restoreValues(values);
+
+            // "If node is a dd or dt, and it is not an allowed child of any of
+            // its ancestors in the same editing host, set the tag name of node
+            // to the default single-line container name and let node be the
+            // result."
+            if (isHtmlElement(node, ["dd", "dt"])
+            && getAncestors(node).every(function(ancestor) {
+                return !inSameEditingHost(node, ancestor)
+                    || !isAllowedChild(node, ancestor)
+            })) {
+                node = setTagName(node, defaultSingleLineContainerName);
+            }
+
+            // "Fix disallowed ancestors of node."
+            fixDisallowedAncestors(node);
+
+            // "Return true."
+            return true;
+        }
+
+        // "Let start node equal node and let start offset equal offset."
+        var startNode = node;
+        var startOffset = offset;
+
+        // "Repeat the following steps:"
+        while (true) {
+            // "If start offset is zero, set start offset to the index of start
+            // node and then set start node to its parent."
+            if (startOffset == 0) {
+                startOffset = getNodeIndex(startNode);
+                startNode = startNode.parentNode;
+
+            // "Otherwise, if start node has an editable invisible child with
+            // index start offset minus one, remove it from start node and
+            // subtract one from start offset."
+            } else if (0 <= startOffset - 1
+            && startOffset - 1 < startNode.childNodes.length
+            && isEditable(startNode.childNodes[startOffset - 1])
+            && isInvisible(startNode.childNodes[startOffset - 1])) {
+                startNode.removeChild(startNode.childNodes[startOffset - 1]);
+                startOffset--;
+
+            // "Otherwise, break from this loop."
+            } else {
+                break;
+            }
+        }
+
+        // "If offset is zero, and node has an editable ancestor container in
+        // the same editing host that's an indentation element:"
+        if (offset == 0
+        && getAncestors(node).concat(node).filter(function(ancestor) {
+            return isEditable(ancestor)
+                && inSameEditingHost(ancestor, node)
+                && isIndentationElement(ancestor);
+        }).length) {
+            // "Block-extend the range whose start and end are both (node, 0),
+            // and let new range be the result."
+            var newRange = createRange();
+            newRange.setStart(node, 0);
+            newRange = blockExtend(newRange);
+
+            // "Let node list be a list of nodes, initially empty."
+            //
+            // "For each node current node contained in new range, append
+            // current node to node list if the last member of node list (if
+            // any) is not an ancestor of current node, and current node is
+            // editable but has no editable descendants."
+            var nodeList = getContainedNodes(newRange, function(currentNode) {
+                return isEditable(currentNode)
+                    && !hasEditableDescendants(currentNode);
+            });
+
+            // "Outdent each node in node list."
+            for (var i = 0; i < nodeList.length; i++) {
+                outdentNode(nodeList[i]);
+            }
+
+            // "Return true."
+            return true;
+        }
+
+        // "If the child of start node with index start offset is a table,
+        // return true."
+        if (isHtmlElement(startNode.childNodes[startOffset], "table")) {
+            return true;
+        }
+
+        // "If start node has a child with index start offset − 1, and that
+        // child is a table:"
+        if (0 <= startOffset - 1
+        && startOffset - 1 < startNode.childNodes.length
+        && isHtmlElement(startNode.childNodes[startOffset - 1], "table")) {
+            // "Call collapse(start node, start offset − 1) on the context
+            // object's Selection."
+            getSelection().collapse(startNode, startOffset - 1);
+            getActiveRange().setStart(startNode, startOffset - 1);
+
+            // "Call extend(start node, start offset) on the context object's
+            // Selection."
+            getSelection().extend(startNode, startOffset);
+            getActiveRange().setEnd(startNode, startOffset);
+
+            // "Return true."
+            return true;
+        }
+
+        // "If offset is zero; and either the child of start node with index
+        // start offset minus one is an hr, or the child is a br whose
+        // previousSibling is either a br or not an inline node:"
+        if (offset == 0
+        && (isHtmlElement(startNode.childNodes[startOffset - 1], "hr")
+            || (
+                isHtmlElement(startNode.childNodes[startOffset - 1], "br")
+                && (
+                    isHtmlElement(startNode.childNodes[startOffset - 1].previousSibling, "br")
+                    || !isInlineNode(startNode.childNodes[startOffset - 1].previousSibling)
+                )
+            )
+        )) {
+            // "Call collapse(start node, start offset − 1) on the context
+            // object's Selection."
+            getSelection().collapse(startNode, startOffset - 1);
+            getActiveRange().setStart(startNode, startOffset - 1);
+
+            // "Call extend(start node, start offset) on the context object's
+            // Selection."
+            getSelection().extend(startNode, startOffset);
+            getActiveRange().setEnd(startNode, startOffset);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Call collapse(node, offset) on the Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setStart(node, offset);
+            getActiveRange().collapse(true);
+
+            // "Return true."
+            return true;
+        }
+
+        // "If the child of start node with index start offset is an li or dt
+        // or dd, and that child's firstChild is an inline node, and start
+        // offset is not zero:"
+        if (isHtmlElement(startNode.childNodes[startOffset], ["li", "dt", "dd"])
+        && isInlineNode(startNode.childNodes[startOffset].firstChild)
+        && startOffset != 0) {
+            // "Let previous item be the child of start node with index start
+            // offset minus one."
+            var previousItem = startNode.childNodes[startOffset - 1];
+
+            // "If previous item's lastChild is an inline node other than a br,
+            // call createElement("br") on the context object and append the
+            // result as the last child of previous item."
+            if (isInlineNode(previousItem.lastChild)
+            && !isHtmlElement(previousItem.lastChild, "br")) {
+                previousItem.appendChild(createElement("br"));
+            }
+
+            // "If previous item's lastChild is an inline node, call
+            // createElement("br") on the context object and append the result
+            // as the last child of previous item."
+            if (isInlineNode(previousItem.lastChild)) {
+                previousItem.appendChild(createElement("br"));
+            }
+        }
+
+        // "If start node's child with index start offset is an li or dt or dd,
+        // and that child's previousSibling is also an li or dt or dd:"
+        if (isHtmlElement(startNode.childNodes[startOffset], ["li", "dt", "dd"])
+        && isHtmlElement(startNode.childNodes[startOffset].previousSibling, ["li", "dt", "dd"])) {
+            // "Call cloneRange() on the active range, and let original range
+            // be the result."
+            //
+            // We need to add it to extraRanges so it will actually get updated
+            // when moving preserving ranges.
+            var originalRange = getActiveRange().cloneRange();
+            extraRanges.push(originalRange);
+
+            // "Set start node to its child with index start offset − 1."
+            startNode = startNode.childNodes[startOffset - 1];
+
+            // "Set start offset to start node's length."
+            startOffset = getNodeLength(startNode);
+
+            // "Set node to start node's nextSibling."
+            node = startNode.nextSibling;
+
+            // "Call collapse(start node, start offset) on the context object's
+            // Selection."
+            getSelection().collapse(startNode, startOffset);
+            getActiveRange().setStart(startNode, startOffset);
+
+            // "Call extend(node, 0) on the context object's Selection."
+            getSelection().extend(node, 0);
+            getActiveRange().setEnd(node, 0);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Call removeAllRanges() on the context object's Selection."
+            getSelection().removeAllRanges();
+
+            // "Call addRange(original range) on the context object's
+            // Selection."
+            getSelection().addRange(originalRange);
+            getActiveRange().setStart(originalRange.startContainer, originalRange.startOffset);
+            getActiveRange().setEnd(originalRange.endContainer, originalRange.endOffset);
+
+            // "Return true."
+            extraRanges.pop();
+            return true;
+        }
+
+        // "While start node has a child with index start offset minus one:"
+        while (0 <= startOffset - 1
+        && startOffset - 1 < startNode.childNodes.length) {
+            // "If start node's child with index start offset minus one is
+            // editable and invisible, remove it from start node, then subtract
+            // one from start offset."
+            if (isEditable(startNode.childNodes[startOffset - 1])
+            && isInvisible(startNode.childNodes[startOffset - 1])) {
+                startNode.removeChild(startNode.childNodes[startOffset - 1]);
+                startOffset--;
+
+            // "Otherwise, set start node to its child with index start offset
+            // minus one, then set start offset to the length of start node."
+            } else {
+                startNode = startNode.childNodes[startOffset - 1];
+                startOffset = getNodeLength(startNode);
+            }
+        }
+
+        // "Call collapse(start node, start offset) on the context object's
+        // Selection."
+        getSelection().collapse(startNode, startOffset);
+        getActiveRange().setStart(startNode, startOffset);
+
+        // "Call extend(node, offset) on the context object's Selection."
+        getSelection().extend(node, offset);
+        getActiveRange().setEnd(node, offset);
+
+        // "Delete the selection, with direction "backward"."
+        deleteSelection({direction: "backward"});
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The formatBlock command /////
+//@{
+// "A formattable block name is "address", "dd", "div", "dt", "h1", "h2", "h3",
+// "h4", "h5", "h6", "p", or "pre"."
+var formattableBlockNames = ["address", "dd", "div", "dt", "h1", "h2", "h3",
+    "h4", "h5", "h6", "p", "pre"];
+
+commands.formatblock = {
+    preservesOverrides: true,
+    action: function(value) {
+        // "If value begins with a "<" character and ends with a ">" character,
+        // remove the first and last characters from it."
+        if (/^<.*>$/.test(value)) {
+            value = value.slice(1, -1);
+        }
+
+        // "Let value be converted to ASCII lowercase."
+        value = value.toLowerCase();
+
+        // "If value is not a formattable block name, return false."
+        if (formattableBlockNames.indexOf(value) == -1) {
+            return false;
+        }
+
+        // "Block-extend the active range, and let new range be the result."
+        var newRange = blockExtend(getActiveRange());
+
+        // "Let node list be an empty list of nodes."
+        //
+        // "For each node node contained in new range, append node to node list
+        // if it is editable, the last member of original node list (if any) is
+        // not an ancestor of node, node is either a non-list single-line
+        // container or an allowed child of "p" or a dd or dt, and node is not
+        // the ancestor of a prohibited paragraph child."
+        var nodeList = getContainedNodes(newRange, function(node) {
+            return isEditable(node)
+                && (isNonListSingleLineContainer(node)
+                || isAllowedChild(node, "p")
+                || isHtmlElement(node, ["dd", "dt"]))
+                && !getDescendants(node).some(isProhibitedParagraphChild);
+        });
+
+        // "Record the values of node list, and let values be the result."
+        var values = recordValues(nodeList);
+
+        // "For each node in node list, while node is the descendant of an
+        // editable HTML element in the same editing host, whose local name is
+        // a formattable block name, and which is not the ancestor of a
+        // prohibited paragraph child, split the parent of the one-node list
+        // consisting of node."
+        for (var i = 0; i < nodeList.length; i++) {
+            var node = nodeList[i];
+            while (getAncestors(node).some(function(ancestor) {
+                return isEditable(ancestor)
+                    && inSameEditingHost(ancestor, node)
+                    && isHtmlElement(ancestor, formattableBlockNames)
+                    && !getDescendants(ancestor).some(isProhibitedParagraphChild);
+            })) {
+                splitParent([node]);
+            }
+        }
+
+        // "Restore the values from values."
+        restoreValues(values);
+
+        // "While node list is not empty:"
+        while (nodeList.length) {
+            var sublist;
+
+            // "If the first member of node list is a single-line
+            // container:"
+            if (isSingleLineContainer(nodeList[0])) {
+                // "Let sublist be the children of the first member of node
+                // list."
+                sublist = [].slice.call(nodeList[0].childNodes);
+
+                // "Record the values of sublist, and let values be the
+                // result."
+                var values = recordValues(sublist);
+
+                // "Remove the first member of node list from its parent,
+                // preserving its descendants."
+                removePreservingDescendants(nodeList[0]);
+
+                // "Restore the values from values."
+                restoreValues(values);
+
+                // "Remove the first member from node list."
+                nodeList.shift();
+
+            // "Otherwise:"
+            } else {
+                // "Let sublist be an empty list of nodes."
+                sublist = [];
+
+                // "Remove the first member of node list and append it to
+                // sublist."
+                sublist.push(nodeList.shift());
+
+                // "While node list is not empty, and the first member of
+                // node list is the nextSibling of the last member of
+                // sublist, and the first member of node list is not a
+                // single-line container, and the last member of sublist is
+                // not a br, remove the first member of node list and
+                // append it to sublist."
+                while (nodeList.length
+                && nodeList[0] == sublist[sublist.length - 1].nextSibling
+                && !isSingleLineContainer(nodeList[0])
+                && !isHtmlElement(sublist[sublist.length - 1], "BR")) {
+                    sublist.push(nodeList.shift());
+                }
+            }
+
+            // "Wrap sublist. If value is "div" or "p", sibling criteria
+            // returns false; otherwise it returns true for an HTML element
+            // with local name value and no attributes, and false otherwise.
+            // New parent instructions return the result of running
+            // createElement(value) on the context object. Then fix disallowed
+            // ancestors of the result."
+            fixDisallowedAncestors(wrap(sublist,
+                ["div", "p"].indexOf(value) == - 1
+                    ? function(node) { return isHtmlElement(node, value) && !attributesOf(node).length }
+                    : function() { return false },
+                function() { return createElement(value) }));
+        }
+
+        // "Return true."
+        return true;
+    }, indeterm: function() {
+        // "If the active range is null, return false."
+        if (!getActiveRange()) {
+            return false;
+        }
+
+        // "Block-extend the active range, and let new range be the result."
+        var newRange = blockExtend(getActiveRange());
+
+        // "Let node list be all visible editable nodes that are contained in
+        // new range and have no children."
+        var nodeList = getAllContainedNodes(newRange, function(node) {
+            return isVisible(node)
+                && isEditable(node)
+                && !node.hasChildNodes();
+        });
+
+        // "If node list is empty, return false."
+        if (!nodeList.length) {
+            return false;
+        }
+
+        // "Let type be null."
+        var type = null;
+
+        // "For each node in node list:"
+        for (var i = 0; i < nodeList.length; i++) {
+            var node = nodeList[i];
+
+            // "While node's parent is editable and in the same editing host as
+            // node, and node is not an HTML element whose local name is a
+            // formattable block name, set node to its parent."
+            while (isEditable(node.parentNode)
+            && inSameEditingHost(node, node.parentNode)
+            && !isHtmlElement(node, formattableBlockNames)) {
+                node = node.parentNode;
+            }
+
+            // "Let current type be the empty string."
+            var currentType = "";
+
+            // "If node is an editable HTML element whose local name is a
+            // formattable block name, and node is not the ancestor of a
+            // prohibited paragraph child, set current type to node's local
+            // name."
+            if (isEditable(node)
+            && isHtmlElement(node, formattableBlockNames)
+            && !getDescendants(node).some(isProhibitedParagraphChild)) {
+                currentType = node.tagName;
+            }
+
+            // "If type is null, set type to current type."
+            if (type === null) {
+                type = currentType;
+
+            // "Otherwise, if type does not equal current type, return true."
+            } else if (type != currentType) {
+                return true;
+            }
+        }
+
+        // "Return false."
+        return false;
+    }, value: function() {
+        // "If the active range is null, return the empty string."
+        if (!getActiveRange()) {
+            return "";
+        }
+
+        // "Block-extend the active range, and let new range be the result."
+        var newRange = blockExtend(getActiveRange());
+
+        // "Let node be the first visible editable node that is contained in
+        // new range and has no children. If there is no such node, return the
+        // empty string."
+        var nodes = getAllContainedNodes(newRange, function(node) {
+            return isVisible(node)
+                && isEditable(node)
+                && !node.hasChildNodes();
+        });
+        if (!nodes.length) {
+            return "";
+        }
+        var node = nodes[0];
+
+        // "While node's parent is editable and in the same editing host as
+        // node, and node is not an HTML element whose local name is a
+        // formattable block name, set node to its parent."
+        while (isEditable(node.parentNode)
+        && inSameEditingHost(node, node.parentNode)
+        && !isHtmlElement(node, formattableBlockNames)) {
+            node = node.parentNode;
+        }
+
+        // "If node is an editable HTML element whose local name is a
+        // formattable block name, and node is not the ancestor of a prohibited
+        // paragraph child, return node's local name, converted to ASCII
+        // lowercase."
+        if (isEditable(node)
+        && isHtmlElement(node, formattableBlockNames)
+        && !getDescendants(node).some(isProhibitedParagraphChild)) {
+            return node.tagName.toLowerCase();
+        }
+
+        // "Return the empty string."
+        return "";
+    }
+};
+
+//@}
+///// The forwardDelete command /////
+//@{
+commands.forwarddelete = {
+    preservesOverrides: true,
+    action: function() {
+        // "If the active range is not collapsed, delete the selection and
+        // return true."
+        if (!getActiveRange().collapsed) {
+            deleteSelection();
+            return true;
+        }
+
+        // "Canonicalize whitespace at the active range's start."
+        canonicalizeWhitespace(getActiveRange().startContainer, getActiveRange().startOffset);
+
+        // "Let node and offset be the active range's start node and offset."
+        var node = getActiveRange().startContainer;
+        var offset = getActiveRange().startOffset;
+
+        // "Repeat the following steps:"
+        while (true) {
+            // "If offset is the length of node and node's nextSibling is an
+            // editable invisible node, remove node's nextSibling from its
+            // parent."
+            if (offset == getNodeLength(node)
+            && isEditable(node.nextSibling)
+            && isInvisible(node.nextSibling)) {
+                node.parentNode.removeChild(node.nextSibling);
+
+            // "Otherwise, if node has a child with index offset and that child
+            // is an editable invisible node, remove that child from node."
+            } else if (offset < node.childNodes.length
+            && isEditable(node.childNodes[offset])
+            && isInvisible(node.childNodes[offset])) {
+                node.removeChild(node.childNodes[offset]);
+
+            // "Otherwise, if offset is the length of node and node is an
+            // inline node, or if node is invisible, set offset to one plus the
+            // index of node, then set node to its parent."
+            } else if ((offset == getNodeLength(node)
+            && isInlineNode(node))
+            || isInvisible(node)) {
+                offset = 1 + getNodeIndex(node);
+                node = node.parentNode;
+
+            // A non-editable element inside the editing host (an island) is
+            // removed whole. The spec does not define this case.
+            } else if (offset < node.childNodes.length
+            && isEditable(node)
+            && node.childNodes[offset].nodeType == DOM.ELEMENT_NODE
+            && !isEditable(node.childNodes[offset])) {
+                node.removeChild(node.childNodes[offset]);
+                getSelection().collapse(node, offset);
+                getActiveRange().setStart(node, offset);
+                getActiveRange().setEnd(node, offset);
+                return true;
+
+            // "Otherwise, if node has a child with index offset and that child
+            // is neither a block node nor a br nor an img nor a collapsed
+            // block prop, set node to that child, then set offset to zero."
+            } else if (offset < node.childNodes.length
+            && !isBlockNode(node.childNodes[offset])
+            && !isHtmlElement(node.childNodes[offset], ["br", "img"])
+            && !isCollapsedBlockProp(node.childNodes[offset])) {
+                node = node.childNodes[offset];
+                offset = 0;
+
+            // "Otherwise, break from this loop."
+            } else {
+                break;
+            }
+        }
+
+        // "If node is a Text node and offset is not node's length:"
+        if (node.nodeType == DOM.TEXT_NODE
+        && offset != getNodeLength(node)) {
+            // "Let end offset be offset plus one."
+            var endOffset = offset + 1;
+
+            // "While end offset is not node's length and the end offsetth
+            // element of node's data has general category M when interpreted
+            // as a Unicode code point, add one to end offset."
+            //
+            // TODO: Not even going to try handling anything beyond the most
+            // basic combining marks, since I couldn't find a good list.  I
+            // special-case a few Hebrew diacritics too to test basic coverage
+            // of non-Latin stuff.
+            while (endOffset != node.length
+            && /^[\u0300-\u036f\u0591-\u05bd\u05c1\u05c2]$/.test(node.data[endOffset])) {
+                endOffset++;
+            }
+
+            // "Call collapse(node, offset) on the context object's Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setStart(node, offset);
+
+            // "Call extend(node, end offset) on the context object's
+            // Selection."
+            getSelection().extend(node, endOffset);
+            getActiveRange().setEnd(node, endOffset);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Return true."
+            return true;
+        }
+
+        // "If node is an inline node, return true."
+        if (isInlineNode(node)) {
+            return true;
+        }
+
+        // "If node has a child with index offset and that child is a br or hr
+        // or img, but is not a collapsed block prop:"
+        if (offset < node.childNodes.length
+        && isHtmlElement(node.childNodes[offset], ["br", "hr", "img"])
+        && !isCollapsedBlockProp(node.childNodes[offset])) {
+            // "Call collapse(node, offset) on the context object's Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setStart(node, offset);
+
+            // "Call extend(node, offset + 1) on the context object's
+            // Selection."
+            getSelection().extend(node, offset + 1);
+            getActiveRange().setEnd(node, offset + 1);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Return true."
+            return true;
+        }
+
+        // "Let end node equal node and let end offset equal offset."
+        var endNode = node;
+        var endOffset = offset;
+
+        // "If end node has a child with index end offset, and that child is a
+        // collapsed block prop, add one to end offset."
+        if (endOffset < endNode.childNodes.length
+        && isCollapsedBlockProp(endNode.childNodes[endOffset])) {
+            endOffset++;
+        }
+
+        // "Repeat the following steps:"
+        while (true) {
+            // "If end offset is the length of end node, set end offset to one
+            // plus the index of end node and then set end node to its parent."
+            if (endOffset == getNodeLength(endNode)) {
+                endOffset = 1 + getNodeIndex(endNode);
+                endNode = endNode.parentNode;
+
+            // "Otherwise, if end node has a an editable invisible child with
+            // index end offset, remove it from end node."
+            } else if (endOffset < endNode.childNodes.length
+            && isEditable(endNode.childNodes[endOffset])
+            && isInvisible(endNode.childNodes[endOffset])) {
+                endNode.removeChild(endNode.childNodes[endOffset]);
+
+            // "Otherwise, break from this loop."
+            } else {
+                break;
+            }
+        }
+
+        // "If the child of end node with index end offset minus one is a
+        // table, return true."
+        if (isHtmlElement(endNode.childNodes[endOffset - 1], "table")) {
+            return true;
+        }
+
+        // "If the child of end node with index end offset is a table:"
+        if (isHtmlElement(endNode.childNodes[endOffset], "table")) {
+            // "Call collapse(end node, end offset) on the context object's
+            // Selection."
+            getSelection().collapse(endNode, endOffset);
+            getActiveRange().setStart(endNode, endOffset);
+
+            // "Call extend(end node, end offset + 1) on the context object's
+            // Selection."
+            getSelection().extend(endNode, endOffset + 1);
+            getActiveRange().setEnd(endNode, endOffset + 1);
+
+            // "Return true."
+            return true;
+        }
+
+        // "If offset is the length of node, and the child of end node with
+        // index end offset is an hr or br:"
+        if (offset == getNodeLength(node)
+        && isHtmlElement(endNode.childNodes[endOffset], ["br", "hr"])) {
+            // "Call collapse(end node, end offset) on the context object's
+            // Selection."
+            getSelection().collapse(endNode, endOffset);
+            getActiveRange().setStart(endNode, endOffset);
+
+            // "Call extend(end node, end offset + 1) on the context object's
+            // Selection."
+            getSelection().extend(endNode, endOffset + 1);
+            getActiveRange().setEnd(endNode, endOffset + 1);
+
+            // "Delete the selection."
+            deleteSelection();
+
+            // "Call collapse(node, offset) on the Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setStart(node, offset);
+            getActiveRange().collapse(true);
+
+            // "Return true."
+            return true;
+        }
+
+        // "While end node has a child with index end offset:"
+        while (endOffset < endNode.childNodes.length) {
+            // "If end node's child with index end offset is editable and
+            // invisible, remove it from end node."
+            if (isEditable(endNode.childNodes[endOffset])
+            && isInvisible(endNode.childNodes[endOffset])) {
+                endNode.removeChild(endNode.childNodes[endOffset]);
+
+            // "Otherwise, set end node to its child with index end offset and
+            // set end offset to zero."
+            } else {
+                endNode = endNode.childNodes[endOffset];
+                endOffset = 0;
+            }
+        }
+
+        // "Call collapse(node, offset) on the context object's Selection."
+        getSelection().collapse(node, offset);
+        getActiveRange().setStart(node, offset);
+
+        // "Call extend(end node, end offset) on the context object's
+        // Selection."
+        getSelection().extend(endNode, endOffset);
+        getActiveRange().setEnd(endNode, endOffset);
+
+        // "Delete the selection."
+        deleteSelection();
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The indent command /////
+//@{
+commands.indent = {
+    preservesOverrides: true,
+    action: function() {
+        // "Let items be a list of all lis that are ancestor containers of the
+        // active range's start and/or end node."
+        //
+        // Has to be in tree order, remember!
+        var items = [];
+        for (var node = getActiveRange().endContainer; node != getActiveRange().commonAncestorContainer; node = node.parentNode) {
+            if (isHtmlElement(node, "LI")) {
+                items.unshift(node);
+            }
+        }
+        for (var node = getActiveRange().startContainer; node != getActiveRange().commonAncestorContainer; node = node.parentNode) {
+            if (isHtmlElement(node, "LI")) {
+                items.unshift(node);
+            }
+        }
+        for (var node = getActiveRange().commonAncestorContainer; node; node = node.parentNode) {
+            if (isHtmlElement(node, "LI")) {
+                items.unshift(node);
+            }
+        }
+
+        // "For each item in items, normalize sublists of item."
+        for (var i = 0; i < items.length; i++) {
+            normalizeSublists(items[i]);
+        }
+
+        // "Block-extend the active range, and let new range be the result."
+        var newRange = blockExtend(getActiveRange());
+
+        // "Let node list be a list of nodes, initially empty."
+        var nodeList = [];
+
+        // "For each node node contained in new range, if node is editable and
+        // is an allowed child of "div" or "ol" and if the last member of node
+        // list (if any) is not an ancestor of node, append node to node list."
+        nodeList = getContainedNodes(newRange, function(node) {
+            return isEditable(node)
+                && (isAllowedChild(node, "div")
+                || isAllowedChild(node, "ol"));
+        });
+
+        // "If the first visible member of node list is an li whose parent is
+        // an ol or ul:"
+        if (isHtmlElement(nodeList.filter(isVisible)[0], "li")
+        && isHtmlElement(nodeList.filter(isVisible)[0].parentNode, ["ol", "ul"])) {
+            // "Let sibling be node list's first visible member's
+            // previousSibling."
+            var sibling = nodeList.filter(isVisible)[0].previousSibling;
+
+            // "While sibling is invisible, set sibling to its
+            // previousSibling."
+            while (isInvisible(sibling)) {
+                sibling = sibling.previousSibling;
+            }
+
+            // "If sibling is an li, normalize sublists of sibling."
+            if (isHtmlElement(sibling, "li")) {
+                normalizeSublists(sibling);
+            }
+        }
+
+        // "While node list is not empty:"
+        while (nodeList.length) {
+            // "Let sublist be a list of nodes, initially empty."
+            var sublist = [];
+
+            // "Remove the first member of node list and append it to sublist."
+            sublist.push(nodeList.shift());
+
+            // "While the first member of node list is the nextSibling of the
+            // last member of sublist, remove the first member of node list and
+            // append it to sublist."
+            while (nodeList.length
+            && nodeList[0] == sublist[sublist.length - 1].nextSibling) {
+                sublist.push(nodeList.shift());
+            }
+
+            // "Indent sublist."
+            indentNodes(sublist);
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertHorizontalRule command /////
+//@{
+commands.inserthorizontalrule = {
+    preservesOverrides: true,
+    action: function() {
+        // "Let start node, start offset, end node, and end offset be the
+        // active range's start and end nodes and offsets."
+        var startNode = getActiveRange().startContainer;
+        var startOffset = getActiveRange().startOffset;
+        var endNode = getActiveRange().endContainer;
+        var endOffset = getActiveRange().endOffset;
+
+        // "While start offset is 0 and start node's parent is not null, set
+        // start offset to start node's index, then set start node to its
+        // parent."
+        while (startOffset == 0
+        && startNode.parentNode) {
+            startOffset = getNodeIndex(startNode);
+            startNode = startNode.parentNode;
+        }
+
+        // "While end offset is end node's length, and end node's parent is not
+        // null, set end offset to one plus end node's index, then set end node
+        // to its parent."
+        while (endOffset == getNodeLength(endNode)
+        && endNode.parentNode) {
+            endOffset = 1 + getNodeIndex(endNode);
+            endNode = endNode.parentNode;
+        }
+
+        // "Call collapse(start node, start offset) on the context object's
+        // Selection."
+        getSelection().collapse(startNode, startOffset);
+        getActiveRange().setStart(startNode, startOffset);
+
+        // "Call extend(end node, end offset) on the context object's
+        // Selection."
+        getSelection().extend(endNode, endOffset);
+        getActiveRange().setEnd(endNode, endOffset);
+
+        // "Delete the selection, with block merging false."
+        deleteSelection({blockMerging: false});
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "If the active range's start node is a Text node and its start
+        // offset is zero, call collapse() on the context object's Selection,
+        // with first argument the active range's start node's parent and
+        // second argument the active range's start node's index."
+        if (getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().startOffset == 0) {
+            var newNode = getActiveRange().startContainer.parentNode;
+            var newOffset = getNodeIndex(getActiveRange().startContainer);
+            getSelection().collapse(newNode, newOffset);
+            getActiveRange().setStart(newNode, newOffset);
+            getActiveRange().collapse(true);
+        }
+
+        // "If the active range's start node is a Text node and its start
+        // offset is the length of its start node, call collapse() on the
+        // context object's Selection, with first argument the active range's
+        // start node's parent, and the second argument one plus the active
+        // range's start node's index."
+        if (getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().startOffset == getNodeLength(getActiveRange().startContainer)) {
+            var newNode = getActiveRange().startContainer.parentNode;
+            var newOffset = 1 + getNodeIndex(getActiveRange().startContainer);
+            getSelection().collapse(newNode, newOffset);
+            getActiveRange().setStart(newNode, newOffset);
+            getActiveRange().collapse(true);
+        }
+
+        // "Let hr be the result of calling createElement("hr") on the
+        // context object."
+        var hr = createElement("hr");
+
+        // "Run insertNode(hr) on the active range."
+        getActiveRange().insertNode(hr);
+
+        // "Fix disallowed ancestors of hr."
+        fixDisallowedAncestors(hr);
+
+        // "Run collapse() on the context object's Selection, with first
+        // argument hr's parent and the second argument equal to one plus hr's
+        // index."
+        getSelection().collapse(hr.parentNode, 1 + getNodeIndex(hr));
+        getActiveRange().setStart(hr.parentNode, 1 + getNodeIndex(hr));
+        getActiveRange().collapse(true);
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertHTML command /////
+//@{
+commands.inserthtml = {
+    preservesOverrides: true,
+    action: function(value) {
+        // "Delete the selection."
+        deleteSelection();
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "Let frag be the result of calling createContextualFragment(value)
+        // on the active range."
+        var frag = getActiveRange().createContextualFragment(value);
+
+        // "Let last child be the lastChild of frag."
+        var lastChild = frag.lastChild;
+
+        // "If last child is null, return true."
+        if (!lastChild) {
+            return true;
+        }
+
+        // "Let descendants be all descendants of frag."
+        var descendants = getDescendants(frag);
+
+        // "If the active range's start node is a block node:"
+        if (isBlockNode(getActiveRange().startContainer)) {
+            // "Let collapsed block props be all editable collapsed block prop
+            // children of the active range's start node that have index
+            // greater than or equal to the active range's start offset."
+            //
+            // "For each node in collapsed block props, remove node from its
+            // parent."
+            [].filter.call(getActiveRange().startContainer.childNodes, function(node) {
+                return isEditable(node)
+                    && isCollapsedBlockProp(node)
+                    && getNodeIndex(node) >= getActiveRange().startOffset;
+            }).forEach(function(node) {
+                node.parentNode.removeChild(node);
+            });
+        }
+
+        // "Call insertNode(frag) on the active range."
+        getActiveRange().insertNode(frag);
+
+        // "If the active range's start node is a block node with no visible
+        // children, call createElement("br") on the context object and append
+        // the result as the last child of the active range's start node."
+        if (isBlockNode(getActiveRange().startContainer)
+        && ![].some.call(getActiveRange().startContainer.childNodes, isVisible)) {
+            getActiveRange().startContainer.appendChild(createElement("br"));
+        }
+
+        // "Call collapse() on the context object's Selection, with last
+        // child's parent as the first argument and one plus its index as the
+        // second."
+        getActiveRange().setStart(lastChild.parentNode, 1 + getNodeIndex(lastChild));
+        getActiveRange().setEnd(lastChild.parentNode, 1 + getNodeIndex(lastChild));
+
+        // "Fix disallowed ancestors of each member of descendants."
+        for (var i = 0; i < descendants.length; i++) {
+            fixDisallowedAncestors(descendants[i]);
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertImage command /////
+//@{
+commands.insertimage = {
+    preservesOverrides: true,
+    action: function(value) {
+        // "If value is the empty string, return false."
+        if (value === "") {
+            return false;
+        }
+
+        // "Delete the selection, with strip wrappers false."
+        deleteSelection({stripWrappers: false});
+
+        // "Let range be the active range."
+        var range = getActiveRange();
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "If range's start node is a block node whose sole child is a br, and
+        // its start offset is 0, remove its start node's child from it."
+        if (isBlockNode(range.startContainer)
+        && range.startContainer.childNodes.length == 1
+        && isHtmlElement(range.startContainer.firstChild, "br")
+        && range.startOffset == 0) {
+            range.startContainer.removeChild(range.startContainer.firstChild);
+        }
+
+        // "Let img be the result of calling createElement("img") on the
+        // context object."
+        var img = createElement("img");
+
+        // "Run setAttribute("src", value) on img."
+        img.setAttribute("src", value);
+
+        // "Run insertNode(img) on the range."
+        range.insertNode(img);
+
+        // "Run collapse() on the Selection, with first argument equal to the
+        // parent of img and the second argument equal to one plus the index of
+        // img."
+        //
+        // Not everyone actually supports collapse(), so we do it manually
+        // instead.  Also, we need to modify the actual range we're given as
+        // well, for the sake of autoimplementation.html's range-filling-in.
+        range.setStart(img.parentNode, 1 + getNodeIndex(img));
+        range.setEnd(img.parentNode, 1 + getNodeIndex(img));
+        getSelection().removeAllRanges();
+        getSelection().addRange(range);
+
+        // IE adds width and height attributes for some reason, so remove those
+        // to actually do what the spec says.
+        img.removeAttribute("width");
+        img.removeAttribute("height");
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertLineBreak command /////
+//@{
+commands.insertlinebreak = {
+    preservesOverrides: true,
+    action: function(value) {
+        // "Delete the selection, with strip wrappers false."
+        deleteSelection({stripWrappers: false});
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "If the active range's start node is an Element, and "br" is not an
+        // allowed child of it, return true."
+        if (getActiveRange().startContainer.nodeType == DOM.ELEMENT_NODE
+        && !isAllowedChild("br", getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "If the active range's start node is not an Element, and "br" is not
+        // an allowed child of the active range's start node's parent, return
+        // true."
+        if (getActiveRange().startContainer.nodeType != DOM.ELEMENT_NODE
+        && !isAllowedChild("br", getActiveRange().startContainer.parentNode)) {
+            return true;
+        }
+
+        // "If the active range's start node is a Text node and its start
+        // offset is zero, call collapse() on the context object's Selection,
+        // with first argument equal to the active range's start node's parent
+        // and second argument equal to the active range's start node's index."
+        if (getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().startOffset == 0) {
+            var newNode = getActiveRange().startContainer.parentNode;
+            var newOffset = getNodeIndex(getActiveRange().startContainer);
+            getSelection().collapse(newNode, newOffset);
+            getActiveRange().setStart(newNode, newOffset);
+            getActiveRange().setEnd(newNode, newOffset);
+        }
+
+        // "If the active range's start node is a Text node and its start
+        // offset is the length of its start node, call collapse() on the
+        // context object's Selection, with first argument equal to the active
+        // range's start node's parent and second argument equal to one plus
+        // the active range's start node's index."
+        if (getActiveRange().startContainer.nodeType == DOM.TEXT_NODE
+        && getActiveRange().startOffset == getNodeLength(getActiveRange().startContainer)) {
+            var newNode = getActiveRange().startContainer.parentNode;
+            var newOffset = 1 + getNodeIndex(getActiveRange().startContainer);
+            getSelection().collapse(newNode, newOffset);
+            getActiveRange().setStart(newNode, newOffset);
+            getActiveRange().setEnd(newNode, newOffset);
+        }
+
+        // "Let br be the result of calling createElement("br") on the context
+        // object."
+        var br = createElement("br");
+
+        // "Call insertNode(br) on the active range."
+        getActiveRange().insertNode(br);
+
+        // "Call collapse() on the context object's Selection, with br's parent
+        // as the first argument and one plus br's index as the second
+        // argument."
+        getSelection().collapse(br.parentNode, 1 + getNodeIndex(br));
+        getActiveRange().setStart(br.parentNode, 1 + getNodeIndex(br));
+        getActiveRange().setEnd(br.parentNode, 1 + getNodeIndex(br));
+
+        // "If br is a collapsed line break, call createElement("br") on the
+        // context object and let extra br be the result, then call
+        // insertNode(extra br) on the active range."
+        if (isCollapsedLineBreak(br)) {
+            getActiveRange().insertNode(createElement("br"));
+
+            // Compensate for nonstandard implementations of insertNode
+            getSelection().collapse(br.parentNode, 1 + getNodeIndex(br));
+            getActiveRange().setStart(br.parentNode, 1 + getNodeIndex(br));
+            getActiveRange().setEnd(br.parentNode, 1 + getNodeIndex(br));
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertOrderedList command /////
+//@{
+commands.insertorderedlist = {
+    preservesOverrides: true,
+    // "Toggle lists with tag name "ol", then return true."
+    action: function() { toggleLists("ol"); return true },
+    // "True if the selection's list state is "mixed" or "mixed ol", false
+    // otherwise."
+    indeterm: function() { return /^mixed( ol)?$/.test(getSelectionListState()) },
+    // "True if the selection's list state is "ol", false otherwise."
+    state: function() { return getSelectionListState() == "ol" },
+};
+
+//@}
+///// The insertParagraph command /////
+//@{
+commands.insertparagraph = {
+    preservesOverrides: true,
+    action: function() {
+        // "Delete the selection."
+        deleteSelection();
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "Let node and offset be the active range's start node and offset."
+        var node = getActiveRange().startContainer;
+        var offset = getActiveRange().startOffset;
+
+        // "If node is a Text node, and offset is neither 0 nor the length of
+        // node, call splitText(offset) on node."
+        if (node.nodeType == DOM.TEXT_NODE
+        && offset != 0
+        && offset != getNodeLength(node)) {
+            node.splitText(offset);
+        }
+
+        // "If node is a Text node and offset is its length, set offset to one
+        // plus the index of node, then set node to its parent."
+        if (node.nodeType == DOM.TEXT_NODE
+        && offset == getNodeLength(node)) {
+            offset = 1 + getNodeIndex(node);
+            node = node.parentNode;
+        }
+
+        // "If node is a Text or Comment node, set offset to the index of node,
+        // then set node to its parent."
+        if (node.nodeType == DOM.TEXT_NODE
+        || node.nodeType == DOM.COMMENT_NODE) {
+            offset = getNodeIndex(node);
+            node = node.parentNode;
+        }
+
+        // "Call collapse(node, offset) on the context object's Selection."
+        getSelection().collapse(node, offset);
+        getActiveRange().setStart(node, offset);
+        getActiveRange().setEnd(node, offset);
+
+        // "Let container equal node."
+        var container = node;
+
+        // "While container is not a single-line container, and container's
+        // parent is editable and in the same editing host as node, set
+        // container to its parent."
+        while (!isSingleLineContainer(container)
+        && isEditable(container.parentNode)
+        && inSameEditingHost(node, container.parentNode)) {
+            container = container.parentNode;
+        }
+
+        // "If container is an editable single-line container in the same
+        // editing host as node, and its local name is "p" or "div":"
+        if (isEditable(container)
+        && isSingleLineContainer(container)
+        && inSameEditingHost(node, container.parentNode)
+        && (container.tagName == "P" || container.tagName == "DIV")) {
+            // "Let outer container equal container."
+            var outerContainer = container;
+
+            // "While outer container is not a dd or dt or li, and outer
+            // container's parent is editable, set outer container to its
+            // parent."
+            while (!isHtmlElement(outerContainer, ["dd", "dt", "li"])
+            && isEditable(outerContainer.parentNode)) {
+                outerContainer = outerContainer.parentNode;
+            }
+
+            // "If outer container is a dd or dt or li, set container to outer
+            // container."
+            if (isHtmlElement(outerContainer, ["dd", "dt", "li"])) {
+                container = outerContainer;
+            }
+        }
+
+        // "If container is not editable or not in the same editing host as
+        // node or is not a single-line container:"
+        if (!isEditable(container)
+        || !inSameEditingHost(container, node)
+        || !isSingleLineContainer(container)) {
+            // "Let tag be the default single-line container name."
+            var tag = defaultSingleLineContainerName;
+
+            // "Block-extend the active range, and let new range be the
+            // result."
+            var newRange = blockExtend(getActiveRange());
+
+            // "Let node list be a list of nodes, initially empty."
+            //
+            // "Append to node list the first node in tree order that is
+            // contained in new range and is an allowed child of "p", if any."
+            var nodeList = getContainedNodes(newRange, function(node) { return isAllowedChild(node, "p") })
+                .slice(0, 1);
+
+            // "If node list is empty:"
+            if (!nodeList.length) {
+                // "If tag is not an allowed child of the active range's start
+                // node, return true."
+                if (!isAllowedChild(tag, getActiveRange().startContainer)) {
+                    return true;
+                }
+
+                // "Set container to the result of calling createElement(tag)
+                // on the context object."
+                container = createElement(tag);
+
+                // "Call insertNode(container) on the active range."
+                getActiveRange().insertNode(container);
+
+                // "Call createElement("br") on the context object, and append
+                // the result as the last child of container."
+                container.appendChild(createElement("br"));
+
+                // "Call collapse(container, 0) on the context object's
+                // Selection."
+                getSelection().collapse(container, 0);
+                getActiveRange().setStart(container, 0);
+                getActiveRange().setEnd(container, 0);
+
+                // "Return true."
+                return true;
+            }
+
+            // "While the nextSibling of the last member of node list is not
+            // null and is an allowed child of "p", append it to node list."
+            while (nodeList[nodeList.length - 1].nextSibling
+            && isAllowedChild(nodeList[nodeList.length - 1].nextSibling, "p")) {
+                nodeList.push(nodeList[nodeList.length - 1].nextSibling);
+            }
+
+            // "Wrap node list, with sibling criteria returning false and new
+            // parent instructions returning the result of calling
+            // createElement(tag) on the context object. Set container to the
+            // result."
+            container = wrap(nodeList,
+                function() { return false },
+                function() { return createElement(tag) }
+            );
+        }
+
+        // "If container's local name is "address", "listing", or "pre":"
+        if (container.tagName == "ADDRESS"
+        || container.tagName == "LISTING"
+        || container.tagName == "PRE") {
+            // "Let br be the result of calling createElement("br") on the
+            // context object."
+            var br = createElement("br");
+
+            // "Call insertNode(br) on the active range."
+            getActiveRange().insertNode(br);
+
+            // "Call collapse(node, offset + 1) on the context object's
+            // Selection."
+            getSelection().collapse(node, offset + 1);
+            getActiveRange().setStart(node, offset + 1);
+            getActiveRange().setEnd(node, offset + 1);
+
+            // "If br is the last descendant of container, let br be the result
+            // of calling createElement("br") on the context object, then call
+            // insertNode(br) on the active range."
+            //
+            // Work around browser bugs: some browsers select the
+            // newly-inserted node, not per spec.
+            if (!isDescendant(nextNode(br), container)) {
+                getActiveRange().insertNode(createElement("br"));
+                getSelection().collapse(node, offset + 1);
+                getActiveRange().setEnd(node, offset + 1);
+            }
+
+            // "Return true."
+            return true;
+        }
+
+        // "If container's local name is "li", "dt", or "dd"; and either it has
+        // no children or it has a single child and that child is a br:"
+        if (["LI", "DT", "DD"].indexOf(container.tagName) != -1
+        && (!container.hasChildNodes()
+        || (container.childNodes.length == 1
+        && isHtmlElement(container.firstChild, "br")))) {
+            // "Split the parent of the one-node list consisting of container."
+            splitParent([container]);
+
+            // "If container has no children, call createElement("br") on the
+            // context object and append the result as the last child of
+            // container."
+            if (!container.hasChildNodes()) {
+                container.appendChild(createElement("br"));
+            }
+
+            // "If container is a dd or dt, and it is not an allowed child of
+            // any of its ancestors in the same editing host, set the tag name
+            // of container to the default single-line container name and let
+            // container be the result."
+            if (isHtmlElement(container, ["dd", "dt"])
+            && getAncestors(container).every(function(ancestor) {
+                return !inSameEditingHost(container, ancestor)
+                    || !isAllowedChild(container, ancestor)
+            })) {
+                container = setTagName(container, defaultSingleLineContainerName);
+            }
+
+            // "Fix disallowed ancestors of container."
+            fixDisallowedAncestors(container);
+
+            // "Return true."
+            return true;
+        }
+
+        // "Let new line range be a new range whose start is the same as
+        // the active range's, and whose end is (container, length of
+        // container)."
+        var splitNode = getActiveRange().startContainer;
+        var splitOffset = getActiveRange().startOffset;
+        var splitPoints = splitNode.nodeType == DOM.TEXT_NODE
+            ? [[splitNode, splitOffset - 1], [splitNode, splitOffset]]
+            : [[splitNode.childNodes[splitOffset - 1], -1], [splitNode.childNodes[splitOffset], 0]];
+        var charAt = function(node, at) {
+            if (at < 0 && node) {
+                node = node.previousSibling;
+                at += node && node.nodeType == DOM.TEXT_NODE ? node.length : 0;
+            } else if (node && at >= node.length) {
+                at -= node.length;
+                node = node.nextSibling;
+            }
+            return node && node.nodeType == DOM.TEXT_NODE ? node.data[at] : undefined;
+        };
+        var shows = function(c) { return c !== undefined && !/[ \t\n\r\f]/.test(c); };
+        splitPoints.forEach(function(point) {
+            var node = point[0];
+            if (!node || node.nodeType != DOM.TEXT_NODE || !isEditable(node)
+            || ["pre", "pre-wrap"].indexOf(getComputedStyle(node.parentNode).whiteSpace) != -1) {
+                return;
+            }
+            var at = point[1] < 0 ? node.length + point[1] : point[1];
+            if (charAt(node, at) == " " && shows(charAt(node, at - 1)) && shows(charAt(node, at + 1))) {
+                node.replaceData(at, 1, "\xa0");
+            }
+        });
+
+        var newLineRange = createRange();
+        newLineRange.setStart(getActiveRange().startContainer, getActiveRange().startOffset);
+        newLineRange.setEnd(container, getNodeLength(container));
+
+        // "While new line range's start offset is zero and its start node is
+        // not a prohibited paragraph child, set its start to (parent of start
+        // node, index of start node)."
+        while (newLineRange.startOffset == 0
+        && !isProhibitedParagraphChild(newLineRange.startContainer)) {
+            newLineRange.setStart(newLineRange.startContainer.parentNode, getNodeIndex(newLineRange.startContainer));
+        }
+
+        // "While new line range's start offset is the length of its start node
+        // and its start node is not a prohibited paragraph child, set its
+        // start to (parent of start node, 1 + index of start node)."
+        while (newLineRange.startOffset == getNodeLength(newLineRange.startContainer)
+        && !isProhibitedParagraphChild(newLineRange.startContainer)) {
+            newLineRange.setStart(newLineRange.startContainer.parentNode, 1 + getNodeIndex(newLineRange.startContainer));
+        }
+
+        // "Let end of line be true if new line range contains either nothing
+        // or a single br, and false otherwise."
+        var containedInNewLineRange = getContainedNodes(newLineRange);
+        var endOfLine = !containedInNewLineRange.length
+            || (containedInNewLineRange.length == 1
+            && isHtmlElement(containedInNewLineRange[0], "br"));
+
+        // "If the local name of container is "h1", "h2", "h3", "h4", "h5", or
+        // "h6", and end of line is true, let new container name be the default
+        // single-line container name."
+        var newContainerName;
+        if (/^H[1-6]$/.test(container.tagName)
+        && endOfLine) {
+            newContainerName = defaultSingleLineContainerName;
+
+        // "Otherwise, if the local name of container is "dt" and end of line
+        // is true, let new container name be "dd"."
+        } else if (container.tagName == "DT"
+        && endOfLine) {
+            newContainerName = "dd";
+
+        // "Otherwise, if the local name of container is "dd" and end of line
+        // is true, let new container name be "dt"."
+        } else if (container.tagName == "DD"
+        && endOfLine) {
+            newContainerName = "dt";
+
+        // "Otherwise, let new container name be the local name of container."
+        } else {
+            newContainerName = container.tagName.toLowerCase();
+        }
+
+        // "Let new container be the result of calling createElement(new
+        // container name) on the context object."
+        var newContainer = createElement(newContainerName);
+
+        // "Copy all attributes of container to new container."
+        for (var i = 0; i < attributesOf(container).length; i++) {
+            newContainer.setAttribute(attributesOf(container)[i].name, attributesOf(container)[i].value);
+        }
+
+        // "If new container has an id attribute, unset it."
+        newContainer.removeAttribute("id");
+
+        // "Insert new container into the parent of container immediately after
+        // container."
+        container.parentNode.insertBefore(newContainer, container.nextSibling);
+
+        // "Let contained nodes be all nodes contained in new line range."
+        var containedNodes = getAllContainedNodes(newLineRange);
+
+        // "Let frag be the result of calling extractContents() on new line
+        // range."
+        var frag = newLineRange.extractContents();
+
+        // "Unset the id attribute (if any) of each Element descendant of frag
+        // that is not in contained nodes."
+        var descendants = getDescendants(frag);
+        for (var i = 0; i < descendants.length; i++) {
+            if (descendants[i].nodeType == DOM.ELEMENT_NODE
+            && containedNodes.indexOf(descendants[i]) == -1) {
+                descendants[i].removeAttribute("id");
+            }
+        }
+
+        // "Call appendChild(frag) on new container."
+        newContainer.appendChild(frag);
+
+        // "While container's lastChild is a prohibited paragraph child, set
+        // container to its lastChild."
+        while (isProhibitedParagraphChild(container.lastChild)) {
+            container = container.lastChild;
+        }
+
+        // "While new container's lastChild is a prohibited paragraph child,
+        // set new container to its lastChild."
+        while (isProhibitedParagraphChild(newContainer.lastChild)) {
+            newContainer = newContainer.lastChild;
+        }
+
+        // "If container has no visible children, call createElement("br") on
+        // the context object, and append the result as the last child of
+        // container."
+        if (![].some.call(container.childNodes, isVisible)) {
+            container.appendChild(createElement("br"));
+        }
+
+        // "If new container has no visible children, call createElement("br")
+        // on the context object, and append the result as the last child of
+        // new container."
+        if (![].some.call(newContainer.childNodes, isVisible)) {
+            newContainer.appendChild(createElement("br"));
+        }
+
+        // "Call collapse(new container, 0) on the context object's Selection."
+        getSelection().collapse(newContainer, 0);
+        getActiveRange().setStart(newContainer, 0);
+        getActiveRange().setEnd(newContainer, 0);
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertText command /////
+//@{
+commands.inserttext = {
+    action: function(value) {
+        // "Delete the selection, with strip wrappers false."
+        deleteSelection({stripWrappers: false});
+
+        // "If the active range's start node is neither editable nor an editing
+        // host, return true."
+        if (!isEditable(getActiveRange().startContainer)
+        && !isEditingHost(getActiveRange().startContainer)) {
+            return true;
+        }
+
+        // "If value's length is greater than one:"
+        if (value.length > 1) {
+            // "For each element el in value, take the action for the
+            // insertText command, with value equal to el."
+            for (var i = 0; i < value.length; i++) {
+                commands.inserttext.action(value[i]);
+            }
+
+            // "Return true."
+            return true;
+        }
+
+        // "If value is the empty string, return true."
+        if (value == "") {
+            return true;
+        }
+
+        // "If value is a newline (U+00A0), take the action for the
+        // insertParagraph command and return true."
+        if (value == "\n" && !literalLineFeeds) {
+            commands.insertparagraph.action();
+            return true;
+        }
+
+        // "Let node and offset be the active range's start node and offset."
+        var node = getActiveRange().startContainer;
+        var offset = getActiveRange().startOffset;
+
+        // "If node has a child whose index is offset − 1, and that child is a
+        // Text node, set node to that child, then set offset to node's
+        // length."
+        if (0 <= offset - 1
+        && offset - 1 < node.childNodes.length
+        && node.childNodes[offset - 1].nodeType == DOM.TEXT_NODE) {
+            node = node.childNodes[offset - 1];
+            offset = getNodeLength(node);
+        }
+
+        // "If node has a child whose index is offset, and that child is a Text
+        // node, set node to that child, then set offset to zero."
+        if (0 <= offset
+        && offset < node.childNodes.length
+        && node.childNodes[offset].nodeType == DOM.TEXT_NODE) {
+            node = node.childNodes[offset];
+            offset = 0;
+        }
+
+        // "Record current overrides, and let overrides be the result."
+        var overrides = recordCurrentOverrides();
+
+        // "Call collapse(node, offset) on the context object's Selection."
+        getSelection().collapse(node, offset);
+        getActiveRange().setStart(node, offset);
+        getActiveRange().setEnd(node, offset);
+
+        // "Canonicalize whitespace at (node, offset)."
+        canonicalizeWhitespace(node, offset);
+
+        // "Let (node, offset) be the active range's start."
+        node = getActiveRange().startContainer;
+        offset = getActiveRange().startOffset;
+
+        // "If node is a Text node:"
+        if (node.nodeType == DOM.TEXT_NODE) {
+            // "Call insertData(offset, value) on node."
+            node.insertData(offset, value);
+
+            // "Call collapse(node, offset) on the context object's Selection."
+            getSelection().collapse(node, offset);
+            getActiveRange().setStart(node, offset);
+
+            // "Call extend(node, offset + 1) on the context object's
+            // Selection."
+            //
+            // Work around WebKit bug: the extend() can throw if the text we're
+            // adding is trailing whitespace.
+            try { getSelection().extend(node, offset + 1); } catch(e) {}
+            getActiveRange().setEnd(node, offset + 1);
+
+        // "Otherwise:"
+        } else {
+            // "If node has only one child, which is a collapsed line break,
+            // remove its child from it."
+            //
+            // FIXME: IE incorrectly returns false here instead of true
+            // sometimes?
+            if (node.childNodes.length == 1
+            && isCollapsedLineBreak(node.firstChild)) {
+                node.removeChild(node.firstChild);
+            }
+
+            // "Let text be the result of calling createTextNode(value) on the
+            // context object."
+            var text = createText(value);
+
+            // "Call insertNode(text) on the active range."
+            getActiveRange().insertNode(text);
+
+            // "Call collapse(text, 0) on the context object's Selection."
+            getSelection().collapse(text, 0);
+            getActiveRange().setStart(text, 0);
+
+            // "Call extend(text, 1) on the context object's Selection."
+            getSelection().extend(text, 1);
+            getActiveRange().setEnd(text, 1);
+        }
+
+        // "Restore states and values from overrides."
+        restoreStatesAndValues(overrides);
+
+        // "Canonicalize whitespace at the active range's start, with fix
+        // collapsed space false."
+        canonicalizeWhitespace(getActiveRange().startContainer, getActiveRange().startOffset, false);
+
+        // "Canonicalize whitespace at the active range's end, with fix
+        // collapsed space false."
+        canonicalizeWhitespace(getActiveRange().endContainer, getActiveRange().endOffset, false);
+
+        // "If value is a space character, autolink the active range's start."
+        if (/^[ \t\n\f\r]$/.test(value)) {
+            autolink(getActiveRange().startContainer, getActiveRange().startOffset);
+        }
+
+        // "Call collapseToEnd() on the context object's Selection."
+        //
+        // Work around WebKit bug: sometimes it blows up the selection and
+        // throws, which we don't want.
+        try { getSelection().collapseToEnd(); } catch(e) {}
+        getActiveRange().collapse(false);
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The insertUnorderedList command /////
+//@{
+commands.insertunorderedlist = {
+    preservesOverrides: true,
+    // "Toggle lists with tag name "ul", then return true."
+    action: function() { toggleLists("ul"); return true },
+    // "True if the selection's list state is "mixed" or "mixed ul", false
+    // otherwise."
+    indeterm: function() { return /^mixed( ul)?$/.test(getSelectionListState()) },
+    // "True if the selection's list state is "ul", false otherwise."
+    state: function() { return getSelectionListState() == "ul" },
+};
+
+//@}
+///// The justifyCenter command /////
+//@{
+commands.justifycenter = {
+    preservesOverrides: true,
+    // "Justify the selection with alignment "center", then return true."
+    action: function() { justifySelection("center"); return true },
+    indeterm: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if among visible editable nodes that
+        // are contained in the result and have no children, at least one has
+        // alignment value "center" and at least one does not. Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.some(function(node) { return getAlignmentValue(node) == "center" })
+            && nodes.some(function(node) { return getAlignmentValue(node) != "center" });
+    }, state: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if there is at least one visible
+        // editable node that is contained in the result and has no children,
+        // and all such nodes have alignment value "center".  Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.length
+            && nodes.every(function(node) { return getAlignmentValue(node) == "center" });
+    }, value: function() {
+        // "Return the empty string if the active range is null.  Otherwise,
+        // block-extend the active range, and return the alignment value of the
+        // first visible editable node that is contained in the result and has
+        // no children. If there is no such node, return "left"."
+        if (!getActiveRange()) {
+            return "";
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        if (nodes.length) {
+            return getAlignmentValue(nodes[0]);
+        } else {
+            return "left";
+        }
+    },
+};
+
+//@}
+///// The justifyFull command /////
+//@{
+commands.justifyfull = {
+    preservesOverrides: true,
+    // "Justify the selection with alignment "justify", then return true."
+    action: function() { justifySelection("justify"); return true },
+    indeterm: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if among visible editable nodes that
+        // are contained in the result and have no children, at least one has
+        // alignment value "justify" and at least one does not. Otherwise
+        // return false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.some(function(node) { return getAlignmentValue(node) == "justify" })
+            && nodes.some(function(node) { return getAlignmentValue(node) != "justify" });
+    }, state: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if there is at least one visible
+        // editable node that is contained in the result and has no children,
+        // and all such nodes have alignment value "justify".  Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.length
+            && nodes.every(function(node) { return getAlignmentValue(node) == "justify" });
+    }, value: function() {
+        // "Return the empty string if the active range is null.  Otherwise,
+        // block-extend the active range, and return the alignment value of the
+        // first visible editable node that is contained in the result and has
+        // no children. If there is no such node, return "left"."
+        if (!getActiveRange()) {
+            return "";
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        if (nodes.length) {
+            return getAlignmentValue(nodes[0]);
+        } else {
+            return "left";
+        }
+    },
+};
+
+//@}
+///// The justifyLeft command /////
+//@{
+commands.justifyleft = {
+    preservesOverrides: true,
+    // "Justify the selection with alignment "left", then return true."
+    action: function() { justifySelection("left"); return true },
+    indeterm: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if among visible editable nodes that
+        // are contained in the result and have no children, at least one has
+        // alignment value "left" and at least one does not. Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.some(function(node) { return getAlignmentValue(node) == "left" })
+            && nodes.some(function(node) { return getAlignmentValue(node) != "left" });
+    }, state: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if there is at least one visible
+        // editable node that is contained in the result and has no children,
+        // and all such nodes have alignment value "left".  Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.length
+            && nodes.every(function(node) { return getAlignmentValue(node) == "left" });
+    }, value: function() {
+        // "Return the empty string if the active range is null.  Otherwise,
+        // block-extend the active range, and return the alignment value of the
+        // first visible editable node that is contained in the result and has
+        // no children. If there is no such node, return "left"."
+        if (!getActiveRange()) {
+            return "";
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        if (nodes.length) {
+            return getAlignmentValue(nodes[0]);
+        } else {
+            return "left";
+        }
+    },
+};
+
+//@}
+///// The justifyRight command /////
+//@{
+commands.justifyright = {
+    preservesOverrides: true,
+    // "Justify the selection with alignment "right", then return true."
+    action: function() { justifySelection("right"); return true },
+    indeterm: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if among visible editable nodes that
+        // are contained in the result and have no children, at least one has
+        // alignment value "right" and at least one does not. Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.some(function(node) { return getAlignmentValue(node) == "right" })
+            && nodes.some(function(node) { return getAlignmentValue(node) != "right" });
+    }, state: function() {
+        // "Return false if the active range is null.  Otherwise, block-extend
+        // the active range. Return true if there is at least one visible
+        // editable node that is contained in the result and has no children,
+        // and all such nodes have alignment value "right".  Otherwise return
+        // false."
+        if (!getActiveRange()) {
+            return false;
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        return nodes.length
+            && nodes.every(function(node) { return getAlignmentValue(node) == "right" });
+    }, value: function() {
+        // "Return the empty string if the active range is null.  Otherwise,
+        // block-extend the active range, and return the alignment value of the
+        // first visible editable node that is contained in the result and has
+        // no children. If there is no such node, return "left"."
+        if (!getActiveRange()) {
+            return "";
+        }
+        var nodes = getAllContainedNodes(blockExtend(getActiveRange()), function(node) {
+            return isEditable(node) && isVisible(node) && !node.hasChildNodes();
+        });
+        if (nodes.length) {
+            return getAlignmentValue(nodes[0]);
+        } else {
+            return "left";
+        }
+    },
+};
+
+//@}
+///// The outdent command /////
+//@{
+commands.outdent = {
+    preservesOverrides: true,
+    action: function() {
+        // "Let items be a list of all lis that are ancestor containers of the
+        // range's start and/or end node."
+        //
+        // It's annoying to get this in tree order using functional stuff
+        // without doing getDescendants(document), which is slow, so I do it
+        // imperatively.
+        var items = [];
+        (function(){
+            for (
+                var ancestorContainer = getActiveRange().endContainer;
+                ancestorContainer != getActiveRange().commonAncestorContainer;
+                ancestorContainer = ancestorContainer.parentNode
+            ) {
+                if (isHtmlElement(ancestorContainer, "li")) {
+                    items.unshift(ancestorContainer);
+                }
+            }
+            for (
+                var ancestorContainer = getActiveRange().startContainer;
+                ancestorContainer;
+                ancestorContainer = ancestorContainer.parentNode
+            ) {
+                if (isHtmlElement(ancestorContainer, "li")) {
+                    items.unshift(ancestorContainer);
+                }
+            }
+        })();
+
+        // "For each item in items, normalize sublists of item."
+        items.forEach(normalizeSublists);
+
+        // "Block-extend the active range, and let new range be the result."
+        var newRange = blockExtend(getActiveRange());
+
+        // "Let node list be a list of nodes, initially empty."
+        //
+        // "For each node node contained in new range, append node to node list
+        // if the last member of node list (if any) is not an ancestor of node;
+        // node is editable; and either node has no editable descendants, or is
+        // an ol or ul, or is an li whose parent is an ol or ul."
+        var nodeList = getContainedNodes(newRange, function(node) {
+            return isEditable(node)
+                && (!getDescendants(node).some(isEditable)
+                || isHtmlElement(node, ["ol", "ul"])
+                || (isHtmlElement(node, "li") && isHtmlElement(node.parentNode, ["ol", "ul"])));
+        });
+
+        // "While node list is not empty:"
+        while (nodeList.length) {
+            // "While the first member of node list is an ol or ul or is not
+            // the child of an ol or ul, outdent it and remove it from node
+            // list."
+            while (nodeList.length
+            && (isHtmlElement(nodeList[0], ["OL", "UL"])
+            || !isHtmlElement(nodeList[0].parentNode, ["OL", "UL"]))) {
+                outdentNode(nodeList.shift());
+            }
+
+            // "If node list is empty, break from these substeps."
+            if (!nodeList.length) {
+                break;
+            }
+
+            // "Let sublist be a list of nodes, initially empty."
+            var sublist = [];
+
+            // "Remove the first member of node list and append it to sublist."
+            sublist.push(nodeList.shift());
+
+            // "While the first member of node list is the nextSibling of the
+            // last member of sublist, and the first member of node list is not
+            // an ol or ul, remove the first member of node list and append it
+            // to sublist."
+            while (nodeList.length
+            && nodeList[0] == sublist[sublist.length - 1].nextSibling
+            && !isHtmlElement(nodeList[0], ["OL", "UL"])) {
+                sublist.push(nodeList.shift());
+            }
+
+            // "Record the values of sublist, and let values be the result."
+            var values = recordValues(sublist);
+
+            // "Split the parent of sublist, with new parent null."
+            splitParent(sublist);
+
+            // "Fix disallowed ancestors of each member of sublist."
+            sublist.forEach(fixDisallowedAncestors);
+
+            // "Restore the values from values."
+            restoreValues(values);
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+
+//////////////////////////////////
+///// Miscellaneous commands /////
+//////////////////////////////////
+
+///// The defaultParagraphSeparator command /////
+//@{
+commands.defaultparagraphseparator = {
+    action: function(value) {
+        // "Let value be converted to ASCII lowercase. If value is then equal
+        // to "p" or "div", set the context object's default single-line
+        // container name to value and return true. Otherwise, return false."
+        value = value.toLowerCase();
+        if (value == "p" || value == "div") {
+            defaultSingleLineContainerName = value;
+            return true;
+        }
+        return false;
+    }, value: function() {
+        // "Return the context object's default single-line container name."
+        return defaultSingleLineContainerName;
+    },
+};
+
+//@}
+///// The undo and redo commands /////
+// The editing host's own history, kept by the edits made in it.
+commands.undo = {
+    action: function() {
+        var host = affectedEditingHost() || editingHostOf(activeElement());
+        if (host) {
+            historyStep(host, false, false);
+        }
+        return true;
+    }
+};
+commands.redo = {
+    action: function() {
+        var host = affectedEditingHost() || editingHostOf(activeElement());
+        if (host) {
+            historyStep(host, true, false);
+        }
+        return true;
+    }
+};
+
+// "The copy, cut and paste commands": the user agent may do nothing and return false, as a
+// script asking for the clipboard does here.
+commands.copy = { action: function() { return false; } };
+commands.cut = { action: function() { return false; } };
+commands.paste = { action: function() { return false; } };
+
+///// The selectAll command /////
+//@{
+commands.selectall = {
+    // Note, this ignores the whole globalRange/getActiveRange() thing and
+    // works with actual selections.  Not suitable for autoimplementation.html.
+    action: function() {
+        // "Let target be the body element of the context object."
+        var target = documentBody();
+
+        // "If target is null, let target be the context object's
+        // documentElement."
+        if (!target) {
+            target = rootNode;
+        }
+
+        // "If target is null, call getSelection() on the context object, and
+        // call removeAllRanges() on the result."
+        if (!target) {
+            getSelection().removeAllRanges();
+
+        // "Otherwise, call getSelection() on the context object, and call
+        // selectAllChildren(target) on the result."
+        } else {
+            getSelection().selectAllChildren(target);
+        }
+
+        // "Return true."
+        return true;
+    }
+};
+
+//@}
+///// The styleWithCSS command /////
+//@{
+commands.stylewithcss = {
+    action: function(value) {
+        // "If value is an ASCII case-insensitive match for the string
+        // "false", set the CSS styling flag to false. Otherwise, set the
+        // CSS styling flag to true.  Either way, return true."
+        cssStylingFlag = String(value).toLowerCase() != "false";
+        return true;
+    }, state: function() { return cssStylingFlag }
+};
+
+//@}
+///// The useCSS command /////
+//@{
+commands.usecss = {
+    action: function(value) {
+        // "If value is an ASCII case-insensitive match for the string "false",
+        // set the CSS styling flag to true. Otherwise, set the CSS styling
+        // flag to false.  Either way, return true."
+        cssStylingFlag = String(value).toLowerCase() == "false";
+        return true;
+    }
+};
+//@}
+
+// Some final setup
+//@{
+(function() {
+// Opera 11.50 doesn't implement Object.keys, so I have to make an explicit
+// temporary, which means I need an extra closure to not leak the temporaries
+// into the global namespace.  >:(
+var commandNames = [];
+for (var command in commands) {
+    commandNames.push(command);
+}
+commandNames.forEach(function(command) {
+    // "If a command does not have a relevant CSS property specified, it
+    // defaults to null."
+    if (!("relevantCssProperty" in commands[command])) {
+        commands[command].relevantCssProperty = null;
+    }
+
+    // "If a command has inline command activated values defined but nothing
+    // else defines when it is indeterminate, it is indeterminate if among
+    // formattable nodes effectively contained in the active range, there is at
+    // least one whose effective command value is one of the given values and
+    // at least one whose effective command value is not one of the given
+    // values."
+    if ("inlineCommandActivatedValues" in commands[command]
+    && !("indeterm" in commands[command])) {
+        commands[command].indeterm = function() {
+            if (!getActiveRange()) {
+                return false;
+            }
+
+            var values = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode)
+                .map(function(node) { return getEffectiveCommandValue(node, command) });
+
+            var matchingValues = values.filter(function(value) {
+                return commands[command].inlineCommandActivatedValues.indexOf(value) != -1;
+            });
+
+            return matchingValues.length >= 1
+                && values.length - matchingValues.length >= 1;
+        };
+    }
+
+    // "If a command has inline command activated values defined, its state is
+    // true if either no formattable node is effectively contained in the
+    // active range, and the active range's start node's effective command
+    // value is one of the given values; or if there is at least one
+    // formattable node effectively contained in the active range, and all of
+    // them have an effective command value equal to one of the given values."
+    if ("inlineCommandActivatedValues" in commands[command]) {
+        commands[command].state = function() {
+            if (!getActiveRange()) {
+                return false;
+            }
+
+            var nodes = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode);
+
+            if (nodes.length == 0) {
+                return commands[command].inlineCommandActivatedValues
+                    .indexOf(getEffectiveCommandValue(getActiveRange().startContainer, command)) != -1;
+            } else {
+                return nodes.every(function(node) {
+                    return commands[command].inlineCommandActivatedValues
+                        .indexOf(getEffectiveCommandValue(node, command)) != -1;
+                });
+            }
+        };
+    }
+
+    // "If a command is a standard inline value command, it is indeterminate if
+    // among formattable nodes that are effectively contained in the active
+    // range, there are two that have distinct effective command values. Its
+    // value is the effective command value of the first formattable node that
+    // is effectively contained in the active range; or if there is no such
+    // node, the effective command value of the active range's start node; or
+    // if that is null, the empty string."
+    if ("standardInlineValueCommand" in commands[command]) {
+        commands[command].indeterm = function() {
+            if (!getActiveRange()) {
+                return false;
+            }
+
+            var values = getAllEffectivelyContainedNodes(getActiveRange())
+                .filter(isFormattableNode)
+                .map(function(node) { return getEffectiveCommandValue(node, command) });
+            for (var i = 1; i < values.length; i++) {
+                if (values[i] != values[i - 1]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        commands[command].value = function() {
+            if (!getActiveRange()) {
+                return "";
+            }
+
+            var refNode = getAllEffectivelyContainedNodes(getActiveRange(), isFormattableNode)[0];
+
+            if (typeof refNode == "undefined") {
+                refNode = getActiveRange().startContainer;
+            }
+
+            var ret = getEffectiveCommandValue(refNode, command);
+            if (ret === null) {
+                return "";
+            }
+            return ret;
+        };
+    }
+
+    // "If a command preserves overrides, then before taking its action, the
+    // user agent must record current overrides. After taking the action, if
+    // the active range is collapsed, it must restore states and values from
+    // the recorded list."
+    if ("preservesOverrides" in commands[command]) {
+        var oldAction = commands[command].action;
+
+        commands[command].action = function(value) {
+            var overrides = recordCurrentOverrides();
+            var ret = oldAction(value);
+            if (getActiveRange().collapsed) {
+                restoreStatesAndValues(overrides);
+            }
+            return ret;
+        };
+    }
+});
+})();
+//@}
+
+// vim: foldmarker=@{,@} foldmethod=marker
 
 // Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
 // paste carries the clipboard's text, HTML and a PNG (bytes as a Latin-1 string). A copy or
