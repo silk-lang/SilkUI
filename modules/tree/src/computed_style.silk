@@ -33,15 +33,15 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 
 /// Appends the computed value of longhand `name` (lowercase, as in `getPropertyValue`) of node
 /// `id` to `out`. Says whether there is one: false for a node that is gone, a text node, a
-/// shorthand or a name CSS does not have. Lays out first when a mutation is pending, so a read
-/// after a write costs a layout, as in a browser; reads with nothing pending cost none.
+/// shorthand or a name CSS does not have. Resolves pending styles first, and lays out only for
+/// the sizes and box edges that read layout, as browsers do.
 pub effect fn write(tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool
   ! TreeError | OutOfMemoryError
   ? &mut Allocator {
   let slot = tree.slotOf(id)
   if slot == NONE || tree.node(slot).kind == NodeKind.Text { return false }
   if name.length > 2 && name[0] == 45 && name[1] == 45 {
-    if tree.layoutPending() { run tree.layoutNow() }
+    run tree.stylesNow()
     return run tree.customProperty(slot, name, &mut out.*)
   }
   let property = match catalog.lookup(name) {
@@ -50,12 +50,16 @@ pub effect fn write(tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes
   }
   let spacing = name == b"white-space" || name == b"white-space-collapse" || name == b"text-wrap-mode"
   if catalog.longhandCount(property) > 1 && !spacing { return false }
-  if tree.layoutPending() { run tree.layoutNow() }
+  let field = fieldOf(name)
+  if usesLayout(field) {
+    if tree.layoutPending() { run tree.layoutNow() }
+  } else {
+    run tree.stylesNow()
+  }
   if spacing {
     run whiteSpace(&tree.node(slot).computed().*, name, &mut out.*)
     return true
   }
-  let field = fieldOf(name)
   if field != motion.FIELDS {
     if run used(&tree.*, slot, field, &mut out.*) { return true }
     run typed(&tree.node(slot).computed().*, field, &mut out.*)
@@ -139,10 +143,15 @@ effect fn px(out: &mut Bytes, value: f32) -> () ! OutOfMemoryError ? &mut Alloca
 /// The used value of a box-model field from the node's first fragment; false when the field has
 /// none or layout gave the node no box (`display: none`, or `width` of an inline box, which
 /// browsers answer with the computed value too).
+/// Whether `used` may answer `field` from layout: sizes and box edges.
+fn usesLayout(field: u32) -> bool {
+  return field == motion.WIDTH || field == motion.WIDTH + 1
+    || field >= motion.MARGIN && field < motion.INSET || field >= motion.BORDER_WIDTH && field < motion.ROW_GAP
+}
+
 effect fn used(tree: &UiTree<'_>, slot: u32, field: u32, out: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if !usesLayout(field) { return false }
   let isSize = field == motion.WIDTH || field == motion.WIDTH + 1
-  let isEdge = field >= motion.MARGIN && field < motion.INSET || field >= motion.BORDER_WIDTH && field < motion.ROW_GAP
-  if !isSize && !isEdge { return false }
   let node = tree.node(slot)
   if node.css >= tree.fragmentOf.length() { return false }
   let index = tree.fragmentOf.get(node.css)

@@ -684,8 +684,19 @@ function domError(name, message) {
 
 // Classes for `instanceof`, by what a node is. Their prototypes are the nodes', so a library
 // that adds to `HTMLElement.prototype` adds to every node.
+// Node.ELEMENT_NODE and the rest, on every node interface and on nodes themselves.
+const NODE_TYPES = {
+  ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4, PROCESSING_INSTRUCTION_NODE: 7,
+  COMMENT_NODE: 8, DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11,
+};
+function defineNodeTypes(target) {
+  for (const [key, value] of Object.entries(NODE_TYPES)) if (!Object.hasOwn(target, key)) Object.defineProperty(target, key, { value });
+}
+
 function nodeClass(name, prototype, test) {
   const Class = function () { throw new TypeError("Illegal constructor: make a " + name + " with document.createElement"); };
+  defineNodeTypes(Class);
+  defineNodeTypes(prototype);
   Object.defineProperty(Class, "name", { value: name });
   Object.defineProperty(Class, "prototype", { value: prototype, writable: false });
   Object.defineProperty(Class, Symbol.hasInstance, { value: (value) => value != null && typeof value === "object" && test(value) });
@@ -818,6 +829,7 @@ for (const [name, tags] of Object.entries({
   HTMLDataElement: ["data"], HTMLModElement: ["ins", "del"], HTMLSlotElement: ["slot"], HTMLScriptElement: ["script"],
   HTMLLinkElement: ["link"], HTMLMetaElement: ["meta"], HTMLTitleElement: ["title"], HTMLBaseElement: ["base"],
 })) classes[name] = nodeClass(name, CoreNode.prototype, tagIs(...tags));
+for (const target of [CoreFragment, SvgText.prototype]) defineNodeTypes(target);
 for (const [name, value] of Object.entries(classes)) {
   if (value && global[name] === undefined) define(name, value);
 }
