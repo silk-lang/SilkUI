@@ -1195,7 +1195,7 @@ test("an empty node shares no list with another, and its looks read back as CSS"
   a.style.set({ width: 12, fontWeight: 600, color: "red" });
   assert.equal(a.style.get("width"), "12px");
   assert.equal(a.style.get("fontWeight"), "600");
-  assert.equal(a.style.cssText, "width:12px;font-weight:600;color:red;");
+  assert.equal(a.style.cssText, "width: 12px; font-weight: 600; color: red;");
   mock.take();
   a.style.set({ width: 12 });
   assert.deepEqual(mock.take(), []);

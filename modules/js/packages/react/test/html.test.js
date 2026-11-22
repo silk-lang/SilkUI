@@ -21,7 +21,7 @@ test("HTML elements are tagged boxes with React DOM's props", () => {
   assert.equal(div.tagName, "DIV");
   assert.equal(div.firstChild.localName, "span");
   assert.deepEqual(attributes(calls, div.nodeId), [
-    ["element", "div"], ["class", "row"], ["title", "Tip"], ["for", "x"], ["hidden", ""], ["data-state", "open"],
+    ["element", "div"], ["class", "row"], ["title", "Tip"], ["for", "x"], ["hidden", ""], ["data-state", "open"], ["style", ""],
   ]);
   assert.ok(calls.some((call) => call[0] === "style" && call[1] === div.nodeId && call[2] === "--gap:4;margin-top:2px;"));
   assert.equal(div.getAttribute("for"), "x");
@@ -72,7 +72,7 @@ test("dangerouslySetInnerHTML parses markup into nodes", () => {
   assert.equal(code.firstChild.firstChild.data, "a & b");
   assert.equal(code.firstChild.style.get("color"), "red");
   assert.equal(pre.childNodes.length, 1);
-  assert.equal(pre.innerHTML, '<code class="x"><span style="color:red;">a &amp; b</span><br>c</code>');
+  assert.equal(pre.innerHTML, '<code class="x"><span style="color: red">a &amp; b</span><br>c</code>', "the style attribute keeps its own text");
 });
 
 test("onFocus and onBlur bubble, and a portal renders into its container", () => {
