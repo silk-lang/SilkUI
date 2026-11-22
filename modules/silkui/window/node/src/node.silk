@@ -41,6 +41,11 @@ import silk.core.option { Option }
 import silk.concurrency.thread { Transferable }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.system.host_input { HostInput, HostInputError }
+import silk.system.system_info { SystemInfo }
+import silk.system.system_info_native { OsSystemInfo as ProcessInfo }
+import silk.core.result { Result }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
 
 effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError | platform.PlatformError
@@ -76,7 +81,8 @@ effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8
   if source.length != 0 { window.ownProcess() }
   run window.define(b"@silkui/core", uiPackage())
   if source.length != 0 {
-    run window.entry(b"/app/app.js", source)
+    let named = run embeddedEntry()
+    run window.entry(named.asSlice(), source)
   } else {
     // Named by its real path, so `import.meta.url` and the files fetched beside it resolve
     // from the bundle's folder.
@@ -85,6 +91,23 @@ effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8
     run window.entry(named.asSlice(), read.asSlice())
   }
   return run window.start(b"app", api, move capabilities)
+}
+
+/// The name of the bundle a release host embeds: `app/app.js` beside the program, where
+/// `silk task build` puts the files the bundle fetches, so `import.meta.url` resolves them.
+/// `/app/app.js` when the system does not say where the program is.
+effect fn embeddedEntry() -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut info = ProcessInfo.make()
+  let found = run Effect.result(SystemInfo.executablePath()) |> Effect.provideMut<SystemInfo>(&mut info)
+  let mut named = List<u8>.make()
+  if let Result.Success { value: program } = move found {
+    let bytes = Bytes.asSlice(&program)
+    let mut end = bytes.length
+    while end > 0 && bytes[end - 1] != 47 { end = end - 1 }
+    if end > 1 { run named.appendSlice(Slice.view<u8>(bytes, 0, end - 1)) }
+  }
+  run named.appendSlice(b"/app/app.js")
+  return move named
 }
 
 fn ran<C: Composition>(settings: Settings, entry: Bytes, source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32 {

@@ -78,15 +78,15 @@ compiler to run the Vite CSS compilation step.
 
 ## The missing API report
 
-A realm has ECMAScript, timers, `requestAnimationFrame`, `console`, `performance.now`,
-`navigator.clipboard` and `@silkui/core`, but no `fetch`, `URL`, `Intl`, `document`,
-`process` or Node modules. Libraries written for browsers or Node often expect them, so the
+A realm has ECMAScript with `Intl`, timers, `requestAnimationFrame`, `console`,
+`performance.now`, `navigator.clipboard` and `@silkui/core`, but no `fetch`, `document`
+(`@silkui/core/globals` brings it, with `URL`), `process` or Node modules. Libraries written for browsers or Node often expect them, so the
 plugin reads every module of a build and says which are used, and by whom:
 
 ```
 APIs used here that a ui-js runtime does not have:
   fetch (network): src/api.js, ky
-  Intl (intl): date-fns
+  WebSocket (network): some-client
   node:fs (node): some-package
 ```
 

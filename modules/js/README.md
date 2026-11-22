@@ -278,15 +278,15 @@ export default defineConfig({
 
 ### APIs the runtime does not have
 
-A realm has ECMAScript, the web globals below and `@silkui/core`: no `fetch`, `URL`, `Intl`,
-`document`, `process` or Node modules. Libraries written for browsers or Node often expect
+A realm has ECMAScript with `Intl`, the web globals below and `@silkui/core`: no `fetch`,
+`document` (`@silkui/core/globals` brings it, with `URL`), `process` or Node modules. Libraries written for browsers or Node often expect
 them, so the plugin reads every module of a build and reports the ones that are used, and
 by whom:
 
 ```
 APIs used here that a ui-js runtime does not have:
   fetch (network): src/api.js, ky
-  Intl (intl): date-fns
+  WebSocket (network): some-client
   node:fs (node): some-package
 ```
 
@@ -521,13 +521,10 @@ constant false, the window host's inspector code is not in the program either.
 silk task --manifest-path modules/js/demo/silk.toml production --release
 ```
 
-Engine features are chosen per build too. The bridge answers
-`EngineServices.includesIntl` and `includesTemporal` with false (a realm here installs
-neither), so the engine's ECMA-402 and Temporal code and their CLDR and time zone tables
-are left out: `localeCompare`, `toLocaleString` and the like give their
-locale-independent results, and a local `Date` string ends at its offset. The production
-demo is 38.0 MB against 44.2 MB for the release build before these changes (5.2 MB from
-the engine features, 1.0 MB from the tools and the inspector). WebAssembly is not part of
+Engine features are chosen per build too. The bridge answers `EngineServices.includesIntl`
+with true and `includesTemporal` with false: a realm has `Intl`, as pages expect, and the
+engine's Temporal code and time zone tables are left out, so a local `Date` string ends at
+its offset. WebAssembly is not part of
 the engine here (it lives in the SilkJS runtime, which ui-js does not link).
 
 ### Bytecode images

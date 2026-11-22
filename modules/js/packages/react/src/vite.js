@@ -124,6 +124,18 @@ const htmlSheetPlugin = {
   },
 };
 
+// `react-dom` is the dom.js beside wherever `@silkui/react` resolves, so an app that points
+// `@silkui/react` at other sources (an alias) loads one copy of the renderer, not two.
+const domPlugin = {
+  name: "silk:react-dom",
+  enforce: "pre",
+  async resolveId(id, importer, options) {
+    if (id !== "react-dom" && id !== "react-dom/client") return;
+    const main = await this.resolve(IMPORT_SOURCE, importer, { ...options, skipSelf: true });
+    return main && !main.external ? join(dirname(main.id.split("?")[0]), "dom.js") : DOM;
+  },
+};
+
 /**
  * @param {object} [options]
  * @param {boolean} [options.refresh] React Fast Refresh under the dev server. Default true.
@@ -135,12 +147,6 @@ export default function react(options = {}) {
     name: "silk:react",
     config: () => ({
       oxc: { jsx: { runtime: "automatic", importSource: IMPORT_SOURCE } },
-      resolve: options.html === false ? {} : {
-        alias: [
-          { find: /^react-dom$/, replacement: DOM },
-          { find: /^react-dom\/client$/, replacement: DOM },
-        ],
-      },
     }),
     // The dev server pre-bundles dependencies before the plugins see them: patch React's
     // reconciler there too.
@@ -149,7 +155,7 @@ export default function react(options = {}) {
     },
   };
   const plugins = [config, reconcilerPlugin()];
-  if (options.html !== false) plugins.push(htmlSheetPlugin);
+  if (options.html !== false) plugins.push(domPlugin, htmlSheetPlugin);
   if (options.refresh ?? true) plugins.push(refreshPlugin);
   return plugins;
 }
