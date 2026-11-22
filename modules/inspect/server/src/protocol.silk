@@ -147,6 +147,9 @@ pub enum Outcome {
   Deferred,
 }
 
+/// Frames after a screenshot that keep copying the app scene for the next ones.
+const SURFACE_FRAMES: u32 = 120
+
 /// The inspector state a connection shares with the app: the highlight, and a CPU copy of the
 /// atlas for screenshots.
 pub struct Protocol {
@@ -155,6 +158,13 @@ pub struct Protocol {
   overlay: Scene,
   surface: Scene,
   hasSurface: bool,
+  /// Frames left that copy the app scene into `surface`: a screenshot sets it, so a burst of
+  /// screenshots reads fresh frames while frames no one shoots cost no copy.
+  surfaceFrames: u32,
+  /// The host hands over its frames' scenes (`afterFrameScene`).
+  sceneHost: bool,
+  /// The last `afterFrameScene` answered screenshots that waited for it.
+  pub drewWaiting: bool,
   inputs: List<Input>,
   /// The first queued input went through `beginNext` and waits for `finishNext`.
   began: bool,
@@ -203,6 +213,9 @@ impl Protocol {
       overlay: Scene.make(),
       surface: Scene.make(),
       hasSurface: false,
+      surfaceFrames: SURFACE_FRAMES,
+      sceneHost: false,
+      drewWaiting: false,
       inputs: List<Input>.make(),
       began: false,
       heldModifiers: 0,
@@ -341,8 +354,16 @@ impl Protocol {
   pub effect fn afterFrameScene(self: &mut Self, tree: &UiTree<'_>, scene: &Scene) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
-    run self.surface.copyFrom(scene)
-    self.hasSurface = true
+    self.sceneHost = true
+    if self.surfaceFrames > 0 || self.highlighting() || self.shots.waiting.length() != 0 {
+      run self.surface.copyFrom(scene)
+      self.hasSurface = true
+      if self.surfaceFrames > 0 { self.surfaceFrames = self.surfaceFrames - 1 }
+    } else {
+      self.hasSurface = false
+    }
+    self.drewWaiting = !self.liveFrames && self.shots.waiting.length() != 0
+    if self.drewWaiting { run self.drawWaiting(tree) }
     run self.afterFrame(tree)
   }
 
@@ -1380,7 +1401,12 @@ impl Protocol {
     // The window shows the highlight when there is one, so a screenshot without it is drawn on
     // the CPU; any other comes from the next frame the host draws, encoded off the UI thread.
     let liveHighlight = !self.highlighting() || flagField(request, "highlight", true)
-    if self.liveFrames && liveHighlight && self.extensions.callerAnswered {
+    self.surfaceFrames = SURFACE_FRAMES
+    // Without a copy of the last frame, a CPU screenshot waits for the next one.
+    let awaitSurface = !self.liveFrames && !self.hasSurface && self.sceneHost
+      && !(self.highlighting() && flagField(request, "highlight", true))
+    if awaitSurface { self.repaint = true }
+    if (self.liveFrames && liveHighlight || awaitSurface) && self.extensions.callerAnswered {
       let mut head = String.make()
       run begin(&mut head, request)
       let mut crop: [u32; 4] = [0; 4]
@@ -1464,6 +1490,13 @@ impl Protocol {
       return ()
     }
     self.liveFrames = false
+    run self.drawWaiting(tree)
+  }
+
+  /// Draws the screenshots waiting for a frame on the CPU and replies to them.
+  effect fn drawWaiting(self: &mut Self, tree: &UiTree<'_>) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
     while self.shots.waiting.length() != 0 {
       let shot = self.shots.waiting.remove(0)
       let mut line = String.make()
