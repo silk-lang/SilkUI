@@ -2,6 +2,7 @@ import host { Kind, Plan, Allows }
 import host
 import stylesheets
 import process
+import ship
 import css_style.sheet { Sheet }
 import css_style.sheet_fonts { FaceSource }
 import css_style.tokens { equal }
@@ -231,4 +232,59 @@ effect fn stopsInTmp() ! TaskError | FileError | OutOfMemoryError | AssertionErr
 test effect fn stoppingAProgramStopsWhatItStarted() ! TaskError | FileError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run stopsInTmp() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// `text` at `dir` + `name`, with the folders it needs.
+effect fn shipFile(dir: string, name: string, text: string) -> () ! FileError | OutOfMemoryError ? &mut Allocator | &mut FileSystem {
+  let mut path = run String.copy(dir)
+  run String.append(&mut path, name)
+  run FileSystem.writeFileWithParents(&run Path.make(String.view(&path)), String.utf8Bytes(text))
+}
+
+effect fn shipped(dir: string, name: string) -> bool ! OutOfMemoryError | FileError ? &mut Allocator | &mut FileSystem {
+  let mut path = run String.copy(dir)
+  run String.append(&mut path, name)
+  return run FileSystem.exists(&run Path.make(String.view(&path)))
+}
+
+/// What a release host reads beside itself: the bundle's folder without the bundle, its
+/// stylesheet, hidden entries, or the folder the build writes into.
+effect fn shipsBesideTheBundle() ! FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut FileSystem {
+  let temporary = run FileSystem.temporaryDirectory(&run Path.root(), "silkui-ship-")
+  let mut dist = run String.copy(temporary.path.view().unwrapOr(""))
+  run String.append(&mut dist, "/dist")
+  let d = String.view(&dist)
+  run shipFile(d, "/app.js", "bundle")
+  run shipFile(d, "/app.sheet", "sheet")
+  run shipFile(d, "/ghostty.wasm", "wasm")
+  run shipFile(d, "/assets/worker.js", "worker")
+  run shipFile(d, "/.vite/manifest.json", "{}")
+  run shipFile(d, "/window/old", "a build before")
+  let mut bundle = run String.copy(d)
+  run String.append(&mut bundle, "/app.js")
+  let mut output = run String.copy(d)
+  run String.append(&mut output, "/window")
+  let mut into = run String.copy(String.view(&output))
+  run String.append(&mut into, "/app")
+  run ship.bundleFiles(String.view(&bundle), String.view(&into), String.view(&output))
+  let i = String.view(&into)
+  let wasm = run shipped(i, "/ghostty.wasm")
+  let worker = run shipped(i, "/assets/worker.js")
+  let embedded = run shipped(i, "/app.js")
+  let sheet = run shipped(i, "/app.sheet")
+  let hidden = run shipped(i, "/.vite")
+  let nested = run shipped(i, "/window")
+  run Testing.expect(wasm && worker, "the files beside the bundle ship")
+  run Testing.expect(!embedded && !sheet, "the embedded bundle and stylesheet do not")
+  run Testing.expect(!hidden && !nested, "nor hidden entries or the build's own folder")
+}
+
+effect fn shipsInTmp() ! FileError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut files = run OsFileSystem.make("/tmp")
+  run shipsBesideTheBundle() |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+test effect fn releaseHostsGetTheFilesBesideTheirBundle() ! FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run shipsInTmp() |> Effect.provideMut<Allocator>(&mut allocator)
 }
