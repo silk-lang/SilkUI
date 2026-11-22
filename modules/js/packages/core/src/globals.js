@@ -925,6 +925,17 @@ for (const [name, types] of Object.entries(HOST_TYPES)) {
     configurable: true,
   });
 }
+// Every host event is an `Event`, as a page's `load` on an `<img>` is. Subclasses that have no
+// rule of their own above inherit this one, so it answers only for `Event` itself.
+if (typeof BaseEvent === "function") {
+  const own = Function.prototype[Symbol.hasInstance];
+  Object.defineProperty(BaseEvent, Symbol.hasInstance, {
+    value(value) {
+      return own.call(this, value) || (this === BaseEvent && value instanceof core.Event);
+    },
+    configurable: true,
+  });
+}
 for (const [name, value] of Object.entries(eventClasses)) if (global[name] === undefined) define(name, value);
 
 // Markup to nodes and back: an HTML or SVG string becomes a document whose root is the parsed
