@@ -5,7 +5,7 @@
 //! time of one input and what the style system did for it.
 //!
 //!   restyle-bench [--runs N]
-import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput }
+import ui_tree.legacy { UiTree, TreeError, Batch, NodeKind, Attribute, FrameInput, Mutation }
 import ui_tree.digest { DigestBox, DigestText, digestLayout }
 import silk.num.u64
 import silk.num.f32
@@ -39,6 +39,10 @@ fn nanos(at: &Mark) -> i64 { return at.*.seconds() * 1000000000 + u32.toI64(at.*
 
 /// The nodes the inputs change, by what the page marks them with.
 struct Targets {
+  top: u32,
+  /// The copy the last Mount input added, and the next free id.
+  mounted: u32,
+  nextId: u32,
   editor: u32,
   editorText: u32,
   sidebarWrapper: u32,
@@ -108,9 +112,11 @@ fn view(bytes: &[u8]) -> string<'_> { return unsafe String.fromUtf8Unchecked(byt
 
 /// Builds the page from the fixture: an `E` line is an element (depth, tag, attributes split by
 /// 0x1f), a `T` line a text node.
-effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets) -> u32 ! OutOfMemoryError ? &mut Allocator {
+/// Makes the page's nodes from id `first`. With `top` 0 its first node is the root; else the
+/// page is built detached and its first node appended to `top` last, as React mounts.
+effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets, top: u32, first: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
   let mut parents = List<u32>.make()
-  let mut next: u32 = 1
+  let mut next: u32 = first
   let mut start: usize = 0
   let mut i: usize = 0
   while i < page.length {
@@ -133,7 +139,7 @@ effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets) -> u32 ! 
       continue
     }
     run batch.create(id, NodeKind.Box)
-    if parent == 0 { run batch.root(id) } else { run batch.append(parent, id) }
+    if parent != 0 { run batch.append(parent, id) } else if top == 0 { run batch.root(id) } else { targets.top = id }
     run batch.attribute(id, Attribute.Element { name: run String.copy(view(field(line, 2))) })
     let attributes = rest(line, 3)
     let mut a: usize = 0
@@ -167,14 +173,16 @@ effect fn build(batch: &mut Batch, page: &[u8], targets: &mut Targets) -> u32 ! 
   if targets.editorText == 0 && targets.editor != 0 {
     run batch.text(targets.editor, next, "")
     targets.editorText = next
+    next = next + 1
   }
+  if top != 0 { run batch.append(top, targets.top) }
   return next
 }
 
-pub enum Kind { Type, Sidebar, Panel, Menu }
+pub enum Kind { Type, Sidebar, Panel, Menu, Mount }
 
 fn kindName(kind: Kind) -> string<'static> {
-  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" }
+  return match kind { Kind.Type => "type a key in the composer" Kind.Sidebar => "click a sidebar thread" Kind.Panel => "collapse or expand the sidebar" Kind.Menu => "open or close a menu button" Kind.Mount => "mount a new copy of the page (thread switch)" }
 }
 
 struct Counts { passes: usize, full: usize, resolves: usize, matches: usize, rootRestyles: usize, causes: [usize; 32] }
@@ -186,8 +194,15 @@ fn counts(tree: &UiTree<'_>) -> Counts {
 }
 
 /// The mutations of input `n` of `kind`.
-effect fn mutate(batch: &mut Batch, targets: &Targets, kind: Kind, n: usize, typed: &mut String) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn mutate(batch: &mut Batch, targets: &mut Targets, page: &[u8], kind: Kind, n: usize, typed: &mut String) -> () ! OutOfMemoryError ? &mut Allocator {
   match kind {
+    Kind.Mount => {
+      // A thread switch: the last view leaves and a new one mounts under the page's root.
+      if targets.mounted != 0 { run batch.push(Mutation.Destroy { id: targets.mounted }) }
+      let mut copy = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, rows: List<u32>.make(), menus: List<u32>.make() }
+      targets.nextId = run build(&mut batch, page, &mut copy, targets.top, targets.nextId)
+      targets.mounted = copy.top
+    }
     Kind.Type => {
       run typed.append(if n % 5 == 4 { " " } else { "a" })
       run batch.setText(targets.editorText, String.view(&typed.*))
@@ -210,7 +225,7 @@ effect fn mutate(batch: &mut Batch, targets: &Targets, kind: Kind, n: usize, typ
   }
 }
 
-effect fn measure(tree: &mut UiTree<'_>, targets: &Targets, kind: Kind, time: &mut f64) -> ()
+effect fn measure(tree: &mut UiTree<'_>, targets: &mut Targets, page: &[u8], kind: Kind, time: &mut f64) -> ()
   ! TreeError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock {
   let mut batch = Batch.make()
   let mut typed = String.make()
@@ -220,7 +235,7 @@ effect fn measure(tree: &mut UiTree<'_>, targets: &Targets, kind: Kind, time: &m
   while n < RUNS {
     let started = run MonotonicClock.now()
     // A handler changes the page, reads layout, changes it again, reads again; then the frame.
-    run mutate(&mut batch, targets, kind, n, &mut typed)
+    run mutate(&mut batch, &mut targets, page, kind, n, &mut typed)
     run tree.apply(run batch.take())
     run tree.layoutNow()
     run tree.layoutNow()
@@ -309,8 +324,11 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
   let compiled = run compile.compile(Source.read("fixtures/t3.css"), &Options.make())
   let bytes = run compiled.encode()
   let mut batch = Batch.make()
-  let mut targets = Targets { editor: 0, editorText: 0, sidebarWrapper: 0, rows: List<u32>.make(), menus: List<u32>.make() }
-  let nodes = run build(&mut batch, Source.read("fixtures/t3-page.tree"), &mut targets)
+  let mut targets = Targets { top: 0, mounted: 0, nextId: 0, editor: 0, editorText: 0, sidebarWrapper: 0, rows: List<u32>.make(), menus: List<u32>.make() }
+  let page = Source.read("fixtures/t3-page.tree")
+  let nodes = run build(&mut batch, page, &mut targets, 0, 1)
+  targets.nextId = nodes
+  targets.top = 1
   run batch.adoptStyleSheet(0, 1, bytes.asSlice())
   let started = run MonotonicClock.now()
   run tree.apply(run batch.take())
@@ -321,10 +339,10 @@ effect fn application() -> i32 ! TreeError | CompileError | CssError | OutOfMemo
     u32.toUsize(nodes), i64.toUsize((nanos(&finished) - nanos(&started)) / 1000000), targets.editor, targets.editorText, targets.sidebarWrapper, targets.rows.length(), targets.menus.length()))
   StderrWriter.print("watch overflows: {} (last at node {})\n", &(tree.work.watchOverflows, tree.work.lastOverflow))
   if targets.editorText == 0 || targets.sidebarWrapper == 0 || targets.rows.length() < 2 || targets.menus.length() == 0 { return 2 }
-  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu]
+  let kinds = [Kind.Type, Kind.Sidebar, Kind.Panel, Kind.Menu, Kind.Mount]
   let mut k: usize = 0
   while k < kinds.length {
-    run measure(&mut tree, &targets, kinds[k], &mut time)
+    run measure(&mut tree, &mut targets, page, kinds[k], &mut time)
     let wrong = run verify(&mut tree, &mut time)
     StderrWriter.print("  against a full restyle: {} differences\n", &.(wrong))
     if wrong != 0 { return 3 }

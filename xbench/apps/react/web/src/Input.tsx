@@ -10,7 +10,7 @@ import page from "xb-page.json";
 import { run, type Step } from "./driver";
 
 type Node = string | [string, Record<string, string>, ...Node[]];
-type State = { text: string; active: number; collapsed: boolean; menu: boolean };
+type State = { text: string; active: number; collapsed: boolean; menu: boolean; shown: boolean };
 
 // HTML attribute names that React spells otherwise.
 const RENAMED: Record<string, string> = {
@@ -78,7 +78,7 @@ function build(node: [string, Record<string, string>, ...Node[]], key: number, s
 }
 
 export function Input() {
-  const [state, setState] = useState<State>({ text: "", active: 0, collapsed: false, menu: false });
+  const [state, setState] = useState<State>({ text: "", active: 0, collapsed: false, menu: false, shown: true });
   useEffect(() => {
     const change = (next: (old: State) => State) => flushSync(() => setState(next));
     const typed = "the quick brown fox jumps over the lazy dog and keeps typing ";
@@ -89,6 +89,8 @@ export function Input() {
       { driver: "select", frames: 60, frame: (f) => change((s) => ({ ...s, active: (f + 1) % Math.max(1, targets.rows.length) })) },
       { driver: "collapse", frames: 60, frame: (f) => change((s) => ({ ...s, collapsed: f % 2 === 0 })) },
       { driver: "menu", frames: 60, frame: (f) => change((s) => ({ ...s, menu: f % 2 === 0 })) },
+      // The whole page leaves and a new copy of it mounts in one frame, as a thread switch does.
+      { driver: "mount", frames: 30, frame: () => { change((s) => ({ ...s, shown: false })); change((s) => ({ ...s, shown: true })); } },
       { idle: "rest", ms: 3000 },
       { mark: "rest" },
     ];
@@ -97,5 +99,5 @@ export function Input() {
     }
     run(steps);
   }, []);
-  return render(page as Node, 0, state);
+  return state.shown ? render(page as Node, 0, state) : null;
 }
