@@ -34,7 +34,7 @@ async function run(options) {
 test("the build reports the missing APIs and who uses them", async () => {
   const text = await run({});
   assert.match(text, /fetch \(network\): src\/library\.js/);
-  assert.match(text, /AbortController \(events\): src\/library\.js/);
+  assert.doesNotMatch(text, /AbortController/, "the realm's prelude has it");
   assert.match(text, /node:fs \(node\): src\/main\.js/);
   assert.doesNotMatch(text, /localStorage/, "a typeof test is not a use");
   assert.doesNotMatch(text, /Blob/, "a local of that name is not the global");

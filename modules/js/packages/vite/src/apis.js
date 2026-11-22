@@ -6,19 +6,16 @@ import { builtinModules } from "node:module";
 export const MISSING = {
   network: ["fetch", "Request", "Response", "Headers", "WebSocket", "XMLHttpRequest", "EventSource"],
   url: ["URL", "URLSearchParams"],
-  encoding: ["TextEncoder", "TextDecoder", "atob", "btoa"],
-  intl: ["Intl"],
   temporal: ["Temporal"],
   wasm: ["WebAssembly"],
-  crypto: ["crypto"],
-  streams: ["ReadableStream", "WritableStream", "TransformStream", "Blob", "File", "FormData"],
-  events: ["Event", "EventTarget", "CustomEvent", "AbortController", "AbortSignal", "MessageChannel", "structuredClone", "DOMException"],
+  streams: ["ReadableStream", "WritableStream", "TransformStream", "FormData"],
+  events: ["MessageChannel", "structuredClone"],
   workers: ["Worker"],
   storage: ["localStorage", "sessionStorage", "indexedDB"],
   dom: [
     "document", "window", "navigator", "location", "history", "MutationObserver", "matchMedia", "Image", "HTMLElement",
   ],
-  node: ["process", "Buffer", "require", "setImmediate", "__dirname", "__filename"],
+  node: ["process", "Buffer", "require", "__dirname", "__filename"],
 };
 
 const AREA = new Map();

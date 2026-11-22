@@ -404,3 +404,23 @@ test("the host's events answer instanceof for their browser classes", () => {
   assert.ok(!(new Event("keydown") instanceof KeyboardEvent));
   field.remove();
 });
+
+test("form elements answer instanceof, and tabIndex and disabled reflect their attributes", () => {
+  const fieldset = document.createElement("fieldset");
+  for (const [tag, name] of [["fieldset", "HTMLFieldSetElement"], ["meter", "HTMLMeterElement"], ["output", "HTMLOutputElement"], ["progress", "HTMLProgressElement"], ["h2", "HTMLHeadingElement"]]) {
+    assert.ok(document.createElement(tag) instanceof globalThis[name], tag);
+  }
+  assert.ok(!(document.createElement("div") instanceof HTMLFieldSetElement));
+  assert.equal(fieldset.disabled, false);
+  fieldset.disabled = true;
+  assert.equal(fieldset.getAttribute("disabled"), "");
+  assert.equal(fieldset.disabled, true);
+  const item = document.createElement("div");
+  assert.equal(item.tabIndex, -1);
+  assert.equal(document.createElement("button").tabIndex, 0);
+  item.tabIndex = 0;
+  assert.equal(item.getAttribute("tabindex"), "0");
+  item.tabIndex = -1;
+  assert.ok(item.hasAttribute("tabindex"));
+  assert.equal(item.tabIndex, -1);
+});
