@@ -1174,3 +1174,22 @@ test("an empty node shares no list with another, and its looks read back as CSS"
   assert.equal(child.parentNode, null);
   assert.equal(heard, 0);
 });
+
+test("an svg clones deeply with its markup attributes, elements and text", () => {
+  const svg = createNode("svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("className", "size-4");
+  const path = createSvgElement("path");
+  path.setAttribute("d", "M5 12h14");
+  svg.appendChild(path);
+  const title = createSvgElement("title");
+  title.append("Model");
+  svg.appendChild(title);
+  const copy = svg.cloneNode(true);
+  assert.notEqual(copy, svg);
+  assert.equal(copy.outerHTML, svg.outerHTML);
+  assert.equal(copy.getAttribute("className"), svg.getAttribute("className"));
+  assert.equal(copy.getAttribute("viewBox"), "0 0 24 24");
+  assert.notEqual(copy.firstChild, path);
+  assert.equal(svg.cloneNode(false).childNodes.length, 0);
+});

@@ -681,6 +681,7 @@ export class Node {
     if (this.#base) this.#base._copyTo(copy.look("base"));
     const looks = this.#rare?.looks;
     for (const state in looks ?? {}) looks[state]._copyTo(copy.look(state));
+    if (this.#className !== null) copy.setAttribute("class", this.#className);
     for (const [name, value] of this.#rare?.attributes ?? []) copy.setAttribute(name, value);
     if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
     return copy;
@@ -2018,6 +2019,10 @@ export class SvgText {
   destroy() {
     this.remove();
   }
+
+  cloneNode() {
+    return new SvgText(this.#data);
+  }
 }
 
 /**
@@ -2131,6 +2136,14 @@ export class SvgElement {
     this.remove();
   }
 
+  /** A copy with the same attributes, and with `deep` copies of the children. */
+  cloneNode(deep = false) {
+    const copy = new SvgElement(this.localName);
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    if (deep) for (const child of this.childNodes) copy.appendChild(child.cloneNode(true));
+    return copy;
+  }
+
   /**
    * Hears pointer events on this element's shapes, as on the web: its `<svg>` turns live (see
    * `Svg`) and the tree tells which shape is under the pointer.
@@ -2237,7 +2250,9 @@ export class Svg extends Node {
   }
 
   _shallowClone() {
-    return new Svg();
+    const copy = new Svg();
+    for (const [name, value] of this.#attributes) copy.setAttribute(name, value);
+    return copy;
   }
 
   getAttribute(name) {
