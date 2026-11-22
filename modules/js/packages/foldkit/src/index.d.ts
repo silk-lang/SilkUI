@@ -20,6 +20,8 @@ export declare const FocusStyle: (style: Style) => Attribute<never>;
 export declare const FocusVisibleStyle: (style: Style) => Attribute<never>;
 /** What its transitions start from when it first shows, as `@starting-style`. */
 export declare const StartingStyle: (style: Style) => Attribute<never>;
+export declare const VirtualList: (options: import("@silkui/core").VirtualListOptions, onRange: (indices: number[]) => void) => Attribute<never>;
+export declare const VirtualRows: (indices: readonly number[]) => Attribute<never>;
 
 declare global {
   interface Node {
