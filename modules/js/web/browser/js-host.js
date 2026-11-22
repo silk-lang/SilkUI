@@ -27,6 +27,7 @@ const OP = {
   fontFamily: 16, defineIcon: 17, source: 18, release: 19, keyframe: 20, keyframes: 21,
   richText: 22, mark: 23, atomStyle: 24, format: 25, insertAtom: 26, styleSheet: 27, load: 28,
   capture: 29, svgInsert: 30, svgRemove: 31, svgAttribute: 32, surface: 33, canvasFrame: 34,
+  virtualList: 35, virtualItems: 36, clearVirtualList: 37,
 };
 
 // The attribute names the tree has besides `role` and `aria-*` (ui-js-calls `attributeOf`):
@@ -230,6 +231,14 @@ export class JsHost {
       remove(id) { write(OP.remove, id); },
       destroy(id) { write(OP.destroy, id); },
       scrollTo(id, x, y) { write(OP.scrollTo, id); calls.f64(x); calls.f64(y); },
+      virtualList(id, count, estimate, overscan, gap, revision) {
+        if (count === undefined) { write(OP.clearVirtualList, id); return; }
+        write(OP.virtualList, id); calls.u32(count); calls.f64(estimate); calls.f64(overscan); calls.f64(gap); calls.f64(revision);
+      },
+      virtualItems(id, ...pairs) {
+        write(OP.virtualItems, id); calls.u32(pairs.length / 2);
+        for (const value of pairs) calls.u32(value);
+      },
       select(id, anchor, focus) { write(OP.select, id); calls.u32(anchor); calls.u32(focus); },
       fontFamily(id, names) { write(OP.fontFamily, id); calls.text(names); },
       defineIcon(resource, markup) { write(OP.defineIcon, resource); calls.text(markup); },
@@ -265,6 +274,9 @@ export class JsHost {
     globalThis.__ui = this.ui;
     this.imports = {
       pending: () => calls.length,
+      virtualRequest: (port, ptr, count) => {
+        this.ui.virtualRequest?.(port, ...new Uint32Array(this.memory().buffer, ptr, count));
+      },
       take: (pointer, length) => {
         new Uint8Array(this.memory().buffer, pointer, length).set(calls.bytes.subarray(0, length));
         calls.length = 0;

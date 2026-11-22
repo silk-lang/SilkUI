@@ -112,8 +112,13 @@ SILK_UI_TRACE_JS=1 dist/window/my-app
   the new source.
 - A host built for another machine (`--target`) starts from the bundle's text, since the
   image is written by a program that runs on the build machine. The build says so.
-- An app on the SilkJS runtime (`Runtime.Node`) starts from the bundle's text: it has no
-  image yet.
+- An app on the SilkJS runtime (`Runtime.Node`) gets its image another way, since only a
+  program with the app's capabilities can compile its bundle: once the release host is in
+  place, the build runs it with `--silk-write-bundle-image` and it writes `app.image`
+  beside itself. The host maps that file at launch and starts from it, so a function never
+  called stays in the file and costs no memory. Ship `app.image` with the program and
+  `app/`. Without the file, or with another build's, the host starts from the bundle's
+  text; `SILK_UI_BUNDLE_TEXT=1` makes it do so, to compare.
 - A custom host (`App.customHost`) gets neither bundle nor image, as before.
 
 ## The definition

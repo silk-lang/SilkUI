@@ -66,6 +66,10 @@ import webgpu.runtime { GpuError }
 import atlas.atlas { AtlasError }
 import vector.geometry_error { GeometryError }
 import generated_prelude { prelude }
+pub import image_file { ImageFile }
+import image_file as imageFiles
+import silk.system.filesystem { FileSystem, FileError, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
 import silk.collections.list { List }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -293,6 +297,23 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
   pub effect fn entry(self: &mut Self, name: &[u8], source: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
     self.lend()
     run self.runtime.evaluateModule(name, source)
+  }
+
+  /// [`NodeApp.entry`] from `image`, the bytecode image this program's build wrote of
+  /// `source` ([`NodeApp.writeImage`]): nothing is parsed, and each function's code stays in
+  /// the image's bytes until its first call.
+  ///
+  /// Safety: `image` stays readable and unchanged until the process ends.
+  pub unsafe effect fn entryImage(self: &mut Self, name: &[u8], source: &[u8], image: &[u8]) -> () ! OutOfMemoryError | JsException ? &mut Allocator {
+    self.lend()
+    run unsafe self.runtime.evaluateModuleImage(name, source, Pointer.fromRef<u8>(&image[0]), image.length)
+  }
+
+  /// The ES module `source` named `name` as a bytecode image, compiled and not run. The
+  /// modules it imports are defined first ([`NodeApp.define`]).
+  pub effect fn writeImage(self: &mut Self, name: &[u8], source: &[u8]) -> List<u8> ! OutOfMemoryError | JsException ? &mut Allocator {
+    self.lend()
+    return run self.runtime.writeModuleImage(name, source)
   }
 
   fn release(self: &mut Self, value: Value) -> () {
@@ -692,17 +713,25 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     let root = tree.current
     drop run self.client.stylesheets.serve(&mut tree.*, root)
     run tree.frame(input)
+    let mut at: usize = 0
+    while at < tree.virtualLists.length() {
+      let args = run bridge.virtualRequest(&tree, at)
+      if args.length() != 0 {
+        let returned = run state.callReporting(b"virtualRequest", args.asSlice())
+        state.release(move returned)
+      }
+      at = at + 1
+    }
+    if tree.virtualLists.length() != 0 && run state.flush(&mut tree) { run tree.frame(input) }
     run state.observe(&mut tree)
     drop run self.client.load(&mut state, &mut tree)
   }
 
   effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
-    state.bridge.attach(&mut tree)
-    drop run self.client.stylesheets.serve(&mut tree.*, root)
-    run tree.frameRoot(root, input)
-    run state.observe(&mut tree)
-    drop run self.client.load(&mut state, &mut tree)
+    if (run tree.useRoot(root)) || tree.current == root {
+      run WindowClient<NodeApp<'r, 'e, 'm, C>, never, never>.layout(&mut self.*, &mut state.*, &mut tree.*, input)
+    }
   }
 
   effect fn canvases(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, presenter: CanvasPresenter) -> ()
@@ -882,6 +911,10 @@ pub struct NodeWindow<'f> {
   modules: List<Defined>,
   name: List<u8>,
   source: List<u8>,
+  /// The entry's text when it is part of the program ([`NodeWindow.entryEmbedded`]).
+  embedded: &'static [u8],
+  /// The file that may hold the entry's bytecode image ([`NodeWindow.imageFile`]).
+  image: ImageFile,
   /// The runtime's `HostApi`, set by `start`.
   api: Option<UiApi>,
   /// Whether the process ends with the runtime, which then starts from the program's heap image.
@@ -899,6 +932,8 @@ impl<'f> NodeWindow<'f> {
       modules: List<Defined>.make(),
       name: List<u8>.make(),
       source: List<u8>.make(),
+      embedded: b"",
+      image: ImageFile.none(),
       api: Option<UiApi>.None,
       ownsProcess: false,
       failure: Option<WindowError | GpuError | TreeError | AtlasError | GeometryError>.None,
@@ -928,6 +963,21 @@ impl<'f> NodeWindow<'f> {
     self.source = List<u8>.make()
     run self.source.reserveExact(source.length)
     run self.source.appendSlice(source)
+  }
+
+  /// [`NodeWindow.entry`] for a text that is part of the program: it is not copied.
+  pub effect fn entryEmbedded(self: &mut Self, name: &[u8], source: &'static [u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.name.clear()
+    run self.name.appendSlice(name)
+    self.source = List<u8>.make()
+    self.embedded = source
+  }
+
+  /// The file that holds the entry's bytecode image when this program wrote one
+  /// ([`writeBundleImage`]): the window then starts from it and parses nothing. A file that
+  /// is not this program's image of this entry is ignored.
+  pub fn imageFile(self: &mut Self, file: ImageFile) -> () {
+    self.image = move file
   }
 
   /// Starts the runtime on this thread with `executable` as its `process.argv[0]` and
@@ -962,6 +1012,66 @@ pub effect fn writeHeapImage<C: Composition>(executable: &[u8], path: &[u8], cap
   run options.arguments.append(run Bytes.copy(path))
   let mut host = Imaging {}
   return run embed.start(move options, &mut host, move capabilities)
+}
+
+/// Writes the bytecode image of the ES module `source` to the file `path`
+/// ([`NodeWindow.imageFile`] reads it), compiled by a runtime with `capabilities` as the
+/// windows start one, where `@silkui/core` is `library`. What a release host runs when its
+/// first argument is `--silk-write-bundle-image`: the image is of the engine this program
+/// links, so only the program itself can write it. Returns the exit status.
+pub effect fn writeBundleImage<C: Composition>(executable: &[u8], path: &[u8], library: &[u8], source: &'static [u8], api: UiApi, capabilities: C) -> i32
+  ! OutOfMemoryError | SynchronizationError ? &mut Allocator {
+  let mut options = run Options.make(executable)
+  options.ownsProcess = true
+  options.keepAlive = false
+  let mut pathCopy = List<u8>.make()
+  run pathCopy.appendSlice(path)
+  let mut libraryCopy = List<u8>.make()
+  run libraryCopy.appendSlice(library)
+  let mut host = BundleImaging { api: api, path: move pathCopy, library: move libraryCopy, source: source }
+  return run embed.start(move options, &mut host, move capabilities)
+}
+
+/// Writes `image`, the bytecode image of `source` ([`NodeApp.writeImage`]), to the file `path`
+/// in the form [`ImageFile`] reads.
+pub effect fn saveImage(path: &[u8], source: &[u8], image: &[u8]) -> usize ! FileError | OutOfMemoryError ? &mut Allocator {
+  let file = run imageFiles.assemble(source, image)
+  run saved(path, file.asSlice())
+  return file.length()
+}
+
+effect fn saved(path: &[u8], bytes: &[u8]) -> () ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut files = run MachineFileSystem.make()
+  run FileSystem.writeFile(&run Path.fromBytes(path), bytes) |> Effect.provideMut<FileSystem>(&mut files)
+}
+
+/// Compiles the bundle in a runtime set up as a window's, and never runs it.
+struct BundleImaging {
+  api: UiApi,
+  path: List<u8>,
+  library: List<u8>,
+  source: &'static [u8],
+}
+
+impl Host for BundleImaging {
+  effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
+    let mut app = run NodeApp.make(&mut runtime.*, self.api)
+    run app.define(b"@silkui/core", self.library.asSlice())
+    // Any name: the image runs under the one the bundle has where the app is installed.
+    let image = run app.writeImage(b"/app/app.js", self.source)
+    let written = run Effect.result(saveImage(self.path.asSlice(), self.source, image.asSlice()))
+    match move written {
+      Result<usize, FileError | OutOfMemoryError>.Success { value } => {
+        StderrWriter.print("silkui: {} bytes of JavaScript compiled into a {} byte bytecode image\n", &(self.source.length, value))
+      }
+      Result<usize, FileError | OutOfMemoryError>.Failure { error } => {
+        drop error
+        StderrWriter.print("silkui: the bytecode image could not be written to its file\n", &())
+        return 1
+      }
+    }
+    return 0
+  }
 }
 
 /// The runtime ends the process when its image is written, before any host runs.
@@ -1018,7 +1128,19 @@ impl<'f> Host for NodeWindow<'f> {
     }
     // Each module's text is the engine's from here: a large bundle's is not kept twice.
     self.modules = List<Defined>.make()
-    run app.entry(self.name.asSlice(), self.source.asSlice())
+    if self.embedded.length != 0 {
+      let text = self.embedded
+      let compiled = self.image.image(text)
+      if compiled.length != 0 {
+        // The file stays mapped until the process ends, which is as long as the engine reads it.
+        run unsafe app.entryImage(self.name.asSlice(), text, compiled)
+        if tracing { StderrWriter.print("silkui: JavaScript starts from its bytecode image ({} of {} bytes)\n", &(compiled.length, text.length)) }
+      } else {
+        run app.entry(self.name.asSlice(), text)
+      }
+    } else {
+      run app.entry(self.name.asSlice(), self.source.asSlice())
+    }
     self.source = List<u8>.make()
     app.quietTraced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
     // The entry's first turn: its imports and top-level code run before the first frame.

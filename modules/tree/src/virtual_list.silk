@@ -12,7 +12,9 @@ import silk.num.usize
 pub struct VirtualList {
   /// Current list configuration.
   pub options: VirtualOptions,
-  /// Estimated or measured item heights, including gaps.
+  /// Logical item count, independent of measurement storage.
+  pub count: usize,
+  /// Materialized strides, allocated only after a row differs from the estimate.
   pub heights: List<f32>,
   sums: List<f64>,
   /// Mounted client items in logical order.
@@ -42,6 +44,7 @@ impl VirtualList {
   pub fn make(options: VirtualOptions) -> VirtualList {
     return VirtualList {
       options: options,
+      count: 0,
       heights: List<f32>.make(),
       sums: List<f64>.make(),
       rows: List<VirtualItem>.make(),
@@ -62,23 +65,38 @@ impl VirtualList {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.options = options
-    self.heights.clear()
-    self.sums.clear()
-    let estimate = f32.max(1.0, options.estimatedHeight) + f32.max(0.0, options.gap)
-    run self.heights.appendRepeated(estimate, count)
-    run self.sums.append(0.0)
+    self.count = count
+    self.heights = List<f32>.make()
+    self.sums = List<f64>.make()
+    drop self.range(true)
+  }
+
+  fn stride(self: &Self) -> f32 {
+    return f32.max(1.0, self.options.estimatedHeight) + self.options.gap
+  }
+
+  effect fn materialize(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let estimate = self.stride()
+    let mut heights = List<f32>.make()
+    let mut sums = List<f64>.make()
+    run heights.appendRepeated(estimate, self.count)
+    run sums.append(0.0)
     let mut i: usize = 1
-    while i <= count {
+    while i <= self.count {
       let low = i - usize.bitAnd(i, i - 1)
-      run self.sums.append(usize.toF64(low) * f32.toF64(estimate))
+      run sums.append(usize.toF64(low) * f32.toF64(estimate))
       i = i + 1
     }
-    drop self.range(true)
+    self.heights = move heights
+    self.sums = move sums
   }
 
   /// Returns the estimated or measured position before item `end`.
   /// `end` must not exceed the item count.
   pub fn prefix(self: &Self, end: usize) -> f32 {
+    if self.heights.length() == 0 {
+      return f64.toF32(usize.toF64(end) * f32.toF64(self.stride()))
+    }
     let mut i = end
     let mut total = 0.0
     while i > 0 {
@@ -90,6 +108,10 @@ impl VirtualList {
 
   /// Returns the item at `position`, or the item count at the end.
   pub fn locate(self: &Self, position: f32) -> usize {
+    if self.heights.length() == 0 {
+      let index = f32.toF64(f32.max(0.0, position)) / f32.toF64(self.stride())
+      return if index >= usize.toF64(self.count) { self.count } else { f64.toUsize(index) }
+    }
     let mut bit: usize = 1
     while bit <= self.heights.length() / 2 {
       bit = bit * 2
@@ -109,12 +131,17 @@ impl VirtualList {
 
   /// Updates one measured height and returns whether it changed.
   /// `index` must be less than the item count.
-  pub fn measure(self: &mut Self, index: usize, height: f32) -> bool {
+  pub effect fn measure(self: &mut Self, index: usize, height: f32) -> bool
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let value = f32.max(1.0, height)
-    let delta = value - self.heights.get(index)
+    let uniform = self.heights.length() == 0
+    let previous = if uniform { self.stride() } else { self.heights.get(index) }
+    let delta = value - previous
     if f32.abs(delta) < 0.25 {
       return false
     }
+    if uniform { run self.materialize() }
     self.heights.set(index, value)
     let mut i = index + 1
     while i < self.sums.length() {
@@ -130,16 +157,16 @@ impl VirtualList {
     let overscan = f32.max(0.0, self.options.overscan)
     let margin = overscan * 0.25
     if !force && (self.first == 0 || self.prefix(self.first) <= self.scroll - margin)
-      && (self.end == self.heights.length()
+      && (self.end == self.count
         || self.prefix(self.end) >= self.scroll + self.height + margin) {
       return false
     }
     let first = self.locate(f32.max(0.0, self.scroll - overscan))
     let candidate = self.locate(self.scroll + self.height + overscan) + 1
-    let end = if candidate < self.heights.length() {
+    let end = if candidate < self.count {
       candidate
     } else {
-      self.heights.length()
+      self.count
     }
     let changed = first != self.first || end != self.end
     self.first = first
@@ -193,7 +220,7 @@ pub fn request(tree: &UiTree<'_>, id: u32) -> Option<VirtualRange> {
   }
   return Option<VirtualRange>.some(
     VirtualRange {
-      count: list.heights.length(),
+      count: list.count,
       first: list.first,
       end: list.end,
       pinned: pinned,
@@ -236,7 +263,7 @@ pub effect fn configure(
     run tree.virtualLists.append(move list)
   }
   let list = &mut tree.virtualLists.asMutSlice()[at]
-  if list.heights.length() != count || list.options.revision != options.revision
+  if list.count != count || list.options.revision != options.revision
     || list.options.estimatedHeight != options.estimatedHeight
     || list.options.gap != options.gap {
     let old = list.locate(list.scroll)
@@ -274,7 +301,7 @@ pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<
   if children.length() != values.length {
     fail TreeError.BadVirtualList { index: mutation, id: id }
   }
-  let count = tree.virtualLists.asSlice()[at].heights.length()
+  let count = tree.virtualLists.asSlice()[at].count
   let mut i: usize = 0
   while i < values.length {
     let item = values[i]
@@ -334,7 +361,7 @@ pub effect fn prepare(tree: &mut UiTree<'_>) -> ()
       let row = tree.virtualLists.asSlice()[v].rows.get(r)
       let slot = tree.slotOf(row.id)
       if slot == NONE || tree.node(slot).parent != port
-        || row.index >= tree.virtualLists.asSlice()[v].heights.length() {
+        || row.index >= tree.virtualLists.asSlice()[v].count {
         drop tree.virtualLists.asMutSlice()[v].rows.remove(r)
       } else {
         run rowCss.append(tree.node(slot).css)
@@ -367,7 +394,7 @@ pub effect fn prepare(tree: &mut UiTree<'_>) -> ()
     while i < list.spacers.length() {
       let last = i == list.rows.length()
       let end = if last {
-        list.heights.length()
+        list.count
       } else {
         list.rows.get(i).index
       }
@@ -448,7 +475,7 @@ pub effect fn settle(tree: &mut UiTree<'_>) -> bool
         let before = list.prefix(anchor)
         let mut resized = false
         if list.width != 0.0 && f32.abs(list.width - port.bounds.width()) > 0.5 {
-          let count = list.heights.length()
+          let count = list.count
           let options = list.options
           run list.reset(count, options)
           resized = true
@@ -457,9 +484,9 @@ pub effect fn settle(tree: &mut UiTree<'_>) -> bool
         let mut i: usize = 0
         while i < measured.length() {
           let row = list.rows.get(i)
-          if measured.get(i) >= 0.0 && row.index < list.heights.length() {
+          if measured.get(i) >= 0.0 && row.index < list.count {
             let height = measured.get(i) + list.options.gap
-            if list.measure(row.index, height) {
+            if run list.measure(row.index, height) {
               resized = true
             }
           }

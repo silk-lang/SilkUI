@@ -5,7 +5,7 @@
 //! on the runtime yet: the development host runs the bundle at the path its command line
 //! gives, once.
 import ui_js.lib { uiPackage, StylesheetCompiler, runtimeStylesheets }
-import ui_js_node.lib { NodeWindow, NodeClient, writeHeapImage }
+import ui_js_node.lib { NodeWindow, NodeClient, ImageFile, writeHeapImage, writeBundleImage }
 pub import ui_js_node.lib { UiApi }
 // What a generated host composes its runtime from: the light set every app gets, and what an
 // app allows beyond it.
@@ -47,7 +47,7 @@ import silk.core.result { Result }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 
-effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32
+effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &'static [u8], launched: Option<Launched>, sheets: StyleAssets, updates: SheetWatch, compiler: StylesheetCompiler, api: UiApi, capabilities: C) -> i32
   ! TreeError | WindowError | GpuError | AtlasError | GeometryError | OutOfMemoryError | SynchronizationError | platform.PlatformError
   ? &mut Allocator {
   let tracing = (run environmentVariable("SILK_UI_TRACE_FRAMES")).isSome()
@@ -82,7 +82,13 @@ effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8
   run window.define(b"@silkui/core", uiPackage())
   if source.length != 0 {
     let named = run embeddedEntry()
-    run window.entry(named.asSlice(), source)
+    run window.entryEmbedded(named.asSlice(), source)
+    // The image `silk task build` had this program write of its bundle, when it is there:
+    // the window starts from it and parses nothing. SILK_UI_BUNDLE_TEXT starts from the text.
+    if (run environmentVariable("SILK_UI_BUNDLE_TEXT")).isNone() {
+      let image = run besideProgram(b"app.image")
+      window.imageFile(run ImageFile.open(image.asSlice()))
+    }
   } else {
     // Named by its real path, so `import.meta.url` and the files fetched beside it resolve
     // from the bundle's folder.
@@ -97,6 +103,12 @@ effect fn program<C: Composition>(settings: Settings, entry: &[u8], source: &[u8
 /// `silk task build` puts the files the bundle fetches, so `import.meta.url` resolves them.
 /// `/app/app.js` when the system does not say where the program is.
 effect fn embeddedEntry() -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  return run besideProgram(b"app/app.js")
+}
+
+/// The path of `name` in the program's folder; `/<name>` when the system does not say where
+/// the program is.
+effect fn besideProgram(name: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
   let mut info = ProcessInfo.make()
   let found = run Effect.result(SystemInfo.executablePath()) |> Effect.provideMut<SystemInfo>(&mut info)
   let mut named = List<u8>.make()
@@ -106,7 +118,8 @@ effect fn embeddedEntry() -> List<u8> ! OutOfMemoryError ? &mut Allocator {
     while end > 0 && bytes[end - 1] != 47 { end = end - 1 }
     if end > 1 { run named.appendSlice(Slice.view<u8>(bytes, 0, end - 1)) }
   }
-  run named.appendSlice(b"/app/app.js")
+  run named.append(47)
+  run named.appendSlice(name)
   return move named
 }
 
@@ -126,11 +139,11 @@ effect fn noArgument<E>(error: E) -> Option<Bytes> {
 struct Sent<C> { api: UiApi, capabilities: C }
 impl<C> Transferable for Sent<C> {}
 
-/// The path after `--silk-write-heap-image`, when that is the host's first argument.
-effect fn imageRequest() -> Option<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+/// The path after `flag`, when that is the host's first argument.
+effect fn imageRequest(flag: &[u8]) -> Option<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
   match move run HostInput.argument(1) {
     Option<Bytes>.Some { value } => {
-      if Bytes.asSlice(&value) != b"--silk-write-heap-image" { return Option<Bytes>.None }
+      if Bytes.asSlice(&value) != flag { return Option<Bytes>.None }
     }
     Option<Bytes>.None => { return Option<Bytes>.None }
   }
@@ -142,7 +155,16 @@ effect fn started<C: Composition + 'static>(settings: Settings, entry: Bytes, so
   let path = move entry
   // `silk task build` runs a release host this way to append its heap image.
   if source.length != 0 {
-    let image = run Effect.catchAll(imageRequest(), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
+    // And this way to write the bytecode image of its bundle beside itself.
+    let bundle = run Effect.catchAll(imageRequest(b"--silk-write-bundle-image"), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
+    match move bundle {
+      Option<Bytes>.Some { value } => {
+        return run Effect.catchAll(writeBundleImage(b"app", Bytes.asSlice(&value), uiPackage(), source, api, move capabilities), failed)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+      Option<Bytes>.None => ()
+    }
+    let image = run Effect.catchAll(imageRequest(b"--silk-write-heap-image"), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
     match move image {
       Option<Bytes>.Some { value } => {
         return run Effect.catchAll(writeHeapImage(b"app", Bytes.asSlice(&value), move capabilities), failed)

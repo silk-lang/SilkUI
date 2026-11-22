@@ -1,9 +1,14 @@
 //! The network check of `ui-js-node`: runs the module at the path in its first argument in a
 //! runtime-backed realm with `@silkui/core`, turns the loop until the module calls process.exit,
-//! and exits with its status (2 when JavaScript queued no mutation for the tree). Run by
+//! and exits with its status (2 when JavaScript queued no mutation for the tree).
+//! With a second argument, a file's path, the module runs from its bytecode image instead: the
+//! check writes the image there, maps the file and starts from it, as a release host does (6
+//! when the file is not accepted). Run by
 //! `scripts/check`, which starts `fixtures/server.mjs` and passes its port in SILK_TEST_PORT.
 import ui_js.lib { uiPackage }
-import ui_js_node.lib { NodeApp }
+import ui_js_node.lib { NodeApp, ImageFile, saveImage }
+import silk.core.result { Result }
+import silk.system.filesystem { FileError }
 import ui_js_node.lib { UiApi }
 import node_runtime.libs.core.capabilities { Composition }
 import node_runtime.libs.core.capabilities { Capabilities, OsProcesses, OsNetwork, OsSystemInfo, ThreadWorkers }
@@ -35,6 +40,10 @@ import silk.system.host_input { HostInput }
 struct Check {
   api: UiApi,
   source: List<u8>,
+  /// Where the module's bytecode image goes, to run from it; empty to run the text.
+  imagePath: List<u8>,
+  /// The image's file, mapped for as long as the runtime reads it.
+  image: ImageFile,
   /// JavaScript queued mutations for the tree.
   built: bool,
 }
@@ -43,7 +52,18 @@ impl Host for Check {
   effect fn drive<'e, 'm, C: Composition>(self: &mut Self, runtime: &mut Runtime<'e, 'm, C>) -> i32 ! OutOfMemoryError | JsException ? &mut Allocator {
     let mut app = run NodeApp.make(&mut runtime.*, self.api)
     run app.define(b"@silkui/core", uiPackage())
-    run app.entry(b"/ui-js-node-check/net.js", self.source.asSlice())
+    if self.imagePath.length() != 0 {
+      // Written under another name than the module runs with, as a build writes it.
+      let compiled = run app.writeImage(b"/ui-js-node-built/net.js", self.source.asSlice())
+      let saved = run Effect.result(saveImage(self.imagePath.asSlice(), self.source.asSlice(), compiled.asSlice()))
+      if let Result<usize, FileError | OutOfMemoryError>.Failure { error } = move saved { drop error return 6 }
+      self.image = run ImageFile.open(self.imagePath.asSlice())
+      let bytes = self.image.image(self.source.asSlice())
+      if bytes.length == 0 { return 6 }
+      run unsafe app.entryImage(b"/ui-js-node-check/net.js", self.source.asSlice(), bytes)
+    } else {
+      run app.entry(b"/ui-js-node-check/net.js", self.source.asSlice())
+    }
     let mut turns: u32 = 0
     while turns < 1200 {
       run app.turn(0.05)
@@ -58,9 +78,11 @@ impl Host for Check {
   }
 }
 
-effect fn check(path: &[u8]) -> i32 ! OutOfMemoryError | SynchronizationError | platform.PlatformError ? &mut Allocator {
+effect fn check(path: &[u8], imagePath: &[u8]) -> i32 ! OutOfMemoryError | SynchronizationError | platform.PlatformError ? &mut Allocator {
   let api = run UiApi.make()
-  let mut host = Check { api: api, source: run platform.readFile(path), built: false }
+  let mut imageCopy = List<u8>.make()
+  run imageCopy.appendSlice(imagePath)
+  let mut host = Check { api: api, source: run platform.readFile(path), imagePath: move imageCopy, image: ImageFile.none(), built: false }
   let options = run Options.make(b"ui-js-node-check")
   return run embed.start(move options, &mut host, Capabilities { platform: OsPlatform {}, modules: NodeResolution {}, files: OsFiles {}, compression: NativeCompression.make(), http2: Nghttp2.make(), crypto: OpenSslCrypto.make(), tls: OpenSslTls.make(), database: SqliteDatabase.make(), addons: DlopenAddons.make(), processes: OsProcesses {}, network: OsNetwork {}, http: Llhttp.make(), systemInfo: OsSystemInfo {}, typeStripping: Amaro {}, workers: ThreadWorkers {}, inspector: NodeInspector.make(), wasm: WamrWasm.make(), hostApi: api })
 }
@@ -82,5 +104,10 @@ pub effect fn main() -> i32 ? &mut HostInput {
     Option<Bytes>.Some { value } => move value
     Option<Bytes>.None => { return 5 }
   }
-  return run Effect.catchAll(check(Bytes.asSlice(&path)), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+  let second = run Effect.catchAll(HostInput.argument(2), noArgument) |> Effect.provideMut<Allocator>(&mut allocator)
+  let image = match move second {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => Bytes.make()
+  }
+  return run Effect.catchAll(check(Bytes.asSlice(&path), Bytes.asSlice(&image)), failed) |> Effect.provideMut<Allocator>(&mut allocator)
 }
