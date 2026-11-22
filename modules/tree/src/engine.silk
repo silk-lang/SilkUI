@@ -111,7 +111,7 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse, Align, OverflowAlignment }
 import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
@@ -537,6 +537,52 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
     }
     NodeKind.Canvas => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
   }
+}
+
+/// Form controls lay out their contents as a browser's do, whatever display or align-content
+/// the app gives them. An input's text flows in one block (the inner editor); a one-line
+/// input centers it in the block axis even when it overflows, as Chromium does. A button,
+/// a select and a button-typed input center their contents unless they overflow (the HTML
+/// rendering's anonymous button content box), except as flex or grid containers.
+fn controlLayout(node: &Node, style: CssStyle) -> CssStyle {
+  let mut used = style
+  match style.display {
+    CssDisplay.Box { outside, inside } => {
+      if node.kind == NodeKind.Input {
+        used.display = CssDisplay.Box { outside: outside, inside: DisplayInside.FlowRoot }
+        if !node.edit().multiline {
+          used.alignContent = Align.Center
+          used.alignContentSafety = OverflowAlignment.Unsafe
+        }
+      } else if node.kind == NodeKind.Box && (inside == DisplayInside.Flow || inside == DisplayInside.FlowRoot) && buttonLike(node) {
+        used.display = CssDisplay.Box { outside: outside, inside: DisplayInside.FlowRoot }
+        used.alignContent = Align.Center
+        used.alignContentSafety = OverflowAlignment.Safe
+      }
+    }
+    _ => {}
+  }
+  return used
+}
+
+fn buttonLike(node: &Node) -> bool {
+  let identity = match node.identity() {
+    Option.Some { value } => value
+    Option.None => { return false }
+  }
+  let tag = identity.tag()
+  if tag == "button" || tag == "select" { return true }
+  if tag != "input" { return false }
+  let attributes = identity.attributes()
+  let mut i: usize = 0
+  while i < attributes.length {
+    if String.view(&attributes[i].name) == "type" {
+      let kind = String.view(&attributes[i].value)
+      return kind == "button" || kind == "submit" || kind == "reset"
+    }
+    i = i + 1
+  }
+  return false
 }
 
 effect fn invalidInitial(error: CssError) -> Value {
@@ -7422,8 +7468,9 @@ impl<'a> UiTree<'a> {
     if !tick && kind == NodeKind.Text && simpleStyles { run self.keepTextInherit(slot) }
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
+      let used = controlLayout(self.node(slot), computed.layout)
       run Effect.catchAll(
-        self.layout.setStyle(NodeId { index: css }, computed.layout),
+        self.layout.setStyle(NodeId { index: css }, used),
         layoutFailed,
       )
       if computed.contain.automatic() != self.layout.automatic(css) {
