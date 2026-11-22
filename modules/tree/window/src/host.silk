@@ -337,6 +337,13 @@ pub interface WindowClient<S, E, ? R> {
     return false
   }
 
+  /// Whether the client is waiting on work outside the process that its first content needs,
+  /// as a development server's modules: a headless run lets real time pass for it, not the
+  /// run's own clock, so a script's `wait 2s` starts once the app is there.
+  fn awaitsOutside(self: &Self, state: &S) -> bool {
+    return false
+  }
+
   /// Whether the client asked to close the window: the loop ends without asking `closing`.
   fn quitting(self: &Self, state: &S) -> bool {
     return false
@@ -2492,11 +2499,19 @@ static if Intrinsic.targetArchitecture() != "wasm32" {
     let mut time: f64 = 0.0
     let mut status: i32 = 0
     let mut quiet = QuietWatch.make()
+    let mut awaited: u32 = 0
     while true {
       // The app's own work and timers, at the run's time.
       drop run content.poll(&mut state, &mut tree, time)
       if content.waitsItself(&state.*) {
         drop run content.wait(&mut state, &mut tree, 0.0)
+      }
+      // Work outside the process gets real time, at most a minute of it, before the run's
+      // clock and its script go on.
+      if content.awaitsOutside(&state.*) && awaited < OUTSIDE_PATIENCE {
+        awaited = awaited + 1
+        run pause(OUTSIDE_STEP)
+        continue
       }
       run content.tick(&mut state, &mut tree, time, false)
       if content.wantsFrames(&state.*) {
@@ -3138,6 +3153,16 @@ effect fn underDirectory(base: Option<String>, path: string) -> String
 static if Intrinsic.targetArchitecture() != "wasm32" {
   import silk.system.monotonic_clock { MonotonicClock }
   import silk.system.monotonic_clock_native { OsMonotonicClock }
+
+  /// Waits `nanoseconds` of real time.
+  effect fn pause(nanoseconds: u64) -> () ? &mut Allocator {
+    let mut clock = OsMonotonicClock.make()
+    run Effect.sleep(nanoseconds) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+
+  /// A headless run's real-time step while a client awaits outside work, and how many it takes.
+  const OUTSIDE_STEP: u64 = 5000000
+  const OUTSIDE_PATIENCE: u32 = 12000
 
   /// `SILK_UI_BENCH_HOLD=<ms>`: the bench sleeps that long after its first frame and after its
   /// last, so a memory tool (footprint, vmmap, heap, malloc_history) can look at the process at

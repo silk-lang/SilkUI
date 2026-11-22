@@ -184,10 +184,8 @@ native counter 93 ms warm (from 101).
 
 ### What could shrink
 
-- **Intl and Temporal.** The realm does not install them, but their data is linked: the
-  time zone, collation, locale and date tables (`intl_*_data`, `temporal_timezone_data`,
-  about 12 MB of Silk source in lib-silkjs's engine) are in the binary. Per-build feature
-  selection in the engine should drop them by default.
+- **Intl and Temporal.** The realm installs `Intl` (pages expect it), so its collation,
+  locale and date tables are in the binary; Temporal's are left out.
 - **The rest of the engine** (14.5 MB with the tables above): the parts an app does not
   use, once the engine's features are packages a build picks.
 - **Devtools.** The demo host links the inspector server (`startInspector`); a production
