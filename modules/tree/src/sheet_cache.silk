@@ -31,9 +31,10 @@ fn sameInherited(a: Inherited, b: Inherited) -> bool {
   return a.rooted == b.rooted && a.color.r == b.color.r && a.color.g == b.color.g && a.color.b == b.color.b && a.color.a == b.color.a
 }
 
-/// A sheet declaration after `var()` substitution in one scope, parsed.
+/// A sheet declaration after `var()` substitution, parsed, for every scope that gives its
+/// variables the values `reads` (`Inputs.substitutionReads`).
 pub struct Substituted {
-  scope: usize,
+  reads: List<u64>,
   sheet: usize,
   declaration: usize,
   pub value: Declaration,
@@ -79,8 +80,24 @@ pub effect fn copy(source: &[Declaration]) -> List<Declaration> ! OutOfMemoryErr
   return move out
 }
 
-fn substitutionKey(scope: ScopeId, sheet: usize, declaration: usize) -> u64 {
-  return Hash.combine(Hash.combine(Hash.mix(&Hash.seed(5381), usize.toU64(scope.index)), usize.toU64(sheet)), usize.toU64(declaration))
+fn substitutionKey(sheet: usize, declaration: usize, reads: &[u64]) -> u64 {
+  let mut key = Hash.combine(Hash.mix(&Hash.seed(5381), usize.toU64(sheet)), usize.toU64(declaration))
+  let mut i: usize = 0
+  while i < reads.length {
+    key = Hash.combine(key, reads[i])
+    i = i + 1
+  }
+  return key
+}
+
+fn sameReads(a: &[u64], b: &[u64]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
 }
 
 fn hash(scope: ScopeId, parent: Inherited, candidates: &[Candidate]) -> u64 {
@@ -172,24 +189,25 @@ impl Cache {
     self.substitutedHeads.clear()
   }
 
-  /// The parsed value sheet declaration `declaration` had in `scope` earlier in this pass.
-  pub fn substitution(self: &Self, scope: ScopeId, sheet: usize, declaration: usize) -> Option<&Substituted> {
-    let mut at = match self.substitutedHeads.get(substitutionKey(scope, sheet, declaration)) { Option.Some { value } => value _ => usize.MAX }
+  /// The parsed value sheet declaration `declaration` had earlier in this pass in a scope that
+  /// gave its variables the values `reads`.
+  pub fn substitution(self: &Self, sheet: usize, declaration: usize, reads: &[u64]) -> Option<&Substituted> {
+    let mut at = match self.substitutedHeads.get(substitutionKey(sheet, declaration, reads)) { Option.Some { value } => value _ => usize.MAX }
     while at != usize.MAX {
       let entry = &self.substituted.asSlice()[at]
-      if entry.scope == scope.index && entry.sheet == sheet && entry.declaration == declaration { return Option<&Substituted>.some(entry) }
+      if entry.sheet == sheet && entry.declaration == declaration && sameReads(entry.reads.asSlice(), reads) { return Option<&Substituted>.some(entry) }
       at = entry.next
     }
     return Option<&Substituted>.None
   }
 
-  pub effect fn keepSubstitution(self: &mut Self, scope: ScopeId, sheet: usize, declaration: usize, value: Declaration, program: Option<ColorProgram>) -> ()
+  pub effect fn keepSubstitution(self: &mut Self, sheet: usize, declaration: usize, reads: List<u64>, value: Declaration, program: Option<ColorProgram>) -> ()
     ! OutOfMemoryError ? &mut Allocator {
     if self.substituted.length() == SUBSTITUTION_LIMIT { return () }
-    let key = substitutionKey(scope, sheet, declaration)
+    let key = substitutionKey(sheet, declaration, reads.asSlice())
     let next = match self.substitutedHeads.get(key) { Option.Some { value: head } => head _ => usize.MAX }
     let index = self.substituted.length()
-    run self.substituted.append(Substituted { scope: scope.index, sheet: sheet, declaration: declaration, value: move value, program: move program, next: next })
+    run self.substituted.append(Substituted { reads: move reads, sheet: sheet, declaration: declaration, value: move value, program: move program, next: next })
     drop run self.substitutedHeads.insert(key, index)
   }
 

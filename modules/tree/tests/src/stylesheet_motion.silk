@@ -268,7 +268,7 @@ test effect fn stylesheetAnimationListsKeepAllEntries() -> ()
   run longAnimations() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
-import ui_tree.legacy { BUTTON_PRIMARY }
+import ui_tree.legacy { BUTTON_PRIMARY, Mutation }
 
 effect fn pointerSheetStates() -> ()
   ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
@@ -337,12 +337,16 @@ effect fn pointerReach() -> ()
   run tree.dispatch(Input.PointerUp { x: 20.0, y: 150.0, button: BUTTON_PRIMARY, modifiers: 0 })
   run tree.frame(at(0.2))
   run Testing.expect(tree.work.resolves - before <= 6, "hover and a press on a leaf restyle only the press chain, not the page under it")
+  let unhovered = tree.work.resolves
   run tree.dispatch(Input.PointerMove { x: 20.0, y: 50.0, modifiers: 0 })
   run tree.frame(at(0.3))
-  run Testing.expect(near(opacity(&tree, 3), 0.5), "an ancestor whose hover a rule asks about restyles its subtree")
+  run Testing.expect(near(opacity(&tree, 3), 0.5), "an ancestor whose hover a rule asks about restyles the subjects of that rule below it")
+  run Testing.expect(tree.work.resolves - unhovered == 2, "and no other descendant: the leaf beside the subject keeps its style")
+  let hovered = tree.work.resolves
   run tree.dispatch(Input.PointerLeave)
   run tree.frame(at(0.4))
   run Testing.expect(near(opacity(&tree, 3), 1.0), "and again when the hover ends")
+  run Testing.expect(tree.work.resolves - hovered == 2, "with the subject and itself alone")
 }
 
 effect fn hasAnchorReach() -> ()
@@ -388,6 +392,57 @@ effect fn hasAnchorReach() -> ()
   run tree.apply(run grouped.take())
   run tree.frame(at(0.2))
   run Testing.expect(near(opacity(&tree, 3), 0.25), "an anchor another match asked restyles what reads it")
+  let mut more = Batch.make()
+  let mut extra: u32 = 40
+  while extra < 50 {
+    run more.create(extra, NodeKind.Box)
+    run more.append(2, extra)
+    run more.attribute(extra, Attribute.ClassName { value: run String.copy("leaf") })
+    extra = extra + 1
+  }
+  run tree.apply(run more.take())
+  run tree.frame(at(0.3))
+  let crowded = tree.work.resolves
+  let mut off = Batch.make()
+  run off.attribute(5, Attribute.ClassName { value: run String.copy("leaf") })
+  run tree.apply(run off.take())
+  run tree.frame(at(0.4))
+  run Testing.expect(near(opacity(&tree, 3), 1.0), "and again when its :has() stops matching")
+  run Testing.expect(tree.work.resolves - crowded <= 3, "that is the anchor, the changed node and the node whose match read the anchor, not the leaves beside it")
+}
+
+/// A blinking caret repaints when its phase changes, not on every frame between.
+effect fn caretFrames() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Input)
+  run batch.append(1, 2)
+  run batch.push(Mutation.Focus { id: 2 })
+  run tree.apply(run batch.take())
+  run tree.frame(at(0.0))
+  run tree.frame(at(0.05))
+  let kept = tree.paintsKept
+  run tree.frame(at(0.1))
+  run tree.frame(at(0.2))
+  run tree.frame(at(0.4))
+  run Testing.expect(tree.paintsKept == kept + 3, "frames within one blink phase of the caret keep the last scene")
+  run tree.frame(at(0.6))
+  run Testing.expect(tree.paintsKept == kept + 3, "the frame where the caret goes off paints")
+  run tree.frame(at(0.7))
+  run tree.frame(at(0.9))
+  run Testing.expect(tree.paintsKept == kept + 5, "and the frames after it keep that scene")
+  run tree.frame(at(1.1))
+  run Testing.expect(tree.paintsKept == kept + 5, "until the caret comes on again")
+}
+
+test effect fn aBlinkingCaretPaintsOnlyWhenItsPhaseChanges() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run caretFrames() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn hasAnchorsRestyleOnlyWhatAskedAboutThem() -> ()

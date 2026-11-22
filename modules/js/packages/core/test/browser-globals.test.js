@@ -148,6 +148,25 @@ test("MutationObserver records child lists, attributes and text", async () => {
   assert.equal(records.length, 5);
 });
 
+test("MutationObserver on the document or <html> with subtree sees changes anywhere in it", async () => {
+  for (const target of [document, document.documentElement]) {
+    const records = [];
+    const observer = new MutationObserver((list) => records.push(...list));
+    observer.observe(target, { childList: true, subtree: true, attributes: true, characterData: true });
+    const box = document.createElement("div");
+    document.body.appendChild(box);
+    const text = document.createTextNode("a");
+    box.appendChild(text);
+    box.setAttribute("data-y", "1");
+    text.data = "b";
+    box.remove();
+    await Promise.resolve();
+    assert.deepEqual(records.map((record) => record.type), ["childList", "childList", "attributes", "characterData", "childList"]);
+    assert.equal(records[0].target, document.body);
+    observer.disconnect();
+  }
+});
+
 test("history and location keep entries and send popstate and hashchange", async () => {
   assert.equal(location.href, "http://localhost/");
   const events = [];

@@ -9,6 +9,7 @@ import style_identity { Atoms }
 import node { Node }
 import mutation { StyleState }
 import silk.collections.hash { Hash }
+import silk.collections.hash_map { HashMap }
 import silk.collections.hash_set { HashSet }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -86,22 +87,87 @@ impl States {
   pub fn make() -> States { return States { descendants: 0, siblings: 0, has: 0, any: 0, wide: false, attributes: false, derived: false } }
 }
 
+/// The subjects of the rules that test a state on an ancestor compound (`.group:hover .label`):
+/// for each key every subject of such a rule carries, the states those rules test. A change of
+/// one of those states on an element restyles the descendants that carry such a key, as a class
+/// change does (`dependencyReach`). `open` are the states some such rule tests whose subjects
+/// share no key, or that it tests through `:has()`: those reach the whole subtree.
+pub struct StateSubjects { pub open: u32, keys: HashMap<u32, u32> }
+
+impl StateSubjects {
+  pub fn make() -> Self { return StateSubjects { open: u32.MAX, keys: HashMap<u32, u32>.make(Hash.seed(5419)) } }
+
+  pub effect fn collect(sheets: &StyleSheets) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut result = StateSubjects.make()
+    result.open = 0
+    let mut i: usize = 0
+    while i < sheets.sheets().length {
+      let sheet = &sheets.sheets()[i].sheet
+      let rules = sheet.resolver.rules()
+      let mut rule: usize = 0
+      while rule < rules.length {
+        let dependencies = sheet.resolver.invalidation(rule)
+        let buffer = &sheet.buffers.asSlice()[rules[rule].buffer]
+        let mut at: usize = 0
+        while at < dependencies.length {
+          let dependency = dependencies[at]
+          at = at + 1
+          if dependency.states == 0 || !dependency.descendants || dependency.subject { continue }
+          let kind = match dependency.subjectKind {
+            SubjectKind.Class => NameKind.Class
+            SubjectKind.Id => NameKind.Id
+            SubjectKind.LocalName => NameKind.Element
+            _ => {
+              result.open = u32.bitOr(result.open, dependency.states)
+              continue
+            }
+          }
+          if dependency.ancestors {
+            result.open = u32.bitOr(result.open, dependency.states)
+            continue
+          }
+          let key = ancestor_filter.key(kind, buffer.text(dependency.subjectName))
+          let held = match result.keys.get(key) { Option.Some { value } => value _ => 0 }
+          drop run result.keys.insert(key, u32.bitOr(held, dependency.states))
+        }
+        rule = rule + 1
+      }
+      i = i + 1
+    }
+    return move result
+  }
+
+  /// The states whose change on an ancestor can restyle an element that carries `key`.
+  pub fn states(self: &Self, key: u32) -> u32 {
+    return match self.keys.get(key) { Option.Some { value } => value _ => 0 }
+  }
+}
+
 /// How far a change reaches beyond the element itself: nothing, the descendants that carry one
-/// of `Extent.keys`, the element's subtree, its parent's subtree or the root.
+/// of `Extent.keys` or a subject key of `Extent.states`, the element's subtree, its parent's
+/// subtree or the root.
 pub enum Reach { None, Descendants, Subtree, Siblings, Root }
 
 const KEYS: u32 = 8
 
 /// What a changed selector input restyles: the element itself when `own`, `reach` from it, and,
 /// when `anchors`, the `:has()` anchors that can see the element. Keys are
-/// `ancestor_filter.key` values of the subjects a `Descendants` reach restyles.
-pub struct Extent { pub reach: Reach, pub anchors: bool, pub own: bool, pub count: u32, pub keys: [u32; 8] }
+/// `ancestor_filter.key` values of the subjects a `Descendants` reach restyles; `states` are
+/// changed states, whose subjects (`StateSubjects`) it restyles as well.
+pub struct Extent { pub reach: Reach, pub anchors: bool, pub own: bool, pub count: u32, pub keys: [u32; 8], pub states: u32 }
 impl Copy for Extent {}
 impl Extent {
-  pub fn none() -> Extent { return Extent { reach: Reach.None, anchors: false, own: false, count: 0, keys: [0; 8] } }
+  pub fn none() -> Extent { return Extent { reach: Reach.None, anchors: false, own: false, count: 0, keys: [0; 8], states: 0 } }
   pub fn of(reach: Reach) -> Extent {
     let mut result = Extent.none()
     result.reach = reach
+    return result
+  }
+  /// The descendants that are subjects of a rule testing one of `states` on an ancestor.
+  pub fn subjects(states: u32) -> Extent {
+    let mut result = Extent.none()
+    result.reach = Reach.Descendants
+    result.states = states
     return result
   }
   pub fn itself() -> Extent {
@@ -132,6 +198,7 @@ impl Extent {
     result.anchors = self.anchors || other.anchors
     result.own = self.own || other.own
     if other.reach == Reach.Descendants {
+      result.states = u32.bitOr(result.states, other.states)
       let mut i: u32 = 0
       while i < other.count {
         result.key(other.keys[u32.toUsize(i)])
