@@ -94,8 +94,8 @@ themeSwitch.addEventListener("click", (event) => {
 });
 const startHint = el({ ...row, gap: 8, position: "absolute", right: 28, top: 0, bottom: 0, fontFamily: MONO, fontSize: 12 }, "edit", file, "to make it yours");
 // The bar at the top is the window's title bar where the system lets the page draw it: the
-// window controls sit at its left, and nothing in it takes clicks.
-const top = el({ ...row, position: "relative", justifyContent: "center", height: 56, flexShrink: 0 },
+// window controls sit at its left, and a press on it moves the window.
+const top = el({ ...row, position: "relative", justifyContent: "center", height: 56, flexShrink: 0, WebkitAppRegion: "drag" },
   el({ ...row, gap: 10, fontWeight: 600, fontSize: 15 }, brandDot, "Silk UI"),
   startHint);
 
