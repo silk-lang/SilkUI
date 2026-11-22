@@ -805,6 +805,9 @@ const SOURCE_PENDING: u8 = 0
 const SOURCE_LOADED: u8 = 1
 const SOURCE_FAILED: u8 = 2
 
+/// How long content must stay still after a scroll before hover follows the pointer again.
+pub const HOVER_SETTLE_SECONDS: f64 = 0.1
+
 /// The retained tree.
 ///
 /// It borrows the fonts it draws with. Each frame: [`UiTree.apply`] the client's batches, call
@@ -976,6 +979,9 @@ pub struct UiTree<'a> {
   quietScrolls: usize,
   /// Frames whose paint was skipped because nothing changed since the last paint.
   pub paintsKept: u64,
+  /// While content scrolls under a still pointer, the frame time at which hover follows it
+  /// again (see `followHover`); negative when no hover update waits.
+  hoverSettleAt: f64,
   /// Of those, the frames that only scrolled: the scene was kept and its scroll positions
   /// moved (see `scrollsWithinLead`). A host draws such a frame by scrolling the last one.
   pub scrollsKept: u64,
@@ -1578,6 +1584,7 @@ impl<'a> UiTree<'a> {
       quietRevision: usize.MAX,
       quietScrolls: usize.MAX,
       paintsKept: 0,
+      hoverSettleAt: -1.0,
       scrollsKept: 0,
       paintedScrolls: List<ScrollPosition>.make(),
       stats: FrameStats.zero(),
@@ -2559,7 +2566,7 @@ impl<'a> UiTree<'a> {
         run identity.setCustom(state, move name, move tokens, important)
         run self.enableInlineScope()
         // The node's variable scope changes: it and what inherits from it, and no selector.
-        self.restyleLocal(slot)
+        self.restyleSelf(slot)
       }
       Mutation.SetStyle { id, state, declarations } => {
         let slot = run self.require(index, id)
@@ -2601,8 +2608,10 @@ impl<'a> UiTree<'a> {
           }
           i = i + 1
         }
-        // A style object changes no selector input: only this node and what inherits from it.
-        self.restyleLocal(slot)
+        // A style object changes no selector input: only this node, and below it the children
+        // whose inherited values or variables change (a row's `top` or a thumb's `transform`
+        // restyles that node alone, not its subtree).
+        self.restyleSelf(slot)
       }
       Mutation.ClearStyle { id, state } => {
         let slot = run self.require(index, id)
@@ -2636,7 +2645,7 @@ impl<'a> UiTree<'a> {
         node.styleNeedsContext = style.requiresContext(node.base.asSlice()) || style.requiresContext(node.hover())
           || style.requiresContext(node.active()) || style.requiresContext(node.focus())
           || style.requiresContext(node.focusVisible()) || style.requiresContext(node.starting())
-        self.restyleLocal(slot)
+        self.restyleSelf(slot)
       }
       Mutation.SetRichText { id, value, marks, atoms } => {
         let slot = run self.requireInput(index, id)
@@ -7723,6 +7732,7 @@ impl<'a> UiTree<'a> {
   /// dispatching input.
   pub fn needsFrame(self: &Self) -> bool {
     return self.applied || self.stylesDirty || self.stylesPending || self.paintDirty || self.scrolled
+      || self.hoverSettleAt >= 0.0
       || cssom_view.scrollAnimating(self)
       || self.textSelection.scrolling
       || scroll_snap.waiting(self)
@@ -7842,11 +7852,12 @@ impl<'a> UiTree<'a> {
     }
 
     // Scrolling and relayout move content under a still pointer: hover follows, and a hover
-    // variant that changes layout is laid out in the same frame.
-    if !self.stats.layoutSkipped || self.scrolled {
+    // variant that changes layout is laid out in the same frame. While content scrolls, hover
+    // waits until the scroll settles (`followHover`).
+    if !self.stats.layoutSkipped || self.scrolled || self.hoverDue() {
       // The hit test prunes by ink and follows stacking when those are current.
-      if self.pointerInside && !self.paintDirty { run self.refreshPaintCaches() }
-      run interact.refreshHover(&mut self)
+      if self.pointerInside && !self.paintDirty && !self.scrolled { run self.refreshPaintCaches() }
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
     }
@@ -8128,7 +8139,7 @@ impl<'a> UiTree<'a> {
       if run interact.settleScrolls(&mut self) {
         run self.layoutFrame()
       }
-      run interact.refreshHover(&mut self)
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
       pass = pass + 1
@@ -8148,7 +8159,7 @@ impl<'a> UiTree<'a> {
       if run interact.settleScrolls(&mut self) {
         run self.layoutFrame()
       }
-      run interact.refreshHover(&mut self)
+      run self.followHover()
       run self.resolveStyles()
       run self.layoutFrame()
       pass = pass + 1
@@ -8236,6 +8247,38 @@ impl<'a> UiTree<'a> {
   /// Whether a mutation or an edit changed styles or layout inputs since the last layout.
   pub fn layoutPending(self: &Self) -> bool {
     return self.stylesDirty || self.stylesPending || self.layout.revision() != self.laidOutRevision
+  }
+
+  /// Whether hover is held while content that scrolled under the pointer settles.
+  pub fn hoverHeld(self: &Self) -> bool {
+    return self.hoverSettleAt >= 0.0
+  }
+
+  /// Whether a hover update held back while content scrolled is due in this frame.
+  fn hoverDue(self: &Self) -> bool {
+    return self.hoverSettleAt >= 0.0 && self.input.time >= self.hoverSettleAt
+  }
+
+  /// Hit tests the pointer again after layout or scrolling moved content under it. While content
+  /// scrolls under a still pointer, hover waits until no scroll has moved it for
+  /// `HOVER_SETTLE_SECONDS`, as browsers hold hover during a scroll: each scrolled frame would
+  /// otherwise restyle the rows that slide under the pointer, run their pointer enter and leave
+  /// handlers (a row's tooltip opening and closing), and with them the layout reads those
+  /// handlers make.
+  effect fn followHover(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.pointerInside {
+      self.hoverSettleAt = -1.0
+      return ()
+    }
+    if self.scrolled {
+      self.hoverSettleAt = self.input.time + HOVER_SETTLE_SECONDS
+      return ()
+    }
+    if self.hoverSettleAt >= 0.0 && !self.hoverDue() { return () }
+    self.hoverSettleAt = -1.0
+    run interact.refreshHover(&mut self)
   }
 
   /// Resolves styles and lays out now, at the last frame's size, so geometry queries between
