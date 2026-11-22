@@ -411,6 +411,12 @@ test("form elements answer instanceof, and tabIndex and disabled reflect their a
     assert.ok(document.createElement(tag) instanceof globalThis[name], tag);
   }
   assert.ok(!(document.createElement("div") instanceof HTMLFieldSetElement));
+  assert.equal(Node.ELEMENT_NODE, 1);
+  assert.equal(Node.TEXT_NODE, 3);
+  assert.equal(Element.ELEMENT_NODE, 1);
+  assert.equal(document.createTextNode("x").nodeType, Node.TEXT_NODE);
+  assert.equal(fieldset.TEXT_NODE, 3);
+  assert.equal(DocumentFragment.DOCUMENT_FRAGMENT_NODE, 11);
   assert.equal(fieldset.disabled, false);
   fieldset.disabled = true;
   assert.equal(fieldset.getAttribute("disabled"), "");
@@ -423,4 +429,9 @@ test("form elements answer instanceof, and tabIndex and disabled reflect their a
   item.tabIndex = -1;
   assert.ok(item.hasAttribute("tabindex"));
   assert.equal(item.tabIndex, -1);
+  const prop = document.createElement("div");
+  prop.setAttribute("tabIndex", 0);
+  assert.ok(prop.hasAttribute("tabindex"), "React's tabIndex prop is the tabindex attribute");
+  prop.removeAttribute("tabIndex");
+  assert.ok(!prop.hasAttribute("tabindex"));
 });

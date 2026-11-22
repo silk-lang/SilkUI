@@ -111,7 +111,7 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse, Align, OverflowAlignment }
 import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
@@ -147,6 +147,7 @@ import live_svg
 import live_svg { LiveSvg }
 import thin { Thin }
 import node {
+  ASKED_UP_SHIFT,
   Move,
   CanvasSurface,
   NodeRare,
@@ -537,6 +538,52 @@ fn defaultDisplay(kind: NodeKind) -> CssDisplay {
     }
     NodeKind.Canvas => CssDisplay.Box { outside: DisplayOutside.Block, inside: DisplayInside.Flow }
   }
+}
+
+/// Form controls lay out their contents as a browser's do, whatever display or align-content
+/// the app gives them. An input's text flows in one block (the inner editor); a one-line
+/// input centers it in the block axis even when it overflows, as Chromium does. A button,
+/// a select and a button-typed input center their contents unless they overflow (the HTML
+/// rendering's anonymous button content box), except as flex or grid containers.
+fn controlLayout(node: &Node, style: CssStyle) -> CssStyle {
+  let mut used = style
+  match style.display {
+    CssDisplay.Box { outside, inside } => {
+      if node.kind == NodeKind.Input {
+        used.display = CssDisplay.Box { outside: outside, inside: DisplayInside.FlowRoot }
+        if !node.edit().multiline {
+          used.alignContent = Align.Center
+          used.alignContentSafety = OverflowAlignment.Unsafe
+        }
+      } else if node.kind == NodeKind.Box && (inside == DisplayInside.Flow || inside == DisplayInside.FlowRoot) && buttonLike(node) {
+        used.display = CssDisplay.Box { outside: outside, inside: DisplayInside.FlowRoot }
+        used.alignContent = Align.Center
+        used.alignContentSafety = OverflowAlignment.Safe
+      }
+    }
+    _ => {}
+  }
+  return used
+}
+
+fn buttonLike(node: &Node) -> bool {
+  let identity = match node.identity() {
+    Option.Some { value } => value
+    Option.None => { return false }
+  }
+  let tag = identity.tag()
+  if tag == "button" || tag == "select" { return true }
+  if tag != "input" { return false }
+  let attributes = identity.attributes()
+  let mut i: usize = 0
+  while i < attributes.length {
+    if String.view(&attributes[i].name) == "type" {
+      let kind = String.view(&attributes[i].value)
+      return kind == "button" || kind == "submit" || kind == "reset"
+    }
+    i = i + 1
+  }
+  return false
 }
 
 effect fn invalidInitial(error: CssError) -> Value {
@@ -2323,6 +2370,10 @@ impl<'a> UiTree<'a> {
     }
     let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
     let mut change = self.stateReach(slot, mask)
+    // A press flips the state of every ancestor up to the root: only those some other node's
+    // match asked about can change what their subtree or siblings compute.
+    let asked = if state == StyleState.Hover { css_element.WATCH_HOVER } else { css_element.WATCH_ACTIVE }
+    if u32.bitAnd(node.styleWatch, asked) == 0 { change.reach = Reach.None }
     // The node's own looks and variables change what it and its subtree compute, no selector.
     if inline || custom { change.reach = style_invalidation.wider(change.reach, Reach.Subtree) }
     self.restyleExtent(slot, change)
@@ -5957,6 +6008,22 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  effect fn mayGenerate(self: &mut Self, origin: u32, target: PseudoTarget) -> bool
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    if at == usize.MAX { return true }
+    let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
+    let entries = roots.asMutSlice()
+    let result = run Effect.result(style_sheets.mayGenerate(&mut entries[at].sheets, &self, origin, target))
+    self.styleSheets = move roots
+    match move result {
+      Result<bool, ResolverError | CssError | OutOfMemoryError>.Success { value } => { return value }
+      Result<bool, ResolverError | CssError | OutOfMemoryError>.Failure { error: why } => {
+        match move why { OutOfMemoryError {} => { fail OutOfMemoryError {} } _ => { return true } }
+      }
+    }
+  }
+
   effect fn installResolved(self: &mut Self, slot: u32, resolvedStyle: Resolved) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let mut value = move resolvedStyle
@@ -6000,11 +6067,13 @@ impl<'a> UiTree<'a> {
         let class = self.node(twin).styleClass
         // An equal node is asked the same of itself; the twin's own match asked no other node.
         let watch = self.node(twin).styleWatch
+        let askedUp = u32.shiftRight(watch, ASKED_UP_SHIFT)
         let node = self.nodeMut(slot)
         node.resolvedSheet = move shared
         node.styleClass = class
         node.styleTwin = twin
-        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, 7), watch)
+        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, css_element.WATCH_ASKED), watch)
+        if askedUp != 0 { self.askUp(slot, askedUp) }
         self.work.sheetTwins = self.work.sheetTwins + 1
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
         return ()
@@ -6016,7 +6085,7 @@ impl<'a> UiTree<'a> {
     let fresh = self.nodeMut(slot)
     fresh.styleClass = class
     fresh.styleTwin = NONE
-    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, 7)
+    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, css_element.WATCH_ASKED)
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
@@ -6060,12 +6129,25 @@ impl<'a> UiTree<'a> {
       self.work.watchOverflows = self.work.watchOverflows + 1
       self.work.lastOverflow = u32.toUsize(slot)
     }
-    let nodes = self.nodes.asMutSlice()
+    let pointer = css_element.WATCH_HOVER | css_element.WATCH_ACTIVE
     let mut i: usize = 0
     while i < watched.length {
       let at = watched[i].node
+      if at != u32.toUsize(slot) {
+        let depth = if u32.bitAnd(watched[i].bits, u32.bitNot(pointer)) == 0 { self.depthAbove(slot, usize.toU32(at)) } else { 0 }
+        if depth == 0 { outside = true }
+        else {
+          let own = self.nodeMut(slot)
+          own.styleWatch = u32.bitOr(own.styleWatch, u32.shiftLeft(1, ASKED_UP_SHIFT + depth - 1))
+        }
+      }
+      i = i + 1
+    }
+    let nodes = self.nodes.asMutSlice()
+    i = 0
+    while i < watched.length {
+      let at = watched[i].node
       nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, watched[i].bits)
-      if at != u32.toUsize(slot) { outside = true }
       if u32.bitAnd(watched[i].bits, css_element.WATCH_HAS_SIBLINGS) != 0 { siblings = true }
       i = i + 1
     }
@@ -6082,11 +6164,37 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// How many levels above `slot` its ancestor `other` is, or zero when it is not one within 16.
+  fn depthAbove(self: &Self, slot: u32, other: u32) -> u32 {
+    let mut up = self.node(slot).parent
+    let mut depth: u32 = 1
+    while up != NONE && depth <= 16 {
+      if up == other { return depth }
+      up = self.node(up).parent
+      depth = depth + 1
+    }
+    return 0
+  }
+
+  /// Flags the ancestors of `slot` that `askedUp` names as asked their pointer states.
+  fn askUp(self: &mut Self, slot: u32, askedUp: u32) -> () {
+    let mut up = self.node(slot).parent
+    let mut depth: u32 = 0
+    while up != NONE && depth < 16 {
+      if u32.bitAnd(askedUp, u32.shiftLeft(1, depth)) != 0 {
+        let node = self.nodeMut(up)
+        node.styleWatch = u32.bitOr(node.styleWatch, css_element.WATCH_HOVER | css_element.WATCH_ACTIVE)
+      }
+      up = self.node(up).parent
+      depth = depth + 1
+    }
+  }
+
   /// Flags every element a match for `slot` can have watched when it watched more than a match
   /// context holds: combinators only step to parents and earlier siblings, so those are `slot`,
   /// its ancestors and the elements before each of them.
   fn watchAround(self: &mut Self, slot: u32) -> () {
-    let bits = css_element.WATCH_HAS | css_element.WATCH_HAS_SIBLINGS | css_element.WATCH_FOCUS_WITHIN
+    let bits = css_element.WATCH_ASKED
     let mut up = slot
     while up != NONE {
       let mut beside = up
@@ -6240,7 +6348,8 @@ impl<'a> UiTree<'a> {
       }
       let mut prepared = Option<Resolved>.None
       let mut content = Option<String>.None
-      if enabled {
+      // A pseudo-element with no box yet keeps none unless something may give it content.
+      if enabled && (old != NONE || run self.mayGenerate(origin, target)) {
         let rendered = old != NONE && style_change.rendered(&self, old)
         let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
         let mut counted = false
@@ -7422,8 +7531,9 @@ impl<'a> UiTree<'a> {
     if !tick && kind == NodeKind.Text && simpleStyles { run self.keepTextInherit(slot) }
     if kind != NodeKind.Text {
       // css-layout leaves the node clean when the style is the one it already has.
+      let used = controlLayout(self.node(slot), computed.layout)
       run Effect.catchAll(
-        self.layout.setStyle(NodeId { index: css }, computed.layout),
+        self.layout.setStyle(NodeId { index: css }, used),
         layoutFailed,
       )
       if computed.contain.automatic() != self.layout.automatic(css) {
@@ -8370,6 +8480,21 @@ impl<'a> UiTree<'a> {
     if self.hoverSettleAt >= 0.0 && !self.hoverDue() { return () }
     self.hoverSettleAt = -1.0
     run interact.refreshHover(&mut self)
+  }
+
+  /// Resolves styles now without laying out, for reads of computed values. A container query
+  /// makes styles depend on layout, so with one this lays out too.
+  pub effect fn stylesNow(self: &mut Self) -> ()
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.containerWatches.length() != 0 {
+      if self.layoutPending() { run self.layoutNow() }
+      return ()
+    }
+    if !self.stylesDirty && !self.stylesPending && self.cssWidth() == self.unitsWidth && self.cssHeight() == self.unitsHeight { return () }
+    style_change.begin(&mut self)
+    run self.resolveStyles()
+    run self.finishStyleChange()
   }
 
   /// Resolves styles and lays out now, at the last frame's size, so geometry queries between

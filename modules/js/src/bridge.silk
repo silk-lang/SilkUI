@@ -31,6 +31,7 @@ import ui_tree.battery
 import ui_tree.battery { BatteryState }
 import generated_web_apis { webApis }
 import generated_clipboard { clipboardApi }
+import ui_tree.error { ProtocolError }
 import ui_tree.legacy { Batch, Attribute, Mutation, Keyframe, Atom, VirtualOptions, VirtualItem, UiTree, TreeError }
 import ui_tree.computed_style
 import ui_tree.cssom_view
@@ -42,6 +43,12 @@ import svg_css.cssom_view { ScrollToOptions, ScrollIntoViewOptions, ScrollLogica
 import svg_css.cssom_view_window { ScrollRequest }
 import svg_css.cssom_geometry { DOMRect }
 import svg_css.cssom_error { CssomError }
+import svg_css.colors
+import svg_css.colors { Color, Context }
+import svg_css.lexer
+import svg_css.input { Input }
+import svg_css.value_cursor { Cursor }
+import svg_css.tokens { Limits }
 import ui_tree.query { Query }
 import silk.mem.pointer { Pointer }
 import silkjs.js_engine { Engine }
@@ -231,6 +238,10 @@ pub const CANVAS2D_TEXT: u32 = 1011478 // nativeId(b"canvas2dText")
 pub const CANVAS2D_READ: u32 = 951167 // nativeId(b"canvas2dRead")
 /// `__ui.canvas2dEnabled()`: whether the host shows 2D canvases (`getContext("2d")` works).
 pub const CANVAS2D_ENABLED: u32 = 415108 // nativeId(b"canvas2dEnabled")
+/// `__ui.canvas2dColor(text)`: CSS color `text` as sRGB, for `fillStyle` syntax `canvas2d.js` does
+/// not read itself (`oklch()`, `lab()`, `color()`, `color-mix()`, system colors). Returns 4 and
+/// leaves red, green, blue and alpha from 0 to 1 for `__ui.geometry`, or 0 when it is not a color.
+pub const CANVAS2D_COLOR: u32 = 344769 // nativeId(b"canvas2dColor")
 /// `__ui.imageDecode(bytes)`: decodes the PNG or JPEG file in typed array `bytes`, for
 /// `createImageBitmap`. Returns 2 and leaves the width and height for `__ui.geometry`, or 0 for
 /// data it cannot decode. The pixels wait for `__ui.imageTake`.
@@ -795,6 +806,7 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"caret", arity: 2 },
     Native { name: b"canvas2d", arity: 1 },
     Native { name: b"canvas2dApi", arity: 0 },
+    Native { name: b"canvas2dColor", arity: 1 },
     Native { name: b"canvas2dEnabled", arity: 0 },
     Native { name: b"canvas2dRead", arity: 6 },
     Native { name: b"canvas2dText", arity: 2 },
@@ -1151,6 +1163,19 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     return Outcome.Returned { value: ValueBits.Bool { value: bridge.gpuEnabled } }
   } else if function == CANVAS2D_ENABLED {
     return Outcome.Returned { value: ValueBits.Bool { value: bridge.canvas2dEnabled } }
+  } else if function == CANVAS2D_COLOR {
+    let value = run text(argv.get(0))
+    bridge.geometry.clear()
+    if let Option<Color>.Some { value: color } = run cssColor(String.utf8Bytes(String.view(&value))) {
+      // currentcolor is black on a canvas without an element style to read.
+      let srgb = colors.toSrgb(colors.compute(color, &Context.make(Color.srgb(0.0, 0.0, 0.0, 1.0), [Color.srgb(0.0, 0.0, 0.0, 1.0); 19])))
+      run bridge.geometry.append(srgb.r)
+      run bridge.geometry.append(srgb.g)
+      run bridge.geometry.append(srgb.b)
+      run bridge.geometry.append(srgb.a)
+      return Outcome.Returned { value: ValueBits.number(4.0) }
+    }
+    return Outcome.Returned { value: ValueBits.number(0.0) }
   } else if function == GPU_REPLY {
     let replies = bridge.gpuReplies.asSlice()
     let at = u32.toUsize(first)
@@ -1636,9 +1661,8 @@ effect fn computed<'v>(bridge: &mut Bridge, id: u32, name: ValueRef<'v>) -> Outc
     Result<bool, TreeError | OutOfMemoryError>.Failure { error } => match move error {
       OutOfMemoryError allocation => { fail move allocation }
       TreeError invalid => {
-        drop invalid
         let mut message = List<u8>.make()
-        run message.appendSlice(b"the tree refused a mutation before getComputedStyle")
+        run refused(&mut message, b"the tree refused a mutation before getComputedStyle: ", invalid)
         return Outcome.TypeError { message: move message }
       }
     }
@@ -1665,9 +1689,8 @@ effect fn selectionText(bridge: &mut Bridge) -> Outcome ! OutOfMemoryError ? &mu
     Result<String, TreeError | OutOfMemoryError>.Failure { error } => match move error {
       OutOfMemoryError allocation => { fail move allocation }
       TreeError invalid => {
-        drop invalid
         let mut message = List<u8>.make()
-        run message.appendSlice(b"the tree refused a mutation before reading the selection")
+        run refused(&mut message, b"the tree refused a mutation before reading the selection: ", invalid)
         return Outcome.TypeError { message: move message }
       }
     }
@@ -1709,9 +1732,8 @@ effect fn query<'v>(bridge: &mut Bridge, mode: u32, id: u32, selector: ValueRef<
       Result<(), TreeError | OutOfMemoryError>.Failure { error } => match move error {
         OutOfMemoryError allocation => { fail move allocation }
         TreeError invalid => {
-          drop invalid
           let mut message = List<u8>.make()
-          run message.appendSlice(b"the tree refused a mutation before a selector query")
+          run refused(&mut message, b"the tree refused a mutation before a selector query: ", invalid)
           return Outcome.TypeError { message: move message }
         }
       }
@@ -1752,6 +1774,13 @@ effect fn writeDecimal(out: &mut Bytes, value: u32) -> () ! OutOfMemoryError ? &
     count = count - 1
     run out.append(Slice.view<u8>(&digits, count, 1))
   }
+}
+
+/// `message` with `prefix` and which mutation the tree refused, and why.
+effect fn refused(message: &mut List<u8>, prefix: &[u8], error: TreeError) -> () ! OutOfMemoryError ? &mut Allocator {
+  run message.appendSlice(prefix)
+  let detail = run ProtocolError.lift(error).message()
+  run message.appendSlice(detail.ownedUtf8Bytes())
 }
 
 effect fn applyAndRead(batch: &mut Batch, tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes) -> bool
@@ -1853,4 +1882,21 @@ impl EngineServices for Bridge {
       _ => Intrinsic.trap("the module compiler returned something else")
     }
   }
+}
+
+/// CSS color `text`, or none when it is not exactly one color.
+effect fn cssColor(text: &[u8]) -> Option<Color> ! OutOfMemoryError ? &mut Allocator {
+  let limits = Limits.make()
+  let buffer = match move run Effect.result(lexer.tokenize(text, &limits)) {
+    Result.Success { value } => move value
+    Result.Failure { error } => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      _ => { return Option<Color>.None }
+    }
+  }
+  let source = Input.Contiguous { buffer: &buffer, range: buffer.all() }
+  let mut cursor = Cursor.make(&source)
+  let parsed = run colors.parse(&source, &mut cursor)
+  if !cursor.done(&source) { return Option<Color>.None }
+  return parsed
 }
