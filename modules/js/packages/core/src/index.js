@@ -4241,8 +4241,14 @@ let rootNode = null;
 // What events pass above the root, outermost last: the document and the window of a DOM layer
 // over the tree (`@silkui/core/globals`). Each has `_run(event, capture)` as a node does.
 let outerTargets = [];
-// Events the web does not send on to the document and the window.
-const NOT_OUTER = new Set(["scroll", "layout", "load", "error"]);
+// The targets above the root on the path of an event of `type`, as DOM's "get the parent"
+// gives them: the document for every event, and the window for all but `load`. An event that
+// does not bubble (`scroll`, `error`) still passes them in the capture phase. `layout` is the
+// tree's own and stays in it.
+function outerPath(type) {
+  if (type === "layout") return [];
+  return type === "load" ? outerTargets.slice(0, 1) : outerTargets;
+}
 
 /** Has events that reach the root go on to `targets` (outermost last), as `@silkui/core/globals` does for `document` and `window`. */
 export function setOuterTargets(...targets) {
@@ -4415,7 +4421,7 @@ export class Event {
   composedPath() {
     const path = [];
     for (let node = this.target; node; node = node.parentNode) path.push(node);
-    if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(this.type)) path.push(...outerTargets);
+    if (outerTargets.length && path[path.length - 1] === rootNode) path.push(...outerPath(this.type));
     return path;
   }
 }
@@ -4608,7 +4614,7 @@ export function dispatchEvent(event) {
 function dispatchThrough(event) {
   const path = [];
   for (let node = event.target; node; node = node.parentNode) path.push(node);
-  if (outerTargets.length && path[path.length - 1] === rootNode && !NOT_OUTER.has(event.type)) path.push(...outerTargets);
+  if (outerTargets.length && path[path.length - 1] === rootNode) path.push(...outerPath(event.type));
   for (let i = path.length - 1; i > 0 && !event._stopped; i--) {
     event.eventPhase = 1;
     event.currentTarget = path[i];
