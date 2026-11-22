@@ -56,6 +56,8 @@ import silkjs.js_intl_common as common
 import silkjs.js_eval as evaluation
 import silkjs.js_errors as errors
 import silkjs.js_runtime as engineRuntime
+import silkjs.js_census as engineCensus
+import silkjs.js_census { Rows as CensusRows }
 import silkjs.js_eval_compile as compilerFinish
 import silkjs.js_heap { HeapHeader }
 import silkjs.js_eval_compile as flags
@@ -158,6 +160,9 @@ pub struct NodeApp<'r, 'e, 'm, C> {
   settled: usize,
   /// Whether SILK_UI_TRACE_JS asked for a line for each quiet moment that did something.
   quietTraced: bool,
+  /// Whether SILK_UI_TRACE_JS=census asked for the engine's census of the heap after each
+  /// quiet moment that collected: what the live JavaScript memory is made of.
+  censusTraced: bool,
   /// Functions compiled as far as a stub and never called, each with a reference of this
   /// list's: quiet moments finish them a step at a time ([`FINISH_STEP`]).
   waiting: List<*mut HeapHeader>,
@@ -176,6 +181,10 @@ const FINISH_STEP: usize = 512
 /// taken down. A full collection walks the whole heap, so a large application pays for one
 /// only after a change of its own size; smaller changes are the engine's own business.
 const RELEASE_MOVED_BYTES: usize = 4194304
+/// The most idle memory a quiet moment leaves with the engine for what comes next. An eighth
+/// of what is in use, uncapped, kept everything a collection freed in a large heap: 75 MB of
+/// a 600 MB one.
+const RELEASE_RESERVE_BYTES: usize = 8388608
 
 
 impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
@@ -189,7 +198,7 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
 
   /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
   pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None, settled: 0, quietTraced: false, waiting: List<*mut HeapHeader>.make(), searched: false }
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None, settled: 0, quietTraced: false, censusTraced: false, waiting: List<*mut HeapHeader>.make(), searched: false }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
@@ -202,7 +211,8 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
   /// waits for a later step ([`NodeApp.finishing`]). Then a full collection when the heap
   /// moved enough since the last one ([`RELEASE_MOVED_BYTES`]) or `shed` says a large
   /// subtree went, and the pooled arenas left wholly idle go back to the system, keeping an
-  /// eighth of what is in use for what comes next. What parsing and starting a large bundle
+  /// eighth of what is in use for what comes next, [`RELEASE_RESERVE_BYTES`] at most. What
+  /// parsing and starting a large bundle
   /// left behind goes this way.
   effect fn releaseIdle(self: &mut Self, shed: bool) -> () ? &mut Allocator {
     let context = self.runtime.rawContext()
@@ -228,10 +238,26 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     let collected = shed || changed
     if collected { drop run unsafe engineRuntime.triggerGC(memory, &mut engine.*, heap, 0, true) }
     let live = memory.usedBytes()
-    let released = unsafe engineRuntime.releaseIdle(memory, heap, live / 8)
+    let reserve = if live / 8 < RELEASE_RESERVE_BYTES { live / 8 } else { RELEASE_RESERVE_BYTES }
+    let released = unsafe engineRuntime.releaseIdle(memory, heap, reserve)
     if collected { self.settled = live }
     if self.quietTraced && (collected || released != 0) {
       StderrWriter.print("silkui: quiet, javascript used {} then {} bytes, {} released\n", &(used, live, released))
+    }
+    if self.censusTraced && collected {
+      // Without memory for the rows there is no census this time.
+      let mut rows = CensusRows.make()
+      if let Result.Success { .. } = run Effect.result(unsafe engineCensus.collect(heap, memory, &mut rows)) {
+        let names = rows.names.asSlice()
+        let values = rows.values.asSlice()
+        let mut index: usize = 0
+        while index < names.length {
+          let kind = values[index * 4]
+          let label = if kind == engineCensus.HELD { "held" } else if kind == engineCensus.UNIT { "unit" } else { "work" }
+          StderrWriter.print("silkui: js census {} {} {} {} {}\n", &(names[index], label, values[index * 4 + 1], values[index * 4 + 2], values[index * 4 + 3]))
+          index = index + 1
+        }
+      }
     }
   }
 
@@ -1142,7 +1168,12 @@ impl<'f> Host for NodeWindow<'f> {
       run app.entry(self.name.asSlice(), self.source.asSlice())
     }
     self.source = List<u8>.make()
-    app.quietTraced = (run environmentVariable("SILK_UI_TRACE_JS")).isSome()
+    let jsTrace = run environmentVariable("SILK_UI_TRACE_JS")
+    app.quietTraced = jsTrace.isSome()
+    app.censusTraced = match &jsTrace {
+      Option<String>.Some { value } => value.view() == "census"
+      Option<String>.None => false
+    }
     // The entry's first turn: its imports and top-level code run before the first frame.
     run app.turn(0.0)
     if tracing { StderrWriter.print("silkui: bundle ready\n", &()) }
