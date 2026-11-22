@@ -1475,7 +1475,13 @@ impl<'a> UiTree<'a> {
     run self.layout.census(&mut out)
     run self.output.census(&mut out)
     run self.provider.text.census(&mut out)
-    // Work.
+    run self.censusWork(&mut out)
+  }
+
+  /// The work rows of `census` alone: counts since the tree was made, cheap enough to read
+  /// between inputs (the inspector's `stats`).
+  pub effect fn censusWork(self: &Self, out: &mut Census) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
     let w = &self.work
     run out.work("frames", w.frames)
     run out.work("frames.styled", w.styleFrames)
@@ -1503,6 +1509,18 @@ impl<'a> UiTree<'a> {
     run out.work("style.resolves", w.resolves)
     run out.work("style.resolves.ticks", w.ticks)
     run out.work("style.scope-moves", w.scopeMoves)
+    run out.work("style.resolves.cause.full-pass", w.resolveCauses[0])
+    run out.work("style.resolves.cause.root-font-changed", w.resolveCauses[1])
+    run out.work("style.resolves.cause.parent-inherited-values-changed", w.resolveCauses[2])
+    run out.work("style.resolves.cause.reached-through-selectors", w.resolveCauses[3])
+    run out.work("style.resolves.cause.own-change", w.resolveCauses[4])
+    run out.work("style.resolves.cause.scope.also-dirty", w.resolveCauses[5])
+    run out.work("style.resolves.cause.scope.a-part-reads-variables", w.resolveCauses[6])
+    run out.work("style.resolves.cause.scope.no-sheet-style", w.resolveCauses[7])
+    run out.work("style.resolves.cause.scope.reads-any-variable", w.resolveCauses[8])
+    run out.work("style.resolves.cause.scope.reads-a-differing-variable", w.resolveCauses[9])
+    run out.work("style.resolves.cause.scope.first-letter", w.resolveCauses[10])
+    run out.work("style.resolves.cause.scope.all-variables-may-differ", w.resolveCauses[11])
     run out.work("style.sheet.skipped(text or no sheet)", w.sheetSkips)
     run out.work("style.sheet.from-twin", w.sheetTwins)
     run out.work("style.sheet.matched", w.sheetMatches)
@@ -7038,6 +7056,10 @@ impl<'a> UiTree<'a> {
         let containment = node.computed().contain.query()
         let skips = node.computed().contain.hidden()
         run self.prepareFilter(slot)
+        if !tick {
+          let cause = self.resolveCause(slot, full, rootFontChanged, entry, differs)
+          self.work.resolveCauses[cause] = self.work.resolveCauses[cause] + 1
+        }
         let namesChanged = run self.resolve(slot, tick)
         self.stats.styledNodes = self.stats.styledNodes + 1
         if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
@@ -7157,6 +7179,25 @@ impl<'a> UiTree<'a> {
     let reads = match node.sheetStyle() { Option.Some { value } => value.variables _ => { return false } }
     if u64.bitAnd(reads, differs) != 0 { return false }
     return match node.identity() { Option.Some { value } => value.letterBox == NONE && !value.letterRules _ => true }
+  }
+
+  /// Why the node at `slot` resolves in this pass, as an index into `Work.resolveCauses`: the
+  /// first reason of the pass's own order, and under a parent's change of scope the first thing
+  /// that kept it from moving (`movesScope`).
+  fn resolveCause(self: &Self, slot: u32, full: bool, rootFontChanged: bool, entry: u64, differs: u64) -> usize {
+    if full { return 0 }
+    if rootFontChanged { return 1 }
+    if u64.bitAnd(entry, 0x100000000) != 0 { return 2 }
+    if u64.bitAnd(entry, 0x200000000) != 0 { return 3 }
+    if u64.bitAnd(entry, 0x400000000) == 0 { return 4 }
+    let node = self.node(slot)
+    if node.styleDirty { return 5 }
+    if !node.variableFree { return 6 }
+    let reads = match node.sheetStyle() { Option.Some { value } => value.variables _ => { return 7 } }
+    if differs == u64.MAX { return 11 }
+    if reads == u64.MAX { return 8 }
+    if u64.bitAnd(reads, differs) != 0 { return 9 }
+    return 10
   }
 
   /// Moves the node at `slot` under its parent's new variable scope, keeping its style: the
