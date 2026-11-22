@@ -4933,6 +4933,18 @@ function focusing(target) {
   pendingFocusOut = null;
   if (left) focusEvent("focusout", left, target);
   else blurredNode = null;
+  caretInto(target);
+}
+
+// An editing host that takes focus with the selection outside it gets a caret at its start,
+// as a browser gives one, so the first edit has a place (a click places its own after).
+function caretInto(target) {
+  if (target instanceof Input || editingHostOf(target) !== target) return;
+  const selection = getSelection();
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  if (range && target.contains(range.startContainer) && target.contains(range.endContainer)) return;
+  const [node, offset] = startIn(target);
+  selection.collapse(node, offset);
 }
 
 // HTML defaults of a click: a checkbox or radio checks, a label passes the click on to its
