@@ -22,8 +22,9 @@ product once.
 ```sh
 silk init my-app -t ui-react  # or ui-loom, ui-foldkit, ui-js
 cd my-app
-silk task dev                 # opens the app in a window, reloading as you edit
-silk task build --release     # writes the release program to dist/window/
+silk dev                      # opens the app in a window, reloading as you edit
+silk build --release          # builds the release program into build/
+silk build --release --out dist  # and copies it to dist/window/
 ```
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and

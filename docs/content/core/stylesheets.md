@@ -53,7 +53,7 @@ h.box(
 }
 ```
 
-`silk task dev` watches configured sheets and replaces their rules without resetting application state. A missing or invalid update keeps the previous sheet until a valid replacement arrives. Editing Silk code still rebuilds the application.
+`silk dev` watches configured sheets and replaces their rules without resetting application state. A missing or invalid update keeps the previous sheet until a valid replacement arrives. Editing Silk code still rebuilds the application.
 
 ## Classes and inline styles
 
@@ -84,7 +84,7 @@ The quickest way is a template that has everything below in place:
 ```sh
 silk init my-app -t ui-loom-tailwind
 cd my-app
-silk task dev
+silk dev
 ```
 
 `ui-react-tailwind`, `ui-foldkit-tailwind` and `ui-js-tailwind` do the same for JavaScript apps.
@@ -125,20 +125,20 @@ silk task dev
    let processor = Tailwind.make("styles/input.css", "styles/app.css")
    match move self {
      // Builds the CSS, then keeps Tailwind watching while the app runs.
-     Tasks.Dev { platform: _, options } => run processor.watching(app()
+     Tasks.Dev { options } => run processor.watching(app()
        |> App.dev(&options)
        |> Built.launch()
        |> Running.watch())
-     Tasks.Build { platform: _, options } => {
+     Tasks.Build { options, out } => {
        drop run processor.build()
-       run app() |> App.build(&options) |> Built.write("dist")
+       run app() |> App.build(&options) |> Built.write(out.view())
      }
    }
    ```
 
 5. Add `styles/app.css` to `.gitignore`: it is build output.
 
-6. Use classes in the view, and run `silk task dev`. Saving a Silk file adds its new classes to the sheet, and the running app takes the new sheet without losing its state.
+6. Use classes in the view, and run `silk dev`. Saving a Silk file adds its new classes to the sheet, and the running app takes the new sheet without losing its state.
 
 The [Tailwind step's page](https://github.com/silk-lang/SilkUI/tree/main/modules/tailwind) covers musl Linux, a project in a subfolder and updating the pinned version.
 

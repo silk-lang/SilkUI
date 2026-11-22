@@ -22,9 +22,19 @@
 //! // The Metal Performance HUD over the window on macOS: presented fps and frame times.
 //!   .metalHud(true)
 //!
-//! run app() |> App.only(target) |> App.dev(&options) |> Built.launch() |> Running.watch()
-//! run app() |> App.only(target) |> App.build(&options) |> Built.write("dist")
+//! run app() |> App.dev(&options) |> Built.launch() |> Running.watch()
+//! run app() |> App.build(&options) |> Built.write(out)
 //! ```
+//!
+//! `--target` picks where it runs: a platform name (`window`, `web-canvas`, `web-dom`) keeps only
+//! that target of the app, and a triple such as `aarch64-apple-darwin` builds the window host for
+//! it. With no platform named, every target of the app is built.
+//!
+//! A build keeps its files where the compiler keeps any program's, by triple and mode: the window
+//! host at `build/<triple>/<mode>/<name>` with its working files in
+//! `build/<triple>/<mode>/silkui/window/`, and a page in
+//! `build/wasm32-unknown-unknown/<mode>/pages/<platform>/`. A development host's folders end in
+//! `-dev`, and its program in `-dev`, so it never replaces the build of the same mode.
 //!
 //! A project's own step is a function of the same shape, `effect fn sign<'env, E, ?R>(built:
 //! once Effect<'env; Built ! E ? R>) -> Built ! … ? …`, placed in the chain. `tap` and `map`
@@ -129,7 +139,8 @@ pub struct Page {
 
 impl Copy for Page {}
 
-/// Where an app runs. Its id names it in `--platform`, in `build/pages/<id>/` and in `dist/<id>/`.
+/// Where an app runs. Its id names it in `--target`, in its build folders and in the folder
+/// [`Built.write`] copies it to.
 pub union Target {
   /// A desktop window (`window`).
   Window { pub window: Window, pub bar: TitleBar, pub hud: bool },
@@ -624,22 +635,159 @@ effect fn nativesModule(project: &Project) -> String
   return move out
 }
 
-/// Where a generated host's compiled stylesheets and, for a web target, its page are written.
-effect fn hostDirectory(project: &Project, target: Target) -> String
+/// Where a generated host's compiled stylesheets and, for a web target, its page are written:
+/// `build/<triple>/<mode>/silkui/<id>` for the window, `build/wasm32-unknown-unknown/<mode>/pages/<id>`
+/// for a page, `<id>-dev` for a development host. The mode is the compiler's name for the
+/// requested optimization.
+effect fn hostDirectory(project: &Project, options: &Options, dev: bool, target: Target) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
-  let base = run fromRoot(project, if target.web() { "build/pages" } else { "build/silkui" })
-  return run joined(base.view(), target.id())
+  let triple = if target.web() {
+    run String.copy("wasm32-unknown-unknown")
+  } else if options.target.length() != 0 {
+    run String.copy(options.target.asSlice()[0].view())
+  } else {
+    run hostTriple()
+  }
+  let mode = if options.optimize == Optimize.None {
+    "dev"
+  } else if options.optimize == Optimize.Size {
+    "size"
+  } else {
+    "release"
+  }
+  let build = run fromRoot(project, "build")
+  let targeted = run joined(build.view(), triple.view())
+  let moded = run joined(targeted.view(), mode)
+  let base = run joined(moded.view(), if target.web() { "pages" } else { "silkui" })
+  let mut leaf = run String.copy(target.id())
+  if dev {
+    run leaf.append("-dev")
+  }
+  return run joined(base.view(), leaf.view())
+}
+
+const HOST_SYSTEM: string<'static> = Intrinsic.targetOperatingSystem()
+const HOST_ARCHITECTURE: string<'static> = Intrinsic.targetArchitecture()
+const HOST_ABI: string<'static> = Intrinsic.targetAbi()
+
+/// The triple of the machine the tasks run on, as the compiler names its build folder.
+effect fn hostTriple() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut triple = run String.copy(HOST_ARCHITECTURE)
+  if HOST_SYSTEM == "darwin" {
+    run triple.append("-apple-darwin")
+  } else if HOST_SYSTEM == "windows" {
+    run triple.append("-pc-windows-")
+    run triple.append(HOST_ABI)
+  } else {
+    run triple.append("-unknown-")
+    run triple.append(HOST_SYSTEM)
+    run triple.append("-")
+    run triple.append(HOST_ABI)
+  }
+  return move triple
+}
+
+/// Whether `word`, a `--target` value, names a platform rather than a triple.
+fn platformName(word: string) -> bool {
+  return word == "window" || word == "web-canvas" || word == "web-dom"
+}
+
+/// `options` with only the triples of its `--target` values: the platform names select targets
+/// ([`chosen`]).
+effect fn triplesOnly(options: &Options) -> Options
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = run copyOptions(options)
+  let mut kept = List<String>.make()
+  while copied.target.length() > 0 {
+    let word = copied.target.remove(0)
+    if !platformName(word.view()) {
+      run kept.append(move word)
+    }
+  }
+  copied.target = move kept
+  return move copied
+}
+
+/// The app's targets that the platform names in `options` select, in the app's order, or all of
+/// them when it names none. Fails naming the app's targets when one named is not among them.
+effect fn chosen(app: &App, options: &Options) -> List<Target>
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let all = app.places.asSlice()
+  let words = options.target.asSlice()
+  let mut named: usize = 0
+  let mut at: usize = 0
+  while at < words.length {
+    let word = words[at].view()
+    let triple = String.startsWith(word, "x86_64-") || String.startsWith(word, "aarch64-")
+      || String.startsWith(word, "wasm32-") || String.startsWith(word, "wasm64-")
+    if !platformName(word) && !triple {
+      let mut message = run String.copy("silkui: --target ")
+      run String.append(&mut message, word)
+      run String.append(&mut message, " is not a platform (window, web-canvas, web-dom) or a target triple")
+      fail TaskError { message: move message, status: 2 }
+    }
+    if platformName(words[at].view()) {
+      named = named + 1
+      let mut found = false
+      let mut place: usize = 0
+      while place < all.length {
+        if all[place].id() == words[at].view() {
+          found = true
+        }
+        place = place + 1
+      }
+      if !found {
+        let mut message = run String.copy("silkui: the app has no target ")
+        run String.append(&mut message, words[at].view())
+        run String.append(&mut message, "; it has ")
+        if all.length == 0 {
+          run String.append(&mut message, "none")
+        }
+        let mut listed: usize = 0
+        while listed < all.length {
+          if listed > 0 {
+            run String.append(&mut message, ", ")
+          }
+          run String.append(&mut message, all[listed].id())
+          listed = listed + 1
+        }
+        fail TaskError { message: move message, status: 2 }
+      }
+    }
+    at = at + 1
+  }
+  let mut kept = List<Target>.make()
+  let mut place: usize = 0
+  while place < all.length {
+    let mut wanted = named == 0
+    let mut word: usize = 0
+    while word < words.length {
+      if words[word].view() == all[place].id() {
+        wanted = true
+      }
+      word = word + 1
+    }
+    if wanted {
+      run kept.append(all[place])
+    }
+    place = place + 1
+  }
+  return move kept
 }
 
 /// The module text that tells a development host which file carries stylesheet updates.
-effect fn updatesModule(project: &Project, target: Target) -> String
+effect fn updatesModule(project: &Project, options: &Options, target: Target) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
   let path = if target.web() {
     run String.copy("/styles.update")
   } else {
-    let directory = run hostDirectory(project, target)
+    let directory = run hostDirectory(project, options, true, target)
     run joined(directory.view(), "styles.update")
   }
   let mut out = run String.copy("pub const path: string<'static> = \"")
@@ -752,7 +900,8 @@ effect fn inspectorProgram(app: &App, options: &Options) -> Compilation
 
 impl App {
   /// A new app named `name`, the program a custom host ([`App.customHost`]) builds. A generated
-  /// host and `dist/` take the project's name. No framework, no target yet.
+  /// host, and the program [`Built.write`] copies, take the project's name. No framework, no
+  /// target yet.
   pub effect fn make(name: string<'static>) -> App {
     return App {
       named: name,
@@ -881,18 +1030,6 @@ impl App {
     return self.places.asSlice()
   }
 
-  fn hasWindow(self: &App) -> bool {
-    let all = self.places.asSlice()
-    let mut at: usize = 0
-    while at < all.length {
-      if all[at].id() == "window" {
-        return true
-      }
-      at = at + 1
-    }
-    return false
-  }
-
   fn sheetCount(self: &App) -> usize {
     let bundled: usize = if String.view(&self.compiledSheet) == "" {
       0
@@ -904,47 +1041,10 @@ impl App {
 
   // --- App: the steps ---
 
-  /// Keeps only the target `id` when it is not empty (a `--platform` flag), and fails naming
-  /// the targets there are when the app has no such target.
-  pub effect fn only<'env, E, ? R>(self: once Effect<'env; App ! E ? R>, id: string) -> App
-    ! E | TaskError | OutOfMemoryError
-    ? R | &mut Allocator {
-    let mut app = run move self
-    if id == "" {
-      return move app
-    }
-    let mut kept = List<Target>.make()
-    let all = app.places.asSlice()
-    let mut names = String.make()
-    let mut at: usize = 0
-    while at < all.length {
-      if all[at].id() == id {
-        run kept.append(all[at])
-      }
-      if at > 0 {
-        run String.append(&mut names, ", ")
-      }
-      run String.append(&mut names, all[at].id())
-      at = at + 1
-    }
-    if kept.length() == 0 {
-      let mut message = run String.copy("silkui: the app has no target ")
-      run String.append(&mut message, id)
-      run String.append(&mut message, "; it has ")
-      if all.length == 0 {
-        run String.append(&mut message, "none")
-      } else {
-        run String.append(&mut message, String.view(&names))
-      }
-      fail TaskError { message: move message, status: 2 }
-    }
-    app.places = move kept
-    return move app
-  }
-
-  /// Describes every selected host as a standard compilation, with the development tools when
-  /// `options` leave the program unoptimized (what an editor builds). Creating the graph runs
-  /// no tools. Host packages must be listed in the application's dependencies.
+  /// Describes every host `options` select (`--target`) as a standard compilation, with the
+  /// development tools when `options` leave the program unoptimized (what an editor builds).
+  /// Creating the graph runs no tools. Host packages must be listed in the application's
+  /// dependencies.
   pub effect fn compilations(self: &Self, options: &Options) -> Build
     ! BuildError | TaskError
     ? &mut HostInput | &mut Allocator | &mut FileSystem {
@@ -953,18 +1053,25 @@ impl App {
 
   /// The compilations, with the development tools when `dev`. Generated entry modules and
   /// release bundles are deferred prerequisites of compilation.
-  effect fn graph(self: &Self, options: &Options, dev: bool) -> Build
+  effect fn graph(self: &Self, given: &Options, dev: bool) -> Build
     ! BuildError | TaskError
     ? &mut HostInput | &mut Allocator | &mut FileSystem {
     let mut graph = run Build.make()
     let project = run readProject()
-    let targets = self.places.asSlice()
-    if targets.length == 0 {
+    if self.places.length() == 0 {
       run Task.abort("silkui: add a target with App.target")
     }
+    let selected = run chosen(self, given)
+    let narrowed = run triplesOnly(given)
+    let options = &narrowed
+    let targets = selected.asSlice()
+    let mut windowed = false
     let mut at: usize = 0
     while at < targets.length {
       let target = targets[at]
+      if target.id() == "window" {
+        windowed = true
+      }
       let mut plan = run hostPlan(self, &project, target, dev)
       plan.image = target.id() == "window" && imaged(self, options, dev)
       plan.tools = self.custom == "" && target.id() == "window" && !dev && plan.kind == Kind.Node && run measured()
@@ -972,6 +1079,10 @@ impl App {
       // A generated host is not named like the runtime packages it depends on.
       run name.append(if self.custom == "" { "-host-" } else { "-" })
       run name.append(target.id())
+      if dev {
+        // Not the name of the build of the same mode, which it would replace.
+        run name.append("-dev")
+      }
       if self.custom != "" && self.sheetCount() != 0 {
         run Task.abort("silkui: stylesheets need a generated host; a custom host adopts its compiled sheets directly")
       }
@@ -995,7 +1106,7 @@ impl App {
         let rooted = run generatedHost.root(run generated.output("main.silk"))
         // Compiled stylesheets are written beside the page and embedded as `style_<n>`; a
         // development host also learns where their updates are published.
-        let directory = run hostDirectory(&project, target)
+        let directory = run hostDirectory(&project, options, dev, target)
         run stylesheets.emitWithCompiled(
           project.root.view(),
           self.stylePaths.asSlice(),
@@ -1017,7 +1128,7 @@ impl App {
             let previous = move styled
             styled = run previous.module(
               "style_updates",
-              run Deferred<String>.value(run updatesModule(&project, target)),
+              run Deferred<String>.value(run updatesModule(&project, options, target)),
             )
           }
         }
@@ -1098,7 +1209,7 @@ impl App {
       graph = run previousGraph.add(move compilation)
       at = at + 1
     }
-    if dev && self.custom == "" && self.hasWindow() {
+    if dev && self.custom == "" && windowed {
       let previousGraph = move graph
       graph = run previousGraph.add(run inspectorProgram(self, options))
     }
@@ -1168,7 +1279,7 @@ impl App {
 }
 
 /// The app, compiled: see [`App.build`] and [`App.dev`].
-effect fn compiled(app: App, options: &Options, dev: bool) -> Built
+effect fn compiled(app: App, given: &Options, dev: bool) -> Built
   ! BuildError
     | TaskError
     | ProcessError
@@ -1179,6 +1290,12 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
   ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
   let mut app = move app
   let project = run readProject()
+  if app.places.length() == 0 {
+    run Task.abort("silkui: add a target with App.target")
+  }
+  app.places = run chosen(&app, given)
+  let narrowed = run triplesOnly(given)
+  let options = &narrowed
   let mode = if dev {
     Mode.Dev
   } else if options.optimize == Optimize.None {
@@ -1284,8 +1401,7 @@ effect fn compiled(app: App, options: &Options, dev: bool) -> Built
     let bytes = run sizeOf(path.view())
     let target = targets[at]
     if target.web() {
-      let mut directory = run fromRoot(&project, "build/pages")
-      directory = run joined(directory.view(), target.id())
+      let directory = run hostDirectory(&project, options, mode == Mode.Dev, target)
       let plan = run hostPlan(&app, &project, target, mode == Mode.Dev)
       let page = run hostPage(&plan)
       run refresh((run joined(directory.view(), "index.html")).view(), page.view())
@@ -1372,9 +1488,10 @@ impl Built {
     return move built
   }
 
-  /// Copies each artifact to `<dir>/<target>/<project name>` (relative to the project), and
-  /// the page of a web target to `<dir>/<target>/`, and lists them with the build's time. It
-  /// ends a build pipeline.
+  /// Lists each artifact where the build keeps it, with the build's time, and when `dir` is not
+  /// empty also copies it to `<dir>/<target>/<project name>` (relative to the project), and the
+  /// page of a web target to `<dir>/<target>/`, listing the copies instead. It ends a build
+  /// pipeline: the `--out` of a project's Build task.
   pub effect fn write<'env, E, ? R>(self: once Effect<'env; Built ! E ? R>, dir: string) -> ()
     ! E
       | BuildError
@@ -1389,6 +1506,16 @@ impl Built {
     let project = run readProject()
     let all = built.outputs.asSlice()
     let mut at: usize = 0
+    while at < all.length && dir == "" {
+      if !all[at].target.web() {
+        run beside(&built, String.view(&all[at].path))
+      }
+      if at == 0 {
+        StderrWriter.print("\n", &.())
+      }
+      listArtifact(relative(String.view(&project.root), String.view(&all[at].path)), all[at].bytes)
+      at = at + 1
+    }
     while at < all.length {
       let mut out = run fromRoot(&project, dir)
       out = run joined(String.view(&out), all[at].target.id())
@@ -1473,7 +1600,7 @@ impl Built {
         )
       } else if built.madeIn == Mode.Dev {
         // A new session starts from `init`; the restarts after edits keep the model.
-        let kept = run keptModel(&project, target)
+        let kept = run keptModel(&project, &built.options, target)
         let file = run Path.make(kept.view())
         if run FileSystem.exists(&file) {
           run FileSystem.removeFile(&file)
@@ -1485,14 +1612,7 @@ impl Built {
           &[Variable { name: KEEP_VARIABLE, value: kept.view() }],
         )
       } else {
-        if shipsBundleFiles(&built) {
-          let path = String.view(&artifact.path)
-          let mut end = String.byteLength(path)
-          while end > 0 && String.utf8Bytes(path)[end - 1] != 47 { end = end - 1 }
-          let files = run joined(String.slice(path, 0, end), "app")
-          run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), "")
-          run bundleImage(&built, path)
-        }
+        run beside(&built, String.view(&artifact.path))
         run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
       }
       return Running {
@@ -1533,6 +1653,19 @@ impl Built {
 
 /// Whether `built` is a release host on the SilkJS runtime that embeds a bundle: it reads the
 /// files beside the bundle (wasm modules, workers, images) from `app/` beside itself.
+/// Puts the files a window host built at `program` reads beside it, when it ships any.
+effect fn beside(built: &Built, program: string) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator | &mut FileSystem | &mut HostInput | &mut ChildProcess {
+  if shipsBundleFiles(built) {
+    let mut end = String.byteLength(program)
+    while end > 0 && String.utf8Bytes(program)[end - 1] != 47 { end = end - 1 }
+    let files = run joined(String.slice(program, 0, end), "app")
+    run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), "")
+    run bundleImage(built, program)
+  }
+}
+
 fn shipsBundleFiles(built: &Built) -> bool {
   return built.madeIn != Mode.Dev && built.source.runsOn == Runtime.Node && String.view(&built.source.bundled) != ""
 }
@@ -1682,10 +1815,10 @@ effect fn ended(code: i32) -> ()
 const KEEP_VARIABLE: string<'static> = "SILKUI_KEEP"
 
 /// Where a Loom development host keeps its model: beside its compiled stylesheets.
-effect fn keptModel(project: &Project, target: Target) -> String
+effect fn keptModel(project: &Project, options: &Options, target: Target) -> String
   ! OutOfMemoryError
   ? &mut Allocator {
-  let directory = run hostDirectory(project, target)
+  let directory = run hostDirectory(project, options, true, target)
   return run joined(directory.view(), "model.json")
 }
 
@@ -1834,7 +1967,7 @@ impl Running {
       if watchesStyles {
         run say("watching stylesheets: CSS edits preserve application state")
       }
-      let directory = run hostDirectory(&project, running.target)
+      let directory = run hostDirectory(&project, &running.launched.options, true, running.target)
       let mut styled = Option<u64>.None
       while !child.ended() {
         pause(300)
@@ -1885,7 +2018,7 @@ impl Running {
           drop error
           run say("the build failed: the previous build runs until the next change")
         }
-        let kept = run keptModel(&project, running.target)
+        let kept = run keptModel(&project, &running.launched.options, running.target)
         child = run start(
           String.view(&artifact.path),
           &[],

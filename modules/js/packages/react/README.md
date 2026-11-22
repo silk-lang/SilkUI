@@ -12,7 +12,7 @@ The quickest start is the React template:
 ```sh
 silk init my-app -t ui-react
 cd my-app
-silk task dev   # opens the window; edits keep component state (Fast Refresh)
+silk dev   # opens the window; edits keep component state (Fast Refresh)
 ```
 
 See [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an

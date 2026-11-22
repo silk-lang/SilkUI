@@ -83,7 +83,7 @@ The program above knows nothing about where it runs. The quickest way to run one
 ```sh
 silk init my-app -t ui-loom
 cd my-app
-silk task dev
+silk dev
 ```
 
 The window restarts when you change `silk/app.silk`. [Get started](/start/) has the rest: building, and running the same app in a browser page.
