@@ -14,6 +14,7 @@ import ui_tree.legacy {
   Mutation,
   HostRequest,
   Keymap,
+  EditCommand,
   MOD_SHIFT,
   MOD_CONTROL,
   BUTTON_PRIMARY,
@@ -650,6 +651,20 @@ effect fn editingHosts() ! TreeError | CssError | CssomError | GeometryError | O
   run Testing.expect(String.view(&got) == "insertText:abc;insertCompositionText:ka;insertText:か;deleteContentBackward:;deleteWordForward:;insertParagraph:;insertLineBreak:;", "keys and text in the host are edits")
   run Testing.expect(String.view(&tree.node(tree.slotOf(102)).text) == "Hello brave world", "the tree changes nothing itself")
 
+  // Undo, redo and the formatting keys are edits too.
+  run press(&mut tree, "z", MOD_CONTROL)
+  run press(&mut tree, "Z", MOD_CONTROL + MOD_SHIFT)
+  run press(&mut tree, "y", MOD_CONTROL)
+  run press(&mut tree, "b", MOD_CONTROL)
+  run press(&mut tree, "i", MOD_CONTROL)
+  run press(&mut tree, "u", MOD_CONTROL)
+  let history = run edits(&mut tree)
+  run Testing.expect(String.view(&history) == "historyUndo:;historyRedo:;historyRedo:;formatBold:;formatItalic:;formatUnderline:;", "undo, redo and formatting keys are edits")
+  run tree.dispatch(Input.Command { command: EditCommand.Undo })
+  run tree.dispatch(Input.Command { command: EditCommand.Redo })
+  let menu = run edits(&mut tree)
+  run Testing.expect(String.view(&menu) == "historyUndo:;historyRedo:;", "the edit menu's undo and redo are edits")
+
   // A paste goes to the host as an edit too.
   run tree.dispatch(Input.Paste { target: 9, text: run String.copy("pasted"), html: String.make(), image: List<u8>.make() })
   let pasted = run edits(&mut tree)
@@ -663,6 +678,58 @@ effect fn editingHosts() ! TreeError | CssError | CssomError | GeometryError | O
   let none = run edits(&mut tree)
   run Testing.expect(String.view(&none) == "", "text without a focused host goes nowhere")
   run caretIs(&mut tree, "none", "a host without focus shows no caret")
+}
+
+effect fn plainAndIslands() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.keymap = Keymap.Standard
+  let mut batch = Batch.make()
+  run body(&mut batch)
+  run batch.create(9, NodeKind.Box)
+  run batch.append(1, 9)
+  run batch.attribute(9, Attribute.Named { name: run String.copy("contenteditable"), value: Option<String>.some(run String.copy("PlainText-Only")) })
+  run batch.attribute(9, Attribute.TabIndex { value: 0 })
+  run batch.listen(9, LISTEN_BEFORE_INPUT)
+  run batch.create(2, NodeKind.Box)
+  run batch.append(9, 2)
+  run batch.text(2, 102, "ab")
+  run batch.create(3, NodeKind.Box)
+  run batch.append(2, 3)
+  run styled(&mut batch, 3, b"display:inline")
+  run batch.attribute(3, Attribute.Named { name: run String.copy("contenteditable"), value: Option<String>.some(run String.copy("FALSE")) })
+  run batch.text(3, 103, "XY")
+  run batch.text(2, 104, "cd")
+  run tree.apply(run batch.take())
+  run tree.frame(frame())
+
+  run Testing.expect(text_selection.editingHost(&tree, tree.slotOf(102)) == tree.slotOf(9), "contenteditable takes any ASCII case")
+  run Testing.expect(text_selection.editingHost(&tree, tree.slotOf(103)) == 0xffffffff, "so does contenteditable=false")
+  run click(&mut tree, 102, 1, 1, 0)
+  drop run edits(&mut tree)
+  run press(&mut tree, "Enter", 0)
+  run press(&mut tree, "b", MOD_CONTROL)
+  let plain = run edits(&mut tree)
+  run Testing.expect(String.view(&plain) == "insertLineBreak:;", "a plain-text host breaks lines on Enter and takes no formatting keys")
+
+  run press(&mut tree, "ArrowRight", 0)
+  run caretIs(&mut tree, "102@2", "Right moves a character")
+  run press(&mut tree, "ArrowRight", 0)
+  run caretIs(&mut tree, "104@0", "Right steps over a contenteditable=false island whole")
+  run press(&mut tree, "ArrowLeft", 0)
+  run caretIs(&mut tree, "102@2", "so does Left")
+
+  // A line step for Selection.modify follows the layout.
+  let from = text_selection.fromDom(&tree, 102, 1)
+  let edge = run text_selection.lineStep(&tree, from, true, true)
+  run Testing.expect(edge.exists() && edge.id == 104 && edge.offset == 2, "a line's end is after its last text")
+  let start = run text_selection.lineStep(&tree, from, false, true)
+  run Testing.expect(start.exists() && start.id == 102 && start.offset == 0, "a line's start is before its first text")
+}
+
+test effect fn plainTextHostsBreakLinesAndTheCaretStepsOverIslands() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run plainAndIslands() |> Effect.provideMut<Allocator>(&mut allocator)
 }
 
 test effect fn editingHostsTakeKeysAndTextAsEditsAndShowACaret() ! TreeError | CssError | CssomError | GeometryError | OutOfMemoryError | AssertionError<'static> {

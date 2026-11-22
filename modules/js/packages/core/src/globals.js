@@ -303,7 +303,11 @@ class Document extends OuterTarget {
     const run = exported("execCommand");
     return typeof run === "function" ? run(command, showUI, value) : false;
   }
-  queryCommandSupported() { return false; }
+  queryCommandSupported(command) { return !!exported("queryCommandSupported")?.(command); }
+  queryCommandEnabled(command) { return !!exported("queryCommandEnabled")?.(command); }
+  queryCommandState(command) { return !!exported("queryCommandState")?.(command); }
+  queryCommandIndeterm(command) { return !!exported("queryCommandIndeterm")?.(command); }
+  queryCommandValue(command) { return exported("queryCommandValue")?.(command) ?? ""; }
   // The fonts the app's style sheets load are the host's, ready before the first frame.
   get fonts() { return fonts; }
 }

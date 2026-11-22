@@ -1034,7 +1034,7 @@ export class Node {
     const number = text == null ? NaN : parseInt(String(text), 10);
     if (!Number.isNaN(number)) return number;
     const focusable = this instanceof Input || this instanceof CheckInput || FOCUSABLE_TAGS.has(this._tag)
-      || (this._tag === "a" && this.hasAttribute("href")) || editableValue(this) === 1;
+      || (this._tag === "a" && this.hasAttribute("href"));
     return focusable ? 0 : -1;
   }
 
@@ -3971,6 +3971,21 @@ export class Selection {
     }));
   }
 
+  /**
+   * Moves (`alter` "move") or extends ("extend") the selection one `granularity` ("character",
+   * "word", "line", "lineboundary", "paragraph", "paragraphboundary", "sentence",
+   * "sentenceboundary", "documentboundary") "forward", "backward", "left" or "right".
+   */
+  modify(alter, direction, granularity) {
+    modifySelection(this, alter, direction, granularity);
+  }
+
+  // Anchor node, offset, focus node, offset, or null: what a script set without asking the tree again.
+  _ends() {
+    if (!this.#pending) this.#sync();
+    return this.#anchor ? [this.#anchor, this.#anchorOffset, this.#focus, this.#focusOffset] : null;
+  }
+
   /** The selected text as copying gives it: rendered white space, line breaks between blocks. */
   toString() {
     this.#sync();
@@ -4503,12 +4518,13 @@ function dispatchRequest(kind, target, forward) {
   return event.defaultPrevented;
 }
 
-// Editing hosts, as the HTML Standard's contenteditable has them. The tree sends a focused
-// host's typing, composition, deleting, line breaks and pastes as `beforeinput` records;
-// unless a listener prevents one, `hostEdit` makes the change in the host's nodes, moves
-// the selection after it and fires `input`, as a browser's editing does. Editors that keep
-// their own model (ProseMirror) prevent what they handle and read the rest back from the
-// nodes, through mutation observers.
+// Editing hosts, as the HTML Standard's contenteditable and the Input Events spec have them,
+// with Chromium's editing where the specs leave it open. The tree sends a focused host's
+// typing, composition, deleting, line breaks, pastes, undo and formatting keys as `beforeinput`
+// records; unless a listener prevents one, `hostEdit` makes the change in the host's nodes,
+// moves the selection after it and fires `input`, as a browser's editing does. Editors that
+// keep their own model (ProseMirror) prevent what they handle and read the rest back from the
+// nodes, through mutation observers. `execCommand` runs the same edits without `beforeinput`.
 
 // 1 for an editable `contenteditable` ("", "true", "plaintext-only"), 2 for "false", else 0.
 function editableValue(node) {
@@ -4529,6 +4545,11 @@ export function editingHostOf(node) {
   return host;
 }
 
+// A `contenteditable="plaintext-only"` host takes text alone: no markup, line breaks as "\n".
+function isPlain(host) {
+  return host.getAttribute("contenteditable")?.toLowerCase() === "plaintext-only";
+}
+
 export class CompositionEvent extends Event {
   constructor(type, init = {}) {
     super(String(type), null);
@@ -4547,6 +4568,7 @@ const BLOCK_TAGS = new Set([
   "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol",
   "p", "pre", "section", "summary", "table", "td", "th", "tr", "ul",
 ]);
+const HEADINGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
 function isBlock(node) {
   return node.nodeType === 1 && !(node instanceof LineBreak) && (BLOCK_TAGS.has(node.localName) || node.kind === "box" && node._tag === undefined);
@@ -4558,44 +4580,47 @@ function blockIn(host, node) {
   return host;
 }
 
-// What the caret steps over: text, `<br>`s and elements with no children (images).
+// What the caret steps over whole: an element that is not editable (`contenteditable="false"`
+// inside the host), a `<br>`, or a replaced element (an image, a control, a canvas).
+const REPLACED = new Set(["img", "svg", "video", "audio", "canvas", "iframe", "object", "embed", "input", "select", "textarea", "button", "meter", "progress"]);
+
+function isAtom(node) {
+  if (node.nodeType !== 1) return false;
+  return node instanceof LineBreak || editableValue(node) === 2 || node.kind !== "box" || REPLACED.has(node.localName);
+}
+
 function isLeaf(node) {
-  return node.nodeType === 3 ? node.length > 0 : node.nodeType === 1 && node.childNodes.length === 0 && !isBlock(node);
+  return node.nodeType === 3 ? node.length > 0 : isAtom(node);
 }
 
-// The leaf before (or after) the point (`container`, `offset`) in tree order, inside `host`.
-function leafBeside(host, container, offset, forward) {
-  let node;
-  if (container.nodeType === 3) node = container;
-  else if (forward) {
-    node = container.childNodes[offset];
-    if (!node) node = following(container, host, true);
-    else if (isLeaf(node)) return node;
-  } else {
-    node = container.childNodes[offset - 1];
-    if (node) {
-      while (node.lastChild) node = node.lastChild;
-      if (isLeaf(node)) return node;
-    } else node = container;
-  }
-  if (forward) {
-    for (let at = node === container && container.nodeType === 3 ? following(node, host, true) : node; at; at = following(at, host)) {
-      if (isLeaf(at)) return at;
-    }
-  } else {
-    for (let at = preceding(node, host); at; at = preceding(at, host)) if (isLeaf(at)) return at;
-  }
-  return null;
+// The next node in tree order inside `within`, stepping over what is inside an atom.
+function nextNode(node, within) {
+  return following(node, within, isAtom(node));
 }
 
-// The node before `node` in tree order (its previous sibling's last descendant, or its
-// parent), inside `within`.
+// The node before `node` in tree order (its previous sibling's last descendant outside atoms,
+// or its parent), inside `within`.
 function preceding(node, within) {
   if (node === within) return null;
   let at = node.previousSibling;
   if (!at) return node.parentNode === within ? null : node.parentNode;
-  while (at.lastChild) at = at.lastChild;
+  while (at.lastChild && !isAtom(at)) at = at.lastChild;
   return at;
+}
+
+// The leaf before (or after) the point (`container`, `offset`) in tree order, inside `host`.
+function leafBeside(host, container, offset, forward) {
+  let at;
+  if (forward) {
+    at = container.nodeType === 3 ? following(container, host, true) : container.childNodes[offset] ?? following(container, host, true);
+    for (; at; at = nextNode(at, host)) if (isLeaf(at)) return at;
+    return null;
+  }
+  at = container.nodeType === 3 ? null : container.childNodes[offset - 1];
+  if (at) while (at.lastChild && !isAtom(at)) at = at.lastChild;
+  else at = preceding(container, host);
+  for (; at; at = preceding(at, host)) if (isLeaf(at)) return at;
+  return null;
 }
 
 const segmenter = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter() : null;
@@ -4636,7 +4661,7 @@ function elementPoint(node, offset) {
 
 // Gives an empty block a `<br>`, so it keeps a line for the caret.
 function keepLine(block) {
-  for (let at = block.firstChild; at; at = following(at, block)) if (isLeaf(at)) return;
+  for (let at = block.firstChild; at; at = nextNode(at, block)) if (isLeaf(at)) return;
   block.appendChild(new LineBreak());
 }
 
@@ -4654,7 +4679,7 @@ function joinBlocks(into, from) {
 // The `<br>` that alone gives `block` its line, if that is all it holds.
 function onlyBreak(block) {
   let found = null;
-  for (let at = block.firstChild; at; at = following(at, block)) {
+  for (let at = block.firstChild; at; at = nextNode(at, block)) {
     if (!isLeaf(at)) continue;
     if (found || !(at instanceof LineBreak)) return null;
     found = at;
@@ -4662,117 +4687,325 @@ function onlyBreak(block) {
   return found;
 }
 
-// Splits `block` at (`node`, `offset`): what follows goes to a copy of the block (and of each
-// element on the way) after it. Returns the copy.
-function splitBlock(block, node, offset) {
-  let [level, at] = elementPoint(node, offset);
-  let carried = null;
-  for (;;) {
-    const copy = level.cloneNode(false);
-    if (carried) copy.appendChild(carried);
-    while (level.childNodes.length > at) copy.appendChild(level.childNodes[at]);
-    if (level === block) {
-      block.parentNode.insertBefore(copy, block.nextSibling);
-      keepLine(block);
-      keepLine(copy);
-      return copy;
-    }
-    carried = copy;
-    at = indexIn(level) + 1;
-    level = level.parentNode;
+// Splits `ancestor` at (`node`, `offset`): what follows goes to a copy of it (and of each
+// element on the way) after it. Returns the copy. Each copy is in the tree before content
+// moves into it, so undo records every move.
+function splitAt(ancestor, node, offset) {
+  const [level, at] = elementPoint(node, offset);
+  const path = [];
+  for (let step = level; ; step = step.parentNode) {
+    path.unshift(step);
+    if (step === ancestor) break;
   }
+  const top = ancestor.cloneNode(false);
+  ancestor.parentNode.insertBefore(top, ancestor.nextSibling);
+  let outer = null;
+  for (let i = 0; i < path.length; i++) {
+    const copy = i === 0 ? top : path[i].cloneNode(false);
+    if (outer) outer.insertBefore(copy, outer.firstChild);
+    const from = i === path.length - 1 ? at : indexIn(path[i + 1]) + 1;
+    while (path[i].childNodes.length > from) copy.appendChild(path[i].childNodes[from]);
+    outer = copy;
+  }
+  return top;
+}
+
+function splitBlock(block, node, offset) {
+  const copy = splitAt(block, node, offset);
+  keepLine(block);
+  keepLine(copy);
+  return copy;
 }
 
 // The first point in text (or the start) inside `node`.
 function startIn(node) {
-  for (let at = node; at; at = following(at, node)) {
+  for (let at = node; at; at = nextNode(at, node)) {
     if (at.nodeType === 3) return [at, 0];
-    if (at instanceof LineBreak) return [at.parentNode, indexIn(at)];
+    if (at !== node && isAtom(at)) return [at.parentNode, indexIn(at)];
   }
   return [node, 0];
 }
 
-// Inserts `text` at the collapsed point (`node`, `offset`); returns the point after it.
-// Line breaks in it become `<br>`s.
-function insertText(node, offset, text) {
-  const lines = text.split(/\r\n|\r|\n/);
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) {
-      [node, offset] = elementPoint(node, offset);
-      node.insertBefore(new LineBreak(), node.childNodes[offset] ?? null);
-      offset += 1;
-    }
-    const line = lines[i];
-    if (!line) continue;
-    if (node.nodeType === 3) {
-      node.insertData(offset, line);
-      offset += line.length;
+// The last point in text (or the end) inside `node`; before a `<br>` that ends it.
+function endIn(node) {
+  let at = node;
+  while (at.lastChild && (at === node || !isAtom(at))) at = at.lastChild;
+  if (at === node) return [node, node.childNodes.length];
+  if (at.nodeType === 3) return [at, at.length];
+  return [at.parentNode, indexIn(at) + (at instanceof LineBreak ? 0 : 1)];
+}
+
+// How `white-space` treats the text at `node`: whether it keeps runs of spaces, and line feeds.
+function whiteSpaceAt(node) {
+  const element = node.nodeType === 1 ? node : node.parentNode;
+  const id = element?.nodeId;
+  if (typeof id !== "number") return { spaces: false, lineFeeds: false };
+  const value = String(readComputed(id, "white-space") ?? "");
+  const collapse = String(readComputed(id, "white-space-collapse") ?? "");
+  const spaces = /^(pre|pre-wrap|break-spaces)\b/.test(value) || collapse === "preserve" || collapse === "break-spaces";
+  return { spaces, lineFeeds: spaces || /^pre-line\b/.test(value) || collapse === "preserve-breaks" };
+}
+
+const NBSP = " ";
+const isSpace = (c) => c === " " || c === NBSP;
+
+// Where `white-space` collapses spaces, the runs of spaces touching `from` to `to` in `text`
+// become spaces and no-break spaces that show as typed, as Chromium's editing rebalances them:
+// one at a paragraph's edge, or after another, is a no-break space.
+function rebalance(host, text, from, to) {
+  if (text.nodeType !== 3 || !text.parentNode) return;
+  const data = text.data;
+  let start = Math.max(0, Math.min(from, data.length));
+  let end = Math.min(data.length, Math.max(to, start));
+  while (start > 0 && isSpace(data[start - 1])) start--;
+  while (end < data.length && isSpace(data[end])) end++;
+  // Only spaces need the style read, which lays out pending changes.
+  if (!/[ \u00a0]/.test(data.slice(start, end)) || whiteSpaceAt(text).spaces) return;
+  const block = blockIn(host, text);
+  const edge = (forward) => {
+    const leaf = leafBeside(host, text, forward ? text.length : 0, forward);
+    return !leaf || leaf instanceof LineBreak || blockIn(host, leaf) !== block;
+  };
+  for (let i = start; i < end;) {
+    if (!isSpace(data[i])) {
+      i++;
       continue;
     }
+    let j = i;
+    while (j < end && isSpace(data[j])) j++;
+    const first = i === 0 && edge(false);
+    const last = j === data.length && edge(true);
+    let run = "";
+    let afterSpace = false;
+    for (let k = i; k < j; k++) {
+      if (afterSpace || k === i && first || k === j - 1 && last) {
+        run += NBSP;
+        afterSpace = false;
+      } else {
+        run += " ";
+        afterSpace = true;
+      }
+    }
+    if (run !== data.slice(i, j)) text.replaceData(i, j - i, run);
+    i = j;
+  }
+}
+
+// Inserts `text` (one line) at (`node`, `offset`); returns the point after it. Text typed into
+// a block that held only its placeholder `<br>` takes the place of the `<br>`.
+function insertRun(host, node, offset, text) {
+  if (!text) return [node, offset];
+  const placeholder = onlyBreak(blockIn(host, node));
+  let at;
+  if (node.nodeType === 3) {
+    node.insertData(offset, text);
+    at = [node, offset + text.length];
+  } else {
     const before = node.childNodes[offset - 1];
     const after = node.childNodes[offset];
     if (before?.nodeType === 3) {
-      const at = before.length;
-      before.appendData(line);
-      [node, offset] = [before, at + line.length];
+      const end = before.length;
+      before.appendData(text);
+      at = [before, end + text.length];
     } else if (after?.nodeType === 3) {
-      after.insertData(0, line);
-      [node, offset] = [after, line.length];
+      after.insertData(0, text);
+      at = [after, text.length];
     } else {
-      const created = new Text(line);
+      const created = new Text(text);
       node.insertBefore(created, after ?? null);
-      [node, offset] = [created, line.length];
+      at = [created, text.length];
     }
+  }
+  if (placeholder?.parentNode && placeholder !== at[0]) placeholder.remove();
+  rebalance(host, at[0], at[1] - text.length, at[1]);
+  return at;
+}
+
+// Inserts `text` at the point; each line feed in it breaks a paragraph, or in plain text (or
+// where `white-space` keeps line feeds) stays a line feed.
+function insertLines(host, node, offset, text) {
+  text = text.replace(/\r\n?/g, "\n");
+  if (isPlain(host) || whiteSpaceAt(node).lineFeeds) return insertRun(host, node, offset, text);
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) [node, offset] = paragraphBreak(host, node, offset);
+    [node, offset] = insertRun(host, node, offset, lines[i]);
   }
   return [node, offset];
 }
 
-// Deletes what `range` covers; paragraphs it crossed into become one. Returns the point
-// where the deleted content was.
-function deleteRange(host, range) {
-  const startBlock = blockIn(host, range.startContainer);
-  const endBlock = blockIn(host, range.endContainer);
+// A line break at the point: a line feed in plain text or where `white-space` keeps them,
+// else a `<br>` (with a second one where it ends its block, so the new line shows).
+function lineBreak(host, node, offset) {
+  if (isPlain(host) || whiteSpaceAt(node).lineFeeds) {
+    const block = blockIn(host, node);
+    const point = insertRun(host, node, offset, "\n");
+    // A line feed that ends the text shows no line after it: give that line its own.
+    const next = leafBeside(host, point[0], point[1], true);
+    if (point[0].nodeType === 3 && point[1] === point[0].length && (!next || blockIn(host, next) !== block)) point[0].appendData("\n");
+    return point;
+  }
+  const block = blockIn(host, node);
+  const [parent, index] = elementPoint(node, offset);
+  parent.insertBefore(new LineBreak(), parent.childNodes[index] ?? null);
+  if (!leafBeside(block, parent, index + 1, true)) parent.insertBefore(new LineBreak(), parent.childNodes[index + 1] ?? null);
+  return [parent, index + 1];
+}
+
+// The run of inline content around the point directly in `host`, moved into a new paragraph
+// element (`defaultParagraphSeparator`, a `<div>`). Returns it.
+function wrapRun(host, node, offset) {
+  let index;
+  if (node === host) index = offset;
+  else {
+    let top = node;
+    while (top.parentNode !== host) top = top.parentNode;
+    index = indexIn(top);
+  }
+  const children = host.childNodes;
+  let start = index;
+  while (start > 0 && !isBlock(children[start - 1])) start--;
+  let end = node === host ? index : index + 1;
+  while (end < children.length && !isBlock(children[end])) end++;
+  const wrapper = createElement(paragraphSeparator);
+  host.insertBefore(wrapper, children[start] ?? null);
+  for (let i = start; i < end; i++) wrapper.appendChild(children[start + 1]);
+  return wrapper;
+}
+
+// Splits the paragraph at the point, as Enter does in Chromium. Returns the caret after it.
+function paragraphBreak(host, node, offset) {
+  if (isPlain(host)) return lineBreak(host, node, offset);
+  let block = blockIn(host, node);
+  if (block.localName === "pre") return lineBreak(host, node, offset);
+  if (block === host) {
+    const hostPoint = node === host;
+    const wrapper = wrapRun(host, node, offset);
+    if (hostPoint) [node, offset] = [wrapper, offset - indexIn(wrapper)];
+    const copy = splitBlock(wrapper, node, offset);
+    // What came before stays as it was, unless it was empty.
+    if (!onlyBreak(wrapper)) {
+      while (wrapper.firstChild) host.insertBefore(wrapper.firstChild, wrapper);
+      wrapper.remove();
+    }
+    return settled(host, wrapper.parentNode ? wrapper : copy.previousSibling, copy);
+  }
+  const empty = !leafBeside(block, block, 0, true) || onlyBreak(block);
+  if (block.localName === "li" && empty) return leaveList(block);
+  if (HEADINGS.has(block.localName) && !leafBeside(block, ...elementPoint(node, offset), true)) {
+    const next = createElement(paragraphSeparator);
+    next.appendChild(new LineBreak());
+    block.parentNode.insertBefore(next, block.nextSibling);
+    return [next, 0];
+  }
+  return settled(host, block, splitBlock(block, node, offset));
+}
+
+// The caret at the start of `after`, the second half of a split, with the spaces at the edges
+// of the two halves shown again.
+function settled(host, before, after) {
+  if (before?.nodeType === 3) rebalance(host, before, before.length, before.length);
+  else if (before) {
+    const [node, offset] = endIn(before);
+    rebalance(host, node, offset, offset);
+  }
+  const start = startIn(after);
+  rebalance(host, start[0], 0, 0);
+  return start;
+}
+
+// Enter in an empty list item ends the list there: the item becomes a paragraph after it.
+function leaveList(item) {
+  const list = item.parentNode;
+  const after = item.nextSibling ? splitAt(list, list, indexIn(item) + 1) : null;
+  item.remove();
+  const paragraph = createElement(paragraphSeparator);
+  paragraph.appendChild(new LineBreak());
+  list.parentNode.insertBefore(paragraph, list.nextSibling);
+  if (!list.firstChild) list.remove();
+  if (after && !after.firstChild) after.remove();
+  return [paragraph, 0];
+}
+
+// The element `defaultParagraphSeparator` names: what Enter makes outside other paragraphs.
+let paragraphSeparator = "div";
+
+// Deletes what the range from (`startNode`, `startOffset`) to (`endNode`, `endOffset`) covers;
+// paragraphs it crossed into become one. Returns the point where the content was.
+function deleteBetween(host, startNode, startOffset, endNode, endOffset) {
+  const range = new Range();
+  range.setStart(startNode, startOffset);
+  range.setEnd(endNode, endOffset);
+  const startBlock = blockIn(host, startNode);
+  const endBlock = blockIn(host, endNode);
   range.deleteContents();
   let point = [range.startContainer, range.startOffset];
-  if (startBlock !== endBlock && startBlock.isConnected !== false && endBlock.parentNode && host.contains(endBlock) && host.contains(startBlock)) {
-    point = joinBlocks(startBlock, endBlock);
+  range.detach?.();
+  if (startBlock !== endBlock && endBlock.parentNode && host.contains(endBlock) && host.contains(startBlock)) {
+    if (startBlock === host) {
+      // Inline content before a paragraph takes in what the paragraph held.
+      const [parent, index] = elementPoint(point[0], point[1]);
+      onlyBreak(endBlock)?.remove();
+      let at = index;
+      while (endBlock.firstChild) parent.insertBefore(endBlock.firstChild, parent.childNodes[at++] ?? null);
+      endBlock.remove();
+      point = [parent, index];
+    } else if (endBlock === host || endBlock.contains(startBlock)) {
+      keepLine(startBlock);
+    } else {
+      point = joinBlocks(startBlock, endBlock);
+    }
   }
-  if (startBlock !== host) keepLine(startBlock);
+  if (startBlock !== host && startBlock.parentNode) keepLine(startBlock);
+  if (point[0].nodeType === 3) rebalance(host, point[0], point[1], point[1]);
   return point;
 }
 
-// Deletes one step (a grapheme, a word, to the line's edge) before or after the caret.
-function deleteStep(host, node, offset, forward, unit) {
-  if (node.nodeType === 3 && (forward ? offset < node.length : offset > 0)) {
-    const data = node.data;
-    const to = unit === "word" ? wordStep(data, offset, forward)
-      : unit === "line" ? (forward ? data.length : 0)
-        : graphemeStep(data, offset, forward);
-    const start = Math.min(offset, to);
-    node.deleteData(start, Math.abs(to - offset));
-    const block = blockIn(host, node);
-    if (block !== host) keepLine(block);
-    return [node, start];
+// The point one `unit` ("character", "word", "line" to the line's edge, "paragraph" to the
+// block's edge) before or after (`node`, `offset`), inside `host`. A step out of a block
+// crosses only the boundary; a step onto an atom takes it whole.
+function stepFrom(host, node, offset, forward, unit) {
+  if (unit === "line") {
+    const found = nativeLineStep(node, offset, forward, true);
+    if (found && host.contains(found[0])) return found;
+    unit = "paragraph";
+  }
+  const block = blockIn(host, node);
+  if (unit === "paragraph") {
+    const [edgeNode, edgeOffset] = forward ? endIn(block) : startIn(block);
+    if (comparePoints(edgeNode, edgeOffset, node, offset) !== 0) return [edgeNode, edgeOffset];
+  } else if (node.nodeType === 3 && (forward ? offset < node.length : offset > 0)) {
+    const to = unit === "word" ? wordStep(node.data, offset, forward) : graphemeStep(node.data, offset, forward);
+    return [node, Math.max(0, Math.min(node.length, to))];
   }
   const leaf = leafBeside(host, node, offset, forward);
   if (!leaf) return [node, offset];
-  const here = blockIn(host, node);
-  const there = blockIn(host, leaf);
-  if (here === there || here === host || there === host) {
-    if (leaf.nodeType === 3) return deleteStep(host, leaf, forward ? 0 : leaf.length, forward, unit);
-    const parent = leaf.parentNode;
-    const index = indexIn(leaf);
-    leaf.remove();
-    if (here !== host) keepLine(here);
-    return [parent, index];
+  if (blockIn(host, leaf) !== block) return leaf.nodeType === 3 ? [leaf, forward ? 0 : leaf.length] : [leaf.parentNode, indexIn(leaf) + (forward ? 0 : 1)];
+  if (leaf.nodeType === 3) {
+    const edge = forward ? 0 : leaf.length;
+    if (unit === "paragraph") return [leaf, edge];
+    return stepFrom(host, leaf, edge, forward, unit);
   }
-  return forward ? joinBlocks(here, there) : joinBlocks(there, here);
+  return [leaf.parentNode, indexIn(leaf) + (forward ? 1 : 0)];
+}
+
+// A line step the tree lays out: to the line's edge (`boundary`), else to the next line. Null
+// where the tree cannot tell (no layout, or a host without one).
+function nativeLineStep(node, offset, forward, boundary) {
+  if (!native.lineStep || typeof node.nodeId !== "number") return null;
+  if (!native.lineStep(node.nodeId, offset, forward ? 1 : 0, boundary ? 1 : 0)) return null;
+  const found = nodes.get(geometry(0));
+  return found ? fromTreePoint(found, geometry(1)) : null;
 }
 
 const compositions = new WeakMap();
 
-function editEvent(type, host, inputType, data, isComposing, cancelable = true) {
-  const event = new InputEvent(type, { bubbles: true, cancelable, composed: true, inputType, data, isComposing });
+function staticRange(startContainer, startOffset, endContainer, endOffset) {
+  return new StaticRange({ startContainer, startOffset, endContainer, endOffset });
+}
+
+function editEvent(type, host, inputType, data, isComposing, cancelable, targetRanges = [], dataTransfer = null) {
+  const event = new InputEvent(type, { bubbles: true, cancelable, composed: true, inputType, data, isComposing, targetRanges, dataTransfer });
   event.target = host;
   dispatchEvent(event);
   return event;
@@ -4784,113 +5017,802 @@ function compositionEvent(type, host, data) {
   dispatchEvent(event);
 }
 
+// The selection's range when it is in `host`, else null.
+function rangeIn(host) {
+  const selection = getSelection();
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  return range && host.contains(range.startContainer) && host.contains(range.endContainer) ? range : null;
+}
+
+const DELETES = /^delete(Content|Word|SoftLine|HardLine)(Backward|Forward)$/;
+const UNITS = { Content: "character", Word: "word", SoftLine: "line", HardLine: "paragraph" };
+
+// What edit `inputType` changes: the selection, or the step a collapsed delete takes. Null
+// without a selection in `host`.
+function targetOf(host, inputType, range) {
+  if (!range) return null;
+  const ends = [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+  if (!range.collapsed) {
+    // Ends between blocks (select all) move in to the content, so the blocks themselves stay.
+    const first = ends[0].nodeType === 1 ? ends[0].childNodes[ends[1]] : null;
+    if (first && !isAtom(first)) [ends[0], ends[1]] = startIn(first);
+    const last = ends[2].nodeType === 1 ? ends[2].childNodes[ends[3] - 1] : null;
+    if (last && !isAtom(last)) [ends[2], ends[3]] = endIn(last);
+  }
+  const match = range.collapsed && DELETES.exec(inputType);
+  if (!match) return ends;
+  const forward = match[2] === "Forward";
+  const [node, offset] = stepFrom(host, ends[0], ends[1], forward, UNITS[match[1]]);
+  return forward ? [ends[0], ends[1], node, offset] : [node, offset, ends[0], ends[1]];
+}
+
+/** Clipboard and drop edits carry their data in `dataTransfer` in a rich host, as `data` in a plain one. */
+const TRANSFERS = new Set(["insertFromPaste", "insertFromDrop", "insertReplacementText", "insertFromYank", "insertFromPasteAsQuotation"]);
+
 // The edit `inputType` with `data` that the tree asked of `host`. Returns whether a listener
 // prevented it.
 function hostEdit(host, inputType, data) {
-  const plain = editableValue(host) === 1 && host.getAttribute("contenteditable").toLowerCase() === "plaintext-only";
-  const selection = getSelection();
-  let range = selection.rangeCount ? selection.getRangeAt(0) : null;
-  if (range && (!host.contains(range.startContainer) || !host.contains(range.endContainer))) range = null;
+  if (inputType === "historyUndo" || inputType === "historyRedo") return historyStep(host, inputType === "historyRedo", true);
   const composing = compositions.get(host);
-
-  if (inputType === "insertCompositionText" || composing && inputType === "insertText") {
-    if (!composing && !data) return false;
-    let start;
-    if (!composing) {
-      compositionEvent("compositionstart", host, range ? range.toString() : "");
-      if (!range) return false;
-      start = range.collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
-    } else {
-      start = [composing.node, composing.offset];
-    }
-    const committing = inputType === "insertText";
-    if (!committing) compositionEvent("compositionupdate", host, data);
-    editEvent("beforeinput", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
-    let [node, offset] = start;
-    if (composing && composing.node.isConnected !== false && composing.node.nodeType === 3) {
-      composing.node.deleteData(composing.offset, Math.min(composing.length, composing.node.length - composing.offset));
-    }
-    const end = data ? insertText(node, offset, data) : [node, offset];
-    // Text inserted into an element point lands in a text node: the composition starts there.
-    if (node.nodeType !== 3 && end[0].nodeType === 3) [node, offset] = [end[0], end[1] - data.length];
-    selection.collapse(end[0], end[1]);
-    editEvent("input", host, committing ? "insertFromComposition" : "insertCompositionText", data, !committing, false);
-    if (committing || !data) {
-      compositions.delete(host);
-      compositionEvent("compositionend", host, data);
-    } else {
-      compositions.set(host, { node, offset, length: data.length });
-    }
-    return false;
+  if (inputType === "insertCompositionText" || composing && inputType === "insertText") return compose(host, data, composing, inputType === "insertText");
+  const range = rangeIn(host);
+  const target = targetOf(host, inputType, range);
+  const plain = isPlain(host);
+  let transfer = null;
+  if (TRANSFERS.has(inputType)) {
+    transfer = inputType === "insertFromPaste" ? pasted(host, data) : textTransfer(data);
+    if (plain) transfer = null;
+    else data = "";
   }
-
-  const event = editEvent("beforeinput", host, inputType, data || null, false);
-  if (event.defaultPrevented || !range) return event.defaultPrevented;
-  let point;
-  const collapsed = range.collapsed;
-  switch (inputType) {
-    case "insertText":
-    case "insertReplacementText":
-    case "insertFromPaste":
-    case "insertFromDrop": {
-      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
-      point = insertText(point[0], point[1], data);
-      break;
-    }
-    case "insertLineBreak":
-    case "insertParagraph": {
-      point = collapsed ? [range.startContainer, range.startOffset] : deleteRange(host, range);
-      const block = blockIn(host, point[0]);
-      if (inputType === "insertParagraph" && !plain && block !== host) {
-        point = startIn(splitBlock(block, point[0], point[1]));
-      } else {
-        const [parent, index] = elementPoint(point[0], point[1]);
-        parent.insertBefore(new LineBreak(), parent.childNodes[index] ?? null);
-        // A break that ends its block needs another after it for the new line to show.
-        if (!leafBeside(block, parent, index + 1, true)) parent.insertBefore(new LineBreak(), parent.childNodes[index + 1] ?? null);
-        point = [parent, index + 1];
-      }
-      break;
-    }
-    case "deleteByCut":
-    case "deleteByDrag":
-    case "deleteContent":
-      if (collapsed) return false;
-      point = deleteRange(host, range);
-      break;
-    default: {
-      const match = /^delete(Content|Word|SoftLine|HardLine)(Backward|Forward)$/.exec(inputType);
-      if (!match) return false;
-      if (!collapsed) point = deleteRange(host, range);
-      else {
-        const unit = match[1] === "Content" ? "grapheme" : match[1] === "Word" ? "word" : "line";
-        point = deleteStep(host, range.startContainer, range.startOffset, match[2] === "Forward", unit);
-      }
-    }
+  const ranges = target ? [staticRange(...target)] : [];
+  if (transfer) transfer._mode = "readonly";
+  const event = editEvent("beforeinput", host, inputType, data || null, false, true, ranges, transfer);
+  if (event.defaultPrevented || !target) {
+    if (transfer) transfer._mode = "protected";
+    return event.defaultPrevented;
   }
-  selection.collapse(point[0], point[1]);
-  editEvent("input", host, inputType, data || null, false, false);
+  const changed = recorded(host, historyKind(inputType), () => perform(host, inputType, data, target, transfer));
+  if (changed) editEvent("input", host, inputType, data || null, false, false, [], transfer);
+  if (transfer) transfer._mode = "protected";
   return false;
 }
 
+// The input method's composition: its text replaces itself until it is committed (`insertText`
+// while composing) or cancelled (empty text), with the events around it in Chromium's order.
+function compose(host, data, composing, committing) {
+  const range = rangeIn(host);
+  if (!composing) {
+    if (!data || !range) return false;
+    compositionEvent("compositionstart", host, range.toString());
+  }
+  compositionEvent("compositionupdate", host, data);
+  const ranges = composing
+    ? [staticRange(composing.node, composing.offset, composing.node, composing.offset + composing.length)]
+    : [staticRange(range.startContainer, range.startOffset, range.endContainer, range.endOffset)];
+  editEvent("beforeinput", host, "insertCompositionText", data, true, false, ranges);
+  let next = null;
+  recorded(host, "typing", () => {
+    let node;
+    let offset;
+    if (composing) {
+      [node, offset] = [composing.node, composing.offset];
+      if (node.parentNode && node.nodeType === 3) node.deleteData(offset, Math.min(composing.length, node.length - offset));
+    } else {
+      [node, offset] = range.collapsed ? [range.startContainer, range.startOffset] : deleteBetween(host, range.startContainer, range.startOffset, range.endContainer, range.endOffset);
+    }
+    const end = data ? insertRun(host, node, offset, data) : [node, offset];
+    // Text inserted at an element point lands in a text node: the composition starts there.
+    if (data) [node, offset] = [end[0], end[1] - data.length];
+    getSelection().collapse(end[0], end[1]);
+    next = { node, offset, length: data.length };
+    return true;
+  });
+  editEvent("input", host, "insertCompositionText", data || null, true, false);
+  if (committing || !data) {
+    compositions.delete(host);
+    compositionEvent("compositionend", host, data);
+  } else {
+    compositions.set(host, next);
+  }
+  return false;
+}
+
+// The default of edit `inputType` over `target` (start node, offset, end node, offset). Returns
+// whether it changed anything.
+function perform(host, inputType, data, target, transfer) {
+  const selection = getSelection();
+  const collapsed = target[0] === target[2] && target[1] === target[3];
+  const remove = () => (collapsed ? [target[0], target[1]] : deleteBetween(host, ...target));
+  let point;
+  switch (inputType) {
+    case "insertText":
+    case "insertReplacementText":
+    case "insertFromDrop":
+    case "insertFromYank":
+    case "insertFromPaste":
+    case "insertFromPasteAsQuotation": {
+      const text = transfer ? transfer.getData("text/plain") : String(data ?? "");
+      const html = transfer && inputType !== "insertText" ? transfer.getData("text/html") : "";
+      const styled = inputType === "insertText" ? typingStyleAt(host, target) : null;
+      point = remove();
+      if (html) point = insertFragment(host, point[0], point[1], fragmentOf(html, true));
+      else if (text) {
+        point = insertLines(host, point[0], point[1], text);
+        if (styled && point[0].nodeType === 3 && !text.includes("\n")) point = applyTypingStyle(host, styled, [point[0], point[1] - text.length], point);
+      }
+      break;
+    }
+    case "insertHTML":
+      point = remove();
+      point = insertFragment(host, point[0], point[1], fragmentOf(String(data ?? ""), false));
+      break;
+    case "insertParagraph":
+      point = paragraphBreak(host, ...remove());
+      break;
+    case "insertLineBreak":
+      point = lineBreak(host, ...remove());
+      break;
+    case "deleteByCut":
+    case "deleteByDrag":
+    case "deleteContent":
+    default: {
+      if (FORMATS[inputType] || inputType === "formatRemove") return format(host, inputType, target);
+      if (inputType !== "deleteByCut" && inputType !== "deleteByDrag" && inputType !== "deleteContent" && !DELETES.test(inputType)) return false;
+      if (collapsed) return false;
+      point = deleteBetween(host, ...target);
+    }
+  }
+  selection.collapse(point[0], point[1]);
+  return true;
+}
+
+// Markup from a paste or `insertHTML`, parsed into a fragment. A paste keeps what shows: no
+// scripts, styles, frames, event handler attributes or classes, which belong to another page.
+const STRIPPED = new Set(["script", "style", "meta", "title", "link", "head", "base", "iframe", "frame", "object", "embed", "template", "noscript"]);
+
+function fragmentOf(html, paste) {
+  const holder = createElement("div");
+  if (paste) {
+    const body = /<body[^>]*>([\s\S]*?)(<\/body>|$)/i.exec(html);
+    if (body) html = body[1];
+    html = html.replace(/<!--(Start|End)Fragment-->/g, "");
+  }
+  parseHTML(html, holder);
+  if (paste) {
+    for (let at = holder.firstChild; at;) {
+      const next = following(at, holder, true);
+      if (at.nodeType === 1 && STRIPPED.has(at.localName)) {
+        at.remove();
+        at = next;
+        continue;
+      }
+      if (at.nodeType === 1) {
+        for (const name of at.getAttributeNames?.() ?? []) {
+          if (/^on/i.test(name) || name === "class" || name === "id" || name === "contenteditable") at.removeAttribute(name);
+        }
+      }
+      at = following(at, holder);
+    }
+  }
+  return holder;
+}
+
+// Inserts the children of `fragment` at the point. Inline content goes in where the caret is;
+// blocks split the paragraph there, the first one's content joining its start and the last
+// one's its end, as Chromium pastes. Returns the point after what was inserted.
+function insertFragment(host, node, offset, fragment) {
+  const items = [...fragment.childNodes];
+  if (!items.length) return [node, offset];
+  const block = blockIn(host, node);
+  const first = items.findIndex(isBlock);
+  if (first < 0 || block === host || items.length === 1) {
+    const inline = first < 0 || block === host ? items : [...items[0].childNodes];
+    const placeholder = onlyBreak(block);
+    let [parent, index] = elementPoint(node, offset);
+    for (const item of inline) parent.insertBefore(item, parent.childNodes[index++] ?? null);
+    if (placeholder?.parentNode && onlyBreak(block) !== placeholder) placeholder.remove();
+    return endAfter(parent, index);
+  }
+  let last = items.length - 1;
+  while (!isBlock(items[last])) last--;
+  const after = splitAt(block, node, offset);
+  // Inline content before the first block (else that block's content) joins the paragraph's
+  // start; inline content after the last block (else that block's content) joins its end.
+  const leading = first > 0 ? items.slice(0, first) : [...items[0].childNodes];
+  const from = first > 0 ? first : 1;
+  const trailing = last < items.length - 1 ? items.slice(last + 1) : last >= from ? [...items[last].childNodes] : [];
+  const to = last < items.length - 1 ? last + 1 : last >= from ? last : from;
+  const middle = items.slice(from, to);
+  if (leading.some(isLeafy)) onlyBreak(block)?.remove();
+  for (const item of leading) block.appendChild(item);
+  for (const item of middle) block.parentNode.insertBefore(item, after);
+  let point = middle.length ? endIn(middle[middle.length - 1]) : endIn(block);
+  if (trailing.length) {
+    if (trailing.some(isLeafy)) onlyBreak(after)?.remove();
+    const head = after.firstChild;
+    for (const item of trailing) after.insertBefore(item, head);
+    point = pointAfter(trailing[trailing.length - 1]);
+  }
+  keepLine(block);
+  keepLine(after);
+  return point;
+}
+
+// Whether `node` is or holds something the caret steps over.
+const isLeafy = (node) => isLeaf(node) || !!leafBeside(node, node, 0, true);
+
+const textIn = (node) => (node.nodeType === 3 ? node.data : node.childNodes.map(textIn).join(""));
+
+function pointAfter(node) {
+  return node.nodeType === 3 ? [node, node.length] : [node.parentNode, indexIn(node) + 1];
+}
+
+// The caret after the child before `index` of `parent`: at its text's end when it is text.
+function endAfter(parent, index) {
+  const before = parent.childNodes[index - 1];
+  if (before?.nodeType === 3) return [before, before.length];
+  if (before && !isAtom(before)) {
+    const end = endIn(before);
+    if (end[0] !== before) return end;
+  }
+  return [parent, index];
+}
+
+function pasted(host, text) {
+  const last = lastPaste;
+  lastPaste = null;
+  if (last && last.host === host) return last.data;
+  return textTransfer(text);
+}
+
+function textTransfer(text) {
+  const transfer = new DataTransfer();
+  if (text) transfer.setData("text/plain", text);
+  return transfer;
+}
+
+// The paste whose `insertFromPaste` comes next, with the clipboard's markup.
+let lastPaste = null;
+
+// Inline formatting, as `formatBold` and the like (and `execCommand("bold")`) make it.
+const FORMATS = {
+  formatBold: { tag: "b", tags: ["b", "strong"], command: "bold" },
+  formatItalic: { tag: "i", tags: ["i", "em"], command: "italic" },
+  formatUnderline: { tag: "u", tags: ["u"], command: "underline" },
+  formatStrikeThrough: { tag: "strike", tags: ["strike", "s", "del"], command: "strikeThrough" },
+  formatSubscript: { tag: "sub", tags: ["sub"], command: "subscript" },
+  formatSuperscript: { tag: "sup", tags: ["sup"], command: "superscript" },
+};
+// What `removeFormat` unwraps.
+const FORMATTING = new Set([
+  "abbr", "acronym", "b", "bdi", "bdo", "big", "blink", "cite", "code", "dfn", "em", "font", "i", "ins", "kbd", "mark",
+  "nobr", "q", "s", "samp", "small", "span", "strike", "strong", "sub", "sup", "tt", "u", "var",
+]);
+
+// The nearest element above `node` in `host` that `test` accepts, or null.
+function ancestorWhere(host, node, test) {
+  for (let at = node.nodeType === 3 ? node.parentNode : node; at && at !== host; at = at.parentNode) {
+    if (at.nodeType === 1 && test(at)) return at;
+  }
+  return null;
+}
+
+const formattedBy = (host, node, format) => ancestorWhere(host, node, (at) => format.tags.includes(at.localName));
+
+// The text nodes the range covers, split at its ends, in order. Text in atoms is left out.
+function textsIn(host, startNode, startOffset, endNode, endOffset) {
+  if (endNode.nodeType === 3 && endOffset > 0 && endOffset < endNode.length) endNode.splitText(endOffset);
+  if (startNode.nodeType === 3 && startOffset > 0 && startOffset < startNode.length) {
+    const rest = startNode.splitText(startOffset);
+    if (endNode === startNode) [endNode, endOffset] = [rest, endOffset - startOffset];
+    [startNode, startOffset] = [rest, 0];
+  }
+  const found = [];
+  for (let at = host.firstChild; at; at = nextNode(at, host)) {
+    if (at.nodeType !== 3 || !at.length) continue;
+    if (comparePoints(at, 0, startNode, startOffset) >= 0 && comparePoints(at, at.length, endNode, endOffset) <= 0) found.push(at);
+  }
+  return found;
+}
+
+// Takes `node` out of `ancestor`: what is before and after it stays in copies of `ancestor`,
+// and what is between `node` and `ancestor` stays around it.
+function unwrapAround(ancestor, node) {
+  const after = splitAt(ancestor, node.parentNode, indexIn(node) + 1);
+  unwrap(splitAt(ancestor, node.parentNode, indexIn(node)));
+  for (const part of [ancestor, after]) if (!leafBeside(part, part, 0, true)) part.remove();
+}
+
+function unwrap(element) {
+  const parent = element.parentNode;
+  while (element.firstChild) parent.insertBefore(element.firstChild, element);
+  element.remove();
+}
+
+// Wraps `node` in a new `tag` element, joined with one just before or after it.
+const bare = (node, tag) => node?.nodeType === 1 && node.localName === tag && node.getAttributeNames().length === 0;
+
+function wrapIn(node, tag) {
+  const before = node.previousSibling;
+  if (bare(before, tag)) {
+    before.appendChild(node);
+    if (bare(before.nextSibling, tag)) unwrapInto(before.nextSibling, before);
+    return;
+  }
+  const after = node.nextSibling;
+  if (bare(after, tag)) {
+    after.insertBefore(node, after.firstChild);
+    return;
+  }
+  const wrapper = createElement(tag);
+  node.parentNode.insertBefore(wrapper, node);
+  wrapper.appendChild(node);
+}
+
+function unwrapInto(from, into) {
+  while (from.firstChild) into.appendChild(from.firstChild);
+  from.remove();
+}
+
+// Whether every text the target covers has `format` (`state`), and whether some do (`some`).
+function formatState(host, target, format) {
+  const range = new Range();
+  range.setStart(target[0], target[1]);
+  range.setEnd(target[2], target[3]);
+  if (range.collapsed) {
+    const typed = typingStyle && typingStyle.host === host && typingStyle.node === target[0] && typingStyle.offset === target[1] ? typingStyle.formats.get(format) : undefined;
+    const on = typed ?? !!formattedBy(host, target[0], format);
+    return { state: on, some: on };
+  }
+  let all = true;
+  let some = false;
+  let any = false;
+  for (let at = host.firstChild; at; at = nextNode(at, host)) {
+    if (at.nodeType !== 3 || !at.length || !range.intersectsNode(at)) continue;
+    if (at === target[2] && target[3] === 0 || at === target[0] && target[1] === at.length) continue;
+    any = true;
+    if (formattedBy(host, at, format)) some = true;
+    else all = false;
+  }
+  return { state: any && all, some };
+}
+
+// Formatting `inputType` over the target. A collapsed target sets how the next typed text is
+// formatted, as Chromium does, and changes nothing yet.
+function format(host, inputType, target) {
+  if (isPlain(host)) return false;
+  const collapsed = target[0] === target[2] && target[1] === target[3];
+  if (inputType === "formatRemove") {
+    if (collapsed) return false;
+    const texts = textsIn(host, ...target);
+    for (const text of texts) {
+      let found;
+      while ((found = ancestorWhere(host, text, (at) => FORMATTING.has(at.localName)))) unwrapAround(found, text);
+    }
+    return select(texts);
+  }
+  const which = FORMATS[inputType];
+  if (collapsed) {
+    const { state } = formatState(host, target, which);
+    if (!typingStyle || typingStyle.host !== host || typingStyle.node !== target[0] || typingStyle.offset !== target[1]) {
+      typingStyle = { host, node: target[0], offset: target[1], formats: new Map() };
+    }
+    typingStyle.formats.set(which, !state);
+    return false;
+  }
+  const on = formatState(host, target, which).state;
+  const texts = textsIn(host, ...target);
+  for (const text of texts) {
+    if (on) {
+      let found;
+      while ((found = formattedBy(host, text, which))) unwrapAround(found, text);
+    } else if (!formattedBy(host, text, which)) wrapIn(text, which.tag);
+  }
+  return select(texts);
+}
+
+function select(texts) {
+  if (!texts.length) return false;
+  const last = texts[texts.length - 1];
+  getSelection().setBaseAndExtent(texts[0], 0, last, last.length);
+  return true;
+}
+
+// Formats a collapsed `formatBold` and the like asked for, for the text typed next at that caret.
+let typingStyle = null;
+
+function typingStyleAt(host, target) {
+  const style = typingStyle;
+  typingStyle = null;
+  return style && style.host === host && style.node === target[0] && style.offset === target[1] ? style : null;
+}
+
+// Gives the text typed from `start` to `end` the formats `style` asked for.
+function applyTypingStyle(host, style, start, end) {
+  const texts = textsIn(host, start[0], start[1], end[0], end[1]);
+  for (const [which, on] of style.formats) {
+    for (const text of texts) {
+      if (on && !formattedBy(host, text, which)) {
+        const wrapper = createElement(which.tag);
+        text.parentNode.insertBefore(wrapper, text);
+        wrapper.appendChild(text);
+      } else if (!on) {
+        let found;
+        while ((found = formattedBy(host, text, which))) unwrapAround(found, text);
+      }
+    }
+  }
+  const last = texts[texts.length - 1];
+  return last ? [last, last.length] : end;
+}
+
+// Undo and redo, as a browser keeps them for editing hosts: each default edit records its
+// changes (the mutation records of the host) with the selection before and after. Typing in a
+// row, and deleting in a row, undo as one step, until the caret moves elsewhere.
+const histories = new WeakMap();
+const HISTORY_LIMIT = 100;
+
+function historyKind(inputType) {
+  if (inputType === "insertText" || inputType === "insertParagraph" || inputType === "insertLineBreak") return "typing";
+  if (/^delete.*Backward$/.test(inputType)) return "backward";
+  if (/^delete.*Forward$/.test(inputType)) return "forward";
+  return null;
+}
+
+// The selection's ends, without asking the tree when a script just set them.
+const selectionNow = () => getSelection()._ends();
+
+const sameSelection = (a, b) => a === b || !!a && !!b && a.every((value, i) => value === b[i]);
+
+// Runs `edit` with the host's changes recorded for undo (as `kind`, to join a run of them).
+// Returns what `edit` returns.
+function recorded(host, kind, edit) {
+  const recorder = new MutationObserver(() => {});
+  recorder.observe(host, { childList: true, subtree: true, characterData: true, characterDataOldValue: true, attributes: true, attributeOldValue: true });
+  const before = selectionNow();
+  let result;
+  let records;
+  try {
+    result = edit();
+  } finally {
+    records = recorder.takeRecords();
+    recorder.disconnect();
+  }
+  if (!records.length) return result;
+  let history = histories.get(host);
+  if (!history) histories.set(host, (history = { undo: [], redo: [] }));
+  const after = selectionNow();
+  const last = history.undo[history.undo.length - 1];
+  if (kind && last && last.kind === kind && !history.redo.length && sameSelection(last.after, before)) {
+    last.records.push(...records);
+    last.after = after;
+  } else {
+    history.undo.push({ kind, records, before, after });
+    if (history.undo.length > HISTORY_LIMIT) history.undo.shift();
+  }
+  history.redo.length = 0;
+  return result;
+}
+
+// Undoes (or redoes) the host's last step; `events` fires `beforeinput` first, as keys and the
+// edit menu do (`execCommand` fires only `input`). Returns whether a listener prevented it.
+function historyStep(host, redo, events) {
+  const history = histories.get(host);
+  const stack = redo ? history?.redo : history?.undo;
+  if (!stack?.length) return false;
+  const inputType = redo ? "historyRedo" : "historyUndo";
+  if (events) {
+    const range = rangeIn(host);
+    const ranges = range ? [staticRange(range.startContainer, range.startOffset, range.endContainer, range.endOffset)] : [];
+    if (editEvent("beforeinput", host, inputType, null, false, true, ranges).defaultPrevented) return true;
+  }
+  const step = stack.pop();
+  if (redo) for (const record of step.records) replay(record, true);
+  else for (let i = step.records.length - 1; i >= 0; i--) replay(step.records[i], false);
+  (redo ? history.undo : history.redo).push(step);
+  const ends = redo ? step.after : step.before;
+  const selection = getSelection();
+  if (ends && inDocument(ends[0]) && inDocument(ends[2])) {
+    try {
+      selection.setBaseAndExtent(ends[0], Math.min(ends[1], nodeLength(ends[0])), ends[2], Math.min(ends[3], nodeLength(ends[2])));
+    } catch {
+      // A node the step left behind has gone: the selection stays where it is.
+    }
+  }
+  editEvent("input", host, inputType, null, false, false);
+  return false;
+}
+
+// Undoes (or with `forward`, redoes) one mutation record. Changes a script made since are kept
+// where they do not collide: a record that no longer fits is passed over.
+function replay(record, forward) {
+  const target = record.target;
+  try {
+    if (record.type === "characterData") {
+      const now = target.data;
+      target.data = forward ? record._newValue : record.oldValue;
+      if (!forward) record._newValue = now;
+    } else if (record.type === "attributes") {
+      const now = target.getAttribute(record.attributeName);
+      const value = forward ? record._newValue : record.oldValue;
+      if (!forward) record._newValue = now;
+      if (value === null) target.removeAttribute(record.attributeName);
+      else target.setAttribute(record.attributeName, value);
+    } else {
+      const out = forward ? record.removedNodes : record.addedNodes;
+      const back = forward ? record.addedNodes : record.removedNodes;
+      for (const node of out) if (node.parentNode === target) node.remove();
+      const next = record.nextSibling?.parentNode === target ? record.nextSibling
+        : record.previousSibling?.parentNode === target ? record.previousSibling.nextSibling : null;
+      for (const node of back) target.insertBefore(node, next);
+    }
+  } catch {
+    // The record no longer fits the nodes: a script changed them in a way this step cannot undo.
+  }
+}
+
+/** Moves or extends the selection by `granularity` in `direction`, as `Selection.modify` does in Chromium. */
+function modifySelection(selection, alter, direction, granularity) {
+  alter = String(alter).toLowerCase();
+  direction = String(direction).toLowerCase();
+  granularity = String(granularity).toLowerCase();
+  if (alter !== "move" && alter !== "extend") return;
+  if (!["forward", "backward", "left", "right"].includes(direction)) return;
+  if (!selection.rangeCount) return;
+  const forward = direction === "forward" || direction === "right";
+  const anchor = [selection.anchorNode, selection.anchorOffset];
+  let focus = [selection.focusNode, selection.focusOffset];
+  const host = editingHostOf(focus[0]) ?? rootOf(focus[0]);
+  if (alter === "move" && !selection.isCollapsed) {
+    const range = selection.getRangeAt(0);
+    focus = forward ? [range.endContainer, range.endOffset] : [range.startContainer, range.startOffset];
+    if (granularity === "character") return selection.collapse(focus[0], focus[1]);
+  }
+  let next;
+  switch (granularity) {
+    case "character":
+    case "word":
+      next = stepFrom(host, focus[0], focus[1], forward, granularity);
+      break;
+    case "line":
+      next = nativeLineStep(focus[0], focus[1], forward, false) ?? blockStep(host, focus, forward);
+      break;
+    case "lineboundary":
+      next = nativeLineStep(focus[0], focus[1], forward, true) ?? stepFrom(host, focus[0], focus[1], forward, "paragraph");
+      break;
+    case "sentence":
+    case "sentenceboundary":
+    case "paragraphboundary":
+      next = stepFrom(host, focus[0], focus[1], forward, "paragraph");
+      break;
+    case "paragraph":
+      next = blockStep(host, focus, forward);
+      break;
+    case "documentboundary":
+      next = forward ? endIn(host) : startIn(host);
+      break;
+    default:
+      return;
+  }
+  if (!host.contains(next[0])) return;
+  if (alter === "move") selection.collapse(next[0], next[1]);
+  else selection.setBaseAndExtent(anchor[0], anchor[1], next[0], next[1]);
+}
+
+// The same place in the next (or previous) block: its edge, as a line step falls back to.
+function blockStep(host, [node, offset], forward) {
+  const edge = stepFrom(host, node, offset, forward, "paragraph");
+  const out = stepFrom(host, edge[0], edge[1], forward, "character");
+  return comparePoints(out[0], out[1], edge[0], edge[1]) === 0 ? edge : stepFrom(host, out[0], out[1], forward, "paragraph");
+}
+
+// The commands `execCommand` runs, by the `inputType` of their `input` event (Chromium's).
+const COMMANDS = new Map([
+  ["inserttext", "insertText"], ["inserthtml", ""], ["insertparagraph", "insertParagraph"],
+  ["insertlinebreak", "insertLineBreak"], ["delete", "deleteContentBackward"], ["forwarddelete", "deleteContentForward"],
+  ["bold", "formatBold"], ["italic", "formatItalic"], ["underline", "formatUnderline"],
+  ["strikethrough", "formatStrikeThrough"], ["subscript", "formatSubscript"], ["superscript", "formatSuperscript"],
+  ["removeformat", "formatRemove"], ["createlink", "insertLink"], ["unlink", ""], ["formatblock", ""],
+  ["undo", "historyUndo"], ["redo", "historyRedo"], ["selectall", null], ["defaultparagraphseparator", null],
+]);
+// Supported, never enabled for scripts: the clipboard belongs to the user.
+const CLIPBOARD_COMMANDS = new Set(["copy", "cut", "paste"]);
+const BLOCK_FORMATS = new Set(["address", "dd", "div", "dt", "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre", "blockquote"]);
+
+// The editing host the selection is in, or (without a selection) the focused one.
+function commandHost() {
+  const range = getSelection().rangeCount ? getSelection().getRangeAt(0) : null;
+  const host = range ? editingHostOf(range.startContainer) : null;
+  if (host && host.contains(range.endContainer)) return host;
+  const focused = activeElement();
+  return !range && focused && editingHostOf(focused) === focused ? focused : null;
+}
+
 /**
- * The classic editing commands an editor may still call: `insertText`, `delete`,
- * `forwardDelete`, `insertParagraph`, `insertLineBreak` and `selectAll`, in the focused
- * editing host. Returns whether it ran.
+ * The classic editing commands, as Chromium runs them in the editing host the selection is in:
+ * `insertText`, `insertHTML`, `insertParagraph`, `insertLineBreak`, `delete`, `forwardDelete`,
+ * `bold`, `italic`, `underline`, `strikeThrough`, `subscript`, `superscript`, `removeFormat`,
+ * `createLink`, `unlink`, `formatBlock`, `undo`, `redo`, `selectAll` and
+ * `defaultParagraphSeparator`. They fire `input`, not `beforeinput`. Returns whether it ran.
  */
 export function execCommand(command, _showUI = false, value = "") {
-  const selection = getSelection();
-  const node = selection.rangeCount ? selection.getRangeAt(0).startContainer : null;
-  const host = node ? editingHostOf(node) : null;
-  if (!host) return false;
-  if (command === "selectAll") {
-    selection.selectAllChildren(host);
+  const name = String(command).toLowerCase();
+  if (!COMMANDS.has(name)) return false;
+  if (name === "defaultparagraphseparator") {
+    const tag = String(value).toLowerCase();
+    if (tag !== "div" && tag !== "p") return false;
+    paragraphSeparator = tag;
     return true;
   }
-  const inputType = { insertText: "insertText", delete: "deleteContentBackward", forwardDelete: "deleteContentForward", insertParagraph: "insertParagraph", insertLineBreak: "insertLineBreak", insertHTML: "insertText" }[command];
-  if (!inputType) return false;
-  hostEdit(host, inputType, inputType === "insertText" ? String(value) : "");
+  const selection = getSelection();
+  if (name === "selectall") {
+    const host = commandHost();
+    if (host) selection.selectAllChildren(host);
+    else if (rootNode) selection.selectAllChildren(rootNode);
+    return true;
+  }
+  const host = commandHost();
+  if (!host) return false;
+  if (name === "undo" || name === "redo") {
+    historyStep(host, name === "redo", false);
+    return true;
+  }
+  const inputType = COMMANDS.get(name);
+  const plain = isPlain(host);
+  if (plain && (FORMATS[inputType] || inputType === "formatRemove" || name === "createlink" || name === "unlink" || name === "formatblock")) return false;
+  const range = rangeIn(host);
+  if (!range && name !== "inserttext" && name !== "inserthtml") return false;
+  const target = range ? targetOf(host, inputType, range) : [...startIn(host), ...startIn(host)];
+  let data = null;
+  const changed = recorded(host, historyKind(inputType), () => {
+    switch (name) {
+      case "inserttext":
+        data = String(value);
+        return perform(host, "insertText", data, target, null);
+      case "inserthtml":
+        // A plain host takes the markup's text, as Chromium does.
+        if (plain) return perform(host, "insertText", textIn(fragmentOf(String(value), true)), target, null);
+        return perform(host, "insertHTML", String(value), target, null);
+      case "createlink":
+        data = String(value);
+        return link(host, target, data);
+      case "unlink":
+        return unlink(host, target);
+      case "formatblock":
+        return formatBlock(host, target, value);
+      default:
+        return perform(host, inputType, null, target, null);
+    }
+  });
+  if (changed) editEvent("input", host, inputType, data, false, false);
   return true;
+}
+
+function link(host, target, url) {
+  if (!url) return false;
+  const collapsed = target[0] === target[2] && target[1] === target[3];
+  if (collapsed) {
+    const anchor = createElement("a");
+    anchor.setAttribute("href", url);
+    anchor.appendChild(new Text(url));
+    const [parent, index] = elementPoint(target[0], target[1]);
+    parent.insertBefore(anchor, parent.childNodes[index] ?? null);
+    getSelection().selectAllChildren(anchor);
+    return true;
+  }
+  const texts = textsIn(host, ...target);
+  for (const text of texts) {
+    const existing = ancestorWhere(host, text, (at) => at.localName === "a");
+    if (existing) existing.setAttribute("href", url);
+    else {
+      wrapIn(text, "a");
+      text.parentNode.setAttribute("href", url);
+    }
+  }
+  // Joined runs of links that share the address are one link.
+  for (const text of texts) {
+    const anchor = text.parentNode;
+    const next = anchor?.nextSibling;
+    if (anchor?.localName === "a" && next?.nodeType === 1 && next.localName === "a" && next.getAttribute("href") === url) unwrapInto(next, anchor);
+  }
+  return select(texts);
+}
+
+function unlink(host, target) {
+  const collapsed = target[0] === target[2] && target[1] === target[3];
+  if (collapsed) return false;
+  const range = new Range();
+  range.setStart(target[0], target[1]);
+  range.setEnd(target[2], target[3]);
+  const anchors = [];
+  for (let at = host.firstChild; at; at = nextNode(at, host)) {
+    if (at.nodeType === 1 && at.localName === "a" && at.hasAttribute("href") && range.intersectsNode(at)) anchors.push(at);
+  }
+  const ends = [target[0], target[1], target[2], target[3]];
+  for (const anchor of anchors) unwrap(anchor);
+  if (anchors.length && inDocument(ends[0]) && inDocument(ends[2])) getSelection().setBaseAndExtent(...ends);
+  return anchors.length > 0;
+}
+
+function formatBlock(host, target, value) {
+  const tag = String(value).replace(/^<|>$/g, "").toLowerCase();
+  if (!BLOCK_FORMATS.has(tag)) return false;
+  const ends = [target[0], target[1], target[2], target[3]];
+  let start = blockIn(host, target[0]);
+  if (start === host) start = wrapRun(host, target[0], target[1]);
+  let end = blockIn(host, target[2]);
+  if (end === host) end = wrapRun(host, target[2], target[3]);
+  const blocks = [];
+  for (let at = start; at; at = following(at, host, true)) {
+    if (isBlock(at) && at !== host) blocks.push(at);
+    if (at === end || at.contains(end)) break;
+  }
+  let changed = false;
+  for (const block of blocks) {
+    if (block.localName === tag) continue;
+    // A block that holds blocks keeps them: only one holding text is renamed.
+    if ([...block.childNodes].some(isBlock)) continue;
+    const renamed = createElement(tag);
+    block.parentNode.insertBefore(renamed, block);
+    while (block.firstChild) renamed.appendChild(block.firstChild);
+    block.remove();
+    changed = true;
+  }
+  if (inDocument(ends[0]) && inDocument(ends[2])) getSelection().setBaseAndExtent(...ends);
+  return changed;
+}
+
+function commandTarget() {
+  const host = commandHost();
+  const range = host ? rangeIn(host) : null;
+  return range ? { host, target: [range.startContainer, range.startOffset, range.endContainer, range.endOffset] } : null;
+}
+
+/** Whether `execCommand` knows `command`. */
+export function queryCommandSupported(command) {
+  const name = String(command).toLowerCase();
+  return COMMANDS.has(name) || CLIPBOARD_COMMANDS.has(name);
+}
+
+/** Whether `execCommand(command)` would run now: the selection is in an editing host that takes it. */
+export function queryCommandEnabled(command) {
+  const name = String(command).toLowerCase();
+  if (!COMMANDS.has(name)) return false;
+  if (name === "selectall" || name === "defaultparagraphseparator") return true;
+  const host = commandHost();
+  if (!host) return false;
+  const inputType = COMMANDS.get(name);
+  return !(isPlain(host) && (FORMATS[inputType] || inputType === "formatRemove" || name === "createlink" || name === "unlink" || name === "formatblock"));
+}
+
+/** Whether the selection has the formatting of `command` (`bold` and the like). */
+export function queryCommandState(command) {
+  const which = FORMATS[COMMANDS.get(String(command).toLowerCase())];
+  const at = which && commandTarget();
+  return at ? formatState(at.host, at.target, which).state : false;
+}
+
+/** Whether only some of the selection has the formatting of `command`. */
+export function queryCommandIndeterm(command) {
+  const which = FORMATS[COMMANDS.get(String(command).toLowerCase())];
+  const at = which && commandTarget();
+  if (!at) return false;
+  const { state, some } = formatState(at.host, at.target, which);
+  return some && !state;
+}
+
+/** The value of `command`: the block's tag for `formatBlock`, the state of `bold` and the like as "true" or "false". */
+export function queryCommandValue(command) {
+  const name = String(command).toLowerCase();
+  if (name === "defaultparagraphseparator") return paragraphSeparator;
+  const at = commandTarget();
+  if (name === "formatblock") {
+    if (!at) return "";
+    const block = blockIn(at.host, at.target[0]);
+    return block !== at.host && BLOCK_FORMATS.has(block.localName) ? block.localName : "";
+  }
+  if (FORMATS[COMMANDS.get(name)]) return String(queryCommandState(name));
+  return "";
 }
 
 // Copy, cut and paste as the Clipboard API and events spec has them, and beforeinput. A
@@ -4917,6 +5839,11 @@ function dispatchEditing(kind, target, first, second, third) {
   if (event.clipboardData) {
     if ((kind === COPY || kind === CUT) && event.defaultPrevented) writeClipboard(event.clipboardData);
     event.clipboardData._mode = "protected";
+  }
+  // The tree's `insertFromPaste` for an editing host follows with the text alone: its markup is here.
+  if (kind === PASTE) {
+    const host = event.defaultPrevented || target instanceof Input ? null : editingHostOf(target);
+    lastPaste = host ? { host, data: event.clipboardData } : null;
   }
   return event.defaultPrevented;
 }
@@ -5268,10 +6195,12 @@ class InputEvent extends Event {
     this.data = init.data ?? null;
     this.dataTransfer = init.dataTransfer ?? null;
     this.isComposing = !!init.isComposing;
+    this._targetRanges = init.targetRanges ? Array.from(init.targetRanges) : [];
   }
 
+  /** The ranges the edit will change, as StaticRanges; empty on `input`. */
   getTargetRanges() {
-    return [];
+    return [...this._targetRanges];
   }
 }
 

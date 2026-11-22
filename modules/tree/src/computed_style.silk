@@ -21,6 +21,7 @@ import properties.keywords { Keyword }
 import properties.values
 import properties.values { Value, Unit }
 import properties.computed { Fill, Visibility, SizeValue, DimensionKind, Display, DisplayInside, DisplayOutside, BoxSizing }
+import properties.computed { WhiteSpaceCollapse, TextWrap }
 import properties.values { Separator }
 import ui_protocol.error { TreeError }
 import silk.collections.bytes { Bytes }
@@ -47,8 +48,13 @@ pub effect fn write(tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes
     Option.Some { value } => value
     _ => { return false }
   }
-  if catalog.longhandCount(property) > 1 { return false }
+  let spacing = name == b"white-space" || name == b"white-space-collapse" || name == b"text-wrap-mode"
+  if catalog.longhandCount(property) > 1 && !spacing { return false }
   if tree.layoutPending() { run tree.layoutNow() }
+  if spacing {
+    run whiteSpace(&tree.node(slot).computed().*, name, &mut out.*)
+    return true
+  }
   let field = fieldOf(name)
   if field != motion.FIELDS {
     if run used(&tree.*, slot, field, &mut out.*) { return true }
@@ -57,6 +63,41 @@ pub effect fn write(tree: &mut UiTree<'_>, id: u32, name: &[u8], out: &mut Bytes
   }
   run cascaded(&tree.*, slot, property, &mut out.*)
   return true
+}
+
+/// `white-space` and its longhands from the computed style, which is where the shorthand
+/// lands: the declarations alone would miss `white-space: pre-wrap` for `white-space-collapse`.
+effect fn whiteSpace(computed: &Computed, name: &[u8], out: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+  let collapse = computed.text.whiteSpaceCollapse
+  let wrap = computed.text.textWrap == TextWrap.Wrap
+  let collapseName = match collapse {
+    WhiteSpaceCollapse.Collapse => b"collapse"
+    WhiteSpaceCollapse.Discard => b"discard"
+    WhiteSpaceCollapse.Preserve => b"preserve"
+    WhiteSpaceCollapse.PreserveBreaks => b"preserve-breaks"
+    WhiteSpaceCollapse.PreserveSpaces => b"preserve-spaces"
+    WhiteSpaceCollapse.BreakSpaces => b"break-spaces"
+  }
+  if name == b"white-space-collapse" {
+    run out.append(collapseName)
+    return
+  }
+  if name == b"text-wrap-mode" {
+    run out.append(if wrap { b"wrap" } else { b"nowrap" })
+    return
+  }
+  if collapse == WhiteSpaceCollapse.Collapse {
+    run out.append(if wrap { b"normal" } else { b"nowrap" })
+  } else if collapse == WhiteSpaceCollapse.Preserve {
+    run out.append(if wrap { b"pre-wrap" } else { b"pre" })
+  } else if collapse == WhiteSpaceCollapse.PreserveBreaks && wrap {
+    run out.append(b"pre-line")
+  } else if collapse == WhiteSpaceCollapse.BreakSpaces && wrap {
+    run out.append(b"break-spaces")
+  } else {
+    run out.append(collapseName)
+    if !wrap { run out.append(b" nowrap") }
+  }
 }
 
 fn fieldOf(name: &[u8]) -> u32 {
