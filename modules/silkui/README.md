@@ -1,8 +1,8 @@
 # silkui
 
 The front door of Silk UI. A project defines its app once, in `silk/tasks.silk`, and builds and
-runs it with pipelines of steps: `silk task dev` opens it with the development tools, and
-`silk task build --release` writes the release program. silkui generates the Silk host for each target,
+runs it with pipelines of steps: `silk dev` opens it with the development tools, and
+`silk build --release` builds the release program. silkui generates the Silk host for each target,
 so the project never assembles hosts, fonts, GPU start-up or bundles by hand.
 
 | Written in | Files the project owns | What silkui generates |
@@ -15,7 +15,7 @@ One root holds both projects, so `silk` and `npm` commands both run there. The m
 
 Generated modules and bundles are cached build steps. Each compilation uses the application's
 manifest and explicit dependencies; its entry module calls into [silkui-window](window) or
-the selected Loom host. `silk task plan` publishes compilation requests for editors without
+the selected Loom host. `silk plan` publishes compilation requests for editors without
 compiling the application.
 
 ## The app and the pipelines
@@ -30,15 +30,9 @@ effect fn app() -> App ! OutOfMemoryError ? &mut Allocator {
 }
 
 // in TaskSet.perform:
-Tasks.Dev { platform, options } => run app()
-  |> App.only(String.view(&platform))
-  |> App.dev(&options)
-  |> Built.launch()
-  |> Running.watch()
-Tasks.Build { platform, options } => run app()
-  |> App.only(String.view(&platform))
-  |> App.build(&options)
-  |> Built.write("dist")
+Tasks.Build { options, out } => run app() |> App.build(&options) |> Built.write(out.view())
+Tasks.Run { options } => run app() |> App.build(&options) |> Built.launch() |> Running.watch()
+Tasks.Dev { options } => run app() |> App.dev(&options) |> Built.launch() |> Running.watch()
 ```
 
 The examples have the whole `tasks.silk`, command line included: [loom](examples/loom),
@@ -48,11 +42,10 @@ An app goes through three stages, and each step is scoped under the stage it tak
 
 | Step | Gives | What it does |
 | --- | --- | --- |
-| `App.only(id)` | App | Keeps only platform `id` (the `--platform` flag); empty keeps them all |
-| `app.compilations(&options)` | Build | Describes the selected hosts as standard compilations, with generated entry modules and release bundles as prerequisites; runs no tools |
+| `app.compilations(&options)` | Build | Describes the hosts `--target` selects as standard compilations, with generated entry modules and release bundles as prerequisites; runs no tools |
 | `App.build(&options)` | Built | Compiles the graph without the development tools and assembles browser pages |
 | `App.dev(&options)` | Built | The same with the development tools, and it installs the Vite packages the dev server needs |
-| `Built.write(dir)` | end | Copies each program to `<dir>/<target>/<project name>`, and each page to `<dir>/<target>/`, and lists them with their sizes and the build time |
+| `Built.write(dir)` | end | Lists each program and page where the build keeps it, with their sizes and the build time. With a `dir` (the `--out` flag), also copies each program to `<dir>/<target>/<project name>` and each page to `<dir>/<target>/`, and lists the copies |
 | `Built.launch()` | Running | Starts the first target: Vite's dev server for a JavaScript app in `Mode.Dev`, which opens the window; a server for the page of a web target, on `http://127.0.0.1:8090/` (or a free port); otherwise the program |
 | `Running.watch()` | end | Runs until the window closes, or serves the page until the task is stopped. Vite replaces edited JavaScript modules in place; a change in the Silk sources of a Loom app rebuilds it and restarts the window, which keeps the model's `pub` fields, the window size, focus and scroll positions, or reloads the page |
 
@@ -71,7 +64,10 @@ effect fn sign<'env, E, ?R>(built: once Effect<'env; Built ! E ? R>) -> Built ! 
 
 Tasks flatten the standard `silk.build.graph.Options` flags: `--release` selects speed
 optimization, `--optimize` selects an optimization mode, `--debug` controls debug information,
-and `--target` selects a native target triple. `--platform` selects the UI host. Only
+and `--target` selects where the app runs: a platform name (`window`, `web-canvas`,
+`web-dom`) keeps only that target, and a triple such as `aarch64-apple-darwin` builds the
+window host for it. With no platform named, every target is built, and `dev` and `run` start
+the first. Only
 `App.dev` builds include the development tools (reload, the development server, the
 inspector); `App.build` without `--release` is `Mode.Debug`, the program unoptimized, as
 `silk build` makes it. A Loom app's development build optimizes the renderer, inspector server
@@ -107,7 +103,7 @@ fail and does not stay quiet: it says so on standard error at launch and runs th
 text, which every host carries as well.
 
 ```sh
-SILK_UI_TRACE_JS=1 dist/window/my-app
+SILK_UI_TRACE_JS=1 build/aarch64-apple-darwin/release/my-app-host-window
 # silkui: JavaScript starts from its bytecode image (2299196 bytes, engine build 7816585738683590938)
 ```
 
@@ -215,9 +211,11 @@ that fills the page (Chrome or Edge 137 and later: the page waits on the GPU thr
 `web-dom` the same `Model` drives the page's own elements through the protocol, and the browser
 does layout and text.
 
-`build` writes a static site to `dist/<target>/`: `index.html`, `app.wasm` and the scripts that
-load it, which any static file server can serve. `dev --platform web-canvas` (or `web-dom`) serves
-it from `build/pages/<target>/site/`, rebuilds when `src/` changes, and the open page reloads itself.
+`build` writes a static site to `build/wasm32-unknown-unknown/<mode>/pages/<target>/site/`:
+`index.html`, `app.wasm` and the scripts that load it, which any static file server can serve;
+`--out <dir>` copies it to `<dir>/<target>/`. `dev --target web-canvas` (or `web-dom`) serves
+its own copy, in `pages/<target>-dev/site/`, rebuilds when `src/` changes, and the open page
+reloads itself.
 A `web-canvas` rebuild links the whole tree to wasm, which takes a minute or two; `web-dom`
 takes seconds.
 
@@ -245,7 +243,7 @@ and hands the bridge their dispatcher. [examples/native](examples/native) is one
 - A Loom app with commands (`Framework.loomWithCommands`) cannot target `web-dom` yet: the page has no shell for them.
 - The web targets read the page scripts from Silk's checkouts of silkui, Loom and lib-native, so
   Git dependencies on silkui and loom must be pinned with `rev`.
-- Under `silk task dev`, an edit to the Silk modules a JavaScript app imports rebuilds the host
+- Under `silk dev`, an edit to the Silk modules a JavaScript app imports rebuilds the host
   and starts it again, so the app's JavaScript state starts over, as after a page reload.
 - Starting Vite and the app beside the tasks, and serving pages, needs subprocesses and sockets
   that silkui uses on macOS and Linux only: `dev` and `launch` fail on Windows.

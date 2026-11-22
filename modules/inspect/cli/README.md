@@ -3,7 +3,7 @@
 A command line client for the inspector protocol ([ui-inspect-server](../server)): it sends one
 request to a running Silk UI and prints the answer.
 
-An app's `silk task dev` builds the same program beside its window host, as `<app>-inspect`,
+An app's `silk dev` builds the same program beside its window host, as `<app>-inspect`,
 from the app's own silkui pin, and prints its path:
 
 ```text

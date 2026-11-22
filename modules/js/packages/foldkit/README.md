@@ -14,7 +14,7 @@ The quickest start is the Foldkit template:
 ```sh
 silk init my-app -t ui-foldkit
 cd my-app
-silk task dev
+silk dev
 ```
 
 See [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an
