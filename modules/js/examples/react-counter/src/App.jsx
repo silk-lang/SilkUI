@@ -74,10 +74,10 @@ export function App() {
 }
 
 // The bar at the top is the window's title bar where the system lets the page draw it (on
-// macOS the window controls sit at its left), so nothing in it takes clicks.
+// macOS the window controls sit at its left), so a press on it moves the window.
 function TitleBar({ theme }) {
   return (
-    <box style={{ ...row, position: "relative", justifyContent: "center", height: 56, flexShrink: 0 }}>
+    <box style={{ ...row, position: "relative", justifyContent: "center", height: 56, flexShrink: 0, WebkitAppRegion: "drag" }}>
       <box style={{ ...row, gap: 10, fontWeight: 600, fontSize: 15 }}>
         <box style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: rgb(theme.ink) }} />
         Silk UI
