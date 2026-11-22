@@ -132,7 +132,7 @@ slots, shapes, functions and their source text, atoms and the allocator's arenas
 | --- | --- | --- |
 | `App.framework` | `Framework.loom("app")`, `Framework.loomWithCommands("app", "Command")`, `Framework.react(".")`, `Framework.foldkit(".")`, `Framework.js(".")` | For Loom, the project module that has `Model` (a `Program<Message, C>`) and `Message`; the project's manifest exports it. For the others, the Vite project's directory (`.` for the project root), whose config has `@silkui/vite`; silkui has it bundle into `.silk/bundle/` |
 | `App.prebuilt(path)` | The app's `app.js`, relative to the project | Takes a bundle another tool built (with `@silkui/vite`), with its `app.sheet` beside it, instead of running `npm ci` and Vite in a copy of the web project: for a pnpm workspace or a custom build script. Build it before `silk task build` |
-| `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release native or canvas host; development hosts always include it |
+| `App.runtimeStylesheets()` | Optional | Includes the CSS text compiler in a release Loom host, native or canvas; development and JavaScript hosts always include it |
 | `App.stylesheet(path)` | A CSS file relative to the project root | Repeatable; declaration order is adoption order. Native and canvas hosts embed compiled bytes; DOM pages link copied CSS files |
 | `App.runtime` | `Runtime.engine()` (default), `Runtime.node()` | What runs a JavaScript app in a window: the SilkJS Engine, or the composable SilkJS runtime: web APIs, `fetch` and sockets, Web Crypto, TLS, compression streams and the files the user picks. The runtime has no JavaScript hot reload yet: `dev` builds the bundle once |
 | `App.allow` | `Access.Files`, `Access.Processes`, `Access.Wasm`, `Access.Database`, `Access.Addons` | Repeatable, on `Runtime.node()`: the whole file system through `node:fs`, `node:child_process`, `WebAssembly`, `node:sqlite`, native addons. Each adds binary size and start time |
@@ -174,7 +174,8 @@ before updating their application roots. A missing or invalid update leaves the 
 intact until a valid update is available. Release hosts do not watch stylesheet files.
 Canvas updates fetch the same compiled bundles; development polling is omitted from release pages.
 
-Runtime CSS text is optional in release: add `App.runtimeStylesheets()` to enable it.
+JavaScript hosts always compile runtime CSS text (`<style>` elements, `CSSStyleSheet.replaceSync`,
+`insertRule`), in release too. For a Loom release host it is optional: add `App.runtimeStylesheets()`.
 Silk code can use `StyleSheet.load(&mut tree, run StyleSource.text(bytes))`, or
 `tree.loadStyleSheet(root, run StyleSource.url("https://example.com/theme.css"))`.
 `StyleSource.url` accepts the same relative, `file:`, HTTP(S), and `data:` sources as

@@ -155,6 +155,7 @@ import node {
   WATCH_OUTSIDE,
   WATCH_HAS_FOR_OTHERS,
   WATCH_POINTER_FAR,
+  WATCH_PSEUDO_PLACE,
   WATCH_KEPT,
   NO_INDEX,
   FrameInput,
@@ -223,6 +224,8 @@ import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
 import canvas2d { Canvas2d, Measured as TextMeasured }
+import canvas_raster { CanvasRasters, Frame as RasterFrame, Live as RasterLive }
+import canvas_raster
 
 /// An open root other than the current one: its share of the tree's state, kept while the
 /// current root is laid out, painted and given input. [`UiTree.useRoot`] swaps it in. The
@@ -404,6 +407,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
     Mutation.SetCanvasSurface { id, .. } => id
+    Mutation.SetCanvasPixels { id, .. } => id
     Mutation.SvgInsert { id, .. } => id
     Mutation.SvgRemove { id, .. } => id
     Mutation.SvgAttribute { id, .. } => id
@@ -946,6 +950,8 @@ pub struct UiTree<'a> {
   pub faces: List<FaceSlot<'a>>,
   /// The bitmaps of the canvas nodes JavaScript draws with Canvas 2D.
   pub canvas2d: Canvas2d<'a>,
+  /// The bitmaps of large canvases' commands (see `canvas_raster`).
+  pub canvasRasters: CanvasRasters,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
   pub paths: PathCache,
@@ -1078,12 +1084,13 @@ pub struct UiTree<'a> {
   /// The nodes that may hold a scroll offset (see `interact.settleScrolls`): each node whose
   /// offset left zero since it was last settled.
   pub scrolledSlots: List<u32>,
-  /// Whether no scroll offset changed between the previous paint and this frame.
+  /// Whether no scroll offset changed between the previous frame and this one.
   scrollsStill: bool,
-  /// Whether a frame since the last paint kept the scene and moved its scroll positions
-  /// (`moveSceneScrolls`). What that paint recorded still holds the offsets it was painted
-  /// at, so the next paint must not replay a subtree that holds a scroll container.
-  sceneScrolled: bool,
+  /// The child lists `restylePlaceReaders` walked since styles last resolved (`placeTick` is
+  /// `Work.styleCalls` then): a slot and its node id.
+  placeWalked: [u64; 8],
+  placeCount: usize,
+  placeTick: usize,
   pub textInk: List<TextInk>,
   facesDirty: bool,
   pub uploads: Pending,
@@ -1618,6 +1625,7 @@ impl<'a> UiTree<'a> {
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
       canvas2d: Canvas2d<'a>.make(),
+      canvasRasters: CanvasRasters.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
       paths: PathCache.make(),
@@ -1684,7 +1692,9 @@ impl<'a> UiTree<'a> {
       scrolledSlots: List<u32>.make(),
       heldNodes: 0,
       scrollsStill: false,
-      sceneScrolled: false,
+      placeWalked: [0; 8],
+      placeCount: 0,
+      placeTick: usize.MAX,
       textInk: List<TextInk>.make(),
       facesDirty: true,
       uploads: Pending.make(),
@@ -2157,13 +2167,86 @@ impl<'a> UiTree<'a> {
       return ()
     }
     if has { self.restyleAnchors(parent, previous) }
-    if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS | css_selectors.READS_EMPTY) != 0 {
+    // With no element on either side the parent may have been empty, or be so now.
+    if u32.bitAnd(reads, css_selectors.READS_EMPTY) != 0 && previous == NONE && next == NONE {
       self.restyleLocal(parent)
       return ()
+    }
+    if u32.bitAnd(reads, css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS) != 0 {
+      self.restylePlaceReaders(parent)
     }
     if u32.bitAnd(reads, css_selectors.READS_EDGE) != 0 {
       if previous != NONE { self.restyleLocal(previous) }
       if next != NONE { self.restyleLocal(next) }
+    }
+  }
+
+  /// Restyles the nodes below `parent` whose match read the place of a child of `parent` among
+  /// its siblings: `+`, `~`, `:nth-*()` and the `*-of-type` classes. Each node's record says
+  /// what its own match read (`Resolved.reads`): a child of `parent` that read its own place,
+  /// and a node further down that read an ancestor's. A node with a pseudo-element whose match
+  /// read a place restyles too (`WATCH_PSEUDO_PLACE`). The other nodes matched without asking,
+  /// so a child that enters or leaves cannot change their styles.
+  ///
+  /// One walk serves every change to the same child list until styles resolve next: it marks
+  /// each reader there is, and a child that enters after it is restyled as new.
+  fn restylePlaceReaders(self: &mut Self, parent: u32) -> () {
+    let above = self.node(parent)
+    if above.styleDirty && above.styleSubtree { return () }
+    let key = u64.bitOr(u64.shiftLeft(u32.toU64(parent), 32), u32.toU64(above.id))
+    let top = above.css
+    if self.placeTick != self.work.styleCalls {
+      self.placeTick = self.work.styleCalls
+      self.placeCount = 0
+    }
+    let mut seen: usize = 0
+    while seen < self.placeCount {
+      if self.placeWalked[seen] == key { return () }
+      seen = seen + 1
+    }
+    if self.placeCount < 8 {
+      self.placeWalked[self.placeCount] = key
+      self.placeCount = self.placeCount + 1
+    }
+    let own = css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS
+    let up = u32.shiftLeft(own, css_selectors.READS_ABOVE)
+    let mut css = self.layout.firstChild(top)
+    let mut depth: usize = 1
+    while css != NO_INDEX {
+      let slot = self.slotOfCssNode(css)
+      let mut enter = false
+      if slot != NONE {
+        let node = self.node(slot)
+        // A subtree that restyles whole asks nothing more.
+        if !(node.styleDirty && node.styleSubtree) {
+          enter = true
+          if !node.styleDirty {
+            let read = match node.sheetStyle() { Option.Some { value } => value.reads _ => 0 }
+            if u32.bitAnd(read, if depth == 1 { own } else { up }) != 0 || u32.bitAnd(node.styleWatch, WATCH_PSEUDO_PLACE) != 0 {
+              self.restyleSelf(slot)
+            }
+          }
+        }
+      }
+      let child = if enter { self.layout.firstChild(css) } else { NO_INDEX }
+      if child != NO_INDEX {
+        css = child
+        depth = depth + 1
+        continue
+      }
+      while true {
+        let beside = self.layout.nextSibling(css)
+        if beside != NO_INDEX {
+          css = beside
+          break
+        }
+        css = self.layout.parent(css)
+        depth = depth - 1
+        if depth == 0 {
+          css = NO_INDEX
+          break
+        }
+      }
     }
   }
 
@@ -3358,6 +3441,13 @@ impl<'a> UiTree<'a> {
           extras.canvas = move commands
         }
         node.content = node.content + 1
+      }
+      Mutation.SetCanvasPixels { id, width, height, opaque, pixels } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        run self.canvas2d.setPixels(id, width, height, opaque, move pixels)
       }
       Mutation.SetCanvasSurface { id, surface, width, height, opaque } => {
         let slot = run self.require(index, id)
@@ -6117,6 +6207,15 @@ impl<'a> UiTree<'a> {
     return move resolved.style
   }
 
+  /// Records on `origin` that the match of one of its pseudo-elements read `reads`, when that
+  /// includes the place of an element among its siblings (`WATCH_PSEUDO_PLACE`).
+  fn notePseudoReads(self: &mut Self, origin: u32, reads: u32) -> () {
+    let place = css_selectors.READS_INDEX | css_selectors.READS_SIBLINGS
+    if u32.bitAnd(reads, u32.bitOr(place, u32.shiftLeft(place, css_selectors.READS_ABOVE))) == 0 { return () }
+    let node = self.nodeMut(origin)
+    node.styleWatch = u32.bitOr(node.styleWatch, WATCH_PSEUDO_PLACE)
+  }
+
   pub effect fn resolvePseudoStyle(self: &mut Self, origin: u32, target: PseudoTarget, states: StateBits, rendered: bool) -> Resolution
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
@@ -6132,6 +6231,7 @@ impl<'a> UiTree<'a> {
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value } => {
         run container_watch.record(&mut self, origin, target, value.containers.asSlice())
         self.noteWatches(origin, value.watched.asSlice(), value.watchAll)
+        self.notePseudoReads(origin, value.style.reads)
         return move value
       }
       Result<Resolution, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -6146,8 +6246,10 @@ impl<'a> UiTree<'a> {
     if at == usize.MAX { return true }
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
-    let result = run Effect.result(style_sheets.mayGenerate(&mut entries[at].sheets, &self, origin, target))
+    let mut read: u32 = 0
+    let result = run Effect.result(style_sheets.mayGenerate(&mut entries[at].sheets, &self, origin, target, &mut read))
     self.styleSheets = move roots
+    self.notePseudoReads(origin, read)
     match move result {
       Result<bool, ResolverError | CssError | OutOfMemoryError>.Success { value } => { return value }
       Result<bool, ResolverError | CssError | OutOfMemoryError>.Failure { error: why } => {
@@ -8355,7 +8457,7 @@ impl<'a> UiTree<'a> {
       run scroll_anchor.select(&mut self)
     }
     edit.beginPaint(&mut self)
-    self.scrollsStill = !self.scrolled && !self.sceneScrolled
+    self.scrollsStill = !self.scrolled
     if scrolledOnly {
       // What paint does first: a selection that changed asks for paint (`paintDirty`).
       run text_selection.refresh(&mut self)
@@ -8371,13 +8473,12 @@ impl<'a> UiTree<'a> {
       // The frame scrolled and changed nothing else, and the last paint reached everything
       // the new offsets show: the last scene is this frame's, at the new offsets.
       run self.moveSceneScrolls()
-      self.sceneScrolled = true
       self.paintsKept = self.paintsKept + 1
       self.scrollsKept = self.scrollsKept + 1
       self.stats.primitives = self.scene().primitiveCount()
     } else {
       run self.paintFrame()
-      self.sceneScrolled = false
+      run self.placeSceneScrolls()
       self.paintedScrolls.clear()
       if self.flipped {
         run self.paintedScrolls.appendSlice(self.sceneB.scrolls())
@@ -8435,6 +8536,35 @@ impl<'a> UiTree<'a> {
 
   /// Moves the kept scene's scroll positions to the nodes' offsets now, so whoever draws the
   /// scene draws this frame.
+  /// Gives the scene just painted the offset of every scroll container it recorded. A subtree
+  /// that paint replayed says the offset it was first painted at, which is not the node's
+  /// when frames since then kept the scene and only moved its scroll positions
+  /// (`moveSceneScrolls`). What a replayed subtree draws does not depend on the offset: paint
+  /// replays it only where the cull the offset gives leaves it whole.
+  effect fn placeSceneScrolls(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let scale = self.input.scale
+    let mut i: usize = 0
+    while i < self.scene().scrolls().length {
+      let mut position = self.scene().scrolls()[i]
+      i = i + 1
+      let slot = self.slotOf(position.node)
+      if slot == NONE { continue }
+      let x = self.node(slot).scrollX() * scale
+      let y = self.node(slot).scrollY() * scale
+      if position.x != x || position.y != y {
+        position.x = x
+        position.y = y
+        if self.flipped {
+          run self.sceneB.setScroll(position)
+        } else {
+          run self.sceneA.setScroll(position)
+        }
+      }
+    }
+  }
+
   effect fn moveSceneScrolls(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -8711,7 +8841,7 @@ impl<'a> UiTree<'a> {
     edit.beginPaint(&mut self)
     self.scrollsStill = false
     run self.paintFrame()
-    self.sceneScrolled = false
+    run self.placeSceneScrolls()
     self.paintDirty = false
     self.stats.nodes = self.nodeCount()
     self.stats.fragments = self.output.fragments.values.length()
@@ -9466,6 +9596,7 @@ impl<'a> UiTree<'a> {
         firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
+        rasters: &mut self.canvasRasters,
         scene: &mut self.sceneB,
         previous: &self.sceneA,
         replayable: self.replayable,
@@ -9517,6 +9648,7 @@ impl<'a> UiTree<'a> {
         firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
+        rasters: &mut self.canvasRasters,
         scene: &mut self.sceneA,
         previous: &self.sceneB,
         replayable: self.replayable,
@@ -9600,6 +9732,7 @@ impl<'a> UiTree<'a> {
       firstLines: &self.firstLines,
       resources: &mut self.resources,
       paths: &mut self.paths,
+      rasters: &mut self.canvasRasters,
       scene: &mut scene,
       previous: &self.sceneA,
       replayable: false,
@@ -9681,6 +9814,73 @@ impl<'a> UiTree<'a> {
   /// Runs the Canvas 2D commands JavaScript wrote (see [`canvas2d`]).
   pub effect fn drawCanvas2d(self: &mut Self, commands: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.canvas2d.draw(&mut self.provider.text, commands)
+  }
+
+  /// Draws the bitmaps paint asked for since the last call whose canvas did not change since
+  /// (see [`canvas_raster`]), into `canvasRasters.frames` for the window to present. A canvas
+  /// whose bitmap would be too large is refused: paint keeps drawing its commands.
+  pub effect fn rasterCanvases(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let wants = Intrinsic.replace(self.canvasRasters.wants, List<canvas_raster.Want>.make())
+    let all = wants.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      let want = all[i]
+      i = i + 1
+      let mut seen = false
+      let mut k: usize = 0
+      while k + 1 < i && !seen {
+        seen = all[k].node == want.node && all[k].key == want.key
+        k = k + 1
+      }
+      let slot = self.slotOf(want.node)
+      if seen || slot == NONE { continue }
+      let node = self.node(slot)
+      if node.kind != NodeKind.Canvas || node.content != want.content || node.raster().key == want.key { continue }
+      let ink = canvas_raster.ink(node.canvas(), want.scale, want.fx, want.fy)
+      let width = ink.xMax - ink.xMin
+      let height = ink.yMax - ink.yMin
+      if width <= 0.0 || height <= 0.0 || width > canvas_raster.MAX_SIDE || height > canvas_raster.MAX_SIDE {
+        let extras = run self.nodeMut(slot).extrasMut()
+        extras.raster.refused = want.key
+        continue
+      }
+      let pixels = run self.canvas2d.drawCommands(
+        self.nodes.asSlice()[u32.toUsize(slot)].canvas(),
+        want.scale,
+        want.fx - ink.xMin,
+        want.fy - ink.yMin,
+        f32.toU32(width),
+        f32.toU32(height),
+      )
+      run self.canvasRasters.frames.append(
+        RasterFrame { node: want.node, key: want.key, x: f32.toI32(ink.xMin), y: f32.toI32(ink.yMin), pixels: move pixels },
+      )
+    }
+    drop wants
+  }
+
+  /// The window shows the bitmap of canvas node `node` drawn for `key` through `surface`, at
+  /// `x`, `y` (see [`RasterFrame`]): paint shows it from the next frame on.
+  pub effect fn showRaster(self: &mut Self, node: u32, surface: u32, key: u64, x: i32, y: i32, width: u32, height: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(node)
+    if slot == NONE { return () }
+    let extras = run self.nodeMut(slot).extrasMut()
+    extras.raster.surface = surface
+    extras.raster.key = key
+    extras.raster.x = x
+    extras.raster.y = y
+    extras.raster.width = width
+    extras.raster.height = height
+    extras.raster.stamp = u32.wrappingAdd(extras.raster.stamp, 1)
+    if self.canvasRasters.surfaceOf(node, NO_SURFACE) == NO_SURFACE {
+      run self.canvasRasters.live.append(RasterLive { node: node, surface: surface })
+    }
+    // Paint replays the canvas's subtree until its hash changes.
+    run self.repair.nodes.append(slot)
+    self.repair.pending = true
+    self.applied = true
   }
 
   /// `measureText` of `value` in `font`, as [`canvas2d.Canvas2d.measure`] gives it.

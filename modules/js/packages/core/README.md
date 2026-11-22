@@ -333,9 +333,7 @@ mount(app);
 await theme.replace(".card { padding: 18px; color: teal }");
 ```
 
-JavaScript development hosts include the text compiler. Release hosts require
-`App.runtimeStylesheets()` in their Silk task pipeline. Without that option they accept
-compiled sheets and reject text compilation. The compiler is linked only when enabled.
+JavaScript hosts include the text compiler, in development and in release.
 
 `adoptedStyleSheets` is an ordered mutable array. Assignment, `push`, `splice`, reordering,
 and shrinking `length` update the active root. Entries must be constructed `CSSStyleSheet`
