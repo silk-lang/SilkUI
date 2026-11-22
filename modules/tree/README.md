@@ -50,7 +50,7 @@ let records = run tree.events()
   `css.display(Keyword.Flex)`), values as written: `setStyle` for the base look, `setStyleFor`
   with a `StyleState` for hover, active, focus and focus-visible, and `clearStyle`. Text
   properties inherit; the rest do not.
-- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setCanvasSurface`, `setGrid`, `setAttribute`
+- **Content and attributes**: `setText`, `setSource`, `setCanvas`, `setCanvasSurface`, `setCanvasPixels`, `setGrid`, `setAttribute`
   (role, label, test id, tab index, cursor, disabled, focus trap, checked, selected, expanded,
   and for inputs multiline, read-only and placeholder), with `setLabel`, `setTestId` and
   `setRole` for the common ones.
@@ -100,7 +100,7 @@ run tree.apply(run batch.take())
 - `Mutation` (`mutation.silk`) has one variant for each thing a direct call does: `Create`,
   `InsertBefore`, `Remove`, `Destroy`, `SetStyle`, `ClearStyle`, `SetText`, `SetAttribute`,
   `SetSelection`, `SetListeners`, `OpenRoot`, `UpdateRoot`, `CloseRoot`, `Focus`, `Blur`,
-  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetCanvasSurface`, `SetGrid`, the virtual list and anchor
+  `ScrollTo`, `ScrollIntoView`, `SetSource`, `SetCanvas`, `SetCanvasSurface`, `SetCanvasPixels`, `SetGrid`, the virtual list and anchor
   mutations, and the resource definitions.
 - Direct calls and protocol ids can share one tree: `NodeId.of(7)` names the client's node 7,
   and a node made with `tree.box` takes a number that is not in use.
@@ -239,6 +239,15 @@ laid out hides the popup until it has geometry again. Destroying the popup remov
 its relationship. The anchor must exist at configuration time; cyclic anchor
 relationships and anchors inside their own popup are rejected. Popup decoration,
 open/closed state, dismissal, and menu keyboard behavior remain client concerns.
+
+## Large canvases and canvas pixels
+
+A canvas node with at least 256 commands is drawn once into a bitmap when its commands hold
+still for a frame, and paint then emits one sprite for it (`canvas_raster`). A window host
+does that drawing and presents the bitmap before each frame's layout
+(`ui_tree_window.canvas_bitmaps`); a host that never calls it keeps painting the commands.
+`SetCanvasPixels` gives a canvas straight RGBA8 pixels, as `putImageData` does; they are shown
+the same way, with the bitmap's size as the node's natural size.
 
 ## Canvas text and image requests
 
