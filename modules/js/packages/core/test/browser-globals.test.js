@@ -423,4 +423,9 @@ test("form elements answer instanceof, and tabIndex and disabled reflect their a
   item.tabIndex = -1;
   assert.ok(item.hasAttribute("tabindex"));
   assert.equal(item.tabIndex, -1);
+  const prop = document.createElement("div");
+  prop.setAttribute("tabIndex", 0);
+  assert.ok(prop.hasAttribute("tabindex"), "React's tabIndex prop is the tabindex attribute");
+  prop.removeAttribute("tabIndex");
+  assert.ok(!prop.hasAttribute("tabindex"));
 });

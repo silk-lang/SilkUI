@@ -14,6 +14,16 @@
 #include <stdint.h>
 #include <string.h>
 
+// AX callbacks can run inside AppKit's wait without delivering a window event.
+// The standalone AccessKit adapter also runs without Silk's window backend.
+#include <dlfcn.h>
+static void wakeWindowLoop(void) {
+    static void (*wake)(void);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ wake = dlsym(RTLD_DEFAULT, "silk_macos_wake"); });
+    if (wake) wake();
+}
+
 // Record tags and flags: keep in step with src/record.silk.
 enum {
     TAG_ROLE = 1,
@@ -42,6 +52,9 @@ enum {
     TAG_DOM_IDENTIFIER = 24,
     TAG_ROWS = 25,
     TAG_TEXT = 26,
+    TAG_POSITION_IN_SET = 27,
+    TAG_SIZE_OF_SET = 28,
+    TAG_FEED_SIZE = 29,
 };
 
 enum {
@@ -189,6 +202,8 @@ static id read_color(SilkAKReader *r) {
 @property(nonatomic, copy) NSString *brailleLabel, *brailleRoleDescription, *domIdentifier;
 @property(nonatomic, strong) id valueObject;
 @property(nonatomic, strong) NSNumber *minValue, *maxValue;
+@property(nonatomic, strong) NSNumber *positionInSet, *sizeOfSet;
+@property(nonatomic, strong) NSNumber *feedSize;
 @property(nonatomic) NSAccessibilityOrientation orientationValue;
 @property(nonatomic) uint32_t flags;
 @property(nonatomic) SilkAKBox box;
@@ -248,12 +263,18 @@ static id read_color(SilkAKReader *r) {
     return out;
 }
 
+- (void)queueAction:(SilkAKAction *)action {
+    BOOL wasEmpty = self.queue.count == 0;
+    [self.queue addObject:action];
+    if (wasEmpty) wakeWindowLoop();
+}
+
 - (void)enqueue:(uint32_t)kind node:(uint64_t)nodeId {
     SilkAKAction *action = [SilkAKAction new];
     action.kind = kind;
     action.nodeId = nodeId;
     action.text = @"";
-    [self.queue addObject:action];
+    [self queueAction:action];
 }
 
 // AccessKit coordinates are physical pixels from the view's top left; AppKit wants logical
@@ -335,6 +356,9 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     self.brailleLabel = nil;
     self.brailleRoleDescription = nil;
     self.domIdentifier = nil;
+    self.positionInSet = nil;
+    self.sizeOfSet = nil;
+    self.feedSize = nil;
     self.valueObject = nil;
     self.minValue = nil;
     self.maxValue = nil;
@@ -369,6 +393,9 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
         case TAG_PLACEHOLDER: self.placeholderText = read_text(r); break;
         case TAG_VALUE_BOOL: self.valueObject = @(read_u8(r) != 0); break;
         case TAG_VALUE_NUMBER: self.valueObject = @(read_f64(r)); break;
+        case TAG_POSITION_IN_SET: self.positionInSet = @(read_u64(r)); break;
+        case TAG_SIZE_OF_SET: self.sizeOfSet = @(read_u64(r)); break;
+        case TAG_FEED_SIZE: self.feedSize = @(read_u64(r)); break;
         case TAG_VALUE_TEXT: self.valueObject = read_text(r); break;
         case TAG_MIN_VALUE: self.minValue = @(read_f64(r)); break;
         case TAG_MAX_VALUE: self.maxValue = @(read_f64(r)); break;
@@ -539,6 +566,8 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
 
 - (NSString *)accessibilityRoleDescription {
     if (self.roleDescriptionText) return self.roleDescriptionText;
+    if ([self.subroleName isEqualToString:@"AXDocumentArticle"])
+        return NSLocalizedString(@"article", @"Accessibility role description for an article");
     return [super accessibilityRoleDescription];
 }
 
@@ -561,7 +590,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     } else {
         return;
     }
-    [self.adapter.queue addObject:action];
+    [self.adapter queueAction:action];
 }
 
 - (id)accessibilityMinValue { return self.minValue; }
@@ -748,7 +777,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     action.start = (uint32_t)clamped.location;
     action.end = (uint32_t)(clamped.location + clamped.length);
     action.text = @"";
-    [self.adapter.queue addObject:action];
+    [self.adapter queueAction:action];
 }
 
 - (BOOL)isAccessibilityRequired { return [self has:FLAG_REQUIRED]; }
@@ -760,7 +789,16 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     [self.adapter enqueue:ACTION_CLICK node:self.nodeId];
 }
 
+- (NSArray *)accessibilityAttributeNames {
+    NSMutableArray *names = [[super accessibilityAttributeNames] mutableCopy] ?: [NSMutableArray array];
+    if (self.positionInSet) [names addObject:@"AXARIAPosInSet"];
+    if (self.sizeOfSet) [names addObject:@"AXARIASetSize"];
+    return names;
+}
+
 - (id)accessibilityAttributeValue:(NSAccessibilityAttributeName)attribute {
+    if ([attribute isEqualToString:@"AXARIAPosInSet"]) return self.positionInSet;
+    if ([attribute isEqualToString:@"AXARIASetSize"]) return self.sizeOfSet ?: self.feedSize;
     if ([attribute isEqualToString:@"AXBrailleLabel"] && self.brailleLabel) return self.brailleLabel;
     if ([attribute isEqualToString:@"AXBrailleRoleDescription"] && self.brailleRoleDescription) {
         return self.brailleRoleDescription;
@@ -833,6 +871,7 @@ static BOOL box_contains(SilkAKBox box, NSPoint point) {
     if (selector == @selector(accessibilityTabs)) return [self has:FLAG_TAB_LIST];
     if (selector == @selector(isAccessibilityModal)) return [self has:FLAG_DIALOG];
     if (selector == @selector(accessibilityAttributeValue:)) return [self has:FLAG_ATTRIBUTES];
+    if (selector == @selector(accessibilityAttributeNames)) return YES;
     if (selector == @selector(accessibilityURL)) return [self has:FLAG_URL];
     return selector == @selector(accessibilityParent) || selector == @selector(accessibilityChildren)
         || selector == @selector(accessibilityChildrenInNavigationOrder)
@@ -864,22 +903,28 @@ static SilkAKAdapter *adapter_of_view(id view) { return objc_getAssociatedObject
 
 static SilkAKAdapter *adapter_for(uint64_t handle) { return adapters[@(handle)]; }
 
+static void requestTree(SilkAKAdapter *adapter) {
+    if (!adapter || adapter.requested) return;
+    adapter.requested = YES;
+    wakeWindowLoop();
+}
+
 static NSArray *view_children(id self, SEL _cmd) {
     SilkAKAdapter *adapter = adapter_of_view(self);
     if (!adapter) return @[];
-    adapter.requested = YES;
+    requestTree(adapter);
     return [adapter elements:adapter.rootIds];
 }
 
 static id view_focused(id self, SEL _cmd) {
     SilkAKAdapter *adapter = adapter_of_view(self);
-    if (adapter) adapter.requested = YES;
+    requestTree(adapter);
     return adapter ? [adapter focusedElement] : nil;
 }
 
 static id view_hit_test(id self, SEL _cmd, NSPoint point) {
     SilkAKAdapter *adapter = adapter_of_view(self);
-    if (adapter) adapter.requested = YES;
+    requestTree(adapter);
     return adapter ? [adapter hitTest:point] : self;
 }
 
@@ -1066,6 +1111,8 @@ static NSString *describe(SilkAKAdapter *adapter, uint64_t nodeId) {
     SilkAKNode *node = adapter.nodes[@(nodeId)];
     if (!node) return @"missing\n";
     [out appendFormat:@"role: %@\n", node.accessibilityRole];
+    [out appendFormat:@"role-description: %@\n", node.accessibilityRoleDescription];
+    if (node.feedSize) [out appendFormat:@"queried set size: %@\n", [node accessibilityAttributeValue:@"AXARIASetSize"]];
     if (node.accessibilitySubrole) [out appendFormat:@"subrole: %@\n", node.accessibilitySubrole];
     if (node.accessibilityTitle) [out appendFormat:@"title: %@\n", node.accessibilityTitle];
     if (node.accessibilityHelp) [out appendFormat:@"help: %@\n", node.accessibilityHelp];
@@ -1074,6 +1121,10 @@ static NSString *describe(SilkAKAdapter *adapter, uint64_t nodeId) {
     [out appendFormat:@"focused: %d\n", node.isAccessibilityFocused ? 1 : 0];
     [out appendFormat:@"enabled: %d\n", node.isAccessibilityEnabled ? 1 : 0];
     [out appendFormat:@"children: %lu\n", (unsigned long)node.accessibilityChildren.count];
+    for (NSString *attr in @[@"AXARIAPosInSet", @"AXARIASetSize"]) {
+        if ([[node accessibilityAttributeNames] containsObject:attr])
+            [out appendFormat:@"%@: %@\n", attr, [node accessibilityAttributeValue:attr]];
+    }
     [out appendFormat:@"press: %d\n", [node isAccessibilitySelectorAllowed:@selector(accessibilityPerformPress)] ? 1 : 0];
     if ([node isAccessibilitySelectorAllowed:@selector(accessibilityNumberOfCharacters)]) {
         [out appendFormat:@"characters: %ld\n", (long)node.accessibilityNumberOfCharacters];

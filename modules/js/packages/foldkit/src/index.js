@@ -30,3 +30,8 @@ export const FocusStyle = look("focusStyle");
 export const FocusVisibleStyle = look("focusVisibleStyle");
 /** What its transitions start from when it first shows, as `@starting-style`. */
 export const StartingStyle = look("startingStyle");
+
+/** Configure a scroll box. Store requested indices in the model and render keyed rows for them. */
+export const VirtualList = (options, onRange) => Prop("virtualList", { options, onRange });
+/** Bind the rendered direct children after Foldkit finishes patching them. */
+export const VirtualRows = indices => Prop("virtualRows", indices);

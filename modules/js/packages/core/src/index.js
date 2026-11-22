@@ -860,6 +860,7 @@ export class Node {
   getAttribute(name) {
     name = String(name);
     if (name === "className" || name === "class") return this.#className;
+    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
     const aria = ariaName(name);
     return this.#rare?.attributes?.get(aria === null ? name : "aria-" + aria) ?? null;
   }
@@ -891,6 +892,8 @@ export class Node {
 
   setAttribute(name, value) {
     name = String(name);
+    // HTML attribute names have no case: React's `tabIndex` prop is the `tabindex` attribute.
+    if (name === "tabIndex" && this._tag !== undefined) name = "tabindex";
     let text = value == null ? null : String(value);
     if (mutationObservers.size) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
@@ -1171,6 +1174,33 @@ export class Node {
   querySelectorAll(selector) {
     const ids = queried(3, this, selector);
     return typeof ids === "string" && ids !== "" ? ids.split(",").map((id) => nodes.get(Number(id))).filter(Boolean) : [];
+  }
+
+  setVirtualList(options, onRange) {
+    if (!options) {
+      this._virtualRange = null;
+      native.virtualList(this.nodeId);
+      return;
+    }
+    const { count, estimatedRowHeight, overscan = 128, gap = 0, revision = 0 } = options;
+    if (!Number.isInteger(count) || count < 0 || count >= 0xffffffff || !Number.isFinite(estimatedRowHeight) || estimatedRowHeight <= 0 ||
+        !Number.isFinite(overscan) || overscan < 0 || !Number.isFinite(gap) || gap < 0 ||
+        !Number.isSafeInteger(revision) || revision < 0 || typeof onRange !== "function") {
+      throw new TypeError("Invalid virtual list configuration");
+    }
+    this._virtualRange = onRange;
+    native.virtualList(this.nodeId, count, estimatedRowHeight, overscan, gap, revision);
+  }
+
+  bindVirtualRows(indices) {
+    if (indices.length !== this.childNodes.length) throw new Error("Bind every direct virtual row");
+    const pairs = [];
+    for (let i = 0; i < indices.length; i++) {
+      if (!Number.isInteger(indices[i]) || indices[i] < 0 || indices[i] >= 0xffffffff ||
+          (i > 0 && indices[i] <= indices[i - 1])) throw new RangeError("Virtual indices must be sorted and unique");
+      pairs.push(indices[i], this.childNodes[i].nodeId);
+    }
+    native.virtualItems(this.nodeId, ...pairs);
   }
 
   /**
@@ -4074,6 +4104,8 @@ const ANNOUNCEMENT_LIFETIME = 7000;
 export function nodeById(id) {
   return nodes.get(id) ?? null;
 }
+
+native.virtualRequest = (port, ...indices) => nodes.get(port)?._virtualRange?.(indices);
 
 // The option bits of `__ui.markdown`.
 const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };

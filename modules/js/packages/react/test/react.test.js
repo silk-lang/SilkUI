@@ -4,12 +4,29 @@ import { installMock } from "../../core/test/mock.js";
 
 const mock = installMock();
 const { createElement: h, useState } = await import("react");
-const { createRoot, flushSync } = await import("../src/index.js");
+const { createRoot, flushSync, VirtualList } = await import("../src/index.js");
 const { createBox } = await import("@silkui/core");
 
 function find(calls, name, predicate = () => true) {
   return calls.filter((call) => call[0] === name && predicate(call));
 }
+
+test("virtual rows follow the tree request including disjoint accessibility pins", () => {
+  const container = createBox();
+  const rendered = [];
+  createRoot(container).render(h(VirtualList, {
+    items: Array.from({ length: 100 }, (_, i) => i), itemKey: i => i, rowHeight: 32
+  }, i => { rendered.push(i); return String(i); }));
+  const port = container.firstChild;
+  assert.deepEqual(rendered, []);
+  mock.native.virtualRequest(port.nodeId, 1, 75, 76);
+  assert.deepEqual(rendered, [1, 75, 76]);
+  const pinned = port.firstChild;
+  mock.native.virtualRequest(port.nodeId, 1, 88);
+  assert.equal(port.firstChild, pinned);
+  assert.deepEqual(find(mock.calls, "virtualItems").at(-1),
+    ["virtualItems", port.nodeId, 1, pinned.nodeId, 88, port.lastChild.nodeId]);
+});
 
 test("a component renders nodes, styles, attributes and text", () => {
   const container = createBox();

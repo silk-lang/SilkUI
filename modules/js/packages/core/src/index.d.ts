@@ -68,6 +68,14 @@ export class ClassList implements Iterable<string> {
   toString(): string;
 }
 
+export interface VirtualListOptions {
+  count: number;
+  estimatedRowHeight: number;
+  overscan?: number;
+  gap?: number;
+  revision?: number;
+}
+
 /** A node of the tree. Make one with `createBox`, `createText`, `createInput` or `createNode`. */
 export class Node {
   constructor(kind: NodeKind);
@@ -165,6 +173,9 @@ export class Node {
   querySelector(selector: string): Node | null;
   /** Every descendant that matches `selector`, in tree order (a static list). */
   querySelectorAll(selector: string): Node[];
+  setVirtualList(options: VirtualListOptions, onRange: (indices: number[]) => void): void;
+  setVirtualList(options: null): void;
+  bindVirtualRows(indices: readonly number[]): void;
   addEventListener<K extends keyof EventMap>(type: K, listener: Listener<EventMap[K]>, options?: ListenerOptions): void;
   /** The app's own event types, sent with `dispatchEvent`. */
   addEventListener(type: string, listener: (event: globalThis.Event) => void, options?: ListenerOptions): void;
