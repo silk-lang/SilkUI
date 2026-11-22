@@ -1630,6 +1630,7 @@ effect fn stepped(tree: &mut UiTree<'_>, key: string, modifiers: u32, edge: u32,
     return true
   } else if key == "ArrowLeft" || key == "ArrowRight" {
     let mut step = if byWord { run wordStep(&tree.*, focus, forward) } else { run characterStep(&tree.*, focus, forward) }
+    if editingHost(&tree.*, edge) == edge { step = pastIsland(&tree.*, edge, step, forward) }
     // A line break's text (a `<br>`) has no place after it: past it is the next line.
     if lineBreak(&tree.*, step.slot) && step.offset > 0 {
       step = if forward { run characterStep(&tree.*, step, true) } else { at(&tree.*, step.slot, 0) }
@@ -1640,6 +1641,26 @@ effect fn stepped(tree: &mut UiTree<'_>, key: string, modifiers: u32, edge: u32,
   }
   tree.textSelection.hasPreferredX = false
   return true
+}
+
+/// Where a caret at `point` goes one line down (`forward`) or up, or with `boundary` to its
+/// line's end or start, as the layout has the lines. None when `point` is not in laid out text.
+pub effect fn lineStep(tree: &UiTree<'_>, point: Point, forward: bool, boundary: bool) -> Point
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let focus = caretPoint(tree, point)
+  let mut piece = Piece { start: 0, end: 0, x0: 0.0, x1: 0.0, top: 0.0, bottom: 0.0, fragment: NO_INDEX, line: 0, lineTop: 0.0, lineBottom: 0.0, lineLeft: 0.0, lineRight: 0.0, shapeKey: 0, glyphs: false, lineBreak: false, rtl: false, base: 0 }
+  let mut x: f32 = 0.0
+  if !run caretOf(tree, focus, &mut piece, &mut x) { return Point.none() }
+  if boundary {
+    return run pointAt(tree, if forward { 1000000.0 } else { -1000000.0 }, (piece.lineTop + piece.lineBottom) * 0.5)
+  }
+  let y = if forward { piece.lineBottom + 0.5 } else { piece.lineTop - 0.5 }
+  let mut found = run pointWith(tree, x, y, false, !forward)
+  if found.same(focus) || (run compare(tree, found, focus)) != (if forward { 1 } else { -1 }) {
+    found = run pointAt(tree, x, y)
+  }
+  return found
 }
 
 /// Ctrl+A (Cmd+A on a Mac) outside inputs: selects everything in the nearest `user-select:
@@ -1804,7 +1825,8 @@ pub fn textPoint(tree: &UiTree<'_>, point: Point, start: bool) -> Point {
 // client answers by changing its nodes (and the selection) itself, as a browser's editing
 // does. Movement keys move the document selection, and the caret is painted at it.
 
-/// What `contenteditable` on `slot` says: 1 editable, 2 not editable, 0 nothing.
+/// What `contenteditable` on `slot` says, in any ASCII case: 1 editable ("", "true"), 3 plain
+/// text ("plaintext-only"), 2 not editable ("false"), 0 nothing (absent, "inherit" or unknown).
 fn editableValue(tree: &UiTree<'_>, slot: u32) -> u32 {
   if let Option<&NodeIdentity>.Some { value } = tree.node(slot).identity() {
     let attributes = value.attributes()
@@ -1812,14 +1834,55 @@ fn editableValue(tree: &UiTree<'_>, slot: u32) -> u32 {
     while i < attributes.length {
       if String.view(&attributes[i].name) == "contenteditable" {
         let text = String.view(&attributes[i].value)
-        if text == "" || text == "true" || text == "plaintext-only" { return 1 }
-        if text == "false" { return 2 }
+        if text == "" || asciiSame(text, "true") { return 1 }
+        if asciiSame(text, "plaintext-only") { return 3 }
+        if asciiSame(text, "false") { return 2 }
         return 0
       }
       i = i + 1
     }
   }
   return 0
+}
+
+/// Whether `text` is `lower` (lowercase ASCII) in any ASCII case.
+fn asciiSame(text: string, lower: string) -> bool {
+  let a = String.utf8Bytes(text)
+  let b = String.utf8Bytes(lower)
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    let c = if a[i] >= 65 && a[i] <= 90 { a[i] + 32 } else { a[i] }
+    if c != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+/// The outermost element between `slot` and `host` that `contenteditable="false"` takes out of
+/// the host, or NONE. The caret steps over such an island whole.
+fn islandOf(tree: &UiTree<'_>, host: u32, slot: u32) -> u32 {
+  let mut found = NONE
+  let mut at = slot
+  while at != NONE && at != host {
+    let kind = tree.node(at).kind
+    if kind != NodeKind.Text && kind != NodeKind.Input && editableValue(tree, at) == 2 { found = at }
+    at = tree.node(at).parent
+  }
+  return if at == host { found } else { NONE }
+}
+
+/// `point`, or where it lands inside an island of `host`, the island's far side (in the text
+/// after it, or before it backward, when that text is in the same block).
+fn pastIsland(tree: &UiTree<'_>, host: u32, point: Point, forward: bool) -> Point {
+  if !point.exists() { return point }
+  let island = islandOf(tree, host, point.slot)
+  if island == NONE { return point }
+  let edge = if forward { after(tree, island) } else { before(tree, island) }
+  let text = textPoint(tree, edge, forward)
+  if text.exists() && inside(tree, host, text.slot) && islandOf(tree, host, text.slot) == NONE
+    && blockOf(tree, text.slot) == blockOf(tree, island) { return text }
+  return edge
 }
 
 /// The editing host `slot` is in: the outermost element above it (or itself) with an editable
@@ -1832,7 +1895,7 @@ pub fn editingHost(tree: &UiTree<'_>, slot: u32) -> u32 {
     if kind != NodeKind.Text && kind != NodeKind.Input {
       let value = editableValue(tree, at)
       if value == 2 { return host }
-      if value == 1 { host = at }
+      if value == 1 || value == 3 { host = at }
     }
     at = tree.node(at).parent
   }
@@ -1943,6 +2006,15 @@ pub effect fn hostCut(tree: &mut UiTree<'_>) -> bool ! OutOfMemoryError ? &mut A
   return true
 }
 
+/// Undo (or `redo`) from the edit menu for the focused editing host, as a `historyUndo` (or
+/// `historyRedo`) edit. False when no host has focus.
+pub effect fn hostHistory(tree: &mut UiTree<'_>, redo: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let host = focusedHost(&tree.*)
+  if host == NONE { return false }
+  run hostEdit(&mut tree, host, if redo { "historyRedo" } else { "historyUndo" }, "")
+  return true
+}
+
 /// Selects all of the focused editing host. False when no host has focus.
 pub effect fn hostSelectAll(tree: &mut UiTree<'_>) -> bool ! OutOfMemoryError ? &mut Allocator {
   let host = focusedHost(&tree.*)
@@ -1974,9 +2046,24 @@ pub effect fn hostKey(tree: &mut UiTree<'_>, key: string, modifiers: u32) -> boo
     run hostEdit(&mut tree, host, kind, "")
     return true
   }
+  // A plain-text host breaks lines only, as Chromium's does.
+  let plain = editableValue(&tree.*, host) == 3
   if key == "Enter" && !control && !alt && !meta {
-    run hostEdit(&mut tree, host, if shift { "insertLineBreak" } else { "insertParagraph" }, "")
+    run hostEdit(&mut tree, host, if shift || plain { "insertLineBreak" } else { "insertParagraph" }, "")
     return true
+  }
+  let primary = if mac { meta && !control } else { control && !meta }
+  if primary && !alt {
+    if edit.letter(key, "z") || !mac && !shift && edit.letter(key, "y") {
+      run hostEdit(&mut tree, host, if shift || edit.letter(key, "y") { "historyRedo" } else { "historyUndo" }, "")
+      return true
+    }
+    // Rich hosts take the formatting keys as formatting edits.
+    let format = if shift || plain { "" } else if edit.letter(key, "b") { "formatBold" } else if edit.letter(key, "i") { "formatItalic" } else if edit.letter(key, "u") { "formatUnderline" } else { "" }
+    if format != "" {
+      run hostEdit(&mut tree, host, format, "")
+      return true
+    }
   }
   if shift { return run extend(&mut tree, key, modifiers) }
   run refresh(&mut tree)

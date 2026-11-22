@@ -2,7 +2,7 @@
 // composed text, Backspace and Enter change the host's nodes, and arrows move the caret. The
 // host runs this, lays out a frame, presses in the first paragraph, then sends keys and text
 // with checks between them.
-import { createElement, createText, getSelection, mount } from "@silkui/core";
+import { createElement, createText, execCommand, getSelection, mount } from "@silkui/core";
 
 const check = (label, got, want) => {
   if (got !== want) throw new Error(label + ": got '" + got + "', want '" + want + "'");
@@ -51,9 +51,20 @@ globalThis.afterBackspace = () => check("Backspace deletes before the caret", sh
 globalThis.afterEnter = () => {
   check("Enter splits the paragraph", shown(), "Hello! / <br> / world");
   check("the caret starts the new paragraph", getSelection().focusNode === host.childNodes[1] && getSelection().focusOffset, 0);
-  check("each edit fired input", heard.slice(1).join(","), "insertText,insertCompositionText,insertFromComposition,deleteContentBackward,insertParagraph");
+  check("each edit fired input", heard.slice(1).join(","), "insertText,insertCompositionText,insertCompositionText,deleteContentBackward,insertParagraph");
 };
 globalThis.afterArrow = () => {
   check("Down moves the caret into the next paragraph", getSelection().focusNode, host.lastChild.firstChild);
+  // Spaces stay plain where white-space keeps them and become no-break spaces where it collapses.
+  for (const [whiteSpace, want] of [["pre-wrap", "a  "], ["normal", "a \u00a0"]]) {
+    const field = createElement("div");
+    field.contentEditable = "true";
+    field.style.set({ whiteSpace });
+    field.appendChild(createText("a"));
+    root.appendChild(field);
+    getSelection().collapse(field.firstChild, 1);
+    execCommand("insertText", false, "  ");
+    check("two spaces typed under white-space: " + whiteSpace, field.firstChild.data, want);
+  }
   globalThis.editingChecked = true;
 };

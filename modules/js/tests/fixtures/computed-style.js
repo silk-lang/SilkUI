@@ -45,6 +45,15 @@ check("custom property with var()", style.getPropertyValue("--gap"), "calc(0.75 
 check("inherited inline custom property", style.getPropertyValue("--tone"), "blue");
 check("missing custom property", style.getPropertyValue("--none"), "");
 check("unknown name", style.getPropertyValue("not-a-property"), "");
+card.style.set({ whiteSpace: "pre-wrap" });
+check("white-space from its computed longhands", style.whiteSpace, "pre-wrap");
+check("white-space-collapse from the shorthand", style.whiteSpaceCollapse, "preserve");
+check("text-wrap-mode from the shorthand", style.textWrapMode, "wrap");
+card.style.set({ whiteSpace: "pre" });
+check("pre", style.whiteSpace, "pre");
+check("pre keeps lines whole", style.textWrapMode, "nowrap");
+card.style.set({ whiteSpace: "normal" });
+check("white-space initial", style.whiteSpace, "normal");
 check("pseudo-element", getComputedStyle(card, "::before").width, "");
 
 card.style.set({ height: "70px" });
