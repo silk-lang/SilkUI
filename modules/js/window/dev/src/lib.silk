@@ -54,7 +54,25 @@ pub struct DevTools {
   bootstrap: String,
   /// Whether the loss of the server was reported.
   lost: bool,
+  /// Module requests (`vite:invoke`) sent to the server and not answered yet.
+  invokes: u32,
 }
+
+/// Whether `needle` occurs in `text`.
+fn contains(text: &[u8], needle: &[u8]) -> bool {
+  if needle.length > text.length { return false }
+  let mut at: usize = 0
+  while at + needle.length <= text.length {
+    let mut i: usize = 0
+    while i < needle.length && text[at + i] == needle[i] { i = i + 1 }
+    if i == needle.length { return true }
+    at = at + 1
+  }
+  return false
+}
+
+/// The event of the module runner's requests and of the server's answers to them.
+const INVOKE: string = "\"vite:invoke\""
 
 fn sameBytes(left: &[u8], right: &[u8]) -> bool {
   if left.length != right.length { return false }
@@ -91,6 +109,7 @@ impl DevTools {
       frame: String.make(),
       bootstrap: String.make(),
       lost: false,
+      invokes: 0,
     }
   }
 
@@ -142,6 +161,7 @@ impl DevTools {
       let items = lines.asSlice()
       let mut i: usize = 0
       while i < items.length {
+        if contains(String.utf8Bytes(String.view(&items[i])), String.utf8Bytes(INVOKE)) { self.invokes = self.invokes + 1 }
         drop run Channel.send(String.view(&items[i])) |> Effect.provideMut<Channel>(&mut channel)
         i = i + 1
       }
@@ -171,6 +191,7 @@ impl DevTools {
         self.bootstrap = move message
         run self.boot(&mut app, &mut tree)
       } else {
+        if self.invokes > 0 && contains(String.utf8Bytes(String.view(&message)), String.utf8Bytes(INVOKE)) { self.invokes = self.invokes - 1 }
         run app.message(&mut tree, String.view(&message))
       }
       run self.sendOut(&mut app)
@@ -243,6 +264,12 @@ impl JsTools for DevTools {
   fn startsEntry(self: &Self) -> bool { return self.port == 0 }
 
   fn servesInspector(self: &Self) -> bool { return true }
+
+  /// The server's first script, then each module the runner asked for, until it is answered.
+  fn awaitsOutside(self: &Self) -> bool {
+    if self.port == 0 || self.lost || self.channel.isNone() { return false }
+    return String.byteLength(String.view(&self.bootstrap)) == 0 || self.invokes > 0
+  }
 
   effect fn opened<'m>(self: &mut Self, app: &mut JsApp<'m>, platform: &HostPlatform) -> () ! OutOfMemoryError ? &mut Allocator {
     if self.port != 0 { run self.connect(platform) }

@@ -108,11 +108,27 @@ test effect fn cliCommandsAreWords() -> ()
 
 struct Counter {
   clicks: u32,
+  /// Turns of the loop the counter still waits on outside work for, and the run's time when
+  /// that wait ended.
+  outside: u32,
+  readyAt: f64,
 }
 
 struct Client {}
 
 impl WindowClient<Counter, never, never> for Client {
+  effect fn poll(self: &mut Self, state: &mut Counter, tree: &mut UiTree<'_>, time: f64) -> bool
+    ! WindowError | TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if state.outside > 0 {
+      state.outside = state.outside - 1
+      if state.outside == 0 { state.readyAt = time }
+    }
+    return false
+  }
+
+  fn awaitsOutside(self: &Self, state: &Counter) -> bool { return state.outside > 0 }
+
   effect fn start(self: &mut Self, state: &mut Counter, tree: &mut UiTree<'_>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
@@ -192,15 +208,23 @@ effect fn readText(path: string) -> String
 struct Ran {
   status: i32,
   clicks: u32,
+  readyAt: f64,
 }
 
 /// Runs the counter headless with `script`.
 effect fn runCounter(script: string) -> Ran
   ! FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
   ? &mut Allocator {
+  return run runCounterAfter(script, 0)
+}
+
+/// Runs the counter headless with `script`, after `outside` turns of waiting on outside work.
+effect fn runCounterAfter(script: string, outside: u32) -> Ran
+  ! FileError | HostInputError | WindowError | GpuError | TreeError | AtlasError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
   run writeText(SCRIPT, script)
   let fonts = run fixtures.fonts()
-  let mut state = Counter { clicks: 0 }
+  let mut state = Counter { clicks: 0, outside: outside, readyAt: -1.0 }
   let mut client = Client {}
   let options = RunOptions {
     title: "Counter",
@@ -222,7 +246,7 @@ effect fn runCounter(script: string) -> Ran
     &mut client,
     SCRIPT,
   )
-  return Ran { status: status, clicks: state.clicks }
+  return Ran { status: status, clicks: state.clicks, readyAt: state.readyAt }
 }
 
 effect fn headlessBody() -> ()
@@ -249,6 +273,8 @@ effect fn headlessBody() -> ()
   run Testing.expect(failed.status == 1 && failed.clicks == 1, "a failing line ends the run")
   let waited = run runCounter("wait --text never\nclick --test-id counter\n")
   run Testing.expect(waited.status == 1 && waited.clicks == 0, "a wait that never holds gives up")
+  let late = run runCounterAfter("click --test-id counter\n", 5)
+  run Testing.expect(late.status == 0 && late.clicks == 1 && late.readyAt == 0.0, "outside work takes real time, not the run's")
   run FileSystem.removeFile(&(run placed(SCRIPT))) |> Effect.provideMut<FileSystem>(&mut files)
   run FileSystem.removeFile(&(run placed(TREE))) |> Effect.provideMut<FileSystem>(&mut files)
   run FileSystem.removeFile(&place) |> Effect.provideMut<FileSystem>(&mut files)

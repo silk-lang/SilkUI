@@ -1024,12 +1024,38 @@ export class Node {
     this.#want(KIND_OF.get(types[0]));
   }
 
+  /** The `tabindex` attribute as a number, else 0 for what takes focus by default and -1. */
+  get tabIndex() {
+    const text = this._tag !== undefined ? this.getAttribute("tabindex") : this._tabIndex;
+    const number = text == null ? NaN : parseInt(String(text), 10);
+    if (!Number.isNaN(number)) return number;
+    const focusable = this instanceof Input || this instanceof CheckInput || FOCUSABLE_TAGS.has(this._tag)
+      || (this._tag === "a" && this.hasAttribute("href")) || editableValue(this) === 1;
+    return focusable ? 0 : -1;
+  }
+
+  // An element reflects it to its `tabindex` attribute, as roving-focus code reads it back.
   set tabIndex(value) {
-    native.attribute(this.nodeId, "tabIndex", value);
+    const number = Math.trunc(Number(value)) || 0;
+    if (this._tag !== undefined) this.setAttribute("tabindex", String(number));
+    else {
+      this._tabIndex = number;
+      native.attribute(this.nodeId, "tabIndex", number);
+    }
+  }
+
+  get disabled() {
+    return this._tag !== undefined ? this.hasAttribute("disabled") : Boolean(this._disabled);
   }
 
   set disabled(value) {
-    native.attribute(this.nodeId, "disabled", value);
+    if (this._tag !== undefined) {
+      if (value) this.setAttribute("disabled", "");
+      else this.removeAttribute("disabled");
+    } else {
+      this._disabled = Boolean(value);
+      native.attribute(this.nodeId, "disabled", value);
+    }
   }
 
   focus() {
@@ -2205,6 +2231,8 @@ export class Svg extends Node {
     super("icon");
     this.kind = "svg";
     this.namespaceURI = SVG_NAMESPACE;
+    // Page selectors such as `button svg` and preflight's `svg { display: block }` name it.
+    native.attribute(this.nodeId, "element", "svg");
     svgChanged(this);
   }
 

@@ -34,6 +34,7 @@
 //! directory and its compiler for `silk build`.
 import stylesheets
 import inspector_socket
+import ship
 import host { Kind, Plan, Allows, main as hostMain, page as hostPage, imageWriter, inspectorWriter, webgpuExports, libm }
 import manifest { Project, read as readProject }
 import bundle as Bundles
@@ -819,7 +820,9 @@ impl App {
   /// Takes the bundle at `path` (relative to the project, such as `"web/dist/app.js"`) as the
   /// app's instead of building one with npm and Vite: for a web project another tool builds,
   /// such as one in a pnpm workspace. Its `app.sheet` beside it, when there is one, is the
-  /// compiled stylesheet. Build it with `@silkui/vite` before `silk task build`.
+  /// compiled stylesheet. A release on `Runtime.node()` embeds the bundle and ships the other
+  /// files beside it (wasm modules, workers, assets) in `app/` beside the program, where its
+  /// fetches find them. Build it with `@silkui/vite` before `silk task build`.
   pub effect fn prebuilt<'env, E, ? R>(
     self: once Effect<'env; App ! E ? R>,
     path: string<'static>,
@@ -1378,8 +1381,13 @@ impl Built {
       } else {
         // cp keeps the program's mode, so it stays executable. It takes the project's name,
         // which `silk init` gives the package.
-        out = run joined(String.view(&out), String.view(&project.name))
-        run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&out)])
+        let program = run joined(String.view(&out), String.view(&project.name))
+        run Task.exec("cp", &["-p", String.view(&all[at].path), String.view(&program)])
+        if shipsBundleFiles(&built) {
+          let files = run joined(String.view(&out), "app")
+          run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), String.view(&out))
+        }
+        out = move program
       }
       if at == 0 {
         StderrWriter.print("\n", &.())
@@ -1456,6 +1464,13 @@ impl Built {
           &[Variable { name: KEEP_VARIABLE, value: kept.view() }],
         )
       } else {
+        if shipsBundleFiles(&built) {
+          let path = String.view(&artifact.path)
+          let mut end = String.byteLength(path)
+          while end > 0 && String.utf8Bytes(path)[end - 1] != 47 { end = end - 1 }
+          let files = run joined(String.slice(path, 0, end), "app")
+          run ship.bundleFiles(String.view(&built.source.bundled), String.view(&files), "")
+        }
         run start(String.view(&artifact.path), &[], String.view(&project.root), &[])
       }
       return Running {
@@ -1492,6 +1507,12 @@ impl Built {
     let built = run move self
     return run f(move built)
   }
+}
+
+/// Whether `built` is a release host on the SilkJS runtime that embeds a bundle: it reads the
+/// files beside the bundle (wasm modules, workers, images) from `app/` beside itself.
+fn shipsBundleFiles(built: &Built) -> bool {
+  return built.madeIn != Mode.Dev && built.source.runsOn == Runtime.Node && String.view(&built.source.bundled) != ""
 }
 
 // --- Running ---

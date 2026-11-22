@@ -2,6 +2,8 @@
 // as a page's is. There is no page to load, so a navigation to another address of the app
 // changes the entry and sends `popstate`, the event routers follow.
 
+import { URL as AppURL } from "./url.js";
+
 export class PopStateEvent extends (globalThis.Event ?? class {}) {
   constructor(type, init = {}) {
     super(type, init);
@@ -17,38 +19,6 @@ export class HashChangeEvent extends (globalThis.Event ?? class {}) {
   }
 }
 
-// The embedded engine has no `URL`: a small one for the parts `location` has.
-class AppURL {
-  constructor(text, base) {
-    text = String(text);
-    const match = /^([a-z][a-z0-9+.-]*:)\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(text);
-    if (match) {
-      this.protocol = match[1].toLowerCase();
-      this.host = match[2].toLowerCase();
-      this.pathname = match[3] || "/";
-      this.search = match[4] && match[4] !== "?" ? match[4] : "";
-      this.hash = match[5] && match[5] !== "#" ? match[5] : "";
-      return;
-    }
-    if (!base) throw new TypeError("'" + text + "' is not an absolute address");
-    const from = new AppURL(String(base));
-    Object.assign(this, { protocol: from.protocol, host: from.host, pathname: from.pathname, search: from.search, hash: "" });
-    const [, path = "", search, hash] = /^([^?#]*)(\?[^#]*)?(#.*)?$/.exec(text);
-    if (path) {
-      this.pathname = path.startsWith("/") ? path : from.pathname.replace(/[^/]*$/, "") + path;
-      this.search = "";
-    }
-    if (search !== undefined) this.search = search === "?" ? "" : search;
-    if (hash !== undefined) this.hash = hash === "#" ? "" : hash;
-  }
-  get hostname() { return this.host.replace(/:\d+$/, ""); }
-  set hostname(value) { this.host = value + (this.port ? ":" + this.port : ""); }
-  get port() { return /:(\d+)$/.exec(this.host)?.[1] ?? ""; }
-  set port(value) { this.host = this.hostname + (value ? ":" + value : ""); }
-  get origin() { return this.protocol + "//" + this.host; }
-  get href() { return this.origin + this.pathname + this.search + this.hash; }
-  toString() { return this.href; }
-}
 const URL = globalThis.URL ?? AppURL;
 
 const url = Symbol("url");

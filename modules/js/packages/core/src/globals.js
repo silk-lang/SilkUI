@@ -42,6 +42,7 @@ import { indexedDBModule } from "./indexeddb.js";
 import { WorkerClass, SharedWorkerClass } from "./worker.js";
 import { windowFetch, eventSourceClass } from "./fetch.js";
 import { ImageBitmap, createImageBitmap } from "./image-bitmap.js";
+import { URL as AppURL, URLSearchParams as AppURLSearchParams } from "./url.js";
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 const KIND_OF_TAG = { span: "box", img: "image", input: "input", textarea: "input", svg: "svg" };
@@ -799,6 +800,20 @@ const classes = {
   HTMLDetailsElement: nodeClass("HTMLDetailsElement", CoreNode.prototype, tagIs("details")),
   HTMLDialogElement: nodeClass("HTMLDialogElement", CoreNode.prototype, tagIs("dialog")),
 };
+// The other HTML interfaces, by the tags they cover, for `instanceof` tests.
+for (const [name, tags] of Object.entries({
+  HTMLFieldSetElement: ["fieldset"], HTMLLegendElement: ["legend"], HTMLMeterElement: ["meter"], HTMLOutputElement: ["output"],
+  HTMLProgressElement: ["progress"], HTMLOptGroupElement: ["optgroup"], HTMLDataListElement: ["datalist"],
+  HTMLParagraphElement: ["p"], HTMLHeadingElement: ["h1", "h2", "h3", "h4", "h5", "h6"], HTMLPreElement: ["pre", "listing", "xmp"],
+  HTMLQuoteElement: ["blockquote", "q"], HTMLHRElement: ["hr"], HTMLUListElement: ["ul"], HTMLOListElement: ["ol"],
+  HTMLLIElement: ["li"], HTMLDListElement: ["dl"], HTMLMenuElement: ["menu"], HTMLTableElement: ["table"],
+  HTMLTableCaptionElement: ["caption"], HTMLTableSectionElement: ["thead", "tbody", "tfoot"], HTMLTableRowElement: ["tr"],
+  HTMLTableCellElement: ["td", "th"], HTMLTableColElement: ["col", "colgroup"], HTMLAudioElement: ["audio"],
+  HTMLSourceElement: ["source"], HTMLTrackElement: ["track"], HTMLPictureElement: ["picture"], HTMLMapElement: ["map"],
+  HTMLAreaElement: ["area"], HTMLEmbedElement: ["embed"], HTMLObjectElement: ["object"], HTMLTimeElement: ["time"],
+  HTMLDataElement: ["data"], HTMLModElement: ["ins", "del"], HTMLSlotElement: ["slot"], HTMLScriptElement: ["script"],
+  HTMLLinkElement: ["link"], HTMLMetaElement: ["meta"], HTMLTitleElement: ["title"], HTMLBaseElement: ["base"],
+})) classes[name] = nodeClass(name, CoreNode.prototype, tagIs(...tags));
 for (const [name, value] of Object.entries(classes)) {
   if (value && global[name] === undefined) define(name, value);
 }
@@ -817,6 +832,9 @@ if (global.Image === undefined) {
   });
 }
 
+for (const [name, value] of Object.entries({ URL: AppURL, URLSearchParams: AppURLSearchParams })) {
+  if (global[name] === undefined) define(name, value);
+}
 for (const [name, value] of Object.entries({
   Range, StaticRange, Selection, DOMRect, ResizeObserver, IntersectionObserver, MutationObserver, getComputedStyle,
   Storage, PopStateEvent, HashChangeEvent, NodeFilter: { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3, SHOW_ALL: 0xffffffff, SHOW_ELEMENT: 1, SHOW_TEXT: 4 },
