@@ -147,6 +147,7 @@ import live_svg
 import live_svg { LiveSvg }
 import thin { Thin }
 import node {
+  ASKED_UP_SHIFT,
   Move,
   CanvasSurface,
   NodeRare,
@@ -2323,6 +2324,10 @@ impl<'a> UiTree<'a> {
     }
     let mask = if state == StyleState.Hover { css_element.HOVER } else { css_element.ACTIVE }
     let mut change = self.stateReach(slot, mask)
+    // A press flips the state of every ancestor up to the root: only those some other node's
+    // match asked about can change what their subtree or siblings compute.
+    let asked = if state == StyleState.Hover { css_element.WATCH_HOVER } else { css_element.WATCH_ACTIVE }
+    if u32.bitAnd(node.styleWatch, asked) == 0 { change.reach = Reach.None }
     // The node's own looks and variables change what it and its subtree compute, no selector.
     if inline || custom { change.reach = style_invalidation.wider(change.reach, Reach.Subtree) }
     self.restyleExtent(slot, change)
@@ -6016,11 +6021,13 @@ impl<'a> UiTree<'a> {
         let class = self.node(twin).styleClass
         // An equal node is asked the same of itself; the twin's own match asked no other node.
         let watch = self.node(twin).styleWatch
+        let askedUp = u32.shiftRight(watch, ASKED_UP_SHIFT)
         let node = self.nodeMut(slot)
         node.resolvedSheet = move shared
         node.styleClass = class
         node.styleTwin = twin
-        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, 7), watch)
+        node.styleWatch = u32.bitOr(u32.bitAnd(node.styleWatch, css_element.WATCH_ASKED), watch)
+        if askedUp != 0 { self.askUp(slot, askedUp) }
         self.work.sheetTwins = self.work.sheetTwins + 1
         run container_watch.record(&mut self, slot, PseudoTarget.None, &[])
         return ()
@@ -6032,7 +6039,7 @@ impl<'a> UiTree<'a> {
     let fresh = self.nodeMut(slot)
     fresh.styleClass = class
     fresh.styleTwin = NONE
-    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, 7)
+    fresh.styleWatch = u32.bitAnd(fresh.styleWatch, css_element.WATCH_ASKED)
     let mut roots = Intrinsic.replace(self.styleSheets, List<RootSheets>.make())
     let entries = roots.asMutSlice()
     let mut stops = Intrinsic.replace(self.easingStops, EasingStops.make())
@@ -6076,12 +6083,25 @@ impl<'a> UiTree<'a> {
       self.work.watchOverflows = self.work.watchOverflows + 1
       self.work.lastOverflow = u32.toUsize(slot)
     }
-    let nodes = self.nodes.asMutSlice()
+    let pointer = css_element.WATCH_HOVER | css_element.WATCH_ACTIVE
     let mut i: usize = 0
     while i < watched.length {
       let at = watched[i].node
+      if at != u32.toUsize(slot) {
+        let depth = if u32.bitAnd(watched[i].bits, u32.bitNot(pointer)) == 0 { self.depthAbove(slot, usize.toU32(at)) } else { 0 }
+        if depth == 0 { outside = true }
+        else {
+          let own = self.nodeMut(slot)
+          own.styleWatch = u32.bitOr(own.styleWatch, u32.shiftLeft(1, ASKED_UP_SHIFT + depth - 1))
+        }
+      }
+      i = i + 1
+    }
+    let nodes = self.nodes.asMutSlice()
+    i = 0
+    while i < watched.length {
+      let at = watched[i].node
       nodes[at].styleWatch = u32.bitOr(nodes[at].styleWatch, watched[i].bits)
-      if at != u32.toUsize(slot) { outside = true }
       if u32.bitAnd(watched[i].bits, css_element.WATCH_HAS_SIBLINGS) != 0 { siblings = true }
       i = i + 1
     }
@@ -6098,11 +6118,37 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// How many levels above `slot` its ancestor `other` is, or zero when it is not one within 16.
+  fn depthAbove(self: &Self, slot: u32, other: u32) -> u32 {
+    let mut up = self.node(slot).parent
+    let mut depth: u32 = 1
+    while up != NONE && depth <= 16 {
+      if up == other { return depth }
+      up = self.node(up).parent
+      depth = depth + 1
+    }
+    return 0
+  }
+
+  /// Flags the ancestors of `slot` that `askedUp` names as asked their pointer states.
+  fn askUp(self: &mut Self, slot: u32, askedUp: u32) -> () {
+    let mut up = self.node(slot).parent
+    let mut depth: u32 = 0
+    while up != NONE && depth < 16 {
+      if u32.bitAnd(askedUp, u32.shiftLeft(1, depth)) != 0 {
+        let node = self.nodeMut(up)
+        node.styleWatch = u32.bitOr(node.styleWatch, css_element.WATCH_HOVER | css_element.WATCH_ACTIVE)
+      }
+      up = self.node(up).parent
+      depth = depth + 1
+    }
+  }
+
   /// Flags every element a match for `slot` can have watched when it watched more than a match
   /// context holds: combinators only step to parents and earlier siblings, so those are `slot`,
   /// its ancestors and the elements before each of them.
   fn watchAround(self: &mut Self, slot: u32) -> () {
-    let bits = css_element.WATCH_HAS | css_element.WATCH_HAS_SIBLINGS | css_element.WATCH_FOCUS_WITHIN
+    let bits = css_element.WATCH_ASKED
     let mut up = slot
     while up != NONE {
       let mut beside = up
