@@ -224,6 +224,8 @@ import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
 import canvas2d { Canvas2d, Measured as TextMeasured }
+import canvas_raster { CanvasRasters, Frame as RasterFrame, Live as RasterLive }
+import canvas_raster
 
 /// An open root other than the current one: its share of the tree's state, kept while the
 /// current root is laid out, painted and given input. [`UiTree.useRoot`] swaps it in. The
@@ -405,6 +407,7 @@ fn nodeOf(mutation: &Mutation) -> u32 {
     Mutation.SetSource { id, .. } => id
     Mutation.SetCanvas { id, .. } => id
     Mutation.SetCanvasSurface { id, .. } => id
+    Mutation.SetCanvasPixels { id, .. } => id
     Mutation.SvgInsert { id, .. } => id
     Mutation.SvgRemove { id, .. } => id
     Mutation.SvgAttribute { id, .. } => id
@@ -947,6 +950,8 @@ pub struct UiTree<'a> {
   pub faces: List<FaceSlot<'a>>,
   /// The bitmaps of the canvas nodes JavaScript draws with Canvas 2D.
   pub canvas2d: Canvas2d<'a>,
+  /// The bitmaps of large canvases' commands (see `canvas_raster`).
+  pub canvasRasters: CanvasRasters,
   pub atlas: Atlas,
   pub glyphs: GlyphCache,
   pub paths: PathCache,
@@ -1620,6 +1625,7 @@ impl<'a> UiTree<'a> {
       nextHostFace: FIRST_HOST_FACE,
       faces: List<FaceSlot<'a>>.make(),
       canvas2d: Canvas2d<'a>.make(),
+      canvasRasters: CanvasRasters.make(),
       atlas: Atlas.make(AtlasOptions.default()),
       glyphs: GlyphCache.make(),
       paths: PathCache.make(),
@@ -3435,6 +3441,13 @@ impl<'a> UiTree<'a> {
           extras.canvas = move commands
         }
         node.content = node.content + 1
+      }
+      Mutation.SetCanvasPixels { id, width, height, opaque, pixels } => {
+        let slot = run self.require(index, id)
+        if self.node(slot).kind != NodeKind.Canvas {
+          fail TreeError.WrongKind { index: index, id: id }
+        }
+        run self.canvas2d.setPixels(id, width, height, opaque, move pixels)
       }
       Mutation.SetCanvasSurface { id, surface, width, height, opaque } => {
         let slot = run self.require(index, id)
@@ -9583,6 +9596,7 @@ impl<'a> UiTree<'a> {
         firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
+        rasters: &mut self.canvasRasters,
         scene: &mut self.sceneB,
         previous: &self.sceneA,
         replayable: self.replayable,
@@ -9634,6 +9648,7 @@ impl<'a> UiTree<'a> {
         firstLines: &self.firstLines,
         resources: &mut self.resources,
         paths: &mut self.paths,
+        rasters: &mut self.canvasRasters,
         scene: &mut self.sceneA,
         previous: &self.sceneB,
         replayable: self.replayable,
@@ -9717,6 +9732,7 @@ impl<'a> UiTree<'a> {
       firstLines: &self.firstLines,
       resources: &mut self.resources,
       paths: &mut self.paths,
+      rasters: &mut self.canvasRasters,
       scene: &mut scene,
       previous: &self.sceneA,
       replayable: false,
@@ -9798,6 +9814,73 @@ impl<'a> UiTree<'a> {
   /// Runs the Canvas 2D commands JavaScript wrote (see [`canvas2d`]).
   pub effect fn drawCanvas2d(self: &mut Self, commands: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
     run self.canvas2d.draw(&mut self.provider.text, commands)
+  }
+
+  /// Draws the bitmaps paint asked for since the last call whose canvas did not change since
+  /// (see [`canvas_raster`]), into `canvasRasters.frames` for the window to present. A canvas
+  /// whose bitmap would be too large is refused: paint keeps drawing its commands.
+  pub effect fn rasterCanvases(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    let wants = Intrinsic.replace(self.canvasRasters.wants, List<canvas_raster.Want>.make())
+    let all = wants.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      let want = all[i]
+      i = i + 1
+      let mut seen = false
+      let mut k: usize = 0
+      while k + 1 < i && !seen {
+        seen = all[k].node == want.node && all[k].key == want.key
+        k = k + 1
+      }
+      let slot = self.slotOf(want.node)
+      if seen || slot == NONE { continue }
+      let node = self.node(slot)
+      if node.kind != NodeKind.Canvas || node.content != want.content || node.raster().key == want.key { continue }
+      let ink = canvas_raster.ink(node.canvas(), want.scale, want.fx, want.fy)
+      let width = ink.xMax - ink.xMin
+      let height = ink.yMax - ink.yMin
+      if width <= 0.0 || height <= 0.0 || width > canvas_raster.MAX_SIDE || height > canvas_raster.MAX_SIDE {
+        let extras = run self.nodeMut(slot).extrasMut()
+        extras.raster.refused = want.key
+        continue
+      }
+      let pixels = run self.canvas2d.drawCommands(
+        self.nodes.asSlice()[u32.toUsize(slot)].canvas(),
+        want.scale,
+        want.fx - ink.xMin,
+        want.fy - ink.yMin,
+        f32.toU32(width),
+        f32.toU32(height),
+      )
+      run self.canvasRasters.frames.append(
+        RasterFrame { node: want.node, key: want.key, x: f32.toI32(ink.xMin), y: f32.toI32(ink.yMin), pixels: move pixels },
+      )
+    }
+    drop wants
+  }
+
+  /// The window shows the bitmap of canvas node `node` drawn for `key` through `surface`, at
+  /// `x`, `y` (see [`RasterFrame`]): paint shows it from the next frame on.
+  pub effect fn showRaster(self: &mut Self, node: u32, surface: u32, key: u64, x: i32, y: i32, width: u32, height: u32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(node)
+    if slot == NONE { return () }
+    let extras = run self.nodeMut(slot).extrasMut()
+    extras.raster.surface = surface
+    extras.raster.key = key
+    extras.raster.x = x
+    extras.raster.y = y
+    extras.raster.width = width
+    extras.raster.height = height
+    extras.raster.stamp = u32.wrappingAdd(extras.raster.stamp, 1)
+    if self.canvasRasters.surfaceOf(node, NO_SURFACE) == NO_SURFACE {
+      run self.canvasRasters.live.append(RasterLive { node: node, surface: surface })
+    }
+    // Paint replays the canvas's subtree until its hash changes.
+    run self.repair.nodes.append(slot)
+    self.repair.pending = true
+    self.applied = true
   }
 
   /// `measureText` of `value` in `font`, as [`canvas2d.Canvas2d.measure`] gives it.

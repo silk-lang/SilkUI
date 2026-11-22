@@ -1,0 +1,128 @@
+//! Shows the bitmaps a tree keeps for its canvas nodes: the ones JavaScript draws with Canvas 2D,
+//! the pixels a client sets (`Mutation.SetCanvasPixels`), and the bitmaps of large canvases'
+//! commands (`ui_tree.canvas_raster`). Each goes to the renderer through the window's
+//! [`CanvasPresenter`], as a GPU canvas's frames do.
+import ui_tree.legacy { UiTree, TreeError, Batch }
+import ui_tree.canvas2d { Bitmap }
+import ui_tree.canvas_raster { Frame as RasterFrame, Live as RasterLive }
+import ui_tree.mutation { NO_SURFACE }
+import canvas_frames { CanvasPresenter, CanvasFrame, SharedPicture }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u32
+import silk.num.usize
+
+/// Draws the bitmaps of large canvases paint asked for, then presents every bitmap drawn
+/// into since the last call through `presenter`: a surface for each on its first frame and
+/// when it was resized, and a frame of its pixels. Closes the surfaces of canvases no longer in
+/// the tree. Says whether it changed the tree. A host calls it before each frame's layout, so
+/// the frame paints what was presented.
+pub effect fn presentCanvasBitmaps(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.rasterCanvases()
+  let changed = run presentRasters(presenter, &mut tree)
+  let mut nodes = List<u32>.make()
+  let all = tree.canvas2d.drawn()
+  let mut i: usize = 0
+  while i < all.length {
+    run nodes.append(all[i].node)
+    i = i + 1
+  }
+  let mut batch = Batch.make()
+  i = 0
+  while i < nodes.length() {
+    let node = nodes.get(i)
+    i = i + 1
+    let gone = !tree.contains(node)
+    let mut empty = false
+    let bitmaps = tree.canvas2d.drawn()
+    let mut k: usize = 0
+    while k < bitmaps.length {
+      if bitmaps[k].node == node { empty = bitmaps[k].pixels.width() == 0 }
+      k = k + 1
+    }
+    if !gone && !empty { continue }
+    if let Option<Bitmap>.Some { value } = tree.canvas2d.remove(node) {
+      if value.surface != NO_SURFACE {
+        run presenter.close(value.surface)
+        // Pixels taken away: the canvas draws its commands again.
+        if !gone { run batch.canvasSurface(node, NO_SURFACE, 0, 0, false) }
+      }
+    }
+  }
+  let mut heap = Allocator.systemAllocatorProvider()
+  let bitmaps = tree.canvas2d.drawn()
+  i = 0
+  while i < bitmaps.length {
+    let bitmap = &mut bitmaps[i]
+    i = i + 1
+    if !bitmap.drawn { continue }
+    bitmap.drawn = false
+    let width = bitmap.pixels.width()
+    let height = bitmap.pixels.height()
+    if bitmap.surface == NO_SURFACE {
+      bitmap.surface = presenter.open()
+      bitmap.resized = true
+    }
+    if bitmap.resized {
+      bitmap.resized = false
+      run batch.canvasSurface(bitmap.node, bitmap.surface, width, height, bitmap.opaque)
+    }
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(bitmap.pixels.data()) |> Effect.provideMut<Allocator>(&mut heap)
+    if presenter.keeps() {
+      let mut kept = List<u8>.make()
+      run kept.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+      run presenter.keepPixels(bitmap.surface, width, height, move kept)
+    }
+    run presenter.present(CanvasFrame { surface: bitmap.surface, width: width, height: height, pixels: move pixels, shared: Option<SharedPicture>.None })
+  }
+  if batch.length() == 0 { return changed }
+  run tree.apply(run batch.take())
+  return true
+}
+
+/// Presents the bitmaps `tree.rasterCanvases` drew and closes the surfaces of canvases gone.
+effect fn presentRasters(presenter: &CanvasPresenter, tree: &mut UiTree<'_>) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut kept = List<RasterLive>.make()
+  let live = tree.canvasRasters.live.asSlice()
+  let mut i: usize = 0
+  let mut closed = false
+  while i < live.length {
+    if tree.contains(live[i].node) {
+      run kept.append(live[i])
+    } else {
+      run presenter.close(live[i].surface)
+      closed = true
+    }
+    i = i + 1
+  }
+  if closed { tree.canvasRasters.live = move kept }
+  let frames = Intrinsic.replace(tree.canvasRasters.frames, List<RasterFrame>.make())
+  let mut heap = Allocator.systemAllocatorProvider()
+  let all = frames.asSlice()
+  i = 0
+  while i < all.length {
+    let frame = &all[i]
+    i = i + 1
+    let width = frame.pixels.width()
+    let height = frame.pixels.height()
+    let mut surface = tree.canvasRasters.surfaceOf(frame.node, NO_SURFACE)
+    if surface == NO_SURFACE { surface = presenter.open() }
+    let mut pixels = List<u8>.make()
+    run pixels.appendSlice(frame.pixels.data()) |> Effect.provideMut<Allocator>(&mut heap)
+    if presenter.keeps() {
+      let mut copy = List<u8>.make()
+      run copy.appendSlice(pixels.asSlice()) |> Effect.provideMut<Allocator>(&mut heap)
+      run presenter.keepPixels(surface, width, height, move copy)
+    }
+    run presenter.present(CanvasFrame { surface: surface, width: width, height: height, pixels: move pixels, shared: Option<SharedPicture>.None })
+    run tree.showRaster(frame.node, surface, frame.key, frame.x, frame.y, width, height)
+  }
+  return all.length != 0
+}
