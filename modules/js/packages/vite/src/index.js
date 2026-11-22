@@ -15,7 +15,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { missingApis, ownerOf, report } from "./apis.js";
 
 // The modules of `@silkui/core/globals`, and the globals it defines.
-const CORE_GLOBALS = /[\\/](?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker|base|fetch|image-bitmap)\.js$/;
+const CORE_GLOBALS = /[\\/](?:(?:@silkui[\\/]core|packages[\\/]core)[\\/]src[\\/](?:globals|storage|location|indexeddb|worker|base|fetch|image-bitmap|url)|@silkui_core_globals)\.js$/;
 // Workers up to this size (characters) go into the bundle as data: addresses.
 const INLINE_WORKER_LIMIT = 256 * 1024;
 const PROVIDED_BY_GLOBALS = ["document", "window", "navigator", "location", "history", "navigation", "EventSource", "SharedWorker", "createImageBitmap", "ImageBitmap", "MutationObserver", "matchMedia", "Image", "HTMLElement", "localStorage", "sessionStorage", "indexedDB", "URL", "URLSearchParams"];
@@ -161,14 +161,16 @@ export default function silk(options = {}) {
         return;
       }
       // `@silkui/core/globals` provides the browser globals, and its own modules test for what
-      // they use.
+      // they use. The dev server reports as it serves, so an import of it counts at once.
       if (CORE_GLOBALS.test(id.split("?")[0])) {
         browserGlobals ||= /globals\.js$/.test(id.split("?")[0]);
         return;
       }
+      browserGlobals ||= ast.body.some((item) => item.type === "ImportDeclaration" && item.source.value === "@silkui/core/globals");
       const owner = ownerOf(id, root);
       for (const { name, area } of missingApis(ast)) {
         if (allow.has(name) || (node && !NOT_IN_NODE.has(area))) continue;
+        if (serving && browserGlobals && PROVIDED_BY_GLOBALS.includes(name)) continue;
         let use = uses.get(name);
         if (!use) uses.set(name, (use = { area, owners: new Set() }));
         if (use.owners.has(owner)) continue;
