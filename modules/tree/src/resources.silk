@@ -460,21 +460,56 @@ effect fn noTile<E>(error: E) -> Option<AtlasTile> {
   return Option<AtlasTile>.None
 }
 
-effect fn iconTile(
+effect fn iconTileInViewport(
   icons: &mut IconCache,
   atlas: &mut Atlas,
   host: &Environment<'_, '_>,
   icon: IconId,
   width: u32,
   height: u32,
+  viewportWidth: f64,
+  viewportHeight: f64,
   style: IconStyle,
   time: f64,
 ) -> Option<AtlasTile>
   ! RenderError | AtlasError | OutOfMemoryError
   ? &mut Resolver | &mut Allocator {
   return Option<AtlasTile>.Some {
-    value: run icons.icon(&mut atlas, host, icon, width, height, style, time),
+    value: run icons.iconInViewport(
+      &mut atlas,
+      host,
+      icon,
+      width,
+      height,
+      viewportWidth,
+      viewportHeight,
+      style,
+      time,
+    ),
   }
+}
+
+fn containsCurrentColor(data: &[u8]) -> bool {
+  let needle = b"currentcolor"
+  if data.length < needle.length {
+    return false
+  }
+  let mut i: usize = 0
+  let limit = data.length - needle.length
+  while i <= limit {
+    let c = lower(data[i])
+    if c == 99 {
+      let mut j: usize = 1
+      while j < needle.length && lower(data[i + j]) == needle[j] {
+        j = j + 1
+      }
+      if j == needle.length {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  return false
 }
 
 effect fn unclassified(error: RenderError) -> bool {
@@ -741,11 +776,15 @@ impl Resources {
           |> Effect.provideMut<Resolver>(&mut self.resolver)
       }
     }
-    drop run Effect.catch<RenderError>(
-      self.icons.classify(icon, CLASSIFY_SIZE, &host, &white),
-      unclassified,
-    )
-      |> Effect.provideMut<Resolver>(&mut self.resolver)
+    if containsCurrentColor(data) {
+      drop run Effect.catch<RenderError>(
+        self.icons.classify(icon, CLASSIFY_SIZE, &host, &white),
+        unclassified,
+      )
+        |> Effect.provideMut<Resolver>(&mut self.resolver)
+    } else {
+      self.icons.setTinted(icon, false)
+    }
     drop host
     drop white
     return icon
@@ -859,6 +898,24 @@ impl Resources {
   ) -> Option<AtlasTile>
     ! OutOfMemoryError
     ? &mut Allocator {
+    return run self.iconTileInViewport(&mut atlas, icon, width, height, 0.0, 0.0, time, color)
+  }
+
+  /// Like [`Resources.iconTile`], with positive `viewportWidth`/`viewportHeight` (CSS pixels)
+  /// overriding the root `<svg>`'s CSS viewport without re-parsing its markup.
+  pub effect fn iconTileInViewport(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    viewportWidth: f64,
+    viewportHeight: f64,
+    time: f64,
+    color: Rgba<f32>,
+  ) -> Option<AtlasTile>
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let tinted = self.icons.tinted(icon)
     let current = if tinted {
       black()
@@ -872,7 +929,18 @@ impl Resources {
     }
     let host = hostOf(&self.host, current)
     let tile = run Effect.catchAll(
-      iconTile(&mut self.icons, &mut atlas, &host, icon, width, height, style, time),
+      iconTileInViewport(
+        &mut self.icons,
+        &mut atlas,
+        &host,
+        icon,
+        width,
+        height,
+        viewportWidth,
+        viewportHeight,
+        style,
+        time,
+      ),
       noTile,
     )
       |> Effect.provideMut<Resolver>(&mut self.resolver)

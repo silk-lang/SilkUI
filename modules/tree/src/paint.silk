@@ -448,7 +448,7 @@ fn hasBorderImage(p: &Painter<'_, '_>, slot: u32) -> bool {
     return false
   }
   return match p.nodes.asSlice()[u32.toUsize(slot)].paintEffects() {
-    Option<&Effects>.Some { value } => value.borderImage.drawn()
+    Option<&Effects>.Some { value } => value.borderImageDrawn()
     Option<&Effects>.None => false
   }
 }
@@ -709,7 +709,9 @@ effect fn decorate(
     match &held {
       Option<Frozen<Effects>>.Some { value } => {
         let effects = value.get()
-        run paint_effects.paintImageBorder(&mut p, effects, &effects.borderImage, f, usedBorder(c), mask, c.nearest)
+        if let Option.Some { value: bi } = effects.borderImage.get() {
+          run paint_effects.paintImageBorder(&mut p, effects, bi, f, usedBorder(c), mask, c.nearest)
+        }
       }
       Option<Frozen<Effects>>.None => {}
     }
@@ -1816,6 +1818,8 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
     if let Option<Resource>.Some { value } = p.resources.get(resource) {
       if let Resource.Icon { icon: own } = value {
         let mut icon = own
+        let mut viewportWidth: f64 = 0.0
+        let mut viewportHeight: f64 = 0.0
         if kind == NodeKind.Icon {
           // Page CSS on the root, and the custom properties the markup reads.
           let mut css = run c.svg.css()
@@ -1824,33 +1828,33 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
             run css.appendSlice(variables.css.asSlice())
             key = Hash.combine(key, variables.key)
           }
-          // An inline svg's viewport is its CSS box, which overrides the root's own size. In a
-          // box of another shape than the svg's, its preserveAspectRatio places it there.
-          let own = f64.toF32(p.resources.iconRatio(icon))
-          let width = content.width() / p.scale
-          let height = content.height() / p.scale
-          if own > 0.0 && f32.isFinite(own) && width > 0.0 && height > 0.0
-            && f32.abs(width / height - own) > own * 0.001 {
-            run css.appendSlice(b"width:")
-            run appendPixels(&mut css, width)
-            run css.appendSlice(b"height:")
-            run appendPixels(&mut css, height)
-            key = Hash.combine(Hash.combine(key, u32.toU64(f32.toBits(width))), u32.toU64(f32.toBits(height)))
-          }
           if css.length() != 0 {
             if let Option.Some { value: painted } = run p.resources.paintedIcon(&mut p.atlas, resource, key, css.asSlice()) { icon = painted }
           }
+          // An inline svg's viewport is its CSS box, which overrides the root's own size. In a
+          // box of another shape than the svg's, its preserveAspectRatio places it there without
+          // re-parsing the markup or re-running currentColor classification on resize.
+          let ownRatio = f64.toF32(p.resources.iconRatio(icon))
+          let width = content.width() / p.scale
+          let height = content.height() / p.scale
+          if ownRatio > 0.0 && f32.isFinite(ownRatio) && width > 0.0 && height > 0.0
+            && f32.abs(width / height - ownRatio) > ownRatio * 0.001 {
+            viewportWidth = f32.toF64(width)
+            viewportHeight = f32.toF64(height)
+          }
         }
         // An svg keeps its aspect in a box of another shape (xMidYMid meet); an inline one sized
-        // to its box above has the box's.
-        let ratio = f64.toF32(p.resources.iconRatio(icon))
+        // to its box above uses the box directly.
         let mut boxWidth = content.width()
         let mut boxHeight = content.height()
-        if ratio > 0.0 && f32.isFinite(ratio) {
-          if boxWidth > boxHeight * ratio {
-            boxWidth = boxHeight * ratio
-          } else {
-            boxHeight = boxWidth / ratio
+        if viewportWidth == 0.0 {
+          let ratio = f64.toF32(p.resources.iconRatio(icon))
+          if ratio > 0.0 && f32.isFinite(ratio) {
+            if boxWidth > boxHeight * ratio {
+              boxWidth = boxHeight * ratio
+            } else {
+              boxHeight = boxWidth / ratio
+            }
           }
         }
         let w = f32.floor(boxWidth + 0.5)
@@ -1858,11 +1862,13 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
         let x = f32.floor(content.xMin + (content.width() - w) / 2.0 + 0.5)
         let y = f32.floor(content.yMin + (content.height() - h) / 2.0 + 0.5)
         if w >= 1.0 && h >= 1.0 {
-          let tile = run p.resources.iconTile(
+          let tile = run p.resources.iconTileInViewport(
             &mut p.atlas,
             icon,
             f32.toU32(w),
             f32.toU32(h),
+            viewportWidth,
+            viewportHeight,
             p.time,
             c.text.color,
           )
@@ -2415,8 +2421,12 @@ fn ownInk(
   }
   if let Option<&Effects>.Some { value } = node.paintEffects() {
     let widths = usedBorder(&c)
-    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.borderImage, widths))
-    reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, &value.maskBorder, widths))
+    if let Option.Some { value: bi } = value.borderImage.get() {
+      reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, bi, widths))
+    }
+    if let Option.Some { value: mb } = value.maskBorder.get() {
+      reach = f32.max(reach, 2.0 + paint_effects.borderImageReach(value, mb, widths))
+    }
   }
   return grow(box, reach)
 }

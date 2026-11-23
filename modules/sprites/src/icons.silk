@@ -22,6 +22,7 @@ import silk.collections.list { List }
 import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.f64
 import silk.num.u32
 import silk.num.u8
@@ -87,10 +88,17 @@ pub struct IconStats {
 
 impl Copy for IconStats {}
 
+/// Maximum distinct viewport-sized tiles retained per (icon, frame, color, tint) so resizing an
+/// inline SVG does not accumulate stale atlas tiles.
+const MAX_VIEWPORT_SIZES: usize = 4
+
 struct IconKey {
   icon: u32,
   width: u32,
   height: u32,
+  /// Bit-encoded CSS viewport width/height overrides (f32.toBits), or 0 when using intrinsic size.
+  viewportWidth: u32,
+  viewportHeight: u32,
   frame: u32,
   color: bool,
   /// The host's `currentColor` as RGBA8 for a color tile; zero for a mask.
@@ -102,6 +110,8 @@ impl Copy for IconKey {}
 impl HashKey for IconKey {
   fn equals(left: &Self, right: &Self) -> bool {
     return left.icon == right.icon && left.width == right.width && left.height == right.height
+      && left.viewportWidth == right.viewportWidth
+      && left.viewportHeight == right.viewportHeight
       && left.frame == right.frame
       && left.color == right.color
       && left.tint == right.tint
@@ -111,6 +121,8 @@ impl HashKey for IconKey {
     let mut hashed = Hash.mix(seed, u32.toU64(value.icon))
     hashed = Hash.combine(hashed, u32.toU64(value.width))
     hashed = Hash.combine(hashed, u32.toU64(value.height))
+    hashed = Hash.combine(hashed, u32.toU64(value.viewportWidth))
+    hashed = Hash.combine(hashed, u32.toU64(value.viewportHeight))
     hashed = Hash.combine(hashed, u32.toU64(value.frame))
     hashed = Hash.combine(hashed, u32.toU64(value.tint))
     return Hash.combine(
@@ -320,7 +332,7 @@ impl IconCache {
       || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
       return true
     }
-    let key = IconKey { icon: icon.index, width: size, height: size, frame: 0, color: true, tint: 0 }
+    let key = IconKey { icon: icon.index, width: size, height: size, viewportWidth: 0, viewportHeight: 0, frame: 0, color: true, tint: 0 }
     let dark = run self.render(black, key)
     let light = run self.render(white, key)
     let a = dark.data()
@@ -343,6 +355,20 @@ impl IconCache {
       Option<Source>.None => {}
     }
     return tinted
+  }
+
+  /// Sets whether `icon` paints only with `currentColor` without rasterizing it twice.
+  pub fn setTinted(self: &mut Self, icon: IconId, tinted: bool) -> () {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return ()
+    }
+    let source = &mut self.sources.asMutSlice()[u32.toUsize(icon.index)]
+    match &mut source.* {
+      Option<Source>.Some { value } => {
+        value.tinted = tinted
+      }
+      Option<Source>.None => {}
+    }
   }
 
   /// Whether `icon` paints only with `currentColor` (see [`IconCache.classify`]).
@@ -474,14 +500,37 @@ impl IconCache {
   ) -> AtlasTile
     ! RenderError | AtlasError | OutOfMemoryError
     ? &mut Resolver | &mut Allocator {
+    return run self.iconInViewport(&mut atlas, host, icon, width, height, 0.0, 0.0, style, time)
+  }
+
+  /// Like [`IconCache.icon`], with positive `viewportWidth`/`viewportHeight` (CSS pixels)
+  /// overriding the root `<svg>`'s CSS viewport without re-parsing its markup.
+  pub effect fn iconInViewport(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    host: &Environment<'_, '_>,
+    icon: IconId,
+    width: u32,
+    height: u32,
+    viewportWidth: f64,
+    viewportHeight: f64,
+    style: IconStyle,
+    time: f64,
+  ) -> AtlasTile
+    ! RenderError | AtlasError | OutOfMemoryError
+    ? &mut Resolver | &mut Allocator {
     if width == 0 || height == 0 || u32.toUsize(icon.index) >= self.sources.length()
       || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
       fail AtlasError.EmptyTile
     }
+    let vwBits = if viewportWidth > 0.0 { f32.toBits(f64.toF32(viewportWidth)) } else { 0 }
+    let vhBits = if viewportHeight > 0.0 { f32.toBits(f64.toF32(viewportHeight)) } else { 0 }
     let key = IconKey {
       icon: icon.index,
       width: width,
       height: height,
+      viewportWidth: vwBits,
+      viewportHeight: vhBits,
       frame: self.frameOf(icon, time),
       color: style.color(),
       tint: if style.color() {
@@ -498,6 +547,33 @@ impl IconCache {
       self.counters.rerendered = self.counters.rerendered + 1
     } else {
       self.counters.misses = self.counters.misses + 1
+    }
+    if vwBits != 0 || vhBits != 0 {
+      self.scratchKeys.clear()
+      let mut b: usize = 0
+      while b < self.entries.bucketCount() {
+        if self.entries.occupiedAt(b) {
+          let existing = self.entries.keyAt(b)
+          if existing.icon == key.icon && existing.frame == key.frame
+            && existing.color == key.color && existing.tint == key.tint
+            && (existing.viewportWidth != 0 || existing.viewportHeight != 0) {
+            run self.scratchKeys.append(existing)
+          }
+        }
+        b = b + 1
+      }
+      let extra = self.scratchKeys.asSlice()
+      if extra.length >= MAX_VIEWPORT_SIZES {
+        let mut dropCount = extra.length - MAX_VIEWPORT_SIZES + 1
+        let mut k: usize = 0
+        while k < extra.length && dropCount > 0 {
+          if let Option<AtlasTile>.Some { value } = self.entries.remove(extra[k]) {
+            drop atlas.free(value.id)
+          }
+          dropCount = dropCount - 1
+          k = k + 1
+        }
+      }
     }
     let pixmap = run self.render(host, key)
     let tile = run atlas.allocate(style.kind(), pixmap.width(), pixmap.height())
@@ -535,7 +611,7 @@ impl IconCache {
       || self.sources.asSlice()[u32.toUsize(icon.index)].isNone() {
       return Option<Pixmap>.None
     }
-    let key = IconKey { icon: icon.index, width: width, height: height, frame: 0, color: true, tint: 0 }
+    let key = IconKey { icon: icon.index, width: width, height: height, viewportWidth: 0, viewportHeight: 0, frame: 0, color: true, tint: 0 }
     return Option<Pixmap>.Some { value: run self.render(host, key) }
   }
 
@@ -546,6 +622,12 @@ impl IconCache {
     let mut options = RenderOptions.make()
     options.width = key.width
     options.height = key.height
+    if key.viewportWidth != 0 {
+      options.viewportWidth = f32.toF64(f32.fromBits(key.viewportWidth))
+    }
+    if key.viewportHeight != 0 {
+      options.viewportHeight = f32.toF64(f32.fromBits(key.viewportHeight))
+    }
     options.time = u32.toF64(key.frame) / self.options.framesPerSecond
     let source = &mut self.sources.asMutSlice()[u32.toUsize(key.icon)]
     return match &mut source.* {

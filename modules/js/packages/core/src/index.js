@@ -102,7 +102,7 @@ const UNITLESS = new Set([
   "gridColumn", "gridColumnStart", "gridColumnEnd", "gridArea", "columnCount", "columns", "orphans", "widows",
 ]);
 
-const nodes = new Map();
+const nodes = [];
 // HTML boolean attributes that are also the tree's own.
 const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline"]);
 // The tag stylesheets match a tree node by, by its kind (see ui-tree's `SelectorTree`).
@@ -177,7 +177,7 @@ function styleProxy(look) {
     },
     set(target, key, value) {
       if (typeof key !== "string" || key in target) return Reflect.set(target, key, value, target);
-      target.set({ [key]: value });
+      target._setOne(key, value);
       return true;
     },
   });
@@ -327,16 +327,35 @@ class Look {
     return name === undefined ? "" : cssName(name);
   }
 
+  _setOne(name, value) {
+    if (!this._touched && this.#state === 0 && this.#node._tag !== undefined) this.#node._styleAttributeAppeared();
+    if (value === null || value === undefined || value === "") {
+      if (name in this.#values) {
+        this._touched = true;
+        delete this.#values[name];
+        native.clearStyle(this.#node.nodeId, this.#state);
+        const css = this.#nativeText();
+        if (css) native.style(this.#node.nodeId, css, this.#state);
+      }
+      return;
+    }
+    this._touched = true;
+    if (this.#values[name] === value) return;
+    const text = cssValue(name, value);
+    this.#values[name] = typeof value === "number" || typeof value === "string" ? value : text;
+    native.style(this.#node.nodeId, cssName(name) + ":" + text + ";", this.#state);
+  }
+
   // CSSStyleDeclaration's methods, which take CSS names (`background-color`, `--gap`).
   setProperty(name, value, priority) {
     const text = value === null || value === undefined ? "" : String(value) + (priority === "important" ? " !important" : "");
-    this.set({ [camelName(String(name))]: text });
+    this._setOne(camelName(String(name)), text);
   }
 
   removeProperty(name) {
     const camel = camelName(String(name));
     const old = this.get(camel) ?? "";
-    this.set({ [camel]: null });
+    this._setOne(camel, null);
     return old;
   }
 
@@ -637,7 +656,7 @@ export class Node {
     this.parentNode = null;
     // A node with no children shares one empty list, and gets its own at its first child.
     this.childNodes = NO_CHILDREN;
-    nodes.set(this.nodeId, this);
+    nodes[this.nodeId] = this;
     native.create(this.nodeId, KINDS[kind]);
   }
 
@@ -941,6 +960,7 @@ export class Node {
     let text = value == null ? null : String(value);
     if (moAttrCount && (this._mutationTargets || moSubtreeAttr)) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
+      if (this.#className === text) return;
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
       return;
@@ -976,6 +996,8 @@ export class Node {
     } else if (this._tag !== undefined && name !== "href" && name !== "placeholder" && name !== "label") {
       // Any other HTML attribute is text the tree keeps for selectors (`[type=checkbox]`). One
       // the tree does not know (React 19's `precedence`, a library's own) stays on the element.
+      const prev = this.#rare?.attributes?.get(name) ?? null;
+      if (prev === text) return;
       try {
         native.attribute(this.nodeId, name, text);
       } catch (error) {
@@ -985,6 +1007,9 @@ export class Node {
       if (name === "href") {
         this._href = text || null;
         this.#want(KIND_OF.get("click"));
+      } else if (name === "lang" || name === "dir" || name.startsWith("data-")) {
+        const prev = this.#rare?.attributes?.get(name) ?? null;
+        if (prev === text) return;
       }
       native.attribute(this.nodeId, name,
         name === "lang" || name === "dir" || name.startsWith("data-") ? text : value);
@@ -1042,7 +1067,7 @@ export class Node {
     if (flags === old) return;
     this.#more().flags = flags;
     // A destroyed node has no tree node to tell: effect cleanups remove listeners after React frees it.
-    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
+    if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
   }
 
   // Whether this node's listeners (or link) want `kind`, and the flag bit that carries it.
@@ -1066,7 +1091,7 @@ export class Node {
     flags >>>= 0;
     if (flags === (this.#rare?.flags ?? 0)) return;
     this.#more().flags = flags;
-    if (nodes.has(this.nodeId)) native.listen(this.nodeId, flags);
+    if (nodes[this.nodeId] !== undefined) native.listen(this.nodeId, flags);
   }
 
   _keep(...types) {
@@ -1172,7 +1197,7 @@ export class Node {
   set scrollLeft(value) { scrollNode(this.nodeId, { left: value }, undefined, 0); }
   get scrollTop() { return metric(this.nodeId, 7); }
   set scrollTop(value) { scrollNode(this.nodeId, { top: value }, undefined, 0); }
-  get offsetParent() { return nodes.get(metric(this.nodeId, 8)) ?? null; }
+  get offsetParent() { return nodes[metric(this.nodeId, 8)] ?? null; }
   get offsetLeft() { return metric(this.nodeId, 9); }
   get offsetTop() { return metric(this.nodeId, 10); }
   get offsetWidth() { return metric(this.nodeId, 11); }
@@ -1209,18 +1234,18 @@ export class Node {
 
   /** This node or its nearest ancestor that matches `selector`, or null. */
   closest(selector) {
-    return nodes.get(queried(1, this, selector)) ?? null;
+    return nodes[queried(1, this, selector)] ?? null;
   }
 
   /** The first descendant, in tree order, that matches `selector`, or null. */
   querySelector(selector) {
-    return nodes.get(queried(2, this, selector)) ?? null;
+    return nodes[queried(2, this, selector)] ?? null;
   }
 
   /** Every descendant that matches `selector`, in tree order: a static list. */
   querySelectorAll(selector) {
     const ids = queried(3, this, selector);
-    return typeof ids === "string" && ids !== "" ? ids.split(",").map((id) => nodes.get(Number(id))).filter(Boolean) : [];
+    return typeof ids === "string" && ids !== "" ? ids.split(",").map((id) => nodes[Number(id)]).filter(Boolean) : [];
   }
 
   setVirtualList(options, onRange) {
@@ -2445,7 +2470,7 @@ export class Svg extends Node {
   }
 
   _draw() {
-    if (!nodes.has(this.nodeId) || this._live) return;
+    if (nodes[this.nodeId] === undefined || this._live) return;
     if (this._extra && this.childNodes.every((child) => liveable(child))) {
       this._goLive();
       return;
@@ -2806,7 +2831,7 @@ export function createRichInput(style) {
 }
 
 function forget(node) {
-  nodes.delete(node.nodeId);
+  nodes[node.nodeId] = undefined;
   node._forget?.();
   for (const child of node.childNodes) {
     child.parentNode = null;
@@ -2903,7 +2928,7 @@ function eachDescendant(node, visit) {
 }
 
 function findById(id) {
-  for (const node of nodes.values()) if (node._elementId === id && (node.parentNode || node === rootNode)) return node;
+  for (let i = 0; i < nodes.length; i++) { const node = nodes[i]; if (node && node._elementId === id && (node.parentNode || node === rootNode)) return node; }
   return null;
 }
 
@@ -2964,7 +2989,7 @@ function applyStyleElements() {
   stylesPending = false;
   const live = [];
   for (const element of styleElements) {
-    if (!nodes.has(element.nodeId)) styleElements.delete(element);
+    if (nodes[element.nodeId] === undefined) styleElements.delete(element);
     else if (inDocument(element)) live.push(element);
   }
   live.sort(treeOrder);
@@ -3963,8 +3988,8 @@ export class Selection {
   #sync() {
     if (this.#pending) this.#flush();
     const count = native.selection?.() ?? 0;
-    const rawAnchor = count ? nodes.get(geometry(0)) : null;
-    const rawFocus = count ? nodes.get(geometry(2)) : null;
+    const rawAnchor = count ? nodes[geometry(0)] : null;
+    const rawFocus = count ? nodes[geometry(2)] : null;
     if (!rawAnchor || !rawFocus) {
       if (this.#anchor) this.#forget();
       return;
@@ -3974,8 +3999,8 @@ export class Selection {
     const stretches = [];
     for (let i = 0; i < count; i++) {
       const at = 4 + 4 * i;
-      const start = nodes.get(geometry(at));
-      const end = nodes.get(geometry(at + 2));
+      const start = nodes[geometry(at)];
+      const end = nodes[geometry(at + 2)];
       if (start && end) stretches.push([...fromTreePoint(start, geometry(at + 1)), ...fromTreePoint(end, geometry(at + 3))]);
     }
     const same = anchor === this.#anchor && anchorOffset === this.#anchorOffset && focus === this.#focus
@@ -4350,10 +4375,10 @@ const ANNOUNCEMENT_LIFETIME = 7000;
 
 /** The node with tree id `id`, for hosts and tools. */
 export function nodeById(id) {
-  return nodes.get(id) ?? null;
+  return nodes[id] ?? null;
 }
 
-native.virtualRequest = (port, ...indices) => nodes.get(port)?._virtualRange?.(indices);
+native.virtualRequest = (port, ...indices) => nodes[port]?._virtualRange?.(indices);
 
 // The option bits of `__ui.markdown`.
 const MARKDOWN_FLAGS = { tables: 1, strikethrough: 2, taskLists: 4, autolinkLiterals: 8, footnotes: 16, frontmatter: 32, alerts: 64 };
@@ -4712,7 +4737,7 @@ function compatTap(click, target) {
 
 // The host calls this for every event record, before the tree runs the default action.
 native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, third, fourth) {
-  const target = nodes.get(id);
+  const target = nodes[id];
   if (!target) return false;
   if (kind >= CLOSE_REQUEST) return dispatchRequest(kind, target, a);
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
@@ -4955,7 +4980,7 @@ function stepFrom(host, node, offset, forward, unit) {
 function nativeLineStep(node, offset, forward, boundary) {
   if (!native.lineStep || typeof node.nodeId !== "number") return null;
   if (!native.lineStep(node.nodeId, offset, forward ? 1 : 0, boundary ? 1 : 0)) return null;
-  const found = nodes.get(geometry(0));
+  const found = nodes[geometry(0)];
   return found ? fromTreePoint(found, geometry(1)) : null;
 }
 
@@ -14071,7 +14096,7 @@ native.unload = function () {
   importedSheets.clear();
   styleElements.clear();
   appliedStyles = [];
-  for (const node of [...nodes.values()]) if (!node.parentNode && nodes.has(node.nodeId)) node.destroy();
+  for (let i = 0; i < nodes.length; i++) { const node = nodes[i]; if (node && !node.parentNode && nodes[node.nodeId] !== undefined) node.destroy(); }
   rootNode = null;
 };
 
@@ -14364,7 +14389,7 @@ const notifications = new Map();
 
 native.shellEvent = function (kind, a, x, y, text) {
   if (kind <= 3) {
-    const target = nodes.get(a) ?? rootNode;
+    const target = nodes[a] ?? rootNode;
     if (kind === 2) {
       const before = dragTarget;
       dragTarget = null;
@@ -15541,7 +15566,7 @@ globalThis.ResizeObserverEntry ??= ResizeObserverEntry;
 
 /** The topmost node at window point `x`, `y`, or null. */
 export function elementFromPoint(x, y) {
-  return nodes.get(native.hit?.(Number(x), Number(y)) ?? 0) ?? null;
+  return nodes[native.hit?.(Number(x), Number(y)) ?? 0] ?? null;
 }
 
 /** Every node at window point `x`, `y`, topmost first. */
@@ -15549,7 +15574,7 @@ export function elementsFromPoint(x, y) {
   const count = native.hits?.(Number(x), Number(y)) ?? 0;
   const list = [];
   for (let i = 0; i < count; i++) {
-    const node = nodes.get(geometry(i));
+    const node = nodes[geometry(i)];
     if (node) list.push(node);
   }
   return list;
@@ -15558,7 +15583,7 @@ export function elementsFromPoint(x, y) {
 /** The text position at window point `x`, `y`: `{ offsetNode, offset, getClientRect() }` (UTF-16 offset), or null. */
 export function caretPositionFromPoint(x, y) {
   if (!native.caret?.(Number(x), Number(y))) return null;
-  const offsetNode = nodes.get(geometry(0)) ?? null;
+  const offsetNode = nodes[geometry(0)] ?? null;
   const offset = geometry(1);
   const rect = new DOMRect(geometry(2), geometry(3), geometry(4), geometry(5));
   return { offsetNode, offset, getClientRect: () => rect };

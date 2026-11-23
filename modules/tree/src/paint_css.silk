@@ -5,6 +5,7 @@
 //! and color, keeping percentages for paint to resolve against the box. As in CSS, a value that
 //! does not parse is dropped and the earlier one stays.
 import mutation { Declaration, CssProperty }
+import thin { Thin }
 import properties.values
 import properties.convert { Context }
 import properties.convert
@@ -419,7 +420,7 @@ pub struct Effects {
   pub filters: List<Filter>,
   /// Zero or one `clip-path`.
   pub clip: List<ClipSource>,
-  pub masks: Layers,
+  pub masks: Thin<Layers>,
   pub backgrounds: Layers,
   /// `text-shadow`, first painted on top. `hasShadows` says the node sets it (`none` included),
   /// so it does not inherit its parent's.
@@ -447,9 +448,9 @@ pub struct Effects {
   /// `shape-image-threshold`, the alpha an image's pixels must pass to be in the shape.
   pub shapeThreshold: f32,
   /// `border-image`, drawn in place of the border's style.
-  pub borderImage: ImageBorder,
+  pub borderImage: Thin<ImageBorder>,
   /// `mask-border`, a mask over the border area besides the mask layers.
-  pub maskBorder: ImageBorder,
+  pub maskBorder: Thin<ImageBorder>,
   /// Zero or one `offset-path` basic shape or `path()`; `transform.Offset` holds the rest.
   pub offset: List<ClipSource>,
   /// Same declarations at the same font size and color hash alike.
@@ -462,7 +463,7 @@ impl Effects {
       numerics: Store<'static>.make(),
       filters: List<Filter>.make(),
       clip: List<ClipSource>.make(),
-      masks: Layers.make(),
+      masks: Thin<Layers>.none(),
       backgrounds: Layers.make(),
       shadows: List<TextShadow>.make(),
       hasShadows: false,
@@ -477,17 +478,45 @@ impl Effects {
       shapeMargin: Option<ExprId>.None,
       shapeImage: List<Image>.make(),
       shapeThreshold: 0.0,
-      borderImage: ImageBorder.make(),
-      maskBorder: ImageBorder.make(),
+      borderImage: Thin<ImageBorder>.none(),
+      maskBorder: Thin<ImageBorder>.none(),
       offset: List<ClipSource>.make(),
       hash: 0,
     }
   }
 
+  pub fn masksPainted(self: &Self) -> bool {
+    return match self.masks.get() { Option.Some { value } => value.painted() _ => false }
+  }
+
+  pub fn masksCount(self: &Self) -> usize {
+    return match self.masks.get() { Option.Some { value } => value.count() _ => 0 }
+  }
+
+  pub fn masksHasUrl(self: &Self) -> bool {
+    return match self.masks.get() { Option.Some { value } => value.hasUrl() _ => false }
+  }
+
+  pub fn borderImageDrawn(self: &Self) -> bool {
+    return match self.borderImage.get() { Option.Some { value } => value.drawn() _ => false }
+  }
+
+  pub fn maskBorderDrawn(self: &Self) -> bool {
+    return match self.maskBorder.get() { Option.Some { value } => value.drawn() _ => false }
+  }
+
+  pub fn borderImageHasUrl(self: &Self) -> bool {
+    return match self.borderImage.get() { Option.Some { value } => usesUrl(&value.image) _ => false }
+  }
+
+  pub fn maskBorderHasUrl(self: &Self) -> bool {
+    return match self.maskBorder.get() { Option.Some { value } => usesUrl(&value.image) _ => false }
+  }
+
   /// Whether paint needs an isolated layer for this node's own effects.
   pub fn layered(self: &Self) -> bool {
-    return self.filters.length() != 0 || self.clip.length() != 0 || self.masks.painted()
-      || self.maskBorder.drawn()
+    return self.filters.length() != 0 || self.clip.length() != 0 || self.masksPainted()
+      || self.maskBorderDrawn()
       || self.blend != BLEND_NORMAL
       || self.isolate
   }
@@ -751,13 +780,14 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
   if property == CssProperty.MaskBorderMode {
     let luminance = cursor.ident(&source, b"luminance")
     if (luminance || cursor.ident(&source, b"alpha")) && cursor.done(&source) {
-      if !effects.maskBorder.set {
+      let mb = run effects.maskBorder.getOrMake(ImageBorder.make)
+      if !mb.set {
         let zero = run dimensions.literal(&mut effects.numerics, 0.0, Unit.Number)
-        effects.maskBorder.set = true
-        effects.maskBorder.slice = [zero; 4]
-        effects.maskBorder.outset = [zero; 4]
+        mb.set = true
+        mb.slice = [zero; 4]
+        mb.outset = [zero; 4]
       }
-      effects.maskBorder.mode = if luminance { MaskMode.Luminance } else { MaskMode.Alpha }
+      mb.mode = if luminance { MaskMode.Luminance } else { MaskMode.Alpha }
     }
     return
   }
@@ -865,11 +895,12 @@ effect fn applyText(effects: &mut Effects, property: CssProperty, css: &[u8], ba
     EffectValue.Masks { layers, resetBorder } => {
       drop resetBorder
       // The `mask` shorthand resets `mask-border` too.
-      if property == CssProperty.Mask { effects.maskBorder = ImageBorder.make() }
+      if property == CssProperty.Mask { effects.maskBorder.clear() }
       if isBackgroundLayer(property) {
         run assignLayers(&mut effects.backgrounds, property, move layers)
       } else {
-        run assignLayers(&mut effects.masks, property, move layers)
+        let m = run effects.masks.getOrMake(Layers.make)
+        run assignLayers(&mut m.*, property, move layers)
       }
     }
     EffectValue.MaskBorder { border } => {
@@ -892,7 +923,11 @@ effect fn assignBorder(effects: &mut Effects, property: CssProperty, border: Bor
   let zero = run dimensions.literal(&mut effects.numerics, 0.0, Unit.Number)
   let one = run dimensions.literal(&mut effects.numerics, 1.0, Unit.Number)
   let whole = run dimensions.literal(&mut effects.numerics, 100.0, Unit.Percent)
-  let target = if image { &mut effects.borderImage } else { &mut effects.maskBorder }
+  let target = if image {
+    run effects.borderImage.getOrMake(ImageBorder.make)
+  } else {
+    run effects.maskBorder.getOrMake(ImageBorder.make)
+  }
   if !target.set {
     // The initial values: border-image slices at 100% one border width wide; mask-border at 0.
     target.set = true

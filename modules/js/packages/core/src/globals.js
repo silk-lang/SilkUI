@@ -522,7 +522,7 @@ const elementMethods = {
   },
   toggleAttribute(name, force) {
     const on = force === undefined ? !this.hasAttribute(name) : Boolean(force);
-    if (on) { if (!this.hasAttribute(name)) this.setAttribute(name, ""); } else this.removeAttribute(name);
+    if (on) { if (!this.hasAttribute(name)) this.setAttribute(name, ""); } else if (this.hasAttribute(name)) this.removeAttribute(name);
     return on;
   },
   hasAttributes() { return this.getAttributeNames().length > 0; },
