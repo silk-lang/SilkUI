@@ -2,7 +2,6 @@
 //! gradients with any number of stops, sized, positioned and repeated), `text-shadow`, and the isolated layers for
 //! `filter`, `mix-blend-mode`, `clip-path` and `mask`. A run of filter functions that the scene
 //! applies in its own order (blur, color matrix, drop shadow) shares one layer; others nest.
-import thin { Thin }
 import paint { Painter, usedBorder, borderBox, paddingBox, contentBox, device, snapped, radiiOf }
 import paint_css { Effects, Layers, Clip, TextShadow, ImageBorder, ATTACH_FIXED, ATTACH_LOCAL }
 import ui_scene.scroll { ScrollAxis, ScrollLink, ROOT_GROUP, UNBOUNDED }
@@ -69,6 +68,7 @@ import silk.geometry.insets { Insets }
 import ui_scene.radii { Radii }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.frozen { Frozen }
 import silk.mem.box { Box }
 import silk.num.f32
 import silk.num.f64
@@ -1344,16 +1344,11 @@ pub effect fn popEffects(p: &mut Painter<'_, '_>, opened: Opened) -> ()
   }
 }
 
-/// Takes node `slot`'s effects out of the node so paint can use them while it changes the
-/// painter; give them back with [`putEffects`].
-pub fn takeEffects(p: &mut Painter<'_, '_>, slot: u32) -> Thin<Effects> {
-  let target = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
-  return Intrinsic.replace(target.effects, Thin<Effects>.none())
-}
-
-pub fn putEffects(p: &mut Painter<'_, '_>, slot: u32, effects: Thin<Effects>) -> () {
-  let target = &mut p.nodes.asMutSlice()[u32.toUsize(slot)]
-  drop Intrinsic.replace(target.effects, move effects)
+/// Clones node `slot`'s frozen effects handle so paint can read them while it changes the
+/// painter without touching the node list.
+pub fn cloneEffects(p: &Painter<'_, '_>, slot: u32) -> Option<Frozen<Effects>> {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  return if node.hasEffectsFlag { Option<Frozen<Effects>>.some(node.effects.clone()) } else { Option<Frozen<Effects>>.None }
 }
 
 /// Paints node `slot`'s `clip-path` and mask images into a mask layer of the layer open now.
@@ -1361,17 +1356,16 @@ pub fn putEffects(p: &mut Painter<'_, '_>, slot: u32, effects: Thin<Effects>) ->
 effect fn paintMask(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, radii: Radii, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let taken = takeEffects(&mut p, slot)
-  match taken.get() {
-    Option<&Effects>.Some { value } => {
+  let held = cloneEffects(&p.*, slot)
+  match &held {
+    Option<Frozen<Effects>>.Some { value } => {
       let c = p.nodes.asSlice()[u32.toUsize(slot)].computed()
       let nearest = c.nearest
       let border = usedBorder(c)
-      run paintMaskOf(&mut p, value, f, radii, mask, nearest, border)
+      run paintMaskOf(&mut p, value.get(), f, radii, mask, nearest, border)
     }
-    Option<&Effects>.None => {}
+    Option<Frozen<Effects>>.None => {}
   }
-  putEffects(&mut p, slot, move taken)
 }
 
 effect fn paintMaskOf(p: &mut Painter<'_, '_>, effects: &Effects, f: &Fragment, radii: Radii, mask: ContentMask, nearest: bool, widths: Insets<f32>) -> ()

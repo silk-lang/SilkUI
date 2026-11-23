@@ -157,6 +157,47 @@ fn hashOf(seed: &HashSeed, view: &[u64]) -> u64 {
   return Hash.combine(Hash.combine(a, b), Hash.combine(c, d))
 }
 
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  let mut i: usize = 0
+  while i < left.length {
+    if left[i] != right[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// Whether `left` and `right` have the same canonical value: equal field bytes and equal active
+// union variants, skipping struct padding and inactive union bytes just as `emit` does.
+fn sameCanonical<T>(left: &T, right: &T) -> bool {
+  static if openStruct<T>() {
+    static for field in Reflect.fields<T>() {
+      if !sameCanonical(Reflect.borrowField(left, field), Reflect.borrowField(right, field)) { return false }
+    }
+    return true
+  } else {
+    static if openUnion<T>() {
+      static for variant in Reflect.variants<T>() {
+        let l = Reflect.isVariant(left, variant)
+        let r = Reflect.isVariant(right, variant)
+        if l != r { return false }
+        if l {
+          static for field in Reflect.variantFields(variant) {
+            if !sameVariantField(left, right, variant, field) { return false }
+          }
+          return true
+        }
+      }
+      return true
+    } else {
+      return sameBytes(bytesOf(left), bytesOf(right))
+    }
+  }
+}
+
+fn sameVariantField<U, V>(left: &U, right: &U, static variant: Intrinsic.Variant<U>, static field: Intrinsic.Field<U, V>) -> bool {
+  return sameCanonical(Reflect.borrowVariantField<U, V>(left, variant, field), Reflect.borrowVariantField<U, V>(right, variant, field))
+}
+
 fn sameWords(left: &[u64], right: &[u64]) -> bool {
   let mut i: usize = 0
   while i < left.length {
@@ -180,10 +221,8 @@ pub struct StylePool {
   places: List<u32>,
   hashes: List<u64>,
   held: List<Frozen<Computed>>,
-  /// The key of each of `held`, `stride` words each.
-  keys: List<u64>,
   stride: usize,
-  /// The key of the style being shared.
+  /// Scratch canonical image of the style being hashed.
   image: Image,
   /// `held`'s length at which the pool next drops the styles only it holds.
   sweepAt: usize,
@@ -192,7 +231,6 @@ pub struct StylePool {
 impl StylePool {
   pub effect fn census(self: &Self, out: &mut Census) -> () ! OutOfMemoryError ? &mut Allocator {
     run out.held("tree.style-pool.styles(Computed)", self.held.length(), self.held.capacity(), Layout.of<Computed>().bytes + 16)
-    run out.held("tree.style-pool.keys", self.keys.length(), self.keys.capacity(), 8)
     run out.held("tree.style-pool.index", self.held.length(), self.places.capacity() / 2 + self.hashes.capacity(), 8)
   }
 
@@ -203,7 +241,6 @@ impl StylePool {
       places: List<u32>.make(),
       hashes: List<u64>.make(),
       held: List<Frozen<Computed>>.make(),
-      keys: List<u64>.make(),
       stride: (size + ORDINALS + 7) / 8,
       image: Image { words: List<u64>.make(), size: size, ordinals: 0 },
       sweepAt: FIRST_SWEEP,
@@ -222,13 +259,12 @@ impl StylePool {
     self.image.ordinals = 0
     emit(value, addressOf(value), &mut self.image)
     let hash = hashOf(&self.seed, self.image.words.asSlice())
-    let found = self.find(hash)
+    let found = self.find(hash, value)
     if found != usize.MAX { return self.held.asSlice()[found].clone() }
     if self.held.length() >= self.sweepAt { run self.sweep() }
     let made = run Frozen<Computed>.make(value.*)
     run self.hashes.append(hash)
     run self.held.append(made.clone())
-    run self.keys.appendSlice(self.image.words.asSlice())
     if self.held.length() * 2 > self.places.length() {
       run self.index()
     } else {
@@ -238,18 +274,17 @@ impl StylePool {
     return move made
   }
 
-  // The index in `held` of the style whose key is `image`, which hashes to `hash`.
-  fn find(self: &Self, hash: u64) -> usize {
+  // The index in `held` of the style equal to `value`, which hashes to `hash`.
+  fn find(self: &Self, hash: u64, value: &Computed) -> usize {
     let size = self.places.length()
     if size == 0 { return usize.MAX }
     let mask = size - 1
-    let key = self.image.words.asSlice()
     let mut at = usize.bitAnd(u64.wrappingToUsize(hash), mask)
     while true {
       let place = self.places.get(at)
       if place == 0 { return usize.MAX }
       let index = u32.toUsize(place) - 1
-      if self.hashes.get(index) == hash && sameWords(Slice.view(self.keys.asSlice(), index * self.stride, self.stride), key) { return index }
+      if self.hashes.get(index) == hash && sameCanonical(self.held.asSlice()[index].get(), value) { return index }
       at = usize.bitAnd(at + 1, mask)
     }
     return usize.MAX
@@ -280,13 +315,11 @@ impl StylePool {
   effect fn sweep(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let mut styles = Intrinsic.replace(self.held, List<Frozen<Computed>>.make())
     let hashes = Intrinsic.replace(self.hashes, List<u64>.make())
-    let keys = Intrinsic.replace(self.keys, List<u64>.make())
     while styles.length() != 0 {
       let last = styles.length() - 1
       if let Option<Frozen<Computed>>.Some { value: style } = move styles.pop() {
         if style.count() > 1 {
           run self.hashes.append(hashes.get(last))
-          run self.keys.appendSlice(Slice.view(keys.asSlice(), last * self.stride, self.stride))
           run self.held.append(move style)
         }
       }

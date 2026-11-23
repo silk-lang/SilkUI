@@ -215,6 +215,7 @@ import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.geometry.vector { Vector2 }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
 import silk.mem.box { Box }
 import silk.num.f32
 import silk.num.f64
@@ -896,6 +897,14 @@ pub const HOVER_SETTLE_SECONDS: f64 = 0.1
 ///
 /// A root can be set aside for a second client that shares the tree, such as devtools running
 /// in the app's process (`setAside`): its records and root events wait for that client.
+struct EndedFilter {
+  slot: u32,
+  id: u32,
+  filters: FilterList,
+}
+
+impl Copy for EndedFilter {}
+
 pub struct UiTree<'a> {
   /// Tree-owned virtualization controllers. Use mutations and `virtualRange` to access them.
   pub virtualLists: List<VirtualList>,
@@ -1228,6 +1237,10 @@ pub struct UiTree<'a> {
   overrides: List<StyleOverride>,
   /// The running CSS transitions of every root (see `motion`).
   pub transitions: List<Running>,
+  /// Shared empty `Effects` sentinel for nodes without declared paint effects (keeps `Node` at 296 B).
+  emptyEffects: Frozen<Effects>,
+  /// Final filter values of `filter` transitions that just ended, consumed by `moveFilters`.
+  endedFilters: List<EndedFilter>,
   /// Whether `translate` transitions are handed to the renderer as [`Move`]s. A host turns
   /// it on when its renderer draws frames by itself (`motion.slides`).
   pub compositedMoves: bool,
@@ -1363,6 +1376,7 @@ impl<'a> UiTree<'a> {
     let mut hovered: usize = 0
     let mut distinctClasses = HashMap<u64, usize>.make(self.seed)
     let mut distinctTexts = HashMap<u64, usize>.make(self.seed)
+    let mut distinctEffects = HashMap<u64, usize>.make(self.seed)
     let mut repeatedTextBytes: usize = 0
     let mut at: usize = 0
     while at < self.nodes.length() {
@@ -1394,7 +1408,11 @@ impl<'a> UiTree<'a> {
       if node.extras.isSome() { extras = extras + 1 }
       if node.moving.isSome() { moving = moving + 1 }
       if node.editing.isSome() { editing = editing + 1 }
-      if node.effects.isSome() { effects = effects + 1 }
+      if node.hasEffectsFlag {
+        effects = effects + 1
+        let addr = usize.toU64(Pointer.address<Effects>(Pointer.fromRef<Effects>(node.effects.get())))
+        drop run distinctEffects.insert(addr, 1)
+      }
       if node.semantics.isSome() { semantics = semantics + 1 }
       if node.resolvedSheet.isSome() { sheets = sheets + 1 }
       if node.styleTwin != NONE { twins = twins + 1 }
@@ -1447,7 +1465,8 @@ impl<'a> UiTree<'a> {
     run out.held("tree.nodes.extras(NodeExtras)", extras, extras, Intrinsic.layoutOf<NodeExtras>().bytes)
     run out.held("tree.nodes.moving(Computed)", moving, moving, Intrinsic.layoutOf<Computed>().bytes)
     run out.held("tree.nodes.editing", editing, editing, Intrinsic.layoutOf<EditState>().bytes)
-    run out.held("tree.nodes.effects", effects, effects, Intrinsic.layoutOf<Effects>().bytes)
+    run out.held("tree.nodes.effects", distinctEffects.length(), distinctEffects.length(), Intrinsic.layoutOf<Effects>().bytes + 16)
+    run out.unit("nodes.with-effects", effects)
     run out.held("tree.nodes.semantics", semantics, semantics, Intrinsic.layoutOf<Semantics>().bytes)
     run out.held("tree.nodes.identity(NodeIdentity)", identities, identities, Intrinsic.layoutOf<NodeIdentity>().bytes)
     run out.held("tree.nodes.identity.extras", identityExtras, identityExtras, Intrinsic.layoutOf<IdentityExtras>().bytes)
@@ -1476,7 +1495,14 @@ impl<'a> UiTree<'a> {
     run out.held("tree.style-models", self.styleModels.length(), self.styleModels.bucketCount(), 21)
     run self.stylePool.census(&mut out)
     run out.held("tree.font-keys", self.fontKeys.length(), self.fontKeys.capacity(), Intrinsic.layoutOf<FontKeyEntry>().bytes)
+    let mut loadedFaces: usize = 0
+    let mut fi: usize = 0
+    while fi < self.faces.length() {
+      if self.faces.asSlice()[fi].face.isSome() { loadedFaces = loadedFaces + 1 }
+      fi = fi + 1
+    }
     run out.held("tree.faces", self.faces.length(), self.faces.capacity(), Intrinsic.layoutOf<FaceSlot<'a>>().bytes)
+    run out.held("tree.faces.loaded", loadedFaces, loadedFaces, Intrinsic.layoutOf<FontFace<'a>>().bytes)
     let mut root: usize = 0
     while root < self.styleSheets.length() {
       let sheets = &self.styleSheets.asSlice()[root]
@@ -1821,6 +1847,8 @@ impl<'a> UiTree<'a> {
       empty: Scene.make(),
       overrides: List<StyleOverride>.make(),
       transitions: List<Running>.make(),
+      emptyEffects: run Frozen<Effects>.make(Effects.make()),
+      endedFilters: List<EndedFilter>.make(),
       compositedMoves: false,
       moves: List<Move>.make(),
       movesKey: 0,
@@ -3847,7 +3875,7 @@ impl<'a> UiTree<'a> {
       svg: Thin<LiveSvg>.none(),
       content: 1,
       editing: move editing,
-      effects: Thin<Effects>.none(),
+      effects: self.emptyEffects.clone(),
       semantics: Thin<Semantics>.none(),
       resolvedSheet: Option<Frozen<Resolved>>.None,
       styleClass: 0,
@@ -3856,6 +3884,7 @@ impl<'a> UiTree<'a> {
       variableFree: false,
       styleWatch: 0,
       activeTransitions: 0,
+      hasEffectsFlag: false,
       computedStamp: 0,
       selectorIdentity: Thin<NodeIdentity>.none(),
       paintCache: NONE,
@@ -4080,6 +4109,7 @@ impl<'a> UiTree<'a> {
     let mut i: usize = 0
     while i < doomed.length() {
       let gone = doomed.get(i)
+      let emptyEffects = self.emptyEffects.clone()
       let node = self.nodeMut(gone)
       node.live = false
       let id = node.id
@@ -4097,7 +4127,8 @@ impl<'a> UiTree<'a> {
       node.paintCache = NONE
       node.moving.clear()
       node.editing.clear()
-      node.effects.clear()
+      node.effects = move emptyEffects
+      node.hasEffectsFlag = false
       node.semantics.clear()
       node.resolvedSheet = Option<Frozen<Resolved>>.None
       node.selectorIdentity.clear()
@@ -7775,6 +7806,7 @@ impl<'a> UiTree<'a> {
     let paintHash = kept.paintHash
     run style_change.prepare(&mut self, slot, false)
     self.work.textInherits = self.work.textInherits + 1
+    let emptyEffects = if self.node(slot).hasEffectsFlag { Option<Frozen<Effects>>.some(self.emptyEffects.clone()) } else { Option<Frozen<Effects>>.None }
     let target = self.nodeMut(slot)
     if !Frozen.same(&target.styled, &styled) || target.moving.isSome() {
       target.styled = move styled
@@ -7784,7 +7816,10 @@ impl<'a> UiTree<'a> {
     target.rendered = rendered
     target.fontKey = fontKey
     target.paintHash = paintHash
-    if target.effects.isSome() { target.effects.clear() }
+    if let Option<Frozen<Effects>>.Some { value } = move emptyEffects {
+      target.hasEffectsFlag = false
+      target.effects = move value
+    }
     run self.dropTickBase(slot)
     return true
   }
@@ -7794,7 +7829,7 @@ impl<'a> UiTree<'a> {
     let place = self.textInheritPlace(slot)
     if place == usize.MAX { return () }
     let node = self.node(slot)
-    if node.moving.isSome() || node.effects.isSome() { return () }
+    if node.moving.isSome() || node.hasEffectsFlag { return () }
     let parent = self.node(node.parent)
     let entry = TextInherit {
       parentStamp: parent.computedStamp, parentRendered: parent.rendered, width: self.cssWidth(), height: self.cssHeight(),
@@ -7830,9 +7865,9 @@ impl<'a> UiTree<'a> {
     let lender = self.computedLender(slot)
     if lender == NONE { return NONE }
     let other = self.node(lender)
-    if other.moving.isSome() || other.effects.isSome() || other.generatedSuppressed { return NONE }
+    if other.moving.isSome() || other.generatedSuppressed { return NONE }
     let values = other.computed()
-    if values.effects.declared || values.list.item() || values.list.counters() { return NONE }
+    if values.effects.shadowFrom == lender || values.list.item() || values.list.counters() { return NONE }
     // A table part's spans come from its own attributes.
     if values.layout.display.isTablePart() && !sameSpans(node, &values.layout) { return NONE }
     if values.anchor.name != 0 || values.anchor.anchored() || values.cursorUrl { return NONE }
@@ -7849,6 +7884,8 @@ impl<'a> UiTree<'a> {
     self.work.sharedResults = self.work.sharedResults + 1
     let other = self.node(lender)
     let styled = other.styled.clone()
+    let lentHasEffects = other.hasEffectsFlag
+    let lentEffects = other.effects.clone()
     let stamp = other.computedStamp
     let fontKey = other.fontKey
     let paintHash = other.paintHash
@@ -7867,7 +7904,8 @@ impl<'a> UiTree<'a> {
     target.rendered = rendered
     target.fontKey = fontKey
     target.paintHash = paintHash
-    if target.effects.isSome() { target.effects.clear() }
+    target.hasEffectsFlag = lentHasEffects
+    target.effects = move lentEffects
     run self.dropTickBase(slot)
     let css = self.node(slot).css
     let values = styled.get()
@@ -8185,9 +8223,11 @@ impl<'a> UiTree<'a> {
       }
       let animatesFilter = u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(motion.FILTER))) != 0
       if !moves || !(showing || animatesFilter) {
-        if self.node(slot).effects.isSome() {
+        if self.node(slot).hasEffectsFlag {
+          let empty = self.emptyEffects.clone()
           let target = self.nodeMut(slot)
-          target.effects.clear()
+          target.hasEffectsFlag = false
+          target.effects = move empty
         }
         return ()
       }
@@ -8224,9 +8264,11 @@ impl<'a> UiTree<'a> {
     if moves { run self.moveFilters(slot, &mut effects, &computed.*, basis, hasBefore, animated) }
     if !computed.effects.declared && effects.filters.length() == 0 {
       // Eased all the way to `none`, with nothing else declared.
-      if self.node(slot).effects.isSome() {
+      if self.node(slot).hasEffectsFlag {
+        let empty = self.emptyEffects.clone()
         let target = self.nodeMut(slot)
-        target.effects.clear()
+        target.hasEffectsFlag = false
+        target.effects = move empty
       }
       return ()
     }
@@ -8242,9 +8284,37 @@ impl<'a> UiTree<'a> {
         computed.effects.shadowHash = effects.hash
       }
     }
-    let boxed = run Thin<Effects>.make(move effects)
+    let frozen = run Frozen<Effects>.make(move effects)
     let target = self.nodeMut(slot)
-    target.effects.set(move boxed)
+    target.hasEffectsFlag = true
+    target.effects = move frozen
+  }
+
+  pub effect fn recordEndedFilter(self: &mut Self, slot: u32, id: u32, filters: FilterList) -> () ! OutOfMemoryError ? &mut Allocator {
+    let items = self.endedFilters.asMutSlice()
+    let mut i: usize = 0
+    while i < items.length {
+      if items[i].slot == slot {
+        items[i] = EndedFilter { slot: slot, id: id, filters: filters }
+        return ()
+      }
+      i = i + 1
+    }
+    run self.endedFilters.append(EndedFilter { slot: slot, id: id, filters: filters })
+  }
+
+  fn takeEndedFilter(self: &mut Self, slot: u32, id: u32) -> Option<FilterList> {
+    let mut i: usize = 0
+    while i < self.endedFilters.length() {
+      let item = self.endedFilters.asSlice()[i]
+      if item.slot == slot {
+        drop self.endedFilters.remove(i)
+        if item.id == id { return Option<FilterList>.some(item.filters) }
+        return Option<FilterList>.None
+      }
+      i = i + 1
+    }
+    return Option<FilterList>.None
   }
 
   /// Eases the `filter` of `effects`, the paint effects node `slot`'s new style `computed`
@@ -8257,7 +8327,11 @@ impl<'a> UiTree<'a> {
       // Too long to ease: it shows as computed.
       _ => { return () }
     }
-    let showed = filter_motion.ofNode(self.node(slot).paintEffects())
+    let nodeId = self.node(slot).id
+    let showed = match self.takeEndedFilter(slot, nodeId) {
+      Option<FilterList>.Some { value } => Option<FilterList>.some(value)
+      Option<FilterList>.None => filter_motion.ofNode(self.node(slot).paintEffects())
+    }
     let before = match showed { Option.Some { value } => value _ => FilterList.none() }
     let mut shown = after
     let mut moved = false
@@ -9496,10 +9570,13 @@ impl<'a> UiTree<'a> {
       }
       let key = u32.toUsize(values[i].fontKey)
       while self.faces.length() <= key {
-        run self.faces.append(FaceSlot<'a> { loaded: false, face: Option<FontFace<'a>>.None })
+        run self.faces.append(FaceSlot<'a> { loaded: false, face: Thin<FontFace<'a>>.none() })
       }
       if !self.faces.asSlice()[key].loaded {
-        let face = run self.provider.text.rasterFace(key)
+        let face = match move run self.provider.text.rasterFace(key) {
+          Option<FontFace<'a>>.Some { value } => run Thin<FontFace<'a>>.make(move value)
+          Option<FontFace<'a>>.None => Thin<FontFace<'a>>.none()
+        }
         let slots = self.faces.asMutSlice()
         slots[key] = FaceSlot<'a> { loaded: true, face: move face }
       }
