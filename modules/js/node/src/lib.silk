@@ -31,7 +31,12 @@ import ui_tree.node { Event as RawEvent }
 import ui_tree_window.host { WindowClient, RunOptions, runWindow, environmentVariable, startInspector }
 import ui_tree_window.loader { Loader }
 import ui_tree_window.console { StderrWriter }
-import ui_tree_window.platform_thread { HostPlatform, AlsoWake }
+import ui_tree_window.platform_thread { HostPlatform, AlsoWake, Nudge }
+import ui_tree.cssom_view { getBoundingClientRect }
+import webview.types { Placement }
+import webview.wire { WireEvent, OP_OPEN, OP_CLOSE }
+import silk.geometry.rect { Rect }
+import silk.num.u8
 import ui_inspect_server.lib { Inspector, InspectorOptions }
 import ui_inspect_server.devtools
 import font_collection.lib { FontCollection }
@@ -168,6 +173,66 @@ pub struct NodeApp<'r, 'e, 'm, C> {
   waiting: List<*mut HeapHeader>,
   /// Whether the heap was searched for such functions since it last changed much.
   searched: bool,
+  /// The web views JavaScript opened, each shown at its node.
+  webViews: List<HostedView>,
+  /// A layout moved or toggled a web view: the next turn places it.
+  placesPending: bool,
+  /// Ends the window's wait, for a layout that moved a web view.
+  nudge: Option<Nudge>,
+}
+
+/// A web view and the node it shows at.
+struct HostedView {
+  view: u32,
+  node: u32,
+  /// JavaScript's `shown`: a hidden view keeps its page.
+  shown: bool,
+  /// Where it was last placed, and where the last layout puts it.
+  placed: Placement,
+  wanted: Placement,
+}
+
+/// `__ui.shell` op 44, show or hide a web view: view, 0 or 1. Served here, not by the views.
+const OP_SHOW: u32 = 44
+
+/// `__ui.shell` op 45, quit: the exit code.
+const OP_QUIT: u32 = 45
+
+/// `__ui.shellEvent` kind of a web view event: `a` the view, `x` its code, `text` its fields.
+const WEB_VIEW_EVENT: u32 = 20
+
+fn samePlacement(a: &Placement, b: &Placement) -> bool {
+  return a.visible == b.visible && a.bounds.xMin == b.bounds.xMin && a.bounds.yMin == b.bounds.yMin
+    && a.bounds.xMax == b.bounds.xMax
+    && a.bounds.yMax == b.bounds.yMax
+    && a.clip.xMin == b.clip.xMin
+    && a.clip.yMin == b.clip.yMin
+    && a.clip.xMax == b.clip.xMax
+    && a.clip.yMax == b.clip.yMax
+}
+
+fn fieldNumber(text: string, at: usize) -> u32 {
+  let bytes = String.utf8Bytes(text)
+  let mut field: usize = 0
+  let mut value: u32 = 0
+  let mut i: usize = 0
+  while i < bytes.length {
+    if bytes[i] == 31 {
+      if field == at {
+        return value
+      }
+      field = field + 1
+      value = 0
+    } else if field == at && bytes[i] >= 48 && bytes[i] <= 57 {
+      value = value * 10 + u8.toU32(bytes[i] - 48)
+    }
+    i = i + 1
+  }
+  return if field == at {
+    value
+  } else {
+    0
+  }
 }
 
 /// How many never-called functions one quiet step finishes. A function waiting for its first
@@ -203,7 +268,7 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
 
   /// Installs `__ui` and the prelude in `runtime`'s realm; `api` is the runtime's [`HostApi`].
   pub effect fn make(runtime: &'r mut Runtime<'e, 'm, C>, api: UiApi) -> NodeApp<'r, 'e, 'm, C> ! OutOfMemoryError | JsException ? &mut Allocator {
-    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None, settled: 0, quietTraced: false, censusTraced: false, waiting: List<*mut HeapHeader>.make(), searched: false }
+    let mut app = NodeApp { runtime: move runtime, api: api, bridge: Bridge.make(), openers: Openers.make(), finished: false, status: 0, zoom: 1.0, presenter: Option<CanvasPresenter>.None, settled: 0, quietTraced: false, censusTraced: false, waiting: List<*mut HeapHeader>.make(), searched: false, webViews: List<HostedView>.make(), placesPending: false, nudge: Option<Nudge>.None }
     app.lend()
     run app.install()
     run app.script(prelude(), b"ui-js:node-prelude")
@@ -504,6 +569,142 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     return true
   }
 
+  /// Runs web view call `op` with `text`'s fields: opening and closing keep the view's node here,
+  /// showing is served here, the rest goes to the platform's views.
+  effect fn webView(
+    self: &mut Self,
+    op: u32,
+    text: string,
+    platform: &mut HostPlatform,
+    window: WindowId,
+  ) -> f64
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let view = fieldNumber(text, 0)
+    if op == OP_QUIT {
+      self.finished = true
+      self.status = u32.toI32(view)
+      return 0.0
+    }
+    if op == OP_SHOW {
+      let shown = fieldNumber(text, 1) != 0
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if list[i].view == view {
+          list[i].shown = shown
+          list[i].wanted.visible = shown
+            && list[i].wanted.bounds.xMax > list[i].wanted.bounds.xMin
+            && list[i].wanted.bounds.yMax > list[i].wanted.bounds.yMin
+          self.placesPending = true
+        }
+        i = i + 1
+      }
+      return 0.0
+    }
+    let value = run platform.webView(op, window, text)
+    if op == OP_OPEN && value != 0.0 {
+      let hidden = Placement.hidden()
+      run self.webViews.append(
+        HostedView {
+          view: view,
+          node: fieldNumber(text, 1),
+          shown: true,
+          placed: hidden,
+          wanted: hidden,
+        },
+      )
+      self.placesPending = true
+    }
+    if op == OP_CLOSE {
+      let mut i: usize = 0
+      while i < self.webViews.length() {
+        if self.webViews.asSlice()[i].view == view {
+          drop self.webViews.remove(i)
+        } else {
+          i = i + 1
+        }
+      }
+    }
+    return value
+  }
+
+  /// Where the last layout puts each web view: its node's border box, in the window.
+  effect fn measureWebViews(self: &mut Self, tree: &UiTree<'_>, scale: f32) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.webViews.length() == 0 {
+      return ()
+    }
+    let window = Rect<f32>.new(0.0, 0.0, tree.input.width, tree.input.height)
+    let list = self.webViews.asMutSlice()
+    let mut moved = false
+    let mut i: usize = 0
+    while i < list.length {
+      let rect = run getBoundingClientRect(tree, list[i].node)
+      let x = f64.toF32(rect.x)
+      let y = f64.toF32(rect.y)
+      let bounds = Rect<f32>.new(x, y, x + f64.toF32(rect.width), y + f64.toF32(rect.height))
+      let wanted = Placement {
+        bounds: bounds,
+        clip: window,
+        visible: list[i].shown && rect.width > 0.0 && rect.height > 0.0,
+        scale: scale,
+      }
+      if !samePlacement(&wanted, &list[i].wanted) {
+        list[i].wanted = wanted
+        moved = true
+      }
+      i = i + 1
+    }
+    if moved {
+      self.placesPending = true
+      if let Option<Nudge>.Some { value } = &self.nudge {
+        value.nudge()
+      }
+    }
+  }
+
+  /// Places the web views a layout moved and hands what the views reported to JavaScript, then
+  /// applies what it built. Says whether there were events.
+  effect fn webViewTurn(self: &mut Self, tree: &mut UiTree<'_>, platform: &mut HostPlatform) -> bool
+    ! TreeError | OutOfMemoryError
+    ? &mut Allocator {
+    if self.placesPending {
+      self.placesPending = false
+      let list = self.webViews.asMutSlice()
+      let mut i: usize = 0
+      while i < list.length {
+        if !samePlacement(&list[i].placed, &list[i].wanted) {
+          list[i].placed = list[i].wanted
+          run platform.placeWebView(list[i].view, list[i].wanted)
+        }
+        i = i + 1
+      }
+    }
+    let mut events = List<WireEvent>.make()
+    run platform.takeWebViewEvents(&mut events)
+    if events.length() == 0 {
+      return false
+    }
+    while events.length() != 0 {
+      let event = events.remove(0)
+      let value = run text(String.utf8Bytes(String.view(&event.text)))
+      let arguments = [
+        ValueBits.number(u32.toF64(WEB_VIEW_EVENT)),
+        ValueBits.number(u32.toF64(event.view)),
+        ValueBits.number(u32.toF64(event.code)),
+        ValueBits.number(0.0),
+        value.borrow().view(),
+      ]
+      let returned = run self.callReporting(b"shellEvent", &arguments)
+      self.release(move returned)
+      self.release(move value)
+    }
+    drop run self.flush(&mut tree)
+    return true
+  }
+
   /// Serves JavaScript's desktop calls (notifications, the tray, global shortcuts, menus,
   /// dialogs, `window`'s state) through `platform`, and the calls their promise jobs made,
   /// then applies what it built. Tells JavaScript when the page zoom changed. Says whether
@@ -520,9 +721,22 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     }
     let mut round: usize = 0
     while round < CLIPBOARD_ROUNDS {
-      let requests = Intrinsic.replace(self.bridge.shell, List<bridge.ShellRequest>.make())
-      if requests.length() == 0 { break }
+      let all = Intrinsic.replace(self.bridge.shell, List<bridge.ShellRequest>.make())
+      if all.length() == 0 { break }
+      let mut requests = List<bridge.ShellRequest>.make()
+      let mut early = List<ShellAnswer>.make()
+      let mut taken = move all
+      while taken.length() != 0 {
+        let request = taken.remove(0)
+        if request.op >= OP_OPEN {
+          let value = run self.webView(request.op, String.view(&request.text), &mut platform, window)
+          run early.append(ShellAnswer { call: request.call, value: value })
+        } else {
+          run requests.append(move request)
+        }
+      }
       let mut answers = run serveShell(move requests, &mut platform, &mut tree, window)
+      while early.length() > 0 { run answers.append(early.remove(0)) }
       while answers.length() > 0 {
         let ShellAnswer { call, value } = answers.remove(0)
         let returned = run self.callReporting(b"shellAnswer", &[ValueBits.number(u32.toF64(call)), ValueBits.number(value)])
@@ -622,7 +836,7 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
   }
 
   /// Runs IntersectionObserver and ResizeObserver on `tree`'s last layout (see `JsHost.observe`).
-  pub effect fn observe<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn observe<'t>(self: &mut Self, tree: &mut UiTree<'t>) -> () ! TreeError | OutOfMemoryError ? &mut Allocator {
     if !self.bridge.observers.any() { return }
     self.bridge.geometry.clear()
     let count = run self.bridge.observers.update(&tree.*, &mut self.bridge.geometry)
@@ -630,6 +844,7 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
     self.bridge.attach(&mut tree)
     let returned = run self.callReporting(b"observed", &[ValueBits.number(usize.toF64(count))])
     self.release(move returned)
+    drop run self.flush(&mut tree)
   }
 
   /// One turn of the runtime's loop, waiting at most `seconds` (with no limit when negative)
@@ -658,6 +873,9 @@ impl<'r, 'e, 'm, C: Composition> NodeApp<'r, 'e, 'm, C> {
 
   /// Whether JavaScript asked for an animation frame.
   pub fn wantsFrame(self: &Self) -> bool { return self.bridge.frame }
+
+  /// Whether a newly registered observer awaits its initial delivery after layout.
+  pub fn observersPending(self: &Self) -> bool { return self.bridge.observers.pending }
 
   /// The runtime's exit status once it finished.
   pub fn exitStatus(self: &Self) -> Option<i32> {
@@ -740,7 +958,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
   fn needsFrame(self: &Self, state: &NodeApp<'r, 'e, 'm, C>, tree: &UiTree<'_>) -> bool {
     // A callback requested by input, a timer, or I/O must wake an idle window before it
     // changes the tree. wantsFrames keeps callbacks going once frames are running.
-    return state.wantsFrame() || tree.needsFrame()
+    return state.wantsFrame() || state.observersPending() || tree.needsFrame()
   }
 
   effect fn layout(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, input: FrameInput) -> ()
@@ -762,6 +980,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     if tree.virtualLists.length() != 0 && run state.flush(&mut tree) { run tree.frame(input) }
     run state.observe(&mut tree)
     drop run self.client.load(&mut state, &mut tree)
+    run state.measureWebViews(&tree.*, input.scale)
   }
 
   effect fn layoutRoot(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>, root: u32, input: FrameInput) -> ()
@@ -814,9 +1033,10 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     }
     let clipboard = run state.clipboard(&mut tree, &mut platform.*)
     let shell = run state.shell(&mut tree, &mut platform.*, window)
+    let views = run state.webViewTurn(&mut tree, &mut platform.*)
     let natives = run state.natives(&mut self.client.jobs, &mut tree)
     let drawn = run state.show2d(&mut tree)
-    return clipboard || shell || natives || drawn
+    return clipboard || shell || views || natives || drawn
   }
 
   effect fn start(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, tree: &mut UiTree<'_>) -> ()
@@ -834,6 +1054,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
   effect fn opened(self: &mut Self, state: &mut NodeApp<'r, 'e, 'm, C>, platform: &mut HostPlatform, window: WindowId) -> ()
     ! WindowError | OutOfMemoryError
     ? &mut Allocator {
+    state.nudge = Option<Nudge>.some(platform.nudge())
     platform.alsoWake(AlsoWake { wake: wakeRuntime, token: state.runtime.wakerAddress() })
   }
 
@@ -873,7 +1094,7 @@ impl<'c, 'r, 'e, 'm, C: Composition> WindowClient<NodeApp<'r, 'e, 'm, C>, never,
     let flushed = run state.flush(&mut tree)
     let drawn = run state.show2d(&mut tree)
     let loaded = run self.client.load(&mut state, &mut tree)
-    return flushed || drawn || loaded || state.wantsFrame()
+    return flushed || drawn || loaded || state.wantsFrame() || state.observersPending()
   }
 
   // A build with the development tools serves it, so headless scripts run; a release build
