@@ -193,6 +193,44 @@ test("MutationObserver on the document or <html> with subtree sees changes anywh
   }
 });
 
+test("MutationObserver handles re-observe, attributeFilter, multi-target dedup, and delivery order", async () => {
+  const parent = document.createElement("div");
+  const child = document.createElement("div");
+  parent.appendChild(child);
+  document.body.appendChild(parent);
+
+  const order = [];
+  const first = new MutationObserver((list) => order.push(["first", list.length, list[0].attributeName, list[0].oldValue]));
+  const second = new MutationObserver((list) => order.push(["second", list.length, list[0].attributeName, list[0].oldValue]));
+
+  // Observe both parent (subtree) and child directly with the same observer: one record per mutation.
+  first.observe(parent, { attributes: true, subtree: true, attributeFilter: ["data-a"] });
+  first.observe(child, { attributes: true, attributeOldValue: true, attributeFilter: ["data-a"] });
+  second.observe(parent, { attributes: true, subtree: true, attributeFilter: ["data-a", "data-b"] });
+
+  child.setAttribute("data-a", "1");
+  child.setAttribute("data-b", "2");
+  await Promise.resolve();
+  assert.deepEqual(order, [
+    ["first", 1, "data-a", null],
+    ["second", 2, "data-a", null],
+  ]);
+
+  // Re-observing replaces options cleanly without leaking counts.
+  order.length = 0;
+  first.observe(child, { attributes: true, attributeOldValue: true, attributeFilter: ["data-b"] });
+  child.setAttribute("data-b", "3");
+  await Promise.resolve();
+  assert.deepEqual(order, [
+    ["first", 1, "data-b", "2"],
+    ["second", 1, "data-b", null],
+  ]);
+
+  first.disconnect();
+  second.disconnect();
+  parent.remove();
+});
+
 test("a deep clone keeps each element's tag and hands the tree only attributes it knows", () => {
   const panel = document.createElement("div");
   const make = (tag, type) => {

@@ -30,9 +30,18 @@ const KIND_OF = new Map(TYPES.map((type, kind) => [type, kind]));
 const liveRanges = new Set();
 // Above zero while a move keeps the ranges itself (see moveNodePreservingRanges).
 let rangesPaused = 0;
-// The `MutationObserver`s observing a node (see MutationObserver below). While there are none
-// a mutation costs one size check.
+// The `MutationObserver`s observing a node (see MutationObserver below). Registrations are
+// indexed per target (`target._mutationTargets`) so each mutation only walks `target` and
+// its ancestors (when any `subtree` observer wants that kind) instead of scanning all observers.
 const mutationObservers = new Set();
+const pendingMutationObservers = new Set();
+let mutationObserverOrder = 0;
+let moChildListCount = 0;
+let moAttrCount = 0;
+let moCharDataCount = 0;
+let moSubtreeChildList = 0;
+let moSubtreeAttr = 0;
+let moSubtreeCharData = 0;
 
 function eachLiveRange(update) {
   for (const ref of liveRanges) {
@@ -769,7 +778,7 @@ export class Node {
     if (old) {
       const index = old.childNodes.indexOf(child);
       if (liveRanges.size && !rangesPaused) eachLiveRange((range) => range._removing(child, old, index));
-      if (mutationObservers.size) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
+      if (moChildListCount && (old._mutationTargets || moSubtreeChildList)) childListRecord(old, null, child, old.childNodes[index - 1], old.childNodes[index + 1]);
       old.childNodes.splice(index, 1);
     }
     child.parentNode = this;
@@ -784,7 +793,7 @@ export class Node {
       this._ownChildren().push(child);
       native.append(this.nodeId, child.nodeId);
     }
-    if (mutationObservers.size) childListRecord(this, child, null, child.previousSibling, before);
+    if (moChildListCount && (this._mutationTargets || moSubtreeChildList)) childListRecord(this, child, null, child.previousSibling, before);
     if (styleElements.size) stylesChanged();
     return child;
   }
@@ -814,7 +823,7 @@ export class Node {
     if (child.parentNode !== this) throw domError("NotFoundError", "the node to remove is not a child of this node");
     const index = this.childNodes.indexOf(child);
     if (liveRanges.size) eachLiveRange((range) => range._removing(child, this, index));
-    if (mutationObservers.size) childListRecord(this, null, child, this.childNodes[index - 1], this.childNodes[index + 1]);
+    if (moChildListCount && (this._mutationTargets || moSubtreeChildList)) childListRecord(this, null, child, this.childNodes[index - 1], this.childNodes[index + 1]);
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
@@ -833,7 +842,7 @@ export class Node {
     if (parent) {
       const index = parent.childNodes.indexOf(this);
       if (liveRanges.size) eachLiveRange((range) => range._removing(this, parent, index));
-      if (mutationObservers.size) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
+      if (moChildListCount && (parent._mutationTargets || moSubtreeChildList)) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
       parent.childNodes.splice(index, 1);
       this.parentNode = null;
     }
@@ -929,7 +938,7 @@ export class Node {
     // HTML attribute names have no case: React's `tabIndex` prop is the `tabindex` attribute.
     if (name === "tabIndex" && (this._tag !== undefined || this.kind === "svg")) name = "tabindex";
     let text = value == null ? null : String(value);
-    if (mutationObservers.size) attributeRecord(this, name, text);
+    if (moAttrCount && (this._mutationTargets || moSubtreeAttr)) attributeRecord(this, name, text);
     if (name === "className" || name === "class") {
       native.attribute(this.nodeId, "class", text);
       this.#className = text;
@@ -1373,7 +1382,7 @@ export class Text extends Node {
     if (value === old && value !== "") return;
     this.#data = value;
     native.setText(this.nodeId, value);
-    if (mutationObservers.size) characterDataRecord(this, old);
+    if (moCharDataCount && (this._mutationTargets || moSubtreeCharData)) characterDataRecord(this, old);
     if (this._svgText) svgChanged(this);
     if (styleElements.size && this.parentNode instanceof StyleElement) stylesChanged();
   }
@@ -14055,6 +14064,7 @@ function follow(target) {
 // The host calls this before it replaces the realm, on a reload: every node goes, so the
 // next realm starts on an empty tree.
 native.unload = function () {
+  for (const observer of [...mutationObservers]) observer.disconnect();
   importedSheets.clear();
   styleElements.clear();
   appliedStyles = [];
@@ -15648,24 +15658,65 @@ class MutationRecord {
 
 let mutationsQueued = false;
 
-function queueRecord(type, target, fields, wants, oldValueOption, filterName) {
-  for (const observer of mutationObservers) {
-    let options = null;
-    for (let node = target; node; node = observedParent(node)) {
-      const found = observer._targets.get(node);
-      if (found && (node === target || found.subtree) && found[wants]) {
+function adjustMutationCounts(entry, delta) {
+  if (entry.childList) {
+    moChildListCount += delta;
+    if (entry.subtree) moSubtreeChildList += delta;
+  }
+  if (entry.attributes) {
+    moAttrCount += delta;
+    if (entry.subtree) moSubtreeAttr += delta;
+  }
+  if (entry.characterData) {
+    moCharDataCount += delta;
+    if (entry.subtree) moSubtreeCharData += delta;
+  }
+}
+
+function enqueueMutation(observer, options, type, target, fields, oldValueOption) {
+  const record = new MutationRecord(type, target, fields);
+  if (oldValueOption && !options[oldValueOption]) record.oldValue = null;
+  observer._records.push(record);
+  pendingMutationObservers.add(observer);
+  if (!mutationsQueued) {
+    mutationsQueued = true;
+    queueMicrotask(deliverMutations);
+  }
+}
+
+function matchMutationObservers(target, wants, filterName, walkAncestors) {
+  let firstObserver = null;
+  let firstOptions = null;
+  let matched = null;
+  for (let node = target; node; node = walkAncestors ? observedParent(node) : null) {
+    const regs = node._mutationTargets;
+    if (regs) {
+      const isTarget = node === target;
+      for (const [observer, found] of regs) {
+        if ((!isTarget && !found.subtree) || !found[wants]) continue;
         if (filterName !== undefined && found.attributeFilter && !found.attributeFilter.includes(filterName)) continue;
-        options = found;
-        break;
+        if (matched) {
+          if (!matched.has(observer)) matched.set(observer, found);
+        } else if (firstObserver === null) {
+          firstObserver = observer;
+          firstOptions = found;
+        } else if (firstObserver !== observer) {
+          matched = new Map();
+          matched.set(firstObserver, firstOptions);
+          matched.set(observer, found);
+        }
       }
     }
-    if (!options) continue;
-    const record = new MutationRecord(type, target, fields);
-    if (oldValueOption && !options[oldValueOption]) record.oldValue = null;
-    observer._records.push(record);
-    if (!mutationsQueued) {
-      mutationsQueued = true;
-      queueMicrotask(deliverMutations);
+  }
+  return matched ?? (firstObserver ? [firstObserver, firstOptions] : null);
+}
+
+function dispatchMatched(matches, type, target, fields, oldValueOption) {
+  if (Array.isArray(matches)) {
+    enqueueMutation(matches[0], matches[1], type, target, fields, oldValueOption);
+  } else {
+    for (const [observer, options] of matches) {
+      enqueueMutation(observer, options, type, target, fields, oldValueOption);
     }
   }
 }
@@ -15677,7 +15728,10 @@ function observedParent(node) {
 
 function deliverMutations() {
   mutationsQueued = false;
-  for (const observer of [...mutationObservers]) {
+  const pending = Array.from(pendingMutationObservers);
+  pendingMutationObservers.clear();
+  if (pending.length > 1) pending.sort((a, b) => a._order - b._order);
+  for (const observer of pending) {
     const records = observer.takeRecords();
     if (records.length === 0) continue;
     try {
@@ -15689,22 +15743,28 @@ function deliverMutations() {
 }
 
 function childListRecord(parent, added, removed, previousSibling, nextSibling) {
-  queueRecord("childList", parent, {
+  const matches = matchMutationObservers(parent, "childList", undefined, moSubtreeChildList > 0);
+  if (!matches) return;
+  dispatchMatched(matches, "childList", parent, {
     addedNodes: added ? [added] : [],
     removedNodes: removed ? [removed] : [],
     previousSibling: previousSibling ?? null,
     nextSibling: nextSibling ?? null,
-  }, "childList");
+  });
 }
 
 function attributeRecord(node, name, text) {
+  const matches = matchMutationObservers(node, "attributes", name, moSubtreeAttr > 0);
+  if (!matches) return;
   const old = node.getAttribute(name);
   if (old === text) return;
-  queueRecord("attributes", node, { attributeName: name, oldValue: old }, "attributes", "attributeOldValue", name);
+  dispatchMatched(matches, "attributes", node, { attributeName: name, oldValue: old }, "attributeOldValue");
 }
 
 function characterDataRecord(node, old) {
-  queueRecord("characterData", node, { oldValue: old }, "characterData", "characterDataOldValue");
+  const matches = matchMutationObservers(node, "characterData", undefined, moSubtreeCharData > 0);
+  if (!matches) return;
+  dispatchMatched(matches, "characterData", node, { oldValue: old }, "characterDataOldValue");
 }
 
 export class MutationObserver {
@@ -15713,6 +15773,7 @@ export class MutationObserver {
     this._callback = callback;
     this._targets = new Map();
     this._records = [];
+    this._order = 0;
   }
 
   observe(target, options = {}) {
@@ -15722,7 +15783,9 @@ export class MutationObserver {
     if (!options.childList && !attributes && !characterData) {
       throw new TypeError("MutationObserver.observe needs childList, attributes or characterData");
     }
-    this._targets.set(target, {
+    const prev = this._targets.get(target);
+    if (prev) adjustMutationCounts(prev, -1);
+    const entry = {
       childList: !!options.childList,
       attributes: !!attributes,
       characterData: !!characterData,
@@ -15730,13 +15793,30 @@ export class MutationObserver {
       attributeOldValue: !!options.attributeOldValue,
       characterDataOldValue: !!options.characterDataOldValue,
       attributeFilter: options.attributeFilter ? Array.from(options.attributeFilter, String) : null,
-    });
-    mutationObservers.add(this);
+    };
+    this._targets.set(target, entry);
+    adjustMutationCounts(entry, 1);
+    let regs = target._mutationTargets;
+    if (!regs) target._mutationTargets = regs = new Map();
+    regs.set(this, entry);
+    if (!mutationObservers.has(this)) {
+      this._order = ++mutationObserverOrder;
+      mutationObservers.add(this);
+    }
   }
 
   disconnect() {
+    for (const [target, entry] of this._targets) {
+      adjustMutationCounts(entry, -1);
+      const regs = target._mutationTargets;
+      if (regs) {
+        regs.delete(this);
+        if (regs.size === 0) target._mutationTargets = null;
+      }
+    }
     this._targets.clear();
     this._records = [];
+    pendingMutationObservers.delete(this);
     mutationObservers.delete(this);
   }
 
