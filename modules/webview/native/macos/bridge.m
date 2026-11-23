@@ -196,6 +196,18 @@ static void set_focused(SilkWKWebView *webView, BOOL focused) {
 
 @implementation SilkWebClipView
 - (BOOL)isFlipped { return YES; }
+// Stop unhandled web view events from bubbling up the responder chain to SilkView behind it.
+- (void)scrollWheel:(NSEvent *)event { (void)event; }
+- (void)magnifyWithEvent:(NSEvent *)event { (void)event; }
+- (void)mouseDown:(NSEvent *)event { (void)event; }
+- (void)mouseUp:(NSEvent *)event { (void)event; }
+- (void)mouseDragged:(NSEvent *)event { (void)event; }
+- (void)rightMouseDown:(NSEvent *)event { (void)event; }
+- (void)rightMouseUp:(NSEvent *)event { (void)event; }
+- (void)rightMouseDragged:(NSEvent *)event { (void)event; }
+- (void)otherMouseDown:(NSEvent *)event { (void)event; }
+- (void)otherMouseUp:(NSEvent *)event { (void)event; }
+- (void)otherMouseDragged:(NSEvent *)event { (void)event; }
 @end
 
 // Reports the page's icon as a data: URL, as Electron's page-favicon-updated callers want, so

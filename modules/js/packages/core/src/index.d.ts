@@ -585,6 +585,8 @@ export interface TouchEvent extends ModifierEvent {
 export interface WheelEvent extends PointerEvent {
   readonly deltaX: number;
   readonly deltaY: number;
+  readonly deltaZ: number;
+  readonly deltaMode: number;
 }
 
 export interface KeyboardEvent extends ModifierEvent {

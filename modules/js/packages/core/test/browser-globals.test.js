@@ -561,3 +561,28 @@ test("form elements answer instanceof, and tabIndex and disabled reflect their a
   prop.removeAttribute("tabIndex");
   assert.ok(!prop.hasAttribute("tabindex"));
 });
+
+test("WheelEvent defines DOM_DELTA constants and host wheel events carry deltaMode 0", () => {
+  assert.equal(WheelEvent.DOM_DELTA_PIXEL, 0);
+  assert.equal(WheelEvent.DOM_DELTA_LINE, 1);
+  assert.equal(WheelEvent.DOM_DELTA_PAGE, 2);
+  assert.equal(WheelEvent.prototype.DOM_DELTA_PIXEL, 0);
+  assert.equal(WheelEvent.prototype.DOM_DELTA_LINE, 1);
+  assert.equal(WheelEvent.prototype.DOM_DELTA_PAGE, 2);
+
+  const box = document.createElement("div");
+  document.body.appendChild(box);
+  let received = null;
+  box.addEventListener("wheel", (event) => {
+    received = event;
+  });
+  mock.native.dispatch(6, box.nodeId, 12, 34, 0, -5, 18);
+  assert.ok(received instanceof WheelEvent);
+  assert.equal(received.deltaX, -5);
+  assert.equal(received.deltaY, 18);
+  assert.equal(received.deltaZ, 0);
+  assert.equal(received.deltaMode, WheelEvent.DOM_DELTA_PIXEL);
+  assert.notEqual(received.deltaMode, WheelEvent.DOM_DELTA_LINE);
+  assert.notEqual(received.deltaMode, WheelEvent.DOM_DELTA_PAGE);
+  box.remove();
+});

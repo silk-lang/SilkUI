@@ -4427,7 +4427,7 @@ export class Event {
     this.bubbles = !NO_BUBBLE.has(type);
     this.cancelable = CANCELABLE.has(type);
     this.defaultPrevented = false;
-    this.timeStamp = native.now();
+    this.timeStamp = typeof native.now === "function" ? native.now() : 0;
     this._stopped = false;
     this._immediate = false;
   }
@@ -4586,6 +4586,8 @@ function fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth) 
   } else if (kind === 6) {
     event.deltaX = d;
     event.deltaY = e;
+    event.deltaZ = 0;
+    event.deltaMode = 0;
   } else if (kind === 7 || kind === 8) {
     event.key = first;
     event.code = second;

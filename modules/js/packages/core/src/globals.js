@@ -880,13 +880,18 @@ const MouseEvent = global.MouseEvent ?? eventClass("MouseEvent", UIEvent, mouseF
 if (!MouseEvent.prototype.getModifierState) MouseEvent.prototype.getModifierState = function (key) { return Boolean(this[{ Alt: "altKey", Control: "ctrlKey", Meta: "metaKey", Shift: "shiftKey" }[key]]); };
 const KeyboardEvent = global.KeyboardEvent ?? eventClass("KeyboardEvent", UIEvent, { ...modifierFields, key: "", code: "", location: 0, repeat: false, isComposing: false, charCode: 0, keyCode: 0 });
 if (!KeyboardEvent.prototype.getModifierState) KeyboardEvent.prototype.getModifierState = MouseEvent.prototype.getModifierState;
+const WheelEvent = global.WheelEvent ?? eventClass("WheelEvent", MouseEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 });
+for (const [name, value] of [["DOM_DELTA_PIXEL", 0], ["DOM_DELTA_LINE", 1], ["DOM_DELTA_PAGE", 2]]) {
+  if (WheelEvent[name] === undefined) Object.defineProperty(WheelEvent, name, { value, enumerable: true });
+  if (WheelEvent.prototype[name] === undefined) Object.defineProperty(WheelEvent.prototype, name, { value, enumerable: true });
+}
 const eventClasses = {
   UIEvent,
   MouseEvent,
   KeyboardEvent,
   FocusEvent: global.FocusEvent ?? eventClass("FocusEvent", UIEvent, { relatedTarget: null }),
   PointerEvent: global.PointerEvent ?? eventClass("PointerEvent", MouseEvent, { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: "mouse", isPrimary: true }),
-  WheelEvent: global.WheelEvent ?? eventClass("WheelEvent", MouseEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }),
+  WheelEvent,
   DragEvent: global.DragEvent ?? eventClass("DragEvent", MouseEvent, { dataTransfer: null }),
   InputEvent: global.InputEvent ?? eventClass("InputEvent", UIEvent, { data: null, inputType: "", isComposing: false, dataTransfer: null }),
   TouchEvent: global.TouchEvent ?? eventClass("TouchEvent", UIEvent, { ...modifierFields, touches: [], targetTouches: [], changedTouches: [] }),
