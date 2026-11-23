@@ -527,6 +527,7 @@ function syncAdoptedSheets() {
   if (!rootNode) return;
   clearAdoptedSheets();
   const sheets = [...importedSheets.values()];
+  if (registeredPropertiesSheet) sheets.push(registeredPropertiesSheet);
   for (const element of appliedStyles) if (element._styleSheet) sheets.push(element._styleSheet);
   sheets.push(...(adoptedLists.get(rootNode)?.values ?? []));
   for (const sheet of sheets) {
@@ -4401,6 +4402,7 @@ export class Event {
     this.bubbles = !NO_BUBBLE.has(type);
     this.cancelable = CANCELABLE.has(type);
     this.defaultPrevented = false;
+    this.timeStamp = native.now();
     this._stopped = false;
     this._immediate = false;
   }
@@ -4672,6 +4674,7 @@ function adopt(event, target) {
 // The compatibility mouse event of `type` that follows pointer event `from`.
 function mouseEvent(type, from, target) {
   const event = new Event(type, target);
+  event.timeStamp = from.timeStamp;
   for (const name of ["clientX", "clientY", "x", "y", "button", "buttons", "detail", "shiftKey", "ctrlKey", "altKey", "metaKey"]) {
     event[name] = from[name];
   }
@@ -15609,9 +15612,51 @@ export function cssEscape(value) {
   return result;
 }
 
+const registeredProperties = new Set();
+let registeredPropertiesCss = "";
+let registeredPropertiesSheet = null;
+
+/**
+ * `CSS.registerProperty(definition)`: registers a custom property's syntax, inheritance and
+ * initial value as an `@property` rule, as the CSS Properties and Values API specifies.
+ */
+export function registerProperty(definition) {
+  if (!definition || typeof definition !== "object") {
+    throw new TypeError("CSS.registerProperty requires a property definition object");
+  }
+  const name = String(definition.name ?? "");
+  if (!/^--[\S]+$/.test(name)) {
+    throw domError("SyntaxError", `invalid custom property name '${name}'`);
+  }
+  if (typeof definition.inherits !== "boolean") {
+    throw new TypeError("CSS.registerProperty requires a boolean inherits descriptor");
+  }
+  const syntax = definition.syntax === undefined ? "*" : String(definition.syntax);
+  const hasInitial = definition.initialValue !== undefined;
+  if (syntax.trim() !== "*" && !hasInitial) {
+    throw domError("SyntaxError", `CSS.registerProperty '${name}' requires initialValue for non-universal syntax`);
+  }
+  if (registeredProperties.has(name)) {
+    throw domError("InvalidModificationError", `custom property '${name}' is already registered`);
+  }
+  registeredProperties.add(name);
+  const initialPart = hasInitial ? ` initial-value: ${String(definition.initialValue)};` : "";
+  registeredPropertiesCss += `@property ${name} { syntax: ${JSON.stringify(syntax)}; inherits: ${definition.inherits};${initialPart} }\n`;
+  if (!native.compileStyleSheet) return;
+  const bytes = native.compileStyleSheet(registeredPropertiesCss);
+  if (!registeredPropertiesSheet) {
+    registeredPropertiesSheet = new CSSStyleSheet();
+    replaceSheet(registeredPropertiesSheet, bytes);
+    if (rootNode) syncAdoptedSheets();
+  } else {
+    replaceSheet(registeredPropertiesSheet, bytes);
+  }
+}
+
 if (typeof globalThis.CSS !== "object" || globalThis.CSS === null) globalThis.CSS = {};
 globalThis.CSS.supports ??= supports;
 globalThis.CSS.escape ??= cssEscape;
+globalThis.CSS.registerProperty ??= registerProperty;
 
 let frameStatsSince = 0;
 

@@ -1,6 +1,6 @@
 import ui_js.lib { JsError, uiPackage, runtimeStylesheets }
 import ui_js_window.lib { JsApp, JsClient, NoTools }
-import ui_tree.legacy { UiTree, TreeError, FrameInput }
+import ui_tree.legacy { UiTree, TreeError, FrameInput, Input }
 import ui_tree.style_assets { StyleAssets }
 import ui_tree_window.host { WindowClient }
 import ui_fixtures.fixtures as fixtures
@@ -88,4 +88,62 @@ test effect fn windowClientPreloadsCompiledSheetsBeforeStartEntryLayoutRead() ->
   ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
   run preloadBeforeStart() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn pointerTimeStampsAndRegisterProperty() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.input = FrameInput { width: 420.0, height: 200.0, scale: 1.0, time: 0.0 }
+  let domain = run WaiterDomain.make()
+  let memoryAllocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run memoryAllocator.observe()
+  let mut app = run JsApp.open(&memory, move memoryAllocator, domain.handle())
+  app.javascript().setStylesheetCompiler(runtimeStylesheets())
+  run app.define(b"@silkui/core", uiPackage())
+  run app.entry(
+    b"app.js",
+    b"import {createBox,mount} from '@silkui/core'; CSS.registerProperty({ name: '--local-y', syntax: '*', inherits: false }); const root = createBox({ width: 200, height: 200 }); const child = createBox({ width: 50, height: 50 }); root.appendChild(child); mount(root); globalThis.stamps = []; root.addEventListener('pointerdown', e => globalThis.stamps.push(e.timeStamp)); root.addEventListener('pointermove', e => globalThis.stamps.push(e.timeStamp)); root.addEventListener('pointerup', e => globalThis.stamps.push(e.timeStamp)); globalThis.setLocal = (v) => root.style.setProperty('--local-y', v);",
+  )
+  let mut client = JsClient.make(NoTools {})
+  let result = run Effect.result(checkPointerAndRegister(&mut client, &mut app, &mut tree))
+  run app.close()
+  match move result {
+    Result.Success { .. } => {}
+    Result.Failure { error } => { fail move error }
+  }
+}
+
+effect fn checkPointerAndRegister<'m>(client: &mut JsClient<NoTools>, app: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run WindowClient<JsApp<'m>, never, never>.start(&mut client.*, &mut app.*, &mut tree.*)
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 420.0, height: 200.0, scale: 1.0, time: 0.0 })
+  // Advance host clock before each pointer input and verify Event.timeStamp matches.
+  let down = Input.PointerDown { x: 20.0, y: 20.0, button: 0, modifiers: 0, clickCount: 1 }
+  let moved = Input.PointerMove { x: 40.0, y: 20.0, modifiers: 0 }
+  let up = Input.PointerUp { x: 40.0, y: 20.0, button: 0, modifiers: 0 }
+  WindowClient<JsApp<'m>, never, never>.advance(&mut client.*, &mut app.*, 0.10)
+  run tree.beginAt(0, &down)
+  let p0 = run WindowClient<JsApp<'m>, never, never>.decide(&mut client.*, &mut app.*, &mut tree.*)
+  run tree.finish(move down, p0)
+  WindowClient<JsApp<'m>, never, never>.advance(&mut client.*, &mut app.*, 0.12)
+  run tree.beginAt(0, &moved)
+  let p1 = run WindowClient<JsApp<'m>, never, never>.decide(&mut client.*, &mut app.*, &mut tree.*)
+  run tree.finish(move moved, p1)
+  WindowClient<JsApp<'m>, never, never>.advance(&mut client.*, &mut app.*, 0.15)
+  run tree.beginAt(0, &up)
+  let p2 = run WindowClient<JsApp<'m>, never, never>.decide(&mut client.*, &mut app.*, &mut tree.*)
+  run tree.finish(move up, p2)
+  run app.script(&mut tree.*, b"if (stamps.length !== 3 || stamps[0] !== 100 || stamps[1] !== 120 || stamps[2] !== 150) throw new Error('bad stamps: ' + JSON.stringify(stamps));", b"check")
+  // Updating the registered non-inheriting property must not move descendant scopes.
+  let movesBefore = tree.work.scopeMoves
+  run app.script(&mut tree.*, b"setLocal('12px');", b"local")
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 420.0, height: 200.0, scale: 1.0, time: 0.2 })
+  run Testing.expect(tree.work.scopeMoves == movesBefore, "CSS.registerProperty(inherits: false) avoids descendant scope moves")
+}
+
+test effect fn eventTimeStampAndRegisterPropertyWork() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run pointerTimeStampsAndRegisterProperty() |> Effect.provideMut<Allocator>(&mut allocator)
 }

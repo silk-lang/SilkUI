@@ -328,3 +328,57 @@ test effect fn equalNodesHoldOneComputedStyle() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run pooledStyles() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn unrelatedAncestorStructuralRules() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  run stack(&mut tree, 8, 2, b".seats-letters > :nth-child(5), .seats-row > :nth-child(5), .other .row + .row, .other .cell:nth-child(even)")
+  run Testing.expect(shared(&tree, 10, 20) && shared(&tree, 20, 80), "unrelated multi-arm :nth-child and single-arm sibling rules do not prevent twin sharing")
+  run Testing.expect(shared(&tree, 11, 12) && shared(&tree, 11, 82), "cells under shared rows take twins too")
+  run Testing.expect(tree.work.sheetTwins > 0 && tree.work.sharedResults > 0, "whole-result lending runs with unrelated structural rules present")
+  let before = tree.work.resolves
+  run add(&mut tree, 90, 1, 0, "row", 1.0)
+  // Only the new row resolves (plus at most the previous last sibling for :last-child); unrelated rows stay clean.
+  run Testing.expect(tree.work.resolves - before <= 3, "appending a row does not restyle all unrelated siblings")
+}
+
+test effect fn unrelatedAncestorStructuralRulesPreserveSharing() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run unrelatedAncestorStructuralRules() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn nonInheritingCustomPropertySkipsSubtree() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = FontCollection.make()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run box(&mut batch, 2, 1, 0, "scroller")
+  let mut i: u32 = 10
+  while i < 20 {
+    run box(&mut batch, i, 2, 0, "row")
+    i = i + 1
+  }
+  let sheet = run compile.compile(b"@property --scroll-y{syntax:'*';inherits:false}.scroller{width:200px}.row{width:100px;height:10px}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 1, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(frame(0.0))
+  let movesBefore = tree.work.scopeMoves
+  let resolvesBefore = tree.work.resolves
+  let mut update = Batch.make()
+  run update.customProperty(2, StyleState.Base, "--scroll-y", Option<string>.some("42px"), false)
+  run tree.apply(run update.take())
+  run tree.frame(frame(1.0))
+  run Testing.expect(tree.work.scopeMoves == movesBefore, "updating a non-inheriting custom property does not move descendant scopes")
+  run Testing.expect(tree.work.resolves - resolvesBefore == 1, "only the scroller itself resolves")
+}
+
+test effect fn nonInheritingCustomPropertyDoesNotWalkDescendants() -> ()
+  ! TreeError | CompileError | CssError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run nonInheritingCustomPropertySkipsSubtree() |> Effect.provideMut<Allocator>(&mut allocator)
+}
