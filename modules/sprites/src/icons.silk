@@ -146,6 +146,10 @@ struct Source {
   /// The root's `width` and `height` in pixels, 0 where the markup gives no absolute one.
   width: f64,
   height: f64,
+  /// Whether the root `<svg>` uses a `viewBox` with `preserveAspectRatio="xMin* slice"` and no
+  /// viewport-dependent CSS queries/units, so narrower widths are exact left-anchored crops of a
+  /// wider cached tile.
+  xMinSlice: bool,
 }
 
 pub struct IconCache {
@@ -174,6 +178,56 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
     i = i + 1
   }
   return false
+}
+
+fn containsIn(data: &[u8], start: usize, end: usize, needle: &[u8]) -> bool {
+  if needle.length == 0 {
+    return true
+  }
+  if end < start || end - start < needle.length {
+    return false
+  }
+  let mut i = start
+  while i + needle.length <= end {
+    let mut j: usize = 0
+    while j < needle.length && data[i + j] == needle[j] {
+      j = j + 1
+    }
+    if j == needle.length {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+/// Whether the root `<svg>` tag has a `viewBox` and `preserveAspectRatio` starting with `xMin` and
+/// using `slice`, with no viewport-width-dependent CSS (`@media`, `vw`, `cqw`, `vmin`, `vmax`).
+fn isXMinSlice(data: &[u8]) -> bool {
+  if contains(data, b"@media") || contains(data, b"vw") || contains(data, b"cqw")
+    || contains(data, b"vmin") || contains(data, b"vmax") {
+    return false
+  }
+  let mut i: usize = 0
+  while i + 4 <= data.length && !(data[i] == 60 && data[i + 1] == 115 && data[i + 2] == 118 && data[i + 3] == 103) {
+    i = i + 1
+  }
+  let start = i
+  while i < data.length && data[i] != 62 {
+    i = i + 1
+  }
+  if start >= i {
+    return false
+  }
+  if !containsIn(data, start, i, b"viewBox=") {
+    return false
+  }
+  return containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMin slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMid slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio=\"xMinYMax slice\"")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMin slice'")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMid slice'")
+    || containsIn(data, start, i, b"preserveAspectRatio='xMinYMax slice'")
 }
 
 /// Attribute `name` of the first `<svg` tag in `data` as pixels: a plain number or one in
@@ -309,6 +363,7 @@ impl IconCache {
           ratio: ratio,
           width: rootLength(data, b"width"),
           height: rootLength(data, b"height"),
+          xMinSlice: isXMinSlice(data),
         },
       ),
     )
@@ -379,6 +434,18 @@ impl IconCache {
     return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
       Option<Source>.Some { value } => value.tinted
       Option<Source>.None => true
+    }
+  }
+
+  /// Whether `icon` has `viewBox` + `preserveAspectRatio="xMin* slice"` with no viewport-width
+  /// CSS dependencies, so narrower boxes are exact left-aligned crops of a wider cached tile.
+  pub fn xMinSlice(self: &Self, icon: IconId) -> bool {
+    if u32.toUsize(icon.index) >= self.sources.length() {
+      return false
+    }
+    return match &self.sources.asSlice()[u32.toUsize(icon.index)] {
+      Option<Source>.Some { value } => value.xMinSlice
+      Option<Source>.None => false
     }
   }
 
