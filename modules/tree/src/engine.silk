@@ -223,6 +223,7 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
+import silk.trace { Trace as Prof }
 import canvas2d { Canvas2d, Measured as TextMeasured }
 import canvas_raster { CanvasRasters, Frame as RasterFrame, Live as RasterLive }
 import canvas_raster
@@ -437,6 +438,12 @@ fn repaintsNode(mutation: &Mutation) -> bool {
     Mutation.SetText { .. } => true
     Mutation.SetAttribute { .. } => true
     Mutation.SetListeners { .. } => true
+    Mutation.SetCanvas { .. } => true
+    Mutation.SetCanvasSurface { .. } => true
+    Mutation.SetCanvasPixels { .. } => true
+    Mutation.SvgInsert { .. } => true
+    Mutation.SvgRemove { .. } => true
+    Mutation.SvgAttribute { .. } => true
     _ => false
   }
 }
@@ -444,6 +451,14 @@ fn repaintsNode(mutation: &Mutation) -> bool {
 fn scrollsOnly(mutation: &Mutation) -> bool {
   return match &mutation.* {
     Mutation.ScrollTo { .. } => true
+    _ => false
+  }
+}
+
+fn virtualOnly(mutation: &Mutation) -> bool {
+  return match &mutation.* {
+    Mutation.SetVirtualList { .. } => true
+    Mutation.SetVirtualItems { .. } => true
     _ => false
   }
 }
@@ -2711,6 +2726,9 @@ impl<'a> UiTree<'a> {
   pub effect fn apply(self: &mut Self, batch: List<Mutation>) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    let _span = Prof.span("ui_tree.apply")
+    let count = batch.length()
+    Prof.set("mutations", &count)
     let before = self.current
     self.work.batches = self.work.batches + 1
     if self.laidOutCurrent() && !self.stylesDirty && !self.stylesPending {
@@ -2797,8 +2815,10 @@ impl<'a> UiTree<'a> {
       _ => {}
     }
     let about = nodeOf(&mutation)
+    let isVirtual = virtualOnly(&mutation)
+    let mut bumpRevision = false
     if self.parked.length() == 0 {
-      self.revision = self.revision + 1
+      bumpRevision = true
     } else if about != NONE {
       // The change is the root's that holds the node; one to a detached node is nobody's yet.
       let slot = self.slotOf(about)
@@ -2806,15 +2826,19 @@ impl<'a> UiTree<'a> {
         let holder = self.rootOfTop(self.topOf(slot))
         if holder != NONE {
           drop run self.useRoot(holder)
-          self.revision = self.revision + 1
+          bumpRevision = true
         }
       }
     } else if reachesEveryRoot(&mutation) {
       self.changedEveryRoot()
     }
+    if bumpRevision && !isVirtual {
+      self.revision = self.revision + 1
+    }
     // A scroll moves what is painted and changes none of it: the fragments' hashes and ink
-    // stand, and `setOffset` says the frame scrolled.
-    if !scrollsOnly(&mutation) {
+    // stand, and `setOffset` says the frame scrolled. Virtual-list configure/bind report below
+    // whether anything actually changed, so unchanged lists keep quiet frames and paint caches.
+    if !scrollsOnly(&mutation) && !isVirtual {
       self.applied = true
       // What a mutation changes of the paint is its node's own, a restyle's, which says so
       // itself, or a layout's, which css-layout reports: the caches are repaired for those.
@@ -2837,10 +2861,18 @@ impl<'a> UiTree<'a> {
         anchoring.clear(&mut self, id)
       }
       Mutation.SetVirtualList { id, count, options } => {
-        run virtual.configure(&mut self, index, id, count, options)
+        if run virtual.configure(&mut self, index, id, count, options) {
+          if bumpRevision { self.revision = self.revision + 1 }
+          self.applied = true
+          self.paintCachesStale = true
+        }
       }
       Mutation.SetVirtualItems { id, items } => {
-        run virtual.bind(&mut self, index, id, move items)
+        if run virtual.bind(&mut self, index, id, move items) {
+          if bumpRevision { self.revision = self.revision + 1 }
+          self.applied = true
+          self.paintCachesStale = true
+        }
       }
       Mutation.ClearVirtualList { id } => {
         run virtual.clear(&mut self, id)
@@ -8390,6 +8422,7 @@ impl<'a> UiTree<'a> {
   pub effect fn frame(self: &mut Self, input: FrameInput) -> ()
     ! TreeError | OutOfMemoryError
     ? &mut Allocator {
+    let _frameSpan = Prof.span("ui_tree.frame")
     // Asked before the frame clears its flags: whether nothing changed since the last paint.
     let quiet = self.quietFrame(input)
     let scrolledOnly = self.scrolledFrame(input)
@@ -8414,12 +8447,18 @@ impl<'a> UiTree<'a> {
     run motion.tick(&mut self)
     run animation.tick(&mut self)
     style_change.begin(&mut self)
+    let _styleSpan = Prof.span("ui_tree.resolveStyles")
     run self.resolveStyles()
+    Prof.set("styledNodes", &self.stats.styledNodes)
+    drop _styleSpan
     if self.laidOutNodes() {
       run scroll_anchor.select(&mut self)
     }
     run virtual.prepare(&mut self)
+    let _layoutSpan = Prof.span("ui_tree.layout")
     run self.layoutFrame()
+    Prof.set("skipped", &self.stats.layoutSkipped)
+    drop _layoutSpan
     run Effect.catch<CssomError>(cssom_view.advanceScrolls(&mut self), viewFailed)
     if run text_selection.autoscroll(&mut self) {
       run self.layoutFrame()
@@ -8467,6 +8506,7 @@ impl<'a> UiTree<'a> {
       // Nothing this frame did changed what paints either: the last scene is this frame's.
       self.paintsKept = self.paintsKept + 1
       self.stats.primitives = self.scene().primitiveCount()
+      Prof.set("paintKept", &true)
     } else if (scrolledOnly || quiet) && self.stats.layoutSkipped && self.stats.styledNodes == 0 && !self.paintDirty
       && self.layout.revision() == self.quietRevision && self.layout.scrollRevision() == self.quietScrolls
       && self.scrollsWithinLead() {
@@ -8476,6 +8516,7 @@ impl<'a> UiTree<'a> {
       self.paintsKept = self.paintsKept + 1
       self.scrollsKept = self.scrollsKept + 1
       self.stats.primitives = self.scene().primitiveCount()
+      Prof.set("scrollKept", &true)
     } else {
       run self.paintFrame()
       run self.placeSceneScrolls()
@@ -9267,6 +9308,7 @@ impl<'a> UiTree<'a> {
     if !self.paintCachesStale && !self.repair.pending && sized && self.fragmentStacking.covers(count) {
       return ()
     }
+    let _span = Prof.span("ui_tree.refreshPaintCaches")
     // Only what changed, when that is known and no fragment's caches read another's.
     let mut repaired = !self.paintCachesStale && sized && self.fragmentStacking.carries(count)
       && self.nextSourceFragment.length() == count
@@ -9277,6 +9319,8 @@ impl<'a> UiTree<'a> {
     if repaired {
       repaired = run self.repairPaintCaches()
     }
+    Prof.set("repaired", &repaired)
+    Prof.set("fragments", &count)
     if repaired {
       self.repair.repairs = self.repair.repairs + 1
     } else {
@@ -9555,6 +9599,7 @@ impl<'a> UiTree<'a> {
   effect fn paintFrame(self: &mut Self) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
+    let _paintSpan = Prof.span("ui_tree.paint")
     run self.loadFaces()
     run self.collectIconVariables()
     run text_selection.refresh(&mut self)
@@ -9625,9 +9670,13 @@ impl<'a> UiTree<'a> {
         inside: false,
         planes: self.preserveUsed,
       }
+      let _rootsSpan = Prof.span("ui_tree.paintRoots")
       run paintRoots(&mut painter, window)
+      drop _rootsSpan
       drop painter
+      let _finishSpan = Prof.span("ui_tree.scene.finish")
       run self.sceneB.finish()
+      drop _finishSpan
       self.stats.primitives = self.sceneB.primitiveCount()
     } else {
       self.sceneA.clear()
@@ -9677,11 +9726,18 @@ impl<'a> UiTree<'a> {
         inside: false,
         planes: self.preserveUsed,
       }
+      let _rootsSpan = Prof.span("ui_tree.paintRoots")
       run paintRoots(&mut painter, window)
+      drop _rootsSpan
       drop painter
+      let _finishSpan = Prof.span("ui_tree.scene.finish")
       run self.sceneA.finish()
+      drop _finishSpan
       self.stats.primitives = self.sceneA.primitiveCount()
     }
+    Prof.set("primitives", &self.stats.primitives)
+    Prof.set("repainted", &self.stats.repaintedSubtrees)
+    Prof.set("replayed", &self.stats.replayedSubtrees)
     self.replayable = true
     self.paintedAt = self.frameNumber
     self.paintIndexOf.clear()
@@ -9694,7 +9750,9 @@ impl<'a> UiTree<'a> {
       }
       orderIndex = orderIndex + 1
     }
+    let _uploadSpan = Prof.span("ui_tree.gatherUploads")
     run self.gatherUploads()
+    drop _uploadSpan
   }
 
   /// Paints node `slot` and its subtree alone into `scene` (finished), from the last layout,
@@ -9822,6 +9880,12 @@ impl<'a> UiTree<'a> {
   pub effect fn rasterCanvases(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
     let wants = Intrinsic.replace(self.canvasRasters.wants, List<canvas_raster.Want>.make())
     let all = wants.asSlice()
+    if all.length == 0 {
+      drop wants
+      return ()
+    }
+    let _span = Prof.span("ui_tree.rasterCanvases")
+    Prof.set("wants", &all.length)
     let mut i: usize = 0
     while i < all.length {
       let want = all[i]

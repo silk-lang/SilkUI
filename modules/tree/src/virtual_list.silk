@@ -345,13 +345,14 @@ pub fn request(tree: &UiTree<'_>, id: u32) -> Option<VirtualRange> {
 }
 
 /// Installs or updates a controller. Called by `Mutation.SetVirtualList`.
+/// Returns whether the controller or its requested range changed.
 pub effect fn configure(
   tree: &mut UiTree<'_>,
   mutation: usize,
   id: u32,
   count: usize,
   options: VirtualOptions,
-) -> ()
+) -> bool
   ! TreeError | OutOfMemoryError
   ? &mut Allocator {
   let slot = tree.slotOf(id)
@@ -371,7 +372,9 @@ pub effect fn configure(
     fail TreeError.BadVirtualList { index: mutation, id: id }
   }
   let mut at = find(&tree, id)
+  let mut changed = false
   if at == usize.MAX {
+    changed = true
     at = tree.virtualLists.length()
     let mut list = VirtualList.make(options)
     list.port = id
@@ -388,15 +391,17 @@ pub effect fn configure(
     }
     list.count = count
     list.options = options
-    return ()
+    return true
   }
   if list.previous != usize.MAX {
+    changed = true
     list.count = list.previous
     list.previous = usize.MAX
   }
   if list.count != count || list.options.revision != options.revision
     || list.options.estimatedHeight != options.estimatedHeight
     || list.options.gap != options.gap {
+    changed = true
     let old = list.locate(list.scroll)
     let offset = list.scroll - list.prefix(old)
     let anchor = if old < count {
@@ -409,12 +414,19 @@ pub effect fn configure(
     list.correction = true
   }
   let overscanChanged = list.options.overscan != options.overscan
+  if overscanChanged {
+    changed = true
+  }
   list.options = options
-  drop list.range(overscanChanged)
+  if list.range(overscanChanged) {
+    changed = true
+  }
+  return changed
 }
 
 /// Binds sorted direct children to indices. Invalid bindings leave the previous bindings intact.
-pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<VirtualItem>) -> ()
+/// Returns whether the bound items or pending remapping changed.
+pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<VirtualItem>) -> bool
   ! TreeError | OutOfMemoryError
   ? &mut Allocator {
   let at = find(&tree, id)
@@ -445,6 +457,22 @@ pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<
     i = i + 1
   }
   let list = &mut tree.virtualLists.asMutSlice()[at]
+  let mut changed = list.previous != usize.MAX
+  if !changed {
+    let existing = list.rows.asSlice()
+    if existing.length != values.length {
+      changed = true
+    } else {
+      let mut k: usize = 0
+      while k < values.length {
+        if existing[k].index != values[k].index || existing[k].id != values[k].id {
+          changed = true
+          break
+        }
+        k = k + 1
+      }
+    }
+  }
   if list.previous != usize.MAX {
     let count = list.count
     let before = Intrinsic.replace(list.rows, List<VirtualItem>.make())
@@ -453,6 +481,7 @@ pub effect fn bind(tree: &mut UiTree<'_>, mutation: usize, id: u32, items: List<
     }
   }
   list.rows = move items
+  return changed
 }
 
 effect fn layoutError<E>(error: E) -> never
