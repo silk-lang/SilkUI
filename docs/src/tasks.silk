@@ -1,25 +1,31 @@
-import silk.collections.list { List }
-import silk.build.graph { Build, BuildError, Compilation, Deferred, Options }
+import silk.build.graph { BuildError, Compilation, Deferred, Options }
+import silk.build.tasks { Standard, StandardError }
 import silk.cli.command { Command, CommandLine, Opt }
-import silk.cli.task { Task, TaskError, TaskSet }
-import silk.io.writer { WriterError }
-import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.system.child_process { ChildProcess, ProcessError }
-import silk.system.filesystem { FileSystem, FileError }
-import silk.system.host_input { HostInput, HostInputError }
+import silk.cli.task { Task, TaskSet }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator }
+import silk.system.child_process { ChildProcess }
+import silk.system.filesystem { FileSystem }
+import silk.system.host_input { HostInput }
 import silk.text.string { String }
 
 union Tasks {
-  Build { pub options: Options },
+  Build { pub options: Options, pub out: String },
   Run { pub options: Options, pub arguments: List<String> },
+  Dev { pub options: Options, pub arguments: List<String> },
   Plan { pub options: Options },
 }
 
 impl CommandLine for Tasks {
   static fn command() -> Command<Tasks> {
-    return Command<Tasks>.make("tasks", "Build the package")
+    return Command<Tasks>.make("tasks", "Build and run the docs site")
+      |> Command.variant("Build", "Build the program into build/ (--release optimizes)")
+      |> Command.variant("Run", "Build the program and run it")
+      |> Command.variant("Dev", "Run the program, and run it again when a source changes")
+      |> Command.variant("Plan", "Write the editor's compilation requests")
       |> Command.flatten("options")
-      |> Command.arg("arguments", Opt.about("Arguments passed to the program"))
+      |> Command.option("out", Opt.about("Also copy the program to this directory"))
+      |> Command.arg("arguments", Opt.about("The program's arguments, after --"))
   }
 }
 
@@ -37,38 +43,15 @@ effect fn compilation(options: &Options) -> Compilation
 
 impl TaskSet for Tasks {
   effect fn perform(self: Tasks) -> ()
-    ! BuildError
-      | TaskError
-      | ProcessError
-      | FileError
-      | HostInputError
-      | OutOfMemoryError
-      | WriterError
+    ! StandardError
     ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
     match move self {
-      Tasks.Build { options } => {
-        let selected = run compilation(&options)
-        let graph = run (run Build.make()).add(move selected)
-        drop run graph.compile()
-      }
+      Tasks.Build { options, out } => run Standard.build(run compilation(&options), out.view())
       Tasks.Run { options, arguments } => {
-        let selected = run compilation(&options)
-        let graph = run (run Build.make()).add(move selected)
-        let built = run graph.compile()
-        let values = arguments.asSlice()
-        let mut forwarded = List<string>.make()
-        let mut at: usize = 0
-        while at < values.length {
-          run forwarded.append(values[at].view())
-          at = at + 1
-        }
-        run built.launch(forwarded.asSlice())
+        run Standard.start(run compilation(&options), &options, &arguments)
       }
-      Tasks.Plan { options } => {
-        let selected = run compilation(&options)
-        let graph = run (run Build.make()).add(move selected)
-        drop run graph.write()
-      }
+      Tasks.Dev { options, arguments } => run Standard.dev(&options, &arguments)
+      Tasks.Plan { options } => run Standard.plan(run compilation(&options))
     }
   }
 }

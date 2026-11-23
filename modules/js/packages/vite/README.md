@@ -9,7 +9,7 @@ framework: a React app adds `react()` from `@silkui/react/vite`.
 ## Install
 
 The templates (`silk init my-app -t ui-react`, `ui-foldkit` or `ui-js`) set it up, and
-`silk task dev` and `silk task build` run Vite for you. See
+`silk dev` and `silk build` run Vite for you. See
 [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an
 existing project:
 
@@ -69,7 +69,7 @@ compiler to run the Vite CSS compilation step.
 | --- | --- | --- |
 | `entry` | `src/main.jsx` | Entry module, relative to the Vite root |
 | `fileName` | `app.js` | Name of the bundle in `build.outDir` |
-| `host` | the `SILKUI_HOST` program, which `silk task dev` sets | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode. Without one, the plugin prints the port for a host you start yourself |
+| `host` | the `SILKUI_HOST` program, which `silk dev` sets | `{ command, args, cwd }`: a host binary to start, given `--dev <port>` under the dev server and `--watch <bundle>` in watch mode. Without one, the plugin prints the port for a host you start yourself |
 | `port` | any free one | Port the dev server listens on for the host |
 | `apis` | `"warn"` | What to do when the build uses an API the runtime does not have: `"warn"`, `"error"` or `"off"` |
 | `allow` | none | Names of such APIs the app provides itself, such as `provided` from `@silkui/foldkit/apis` |

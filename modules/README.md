@@ -7,7 +7,7 @@ native window (macOS, Windows, X11, Wayland) through [modules/platform/window](h
 
 | Package | What it is |
 | --- | --- |
-| [modules/silkui](silkui) | The front door: an app definition in `tasks.silk` and the pipeline steps that build and run it (`silk task dev`, `silk task build`) for Loom, React, Foldkit and plain JS apps; it generates each target's host |
+| [modules/silkui](silkui) | The front door: an app definition in `tasks.silk` and the pipeline steps that build and run it (`silk dev`, `silk build`) for Loom, React, Foldkit and plain JS apps; it generates each target's host |
 | [modules/text](text) | Text for layout: font fallback, line breaking, bidi, shaping |
 | [modules/tree](tree) | The retained tree: nodes, typed styles, layout, paint, input, focus, scrolling, text editing. Driven by plain-data `Mutation`s, reports plain-data `Event`s |
 | [loom](https://github.com/silk-lang/loom/tree/main/modules/loom) (silk-lang/loom) | The framework: model, messages, `view`, `update`, commands and subscriptions; the view is diffed into tree mutations. Its inspector extension is [loom-inspect](https://github.com/silk-lang/loom/tree/main/modules/loom/inspect) |

@@ -22,8 +22,9 @@ product once.
 ```sh
 silk init my-app -t ui-react  # or ui-loom, ui-foldkit, ui-js
 cd my-app
-silk task dev                 # opens the app in a window, reloading as you edit
-silk task build --release     # writes the release program to dist/window/
+silk dev                      # opens the app in a window, reloading as you edit
+silk build --release          # builds the release program into build/
+silk build --release --out dist  # and copies it to dist/window/
 ```
 
 The templates live in [silk-lang/examples](https://github.com/silk-lang/examples), and
@@ -114,7 +115,7 @@ intentional module bindings, not warning suppression or removal of test/browser 
 
 Extracted without removing UI packages, fixtures, goldens, demos, inspector tools, or browser surfaces from `silk-lang/nonstd` commit `7d6c3693a9ad1fec24127985626ab4224f9f1995`. Packages live under `modules/`; public package names and import namespaces are unchanged. Studio lives in its own repository, linked above; it is a consumer, not a dependency of this repository.
 
-Use Silk **0.1.0-dev.98+dc4d2328ed3a** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
+Use Silk **0.1.0-dev.100+8f42b4e7342a** and LLVM **22.1.8**. `silk.toml` pins Silk; the official launcher installs and verifies that release. Repository maintenance uses typed, cached `silk task` commands. Browser runtime JavaScript remains runtime code, not task orchestration.
 
 Hosted CI bootstraps Clang and the pinned Silk release before running any compiled task. The official installer is pinned to the compiler commit. `silk task setup-ci` invokes the exact native dependency's tasks; `--linux-gpu` provisions lavapipe and `--browser` selects Chromium. There are no old script entrypoints or Playwright compatibility aliases.
 

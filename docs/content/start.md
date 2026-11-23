@@ -9,7 +9,7 @@ You need [Silk](https://github.com/silk-lang/silk), and for the JavaScript templ
 ```sh
 silk init my-app -t ui-react
 cd my-app
-silk task dev
+silk dev
 ```
 
 `silk run` does the same in the JavaScript templates. The first `dev` installs the npm packages and builds the window, which takes a few minutes. After that it starts in seconds. Edit `js/App.tsx` while the window is open: Vite replaces the modules you changed, and the counter keeps its count.
@@ -35,7 +35,7 @@ JavaScript apps run in the window on the SilkJS Engine, embedded in the program:
 
 ## What is in the project
 
-The project root holds both the Silk and the npm side, so `silk task dev` and `npm install` both run there:
+The project root holds both the Silk and the npm side, so `silk dev` and `npm install` both run there:
 
 | Path | What it is |
 | --- | --- |
@@ -46,7 +46,7 @@ The project root holds both the Silk and the npm side, so `silk task dev` and `n
 
 A Loom template has `silk/app.silk` in place of `js/` and the npm files, and depends on `loom` as well.
 
-In a Loom app, `dev` rebuilds and restarts the window when you save a file in `silk/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. The window keeps its size, focus and scroll positions too. Each new `silk task dev` starts from `init`.
+In a Loom app, `dev` rebuilds and restarts the window when you save a file in `silk/`, and the model comes back as it was. Fields are matched by name: a field you add starts with its `init` value, and one whose type you changed starts over, which the terminal reports. Only `pub` fields are kept, and enums start over. The window keeps its size, focus and scroll positions too. Each new `silk dev` starts from `init`.
 
 The app definition is a few lines at the top of `silk/tasks.silk`:
 
@@ -63,10 +63,10 @@ Below it, `dev` and `build` are pipelines of steps, written out so you can read 
 ## Build it
 
 ```sh
-silk task build --release
+silk build --release --out dist
 ```
 
-`dist/window/my-app`, named after the project, is the release program, with the bundle inside and no development tools. Copy it anywhere and run it. Without `--release` the task writes the same program unoptimized, which builds faster.
+`dist/window/my-app`, named after the project, is the release program, with the bundle inside and no development tools. Copy it anywhere and run it. Without `--out`, the build keeps it in `build/<triple>/release/`, beside the other builds, and lists where it is. Without `--release` the task builds the same program unoptimized, into `build/<triple>/dev/`, which builds faster.
 
 ## Add a target
 
@@ -77,7 +77,7 @@ A target is where the app runs, and it is one line in `app()`. A Loom app can al
     |> App.target(Target.webCanvas(Page { title: "My app" }))
 ```
 
-`silk task dev --platform web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk task build --release` writes each page to `dist/<target>/` as a static site. JavaScript apps run in a window for now; the web canvas comes next.
+`silk dev --target web-dom` serves the page on `http://127.0.0.1:8090/` and reloads it when `silk/` changes. `silk build --release --out dist` writes each page to `dist/<target>/` as a static site, and `--target web-dom` builds only that one. JavaScript apps run in a window for now; the web canvas comes next.
 
 ## Call Silk from JavaScript
 
@@ -141,7 +141,7 @@ For types in the editor, add the TypeScript plugin to `tsconfig.json`. It needs 
 
 Hover shows the Silk doc comment, go to definition opens the `.silk` file, and Silk errors show in the editor. `tsc` needs `--runExternalCode`. With an older TypeScript, `.silk/natives/types/` has the same declarations as `.d.silk.ts` files, for `rootDirs` with `allowArbitraryExtensions`.
 
-Under `silk task dev`, saving a `.silk` file rebuilds the window's program and starts it again, in a few seconds. The JavaScript state starts over, as after a page reload; if the build fails, the previous program keeps running until the next save.
+Under `silk dev`, saving a `.silk` file rebuilds the window's program and starts it again, in a few seconds. The JavaScript state starts over, as after a page reload; if the build fails, the previous program keeps running until the next save.
 
 ## Draw the title bar
 

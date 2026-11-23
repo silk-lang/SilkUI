@@ -131,7 +131,7 @@ of paint, with the layout passes and boxes laid out. The clock moves 1/120 s a f
   client adds its own through `WindowClient.census`. Counters only: nothing changes what is
   laid out or painted.
 
-    SILK_UI_BENCH=2400 SILK_UI_BENCH_X=520 SILK_UI_BENCH_Y=400 dist/window/my-app
+    SILK_UI_BENCH=2400 SILK_UI_BENCH_X=520 SILK_UI_BENCH_Y=400 build/aarch64-apple-darwin/release/my-app-host-window
 
 The check dispatches a click and Tab through the real input path, verifies the
 updated text, and compares GPU output with the CPU reference. `--debug` builds a

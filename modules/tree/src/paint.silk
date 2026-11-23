@@ -96,6 +96,7 @@ import silk.num.u64
 import silk.num.u8
 import silk.num.usize
 import silk.text.string { String }
+import silk.trace { Trace as Prof }
 
 /// Conservative local device-pixel ink bounds of a horizontal raster glyph run.
 /// Bounds contain no atlas references and remain useful when tiles are evicted.
@@ -1977,6 +1978,7 @@ effect fn paintCanvas(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  let _span = Prof.span("ui_tree.paintCanvas")
   let s = p.scale
   let transform = Affine.new(
     f32.toF64(s),
@@ -1989,6 +1991,7 @@ effect fn paintCanvas(
   let node = &p.nodes.asSlice()[u32.toUsize(slot)]
   let count = node.canvas().length
   let content = node.content
+  Prof.set("commands", &count)
   if count >= canvas_raster.MIN_COMMANDS {
     let ox = origin.xMin * s
     let oy = origin.yMin * s
@@ -2051,6 +2054,7 @@ effect fn paintCanvas(
         run path.close()
       }
       CanvasCommand.Fill { color } => {
+        let _fill = Prof.span("ui_tree.canvas.fill")
         let id = canvasKey(&p.*, slot, content, i, origin)
         drop run Effect.catchAll(
           p.paths.fill(&mut p.scene, id, &path, &transform, NONZERO, Background.solid(color), mask),
@@ -2059,6 +2063,7 @@ effect fn paintCanvas(
         path.clear()
       }
       CanvasCommand.Stroke { color, width } => {
+        let _stroke = Prof.span("ui_tree.canvas.stroke")
         let id = canvasKey(&p.*, slot, content, i, origin)
         let stroke = Stroke.make(f32.toF64(width))
         drop run Effect.catchAll(
@@ -2331,7 +2336,12 @@ fn ownInk(
     return unboundedInk()
   }
   let c = &node.computed().*
-  let mut reach: f32 = 2.0
+  let mut reach: f32 = if c.clips() && !c.decorated() && !c.effects.declared
+    && !c.paint.hasShadow && !c.outline.drawn() {
+    0.0
+  } else {
+    2.0
+  }
   if c.paint.hasShadow && !c.paint.shadow.inset {
     let offset = f32.max(f32.abs(c.paint.shadow.offsetX), f32.abs(c.paint.shadow.offsetY))
     reach = reach + offset + f32.max(c.paint.shadow.spread, 0.0) + 2.0 * c.paint.shadow.blur
@@ -2534,6 +2544,9 @@ fn inkVisible(p: &Painter<'_, '_>, index: usize, mask: ContentMask) -> bool {
   let ink = p.ink.get(index)
   let s = p.scale
   let cull = ContentMask.new(p.cull).intersect(mask).bounds
+  if cull.xMin >= cull.xMax || cull.yMin >= cull.yMax {
+    return false
+  }
   return ink.xMin * s < cull.xMax && ink.xMax * s > cull.xMin && ink.yMin * s < cull.yMax
     && ink.yMax * s > cull.yMin
 }

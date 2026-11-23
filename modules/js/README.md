@@ -8,7 +8,7 @@ a Vite plugin that builds an application and, in development, replaces edited mo
 the running window.
 
 To start an app, use a template: `silk init my-app -t ui-react` (or `ui-foldkit`, `ui-js`)
-gives a project whose `silk task dev` builds and opens it through [silkui](../silkui). This
+gives a project whose `silk dev` builds and opens it through [silkui](../silkui). This
 page is the reference for the packages and the host underneath.
 
 ## @silkui/core

@@ -9,11 +9,17 @@ import ui_tree.legacy {
   FrameInput,
   NodeKind,
   Mutation,
-  Position
+  Position,
+  Overflow,
+  CanvasCommand,
+  VirtualItem,
+  VirtualOptions,
 }
 import ui_fixtures.fixtures as fixtures
 import ui_tree.mutation { Declaration }
+import silk.collections.list { List }
 import silk.core.effect { Effect }
+import silk.core.option { Option }
 import silk.system.filesystem { FileError }
 import silk.system.host_input { HostInputError }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -193,4 +199,113 @@ test effect fn repairedPaintCachesMatchARebuild() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run repairsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn canvasAndOffscreenBody() -> ()
+  ! TreeError | FileError | HostInputError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(400.0)), css.height(px(300.0)), css.overflow(Overflow.Hidden)])
+  // Visible canvas.
+  run batch.create(2, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+  run batch.style(2, &[css.width(px(400.0)), css.height(px(100.0))])
+  let mut cmds1 = List<CanvasCommand>.make()
+  run cmds1.append(CanvasCommand.FillRect { x: 0.0, y: 0.0, width: 50.0, height: 20.0, radius: 0.0, color: fixtures.rgb(0x2288ff) })
+  run batch.push(Mutation.SetCanvas { id: 2, commands: move cmds1 })
+  // Off-screen translated panel holding a canvas with many quads.
+  let shift = run css.text(b"100% 0")
+  run batch.box(
+    1,
+    3,
+    &[
+      css.position(Position.Absolute),
+      css.top(px(0.0)),
+      css.left(px(0.0)),
+      css.width(px(400.0)),
+      css.height(px(300.0)),
+      css.overflow(Overflow.Hidden),
+      css.declare(Property.Translate, move shift),
+    ],
+  )
+  run batch.create(4, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 3, child: 4, before: Option<u32>.None })
+  run batch.style(4, &[css.width(px(400.0)), css.height(px(300.0))])
+  let mut hiddenCmds = List<CanvasCommand>.make()
+  let mut k: u32 = 0
+  while k < 32 {
+    run hiddenCmds.append(CanvasCommand.FillRect {
+      x: 4.0, y: 4.0, width: 20.0, height: 10.0, radius: 0.0, color: fixtures.rgb(0xff0000),
+    })
+    k = k + 1
+  }
+  run batch.push(Mutation.SetCanvas { id: 4, commands: move hiddenCmds })
+  run tree.apply(run batch.take())
+  let view = FrameInput { width: 400.0, height: 300.0, scale: 1.0, time: 0.0 }
+  run tree.frame(view)
+  run Testing.expect(tree.stats.primitives < 10, "offscreen translate(100% 0) canvas is culled")
+
+  // Updating the visible canvas repairs paint caches incrementally without a full rebuild.
+  let rebuildsBefore = tree.repair.rebuilds
+  let repairsBefore = tree.repair.repairs
+  tree.repair.verify = true
+  let mut cmds2 = List<CanvasCommand>.make()
+  run cmds2.append(CanvasCommand.FillRect { x: 10.0, y: 0.0, width: 80.0, height: 20.0, radius: 0.0, color: fixtures.rgb(0x44cc88) })
+  run batch.push(Mutation.SetCanvas { id: 2, commands: move cmds2 })
+  run tree.apply(run batch.take())
+  run tree.frame(view)
+  run Testing.expect(tree.repair.rebuilds == rebuildsBefore, "SetCanvas does not trigger full paint cache rebuild")
+  run Testing.expect(tree.repair.repairs > repairsBefore, "SetCanvas repairs paint caches incrementally")
+  run Testing.expect(tree.repair.mismatches == 0, "SetCanvas repair matches full rebuild")
+}
+
+effect fn noopVirtualListKeepsQuietFrameBody() -> ()
+  ! TreeError | FileError | HostInputError | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.style(1, &[css.width(px(300.0)), css.height(px(200.0))])
+  run batch.box(1, 2, &[css.height(px(200.0)), css.overflow(Overflow.Auto)])
+  run batch.box(2, 3, &[css.height(px(40.0))])
+  let opts = VirtualOptions { estimatedHeight: 40.0, overscan: 80.0, gap: 0.0, revision: 0 }
+  run batch.push(Mutation.SetVirtualList { id: 2, count: 100, options: opts })
+  let mut items = List<VirtualItem>.make()
+  run items.append(VirtualItem { index: 0, id: 3 })
+  run batch.push(Mutation.SetVirtualItems { id: 2, items: move items })
+  run tree.apply(run batch.take())
+  let view = FrameInput { width: 300.0, height: 200.0, scale: 1.0, time: 0.0 }
+  run tree.frame(view)
+  // Second frame settles initial virtual range/measurements.
+  run tree.frame(view)
+
+  // Re-sending identical SetVirtualList + SetVirtualItems keeps the frame quiet.
+  let keptBefore = tree.paintsKept
+  let rebuildsBefore = tree.repair.rebuilds
+  run batch.push(Mutation.SetVirtualList { id: 2, count: 100, options: opts })
+  let mut sameItems = List<VirtualItem>.make()
+  run sameItems.append(VirtualItem { index: 0, id: 3 })
+  run batch.push(Mutation.SetVirtualItems { id: 2, items: move sameItems })
+  run tree.apply(run batch.take())
+  run tree.frame(view)
+  run Testing.expect(tree.paintsKept > keptBefore, "unchanged SetVirtualList/SetVirtualItems keeps quiet frame")
+  run Testing.expect(tree.repair.rebuilds == rebuildsBefore, "unchanged SetVirtualList/SetVirtualItems does not rebuild paint caches")
+}
+
+test effect fn canvasRepairsIncrementallyAndOffscreenCulls() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run canvasAndOffscreenBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn noopVirtualListKeepsQuietFrame() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run noopVirtualListKeepsQuietFrameBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

@@ -16,7 +16,7 @@ The quickest start is a template, which sets up the Silk host, Vite and this pac
 ```sh
 silk init my-app -t ui-js   # plain TypeScript; ui-react and ui-foldkit use this package too
 cd my-app
-silk task dev
+silk dev
 ```
 
 See [Get started](https://silk-ui-docs.juliaortiz-js.workers.dev/start/). To add it to an
