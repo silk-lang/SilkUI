@@ -921,6 +921,13 @@ pub struct UiTree<'a> {
   pub ancestorFilter: AncestorFilter,
   pub filterPath: List<u32>,
   pub filterOn: bool,
+  /// During a style pass: 1-based element index among siblings (by slot), total element
+  /// children (by parent slot), and the pass stamp for each parent whose children were counted.
+  pub siblingIndex: List<u32>,
+  pub siblingCount: List<u32>,
+  pub siblingStamp: List<u32>,
+  pub siblingPass: u32,
+  pub siblingOn: bool,
   pub styleSheets: List<RootSheets>,
   styleLoads: List<StyleRequest>,
   styleGeneration: u64,
@@ -1612,6 +1619,11 @@ impl<'a> UiTree<'a> {
       ancestorFilter: AncestorFilter.make(),
       filterPath: List<u32>.make(),
       filterOn: false,
+      siblingIndex: List<u32>.make(),
+      siblingCount: List<u32>.make(),
+      siblingStamp: List<u32>.make(),
+      siblingPass: 0,
+      siblingOn: false,
       styleSheets: List<RootSheets>.make(),
       styleLoads: List<StyleRequest>.make(),
       styleGeneration: 0,
@@ -7223,6 +7235,11 @@ impl<'a> UiTree<'a> {
       self.paintCachesStale = true
     }
     let scrollbarRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasScrollbars
+    let firstLetterRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasFirstLetter
+    let firstLineRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasFirstLine
+    let generatedRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasGenerated
+    let selectionRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasSelection
+    let placeholderRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasPlaceholder
     if self.root == NONE {
       return ()
     }
@@ -7231,6 +7248,31 @@ impl<'a> UiTree<'a> {
     run self.ancestorFilter.clear()
     self.filterPath.clear()
     self.filterOn = true
+    if self.siblingPass == u32.MAX {
+      self.siblingPass = 1
+      let stamps = self.siblingStamp.asMutSlice()
+      let mut s: usize = 0
+      while s < stamps.length { stamps[s] = 0 s = s + 1 }
+    } else {
+      self.siblingPass = self.siblingPass + 1
+    }
+    let nodeCount = self.nodes.length()
+    if self.siblingIndex.length() < nodeCount {
+      let missing = nodeCount - self.siblingIndex.length()
+      run self.siblingIndex.reserve(missing)
+      while self.siblingIndex.length() < nodeCount { run self.siblingIndex.append(0) }
+    }
+    if self.siblingCount.length() < nodeCount {
+      let missing = nodeCount - self.siblingCount.length()
+      run self.siblingCount.reserve(missing)
+      while self.siblingCount.length() < nodeCount { run self.siblingCount.append(0) }
+    }
+    if self.siblingStamp.length() < nodeCount {
+      let missing = nodeCount - self.siblingStamp.length()
+      run self.siblingStamp.reserve(missing)
+      while self.siblingStamp.length() < nodeCount { run self.siblingStamp.append(0) }
+    }
+    self.siblingOn = true
     // Each entry is a slot and whether its parent's inherited values changed.
     let mut stack = List<u64>.make()
     run stack.append(u32.toU64(self.root))
@@ -7298,13 +7340,17 @@ impl<'a> UiTree<'a> {
         }
         let namesChanged = run self.resolve(slot, tick)
         self.stats.styledNodes = self.stats.styledNodes + 1
-        if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run selection.resolve(&mut self, slot) }
-        if self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Input { run placeholder.resolve(&mut self, slot) }
-        if self.styleSheets.length() != 0 && self.node(slot).kind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
-        run self.syncGenerated(slot)
+        let resolvedKind = self.node(slot).kind
+        let hasSel = match self.node(slot).identity() { Option<&NodeIdentity>.Some { value } => value.selection.isSome() _ => false }
+        let hasBar = match self.node(slot).identity() { Option<&NodeIdentity>.Some { value } => value.scrollbars.isSome() _ => false }
+        let hasGen = match self.node(slot).identity() { Option<&NodeIdentity>.Some { value } => value.before != NONE || value.after != NONE _ => false }
+        if (selectionRules || hasSel) && resolvedKind != NodeKind.Text { run selection.resolve(&mut self, slot) }
+        if resolvedKind == NodeKind.Input && (placeholderRules || self.styleSheets.length() != 0) { run placeholder.resolve(&mut self, slot) }
+        if (scrollbarRules || hasBar) && resolvedKind != NodeKind.Text { run scrollbar_parts.resolve(&mut self, slot) }
+        if generatedRules || hasGen { run self.syncGenerated(slot) }
         if listStyle.item() || self.node(slot).computed().list.item() { run self.syncMarker(slot) }
-        if (self.letterUsed || self.styleSheets.length() != 0) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
-        if self.lineOrigins.length() != 0 || self.styleSheets.length() != 0 && self.node(slot).kind == NodeKind.Box { run self.syncFirstLine(slot) }
+        if (self.letterUsed || firstLetterRules) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
+        if self.lineOrigins.length() != 0 || (firstLineRules && resolvedKind == NodeKind.Box) { run self.syncFirstLine(slot) }
         let styled = self.node(slot)
         let repaints = tracksPaint && !self.paintCachesStale && (scrollbarRules || styled.kind == NodeKind.Input
           || paintBefore != styled.paintHash || beforeFont != styled.fontKey || wasRendered != styled.rendered
@@ -7352,17 +7398,37 @@ impl<'a> UiTree<'a> {
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
-        let layoutNodes = &self.layout
-        let mut child = layoutNodes.firstChild(css)
+        let mut child = self.layout.firstChild(css)
+        let mut elemCount: u32 = 0
+        let parentIndex = u32.toUsize(slot)
+        let pass = self.siblingPass
         while child != NO_INDEX {
           let found = self.slotOfCssNode(child)
-          // A child that inherits a property explicitly reads what its parent resolved to.
-          if found != NONE && (changed || below || subtree || self.node(found).styleDirty || explicitInherit(self.node(found))) {
-            let extra: u64 = if own && !changed && explicitInherit(self.node(found)) { 0x100000000 } else { 0 }
-            run stack.append(u64.bitOr(u32.toU64(found), u64.bitOr(flag, extra)))
-            run differing.append(differBelow)
+          if found != NONE {
+            let isElem = self.node(found).live && self.node(found).kind != NodeKind.Text && !self.node(found).isGenerated()
+            if isElem {
+              elemCount = elemCount + 1
+              let idx = u32.toUsize(found)
+              if idx < self.siblingIndex.length() {
+                let indices = self.siblingIndex.asMutSlice()
+                indices[idx] = elemCount
+              }
+            }
+            // A child that inherits a property explicitly reads what its parent resolved to.
+            let inherit = explicitInherit(self.node(found))
+            if changed || below || subtree || self.node(found).styleDirty || inherit {
+              let extra: u64 = if own && !changed && inherit { 0x100000000 } else { 0 }
+              run stack.append(u64.bitOr(u32.toU64(found), u64.bitOr(flag, extra)))
+              run differing.append(differBelow)
+            }
           }
-          child = layoutNodes.nextSibling(child)
+          child = self.layout.nextSibling(child)
+        }
+        if parentIndex < self.siblingCount.length() {
+          let counts = self.siblingCount.asMutSlice()
+          counts[parentIndex] = elemCount
+          let stamps = self.siblingStamp.asMutSlice()
+          stamps[parentIndex] = pass
         }
         let items = stack.asMutSlice()
         let mut a = first
@@ -7376,6 +7442,8 @@ impl<'a> UiTree<'a> {
         }
       }
     }
+    self.siblingOn = false
+    self.filterOn = false
     if self.letterPending.length() != 0 {
       let mut i: usize = 0
       while i < self.letterPending.length() {
