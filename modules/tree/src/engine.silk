@@ -173,7 +173,7 @@ import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, re
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels, IconVariables }
 import svg_css.effect_values { Image }
-import repair { Repair, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
+import repair { Repair, FragileEntry, FRAGILE_SELF, FRAGILE_SUBTREE, MAX_TRACKED_FRAGILE, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
 import provider { Provider }
 import ui_text.system { TextSystem }
 import ui_text.fonts { TextStyle as FontStyleRequest, Treatment }
@@ -990,8 +990,10 @@ pub struct UiTree<'a> {
   /// Some nodes have `styleDirty`: the next resolve visits only their subtrees' paths.
   pub stylesPending: bool,
   /// Some node is a list item or changes counters, or generated content names one: each
-  /// style pass ends with the counters pass (`lists.update`).
+  /// style pass that touches lists/counters or tree structure ends with `lists.update`.
   pub listsUsed: bool,
+  listsDirty: bool,
+  listsStructure: usize,
   /// Some node has had a `::first-letter` box: edits under one may move its letter.
   pub letterUsed: bool,
   /// Blocks whose `::first-letter` the style pass syncs once their subtrees are styled: the
@@ -1700,6 +1702,8 @@ impl<'a> UiTree<'a> {
       stylesDirty: true,
       stylesPending: false,
       listsUsed: false,
+      listsDirty: false,
+      listsStructure: usize.MAX,
       letterUsed: false,
       letterPending: List<u32>.make(),
       lineOrigins: List<u32>.make(),
@@ -3305,10 +3309,14 @@ impl<'a> UiTree<'a> {
             let key = run self.selectorKeys.intern(String.view(&name), String.view(&classes), atoms.asSlice())
             let identity = run self.nodeMut(slot).identityMut()
             identity.key = move key
+            if self.listsUsed { self.listsDirty = true }
           }
           Attribute.Named { name, value } => {
             if !isNamedAttribute(String.view(&name)) { return () }
-            if self.listsUsed && (String.view(&name) == "start" || String.view(&name) == "value") { self.stylesPending = true }
+            if self.listsUsed && (String.view(&name) == "start" || String.view(&name) == "value") {
+              self.stylesPending = true
+              self.listsDirty = true
+            }
             let words = match &value { Option<String>.Some { value: text } => String.view(&text) _ => "" }
             if String.view(&name) == "class" || String.view(&name) == "id" {
               let present = value.isSome()
@@ -4015,7 +4023,10 @@ impl<'a> UiTree<'a> {
       run self.moveFocus(to, false)
     }
     // Counters after it count one less.
-    if self.listsUsed { self.stylesPending = true }
+    if self.listsUsed {
+      self.stylesPending = true
+      self.listsDirty = true
+    }
     // The detached subtree is resolved when it is attached again.
     self.applied = true
   }
@@ -4640,6 +4651,7 @@ impl<'a> UiTree<'a> {
     self.paintDirty = s.paintDirty
     self.paintCachesStale = s.paintCachesStale || s.applied
     self.repair.reset()
+    self.listsDirty = true
     self.layoutObserversDirty = s.layoutObserversDirty
     self.facesDirty = s.facesDirty
     self.paintedAt = s.paintedAt
@@ -6722,7 +6734,10 @@ impl<'a> UiTree<'a> {
         let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
         let mut counted = false
         content = run Effect.catchAll(generated.content(&self, origin, value.declarations.asSlice(), &Scope.empty(), &mut counted), generatedFailed)
-        if counted { self.listsUsed = true }
+        if counted {
+          self.listsUsed = true
+          self.listsDirty = true
+        }
         prepared = Option<Resolved>.some(move value)
       }
       if let Option<String>.Some { value: text } = move content {
@@ -6821,6 +6836,7 @@ impl<'a> UiTree<'a> {
       identity.marker = slot
     }
     self.listsUsed = true
+    self.listsDirty = true
     if let Option<Resolved>.Some { value } = move prepared { run self.installResolved(slot, move value) }
   }
 
@@ -7321,6 +7337,7 @@ impl<'a> UiTree<'a> {
     // reach them through the layout pass.
     if full {
       self.paintCachesStale = true
+      self.listsDirty = true
     }
     let scrollbarRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasScrollbars
     let firstLetterRules = sheetIndex != usize.MAX && self.styleSheets.asSlice()[sheetIndex].hasFirstLetter
@@ -7420,6 +7437,7 @@ impl<'a> UiTree<'a> {
         let placedBefore = if tracksPaint { transform.placementHash(&node.computed().transform, 0) } else { 0 }
         let perspectiveBefore = if tracksPaint { transform.perspectiveHash(&node.computed().transform, 0) } else { 0 }
         let containment = node.computed().contain.query()
+        let containStyleBefore = node.computed().contain.style()
         let skips = node.computed().contain.hidden()
         run self.prepareFilter(slot)
         if !tick {
@@ -7451,6 +7469,9 @@ impl<'a> UiTree<'a> {
           self.repair.pending = true
         }
         let after = &self.node(slot).computed().*
+        let listsChanged = self.listsUsed && (wasRendered != self.node(slot).rendered || &listStyle != &after.list
+          || listStyle.counters() || after.list.counters() || containStyleBefore != after.contain.style()
+          || self.node(slot).isGenerated())
         if slot == self.root && (beforeFont != self.node(slot).fontKey || &before.lineHeight != &after.text.lineHeight) { rootFontChanged = true }
         // A tick leaves the variables below as they were: only inherited values can pass on.
         subtree = !tick && (reached || self.node(slot).styleSubtree) && self.node(slot).sheetStyle().isSome()
@@ -7473,6 +7494,7 @@ impl<'a> UiTree<'a> {
         changed = full || rootFontChanged || inheritsScope || valuesChanged
         scopeOnly = !full && !rootFontChanged && scopeChanged && !valuesChanged
         let free = self.variableUses() == usesBefore
+        if listsChanged { self.listsDirty = true }
         let flagged = self.nodeMut(slot)
         flagged.variableFree = free
       }
@@ -7545,7 +7567,11 @@ impl<'a> UiTree<'a> {
       // A new or moved letter box asked for its own style.
       if self.stylesPending { run self.resolveStyles() }
     }
-    if self.listsUsed { run lists.update(&mut self) }
+    if self.listsUsed && (self.listsDirty || self.layout.structureRevision() != self.listsStructure) {
+      run lists.update(&mut self)
+      self.listsDirty = false
+      self.listsStructure = self.layout.structureRevision()
+    }
   }
 
   /// The styles of parts resolved so far that read a variable or declare one (`Cache.variableUses`).
@@ -7949,7 +7975,10 @@ impl<'a> UiTree<'a> {
     }
     if computed.layout.display.isTablePart() { tableSpans(self.node(slot), &mut computed.layout) }
     if self.listsUsed && self.node(slot).kind == NodeKind.Box && lists.isMarker(self.node(slot)) { lists.markerLayout(&mut computed, self.node(parent).computed().list) }
-    if computed.list.item() || computed.list.counters() { self.listsUsed = true }
+    if computed.list.item() || computed.list.counters() {
+      self.listsUsed = true
+      self.listsDirty = true
+    }
     if computed.scroll.snapsX() || computed.scroll.snapsY() { self.snapUsed = true }
     if computed.transform.offset.path != transform.PATH_NONE { self.offsetUsed = true }
     if computed.transform.preserve3d { self.preserveUsed = true }
@@ -9403,6 +9432,18 @@ impl<'a> UiTree<'a> {
             i = i + 1
           }
           self.repair.fragments.truncate(kept)
+          let tracked = self.repair.fragiles.asMutSlice()
+          kept = 0
+          i = 0
+          while i < tracked.length {
+            let to = plan.newIndex(tracked[i].fragment)
+            if to != NO_INDEX {
+              tracked[kept] = FragileEntry { fragment: to, kind: tracked[i].kind }
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragiles.truncate(kept)
         } else {
           let pending = self.repair.fragments.asMutSlice()
           let mut kept: usize = 0
@@ -9415,6 +9456,17 @@ impl<'a> UiTree<'a> {
             i = i + 1
           }
           self.repair.fragments.truncate(kept)
+          let tracked = self.repair.fragiles.asMutSlice()
+          kept = 0
+          i = 0
+          while i < tracked.length {
+            if tracked[i].fragment < count {
+              tracked[kept] = tracked[i]
+              kept = kept + 1
+            }
+            i = i + 1
+          }
+          self.repair.fragiles.truncate(kept)
         }
         run self.repair.fragments.appendSlice(dirty.asSlice())
         self.repair.pending = true
@@ -9488,6 +9540,7 @@ impl<'a> UiTree<'a> {
         &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
         self.input.width, self.input.height,
         &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+        &mut self.repair.fragiles,
       )
       run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
       run foldLiftedRoots(
@@ -9568,6 +9621,33 @@ impl<'a> UiTree<'a> {
       }
     }
 
+    // Directly changed subtree-fragile fragments (perspective, preserve-3d) affect their
+    // descendants: fall back to a full rebuild. Self-fragile fragments (sticky, offset-path,
+    // positioning shells) may read an ancestor or skip SourceIndex, so recompute them too.
+    let mut fIdx: usize = 0
+    while fIdx < self.repair.fragiles.length() {
+      let entry = self.repair.fragiles.get(fIdx)
+      fIdx = fIdx + 1
+      if entry.fragment >= count { continue }
+      if u8.bitAnd(entry.kind, FRAGILE_SUBTREE) != 0 && marks.get(entry.fragment) {
+        d = 0
+        while d < dirty.length() {
+          marks.set(dirty.get(d), false)
+          d = d + 1
+        }
+        dirty.clear()
+        self.repair.fragments = move dirty
+        self.repair.stack = move stack
+        self.repair.marks = move marks
+        self.repair.fragileRebuilds = self.repair.fragileRebuilds + 1
+        return false
+      }
+      if u8.bitAnd(entry.kind, FRAGILE_SELF) != 0 && !marks.get(entry.fragment) {
+        marks.set(entry.fragment, true)
+        run dirty.append(entry.fragment)
+      }
+    }
+
     // Every fragment above a changed one folds it in.
     let listed = dirty.length()
     d = 0
@@ -9599,15 +9679,44 @@ impl<'a> UiTree<'a> {
       run sortUnique(&mut dirty)
     }
     let mut ordered = true
-    let fragile = repairFragments(
+    let mut foundFragiles = Intrinsic.replace(self.repair.spareFragiles, List<FragileEntry>.make())
+    run repairFragments(
       &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
       self.input.width, self.input.height,
       &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
-      dirty.asSlice(), &mut ordered,
+      dirty.asSlice(), &mut foundFragiles, &mut ordered,
     )
     dirty.clear()
     self.repair.fragments = move dirty
-    if fragile || !ordered {
+    let mut needRebuild = !ordered
+    let mut fi: usize = 0
+    while !needRebuild && fi < foundFragiles.length() {
+      let found = foundFragiles.get(fi)
+      fi = fi + 1
+      let mut known: usize = 0
+      while known < self.repair.fragiles.length() && self.repair.fragiles.get(known).fragment != found.fragment {
+        known = known + 1
+      }
+      if known < self.repair.fragiles.length() {
+        let prev = self.repair.fragiles.get(known)
+        if u8.bitAnd(found.kind, FRAGILE_SUBTREE) != 0 && u8.bitAnd(prev.kind, FRAGILE_SUBTREE) == 0 {
+          needRebuild = true
+        } else {
+          self.repair.fragiles.set(known, FragileEntry { fragment: found.fragment, kind: u8.bitOr(prev.kind, found.kind) })
+        }
+      } else if u8.bitAnd(found.kind, FRAGILE_SUBTREE) != 0 {
+        needRebuild = true
+      } else if self.repair.fragiles.length() < MAX_TRACKED_FRAGILE {
+        run self.repair.fragiles.append(found)
+      } else {
+        self.repair.fragile = true
+        needRebuild = true
+      }
+    }
+    foundFragiles.clear()
+    self.repair.spareFragiles = move foundFragiles
+    if needRebuild {
+      if ordered { self.repair.fragileRebuilds = self.repair.fragileRebuilds + 1 }
       return false
     }
     if lifts {
@@ -9637,6 +9746,7 @@ impl<'a> UiTree<'a> {
       &self.seed, &self.output, &self.slotOfCss, &self.layout, &self.nodes,
       self.input.width, self.input.height,
       &mut self.fragmentHashes, &mut self.fragmentInk, &mut self.fragmentScrollers,
+      &mut self.repair.fragiles,
     )
     run self.fragmentStacking.update(&self.output, &self.slotOfCss, &self.layout, &self.nodes)
     run foldLiftedRoots(
@@ -9649,7 +9759,7 @@ impl<'a> UiTree<'a> {
     run self.indexFragments()
     self.facesDirty = facesDirty
     let count = self.output.fragments.values.length()
-    let mut same = !fragile && hashes.length() == count && ink.length() == count && scrollers.length() == count
+    let mut same = hashes.length() == count && ink.length() == count && scrollers.length() == count
       && nexts.length() == count && firsts.length() == self.fragmentOf.length()
       && stacking.matches(&self.fragmentStacking)
     let mut i: usize = 0

@@ -22,6 +22,7 @@ import transform
 import layers { Sticky }
 import stacking
 import stacking { Stacking, IN_FLOW }
+import repair { FragileEntry, FRAGILE_NONE, FRAGILE_SELF, FRAGILE_SUBTREE, MAX_TRACKED_FRAGILE }
 import edit
 import selection
 import text_selection
@@ -77,6 +78,7 @@ import vector.strips { NONZERO }
 import vector.stroke { Stroke }
 import silk.collections.hash { Hash, HashSeed }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.color.rgba { Rgba }
 import silk.core.effect { Effect }
 import silk.core.option { Option }
@@ -2194,22 +2196,50 @@ fn clipsBelow(p: &Painter<'_, '_>, at: usize) -> bool {
 effect fn paintHoisted(p: &mut Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let mut path = List<usize>.make()
-  let mut at = p.output.fragments.values.asSlice()[entry].parent
+  let values = p.output.fragments.values.asSlice()
+  let mut clips: [usize; 16] = [0; 16]
+  let mut count: usize = 0
+  let mut overflow = List<usize>.make()
+  let mut hasScroller = false
+  let mut at = values[entry].parent
   while at != root && at != NO_INDEX {
     if clipsBelow(&p.*, at) {
-      run path.append(at)
+      let slot = slotIn(p.slotOfCss, values[at].source)
+      if !hasScroller && slot != NONE && layers.scroller(&p.nodes.asSlice()[u32.toUsize(slot)].computed().*) {
+        hasScroller = true
+      }
+      if count < 16 {
+        clips[count] = at
+        count = count + 1
+      } else {
+        if overflow.length() == 0 {
+          run overflow.appendSlice(Slice.view(&clips, 0, 16))
+        }
+        run overflow.append(at)
+      }
     }
-    at = p.output.fragments.values.asSlice()[at].parent
+    at = values[at].parent
   }
-  run paintThrough(&mut p, &path, path.length(), entry, mask)
+  if !hasScroller && !inkVisible(&p.*, entry, mask) {
+    p.stats.culledSubtrees = p.stats.culledSubtrees + 1
+    return ()
+  }
+  if count == 0 {
+    run paintFragment(&mut p, entry, mask)
+    return ()
+  }
+  if overflow.length() != 0 {
+    run paintThrough(&mut p, overflow.asSlice(), overflow.length(), entry, mask)
+  } else {
+    run paintThrough(&mut p, Slice.view(&clips, 0, count), count, entry, mask)
+  }
 }
 
 /// Opens the clip and scroll group of `path[count - 1]` (the path runs bottom up), then the
 /// rest of the path, then paints `entry`.
 effect fn paintThrough(
   p: &mut Painter<'_, '_>,
-  path: &List<usize>,
+  path: &[usize],
   count: usize,
   entry: usize,
   mask: ContentMask,
@@ -2220,12 +2250,13 @@ effect fn paintThrough(
     run paintFragment(&mut p, entry, mask)
     return ()
   }
-  let at = path.get(count - 1)
+  let at = path[count - 1]
   let f = p.output.fragments.values.asSlice()[at]
   let slot = slotIn(p.slotOfCss, f.source)
   let c = p.nodes.asSlice()[u32.toUsize(slot)].computed().*
   let mut inner = mask.intersect(clipMask(&p.*, slot, &c, &f))
-  if empty(inner) {
+  if empty(inner) || empty(ContentMask.new(p.cull).intersect(inner)) {
+    p.stats.culledSubtrees = p.stats.culledSubtrees + 1
     return ()
   }
   let saved = p.cull
@@ -2393,7 +2424,7 @@ pub effect fn inkFragments(
 fn foldInkAt(
   output: &LayoutTree, slots: &List<u32>, css: &LayoutTable, nodes: &List<Node>, width: f32, height: f32,
   out: &mut List<Rect<f32>>, scrollers: &mut List<bool>, index: usize, owner: u32,
-) -> bool {
+) -> u8 {
   let fragile = settleInkAt(output, slots, css, nodes, width, height, &mut out, &mut scrollers, index, owner)
   let parent = output.fragments.values.asSlice()[index].parent
   if parent != NO_INDEX {
@@ -2408,27 +2439,27 @@ fn foldInkAt(
 }
 
 /// Turns `out[index]` and `scrollers[index]`, which hold the fold of the fragment's children,
-/// into the fragment's own. Returns whether its ink reads another fragment (see
-/// `Repair.fragile`).
+/// into the fragment's own. Returns its fragility flags (`FRAGILE_SELF` / `FRAGILE_SUBTREE`).
 fn settleInkAt(
   output: &LayoutTree, slots: &List<u32>, css: &LayoutTable, nodes: &List<Node>, width: f32, height: f32,
   out: &mut List<Rect<f32>>, scrollers: &mut List<bool>, index: usize, owner: u32,
-) -> bool {
+) -> u8 {
   let f = &output.fragments.values.asSlice()[index]
   let own = ownInk(output, owner, nodes, index)
   let below = out.get(index)
   let mut clips = false
   let mut clippedBelow = below
   let mut sticky = false
-  let mut fragile = f.positioningShell
+  let mut fragile: u8 = if f.positioningShell { FRAGILE_SELF } else { FRAGILE_NONE }
   if (f.kind == FragmentKind.Box || f.kind == FragmentKind.Inline) && !f.positioningShell {
     let slot = slotIn(slots, f.source)
     if slot != NONE {
       let c = &nodes.asSlice()[u32.toUsize(slot)].computed().*
-      // Its children's transforms read its perspective, its 3D rendering context sorts planes
-      // across fragments, and a motion path places it against its containing block after
-      // layout (`offset_path.settle`).
-      if c.transform.deep() || c.transform.preserve3d || c.transform.offset.path != transform.PATH_NONE { fragile = true }
+      // Its children's transforms read its perspective and its 3D rendering context sorts planes
+      // across fragments (`FRAGILE_SUBTREE`); a motion path places it against its containing
+      // block after layout (`FRAGILE_SELF`).
+      if c.transform.deep() || c.transform.preserve3d { fragile = u8.bitOr(fragile, FRAGILE_SUBTREE) }
+      if c.transform.offset.path != transform.PATH_NONE { fragile = u8.bitOr(fragile, FRAGILE_SELF) }
       clips = f.kind == FragmentKind.Box && c.clips()
       if clips {
         let clip = overflowClip(c, f)
@@ -2440,7 +2471,7 @@ fn settleInkAt(
         )
       }
       sticky = c.layout.position == Position.Sticky
-      if sticky { fragile = true }
+      if sticky { fragile = u8.bitOr(fragile, FRAGILE_SELF) }
       if f.kind == FragmentKind.Box && layers.scroller(c) {
         scrollers.set(index, true)
       }
@@ -3786,11 +3817,13 @@ fn foldHashAt(
   }
 }
 
-/// Hashes and bounds every fragment (see [`hashFragments`] and [`inkFragments`]). Returns
-/// whether some fragment's ink reads another fragment (see `Repair.fragile`).
+/// Hashes and bounds every fragment (see [`hashFragments`] and [`inkFragments`]). Records
+/// fragile fragments in `fragiles`; returns true when there were more than `MAX_TRACKED_FRAGILE`
+/// (see `Repair.fragile`).
 pub effect fn cacheFragments(
   seed: &HashSeed, output: &LayoutTree, slots: &List<u32>, css: &LayoutTable, nodes: &List<Node>,
   width: f32, height: f32, hashes: &mut List<u64>, ink: &mut List<Rect<f32>>, scrollers: &mut List<bool>,
+  fragiles: &mut List<FragileEntry>,
 ) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -3798,31 +3831,41 @@ pub effect fn cacheFragments(
   hashes.clear()
   ink.clear()
   scrollers.clear()
+  fragiles.clear()
   run hashes.appendRepeated(0, count)
   run ink.appendRepeated(Rect<f32>.new(UNBOUNDED_INK, UNBOUNDED_INK, -UNBOUNDED_INK, -UNBOUNDED_INK), count)
   run scrollers.appendRepeated(false, count)
-  let mut fragile = false
+  let mut overflow = false
   let mut index = count
   while index > 0 {
     index = index - 1
     let owner = styleSlot(slots, css, nodes, output.fragments.values.asSlice()[index].source)
     foldHashAt(seed, output, slots, nodes, &mut hashes, index, owner)
-    if foldInkAt(output, slots, css, nodes, width, height, &mut ink, &mut scrollers, index, owner) { fragile = true }
+    let kind = foldInkAt(output, slots, css, nodes, width, height, &mut ink, &mut scrollers, index, owner)
+    if kind != FRAGILE_NONE {
+      if fragiles.length() < MAX_TRACKED_FRAGILE {
+        run fragiles.append(FragileEntry { fragment: index, kind: kind })
+      } else {
+        overflow = true
+      }
+    }
   }
-  return fragile
+  return overflow
 }
 
 /// [`cacheFragments`] for the fragments of `dirty` alone (ascending, each with every fragment
 /// above it): each one's hash, ink and scroller flag from its own inputs and its children's
-/// entries, which stand. Returns whether one of them is fragile; `ordered` is cleared when
-/// some fragment's children are not in arena order, which the fold of a full pass assumes.
-pub fn repairFragments(
+/// entries, which stand. Appends any fragile fragments seen to `found`; `ordered` is cleared
+/// when some fragment's children are not in arena order, which the fold of a full pass assumes.
+pub effect fn repairFragments(
   seed: &HashSeed, output: &LayoutTree, slots: &List<u32>, css: &LayoutTable, nodes: &List<Node>,
   width: f32, height: f32, hashes: &mut List<u64>, ink: &mut List<Rect<f32>>, scrollers: &mut List<bool>,
-  dirty: &[usize], ordered: &mut bool,
-) -> bool {
+  dirty: &[usize], found: &mut List<FragileEntry>, ordered: &mut bool,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let values = output.fragments.values.asSlice()
-  let mut fragile = false
+  found.clear()
   let mut at = dirty.length
   while at > 0 {
     at = at - 1
@@ -3845,9 +3888,11 @@ pub fn repairFragments(
     hashes.set(index, Hash.combine(ownHash(seed, output, slots, owner, nodes, index), hash))
     ink.set(index, bounds)
     scrollers.set(index, scrolls)
-    if settleInkAt(output, slots, css, nodes, width, height, &mut ink, &mut scrollers, index, owner) { fragile = true }
+    let kind = settleInkAt(output, slots, css, nodes, width, height, &mut ink, &mut scrollers, index, owner)
+    if kind != FRAGILE_NONE {
+      run found.append(FragileEntry { fragment: index, kind: kind })
+    }
   }
-  return fragile
 }
 
 /// The sampling rectangle; clipping remains on the content box, including its radii.

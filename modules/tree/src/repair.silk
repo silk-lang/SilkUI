@@ -16,8 +16,24 @@ import silk.core.order { Order, Ordering }
 import silk.core.ownership { Copy }
 import silk.geometry.rect { Rect }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+
+pub const FRAGILE_NONE: u8 = 0
+/// A fragment whose own ink or hash reads another fragment (sticky, offset-path, positioning
+/// shell): recomputing it and its ancestors keeps the caches exact.
+pub const FRAGILE_SELF: u8 = 1
+/// A fragment whose descendants read it (perspective, preserve-3d): a direct change to it
+/// rebuilds the caches, while unrelated edits leave it and its children intact.
+pub const FRAGILE_SUBTREE: u8 = 2
+pub const MAX_TRACKED_FRAGILE: usize = 64
+
+pub struct FragileEntry {
+  pub fragment: usize,
+  pub kind: u8,
+}
+impl Copy for FragileEntry {}
 
 /// Whether every tree compares each repair of its paint caches with a full rebuild and stops
 /// the program when they differ. False but for test runs: build the tree tests with it set to
@@ -520,10 +536,13 @@ pub struct Repair {
   pub nodes: List<u32>,
   /// Fragments of the last layout that are new or changed.
   pub fragments: List<usize>,
-  /// Whether the caches hold something a fragment elsewhere can change without changing
-  /// itself (a sticky box, a `perspective` on its children's transforms, a 3D rendering
-  /// context, a box on a motion path, a positioning shell): any change then rebuilds them all.
+  /// Whether the caches hold more fragile fragments than tracked (`MAX_TRACKED_FRAGILE`) or
+  /// have not been built yet: any change then rebuilds them all.
   pub fragile: bool,
+  /// Tracked fragile fragments (when `!fragile`), carried across layout passes.
+  pub fragiles: List<FragileEntry>,
+  /// Scratch list for newly observed fragile fragments during repair.
+  pub spareFragiles: List<FragileEntry>,
   /// Whether the last refresh folded fixed boxes' roots into the roots that paint them.
   pub lifted: bool,
   pub plan: CarryPlan,
@@ -559,6 +578,8 @@ impl Repair {
       nodes: List<u32>.make(),
       fragments: List<usize>.make(),
       fragile: true,
+      fragiles: List<FragileEntry>.make(),
+      spareFragiles: List<FragileEntry>.make(),
       lifted: false,
       plan: CarryPlan.make(),
       index: SourceIndex.make(),
@@ -589,6 +610,8 @@ impl Repair {
   pub fn reset(self: &mut Self) -> () {
     self.settle()
     self.fragile = true
+    self.fragiles.clear()
+    self.spareFragiles.clear()
     self.lifted = false
     self.index.clear()
     self.marks.clearAndFree()
