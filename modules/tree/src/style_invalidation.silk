@@ -1,19 +1,24 @@
 import svg_css.adopted { StyleSheets }
-import svg_css.sheet { ConditionKind, NONE }
+import svg_css.sheet { ConditionKind, Declaration as SheetDeclaration, NONE }
 import svg_css.selectors { Dependency, DependencyKind, Sharing, SubjectKind }
 import svg_css.ancestor_filter
 import svg_css.ancestor_filter { NameKind }
 import svg_css.element { PseudoTarget }
 import svg_css.tokens { equal, insensitive }
+import properties.catalog { Property }
 import style_identity { Atoms }
 import node { Node }
-import mutation { StyleState }
+import mutation { NodeKind, StyleState }
 import silk.collections.hash { Hash }
 import silk.collections.hash_map { HashMap }
 import silk.collections.hash_set { HashSet }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
 import silk.num.u32
+import silk.num.u64
+import silk.num.usize
+import silk.text.string { String }
 import silk.core.ownership { Copy }
 
 pub struct StartingSubjects { all: bool, classes: HashSet<usize> }
@@ -64,6 +69,173 @@ impl StartingSubjects {
         if value.custom()[index].state == StyleState.Starting { return true }
         index = index + 1
       }
+    }
+    return false
+  }
+}
+
+fn attrKey(text: &[u8]) -> u32 {
+  let seed = Hash.seed(0x61747472)
+  let mut result = Hash.mix(&seed, usize.toU64(text.length))
+  let mut i: usize = 0
+  while i < text.length {
+    let mut byte = text[i]
+    if byte >= 65 && byte <= 90 { byte = byte + 32 }
+    result = Hash.combine(result, u8.toU64(byte))
+    i = i + 1
+  }
+  return u64.wrappingToU32(u64.bitXor(result, u64.shiftRight(result, 32)))
+}
+
+fn defaultTag(kind: NodeKind) -> &'static [u8] {
+  return match kind {
+    NodeKind.Input => b"input"
+    NodeKind.Image => b"img"
+    NodeKind.Icon => b"span"
+    NodeKind.Canvas => b"canvas"
+    _ => b"div"
+  }
+}
+
+fn ruleMentionsContent(declarations: &[SheetDeclaration], start: usize, end: usize) -> bool {
+  let mut at = start
+  while at < end {
+    let mentions = match &declarations[at] {
+      SheetDeclaration.Custom { .. } => false
+      SheetDeclaration.Typed { property, .. } => property == Property.Content || property == Property.All
+      SheetDeclaration.Pending { property, .. } => property == Property.Content || property == Property.All
+      SheetDeclaration.ColorExpression { property, .. } => property == Property.Content || property == Property.All
+    }
+    if mentions { return true }
+    at = at + 1
+  }
+  return false
+}
+
+/// Conservative subject-key prefilter for rules targeting a pseudo-element (`::before`,
+/// `::after`, `::selection`, `::-webkit-scrollbar*`). When `mayMatch` is false, no matching
+/// rule of that kind exists for the element, so full selector resolution for that pseudo-element
+/// can be skipped in O(1).
+pub struct PseudoSubjects {
+  all: bool,
+  roots: bool,
+  classes: HashSet<usize>,
+  elements: HashSet<u32>,
+  ids: HashSet<u32>,
+  attributes: HashSet<u32>,
+}
+
+impl PseudoSubjects {
+  pub fn make() -> Self {
+    return PseudoSubjects {
+      all: false,
+      roots: false,
+      classes: HashSet<usize>.make(Hash.seed(5431)),
+      elements: HashSet<u32>.make(Hash.seed(5437)),
+      ids: HashSet<u32>.make(Hash.seed(5441)),
+      attributes: HashSet<u32>.make(Hash.seed(5443)),
+    }
+  }
+
+  effect fn addKeys(self: &mut Self, sheets: &StyleSheets, atoms: &mut Atoms, target: PseudoTarget, contentOnly: bool) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut i: usize = 0
+    while i < sheets.sheets().length {
+      let sheet = &sheets.sheets()[i].sheet
+      let rules = sheet.resolver.rules()
+      let declarations = sheet.declarations.asSlice()
+      let mut rule: usize = 0
+      while rule < rules.length {
+        let entry = &rules[rule]
+        if entry.selectors.hasPseudoTarget(target)
+          && (!contentOnly || ruleMentionsContent(declarations, entry.declarations.start, entry.declarations.end)) {
+          let mut keys = entry.selectors.subjectKeys()
+          while let Option.Some { value } = keys.next() {
+            if value.target != target || value.kind == SubjectKind.Never { continue }
+            match value.kind {
+              SubjectKind.Class => {
+                let atom = run atoms.intern(sheet.buffers.asSlice()[entry.buffer].text(value.text))
+                drop run self.classes.insert(atom)
+              }
+              SubjectKind.LocalName => {
+                let k = ancestor_filter.key(NameKind.Element, sheet.buffers.asSlice()[entry.buffer].text(value.text))
+                drop run self.elements.insert(k)
+              }
+              SubjectKind.Id => {
+                let k = ancestor_filter.key(NameKind.Id, sheet.buffers.asSlice()[entry.buffer].text(value.text))
+                drop run self.ids.insert(k)
+              }
+              SubjectKind.Attribute => {
+                let k = attrKey(sheet.buffers.asSlice()[entry.buffer].text(value.text))
+                drop run self.attributes.insert(k)
+              }
+              SubjectKind.Root => { self.roots = true }
+              _ => {
+                self.all = true
+                return ()
+              }
+            }
+          }
+        }
+        rule = rule + 1
+      }
+      i = i + 1
+    }
+  }
+
+  pub effect fn collect(sheets: &StyleSheets, atoms: &mut Atoms, target: PseudoTarget, contentOnly: bool) -> Self
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut result = PseudoSubjects.make()
+    run result.addKeys(sheets, &mut atoms, target, contentOnly)
+    return move result
+  }
+
+  pub effect fn collectScrollbars(sheets: &StyleSheets, atoms: &mut Atoms) -> Self
+    ! OutOfMemoryError ? &mut Allocator {
+    let mut result = PseudoSubjects.make()
+    let targets = [PseudoTarget.Scrollbar, PseudoTarget.ScrollbarThumb, PseudoTarget.ScrollbarTrack]
+    let mut i: usize = 0
+    while i < targets.length && !result.all {
+      run result.addKeys(sheets, &mut atoms, targets[i], false)
+      i = i + 1
+    }
+    return move result
+  }
+
+  pub fn mayMatch(self: &Self, node: &Node, isRoot: bool) -> bool {
+    if self.all { return true }
+    if self.roots && isRoot { return true }
+    if let Option.Some { value } = node.identity() {
+      if self.classes.length() != 0 {
+        let classes = value.classAtoms()
+        let mut i: usize = 0
+        while i < classes.length {
+          if self.classes.contains(classes[i]) { return true }
+          i = i + 1
+        }
+      }
+      if self.ids.length() != 0 && value.hasId {
+        if self.ids.contains(ancestor_filter.key(NameKind.Id, String.utf8Bytes(value.id()))) { return true }
+      }
+      if self.elements.length() != 0 {
+        let tag = String.utf8Bytes(value.tag())
+        let name = if tag.length != 0 { tag } else { defaultTag(node.kind) }
+        if self.elements.contains(ancestor_filter.key(NameKind.Element, name)) { return true }
+      }
+      if self.attributes.length() != 0 {
+        if value.hasId && self.attributes.contains(attrKey(b"id")) { return true }
+        if value.hasClasses && self.attributes.contains(attrKey(b"class")) { return true }
+        let attrs = value.attributes()
+        let mut i: usize = 0
+        while i < attrs.length {
+          if self.attributes.contains(attrKey(String.utf8Bytes(String.view(&attrs[i].name)))) { return true }
+          i = i + 1
+        }
+      }
+      return false
+    }
+    if self.elements.length() != 0 {
+      if self.elements.contains(ancestor_filter.key(NameKind.Element, defaultTag(node.kind))) { return true }
     }
     return false
   }

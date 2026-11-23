@@ -1107,15 +1107,7 @@ fn find(tree: &UiTree<'_>, slot: u32, id: u32, field: u32) -> usize {
 
 /// Whether the node at `slot` has a running transition.
 pub fn running(tree: &UiTree<'_>, slot: u32) -> bool {
-  let list = tree.transitions.asSlice()
-  let mut i: usize = 0
-  while i < list.length {
-    if list[i].slot == slot {
-      return true
-    }
-    i = i + 1
-  }
-  return false
+  return tree.node(slot).activeTransitions != 0
 }
 
 fn listenFlag(kind: EventKind) -> u32 {
@@ -1158,6 +1150,12 @@ effect fn cancel(tree: &mut UiTree<'_>, index: usize, now: f64) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let gone = tree.transitions.remove(index)
+  if u32.toUsize(gone.slot) < tree.nodes.length() {
+    let node = tree.nodeMut(gone.slot)
+    if node.live && node.id == gone.id && node.activeTransitions != 0 {
+      node.activeTransitions = node.activeTransitions - 1
+    }
+  }
   run record(&mut tree, EventKind.TransitionCancel, gone.slot, gone.field, gone.elapsed(now))
 }
 
@@ -1165,6 +1163,7 @@ effect fn cancel(tree: &mut UiTree<'_>, index: usize, now: f64) -> ()
 pub effect fn cancelAll(tree: &mut UiTree<'_>, slot: u32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
+  if tree.node(slot).activeTransitions == 0 { return () }
   let now = tree.input.time
   let mut i: usize = 0
   while i < tree.transitions.length() {
@@ -1288,7 +1287,7 @@ pub fn filterMoves(tree: &UiTree<'_>, slot: u32, lists: &TransitionLists, animat
   if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(FILTER))) != 0 {
     return true
   }
-  if tree.transitions.length() != 0 && find(tree, slot, tree.node(slot).id, FILTER) != usize.MAX {
+  if tree.node(slot).activeTransitions != 0 && find(tree, slot, tree.node(slot).id, FILTER) != usize.MAX {
     return true
   }
   if let Option.Some { value } = tree.node(slot).paintEffects() {
@@ -1317,12 +1316,14 @@ pub effect fn transitionFilter(
   let id = tree.node(slot).id
   let now = tree.input.time
   if u64.bitAnd(animated, u64.shiftLeft(1, u32.toU64(FILTER))) != 0 || style.layout.display.isNone() {
-    let at = find(&tree.*, slot, id, FILTER)
-    if at != usize.MAX { run cancel(&mut tree, at, now) }
+    if tree.node(slot).activeTransitions != 0 {
+      let at = find(&tree.*, slot, id, FILTER)
+      if at != usize.MAX { run cancel(&mut tree, at, now) }
+    }
     return Option<FilterList>.None
   }
   let spec = style.transition.spec(FILTER, &tree.easingStops)
-  let mayRun = tree.transitions.length() != 0
+  let mayRun = tree.node(slot).activeTransitions != 0
   let moved = run settle(&mut tree, slot, id, FILTER, &spec, style, Option<Sample>.some(Sample.Filters { value: before }), hasBefore, Sample.Filters { value: after }, now, mayRun)
   return match moved {
     Option<Sample>.Some { value: Sample.Filters { value } } => Option<FilterList>.some(value)
@@ -1384,7 +1385,10 @@ effect fn begin(tree: &mut UiTree<'_>, next: Running, now: f64) -> Sample
     run record(&mut tree, EventKind.TransitionStart, added.slot, added.field, added.elapsed(now))
   }
   let value = added.at(now, &tree.easingStops)
+  let targetSlot = added.slot
   run tree.transitions.append(added)
+  let target = tree.nodeMut(targetSlot)
+  if target.activeTransitions < 255 { target.activeTransitions = target.activeTransitions + 1 }
   return value
 }
 
@@ -1428,6 +1432,8 @@ pub effect fn tick(tree: &mut UiTree<'_>) -> ()
         }
       }
       drop tree.transitions.remove(i)
+      let endedNode = tree.nodeMut(slot)
+      if endedNode.activeTransitions != 0 { endedNode.activeTransitions = endedNode.activeTransitions - 1 }
       run record(&mut tree, EventKind.TransitionEnd, slot, item.field, f64.toF32(item.duration))
       tree.restyleTick(slot)
       continue

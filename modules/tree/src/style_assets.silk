@@ -2,6 +2,7 @@
 //! come from the build; no stylesheet text compiler is linked by this module.
 import engine { UiTree, TreeError }
 import batch { Batch }
+import mutation { FIRST_ROOT }
 import style_sheets
 import ui_protocol.style_bundle as bundle
 import svg_css.sheet { Sheet }
@@ -21,11 +22,13 @@ pub struct StyleAssets {
   sources: List<Bytes>,
   installed: List<Installed>,
   revision: usize,
+  preloaded: bool,
+  preloadedRevision: usize,
 }
 
 impl StyleAssets {
   pub fn make() -> StyleAssets {
-    return StyleAssets { sources: List<Bytes>.make(), installed: List<Installed>.make(), revision: 0 }
+    return StyleAssets { sources: List<Bytes>.make(), installed: List<Installed>.make(), revision: 0, preloaded: false, preloadedRevision: 0 }
   }
 
   pub effect fn from(sources: &[&[u8]]) -> StyleAssets ! OutOfMemoryError ? &mut Allocator {
@@ -99,6 +102,20 @@ impl StyleAssets {
     return changed
   }
 
+  /// Registers compiled application stylesheets on `tree` so `FIRST_ROOT` adopts them
+  /// immediately when opened during `start` (before any synchronous layout queries run).
+  pub effect fn preload(self: &mut Self, tree: &mut UiTree<'_>) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    if self.sources.length() == 0 { return () }
+    if tree.rootOpen(FIRST_ROOT) {
+      drop run self.serve(&mut tree, FIRST_ROOT)
+      return ()
+    }
+    run tree.setPendingFirstRootSheets(self.sources.asSlice())
+    self.preloaded = true
+    self.preloadedRevision = self.revision
+  }
+
   /// Called for the client's root before layout, including windows opened later.
   /// It never adopts into another client's root (such as the embedded inspector).
   pub effect fn serve(self: &mut Self, tree: &mut UiTree<'_>, root: u32) -> bool
@@ -113,6 +130,10 @@ impl StyleAssets {
     while installed < self.installed.length() && self.installed.asSlice()[installed].root != root { installed = installed + 1 }
     let context = style_sheets.index(tree.styleSheets.asSlice(), root)
     let present = context != usize.MAX && tree.styleSheets.asSlice()[context].sheets.index(u32.MAX) != usize.MAX
+    if root == FIRST_ROOT && present && self.preloaded && self.preloadedRevision == self.revision && installed == self.installed.length() {
+      run self.installed.append(Installed { root: root, revision: self.revision })
+      return false
+    }
     if !present || installed == self.installed.length() || self.installed.asSlice()[installed].revision != self.revision {
       let mut batch = Batch.make()
       let mut order = List<u32>.make()

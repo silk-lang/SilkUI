@@ -115,7 +115,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach, Extent, StartingSubjects, StateSubjects }
+import style_invalidation { Reach, Extent, StartingSubjects, StateSubjects, PseudoSubjects }
 import svg_css.variables { ScopeId }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
@@ -929,6 +929,7 @@ pub struct UiTree<'a> {
   pub siblingPass: u32,
   pub siblingOn: bool,
   pub styleSheets: List<RootSheets>,
+  pendingFirstRootSheets: List<Bytes>,
   styleLoads: List<StyleRequest>,
   styleGeneration: u64,
   nextStyleId: u32,
@@ -1538,6 +1539,40 @@ impl<'a> UiTree<'a> {
     run out.work("style.resolve-styles-calls.past-early-return", w.stylePasses)
     run out.work("style.resolve-styles-calls.full", w.fullStylePasses)
     run out.work("style.root-restyles", w.rootRestyles)
+    run out.work("style.watch-overflows", w.watchOverflows)
+    let dirtyNames = [
+      "style.dirty-cause.00-anchor-set",
+      "style.dirty-cause.01-anchor-clear",
+      "style.dirty-cause.02-css-anchor",
+      "style.dirty-cause.03-restyle",
+      "style.dirty-cause.04-other",
+      "style.dirty-cause.05-other",
+      "style.dirty-cause.06-sheet-order",
+      "style.dirty-cause.07-sheet-remove",
+      "style.dirty-cause.08-font-family",
+      "style.dirty-cause.09-keyframes",
+      "style.dirty-cause.10-touch-root",
+      "style.dirty-cause.11-use-root-touched",
+      "style.dirty-cause.12-font-rules",
+      "style.dirty-cause.13-set-root",
+      "style.dirty-cause.14-style-prefs",
+      "style.dirty-cause.15-font-face-load",
+      "style.dirty-cause.16-font-face-fail",
+      "style.dirty-cause.17-page-zoom",
+      "style.dirty-cause.18-style-env",
+      "style.dirty-cause.19-adopt-sheet",
+      "style.dirty-cause.20-media-cond",
+      "style.dirty-cause.21-class-wrap",
+      "style.dirty-cause.22-scope-limit",
+      "style.dirty-cause.23-detached",
+    ]
+    let mut dirtyCause: usize = 0
+    while dirtyCause < dirtyNames.length {
+      if w.dirtyCauses[dirtyCause] != 0 {
+        run out.work(dirtyNames[dirtyCause], w.dirtyCauses[dirtyCause])
+      }
+      dirtyCause = dirtyCause + 1
+    }
     run out.work("style.media-conditions-evaluated", w.conditionsEvaluated)
     run out.work("style.rules-walked-for-conditions", w.conditionRulesWalked)
     run out.work("style.resolves", w.resolves)
@@ -1625,6 +1660,7 @@ impl<'a> UiTree<'a> {
       siblingPass: 0,
       siblingOn: false,
       styleSheets: List<RootSheets>.make(),
+      pendingFirstRootSheets: List<Bytes>.make(),
       styleLoads: List<StyleRequest>.make(),
       styleGeneration: 0,
       nextStyleId: 1,
@@ -3811,6 +3847,7 @@ impl<'a> UiTree<'a> {
       movedScope: NONE,
       variableFree: false,
       styleWatch: 0,
+      activeTransitions: 0,
       computedStamp: 0,
       selectorIdentity: Thin<NodeIdentity>.none(),
       paintCache: NONE,
@@ -4765,6 +4802,9 @@ impl<'a> UiTree<'a> {
       run self.setRootNode(index, slot)
       self.currentOpen = true
       self.currentOptions = move options
+      if root == FIRST_ROOT && self.pendingFirstRootSheets.length() != 0 {
+        run self.installPendingFirstRootSheets(index)
+      }
       return ()
     }
     let mut open = usize.toU32(self.parked.length())
@@ -4783,6 +4823,9 @@ impl<'a> UiTree<'a> {
       run self.setRootNode(index, slot)
       self.currentOpen = true
       self.currentOptions = move options
+      if root == FIRST_ROOT && self.pendingFirstRootSheets.length() != 0 {
+        run self.installPendingFirstRootSheets(index)
+      }
       return ()
     }
 
@@ -6212,6 +6255,28 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  /// Registers compiled application stylesheets to adopt automatically when `FIRST_ROOT` opens.
+  pub effect fn setPendingFirstRootSheets(self: &mut Self, sources: &[Bytes]) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    self.pendingFirstRootSheets.clear()
+    let mut i: usize = 0
+    while i < sources.length {
+      run self.pendingFirstRootSheets.append(run Bytes.copy(sources[i].asSlice()))
+      i = i + 1
+    }
+  }
+
+  effect fn installPendingFirstRootSheets(self: &mut Self, index: usize) -> ()
+    ! TreeError | OutOfMemoryError ? &mut Allocator {
+    let sources = Intrinsic.replace(self.pendingFirstRootSheets, List<Bytes>.make())
+    let mut i: usize = 0
+    while i < sources.length() {
+      let id = u32.MAX - usize.toU32(i)
+      run self.adoptSheet(index, FIRST_ROOT, id, sources.asSlice()[i].asSlice(), false)
+      i = i + 1
+    }
+  }
+
   effect fn adoptSheet(self: &mut Self, index: usize, root: u32, id: u32, bytes: &[u8], replace: bool) -> ()
     ! TreeError | OutOfMemoryError ? &mut Allocator {
     run self.adoptSheetFrom(index,root,id,bytes,replace,"")
@@ -6500,20 +6565,28 @@ impl<'a> UiTree<'a> {
   }
 
 
+  fn hasPlayingAnimation(self: &Self, slot: u32) -> bool {
+    if self.animations.length() == 0 { return false }
+    let range = animation.rangeOf(self.animations.asSlice(), slot)
+    return range[0] < range[1]
+  }
+
   /// The node whose computed values `slot` can copy, or NONE: the twin it just took its record
   /// from, when both inherit from one parent, or from parents that hold one set of values, and
   /// nothing feeds the style but that record and what is inherited. Motion, inspector
   /// overrides, anchors and focus are per node, so any of them keeps the node computing.
   fn computedLender(self: &Self, slot: u32) -> u32 {
-    if self.transitions.length() != 0 || self.animations.length() != 0 || self.overrides.length() != 0 || self.anchors.length() != 0 { return NONE }
+    if self.overrides.length() != 0 { return NONE }
     let node = self.node(slot)
     let lender = node.styleTwin
     if lender == NONE || node.kind != NodeKind.Box || node.isGenerated() || self.focused == slot || self.focused == lender { return NONE }
-    if node.hasTransition() || node.starting().length != 0 || node.styleNeedsContext { return NONE }
+    if node.activeTransitions != 0 || node.hasTransition() || node.starting().length != 0 || node.styleNeedsContext { return NONE }
     let other = self.node(lender)
     if !other.live || other.styleDirty || other.computedStamp == 0 || other.styleClass != node.styleClass { return NONE }
-    if other.kind != NodeKind.Box || other.isGenerated() || other.hasTransition() || other.styleNeedsContext { return NONE }
+    if other.kind != NodeKind.Box || other.isGenerated() || other.activeTransitions != 0 || other.hasTransition() || other.styleNeedsContext { return NONE }
     if other.hovered != node.hovered || other.pressed != node.pressed { return NONE }
+    if self.hasPlayingAnimation(slot) || self.hasPlayingAnimation(lender) { return NONE }
+    if self.anchors.length() != 0 && (anchoring.find(&self, node.id) != usize.MAX || anchoring.find(&self, other.id) != usize.MAX) { return NONE }
     let same = match &node.resolvedSheet {
       Option<Frozen<Resolved>>.Some { value: mine } => match &other.resolvedSheet {
         Option<Frozen<Resolved>>.Some { value: theirs } => Frozen.same(&mine, &theirs) && mine.get().plain
@@ -6640,8 +6713,11 @@ impl<'a> UiTree<'a> {
       }
       let mut prepared = Option<Resolved>.None
       let mut content = Option<String>.None
+      let maySubject = if !enabled { false }
+        else if target == PseudoTarget.Before { self.styleSheets.asSlice()[at].beforeSubjects.mayMatch(self.node(origin), self.isRootNode(origin)) }
+        else { self.styleSheets.asSlice()[at].afterSubjects.mayMatch(self.node(origin), self.isRootNode(origin)) }
       // A pseudo-element with no box yet keeps none unless something may give it content.
-      if enabled && (old != NONE || run self.mayGenerate(origin, target)) {
+      if enabled && (old != NONE || (maySubject && run self.mayGenerate(origin, target))) {
         let rendered = old != NONE && style_change.rendered(&self, old)
         let value = run self.resolveGeneratedStyle(origin, target, StateBits.empty(), rendered)
         let mut counted = false
@@ -7208,12 +7284,24 @@ impl<'a> UiTree<'a> {
           run StartingSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
         } else { StartingSubjects.make() }
         roots[sheetIndex].hasGenerated = generated.hasContent(&roots[sheetIndex].sheets)
+        roots[sheetIndex].beforeSubjects = if roots[sheetIndex].hasGenerated {
+          run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.Before, true)
+        } else { PseudoSubjects.make() }
+        roots[sheetIndex].afterSubjects = if roots[sheetIndex].hasGenerated {
+          run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.After, true)
+        } else { PseudoSubjects.make() }
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasFirstLetter = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLetter)
         roots[sheetIndex].hasFirstLine = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLine)
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
+        roots[sheetIndex].selectionSubjects = if roots[sheetIndex].hasSelection {
+          run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.Selection, false)
+        } else { PseudoSubjects.make() }
         roots[sheetIndex].hasPlaceholder = placeholder.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasScrollbars = scrollbar_parts.present(&roots[sheetIndex].sheets)
+        roots[sheetIndex].scrollbarSubjects = if roots[sheetIndex].hasScrollbars {
+          run PseudoSubjects.collectScrollbars(&roots[sheetIndex].sheets, &mut self.styleAtoms)
+        } else { PseudoSubjects.make() }
       }
       roots[sheetIndex].cache.reset()
     }
@@ -7711,7 +7799,6 @@ impl<'a> UiTree<'a> {
   fn wholeLender(self: &Self, slot: u32) -> u32 {
     let node = self.node(slot)
     if node.styleTwin == NONE || node.generatedSuppressed || node.moving.isSome() { return NONE }
-    if self.listsUsed || self.letterUsed { return NONE }
     let lender = self.computedLender(slot)
     if lender == NONE { return NONE }
     let other = self.node(lender)
@@ -7892,7 +7979,7 @@ impl<'a> UiTree<'a> {
     let parentRendered = parent == NONE || self.node(parent).rendered
     let rendered = parentRendered && !computed.layout.display.isNone()
     let needsMotion = kind != NodeKind.Text && (!simpleStyles || self.node(slot).hasTransition()
-      || self.node(slot).starting().length != 0 || self.transitions.length() != 0 || self.animations.length() != 0)
+      || self.node(slot).starting().length != 0 || self.node(slot).activeTransitions != 0 || self.hasPlayingAnimation(slot))
     // What `filter`, which lives in the paint effects, eases with (see `moveFilters`).
     let mut filterBefore = false
     let mut motionAnimated: u64 = 0
@@ -7935,14 +8022,16 @@ impl<'a> UiTree<'a> {
         let mut currentStops = Intrinsic.replace(self.easingStops, EasingStops.make())
         run self.applyNodeLengths(slot, &mut computed, &parentStyle, &mut currentStops, &currentUnits)
         self.easingStops = move currentStops
-        let transitions = self.transitions.asSlice()
-        let mut i: usize = 0
-        while i < transitions.length {
-          let item = transitions[i]
-          if item.slot == slot && item.id == self.node(slot).id {
-            motion.write(&mut computed, item.field, motion.sample(&moving, item.field))
+        if self.node(slot).activeTransitions != 0 {
+          let transitions = self.transitions.asSlice()
+          let mut i: usize = 0
+          while i < transitions.length {
+            let item = transitions[i]
+            if item.slot == slot && item.id == self.node(slot).id {
+              motion.write(&mut computed, item.field, motion.sample(&moving, item.field))
+            }
+            i = i + 1
           }
-          i = i + 1
         }
       }
       if animated != 0 {

@@ -49,3 +49,43 @@ test effect fn windowClientAdoptsCompiledSheetsBeforeFirstFrame() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run firstFrame() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn preloadBeforeStart() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  tree.input = FrameInput { width: 420.0, height: 200.0, scale: 1.0, time: 0.0 }
+  let domain = run WaiterDomain.make()
+  let memoryAllocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run memoryAllocator.observe()
+  let mut app = run JsApp.open(&memory, move memoryAllocator, domain.handle())
+  run app.define(b"@silkui/core", uiPackage())
+  run app.entry(b"app.js", b"import {createBox,mount} from '@silkui/core'; const box=createBox(); box.className='card'; mount(box); const w = box.getBoundingClientRect().width; box.setAttribute('data-w', String(Math.round(w)));")
+  let bytes = runtimeStylesheets().call(b".card { width: 123px; padding: 16px; transition: width 200ms; }").unwrapOr(Bytes.make())
+  run Testing.expect(bytes.length() != 0, "test sheet compiles")
+  let mut client = JsClient.make(NoTools {})
+  client.stylesheets = run StyleAssets.from(&[bytes.asSlice()])
+  let result = run Effect.result(checkPreload(&mut client, &mut app, &mut tree))
+  run app.close()
+  match move result {
+    Result.Success { .. } => {}
+    Result.Failure { error } => { fail move error }
+  }
+}
+
+effect fn checkPreload<'m>(client: &mut JsClient<NoTools>, app: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  run WindowClient<JsApp<'m>, never, never>.start(&mut client.*, &mut app.*, &mut tree.*)
+  let slot = tree.slotOf(1)
+  run Testing.expect(tree.node(slot).computed().layout.width.value == 123.0,
+    "start preloads compiled stylesheets before startEntry queries layout")
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 420.0, height: 200.0, scale: 1.0, time: 0.0 })
+  run Testing.expect(tree.transitions.length() == 0,
+    "first frame layout does not start spurious transitions from unstyled startEntry")
+}
+
+test effect fn windowClientPreloadsCompiledSheetsBeforeStartEntryLayoutRead() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run preloadBeforeStart() |> Effect.provideMut<Allocator>(&mut allocator)
+}
