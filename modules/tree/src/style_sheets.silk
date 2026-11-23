@@ -567,6 +567,8 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
   let selected = run sheet_cascade.winners(declarations.asSlice(), ranks.asSlice())
   let mut winning = List<Declaration>.make()
   let mut winningExpressions = List<Expression>.make()
+  let mut targets = List<Property>.make()
+  let mut projected = List<Option<Value>>.make()
   i = 0
   while i < declarations.length() {
     let declaration = &declarations.asSlice()[i]
@@ -575,8 +577,9 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
     let mut whole = declaration.property == Property.WhiteSpace || declaration.property == Property.VerticalAlign || declaration.property == Property.TextAlign
       || declaration.property == Property.BorderImage || declaration.property == Property.MaskBorder
     if sheet_cascade.wide(&declaration.value).isSome() { whole = false }
+    let count = catalog.longhandCount(declaration.property)
     let mut check: usize = 0
-    while whole && check < catalog.longhandCount(declaration.property) {
+    while whole && check < count {
       if selected[catalog.index(catalog.longhandAt(declaration.property, check))] != i { whole = false }
       check = check + 1
     }
@@ -585,39 +588,55 @@ effect fn finish(mut declarations: List<Declaration>, ranks: List<Priority>, mut
       i = i + 1
       continue
     }
+    targets.truncate(0)
+    projected.truncate(0)
+    if count == 1 && catalog.longhandAt(declaration.property, 0) == declaration.property {
+      if selected[catalog.index(declaration.property)] == i {
+        run targets.append(declaration.property)
+        run projected.append(Option<Value>.some(run values.clone(&declaration.value)))
+      }
+    } else {
+      let mut at: usize = 0
+      while at < count {
+        let target = catalog.longhandAt(declaration.property, at)
+        if selected[catalog.index(target)] == i { run targets.append(target) }
+        at = at + 1
+      }
+      if targets.length() != 0 {
+        run written.longhands(declaration, targets.asSlice(), &mut projected)
+      }
+    }
     let mut at: usize = 0
-    while at < catalog.longhandCount(declaration.property) {
-      let target = catalog.longhandAt(declaration.property, at)
-      if selected[catalog.index(target)] == i {
-        let projected = run written.longhand(declaration, target)
-        if let Option<Value>.Some { value } = move projected {
-          let mut expressionIndex: usize = 0
-          while expressionIndex < expressions.length() {
-            let expression = &expressions.asSlice()[expressionIndex]
-            if expression.index == i && (target == declaration.property || convert.color(&value).isSome()) {
-              run winningExpressions.append(Expression { index: winning.length(), program: run expression.program.copy() })
-              break
-            }
-            expressionIndex = expressionIndex + 1
+    while at < projected.length() {
+      let target = targets.asSlice()[at]
+      let item = Intrinsic.replace(projected.asMutSlice()[at], Option<Value>.None)
+      if let Option<Value>.Some { value } = move item {
+        let mut expressionIndex: usize = 0
+        while expressionIndex < expressions.length() {
+          let expression = &expressions.asSlice()[expressionIndex]
+          if expression.index == i && (target == declaration.property || convert.color(&value).isSome()) {
+            run winningExpressions.append(Expression { index: winning.length(), program: run expression.program.copy() })
+            break
           }
-          let mut resolved = move value
-          if let Option<Wide>.Some { value: wide } = &sheet_cascade.wide(&resolved) {
-            let inherits = wide == Wide.Inherit || (wide == Wide.Unset && (highlight || catalog.inherited(target)))
-            if inherits && parent != NONE {
-              resolved = values.keyword(Keyword.Inherit)
-            } else {
-              if target == Property.Color {
-                let rgba = colors.toSrgb(system[colors.systemIndex(SystemColor.CanvasText)])
-                resolved = values.color(Rgba<f32> { r: f64.toF32(rgba.r), g: f64.toF32(rgba.g), b: f64.toF32(rgba.b), a: f64.toF32(rgba.a) })
-              } else if paint_css.handles(target) {
-                resolved = run written.value(catalog.initial(target))
-              } else {
-                resolved = values.keyword(Keyword.Initial)
-              }
-            }
-          }
-          run winning.append(Declaration { property: target, important: declaration.important, value: move resolved })
+          expressionIndex = expressionIndex + 1
         }
+        let mut resolved = move value
+        if let Option<Wide>.Some { value: wide } = &sheet_cascade.wide(&resolved) {
+          let inherits = wide == Wide.Inherit || (wide == Wide.Unset && (highlight || catalog.inherited(target)))
+          if inherits && parent != NONE {
+            resolved = values.keyword(Keyword.Inherit)
+          } else {
+            if target == Property.Color {
+              let rgba = colors.toSrgb(system[colors.systemIndex(SystemColor.CanvasText)])
+              resolved = values.color(Rgba<f32> { r: f64.toF32(rgba.r), g: f64.toF32(rgba.g), b: f64.toF32(rgba.b), a: f64.toF32(rgba.a) })
+            } else if paint_css.handles(target) {
+              resolved = run written.value(catalog.initial(target))
+            } else {
+              resolved = values.keyword(Keyword.Initial)
+            }
+          }
+        }
+        run winning.append(Declaration { property: target, important: declaration.important, value: move resolved })
       }
       at = at + 1
     }
