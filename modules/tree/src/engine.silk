@@ -111,7 +111,7 @@ import timing
 import timing { EasingStops }
 import transform
 import style
-import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Float, Position, WhiteSpaceCollapse, Align, OverflowAlignment }
+import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInside, WritingMode, Direction, UnicodeBidi, Float, Position, WhiteSpaceCollapse, Align, OverflowAlignment }
 import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
@@ -145,6 +145,7 @@ import style_attributes
 import ui_protocol.aria { isNamedAttribute }
 import live_svg
 import live_svg { LiveSvg }
+import svg_styles
 import thin { Thin }
 import node {
   ASKED_UP_SHIFT,
@@ -941,6 +942,7 @@ pub struct UiTree<'a> {
   pendingFirstRootSheets: List<Bytes>,
   styleLoads: List<StyleRequest>,
   styleGeneration: u64,
+  pub svgStyleRevision: u64,
   nextStyleId: u32,
   hostStylePreferences: Option<Preferences>,
   free: List<u32>,
@@ -1691,6 +1693,7 @@ impl<'a> UiTree<'a> {
       pendingFirstRootSheets: List<Bytes>.make(),
       styleLoads: List<StyleRequest>.make(),
       styleGeneration: 0,
+      svgStyleRevision: 1,
       nextStyleId: 1,
       hostStylePreferences: Option<Preferences>.None,
       free: List<u32>.make(),
@@ -2426,6 +2429,8 @@ impl<'a> UiTree<'a> {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX { return Extent.none() }
     let sheets = &self.styleSheets.asSlice()[at]
+    // Generated content can read any attribute of its origin with attr().
+    let mut least = if sheets.hasGenerated { Extent.itself() } else { Extent.none() }
     let mut any = false
     let mut i: usize = 0
     while i < names.length {
@@ -2438,11 +2443,13 @@ impl<'a> UiTree<'a> {
         derived.anchors = true
         return derived
       }
+      // HTML `dir` is a presentational hint for `direction` (inherited) and `unicode-bidi`.
+      if css_tokens.insensitive(names[i], b"dir") {
+        least = least.with(Extent.of(Reach.Subtree))
+      }
       i = i + 1
     }
     if !any { return Extent.none() }
-    // Generated content can read any attribute of its origin with attr().
-    let least = if sheets.hasGenerated { Extent.itself() } else { Extent.none() }
     if !sheets.states.attributes { return least }
     return least.with(style_invalidation.attributeReach(&sheets.sheets, &self.styleAtoms, names, ids))
   }
@@ -7311,6 +7318,7 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.work.stylePasses = self.work.stylePasses + 1
+    self.svgStyleRevision = self.svgStyleRevision + 1
     if self.stylesDirty {
       run sheet_faces.sync(&mut self)
       if run font_rules.sync(&mut self) { self.fontRulesChanged() }
@@ -7992,7 +8000,12 @@ impl<'a> UiTree<'a> {
         computed.layout.overflowX = Overflow.Hidden
         computed.layout.overflowY = Overflow.Hidden
       }
+    } else if initialNode.kind == NodeKind.Icon {
+      // HTML/SVG UA default: `svg:not(:root) { overflow: hidden }`, overridable by author CSS.
+      computed.layout.overflowX = Overflow.Hidden
+      computed.layout.overflowY = Overflow.Hidden
     }
+    applyDirAttribute(initialNode, &mut computed)
     if initialNode.hasTransition() {
       run stops.read(String.utf8Bytes(initialNode.transition()))
       run motion.declare(&mut computed.transition, motion.SHORTHAND, String.utf8Bytes(initialNode.transition()), &mut stops)
@@ -9957,6 +9970,7 @@ impl<'a> UiTree<'a> {
     let _paintSpan = Prof.span("ui_tree.paint")
     run self.loadFaces()
     run self.collectIconVariables()
+    run svg_styles.sync(&mut self)
     run text_selection.refresh(&mut self)
     if run motion.slides(&mut self) {
       // A node that starts or stops being a move paints through another group.
@@ -10116,6 +10130,7 @@ impl<'a> UiTree<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.collectIconVariables()
+    run svg_styles.sync(&mut self)
     // Between a layout pass and the refresh, stacking lists no roots to paint from.
     if self.repair.pending && !self.paintCachesStale { run self.refreshPaintCaches() }
     let window = ContentMask.new(
@@ -10649,6 +10664,32 @@ fn inheritTable(target: &mut CssStyle, parent: &CssStyle) {
   target.borderSpacingX = parent.borderSpacingX
   target.borderSpacingY = parent.borderSpacingY
   target.captionSide = parent.captionSide
+}
+
+// HTML `dir` attribute presentational hint: maps `rtl`/`ltr` to CSS `direction` + `unicode-bidi: isolate`
+// and `auto` to `unicode-bidi: plaintext`, before author styles so CSS overrides it.
+fn applyDirAttribute(node: &Node, computed: &mut Computed) {
+  if let Option.Some { value: identity } = node.identity() {
+    let attributes = identity.attributes()
+    let mut i: usize = 0
+    while i < attributes.length {
+      let name = String.utf8Bytes(String.view(&attributes[i].name))
+      if css_tokens.insensitive(name, b"dir") {
+        let value = String.utf8Bytes(String.view(&attributes[i].value))
+        if css_tokens.insensitive(value, b"rtl") {
+          computed.apply(&declare.direction(Direction.Rtl))
+          computed.apply(&declare.unicodeBidi(UnicodeBidi.Isolate))
+        } else if css_tokens.insensitive(value, b"ltr") {
+          computed.apply(&declare.direction(Direction.Ltr))
+          computed.apply(&declare.unicodeBidi(UnicodeBidi.Isolate))
+        } else if css_tokens.insensitive(value, b"auto") {
+          computed.apply(&declare.unicodeBidi(UnicodeBidi.Plaintext))
+        }
+        return ()
+      }
+      i = i + 1
+    }
+  }
 }
 
 // HTML's `colspan` and `rowspan` on cells and `span` on columns, for the table layout.

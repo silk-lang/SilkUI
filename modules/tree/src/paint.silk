@@ -1821,24 +1821,35 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
         let mut viewportWidth: f64 = 0.0
         let mut viewportHeight: f64 = 0.0
         if kind == NodeKind.Icon {
-          // Page CSS on the root, and the custom properties the markup reads.
+          // Page CSS on the root, custom properties, and any page CSS rules matched on inner SVG elements.
           let mut css = run c.svg.css()
           let mut key = c.svg.key()
           if let Option.Some { value: variables } = p.resources.iconVariables(slot) {
             run css.appendSlice(variables.css.asSlice())
             key = Hash.combine(key, variables.key)
           }
-          if css.length() != 0 {
+          let mut styledKey: u64 = 0
+          let mut styledMarkup = List<u8>.make()
+          if let Option.Some { value: styled } = p.resources.styledIcon(slot, resource) {
+            styledKey = Hash.combine(key, styled.key)
+            run styledMarkup.appendSlice(styled.markup.asSlice())
+          }
+          if styledMarkup.length() != 0 {
+            if let Option.Some { value: painted } = run p.resources.paintedIconFromMarkup(&mut p.atlas, resource, styledKey, styledMarkup.asSlice(), css.asSlice()) {
+              icon = painted
+            }
+          } else if css.length() != 0 {
             if let Option.Some { value: painted } = run p.resources.paintedIcon(&mut p.atlas, resource, key, css.asSlice()) { icon = painted }
           }
           // An inline svg's viewport is its CSS box, which overrides the root's own size. In a
-          // box of another shape than the svg's, its preserveAspectRatio places it there without
-          // re-parsing the markup or re-running currentColor classification on resize.
+          // box of another shape than the svg's (or when the root gave no pixel size), its
+          // preserveAspectRatio places it there without re-parsing the markup.
           let ownRatio = f64.toF32(p.resources.iconRatio(icon))
           let width = content.width() / p.scale
           let height = content.height() / p.scale
-          if ownRatio > 0.0 && f32.isFinite(ownRatio) && width > 0.0 && height > 0.0
-            && f32.abs(width / height - ownRatio) > ownRatio * 0.001 {
+          let missingSize = p.resources.iconWidth(icon) <= 0.0 || p.resources.iconHeight(icon) <= 0.0
+          if width > 0.0 && height > 0.0
+            && (missingSize || (ownRatio > 0.0 && f32.isFinite(ownRatio) && f32.abs(width / height - ownRatio) > ownRatio * 0.001)) {
             viewportWidth = f32.toF64(width)
             viewportHeight = f32.toF64(height)
           }
@@ -1879,11 +1890,21 @@ effect fn paintContent(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: C
               }
             }
           }
+          // Cap rasterization size to 4096px per side so huge SVGs (e.g. map canvases) still fit
+          // in the atlas and render cleanly without hitting texture or pixel budgets.
+          let maxSide: f32 = 4096.0
+          let mut texW = renderW
+          let mut texH = h
+          if texW > maxSide || texH > maxSide {
+            let shrink = f32.min(maxSide / texW, maxSide / texH)
+            texW = f32.max(1.0, f32.floor(texW * shrink + 0.5))
+            texH = f32.max(1.0, f32.floor(texH * shrink + 0.5))
+          }
           let tile = run p.resources.iconTileInViewport(
             &mut p.atlas,
             icon,
-            f32.toU32(renderW),
-            f32.toU32(h),
+            f32.toU32(texW),
+            f32.toU32(texH),
             renderViewportW,
             viewportHeight,
             p.time,
@@ -1975,19 +1996,27 @@ effect fn appendPixels(out: &mut List<u8>, value: f32) -> () ! OutOfMemoryError 
   run out.appendSlice(b"px;")
 }
 
+effect fn copyList(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut out = List<u8>.make()
+  run out.appendSlice(bytes)
+  return move out
+}
+
 /// Paints the live svg of icon node `slot` over `content`, its content box in device pixels.
 effect fn paintLiveSvg(p: &mut Painter<'_, '_>, slot: u32, content: Rect<f32>, mask: ContentMask) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let index = u32.toUsize(slot)
-  let color = p.nodes.asSlice()[index].computed().text.color
+  let c = p.nodes.asSlice()[index].computed().*
+  let color = c.text.color
+  let clipToViewport = c.clips()
   let seed = Hash.mix(&p.seed, u32.toU64(p.nodes.asSlice()[index].id) + 0x5356470000000000)
   let taken = Intrinsic.replace(p.nodes.asMutSlice()[index].svg, Thin<LiveSvg>.none())
   if let Option<&LiveSvg>.Some { value } = taken.get() {
-    let css = p.nodes.asSlice()[index].computed().svg
+    let css = c.svg
     let root = RootPaint { fill: livePaint(css.fillKind, css.fill), stroke: livePaint(css.strokeKind, css.stroke), strokeWidth: css.strokeWidth }
     let mut canvas = LiveCanvas { scene: &mut p.scene.*, paths: &mut p.paths.*, seed: seed, color: color, root: root }
-    run live_svg.paint(value, &mut canvas, content, mask)
+    run live_svg.paint(value, &mut canvas, content, p.scale, clipToViewport, mask)
   }
   let nodes = p.nodes.asMutSlice()
   nodes[index].svg = move taken
@@ -2424,6 +2453,10 @@ fn ownInk(
     return unboundedInk()
   }
   let c = &node.computed().*
+  // An inline `<svg>` with `overflow: visible` (e.g. a 1x1 edge overlay) can draw anywhere.
+  if node.kind == NodeKind.Icon && !c.clips() {
+    return unboundedInk()
+  }
   let mut reach: f32 = if c.clips() && !c.decorated() && !c.effects.declared
     && !c.paint.hasShadow && !c.outline.drawn() {
     0.0
@@ -2736,31 +2769,6 @@ fn localInk(p: &Painter<'_, '_>, index: usize) -> Rect<f32> {
   return total
 }
 
-/// How far to move a transformed layer whose content covers `bounds` (device pixels, before
-/// `matrix`) so the part of it that can land inside `mask` lies inside the `width` by `height`
-/// target, in whole pixels. Zero when it already does.
-fn layerShift(matrix: Matrix3<f32>, bounds: Rect<f32>, mask: Rect<f32>, width: f32, height: f32) -> [f32; 2] {
-  if bounds.xMin >= 0.0 && bounds.yMin >= 0.0 && bounds.xMax <= width && bounds.yMax <= height {
-    return [0.0, 0.0]
-  }
-  let target = Rect<f32>.new(f32.max(mask.xMin, 0.0), f32.max(mask.yMin, 0.0), f32.min(mask.xMax, width), f32.min(mask.yMax, height))
-  let mut visible = bounds
-  if let Option.Some { value } = matrix.inverse() {
-    let back = transform.mapRect(&value, target)
-    visible = Rect<f32>.new(
-      f32.max(bounds.xMin, back.xMin),
-      f32.max(bounds.yMin, back.yMin),
-      f32.min(bounds.xMax, back.xMax),
-      f32.min(bounds.yMax, back.yMax),
-    )
-  }
-  if visible.xMin >= 0.0 && visible.yMin >= 0.0 && visible.xMax <= width && visible.yMax <= height
-    || visible.xMax <= visible.xMin || visible.yMax <= visible.yMin {
-    return [0.0, 0.0]
-  }
-  return [-f32.floor(visible.xMin), -f32.floor(visible.yMin)]
-}
-
 /// Paints fragment `index` as the group of its node's [`Move`], if it has one: a scroll group
 /// whose position is the translation now, which the renderer moves along the transition by
 /// itself. Paint keeps what shows at either end, so a renderer that runs the whole move alone
@@ -2963,48 +2971,19 @@ effect fn paintLayer(
   let a = flat.values
   let onDevice = Matrix3<f32>.new([a[0], a[1], a[2] / s, a[3], a[4], a[5] / s, a[6] * s, a[7] * s, a[8]])
   let bounds = device(ink, s)
-  // The layer is drawn into a target-sized texture before the matrix maps it, so its visible
-  // part must lie inside the target: shift it there and fold the shift into the matrix.
-  let shift = layerShift(onDevice, bounds, mask.bounds, p.width * s, p.height * s)
-  let tx = shift[0]
-  let ty = shift[1]
-  let shifted = tx != 0.0 || ty != 0.0
-  let b = onDevice.values
-  let matrix = if shifted {
-    Matrix3<f32>.new([
-      b[0], b[1], b[2], b[3], b[4], b[5],
-      b[6] - b[0] * tx - b[3] * ty,
-      b[7] - b[1] * tx - b[4] * ty,
-      b[8] - b[2] * tx - b[5] * ty,
-    ])
-  } else {
-    onDevice
-  }
-  let placed = Rect<f32>.new(bounds.xMin + tx, bounds.yMin + ty, bounds.xMax + tx, bounds.yMax + ty)
   drop run p.scene.pushTransformLayer(
-    placed,
+    bounds,
     mask,
     Isolation { opacity: 1.0, blend: 0 },
-    matrix,
+    onDevice,
   )
-  if shifted {
-    let fixed = ScrollAxis { factor: 0.0, base: 0.0, low: -UNBOUNDED_INK, high: UNBOUNDED_INK }
-    let mut x = fixed
-    x.base = tx
-    let mut y = fixed
-    y.base = ty
-    drop run p.scene.pushScrollGroup(ScrollLink { node: NONE, x: x, y: y }, everywhere(), placed)
-  }
   p.cull = everywhere()
-  let cut = run cutTo(&mut p, flat, placed, clip)
+  let cut = run cutTo(&mut p, flat, bounds, clip)
   run paintFragmentIn(&mut p, index, ContentMask.new(everywhere()))
   if cut {
     run p.scene.popLayer()
   }
   p.cull = saved
-  if shifted {
-    run p.scene.popScrollGroup()
-  }
   run p.scene.popLayer()
 }
 

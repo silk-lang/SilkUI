@@ -308,6 +308,18 @@ pub struct IconVariables {
   pub mixed: u64,
 }
 
+/// An inline `<svg>` node's markup with page CSS rules resolved and injected onto its elements,
+/// and its cache key.
+pub struct StyledIconMarkup {
+  pub slot: u32,
+  pub resource: u32,
+  pub revision: u64,
+  pub key: u64,
+  pub markup: List<u8>,
+  pub base: u64,
+  pub mixed: u64,
+}
+
 // Icon `id` drawn with the root paint keyed `key`; `icon` is the icon itself when that fails.
 struct Painted {
   id: u32,
@@ -603,6 +615,8 @@ pub struct Resources<'a> {
   painted: List<Painted>,
   /// This frame's custom properties of inline svgs whose markup reads some.
   pub variables: List<IconVariables>,
+  /// Page-CSS-styled markup overrides for inline `<svg>` nodes drawn via lib-svg.
+  pub styledIcons: List<StyledIconMarkup>,
 }
 
 impl<'a> Resources<'a> {
@@ -621,6 +635,7 @@ impl<'a> Resources<'a> {
       markup: List<Markup>.make(),
       painted: List<Painted>.make(),
       variables: List<IconVariables>.make(),
+      styledIcons: List<StyledIconMarkup>.make(),
     }
   }
 
@@ -821,6 +836,78 @@ impl<'a> Resources<'a> {
       i = i + 1
     }
     return Option<&IconVariables>.None
+  }
+
+  /// The raw SVG markup of icon `id`, or empty when not registered as an icon.
+  pub fn rawMarkup(self: &Self, id: u32) -> &[u8] {
+    let markup = self.markup.asSlice()
+    let mut i: usize = 0
+    while i < markup.length {
+      if markup[i].id == id { return markup[i].data.asSlice() }
+      i = i + 1
+    }
+    return b""
+  }
+
+  /// The page-CSS-styled markup override for the inline svg at `slot`, if any.
+  pub fn styledIcon(self: &Self, slot: u32, resource: u32) -> Option<&StyledIconMarkup> {
+    let all = self.styledIcons.asSlice()
+    let mut i: usize = 0
+    while i < all.length {
+      if all[i].slot == slot && all[i].resource == resource && all[i].markup.length() != 0 {
+        return Option<&StyledIconMarkup>.some(&all[i])
+      }
+      i = i + 1
+    }
+    return Option<&StyledIconMarkup>.None
+  }
+
+  /// Icon `id` rendered from pre-styled markup `data` (and optional root `css`), keyed `key`.
+  pub effect fn paintedIconFromMarkup(
+    self: &mut Self,
+    atlas: &mut Atlas,
+    id: u32,
+    key: u64,
+    data: &[u8],
+    css: &[u8],
+  ) -> Option<IconId>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let base = match self.get(id) {
+      Option<Resource>.Some { value: Resource.Icon { icon } } => icon
+      _ => { return Option<IconId>.None }
+    }
+    let painted = self.painted.asSlice()
+    let mut i: usize = 0
+    let mut count: usize = 0
+    while i < painted.length {
+      if painted[i].id == id {
+        if painted[i].key == key { return Option<IconId>.some(painted[i].icon) }
+        count = count + 1
+      }
+      i = i + 1
+    }
+    if count >= PAINTS_PER_ICON { run self.forgetPaints(&mut atlas, id, base, 1) }
+    let mut styled = List<u8>.make()
+    let source = if css.length != 0 {
+      styled = run withRootStyle(data, css)
+      styled.asSlice()
+    } else {
+      data
+    }
+    let mut made = base
+    if source.length != 0 {
+      let registered = run Effect.result(self.registerIcon(source))
+      match move registered {
+        Result<IconId, ResourceError | OutOfMemoryError>.Success { value } => { made = value }
+        Result<IconId, ResourceError | OutOfMemoryError>.Failure { error } => match move error {
+          OutOfMemoryError failure => { fail move failure }
+          ResourceError _ => {}
+        }
+      }
+    }
+    run self.painted.append(Painted { id: id, key: key, icon: made })
+    return Option<IconId>.some(made)
   }
 
   /// Icon `id` with `css`, declarations keyed `key`, on its root's style: page CSS on an inline

@@ -1870,6 +1870,16 @@ function liveAttribute(name, text) {
   return !UNLIVE_ATTRIBUTES.has(name) && !(name === "style" && UNLIVE_STYLE.test(text));
 }
 
+/** Whether any element inside `child` carries class/data attributes that page CSS can target. */
+function hasStyledDescendant(child) {
+  if (!(child instanceof SvgElement)) return false;
+  for (const [name] of child._attributes()) {
+    if (name === "class" || name.startsWith("data-")) return true;
+  }
+  for (const grandchild of child.childNodes) if (hasStyledDescendant(grandchild)) return true;
+  return false;
+}
+
 /** Whether the tree's live svg can draw `child` and what is in it. */
 function liveable(child, quiet = false) {
   if (!(child instanceof SvgElement)) return quiet;
@@ -2471,7 +2481,8 @@ export class Svg extends Node {
 
   _draw() {
     if (nodes[this.nodeId] === undefined || this._live) return;
-    if (this._extra && this.childNodes.every((child) => liveable(child))) {
+    const canGoLive = this.childNodes.length > 0 && this.childNodes.every((child) => liveable(child));
+    if (canGoLive && (this._extra || !this.#attributes.has("viewBox") || this.childNodes.some(hasStyledDescendant))) {
       this._goLive();
       return;
     }

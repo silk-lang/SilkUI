@@ -112,6 +112,33 @@ pub fn tagOf(name: &[u8]) -> Tag {
   }
 }
 
+/// The lowercase tag name of `tag` as CSS selectors match it.
+pub fn tagName(tag: Tag) -> &'static [u8] {
+  return match tag {
+    Tag.Svg => b"svg"
+    Tag.G => b"g"
+    Tag.Path => b"path"
+    Tag.Rect => b"rect"
+    Tag.Circle => b"circle"
+    Tag.Ellipse => b"ellipse"
+    Tag.Line => b"line"
+    Tag.Polyline => b"polyline"
+    Tag.Polygon => b"polygon"
+    Tag.Defs => b"defs"
+    Tag.ClipPath => b"clipPath"
+    Tag.LinearGradient => b"linearGradient"
+    Tag.RadialGradient => b"radialGradient"
+    Tag.Stop => b"stop"
+    Tag.Other => b""
+  }
+}
+
+/// One attribute kept on an element for CSS selector matching (such as `data-*`).
+pub struct Attr {
+  pub name: Bytes,
+  pub value: Bytes,
+}
+
 fn isShape(tag: Tag) -> bool {
   return tag == Tag.Path || tag == Tag.Rect || tag == Tag.Circle || tag == Tag.Ellipse
     || tag == Tag.Line || tag == Tag.Polyline || tag == Tag.Polygon
@@ -225,11 +252,19 @@ pub struct Element {
   pub used: bool,
   /// The hash of the `id` attribute, 0 for none.
   pub id: u64,
+  /// Raw `id`, `class`, and non-geometry attributes (e.g. `data-*`) for page CSS matching.
+  pub idText: Bytes,
+  pub classes: Bytes,
+  pub attrs: List<Attr>,
   /// Bumped when the element's own geometry or stroke changes: part of its path cache ids.
   pub generation: u64,
   pub attributes: Props,
+  /// Page CSS stylesheet properties resolved for this element (between `attributes` and `styles`).
+  pub sheetStyles: Props,
   pub styles: Props,
   pub transform: Affine,
+  /// Transform set by page CSS (`transform`, `translate`, `scale`, `rotate`), overriding `transform`.
+  pub sheetTransform: Option<Affine>,
   /// Geometry attributes, by [`Geometry`] index.
   pub numbers: [f64; 14],
   /// Which `numbers` were written.
@@ -275,10 +310,15 @@ impl Element {
       previous: NO_ELEMENT,
       used: true,
       id: 0,
+      idText: Bytes.make(),
+      classes: Bytes.make(),
+      attrs: List<Attr>.make(),
       generation: 0,
       attributes: Props.make(),
+      sheetStyles: Props.make(),
       styles: Props.make(),
       transform: Affine.identity(),
+      sheetTransform: Option<Affine>.None,
       numbers: [0.0; 14],
       written: 0,
       data: Bytes.make(),
@@ -320,6 +360,10 @@ pub struct LiveSvg {
   pub height: f64,
   /// Elements whose parsed attributes failed and were dropped since the last check, for tests.
   pub rejected: u32,
+  /// Whether structure or selector-visible attributes changed since page CSS was last matched.
+  pub styleDirty: bool,
+  /// Revision of the last page CSS stylesheet pass that styled this svg.
+  pub styleRevision: u64,
 }
 
 impl LiveSvg {
@@ -328,7 +372,7 @@ impl LiveSvg {
     ? &mut Allocator {
     let mut elements = List<Element>.make()
     run elements.append(Element.make(Tag.Svg))
-    return LiveSvg { elements: move elements, width: 0.0, height: 0.0, rejected: 0 }
+    return LiveSvg { elements: move elements, width: 0.0, height: 0.0, rejected: 0, styleDirty: true, styleRevision: 0 }
   }
 
   pub fn length(self: &Self) -> usize {
@@ -340,7 +384,7 @@ impl LiveSvg {
     return index < self.elements.length() && self.elements.asSlice()[index].used
   }
 
-  fn at(self: &Self, element: u32) -> &Element {
+  pub fn at(self: &Self, element: u32) -> &Element {
     return &self.elements.asSlice()[u32.toUsize(element)]
   }
 
@@ -387,6 +431,7 @@ impl LiveSvg {
       slots[index] = Element.make(tag)
     }
     self.attach(element, parent, before)
+    self.styleDirty = true
     return true
   }
 
@@ -451,6 +496,7 @@ impl LiveSvg {
     }
     self.detach(element)
     self.free(element)
+    self.styleDirty = true
     return true
   }
 
@@ -492,6 +538,14 @@ impl LiveSvg {
     if name == b"id" {
       let touched10 = self.atMut(element)
       touched10.id = if present && text.length != 0 { idHash(text) } else { 0 }
+      touched10.idText = if present { run Bytes.copy(text) } else { Bytes.make() }
+      self.styleDirty = true
+      return true
+    }
+    if name == b"class" {
+      let touchedClass = self.atMut(element)
+      touchedClass.classes = if present { run Bytes.copy(text) } else { Bytes.make() }
+      self.styleDirty = true
       return true
     }
     if name == b"transform" {
@@ -579,7 +633,82 @@ impl LiveSvg {
     if strokeShape(&e.attributes) != before {
       e.generation = e.generation + 1
     }
+    // Keep generic attributes (such as `data-*`) for page CSS selector matching.
+    let mut foundAttr = false
+    let mut ai: usize = 0
+    while ai < e.attrs.length() {
+      if e.attrs.asSlice()[ai].name.asSlice() == name {
+        foundAttr = true
+        if present {
+          let copy = run Bytes.copy(text)
+          let attrSlice = e.attrs.asMutSlice()
+          attrSlice[ai].value = move copy
+        } else {
+          drop e.attrs.remove(ai)
+        }
+        break
+      }
+      ai = ai + 1
+    }
+    if !foundAttr && present {
+      run e.attrs.append(Attr { name: run Bytes.copy(name), value: run Bytes.copy(text) })
+    }
+    self.styleDirty = true
     return true
+  }
+
+  /// Replaces the page CSS stylesheet properties of `element` with `next` and `cssTransform`.
+  /// Returns true when the element's rendered state changed.
+  pub fn setSheetResult(self: &mut Self, element: u32, next: Props, cssTransform: Option<Affine>) -> bool {
+    if !self.has(element) {
+      return false
+    }
+    let e = self.atMut(element)
+    let beforeShape = strokeShape(&e.sheetStyles)
+    let afterShape = strokeShape(&next)
+    let changed = e.sheetStyles.set != next.set || beforeShape != afterShape
+      || e.sheetStyles.fillOpacity != next.fillOpacity
+      || e.sheetStyles.strokeOpacity != next.strokeOpacity
+      || e.sheetStyles.opacity != next.opacity
+      || e.sheetStyles.evenOdd != next.evenOdd
+      || e.sheetStyles.hidden != next.hidden
+      || e.sheetStyles.invisible != next.invisible
+      || e.sheetStyles.clip != next.clip
+      || e.sheetStyles.pointer != next.pointer
+      || !samePaint(e.sheetStyles.fill, next.fill)
+      || !samePaint(e.sheetStyles.stroke, next.stroke)
+      || !sameRgba(e.sheetStyles.color, next.color)
+      || !sameOptionalAffine(e.sheetTransform, cssTransform)
+    e.sheetStyles = move next
+    e.sheetTransform = cssTransform
+    if beforeShape != afterShape {
+      e.generation = e.generation + 1
+    }
+    return changed
+  }
+
+  /// Applies one CSS property (`name: text`) to `props` using the live svg parser.
+  pub effect fn applyCssProperty(props: &mut Props, name: &[u8], text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run property(&mut props.*, name, text)
+  }
+
+  /// Sets a resolved sRGB color property (`fill`, `stroke`, `color`, `stop-color`) on `props`.
+  pub fn applyCssColor(props: &mut Props, name: &[u8], color: Rgba<f32>) -> () {
+    if name == b"fill" {
+      props.fill = Paint.Color { color: color }
+      props.set = props.set | P_FILL
+    } else if name == b"stroke" {
+      props.stroke = Paint.Color { color: color }
+      props.set = props.set | P_STROKE
+    } else if name == b"color" {
+      props.color = color
+      props.set = props.set | P_COLOR
+    } else if name == b"stop-color" {
+      props.stopColor = Paint.Color { color: color }
+      props.set = props.set | P_STOP_COLOR
+    }
   }
 
   /// Builds the element's path from its geometry again.
@@ -1181,15 +1310,20 @@ effect fn cssColor(text: &[u8]) -> Option<Rgba<f32>>
   let buffer = run lexer.tokenize(text, &Limits.make())
   let input = Input.Contiguous { buffer: &buffer, range: buffer.all() }
   let mut cursor = Cursor.make(&input)
-  let parsed = run colors.parse(&input, &mut cursor)
+  let parsed = run colors.parseProgram(&input, &mut cursor)
   if !cursor.done(&input) {
     return Option<Rgba<f32>>.None
   }
-  return match parsed {
-    Option<Color>.Some { value } => {
+  return match move parsed {
+    Option<colors.ColorProgram>.Some { value: program } => {
       let context = ColorContext.make(Color.srgb(0.0, 0.0, 0.0, 1.0), [Color.srgb(0.0, 0.0, 0.0, 1.0); 19])
-      let c = colors.toSrgb(colors.compute(value, &context))
-      Option<Rgba<f32>>.some(Rgba<f32> { r: f64.toF32(c.r), g: f64.toF32(c.g), b: f64.toF32(c.b), a: f64.toF32(c.a) })
+      match program.evaluate(&context) {
+        Option<Color>.Some { value } => {
+          let c = colors.toSrgb(value)
+          Option<Rgba<f32>>.some(Rgba<f32> { r: f64.toF32(c.r), g: f64.toF32(c.g), b: f64.toF32(c.b), a: f64.toF32(c.a) })
+        }
+        _ => Option<Rgba<f32>>.None
+      }
     }
     _ => Option<Rgba<f32>>.None
   }
@@ -1240,8 +1374,8 @@ pub struct RootPaint {
 impl Copy for RootPaint {}
 
 /// The transform from the root's user space to device pixels, for content box `box` (in
-/// device pixels).
-pub fn rootTransform(svg: &LiveSvg, box: Rect<f32>) -> Affine {
+/// device pixels) at device pixel ratio `scale`.
+pub fn rootTransform(svg: &LiveSvg, box: Rect<f32>, scale: f32) -> Affine {
   let root = svg.at(0)
   let width = f32.toF64(box.xMax - box.xMin)
   let height = f32.toF64(box.yMax - box.yMin)
@@ -1251,15 +1385,25 @@ pub fn rootTransform(svg: &LiveSvg, box: Rect<f32>) -> Affine {
       return place * fitted
     }
   }
-  // Without a viewBox, user units are CSS pixels; the box may be scaled from its natural size.
-  let natural = if svg.width > 0.0 { width / svg.width } else { 1.0 }
-  let naturalY = if svg.height > 0.0 { height / svg.height } else { natural }
+  // Without a viewBox, user units are CSS pixels; when the root also gives no pixel width/height
+  // attributes, `scale` maps CSS pixels to device pixels.
+  let s = f32.toF64(scale)
+  let natural = if svg.width > 0.0 { width / svg.width } else { s }
+  let naturalY = if svg.height > 0.0 { height / svg.height } else if svg.width > 0.0 { natural } else { s }
   return place * Affine.scale(natural, naturalY)
 }
 
-/// Paints `svg` into content box `box` (device pixels), clipped to `mask`. `scale` maps CSS
-/// pixels to device pixels; the root transform already includes it through `box`.
-pub effect fn paint(svg: &LiveSvg, canvas: &mut Canvas<'_>, box: Rect<f32>, mask: ContentMask) -> ()
+/// Paints `svg` into content box `box` (device pixels), clipped to `mask` (and to `box` when
+/// `clipToViewport` is true, i.e. `overflow` is not `visible`). `scale` maps CSS pixels to device
+/// pixels.
+pub effect fn paint(
+  svg: &LiveSvg,
+  canvas: &mut Canvas<'_>,
+  box: Rect<f32>,
+  scale: f32,
+  clipToViewport: bool,
+  mask: ContentMask,
+) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let root = svg.at(0)
@@ -1289,32 +1433,87 @@ pub effect fn paint(svg: &LiveSvg, canvas: &mut Canvas<'_>, box: Rect<f32>, mask
   if hiddenOf(root) {
     return ()
   }
-  // The outermost svg clips to its viewport (overflow: hidden).
-  let clipped = mask.intersect(ContentMask.new(box))
-  let transform = rootTransform(svg, box)
+  let clipped = if clipToViewport { mask.intersect(ContentMask.new(box)) } else { mask }
+  let transform = rootTransform(svg, box, scale)
   run paintGroup(svg, &mut canvas.*, 0, &transform, inherited, clipped, 0)
 }
 
 fn hiddenOf(e: &Element) -> bool {
-  return if e.styles.set & P_DISPLAY != 0 { e.styles.hidden } else if e.attributes.set & P_DISPLAY != 0 { e.attributes.hidden } else { false }
+  return if e.styles.set & P_DISPLAY != 0 {
+    e.styles.hidden
+  } else if e.sheetStyles.set & P_DISPLAY != 0 {
+    e.sheetStyles.hidden
+  } else if e.attributes.set & P_DISPLAY != 0 {
+    e.attributes.hidden
+  } else {
+    false
+  }
 }
 
 fn opacityOf(e: &Element) -> f32 {
-  return if e.styles.set & P_OPACITY != 0 { e.styles.opacity } else if e.attributes.set & P_OPACITY != 0 { e.attributes.opacity } else { 1.0 }
+  return if e.styles.set & P_OPACITY != 0 {
+    e.styles.opacity
+  } else if e.sheetStyles.set & P_OPACITY != 0 {
+    e.sheetStyles.opacity
+  } else if e.attributes.set & P_OPACITY != 0 {
+    e.attributes.opacity
+  } else {
+    1.0
+  }
 }
 
 fn clipOf(e: &Element) -> u64 {
-  return if e.styles.set & P_CLIP != 0 { e.styles.clip } else if e.attributes.set & P_CLIP != 0 { e.attributes.clip } else { 0 }
+  return if e.styles.set & P_CLIP != 0 {
+    e.styles.clip
+  } else if e.sheetStyles.set & P_CLIP != 0 {
+    e.sheetStyles.clip
+  } else if e.attributes.set & P_CLIP != 0 {
+    e.attributes.clip
+  } else {
+    0
+  }
 }
 
-/// The props of `e` that set `bit`: its style over its attributes, or none.
+/// The props of `e` that set `bit`: inline style over page CSS over presentation attributes.
 fn propsFor(e: &Element, bit: u32) -> Option<&Props> {
   return if e.styles.set & bit != 0 {
     Option<&Props>.some(&e.styles)
+  } else if e.sheetStyles.set & bit != 0 {
+    Option<&Props>.some(&e.sheetStyles)
   } else if e.attributes.set & bit != 0 {
     Option<&Props>.some(&e.attributes)
   } else {
     Option<&Props>.None
+  }
+}
+
+fn elementTransform(e: &Element) -> Affine {
+  return match e.sheetTransform {
+    Option<Affine>.Some { value } => value
+    Option<Affine>.None => e.transform
+  }
+}
+
+fn sameRgba(a: Rgba<f32>, b: Rgba<f32>) -> bool {
+  return a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a
+}
+
+fn samePaint(a: Paint, b: Paint) -> bool {
+  return match a {
+    Paint.None => match b { Paint.None => true _ => false }
+    Paint.Current => match b { Paint.Current => true _ => false }
+    Paint.Color { color: ca } => match b { Paint.Color { color: cb } => sameRgba(ca, cb) _ => false }
+    Paint.Url { ref: ra } => match b { Paint.Url { ref: rb } => ra == rb _ => false }
+  }
+}
+
+fn sameOptionalAffine(a: Option<Affine>, b: Option<Affine>) -> bool {
+  return match a {
+    Option<Affine>.None => b.isNone()
+    Option<Affine>.Some { value: x } => match b {
+      Option<Affine>.Some { value: y } => x.xx == y.xx && x.yx == y.yx && x.xy == y.xy && x.yy == y.yy && x.dx == y.dx && x.dy == y.dy
+      Option<Affine>.None => false
+    }
   }
 }
 
@@ -1349,7 +1548,7 @@ fn inherit(svg: &LiveSvg, parent: Inherited, element: u32) -> Inherited {
   if let Option<&Props>.Some { value } = propsFor(e, P_MITER) {
     out.miter = value.miter
   }
-  if e.styles.set & P_DASHES != 0 || e.attributes.set & P_DASHES != 0 {
+  if e.styles.set & P_DASHES != 0 || e.sheetStyles.set & P_DASHES != 0 || e.attributes.set & P_DASHES != 0 {
     out.dashes = element
   }
   if let Option<&Props>.Some { value } = propsFor(e, P_DASH_OFFSET) {
@@ -1373,7 +1572,13 @@ fn dashesOf(svg: &LiveSvg, from: u32) -> &[f64] {
     return Slice.view<f64>(svg.at(0).styles.dashes.asSlice(), 0, 0)
   }
   let e = svg.at(from)
-  return if e.styles.set & P_DASHES != 0 { e.styles.dashes.asSlice() } else { e.attributes.dashes.asSlice() }
+  return if e.styles.set & P_DASHES != 0 {
+    e.styles.dashes.asSlice()
+  } else if e.sheetStyles.set & P_DASHES != 0 {
+    e.sheetStyles.dashes.asSlice()
+  } else {
+    e.attributes.dashes.asSlice()
+  }
 }
 
 effect fn paintGroup(
@@ -1421,7 +1626,7 @@ effect fn paintElement(
   if opacity <= 0.0 {
     return ()
   }
-  let transform = parentTransform.* * e.transform
+  let transform = parentTransform.* * elementTransform(e)
   let inherited = inherit(svg, parentInherited, element)
   let mut mask = parentMask
   let mut layers: u32 = 0
@@ -2043,7 +2248,7 @@ fn mapPoint(m: &Affine, x: f64, y: f64) -> FlatPoint {
 /// The element of `svg` drawn topmost at (`x`, `y`), for a content box `box` in the same space,
 /// or 0 when the point is over none. `pointer-events`, `display`, `visibility` and clip paths
 /// decide as they do on the web.
-pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32>) -> u32
+pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32>, clipToViewport: bool) -> u32
   ! OutOfMemoryError
   ? &mut Allocator {
   let root = svg.at(0)
@@ -2052,7 +2257,7 @@ pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32
   }
   let fx = f32.toF64(x)
   let fy = f32.toF64(y)
-  if fx < f32.toF64(box.xMin) || fx > f32.toF64(box.xMax) || fy < f32.toF64(box.yMin) || fy > f32.toF64(box.yMax) {
+  if clipToViewport && (fx < f32.toF64(box.xMin) || fx > f32.toF64(box.xMax) || fy < f32.toF64(box.yMin) || fy > f32.toF64(box.yMax)) {
     return 0
   }
   let inherited = inherit(
@@ -2075,7 +2280,7 @@ pub effect fn hit(svg: &LiveSvg, box: Rect<f32>, x: f32, y: f32, color: Rgba<f32
     },
     0,
   )
-  let transform = rootTransform(svg, box)
+  let transform = rootTransform(svg, box, 1.0)
   return run hitGroup(svg, 0, &transform, inherited, fx, fy, 0)
 }
 
@@ -2104,7 +2309,7 @@ effect fn hitElement(svg: &LiveSvg, element: u32, parentTransform: &Affine, pare
   if !(tag == Tag.G || tag == Tag.Svg || isShape(tag)) || hiddenOf(e) {
     return 0
   }
-  let transform = parentTransform.* * e.transform
+  let transform = parentTransform.* * elementTransform(e)
   let inherited = inherit(svg, parentInherited, element)
   let clip = clipOf(e)
   if clip != 0 {

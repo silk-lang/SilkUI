@@ -414,3 +414,158 @@ test effect fn inlineSvgSlicesIntoItsBox() ! TreeError | CssError | GeometryErro
   let mut allocator = Allocator.systemAllocatorProvider()
   run slicedStageArt() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+// Live svg without viewBox scales by device scale, honors overflow: visible, and resolves
+// page CSS rules (custom properties, :first-child, attribute selectors, translate).
+effect fn liveSvgPageCssAndOverflow() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.attribute(1, Attribute.ClassName { value: run String.copy("bay") })
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(SVG, NodeKind.Icon)
+  run batch.append(1, SVG)
+  run batch.attribute(SVG, Attribute.ClassName { value: run String.copy("edges") })
+  let own = run written.declarations(b"display:block;width:1px;height:1px;overflow:visible")
+  run batch.style(SVG, own.asSlice())
+  // Group with data-source="mic", containing a path and a shifted shine path, plus a plug group.
+  run batch.svgInsert(SVG, 1, "g", 0, Option<u32>.None)
+  run set(&mut batch, 1, "class", "cable")
+  run set(&mut batch, 1, "data-source", "mic")
+  run batch.svgInsert(SVG, 2, "path", 1, Option<u32>.None)
+  run set(&mut batch, 2, "d", "M 20 30 L 120 30")
+  run batch.svgInsert(SVG, 3, "path", 1, Option<u32>.None)
+  run set(&mut batch, 3, "class", "shine")
+  run set(&mut batch, 3, "d", "M 20 30 L 120 30")
+  run batch.svgInsert(SVG, 4, "g", 0, Option<u32>.None)
+  run set(&mut batch, 4, "class", "plug")
+  run batch.svgInsert(SVG, 5, "circle", 4, Option<u32>.None)
+  run set(&mut batch, 5, "cx", "60")
+  run set(&mut batch, 5, "cy", "100")
+  run set(&mut batch, 5, "r", "12")
+  run batch.svgInsert(SVG, 6, "circle", 4, Option<u32>.None)
+  run set(&mut batch, 6, "cx", "60")
+  run set(&mut batch, 6, "cy", "100")
+  run set(&mut batch, 6, "r", "5")
+  let css = b".bay [data-source=\"mic\"]{--cable:#ff0000}.bay [data-source=\"bass\"]{--cable:#0000ff}.cable path{fill:none;stroke:var(--cable);stroke-width:10}.cable path.shine{stroke:#00ff00;stroke-width:8;translate:0 30px}.plug circle:first-child{fill:#0000ff}.plug circle:last-child{fill:#ffff00}"
+  let sheet = run compile.compile(css, &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 7, bytes.asSlice())
+  run tree.apply(run batch.take())
+  // Scale 2.0 verifies no-viewBox live SVGs scale by device pixel ratio rather than drawing half-size.
+  let hidpi = FrameInput { width: 200.0, height: 200.0, scale: 2.0, time: 0.0 }
+  run tree.frame(hidpi)
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 140, 60, 255, 0, 0), "overflow:visible path at CSS (70,30) renders red at 2x device (140,60)")
+  run Testing.expect(color(&image, 140, 120, 0, 255, 0), "CSS translate: 0 30px shifts the shine path to CSS (70,60) -> device (140,120)")
+  run Testing.expect(color(&image, 138, 200, 0, 0, 255), ":first-child fills outer circle blue at CSS (69,100) -> device (138,200)")
+  run Testing.expect(color(&image, 120, 200, 255, 255, 0), ":last-child fills inner circle yellow at CSS (60,100) -> device (120,200)")
+  // Changing data-source updates --cable and repaints the path blue.
+  run set(&mut batch, 1, "data-source", "bass")
+  run tree.apply(run batch.take())
+  run tree.frame(hidpi)
+  let updated = run rendered(&mut tree)
+  run Testing.expect(color(&updated, 140, 60, 0, 0, 255), "changing data-source re-resolves page CSS variables on live svg")
+}
+
+test effect fn liveSvgResolvesPageCssAndOverflowVisible() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run liveSvgPageCssAndOverflow() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Inline markup SVGs (painted by lib-svg, e.g. MapArt) receive page CSS rules on descendants.
+effect fn markupSvgPageCss() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:200px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.icon(1, b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect class='land' width='100' height='100'/><path class='river' data-wide='' d='M 0 50 L 100 50'/></svg>")
+  run batch.create(2, NodeKind.Icon)
+  run batch.append(1, 2)
+  let own = run written.declarations(b"display:block;width:100px;height:100px")
+  run batch.style(2, own.asSlice())
+  run batch.source(2, 1)
+  let sheet = run compile.compile(b".land{fill:#00ff00}.river{fill:none;stroke:#0000ff;stroke-width:4}.river[data-wide]{stroke-width:24}", &Options.make())
+  let bytes = run sheet.encode()
+  run batch.adoptStyleSheet(0, 7, bytes.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  let image = run rendered(&mut tree)
+  run Testing.expect(color(&image, 50, 10, 0, 255, 0), "page CSS class rule fills markup svg rect green")
+  run Testing.expect(color(&image, 50, 50, 0, 0, 255), "page CSS attribute rule strokes markup svg path blue")
+  run Testing.expect(color(&image, 50, 59, 0, 0, 255), "data-wide overrides stroke-width to 24px")
+}
+
+test effect fn markupSvgReceivesPageCssRules() ! TreeError | CssError | CompileError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run markupSvgPageCss() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// HTML `dir="rtl"` sets CSS direction: rtl, right-aligning start-aligned text and inheriting down.
+effect fn htmlDirAttributeRtl() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let mut snapshot = CpuSnapshot.make()
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  let root = run written.declarations(b"display:block;width:200px;height:100px;background-color:white")
+  run batch.style(1, root.asSlice())
+  run batch.create(2, NodeKind.Box)
+  run batch.append(1, 2)
+  run batch.attribute(2, Attribute.Named { name: run String.copy("dir"), value: Option<String>.some(run String.copy("rtl")) })
+  let boxStyle = run written.declarations(b"display:block;width:200px;height:40px;font-size:20px;color:#000000")
+  run batch.style(2, boxStyle.asSlice())
+  run batch.text(2, 3, "Hi")
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  let image = run snapshot.render(&tree)
+  let mut leftDark: u32 = 0
+  let mut rightDark: u32 = 0
+  let mut y: u32 = 0
+  while y < 40 {
+    let mut x: u32 = 0
+    while x < 200 {
+      let p = image.pixel(x, y)
+      if p.r < 200 {
+        if x < 100 { leftDark = leftDark + 1 } else { rightDark = rightDark + 1 }
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  run Testing.expect(rightDark > 10 && leftDark == 0, "dir=rtl right-aligns text into the right half")
+  // Switching dir back to ltr moves text to the left half.
+  run batch.attribute(2, Attribute.Named { name: run String.copy("dir"), value: Option<String>.some(run String.copy("ltr")) })
+  run tree.apply(run batch.take())
+  run tree.frame(viewport())
+  run snapshot.sync(&mut tree)
+  let ltr = run snapshot.render(&tree)
+  leftDark = 0
+  rightDark = 0
+  y = 0
+  while y < 40 {
+    let mut x: u32 = 0
+    while x < 200 {
+      let p = ltr.pixel(x, y)
+      if p.r < 200 {
+        if x < 100 { leftDark = leftDark + 1 } else { rightDark = rightDark + 1 }
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+  run Testing.expect(leftDark > 10 && rightDark == 0, "switching dir to ltr aligns text back to the left half")
+}
+
+test effect fn htmlDirAttributeControlsTextDirection() ! TreeError | CssError | GeometryError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run htmlDirAttributeRtl() |> Effect.provideMut<Allocator>(&mut allocator)
+}
