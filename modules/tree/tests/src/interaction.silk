@@ -11,6 +11,8 @@ import ui_tree.legacy {
   CpuSnapshot,
   NodeInfo,
   NodeKind,
+  FlexDirection,
+  Overflow,
   Attribute,
   Event,
   EventKind,
@@ -34,6 +36,7 @@ import silk.core.effect { Effect }
 import silk.core.option { Option }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
+import silk.num.u32
 import silk.system.filesystem { FileError }
 import silk.system.host_input { HostInputError }
 import silk.testing.testing { Testing, AssertionError }
@@ -1053,4 +1056,203 @@ test effect fn draggingAScrollbarThumbScrolls() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run thumbBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Builds a sibling status bar above a fixed-height scroll container with 40 uniquely coloured
+/// rows (960px tall total) so kept scrolls can step across a 160px paint lead in two moves.
+effect fn longScrollList<'a>(
+  collection: &'a FontCollection,
+  status: string,
+  input: FrameInput,
+  y: f32,
+) -> UiTree<'a>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[
+      css.display(Keyword.Flex),
+      css.flexDirection(FlexDirection.Column),
+      css.width(css.px(240.0)),
+      css.height(css.px(160.0)),
+      css.backgroundColor(Rgba<f32>.new(0.06, 0.06, 0.08, 1.0)),
+    ],
+  )
+  run batch.root(1)
+  run batch.box(1, 2, &[css.height(css.px(24.0)), css.flexShrink(0.0)])
+  run batch.text(2, 3, status)
+  run batch.box(
+    1,
+    4,
+    &[
+      css.height(css.px(120.0)),
+      css.flexShrink(0.0),
+      css.overflowY(Overflow.Scroll),
+      css.backgroundColor(Rgba<f32>.new(0.08, 0.08, 0.11, 1.0)),
+    ],
+  )
+  let mut i: u32 = 0
+  while i < 40 {
+    let rowId: u32 = 100 + i
+    let step: f32 = if i % 2 == 0 { 0.25 } else { 0.55 }
+    let r: f32 = 0.15 + 0.02 * u32.toF32(i)
+    run batch.box(
+      4,
+      rowId,
+      &[
+        css.height(css.px(24.0)),
+        css.flexShrink(0.0),
+        css.backgroundColor(Rgba<f32>.new(r, step, 0.7, 1.0)),
+      ],
+    )
+    i = i + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(input)
+  if y != 0.0 {
+    let mut scroll = Batch.make()
+    run scroll.scrollTo(4, 0.0, y)
+    run tree.apply(run scroll.take())
+  }
+  return move tree
+}
+
+effect fn drawnFrameAt(tree: &mut UiTree<'_>, snapshot: &mut CpuSnapshot, input: FrameInput) -> Pixmap
+  ! TreeError | GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run tree.frame(input)
+  run snapshot.sync(&mut tree)
+  return run snapshot.render(&tree)
+}
+
+effect fn scrollLeadDriftBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let input = FrameInput { width: 240.0, height: 160.0, scale: 1.0, time: 0.0 }
+  let mut tree = run longScrollList(&collection, "Ready", input, 0.0)
+  let mut snapshot = CpuSnapshot.make()
+
+  // Frame 1 (already painted at y = 0 in `longScrollList`; lead = 160px, rows past y = 280 culled).
+  run snapshot.sync(&mut tree)
+
+  // Frame 2: kept scroll to y = 120 (within the 160px lead of y = 0).
+  let mut step1 = Batch.make()
+  run step1.scrollTo(4, 0.0, 120.0)
+  run tree.apply(run step1.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(tree.scrollsKept == 1, "first scroll within lead keeps the scene")
+
+  // Frame 3: an unrelated sibling changes, so the frame paints and replays the scroll container
+  // (still culled around y = 0, not y = 120).
+  let mut sibling = Batch.make()
+  run sibling.setText(3, "Tick")
+  run tree.apply(run sibling.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(tree.scrollsKept == 1, "sibling change paints")
+
+  // Frame 4: scroll to y = 240 (within 160px of y = 120, but past the 160px lead of y = 0).
+  // The list must repaint instead of keeping the stale y = 0 cull.
+  let mut step2 = Batch.make()
+  run step2.scrollTo(4, 0.0, 240.0)
+  run tree.apply(run step2.take())
+  let down = run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(tree.scrollsKept == 1, "scrolling past the original painted lead repaints")
+  let mut freshDown = run longScrollList(&collection, "Tick", input, 240.0)
+  freshDown.invalidatePaint()
+  let mut freshDownSnap = CpuSnapshot.make()
+  let expectedDown = run drawnFrameAt(&mut freshDown, &mut freshDownSnap, input)
+  run Testing.expect(
+    samePixels(&down, &expectedDown),
+    "scrolling down after a replayed kept scroll repaints past the original lead",
+  )
+
+  // Now test the same drift scrolling upward from near the bottom.
+  let mut jump = Batch.make()
+  run jump.scrollTo(4, 0.0, 600.0)
+  run tree.apply(run jump.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+
+  // Prime the scroller's paint cache at y = 600 (as a settle or sibling paint does).
+  let mut prime = Batch.make()
+  run prime.setText(3, "At 600")
+  run tree.apply(run prime.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+  let keptAfterJump = tree.scrollsKept
+
+  let mut up1 = Batch.make()
+  run up1.scrollTo(4, 0.0, 480.0)
+  run tree.apply(run up1.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(tree.scrollsKept == keptAfterJump + 1, "first upward scroll keeps the scene")
+
+  // Unrelated paint replays the y = 600 cache; `paintedScrolls` must remain at y = 600.
+  let mut sibling2 = Batch.make()
+  run sibling2.setText(3, "Tick 2")
+  run tree.apply(run sibling2.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+
+  let mut up2 = Batch.make()
+  run up2.scrollTo(4, 0.0, 360.0)
+  run tree.apply(run up2.take())
+  let up = run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(
+    tree.scrollsKept == keptAfterJump + 1,
+    "scrolling up past the original painted lead repaints",
+  )
+  let mut freshUp = run longScrollList(&collection, "Tick 2", input, 360.0)
+  freshUp.invalidatePaint()
+  let mut freshUpSnap = CpuSnapshot.make()
+  let expectedUp = run drawnFrameAt(&mut freshUp, &mut freshUpSnap, input)
+  run Testing.expect(
+    samePixels(&up, &expectedUp),
+    "scrolling up after a replayed kept scroll repaints past the original lead",
+  )
+}
+
+test effect fn keptScrollBeforeUnrelatedPaintDoesNotDriftPaintedLead() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run scrollLeadDriftBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn viewportGrowLeadBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let small = FrameInput { width: 240.0, height: 160.0, scale: 1.0, time: 0.0 }
+  let tall = FrameInput { width: 240.0, height: 400.0, scale: 1.0, time: 0.0 }
+  let mut tree = run longScrollList(&collection, "Ready", small, 0.0)
+  let mut snapshot = CpuSnapshot.make()
+
+  // Frame 1 (painted at 160px viewport height: lead = 160px, rows past y = 280 culled).
+  run snapshot.sync(&mut tree)
+
+  // Frame 2: grow viewport to 400px height. The fixed-height scroll container must not
+  // replay its 160px-lead ops under a 400px quietInput lead.
+  drop run drawnFrameAt(&mut tree, &mut snapshot, tall)
+
+  // Frame 3: scroll to y = 300 (within 400px lead, past the earlier 160px lead).
+  let mut scroll = Batch.make()
+  run scroll.scrollTo(4, 0.0, 300.0)
+  run tree.apply(run scroll.take())
+  let moved = run drawnFrameAt(&mut tree, &mut snapshot, tall)
+
+  let mut fresh = run longScrollList(&collection, "Ready", tall, 300.0)
+  fresh.invalidatePaint()
+  let mut freshSnap = CpuSnapshot.make()
+  let expected = run drawnFrameAt(&mut fresh, &mut freshSnap, tall)
+  run Testing.expect(
+    samePixels(&moved, &expected),
+    "growing the viewport does not let a kept scroll outrun a replayed scroller's painted lead",
+  )
+}
+
+test effect fn growingViewportDoesNotOutrunReplayedScrollLead() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run viewportGrowLeadBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
