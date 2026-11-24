@@ -593,6 +593,22 @@
   }
   Object.defineProperty(File.prototype, Symbol.toStringTag, { value: "File" });
 
+  class SubmitEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      this.submitter = init?.submitter ?? null;
+    }
+  }
+  class FormDataEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      if (!init || !(init.formData instanceof FormData)) {
+        throw new TypeError("FormDataEvent requires a formData option");
+      }
+      this.formData = init.formData;
+    }
+  }
+
   // As XMLHttpRequest's FormData: an ordered list of names with strings or Files.
   const formValue = (value, filename) => {
     if (!(value instanceof Blob)) return String(value);
@@ -601,23 +617,71 @@
     }
     return value;
   };
-  // The form data set of a form element's controls (HTML's "constructing the entry list").
+  const isInDataList = (node) => {
+    for (let p = node?.parentNode; p; p = p.parentNode) {
+      if (String(p.localName ?? "").toLowerCase() === "datalist") return true;
+    }
+    return false;
+  };
+  const isControlActuallyDisabled = (control) => {
+    if (typeof control?._isActuallyDisabled === "function") return control._isActuallyDisabled();
+    if (control?.disabled || control?.hasAttribute?.("disabled")) return true;
+    let child = control;
+    for (let p = control?.parentNode; p; child = p, p = p.parentNode) {
+      if (String(p.localName ?? "").toLowerCase() === "fieldset" && (p.disabled || p.hasAttribute?.("disabled"))) {
+        let firstLegend = null;
+        for (const c of p.childNodes ?? []) {
+          if (String(c.localName ?? "").toLowerCase() === "legend") { firstLegend = c; break; }
+        }
+        if (child !== firstLegend) return true;
+      }
+    }
+    return false;
+  };
+  const isSubmitButton = (el) => {
+    if (!el || typeof el !== "object") return false;
+    const tag = String(el.localName ?? "").toLowerCase();
+    const type = String(el.type ?? el.getAttribute?.("type") ?? (tag === "button" ? "submit" : "")).toLowerCase();
+    return (tag === "button" && type === "submit") || (tag === "input" && (type === "submit" || type === "image"));
+  };
+  // The form data set of a form element's controls (HTML §4.10.21.4 "constructing the entry list").
   const formEntries = (form, submitter) => {
     const entries = [];
     const controls = form.elements ?? form.querySelectorAll("button, input, select, textarea");
     for (const control of controls) {
-      const name = control.getAttribute?.("name") ?? control.name;
-      if (!name || control.disabled || control.hasAttribute?.("disabled")) continue;
+      if (isInDataList(control) || isControlActuallyDisabled(control)) continue;
       const tag = String(control.localName ?? "").toLowerCase();
+      if (tag === "fieldset") continue;
       const type = String(control.type ?? control.getAttribute?.("type") ?? (tag === "button" ? "submit" : "text")).toLowerCase();
-      if (tag === "button" || type === "submit" || type === "button" || type === "reset" || type === "image") {
-        if (control === submitter && type !== "button" && type !== "reset") entries.push([String(name), String(control.value ?? control.getAttribute?.("value") ?? "")]);
+      if (tag === "button" || type === "submit" || type === "button" || type === "reset") {
+        if (control === submitter && type === "submit") {
+          const name = control.getAttribute?.("name") ?? control.name;
+          if (name) entries.push([String(name), String(control.value ?? control.getAttribute?.("value") ?? "")]);
+        }
+        continue;
+      }
+      if (type === "image") {
+        if (control === submitter) {
+          const name = control.getAttribute?.("name") ?? control.name ?? "";
+          entries.push([name ? `${name}.x` : "x", "0"]);
+          entries.push([name ? `${name}.y` : "y", "0"]);
+        }
         continue;
       }
       if ((type === "checkbox" || type === "radio") && !control.checked) continue;
+      const name = control.getAttribute?.("name") ?? control.name;
+      if (!name) continue;
+      if (tag === "input" && type === "hidden" && String(name).toLowerCase() === "_charset_") {
+        entries.push([String(name), "UTF-8"]);
+        continue;
+      }
       if (tag === "select") {
         for (const option of control.options ?? control.querySelectorAll("option")) {
-          if (option.selected) entries.push([String(name), String(option.value ?? option.textContent ?? "")]);
+          if (option.selected && !option.disabled && !option.hasAttribute?.("disabled")) {
+            const parent = option.parentNode;
+            if (String(parent?.localName ?? "").toLowerCase() === "optgroup" && (parent.disabled || parent.hasAttribute?.("disabled"))) continue;
+            entries.push([String(name), String(option.value ?? option.textContent ?? "")]);
+          }
         }
         continue;
       }
@@ -627,8 +691,15 @@
         for (const file of files) entries.push([String(name), file instanceof Blob ? formValue(file) : file]);
         continue;
       }
-      const value = control.value ?? control.getAttribute?.("value") ?? ((type === "checkbox" || type === "radio") ? "on" : "");
-      entries.push([String(name), String(value)]);
+      const rawValue = control.value ?? control.getAttribute?.("value") ?? ((type === "checkbox" || type === "radio") ? "on" : "");
+      // Normalize line breaks to CRLF per HTML spec §4.10.21.4 for textarea/text controls.
+      const normalized = tag === "textarea" ? String(rawValue).replace(/\r\n|\r|\n/g, "\r\n") : String(rawValue);
+      entries.push([String(name), normalized]);
+      const dirname = control.getAttribute?.("dirname");
+      if (dirname) {
+        const dir = control.getAttribute?.("dir") || "ltr";
+        entries.push([String(dirname), dir === "rtl" ? "rtl" : "ltr"]);
+      }
     }
     return entries;
   };
@@ -636,8 +707,31 @@
     #entries = [];
     constructor(form, submitter) {
       if (form === undefined || form === null) return;
-      if (typeof form !== "object" || (form.elements === undefined && typeof form.querySelectorAll !== "function")) throw new TypeError("FormData takes a form element");
-      this.#entries = formEntries(form, submitter ?? null);
+      if (typeof form !== "object" || (form.elements === undefined && typeof form.querySelectorAll !== "function")) {
+        throw new TypeError("FormData takes a form element");
+      }
+      if (submitter !== undefined && submitter !== null) {
+        if (!isSubmitButton(submitter)) throw new TypeError("The specified element is not a submit button.");
+        if (submitter.form !== undefined && submitter.form !== form) {
+          const err = new Error("The specified element is not owned by this form element.");
+          err.name = "NotFoundError";
+          throw err;
+        }
+      }
+      if (form._constructingEntryList) {
+        const err = new Error("Form is already constructing an entry list.");
+        err.name = "InvalidStateError";
+        throw err;
+      }
+      form._constructingEntryList = true;
+      try {
+        this.#entries = formEntries(form, submitter ?? null);
+        if (typeof form.dispatchEvent === "function") {
+          form.dispatchEvent(new FormDataEvent("formdata", { bubbles: true, formData: this }));
+        }
+      } finally {
+        form._constructingEntryList = false;
+      }
     }
     append(name, value, filename) {
       this.#entries.push([String(name), formValue(value, filename)]);
@@ -687,5 +781,5 @@
   }
   Object.defineProperty(FormData.prototype, Symbol.toStringTag, { value: "FormData" });
 
-  return { Blob, File, FormData, AbortController, AbortSignal, BatteryManager, getBattery, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
+  return { Blob, File, FormData, SubmitEvent, FormDataEvent, AbortController, AbortSignal, BatteryManager, getBattery, matchMedia, mediaChanged, MediaQueryList, MediaQueryListEvent, performance, setImmediate, clearImmediate, requestIdleCallback, cancelIdleCallback, console, atob, btoa, TextEncoder, TextDecoder, crypto, Event, CustomEvent, PromiseRejectionEvent, EventTarget };
 })

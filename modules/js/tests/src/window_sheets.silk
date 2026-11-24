@@ -326,3 +326,92 @@ test effect fn imageDecodeDrawAndRangeInputWork() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   run runImageAndRangeSmoke() |> Effect.provideMut<Allocator>(&mut allocator)
 }
+
+effect fn runFormsAndPerfSmoke() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fonts = run fixtures.fonts()
+  let mut tree = run UiTree.make(&fonts)
+  let domain = run WaiterDomain.make()
+  let memoryAllocator = run RuntimeAllocator.make(Allocator.systemAllocatorProvider())
+  let memory = run memoryAllocator.observe()
+  let mut app = run JsApp.open(&memory, move memoryAllocator, domain.handle())
+  app.javascript().setStylesheetCompiler(runtimeStylesheets())
+  let mut client = JsClient.make(NoTools {})
+  let css = b"input:valid { border-top-width: 2px; } input:invalid { border-top-width: 7px; } input:user-invalid { border-bottom-width: 9px; } button:default { border-left-width: 5px; } input:disabled { border-right-width: 6px; } .card[hidden] { display: none; } .emoji::first-letter { font-weight: 700; }"
+  let bytes = runtimeStylesheets().call(css).unwrapOr(Bytes.make())
+  run Testing.expect(bytes.length() != 0, "forms/perf test sheet compiles")
+  client.stylesheets = run StyleAssets.from(&[bytes.asSlice()])
+  run app.define(b"@silkui/core", uiPackage())
+  let js = b"import { createElement, mount } from '@silkui/core'; const root = createElement('div'); const form = createElement('form'); const email = createElement('input', { type: 'email' }); email.id = 'em'; email.setAttribute('name', 'email'); email.required = true; const pass = createElement('input', { type: 'password' }); pass.id = 'pw'; pass.setAttribute('name', 'pw'); pass.value = 'secret'; const fs = createElement('fieldset'); fs.disabled = true; const lg = createElement('legend'); const inLg = createElement('input', { type: 'text' }); inLg.id = 'inlg'; lg.appendChild(inLg); const inFs = createElement('input', { type: 'text' }); inFs.id = 'infs'; fs.append(lg, inFs); const sel = createElement('select'); sel.id = 'sel'; sel.setAttribute('name', 'role'); const o1 = createElement('option'); o1.value = 'dev'; o1.text = 'Developer'; const o2 = createElement('option'); o2.value = 'ops'; o2.text = 'Ops'; sel.append(o1, o2); const btn = createElement('button'); btn.id = 'go'; const prog = createElement('progress'); prog.max = 10; prog.value = 4; const meter = createElement('meter'); meter.min = 0; meter.max = 100; meter.low = 30; meter.high = 70; meter.optimum = 80; meter.value = 20; const color = createElement('input', { type: 'color' }); color.value = '#336699'; const cb = createElement('input', { type: 'checkbox' }); cb.checked = true; form.append(email, pass, fs, sel, prog, meter, color, cb, btn); root.appendChild(form); const cards = []; for (let i = 0; i < 40; i++) { const c = createElement('article'); c.className = 'card'; for (let j = 0; j < 15; j++) { const s = createElement('span'); s.textContent = 'x'; c.appendChild(s); } cards.push(c); root.appendChild(c); } mount(root); globalThis.__f = { form, email, pass, inLg, inFs, sel, btn, cards };"
+  run app.entry(b"app.js", js)
+  let result = run Effect.result(checkFormsAndPerf(&mut client, &mut app, &mut tree))
+  run app.close()
+  match move result {
+    Result.Success { .. } => {}
+    Result.Failure { error } => { fail move error }
+  }
+}
+
+fn findSlotById(tree: &UiTree<'_>, want: string) -> u32 {
+  let mut slot: usize = 0
+  while slot < tree.nodes.length() {
+    let n = tree.node(usize.toU32(slot))
+    if n.live {
+      if let Option.Some { value: id } = n.identity() {
+        if id.id() == want { return usize.toU32(slot) }
+      }
+    }
+    slot = slot + 1
+  }
+  return 4294967295
+}
+
+effect fn checkFormsAndPerf<'m>(client: &mut JsClient<NoTools>, app: &mut JsApp<'m>, tree: &mut UiTree<'_>) -> ()
+  ! TreeError | JsError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let fi0 = FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.0 }
+  run WindowClient<JsApp<'m>, never, never>.start(&mut client.*, &mut app.*, &mut tree.*)
+  run WindowClient<JsApp<'m>, never, never>.tick(&mut client.*, &mut app.*, &mut tree.*, 0.0, true)
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, fi0)
+
+  // Verify :invalid, :default, fieldset disabled first-legend exemption, and password bullet masking.
+  let emSlot = findSlotById(&tree.*, "em")
+  let pwSlot = findSlotById(&tree.*, "pw")
+  let inLgSlot = findSlotById(&tree.*, "inlg")
+  let inFsSlot = findSlotById(&tree.*, "infs")
+  let goSlot = findSlotById(&tree.*, "go")
+  run Testing.expect(emSlot != 4294967295 && pwSlot != 4294967295 && inLgSlot != 4294967295 && inFsSlot != 4294967295 && goSlot != 4294967295, "all form nodes mounted")
+  run Testing.expect(tree.node(emSlot).computed().layout.border.top.value == 7.0, "empty required email matches :invalid")
+  run Testing.expect(tree.node(emSlot).computed().layout.border.bottom.value == 0.0, "untouched invalid email does not match :user-invalid")
+  run Testing.expect(tree.node(goSlot).computed().layout.border.left.value == 5.0, "first submit button matches :default")
+  run Testing.expect(tree.node(inLgSlot).computed().layout.border.right.value == 0.0, "input in first legend of disabled fieldset is enabled")
+  run Testing.expect(tree.node(inFsSlot).computed().layout.border.right.value == 6.0, "input in disabled fieldset matches :disabled")
+  run Testing.expect(tree.node(pwSlot).edit().masked, "password input sets EditState.masked")
+  run Testing.expect(String.view(&tree.node(pwSlot).edit().display) == "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}", "password input displays bullets instead of plaintext")
+
+  // Trigger reportValidity -> :user-invalid, then enter valid email -> :valid, and verify FormData.
+  run app.script(&mut tree.*, b"(() => { const { form, email, sel } = globalThis.__f; if (form.reportValidity()) throw new Error('should be invalid'); })();", b"userInvalid")
+  run WindowClient<JsApp<'m>, never, never>.tick(&mut client.*, &mut app.*, &mut tree.*, 0.016, true)
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.016 })
+  run Testing.expect(tree.node(emSlot).computed().layout.border.bottom.value == 9.0, "after reportValidity, invalid email matches :user-invalid")
+
+  run app.script(&mut tree.*, b"(() => { const { form, email, sel } = globalThis.__f; email.value = 'ada@example.com'; sel.value = 'ops'; const fd = new FormData(form); if (fd.get('email') !== 'ada@example.com' || fd.get('pw') !== 'secret' || fd.get('role') !== 'ops') throw new Error('FormData mismatch'); if (fd.has('infs')) throw new Error('disabled fieldset input leaked into FormData'); })();", b"makeValid")
+  run WindowClient<JsApp<'m>, never, never>.tick(&mut client.*, &mut app.*, &mut tree.*, 0.032, true)
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.032 })
+  run Testing.expect(tree.node(emSlot).computed().layout.border.top.value == 2.0, "valid email switches to :valid")
+
+  // Verify hiding 35 cards (35 * 16 = 560 nodes) skips hidden descendant resolves & full style passes.
+  let rBefore = tree.work.resolves
+  let fullBefore = tree.work.fullStylePasses
+  run app.script(&mut tree.*, b"(() => { for (let i = 0; i < 35; i++) globalThis.__f.cards[i].setAttribute('hidden', ''); })();", b"hideCards")
+  run WindowClient<JsApp<'m>, never, never>.tick(&mut client.*, &mut app.*, &mut tree.*, 0.048, true)
+  run WindowClient<JsApp<'m>, never, never>.layout(&mut client.*, &mut app.*, &mut tree.*, FrameInput { width: 800.0, height: 600.0, scale: 1.0, time: 0.048 })
+  let resolvesUsed = tree.work.resolves - rBefore
+  run Testing.expect(tree.work.fullStylePasses == fullBefore, "hiding cards via [hidden] triggers zero full style passes")
+  run Testing.expect(resolvesUsed < 100, "hiding 35 cards (560 descendants) resolves only the cards, not hidden descendants")
+}
+
+test effect fn formsCssValidationAndHidePerfWork() -> ()
+  ! TreeError | JsError | SynchronizationError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run runFormsAndPerfSmoke() |> Effect.provideMut<Allocator>(&mut allocator)
+}

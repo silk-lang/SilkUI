@@ -24,7 +24,7 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext, createElement, useLayoutEffect, useRef, useState } from "react";
-import { CheckInput, Input, RangeInput, RichInput, SvgElement, SvgText, createElement as createHtmlElement, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
+import { ButtonElement, ButtonInput, CheckInput, ColorInput, FileInput, HiddenInput, Input, OptionElement, RangeInput, RichInput, SelectElement, SvgElement, SvgText, createElement as createHtmlElement, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
@@ -132,6 +132,15 @@ function restoreLater(node) {
   });
 }
 
+function applySelectValue(node, value) {
+  if (Array.isArray(value)) {
+    const set = new Set(value.map(String));
+    for (const opt of node.options) opt.selected = set.has(opt.value);
+  } else if (value !== undefined && value !== null) {
+    node.value = String(value);
+  }
+}
+
 function restoreControlled(node) {
   const props = bindings.get(node)?.props;
   if (!props) return;
@@ -139,8 +148,12 @@ function restoreControlled(node) {
     if (props.checked !== undefined && !!props.checked !== node.checked) node.checked = props.checked;
     return;
   }
-  if (node instanceof RangeInput) {
+  if (node instanceof RangeInput || node instanceof ColorInput) {
     if (props.value !== undefined && String(props.value) !== node.value) node.value = props.value;
+    return;
+  }
+  if (node instanceof SelectElement) {
+    if (props.value !== undefined) applySelectValue(node, props.value);
     return;
   }
   if (node instanceof RichInput) {
@@ -246,7 +259,10 @@ function setHtmlAttribute(node, name, value) {
 }
 
 function htmlEventType(node, type) {
-  if (type === "change") return node instanceof Input ? "input" : "change";
+  if (type === "change") {
+    if (node instanceof Input || node instanceof RangeInput || node instanceof ColorInput) return "input";
+    return "change";
+  }
   return HTML_EVENTS[type] ?? type;
 }
 
@@ -299,6 +315,24 @@ function applyHtmlProps(node, previous, next) {
       listen(node, "onChange", "input", false, next);
     } else if (previous === EMPTY && next.defaultValue !== undefined) {
       node.value = next.defaultValue;
+    }
+  } else if (node instanceof ColorInput) {
+    const value = next.value;
+    if (value !== undefined && value !== null) {
+      if (String(value).toLowerCase() !== node.value) node.value = value;
+      listen(node, "onChange", "input", false, next);
+    } else if (previous === EMPTY && next.defaultValue !== undefined) {
+      node.value = next.defaultValue;
+    }
+  } else if (node instanceof HiddenInput || node instanceof ButtonInput) {
+    if (next.value !== undefined && next.value !== null) node.value = String(next.value);
+    else if (previous === EMPTY && next.defaultValue !== undefined) node.value = String(next.defaultValue);
+  } else if (node instanceof SelectElement) {
+    if (next.value !== undefined) {
+      applySelectValue(node, next.value);
+      listen(node, "onChange", "change", false, next);
+    } else if (previous === EMPTY && next.defaultValue !== undefined) {
+      applySelectValue(node, next.defaultValue);
     }
   } else if (node instanceof Input) {
     const value = next.value;
@@ -464,8 +498,14 @@ const hostConfig = {
   },
   createTextInstance: (text, _root, context) => (context === SVG ? new SvgText(text) : createText(text)),
   appendInitialChild: (parent, child) => parent.appendChild(child),
-  // `autoFocus` focuses the element once it is in the tree.
-  finalizeInitialChildren: (_node, _type, props) => props.autoFocus === true,
+  // `autoFocus` focuses the element once it is in the tree; `<select>` applies its initial value once `<option>` children are mounted.
+  finalizeInitialChildren(node, _type, props) {
+    if (node instanceof SelectElement) {
+      if (props.value !== undefined) applySelectValue(node, props.value);
+      else if (props.defaultValue !== undefined) applySelectValue(node, props.defaultValue);
+    }
+    return props.autoFocus === true;
+  },
   commitMount(node) {
     node.focus?.();
   },

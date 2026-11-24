@@ -8,7 +8,7 @@ export const MISSING = {
   url: ["URL", "URLSearchParams"],
   temporal: ["Temporal"],
   wasm: ["WebAssembly"],
-  streams: ["ReadableStream", "WritableStream", "TransformStream", "FormData"],
+  streams: ["ReadableStream", "WritableStream", "TransformStream"],
   events: ["MessageChannel", "structuredClone"],
   workers: ["Worker"],
   storage: ["localStorage", "sessionStorage", "indexedDB"],

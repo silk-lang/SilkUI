@@ -215,9 +215,46 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
     let form = record.kind == NodeKind.Input || equal(tag, b"input") || equal(tag, b"button")
       || equal(tag, b"select") || equal(tag, b"textarea") || equal(tag, b"fieldset")
       || equal(tag, b"option") || equal(tag, b"optgroup")
-    if record.disabled { bits = bits | element.DISABLED }
+    // HTML §4.10.18.5 & §4.10.16: a form control is actually disabled if it has `disabled`,
+    // or is a descendant of a disabled `<fieldset>` outside that fieldset's first `<legend>` child,
+    // or is an `<option>` inside a disabled `<optgroup>`.
+    let mut actuallyDisabled = record.disabled
+    if !actuallyDisabled && form {
+      if equal(tag, b"option") {
+        let p = self.parent(node)
+        if p != NO_ELEMENT && equal(self.localName(p), b"optgroup") && self.record(p).disabled {
+          actuallyDisabled = true
+        }
+      }
+      if !actuallyDisabled && !equal(tag, b"option") && !equal(tag, b"optgroup") {
+        let mut child = node
+        let mut anc = self.parent(node)
+        while anc != NO_ELEMENT {
+          let ancTag = self.localName(anc)
+          if equal(ancTag, b"fieldset") && self.record(anc).disabled {
+            // Check whether `child` is the fieldset's first `<legend>` element child.
+            let mut firstLegend = NO_ELEMENT
+            let mut c = self.firstChild(anc)
+            while c != NO_ELEMENT {
+              if equal(self.localName(c), b"legend") {
+                firstLegend = c
+                break
+              }
+              c = self.nextSibling(c)
+            }
+            if child != firstLegend {
+              actuallyDisabled = true
+              break
+            }
+          }
+          child = anc
+          anc = self.parent(anc)
+        }
+      }
+    }
+    if actuallyDisabled { bits = bits | element.DISABLED }
     else if form { bits = bits | element.ENABLED }
-    if record.checked { bits = bits | element.CHECKED }
+    if record.checked || (equal(tag, b"option") && record.selected) { bits = bits | element.CHECKED }
     let required = match &record.semanticsOf() { Option<&Semantics>.Some { value } => value.required _ => false }
     if let Option<&Semantics>.Some { value } = record.semanticsOf() {
       if value.indeterminate { bits = bits | element.INDETERMINATE }
@@ -229,12 +266,27 @@ impl<'tree, 'fonts> ElementTree for SelectorTree<'tree, 'fonts> {
       bits = bits | (if record.valueNow() >= record.valueMin() && record.valueNow() <= record.valueMax() { element.IN_RANGE } else { element.OUT_OF_RANGE })
     }
     if form { bits = bits | (if required { element.REQUIRED } else { element.OPTIONAL }) }
-    if record.kind == NodeKind.Input && record.hasEdit() && !record.edit().readOnly && !record.disabled { bits = bits | element.READ_WRITE }
+    if record.kind == NodeKind.Input && record.hasEdit() && !record.edit().readOnly && !actuallyDisabled { bits = bits | element.READ_WRITE }
     else { bits = bits | element.READ_ONLY }
     if record.kind == NodeKind.Input && record.hasEdit() && record.text.ownedByteLength() == 0 && record.edit().placeholder.ownedByteLength() != 0 {
       bits = bits | element.PLACEHOLDER_SHOWN
     }
     if self.namedAttribute(node, b"open").isSome() { bits = bits | element.OPEN }
+    if let Option<&[u8]>.Some { value: v } = self.namedAttribute(node, b"-silk-valid") {
+      if equal(v, b"1") { bits = bits | element.VALID }
+      else if equal(v, b"0") { bits = bits | element.INVALID }
+    } else if form || equal(tag, b"form") {
+      let inv = match &record.semanticsOf() { Option<&Semantics>.Some { value } => value.invalid _ => false }
+      if inv { bits = bits | element.INVALID }
+      else if form && !equal(tag, b"option") && !equal(tag, b"optgroup") { bits = bits | element.VALID }
+    }
+    if let Option<&[u8]>.Some { value: uv } = self.namedAttribute(node, b"-silk-user-valid") {
+      if equal(uv, b"1") { bits = bits | element.USER_VALID }
+      else if equal(uv, b"0") { bits = bits | element.USER_INVALID }
+    }
+    if let Option<&[u8]>.Some { value: def } = self.namedAttribute(node, b"-silk-default") {
+      if equal(def, b"1") { bits = bits | element.DEFAULT }
+    }
     return StateBits { bits: bits }
   }
 }

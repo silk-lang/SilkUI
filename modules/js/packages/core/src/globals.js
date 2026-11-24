@@ -19,6 +19,22 @@ import {
   Input,
   CheckInput,
   RangeInput,
+  ColorInput,
+  FileInput,
+  ButtonInput,
+  HiddenInput,
+  FormElement,
+  SelectElement,
+  OptionElement,
+  OptGroupElement,
+  ButtonElement,
+  FieldSetElement,
+  LabelElement,
+  ProgressElement,
+  MeterElement,
+  OutputElement,
+  ValidityState,
+  isControlDisabled,
   Image as CoreImage,
   Canvas,
   caretPositionFromPoint,
@@ -556,9 +572,11 @@ const elementMethods = {
     this.insertAdjacentElement(where, fragment);
   },
   click() {
-    if (this.hasAttribute("disabled")) return;
+    if (isControlDisabled(this)) return;
     const MouseEventClass = global.MouseEvent ?? global.Event;
-    this.dispatchEvent(new MouseEventClass("click", { bubbles: true, cancelable: true, composed: true }));
+    const event = new MouseEventClass("click", { bubbles: true, cancelable: true, composed: true });
+    this.dispatchEvent(event);
+    if (!event.defaultPrevented && typeof this._activate === "function") this._activate();
   },
   // Animations run to their end at once: the end state is the app's style, so nothing waits.
   animate(_keyframes, options) {
@@ -794,18 +812,23 @@ const classes = {
   HTMLDocument: nodeClass("HTMLDocument", Document.prototype, (value) => value === documentTarget),
   DocumentFragment: CoreFragment,
   ShadowRoot: nodeClass("ShadowRoot", CoreFragment.prototype, () => false),
-  HTMLInputElement: nodeClass("HTMLInputElement", Input.prototype, (value) => (value instanceof Input && value.localName !== "textarea") || value instanceof CheckInput || value instanceof RangeInput),
+  HTMLInputElement: nodeClass("HTMLInputElement", Input.prototype, (value) => (value instanceof Input && value.localName !== "textarea") || value instanceof CheckInput || value instanceof RangeInput || value instanceof ColorInput || value instanceof FileInput || value instanceof ButtonInput || value instanceof HiddenInput),
   HTMLTextAreaElement: nodeClass("HTMLTextAreaElement", Input.prototype, (value) => value instanceof Input && value.localName === "textarea"),
   HTMLImageElement: nodeClass("HTMLImageElement", CoreImage.prototype, (value) => value instanceof CoreImage),
   HTMLCanvasElement: nodeClass("HTMLCanvasElement", Canvas.prototype, (value) => value instanceof Canvas),
   HTMLDivElement: nodeClass("HTMLDivElement", CoreNode.prototype, tagIs("div")),
   HTMLSpanElement: nodeClass("HTMLSpanElement", CoreNode.prototype, tagIs("span")),
-  HTMLButtonElement: nodeClass("HTMLButtonElement", CoreNode.prototype, tagIs("button")),
+  HTMLButtonElement: nodeClass("HTMLButtonElement", ButtonElement.prototype, (value) => value instanceof ButtonElement || tagIs("button")(value)),
   HTMLAnchorElement: nodeClass("HTMLAnchorElement", CoreNode.prototype, tagIs("a")),
-  HTMLLabelElement: nodeClass("HTMLLabelElement", CoreNode.prototype, tagIs("label")),
-  HTMLFormElement: nodeClass("HTMLFormElement", CoreNode.prototype, tagIs("form")),
-  HTMLSelectElement: nodeClass("HTMLSelectElement", CoreNode.prototype, tagIs("select")),
-  HTMLOptionElement: nodeClass("HTMLOptionElement", CoreNode.prototype, tagIs("option")),
+  HTMLLabelElement: nodeClass("HTMLLabelElement", LabelElement.prototype, (value) => value instanceof LabelElement || tagIs("label")(value)),
+  HTMLFormElement: nodeClass("HTMLFormElement", FormElement.prototype, (value) => value instanceof FormElement || tagIs("form")(value)),
+  HTMLSelectElement: nodeClass("HTMLSelectElement", SelectElement.prototype, (value) => value instanceof SelectElement || tagIs("select")(value)),
+  HTMLOptionElement: nodeClass("HTMLOptionElement", OptionElement.prototype, (value) => value instanceof OptionElement || tagIs("option")(value)),
+  HTMLOptGroupElement: nodeClass("HTMLOptGroupElement", OptGroupElement.prototype, (value) => value instanceof OptGroupElement || tagIs("optgroup")(value)),
+  HTMLFieldSetElement: nodeClass("HTMLFieldSetElement", FieldSetElement.prototype, (value) => value instanceof FieldSetElement || tagIs("fieldset")(value)),
+  HTMLProgressElement: nodeClass("HTMLProgressElement", ProgressElement.prototype, (value) => value instanceof ProgressElement || tagIs("progress")(value)),
+  HTMLMeterElement: nodeClass("HTMLMeterElement", MeterElement.prototype, (value) => value instanceof MeterElement || tagIs("meter")(value)),
+  HTMLOutputElement: nodeClass("HTMLOutputElement", OutputElement.prototype, (value) => value instanceof OutputElement || tagIs("output")(value)),
   HTMLIFrameElement: nodeClass("HTMLIFrameElement", CoreNode.prototype, tagIs("iframe")),
   HTMLVideoElement: nodeClass("HTMLVideoElement", CoreNode.prototype, tagIs("video")),
   HTMLMediaElement: nodeClass("HTMLMediaElement", CoreNode.prototype, tagIs("video", "audio")),
@@ -819,8 +842,7 @@ const classes = {
 };
 // The other HTML interfaces, by the tags they cover, for `instanceof` tests.
 for (const [name, tags] of Object.entries({
-  HTMLFieldSetElement: ["fieldset"], HTMLLegendElement: ["legend"], HTMLMeterElement: ["meter"], HTMLOutputElement: ["output"],
-  HTMLProgressElement: ["progress"], HTMLOptGroupElement: ["optgroup"], HTMLDataListElement: ["datalist"],
+  HTMLLegendElement: ["legend"], HTMLDataListElement: ["datalist"],
   HTMLParagraphElement: ["p"], HTMLHeadingElement: ["h1", "h2", "h3", "h4", "h5", "h6"], HTMLPreElement: ["pre", "listing", "xmp"],
   HTMLQuoteElement: ["blockquote", "q"], HTMLHRElement: ["hr"], HTMLUListElement: ["ul"], HTMLOListElement: ["ol"],
   HTMLLIElement: ["li"], HTMLDListElement: ["dl"], HTMLMenuElement: ["menu"], HTMLTableElement: ["table"],
@@ -849,6 +871,13 @@ if (global.Image === undefined) {
     return image;
   });
 }
+
+if (global.Option === undefined) {
+  define("Option", function Option(text, value, defaultSelected, selected) {
+    return new OptionElement(text, value, defaultSelected, selected);
+  });
+}
+if (global.ValidityState === undefined) define("ValidityState", ValidityState);
 
 for (const [name, value] of Object.entries({ URL: AppURL, URLSearchParams: AppURLSearchParams })) {
   if (global[name] === undefined) define(name, value);
@@ -903,6 +932,8 @@ const eventClasses = {
   ProgressEvent: global.ProgressEvent ?? eventClass("ProgressEvent", BaseEvent, { lengthComputable: false, loaded: 0, total: 0 }),
   StorageEvent: global.StorageEvent ?? eventClass("StorageEvent", BaseEvent, { key: null, oldValue: null, newValue: null, url: "", storageArea: null }),
   PageTransitionEvent: global.PageTransitionEvent ?? eventClass("PageTransitionEvent", BaseEvent, { persisted: false }),
+  SubmitEvent: global.SubmitEvent ?? eventClass("SubmitEvent", BaseEvent, { submitter: null }),
+  FormDataEvent: global.FormDataEvent ?? eventClass("FormDataEvent", BaseEvent, { formData: null }),
 };
 // The host's events are the runtime's own `Event`s; each answers `instanceof` for the classes
 // a browser gives its type.
@@ -919,6 +950,8 @@ const HOST_TYPES = {
   TouchEvent: ["touchstart", "touchmove", "touchend", "touchcancel"],
   AnimationEvent: ["animationstart", "animationiteration", "animationend", "animationcancel"],
   TransitionEvent: ["transitionrun", "transitionstart", "transitionend", "transitioncancel"],
+  SubmitEvent: ["submit"],
+  FormDataEvent: ["formdata"],
 };
 HOST_TYPES.UIEvent = [...MOUSE_TYPES, "keydown", "keyup", "focus", "blur", "focusin", "focusout", "input", "beforeinput", "touchstart", "touchmove", "touchend", "touchcancel"];
 for (const [name, types] of Object.entries(HOST_TYPES)) {

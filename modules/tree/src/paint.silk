@@ -835,6 +835,243 @@ effect fn paintRange(
   drop run p.scene.quad(thumbQuad)
 }
 
+fn nodeNamedAttr<'a>(node: &'a Node, name: string) -> Option<&'a [u8]> {
+  if let Option.Some { value: id } = node.identity() {
+    let attrs = id.attributes()
+    let mut i: usize = 0
+    while i < attrs.length {
+      if String.view(&attrs[i].name) == name {
+        return Option<&'a [u8]>.some(String.utf8Bytes(String.view(&attrs[i].value)))
+      }
+      i = i + 1
+    }
+  }
+  return Option<&'a [u8]>.None
+}
+
+fn nodeTagBytes<'a>(node: &'a Node) -> &'a [u8] {
+  return match node.identity() {
+    Option.Some { value: id } => String.utf8Bytes(id.tag())
+    _ => b""
+  }
+}
+
+fn bytesEq(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut i: usize = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+fn hexNibble(c: u8) -> i32 {
+  if c >= 48 && c <= 57 { return u8.toI32(c - 48) }
+  if c >= 65 && c <= 70 { return u8.toI32(c - 55) }
+  if c >= 97 && c <= 102 { return u8.toI32(c - 87) }
+  return -1
+}
+
+fn parseHexColor(bytes: &[u8]) -> Option<Rgba<f32>> {
+  if bytes.length != 7 || bytes[0] != 35 { return Option<Rgba<f32>>.None }
+  let r0 = hexNibble(bytes[1])
+  let r1 = hexNibble(bytes[2])
+  let g0 = hexNibble(bytes[3])
+  let g1 = hexNibble(bytes[4])
+  let b0 = hexNibble(bytes[5])
+  let b1 = hexNibble(bytes[6])
+  if r0 < 0 || r1 < 0 || g0 < 0 || g1 < 0 || b0 < 0 || b1 < 0 { return Option<Rgba<f32>>.None }
+  return Option<Rgba<f32>>.some(Rgba<f32> {
+    r: i32.toF32(r0 * 16 + r1) / 255.0,
+    g: i32.toF32(g0 * 16 + g1) / 255.0,
+    b: i32.toF32(b0 * 16 + b1) / 255.0,
+    a: 1.0,
+  })
+}
+
+fn controlAccent(c: &Computed, disabled: bool) -> Rgba<f32> {
+  let mut accent = if c.hasAccentColor {
+    c.accentColor
+  } else {
+    Rgba<f32> { r: 0.0, g: 0.459, b: 1.0, a: 1.0 }
+  }
+  if disabled { accent.a = accent.a * 0.45 }
+  return accent
+}
+
+/// Paints native `<input type="checkbox">` check / indeterminate glyph over the box.
+effect fn paintCheckbox(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let indeterminate = match node.semanticsOf() { Option.Some { value } => value.indeterminate _ => false }
+  if !node.checked && !indeterminate { return () }
+  let s = p.scale
+  let box = borderBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w <= 2.0 || h <= 2.0 { return () }
+  let accent = controlAccent(c, node.disabled)
+  let rect = snapped(device(box, s))
+  let mut fillQuad = Quad.fill(rect, mask, Background.solid(accent))
+  let radius = f32.min(3.0, f32.min(w, h) * 0.2) * s
+  fillQuad.cornerRadii = Radii.uniform(radius)
+  drop run p.scene.quad(fillQuad)
+  let markColor = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: if node.disabled { 0.65 } else { 1.0 } }
+  let mut path = VectorPath.make()
+  if indeterminate {
+    run path.moveTo(0.22, 0.5)
+    run path.lineTo(0.78, 0.5)
+  } else {
+    run path.moveTo(0.22, 0.52)
+    run path.lineTo(0.42, 0.72)
+    run path.lineTo(0.78, 0.28)
+  }
+  let transform = Affine.new(f32.toF64(w * s), 0.0, 0.0, f32.toF64(h * s), f32.toF64(box.xMin * s), f32.toF64(box.yMin * s))
+  let stroke = Stroke.make(0.15)
+  drop run Effect.catchAll(p.paths.stroke(&mut p.scene, 0, &path, &stroke, &transform, Background.solid(markColor), mask), noPath)
+}
+
+/// Paints native `<input type="radio">` accent ring and crisp inner dot when checked.
+effect fn paintRadio(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  if !node.checked { return () }
+  let s = p.scale
+  let box = borderBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w <= 2.0 || h <= 2.0 { return () }
+  let accent = controlAccent(c, node.disabled)
+  let outerRect = snapped(device(box, s))
+  let mut outer = Quad.fill(outerRect, mask, Background.solid(accent))
+  outer.cornerRadii = Radii.uniform(f32.min(w, h) * 0.5 * s)
+  drop run p.scene.quad(outer)
+  let inset = f32.min(w, h) * 0.28
+  let innerRect = snapped(device(Rect<f32>.new(box.xMin + inset, box.yMin + inset, box.xMax - inset, box.yMax - inset), s))
+  let dotColor = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: if node.disabled { 0.65 } else { 1.0 } }
+  let mut dot = Quad.fill(innerRect, mask, Background.solid(dotColor))
+  dot.cornerRadii = Radii.uniform(f32.max(1.0, (f32.min(w, h) - inset * 2.0) * 0.5 * s))
+  drop run p.scene.quad(dot)
+}
+
+/// Paints native `<progress>` track and determinate/indeterminate fill bar.
+effect fn paintProgress(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let s = p.scale
+  let box = contentBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w <= 0.0 || h <= 0.0 { return () }
+  let barH = f32.min(h, f32.max(6.0, h * 0.5))
+  let cy = (box.yMin + box.yMax) * 0.5
+  let radius = (barH * 0.5) * s
+  let trackRect = snapped(device(Rect<f32>.new(box.xMin, cy - barH * 0.5, box.xMax, cy + barH * 0.5), s))
+  let mut track = Quad.fill(trackRect, mask, Background.solid(Rgba<f32> { r: 0.55, g: 0.55, b: 0.55, a: 0.28 }))
+  track.cornerRadii = Radii.uniform(radius)
+  drop run p.scene.quad(track)
+  let accent = controlAccent(c, node.disabled)
+  if node.hasValueRange() {
+    let minVal = node.valueMin()
+    let maxVal = node.valueMax()
+    let nowVal = node.valueNow()
+    let ratio: f32 = if maxVal > minVal { f32.min(1.0, f32.max(0.0, (nowVal - minVal) / (maxVal - minVal))) } else { 0.0 }
+    if ratio > 0.0 {
+      let fillRect = snapped(device(Rect<f32>.new(box.xMin, cy - barH * 0.5, box.xMin + w * ratio, cy + barH * 0.5), s))
+      let mut fill = Quad.fill(fillRect, mask, Background.solid(accent))
+      fill.cornerRadii = Radii.uniform(radius)
+      drop run p.scene.quad(fill)
+    }
+  } else {
+    // Indeterminate progress bar: centered 30% bar.
+    let segW = w * 0.3
+    let x0 = box.xMin + (w - segW) * 0.5
+    let fillRect = snapped(device(Rect<f32>.new(x0, cy - barH * 0.5, x0 + segW, cy + barH * 0.5), s))
+    let mut fill = Quad.fill(fillRect, mask, Background.solid(accent))
+    fill.cornerRadii = Radii.uniform(radius)
+    drop run p.scene.quad(fill)
+  }
+}
+
+/// Paints native `<meter>` gauge bar colored by optimum / suboptimum / even-less-good region.
+effect fn paintMeter(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let s = p.scale
+  let box = contentBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w <= 0.0 || h <= 0.0 { return () }
+  let barH = f32.min(h, f32.max(8.0, h * 0.7))
+  let cy = (box.yMin + box.yMax) * 0.5
+  let radius = (barH * 0.35) * s
+  let trackRect = snapped(device(Rect<f32>.new(box.xMin, cy - barH * 0.5, box.xMax, cy + barH * 0.5), s))
+  let mut track = Quad.fill(trackRect, mask, Background.solid(Rgba<f32> { r: 0.55, g: 0.55, b: 0.55, a: 0.25 }))
+  track.cornerRadii = Radii.uniform(radius)
+  drop run p.scene.quad(track)
+  let ratio: f32 = if node.hasValueRange() && node.valueMax() > node.valueMin() {
+    f32.min(1.0, f32.max(0.0, (node.valueNow() - node.valueMin()) / (node.valueMax() - node.valueMin())))
+  } else { 0.0 }
+  if ratio > 0.0 {
+    let mut color = Rgba<f32> { r: 0.133, g: 0.647, b: 0.349, a: 1.0 }
+    if let Option.Some { value: state } = nodeNamedAttr(node, "-silk-meter-state") {
+      if bytesEq(state, b"suboptimum") {
+        color = Rgba<f32> { r: 0.898, g: 0.604, b: 0.086, a: 1.0 }
+      } else if bytesEq(state, b"even-less-good") {
+        color = Rgba<f32> { r: 0.863, g: 0.208, b: 0.271, a: 1.0 }
+      }
+    }
+    let fillRect = snapped(device(Rect<f32>.new(box.xMin, cy - barH * 0.5, box.xMin + w * ratio, cy + barH * 0.5), s))
+    let mut fill = Quad.fill(fillRect, mask, Background.solid(color))
+    fill.cornerRadii = Radii.uniform(radius)
+    drop run p.scene.quad(fill)
+  }
+}
+
+/// Paints native `<input type="color">` inset color swatch.
+effect fn paintColorSwatch(p: &mut Painter<'_, '_>, slot: u32, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let s = p.scale
+  let box = contentBox(f)
+  if box.xMax <= box.xMin || box.yMax <= box.yMin { return () }
+  let swatch = match nodeNamedAttr(node, "-silk-color") {
+    Option.Some { value } => match parseHexColor(value) {
+      Option.Some { value: rgba } => rgba
+      _ => Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+    }
+    _ => Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }
+  }
+  let mut quad = Quad.fill(snapped(device(box, s)), mask, Background.solid(swatch))
+  quad.cornerRadii = Radii.uniform(2.0 * s)
+  drop run p.scene.quad(quad)
+}
+
+/// Paints native `<select>` dropdown chevron on the trailing edge of a single-select box.
+effect fn paintSelectChrome(p: &mut Painter<'_, '_>, slot: u32, c: &Computed, f: &Fragment, mask: ContentMask) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  if nodeNamedAttr(node, "multiple").isSome() { return () }
+  let s = p.scale
+  let box = paddingBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w < 14.0 || h < 8.0 { return () }
+  let chevSize = f32.min(8.0, h * 0.35)
+  let cx = box.xMax - 11.0
+  let cy = (box.yMin + box.yMax) * 0.5
+  let mut color = c.text.color
+  if node.disabled { color.a = color.a * 0.45 }
+  let mut path = VectorPath.make()
+  run path.moveTo(-0.5, -0.22)
+  run path.lineTo(0.0, 0.28)
+  run path.lineTo(0.5, -0.22)
+  let transform = Affine.new(f32.toF64(chevSize * s), 0.0, 0.0, f32.toF64(chevSize * s), f32.toF64(cx * s), f32.toF64(cy * s))
+  let stroke = Stroke.make(0.18)
+  drop run Effect.catchAll(p.paths.stroke(&mut p.scene, 0, &path, &stroke, &transform, Background.solid(color), mask), noPath)
+}
+
 /// The color of an `outline: auto` focus ring whose color is `auto`.
 const FOCUS_RING: Rgba<f32> = Rgba<f32> { r: 0.0, g: 0.373, b: 0.8, a: 1.0 }
 
@@ -3463,10 +3700,24 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: &Fragment, mask: Co
           tint.a = tint.a * 0.5
           drop run p.scene.quad(Quad.fill(device(borderBox(f), p.scale), mask, Background.solid(tint)))
         }
-      } else if p.nodes.asSlice()[u32.toUsize(slot)].accessRole == Role.Slider
-        && p.nodes.asSlice()[u32.toUsize(slot)].hasValueRange()
-        && !c.appearanceNone {
-        run paintRange(&mut p, slot, c, f, mask)
+      } else if !c.appearanceNone {
+        let ctrlNode = &p.nodes.asSlice()[u32.toUsize(slot)]
+        let ctrlTag = nodeTagBytes(ctrlNode)
+        if ctrlNode.accessRole == Role.Slider && ctrlNode.hasValueRange() {
+          run paintRange(&mut p, slot, c, f, mask)
+        } else if ctrlNode.accessRole == Role.Checkbox && bytesEq(ctrlTag, b"input") {
+          run paintCheckbox(&mut p, slot, c, f, mask)
+        } else if ctrlNode.accessRole == Role.Radio && bytesEq(ctrlTag, b"input") {
+          run paintRadio(&mut p, slot, c, f, mask)
+        } else if bytesEq(ctrlTag, b"progress") {
+          run paintProgress(&mut p, slot, c, f, mask)
+        } else if bytesEq(ctrlTag, b"meter") {
+          run paintMeter(&mut p, slot, f, mask)
+        } else if bytesEq(ctrlTag, b"input") && match nodeNamedAttr(ctrlNode, "type") { Option.Some { value } => bytesEq(value, b"color") _ => false } {
+          run paintColorSwatch(&mut p, slot, f, mask)
+        } else if bytesEq(ctrlTag, b"select") {
+          run paintSelectChrome(&mut p, slot, c, f, mask)
+        }
       }
     }
     let mut inner = mask

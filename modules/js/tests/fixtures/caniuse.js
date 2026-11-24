@@ -220,7 +220,15 @@ check("clipboard", true, () => {
 });
 check("console-basic", true, () => ["log", "info", "warn", "error", "debug"].every((name) => typeof console[name] === "function"));
 check("console-time", true, () => typeof console.time === "function" && typeof console.timeEnd === "function" && typeof console.timeLog === "function");
-check("constraint-validation", false, () => typeof ui.createInput().checkValidity === "function");
+check("constraint-validation", true, () => {
+  const input = ui.createInput();
+  input.required = true;
+  if (input.checkValidity() !== false || !input.validity.valueMissing) return false;
+  input.value = "ok";
+  if (input.checkValidity() !== true || !input.validity.valid) return false;
+  input.setCustomValidity("bad");
+  return input.checkValidity() === false && input.validity.customError && input.validationMessage === "bad";
+});
 check("createimagebitmap", false, () => typeof globalThis.createImageBitmap === "function");
 check("credential-management", false, () => typeof navigator.credentials === "object");
 check("cryptography", NODE, async () => {

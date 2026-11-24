@@ -108,7 +108,7 @@
   forward(globalThis.performance, "performance", ["mark", "measure", "getEntries", "getEntriesByName", "getEntriesByType", "clearMarks", "clearMeasures"]);
   globalThis.performance.toJSON = () => ({ timeOrigin: globalThis.performance.timeOrigin });
   const own = (name, value) => Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
-  for (const name of ["Blob", "File", "FormData", "setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
+  for (const name of ["Blob", "File", "FormData", "SubmitEvent", "FormDataEvent", "setImmediate", "clearImmediate", "requestIdleCallback", "cancelIdleCallback", "atob", "btoa", "TextEncoder", "TextDecoder", "crypto", "Event", "CustomEvent", "PromiseRejectionEvent", "EventTarget", "MediaQueryList", "MediaQueryListEvent", "AbortController", "AbortSignal", "BatteryManager"]) {
     Object.defineProperty(globalThis, name, {
       get: () => {
         const value = api()[name];

@@ -554,3 +554,137 @@ pub fn classReach(sheets: &StyleSheets, atoms: &Atoms, before: &[usize], after: 
 pub fn attributeReach(sheets: &StyleSheets, atoms: &Atoms, names: &[&[u8]], ids: &[&[u8]]) -> Extent {
   return reach(sheets, &Probe { classes: false, atoms: atoms, before: &[], after: &[], names: names, ids: ids }, Extent.none())
 }
+
+effect fn mergeU32Extent(map: &mut HashMap<u32, Extent>, key: u32, add: Extent) -> () ! OutOfMemoryError ? &mut Allocator {
+  let merged = match map.get(key) {
+    Option.Some { value } => value.with(add)
+    _ => add
+  }
+  drop run map.insert(key, merged)
+}
+
+effect fn mergeAtomExtent(map: &mut HashMap<usize, Extent>, key: usize, add: Extent) -> () ! OutOfMemoryError ? &mut Allocator {
+  let merged = match map.get(key) {
+    Option.Some { value } => value.with(add)
+    _ => add
+  }
+  drop run map.insert(key, merged)
+}
+
+fn containsAtom(values: &[usize], atom: usize) -> bool {
+  let mut i: usize = 0
+  while i < values.length {
+    if values[i] == atom { return true }
+    i = i + 1
+  }
+  return false
+}
+
+/// Precomputed O(1) invalidation lookup tables for a root's adopted stylesheets, built once
+/// whenever stylesheets change. Replaces linear scanning over every rule on each class, id,
+/// or attribute mutation.
+pub struct InvalidationMap {
+  classes: HashMap<usize, Extent>,
+  classAttr: Extent,
+  attributes: HashMap<u32, Extent>,
+  ids: HashMap<u32, Extent>,
+}
+
+impl InvalidationMap {
+  pub fn make() -> Self {
+    return InvalidationMap {
+      classes: HashMap<usize, Extent>.make(Hash.seed(5471)),
+      classAttr: Extent.none(),
+      attributes: HashMap<u32, Extent>.make(Hash.seed(5477)),
+      ids: HashMap<u32, Extent>.make(Hash.seed(5479)),
+    }
+  }
+
+  pub effect fn collect(sheets: &StyleSheets, atoms: &mut Atoms) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let mut result = InvalidationMap.make()
+    let mut i: usize = 0
+    while i < sheets.sheets().length {
+      let sheet = &sheets.sheets()[i].sheet
+      let rules = sheet.resolver.rules()
+      let mut rule: usize = 0
+      while rule < rules.length {
+        let dependencies = sheet.resolver.invalidation(rule)
+        let buffer = &sheet.buffers.asSlice()[rules[rule].buffer]
+        let mut at: usize = 0
+        while at < dependencies.length {
+          let dependency = dependencies[at]
+          let ext = dependencyReach(&dependency, buffer.text(dependency.subjectName))
+          let name = buffer.text(dependency.name)
+          match dependency.kind {
+            DependencyKind.Class => {
+              let atom = run atoms.intern(name)
+              run mergeAtomExtent(&mut result.classes, atom, ext)
+            }
+            DependencyKind.Attribute => {
+              run mergeU32Extent(&mut result.attributes, attrKey(name), ext)
+              if insensitive(name, b"class") {
+                result.classAttr = result.classAttr.with(ext)
+              }
+            }
+            DependencyKind.Id => {
+              run mergeU32Extent(&mut result.ids, ancestor_filter.key(NameKind.Id, name), ext)
+            }
+            _ => {}
+          }
+          at = at + 1
+        }
+        rule = rule + 1
+      }
+      i = i + 1
+    }
+    return move result
+  }
+
+  pub fn classReach(self: &Self, before: &[usize], after: &[usize], least: Extent) -> Extent {
+    let mut change = least.with(self.classAttr)
+    let mut i: usize = 0
+    while i < before.length {
+      let atom = before[i]
+      if !containsAtom(after, atom) {
+        if let Option.Some { value } = self.classes.get(atom) {
+          change = change.with(value)
+        }
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < after.length {
+      let atom = after[i]
+      if !containsAtom(before, atom) {
+        if let Option.Some { value } = self.classes.get(atom) {
+          change = change.with(value)
+        }
+      }
+      i = i + 1
+    }
+    return change
+  }
+
+  pub fn attributeReach(self: &Self, names: &[&[u8]], ids: &[&[u8]]) -> Extent {
+    let mut change = Extent.none()
+    let mut i: usize = 0
+    while i < names.length {
+      if names[i].length != 0 {
+        if let Option.Some { value } = self.attributes.get(attrKey(names[i])) {
+          change = change.with(value)
+        }
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < ids.length {
+      if ids[i].length != 0 {
+        if let Option.Some { value } = self.ids.get(ancestor_filter.key(NameKind.Id, ids[i])) {
+          change = change.with(value)
+        }
+      }
+      i = i + 1
+    }
+    return change
+  }
+}

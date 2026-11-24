@@ -115,7 +115,7 @@ import properties.computed { Display as CssDisplay, DisplayOutside, DisplayInsid
 import style_identity { Atoms, NodeIdentity, SelectorKey, SelectorKeys, IdentityExtras }
 import style_sheets
 import style_invalidation
-import style_invalidation { Reach, Extent, StartingSubjects, StateSubjects, PseudoSubjects }
+import style_invalidation { Reach, Extent, StartingSubjects, StateSubjects, PseudoSubjects, InvalidationMap }
 import svg_css.variables { ScopeId }
 import svg_css.element as css_element
 import svg_css.selectors as css_selectors
@@ -944,6 +944,7 @@ pub struct UiTree<'a> {
   styleLoads: List<StyleRequest>,
   styleGeneration: u64,
   pub svgStyleRevision: u64,
+  pub svgStylesPending: bool,
   nextStyleId: u32,
   hostStylePreferences: Option<Preferences>,
   free: List<u32>,
@@ -1695,6 +1696,7 @@ impl<'a> UiTree<'a> {
       styleLoads: List<StyleRequest>.make(),
       styleGeneration: 0,
       svgStyleRevision: 1,
+      svgStylesPending: true,
       nextStyleId: 1,
       hostStylePreferences: Option<Preferences>.None,
       free: List<u32>.make(),
@@ -2287,7 +2289,7 @@ impl<'a> UiTree<'a> {
     let before = match self.node(slot).identity() { Option.Some { value } => value.classAtoms() _ => &[] }
     // Generated content can read the class with attr().
     let least = if sheets.hasGenerated { Extent.itself() } else { Extent.none() }
-    return style_invalidation.classReach(&sheets.sheets, &self.styleAtoms, before, after, least)
+    return sheets.invalidation.classReach(before, after, least)
   }
 
   /// Restyles the subtree of `slot`'s parent, which holds every sibling a selector can relate it to.
@@ -2508,7 +2510,7 @@ impl<'a> UiTree<'a> {
     }
     if !any { return Extent.none() }
     if !sheets.states.attributes { return least }
-    return least.with(style_invalidation.attributeReach(&sheets.sheets, &self.styleAtoms, names, ids))
+    return least.with(sheets.invalidation.attributeReach(names, ids))
   }
 
   fn idReach(self: &Self, slot: u32, after: &[u8]) -> Extent {
@@ -2538,13 +2540,29 @@ impl<'a> UiTree<'a> {
     }
   }
 
+  fn markIconStyleDirty(self: &mut Self, slot: u32) -> () {
+    let node = self.nodeMut(slot)
+    if node.kind != NodeKind.Icon { return () }
+    let mut isLive = false
+    if let Option<&mut LiveSvg>.Some { value: svg } = node.svg.getMut() {
+      svg.styleDirty = true
+      isLive = true
+    }
+    if !isLive {
+      self.resources.invalidateStyledIcon(slot)
+    }
+    self.svgStylesPending = true
+  }
+
   /// Restyles the elements below `slot` that carry one of `change.keys`: the subjects a
   /// selector that tests `slot` in an ancestor compound can match.
   fn restyleCarriers(self: &mut Self, slot: u32, change: &Extent) -> () {
     let root = u32.toUsize(slot)
     let mut at = self.elementAfter(root, root, true)
     while at != css_element.NO_ELEMENT {
-      if self.carries(usize.toU32(at), change) { self.restyleSelf(usize.toU32(at)) }
+      let s = usize.toU32(at)
+      if self.node(s).kind == NodeKind.Icon { self.markIconStyleDirty(s) }
+      if self.carries(s, change) { self.restyleSelf(s) }
       at = self.elementAfter(at, root, true)
     }
   }
@@ -2611,10 +2629,12 @@ impl<'a> UiTree<'a> {
     let root = u32.toUsize(slot)
     let mut at = self.elementAfter(root, root, true)
     while at != css_element.NO_ELEMENT {
-      let watch = self.node(usize.toU32(at)).styleWatch
-      let depth = self.depthAbove(usize.toU32(at), slot)
+      let s = usize.toU32(at)
+      if self.node(s).kind == NodeKind.Icon { self.markIconStyleDirty(s) }
+      let watch = self.node(s).styleWatch
+      let depth = self.depthAbove(s, slot)
       if (far && u32.bitAnd(watch, WATCH_OUTSIDE) != 0) || (depth != 0 && u32.bitAnd(watch, u32.shiftLeft(1, ASKED_UP_SHIFT + depth - 1)) != 0) {
-        self.restyleSelf(usize.toU32(at))
+        self.restyleSelf(s)
       }
       at = self.elementAfter(at, root, true)
     }
@@ -3235,9 +3255,16 @@ impl<'a> UiTree<'a> {
           }
           Attribute.Disabled { value } => {
             if node.disabled != value {
+              let isGroup = match node.identity() {
+                Option.Some { value: found } => found.tag() == "fieldset" || found.tag() == "optgroup"
+                _ => false
+              }
               node.disabled = value
               node.content = node.content + 1
               self.paintDirty = true
+              if isGroup {
+                self.restyleLocal(slot)
+              }
             }
           }
           Attribute.Prevent { actions } => {
@@ -3247,7 +3274,11 @@ impl<'a> UiTree<'a> {
             node.focusTrap = value
           }
           Attribute.Checked { value } => {
-            node.checked = value
+            if node.checked != value {
+              node.checked = value
+              node.content = node.content + 1
+              self.paintDirty = true
+            }
           }
           Attribute.Selected { value } => {
             node.selected = value
@@ -3293,7 +3324,11 @@ impl<'a> UiTree<'a> {
           }
           Attribute.Indeterminate { value } => {
             let semantics = run node.semanticsMut()
-            semantics.indeterminate = value
+            if semantics.indeterminate != value {
+              semantics.indeterminate = value
+              node.content = node.content + 1
+              self.paintDirty = true
+            }
           }
           Attribute.Required { value } => {
             let semantics = run node.semanticsMut()
@@ -3448,10 +3483,22 @@ impl<'a> UiTree<'a> {
             }
             let range = style_attributes.isRange(String.view(&name))
             let span = style_attributes.isSpan(String.view(&name))
+            let isType = String.view(&name) == "type"
+            let isSelectLabel = String.view(&name) == "-silk-select-label"
+            let isControlPaint = String.view(&name) == "-silk-color" || String.view(&name) == "-silk-meter-state" || isSelectLabel
             let identity = run self.nodeMut(slot).identityMut()
             run identity.set(move name, move value)
             if range { run style_attributes.syncRange(self.nodeMut(slot)) }
             if span { self.restyleFor(slot, 24) }
+            if isType && self.node(slot).kind == NodeKind.Input && self.node(slot).hasEdit() {
+              run edit.syncDisplay(&mut self, slot)
+            }
+            if isControlPaint {
+              let n = self.nodeMut(slot)
+              n.content = n.content + 1
+              self.paintDirty = true
+              if isSelectLabel { self.restyleSelf(slot) }
+            }
           }
           Attribute.ClassName { value } => {
             let tag = match node.identity() { Option.Some { value: identity } => run String.copy(identity.tag()) _ => String.make() }
@@ -3614,6 +3661,10 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         node.resource = resource
         node.content = node.content + 1
+        if kind == NodeKind.Icon {
+          self.resources.invalidateStyledIcon(slot)
+          self.svgStylesPending = true
+        }
         run self.updateNatural(slot)
         // A source that already settled still tells a new node, as an image from the cache
         // does on the web.
@@ -3667,7 +3718,9 @@ impl<'a> UiTree<'a> {
         let node = self.nodeMut(slot)
         let svg = run node.liveSvg()
         drop run svg.insert(element, String.utf8Bytes(String.view(&tag)), parent, at)
+        svg.styleDirty = true
         node.content = node.content + 1
+        self.svgStylesPending = true
       }
       Mutation.SvgRemove { id, element } => {
         let slot = run self.requireSvg(index, id)
@@ -3676,8 +3729,10 @@ impl<'a> UiTree<'a> {
           node.svg.clear()
         } else if let Option<&mut LiveSvg>.Some { value } = node.svg.getMut() {
           drop value.remove(element)
+          value.styleDirty = true
         }
         node.content = node.content + 1
+        self.svgStylesPending = true
         run self.updateNatural(slot)
       }
       Mutation.SvgAttribute { id, element, name, value } => {
@@ -3693,7 +3748,9 @@ impl<'a> UiTree<'a> {
             drop run svg.set(element, String.utf8Bytes(String.view(&name)), b"", false)
           }
         }
+        svg.styleDirty = true
         node.content = node.content + 1
+        self.svgStylesPending = true
         if sized {
           run self.updateNatural(slot)
         }
@@ -4476,15 +4533,22 @@ impl<'a> UiTree<'a> {
     let old = Intrinsic.replace(self.resources.variables, List<IconVariables>.make())
     let mut found = List<IconVariables>.make()
     let count = self.nodes.length()
+    let mut oldCursor: usize = 0
     let mut slot: usize = 0
     while slot < count {
-      if self.nodes.asSlice()[slot].kind == NodeKind.Icon {
-        let names = self.resources.markupVariables(self.nodes.asSlice()[slot].resource)
+      let n = &self.nodes.asSlice()[slot]
+      if n.live && n.rendered && n.kind == NodeKind.Icon {
+        let slotU32 = usize.toU32(slot)
+        let names = self.resources.markupVariables(n.resource)
+        if names.length == 0 {
+          slot = slot + 1
+          continue
+        }
         let mut css = List<u8>.make()
         let mut i: usize = 0
         while i < names.length {
           let mut value = Bytes.make()
-          if run self.customProperty(usize.toU32(slot), names[i].asSlice(), &mut value) {
+          if run self.customProperty(slotU32, names[i].asSlice(), &mut value) {
             run css.appendSlice(names[i].asSlice())
             run css.append(58)
             run css.appendSlice(value.asSlice())
@@ -4502,21 +4566,22 @@ impl<'a> UiTree<'a> {
         let current = self.nodes.asSlice()[slot].paintHash
         // A restyle since the last frame wrote a fresh hash; otherwise it still holds the old key.
         let mut base = current
-        let mut j: usize = 0
-        while j < old.length() {
-          let entry = &old.asSlice()[j]
-          if entry.slot == usize.toU32(slot) && entry.mixed == current { base = entry.base }
-          j = j + 1
+        while oldCursor < old.length() && old.asSlice()[oldCursor].slot < slotU32 {
+          oldCursor = oldCursor + 1
+        }
+        if oldCursor < old.length() {
+          let entry = &old.asSlice()[oldCursor]
+          if entry.slot == slotU32 && entry.mixed == current { base = entry.base }
         }
         let mixed = if bytes.length == 0 { base } else { Hash.combine(base, key) }
         if mixed != current {
-          let target = self.nodeMut(usize.toU32(slot))
+          let target = self.nodeMut(slotU32)
           target.paintHash = mixed
-          run self.repair.nodes.append(usize.toU32(slot))
+          run self.repair.nodes.append(slotU32)
           self.repair.pending = true
         }
         if bytes.length != 0 {
-          run found.append(IconVariables { slot: usize.toU32(slot), key: key, css: move css, base: base, mixed: mixed })
+          run found.append(IconVariables { slot: slotU32, key: key, css: move css, base: base, mixed: mixed })
         }
       }
       slot = slot + 1
@@ -6959,6 +7024,16 @@ impl<'a> UiTree<'a> {
     if held { return true }
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLetter
+      && self.styleSheets.asSlice()[at].firstLetterSubjects.mayMatch(node, self.isRootNode(slot))
+  }
+
+  /// Whether `syncFirstLine` has anything to do at `slot`.
+  fn lineCandidate(self: &Self, slot: u32) -> bool {
+    let node = self.node(slot)
+    if node.kind != NodeKind.Box || node.isGenerated() { return false }
+    let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
+    return at != usize.MAX && self.styleSheets.asSlice()[at].hasFirstLine
+      && self.styleSheets.asSlice()[at].firstLineSubjects.mayMatch(node, self.isRootNode(slot))
   }
 
   effect fn syncFirstLetter(self: &mut Self, origin: u32) -> ()
@@ -7387,8 +7462,9 @@ impl<'a> UiTree<'a> {
       return ()
     }
     self.work.stylePasses = self.work.stylePasses + 1
-    self.svgStyleRevision = self.svgStyleRevision + 1
     if self.stylesDirty {
+      self.svgStyleRevision = self.svgStyleRevision + 1
+      self.svgStylesPending = true
       run sheet_faces.sync(&mut self)
       if run font_rules.sync(&mut self) { self.fontRulesChanged() }
     }
@@ -7404,6 +7480,7 @@ impl<'a> UiTree<'a> {
         roots[sheetIndex].reads = style_invalidation.reads(&roots[sheetIndex].sheets)
         roots[sheetIndex].sharing = style_invalidation.sharing(&roots[sheetIndex].sheets)
         roots[sheetIndex].stateSubjects = run StateSubjects.collect(&roots[sheetIndex].sheets)
+        roots[sheetIndex].invalidation = run InvalidationMap.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
         roots[sheetIndex].startingSubjects = if roots[sheetIndex].hasStarting {
           run StartingSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms)
         } else { StartingSubjects.make() }
@@ -7416,7 +7493,13 @@ impl<'a> UiTree<'a> {
         } else { PseudoSubjects.make() }
         roots[sheetIndex].hasMarker = lists.hasMarkerRules(&roots[sheetIndex].sheets)
         roots[sheetIndex].hasFirstLetter = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLetter)
+        roots[sheetIndex].firstLetterSubjects = if roots[sheetIndex].hasFirstLetter {
+          run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.FirstLetter, false)
+        } else { PseudoSubjects.make() }
         roots[sheetIndex].hasFirstLine = first_letter.hasRules(&roots[sheetIndex].sheets, PseudoTarget.FirstLine)
+        roots[sheetIndex].firstLineSubjects = if roots[sheetIndex].hasFirstLine {
+          run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.FirstLine, false)
+        } else { PseudoSubjects.make() }
         roots[sheetIndex].hasSelection = selection.present(&roots[sheetIndex].sheets)
         roots[sheetIndex].selectionSubjects = if roots[sheetIndex].hasSelection {
           run PseudoSubjects.collect(&roots[sheetIndex].sheets, &mut self.styleAtoms, PseudoTarget.Selection, false)
@@ -7505,22 +7588,53 @@ impl<'a> UiTree<'a> {
       // Bit 34: all that changed in the parent is its variable scope. A node that reads none
       // of the variables that differ keeps its style and moves under the new scope.
       let scoped = u64.bitAnd(entry, 0x400000000) != 0
+      // Bit 35: all that changed in the parent is its `rendered` visibility (e.g. toggling
+      // `display: none` / `hidden`). Clean descendants without animations, transitions, or
+      // `@starting-style` only update `rendered` without re-matching selectors or recomputing styles.
+      let rendOnly = u64.bitAnd(entry, 0x800000000) != 0
       let moves = scoped && !full && !rootFontChanged && !reached && u64.bitAnd(entry, 0x100000000) == 0 && self.movesScope(slot, differs)
+      let fastRendered = rendOnly && !full && !rootFontChanged && !reached && u64.bitAnd(entry, 0x100000000) == 0 && !scoped
+        && self.canFastRendered(slot, sheetIndex, firstLetterRules, firstLineRules)
       // A node that cannot move takes the new scope as any other change of what it inherits.
-      let forced = full || rootFontChanged || u64.bitAnd(entry, 0x100000000) != 0 || (scoped && !moves)
+      let forced = full || rootFontChanged || u64.bitAnd(entry, 0x100000000) != 0 || (scoped && !moves) || (rendOnly && !fastRendered)
       let mut changed = full
       // The change is the node's variable scope and nothing else its children inherit.
       let mut scopeOnly = false
+      // The change is the node's `rendered` flag and nothing else its children inherit.
+      let mut renderedOnly = false
       // The properties that may differ in this node's new scope, for its children.
       let mut differBelow = differs
       if moves {
         changed = run self.moveScope(slot)
         scopeOnly = changed
+        if changed && self.node(slot).kind == NodeKind.Icon { self.markIconStyleDirty(slot) }
         // Its children are not visited: what they share was taken under the class it held.
         if !changed { run self.forgetShares(slot) }
+      } else if fastRendered {
+        let parentRendered = self.node(self.node(slot).parent).rendered
+        let newRendered = parentRendered && !self.node(slot).computed().layout.display.isNone()
+        if newRendered != self.node(slot).rendered {
+          let target = self.nodeMut(slot)
+          target.rendered = newRendered
+          if newRendered && target.kind == NodeKind.Icon {
+            let resource = target.resource
+            let needsSvg = match target.svg.get() {
+              Option<&LiveSvg>.Some { value: svg } => svg.styleDirty || svg.styleRevision != self.svgStyleRevision
+              _ => resource != 0 && self.resources.styledIconRevision(slot, resource) != self.svgStyleRevision
+            }
+            if needsSvg { self.svgStylesPending = true }
+          }
+          if !self.paintCachesStale {
+            run self.repair.nodes.append(slot)
+            self.repair.pending = true
+          }
+          if self.listsUsed { self.listsDirty = true }
+          changed = true
+          renderedOnly = true
+        }
       }
       let node = self.node(slot)
-      let own = !moves && (forced || reached || node.styleDirty)
+      let own = !moves && !fastRendered && (forced || reached || node.styleDirty)
       let tick = !forced && !reached && node.styleTick
       let below = node.subtreeDirty
       let mut subtree = false
@@ -7564,7 +7678,7 @@ impl<'a> UiTree<'a> {
         if generatedRules || hasGen { run self.syncGenerated(slot) }
         if listStyle.item() || self.node(slot).computed().list.item() { run self.syncMarker(slot) }
         if (self.letterUsed || firstLetterRules) && self.letterCandidate(slot) { run self.letterPending.append(slot) }
-        if self.lineOrigins.length() != 0 || (firstLineRules && resolvedKind == NodeKind.Box) { run self.syncFirstLine(slot) }
+        if self.lineOrigins.length() != 0 || (firstLineRules && self.lineCandidate(slot)) { run self.syncFirstLine(slot) }
         let styled = self.node(slot)
         let repaints = tracksPaint && !self.paintCachesStale && (scrollbarRules || styled.kind == NodeKind.Input
           || paintBefore != styled.paintHash || beforeFont != styled.fontKey || wasRendered != styled.rendered
@@ -7587,12 +7701,13 @@ impl<'a> UiTree<'a> {
         // does not resolve again in this pass give it up.
         forget = classBefore != self.node(slot).styleClass && !subtree
         let scopeChanged = !sameScope(scopeBefore, self.node(slot).sheetScope())
-        let valuesChanged = !sameText(&before, &after.text) || events != after.paint.pointerEvents
+        let renderedChanged = wasRendered != self.node(slot).rendered
+        let otherValuesChanged = !sameText(&before, &after.text) || events != after.paint.pointerEvents
           || selects != after.userSelect || &barColors != &after.scroll.colors || &listStyle != &after.list || nearest != after.nearest
           || namesChanged || containment != after.contain.query() || skips != after.contain.hidden()
-          || wasRendered != self.node(slot).rendered
           || shadow.shadowFrom != after.effects.shadowFrom
           || shadow.shadowHash != after.effects.shadowHash
+        let valuesChanged = otherValuesChanged || renderedChanged
         // What may differ below: what differed above, where that is known, and what the node's
         // own declarations give another value now.
         let known = scopeBefore.isSome() && !full && !rootFontChanged && (scoped || u64.bitAnd(entry, 0x100000000) == 0)
@@ -7601,10 +7716,12 @@ impl<'a> UiTree<'a> {
         let inheritsScope = scopeChanged && (!known || differBelow != 0)
         changed = full || rootFontChanged || inheritsScope || valuesChanged
         scopeOnly = !full && !rootFontChanged && scopeChanged && !valuesChanged
+        renderedOnly = !full && !rootFontChanged && !inheritsScope && !otherValuesChanged && renderedChanged
         let free = self.variableUses() == usesBefore
         if listsChanged { self.listsDirty = true }
         let flagged = self.nodeMut(slot)
         flagged.variableFree = free
+        if resolvedKind == NodeKind.Icon { self.markIconStyleDirty(slot) }
       }
       // Under a change of scope alone every child is visited and takes a class again.
       if forget && !scopeOnly { run self.forgetShares(slot) }
@@ -7614,7 +7731,10 @@ impl<'a> UiTree<'a> {
       cleared.subtreeDirty = false
       cleared.styleSubtree = false
       if changed || below || subtree || own {
-        let flag: u64 = u64.bitOr(u64.bitOr(if changed && !scopeOnly { 0x100000000 } else { 0 }, if subtree { 0x200000000 } else { 0 }), if scopeOnly { 0x400000000 } else { 0 })
+        let flag: u64 = u64.bitOr(
+          u64.bitOr(if changed && !scopeOnly && !renderedOnly { 0x100000000 } else { 0 }, if subtree { 0x200000000 } else { 0 }),
+          u64.bitOr(if scopeOnly { 0x400000000 } else { 0 }, if renderedOnly { 0x800000000 } else { 0 }),
+        )
         // Children in reverse, so the first is resolved first.
         let css = self.node(slot).css
         let first = stack.length()
@@ -7694,6 +7814,26 @@ impl<'a> UiTree<'a> {
     let at = style_sheets.index(self.styleSheets.asSlice(), self.current)
     if at == usize.MAX { return u64.MAX }
     return self.styleSheets.asSlice()[at].sheets.variablesDiffering(before, after)
+  }
+
+  fn canFastRendered(self: &Self, slot: u32, sheetIndex: usize, firstLetterRules: bool, firstLineRules: bool) -> bool {
+    let node = self.node(slot)
+    if node.parent == NONE || node.styleDirty || node.styleTick || node.computedStamp == 0 { return false }
+    if node.generatedSuppressed || node.activeTransitions != 0 || self.hasPlayingAnimation(slot) { return false }
+    if node.computed().animation.names.start != usize.MAX { return false }
+    if style_change.tracks(self, slot) { return false }
+    if firstLetterRules && self.letterCandidate(slot) { return false }
+    if firstLineRules && self.lineCandidate(slot) { return false }
+    let parentRendered = self.node(node.parent).rendered
+    let newRendered = parentRendered && !node.computed().layout.display.isNone()
+    if newRendered && !node.rendered {
+      if node.starting().length != 0 { return false }
+      if sheetIndex != usize.MAX {
+        let sheets = &self.styleSheets.asSlice()[sheetIndex]
+        if sheets.hasStarting && sheets.startingSubjects.mayMatch(node) { return false }
+      }
+    }
+    return true
   }
 
   /// Whether the node at `slot`, whose parent changed only its variable scope, can keep its

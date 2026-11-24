@@ -90,7 +90,7 @@ const NO_BUBBLE = new Set([
 const CANCELABLE = new Set([
   "pointerdown", "pointerup", "click", "wheel", "keydown", "keyup", "dragenter", "dragover", "drop",
   "mousedown", "mouseup", "mousemove", "mouseover", "mouseout", "selectstart", "copy", "cut", "paste", "beforeinput",
-  "closerequest", "navigate",
+  "closerequest", "navigate", "submit", "reset", "invalid",
 ]);
 // Files dragged from the desktop: the host dispatches these itself, so nodes need no flag.
 const DRAG_TYPES = new Set(["dragenter", "dragover", "dragleave", "drop"]);
@@ -104,7 +104,7 @@ const UNITLESS = new Set([
 
 const nodes = [];
 // HTML boolean attributes that are also the tree's own.
-const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline"]);
+const BOOLEAN_TREE_ATTRIBUTES = new Set(["disabled", "checked", "selected", "inert", "readonly", "multiline", "required"]);
 // The tag stylesheets match a tree node by, by its kind (see ui-tree's `SelectorTree`).
 const LOCAL_NAMES = { box: "div", input: "input", image: "img", canvas: "canvas", svg: "svg", text: "#text" };
 const NO_CHILDREN = Object.freeze([]);
@@ -814,6 +814,9 @@ export class Node {
       native.append(this.nodeId, child.nodeId);
     }
     if (moChildListCount && (this._mutationTargets || moSubtreeChildList)) childListRecord(this, child, null, child.previousSibling, before);
+    if (old && old._onChildrenChange) old._onChildrenChange();
+    if (this._onChildrenChange) this._onChildrenChange();
+    if (formCount) { syncAncestorForm(this); if (old) syncAncestorForm(old); }
     if (styleElements.size) stylesChanged();
     return child;
   }
@@ -847,6 +850,8 @@ export class Node {
     this.childNodes.splice(index, 1);
     child.parentNode = null;
     native.remove(child.nodeId);
+    if (this._onChildrenChange) this._onChildrenChange();
+    if (formCount) syncAncestorForm(this);
     if (styleElements.size) stylesChanged();
     return child;
   }
@@ -857,6 +862,7 @@ export class Node {
 
   /** Detaches and frees this node and its subtree. They cannot be used again. */
   destroy() {
+    if (openSelectPopup && (this === openSelectPopup.select || this.contains(openSelectPopup.select))) closeSelectPopup();
     if (rootNode && this.contains(rootNode)) { clearAdoptedSheets(); rootNode = null; }
     const parent = this.parentNode;
     if (parent) {
@@ -865,6 +871,8 @@ export class Node {
       if (moChildListCount && (parent._mutationTargets || moSubtreeChildList)) childListRecord(parent, null, this, parent.childNodes[index - 1], parent.childNodes[index + 1]);
       parent.childNodes.splice(index, 1);
       this.parentNode = null;
+      if (parent._onChildrenChange) parent._onChildrenChange();
+      if (formCount) syncAncestorForm(parent);
     }
     native.destroy(this.nodeId);
     forget(this);
@@ -972,6 +980,8 @@ export class Node {
     } else if (name === "id") {
       this.#identify(text);
     } else if (aria !== null) {
+      const prev = this.#rare?.attributes?.get(name) ?? null;
+      if (prev === text) return;
       native.attribute(this.nodeId, name, text);
     } else if (name === "src") {
       // An image's address, as `<img src>`.
@@ -1105,7 +1115,9 @@ export class Node {
     const text = this._tag !== undefined ? this.getAttribute("tabindex") : this._tabIndex;
     const number = text == null ? NaN : parseInt(String(text), 10);
     if (!Number.isNaN(number)) return number;
-    const focusable = this instanceof Input || this instanceof CheckInput || this instanceof RangeInput || FOCUSABLE_TAGS.has(this._tag)
+    const focusable = this instanceof Input || this instanceof CheckInput || this instanceof RangeInput
+      || this instanceof ColorInput || this instanceof FileInput || this instanceof ButtonInput
+      || this instanceof SelectElement || this instanceof ButtonElement || FOCUSABLE_TAGS.has(this._tag)
       || (this._tag === "a" && this.hasAttribute("href"));
     return focusable ? 0 : -1;
   }
@@ -1409,6 +1421,8 @@ export class Text extends Node {
     this.#data = value;
     native.setText(this.nodeId, value);
     if (moCharDataCount && (this._mutationTargets || moSubtreeCharData)) characterDataRecord(this, old);
+    if (this.parentNode instanceof OptionElement) this.parentNode._notifySelect();
+    else if (this.parentNode instanceof OutputElement) this.parentNode._textChanged();
     if (this._svgText) svgChanged(this);
     if (styleElements.size && this.parentNode instanceof StyleElement) stylesChanged();
   }
@@ -1491,10 +1505,19 @@ export class Input extends Node {
   #start = 0;
   #end = 0;
   #direction = "forward";
+  #dirtyValue = false;
+  #committedValue = "";
+  #defaultTextValue = "";
+  #checked = false;
+  #indeterminate = false;
+  #files = [];
+  _customValidity = "";
+  _userInteracted = false;
 
-  constructor() {
+  constructor(type = "text") {
     super("input");
-    this._keep("input", "selectionchange");
+    this._inputType = canonicalInputType(type);
+    this._keep("input", "selectionchange", "focus", "blur", "keydown");
   }
 
   /** The text the selection offsets index into. */
@@ -1508,17 +1531,317 @@ export class Input extends Node {
     return copy;
   }
 
+  get type() {
+    if (this._tag === "textarea") return "textarea";
+    return canonicalInputType(this.getAttribute("type") ?? this._inputType ?? "text");
+  }
+
+  set type(value) {
+    if (this._tag === "textarea") return;
+    const next = canonicalInputType(value);
+    this._inputType = next;
+    super.setAttribute("type", String(value));
+    syncValidationState(this);
+  }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get placeholder() { return this.getAttribute("placeholder") ?? ""; }
+  set placeholder(v) { this.setAttribute("placeholder", String(v)); }
+
+  get readOnly() { return this.hasAttribute("readonly"); }
+  set readOnly(v) { if (v) this.setAttribute("readonly", ""); else this.removeAttribute("readonly"); }
+
+  get required() { return this.hasAttribute("required"); }
+  set required(v) { if (v) this.setAttribute("required", ""); else this.removeAttribute("required"); }
+
+  get multiple() { return this.hasAttribute("multiple"); }
+  set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
+
+  get pattern() { return this.getAttribute("pattern") ?? ""; }
+  set pattern(v) { this.setAttribute("pattern", String(v)); }
+
+  get min() { return this.getAttribute("min") ?? ""; }
+  set min(v) { this.setAttribute("min", String(v)); }
+
+  get max() { return this.getAttribute("max") ?? ""; }
+  set max(v) { this.setAttribute("max", String(v)); }
+
+  get step() { return this.getAttribute("step") ?? ""; }
+  set step(v) { this.setAttribute("step", String(v)); }
+
+  get accept() { return this.getAttribute("accept") ?? ""; }
+  set accept(v) { this.setAttribute("accept", String(v)); }
+
+  get autocomplete() { return this.getAttribute("autocomplete") ?? ""; }
+  set autocomplete(v) { this.setAttribute("autocomplete", String(v)); }
+
+  get dirName() { return this.getAttribute("dirname") ?? ""; }
+  set dirName(v) { this.setAttribute("dirname", String(v)); }
+
+  get minLength() {
+    const raw = this.getAttribute("minlength");
+    if (raw === null) return -1;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : -1;
+  }
+  set minLength(v) {
+    const n = Math.trunc(Number(v));
+    if (n < 0) throw domError("IndexSizeError", "minLength cannot be negative");
+    this.setAttribute("minlength", String(n));
+  }
+
+  get maxLength() {
+    const raw = this.getAttribute("maxlength");
+    if (raw === null) return -1;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : -1;
+  }
+  set maxLength(v) {
+    const n = Math.trunc(Number(v));
+    if (n < 0) throw domError("IndexSizeError", "maxLength cannot be negative");
+    this.setAttribute("maxlength", String(n));
+  }
+
+  get size() {
+    const raw = this.getAttribute("size");
+    const n = raw === null ? NaN : parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 20;
+  }
+  set size(v) {
+    const n = Math.trunc(Number(v));
+    if (n <= 0) throw domError("IndexSizeError", "size must be greater than zero");
+    this.setAttribute("size", String(n));
+  }
+
+  get rows() {
+    const raw = this.getAttribute("rows");
+    const n = raw === null ? NaN : parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 2;
+  }
+  set rows(v) {
+    const n = Math.trunc(Number(v));
+    this.setAttribute("rows", String(n > 0 ? n : 2));
+  }
+
+  get cols() {
+    const raw = this.getAttribute("cols");
+    const n = raw === null ? NaN : parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : 20;
+  }
+  set cols(v) {
+    const n = Math.trunc(Number(v));
+    this.setAttribute("cols", String(n > 0 ? n : 20));
+  }
+
+  get wrap() { return this.getAttribute("wrap") ?? ""; }
+  set wrap(v) { this.setAttribute("wrap", String(v)); }
+
+  get textLength() { return this.#value.length; }
+
+  get defaultValue() {
+    if (this._tag === "textarea") return this.#defaultTextValue;
+    return this.getAttribute("value") ?? "";
+  }
+  set defaultValue(v) {
+    const text = String(v);
+    if (this._tag === "textarea") {
+      this.#defaultTextValue = text;
+      if (!this.#dirtyValue) this._setValueInternal(text, false);
+    } else {
+      this.setAttribute("value", text);
+    }
+  }
+
+  // Fallback checked/indeterminate/files for dynamically re-typed inputs (`createElement("input"); el.type = "checkbox"`).
+  get checked() { return this.#checked; }
+  set checked(v) {
+    const next = !!v;
+    if (next === this.#checked) return;
+    this.#checked = next;
+    native.attribute(this.nodeId, "checked", next);
+    syncValidationState(this);
+  }
+  get indeterminate() { return this.#indeterminate; }
+  set indeterminate(v) {
+    const next = !!v;
+    if (next === this.#indeterminate) return;
+    this.#indeterminate = next;
+    native.attribute(this.nodeId, "indeterminate", next);
+  }
+  get files() { return this.type === "file" ? createFileList(this.#files) : null; }
+  set files(list) {
+    if (this.type !== "file") return;
+    this.#files = list ? Array.from(list) : [];
+    syncValidationState(this);
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return this.type === "hidden" ? [] : labelsOf(this); }
+  get list() {
+    const id = this.getAttribute("list");
+    if (!id) return null;
+    const target = findById(id);
+    return target?.localName === "datalist" ? target : null;
+  }
+
   get value() {
     return this.#value;
   }
 
   set value(value) {
-    value = String(value);
-    if (value === this.#value) return;
-    this.#value = value;
-    native.setText(this.nodeId, value);
-    this.#start = this.#end = value.length;
-    this.#direction = "forward";
+    this._setValueInternal(value == null ? "" : String(value), true);
+  }
+
+  _setValueInternal(value, markDirty) {
+    if (this._tag !== "textarea") value = sanitizeInputValue(this.type, value);
+    if (markDirty) this.#dirtyValue = true;
+    if (value !== this.#value) {
+      this.#value = value;
+      native.setText(this.nodeId, value);
+      this.#start = this.#end = value.length;
+      this.#direction = "forward";
+    }
+    syncValidationState(this);
+  }
+
+  get valueAsNumber() {
+    return parseInputValueAsNumber(this.type, this.#value);
+  }
+
+  set valueAsNumber(v) {
+    const t = this.type;
+    if (!NUMERIC_OR_TEMPORAL_TYPES.has(t)) {
+      throw domError("InvalidStateError", "This input element does not support valueAsNumber.");
+    }
+    const n = Number(v);
+    if (!Number.isFinite(n)) {
+      this.value = "";
+      return;
+    }
+    this.value = formatNumberForInputType(t, n);
+  }
+
+  get valueAsDate() {
+    const t = this.type;
+    if (!DATE_VALUE_TYPES.has(t)) return null;
+    const ms = parseInputValueAsNumber(t, this.#value);
+    return Number.isFinite(ms) ? new Date(t === "month" ? Date.UTC(1970 + Math.floor(ms / 12), ((ms % 12) + 12) % 12, 1) : ms) : null;
+  }
+
+  set valueAsDate(date) {
+    const t = this.type;
+    if (!DATE_VALUE_TYPES.has(t)) {
+      throw domError("InvalidStateError", "This input element does not support valueAsDate.");
+    }
+    if (date === null) {
+      this.value = "";
+      return;
+    }
+    if (!(date instanceof Date) || Number.isNaN(date.getTime())) {
+      this.value = "";
+      return;
+    }
+    const ms = date.getTime();
+    if (t === "month") {
+      this.value = formatNumberForInputType("month", (date.getUTCFullYear() - 1970) * 12 + date.getUTCMonth());
+    } else if (t === "time") {
+      const dayMs = ((ms % 86400000) + 86400000) % 86400000;
+      this.value = formatNumberForInputType("time", dayMs);
+    } else {
+      this.value = formatNumberForInputType(t, ms);
+    }
+  }
+
+  stepUp(n = 1) {
+    stepInputValue(this, Math.trunc(Number(n) || 0));
+  }
+
+  stepDown(n = 1) {
+    stepInputValue(this, -Math.trunc(Number(n) || 0));
+  }
+
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) {
+    this._customValidity = String(message);
+    syncValidationState(this);
+  }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  _reset() {
+    this.#dirtyValue = false;
+    this._userInteracted = false;
+    this._setValueInternal(this.defaultValue, false);
+    this.#committedValue = this.#value;
+  }
+
+  _handleFocus() {
+    this.#committedValue = this.#value;
+  }
+
+  _handleBlur() {
+    if (this.#value !== this.#committedValue) {
+      this.#committedValue = this.#value;
+      this._userInteracted = true;
+      syncValidationState(this);
+      const change = new Event("change", this);
+      change.bubbles = true;
+      dispatchEvent(change);
+    }
+  }
+
+  _handleKey(event) {
+    if (isControlDisabled(this)) return false;
+    if (this._tag === "input" && event.key === "Enter") {
+      event.preventDefault();
+      if (this.#value !== this.#committedValue) {
+        this.#committedValue = this.#value;
+        this._userInteracted = true;
+        const change = new Event("change", this);
+        change.bubbles = true;
+        dispatchEvent(change);
+      }
+      implicitFormSubmit(this);
+      return true;
+    }
+    if (this._tag === "input" && this.type === "number" && !this.readOnly && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      const before = this.#value;
+      try {
+        if (event.key === "ArrowUp") this.stepUp(1);
+        else this.stepDown(1);
+      } catch {}
+      if (this.#value !== before) {
+        this._userInteracted = true;
+        const inputEv = new Event("input", this);
+        inputEv.bubbles = true;
+        dispatchEvent(inputEv);
+        const changeEv = new Event("change", this);
+        changeEv.bubbles = true;
+        dispatchEvent(changeEv);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    if (lower === "value" && this._tag !== "textarea") {
+      super.setAttribute(name, value);
+      if (!this.#dirtyValue) this._setValueInternal(value == null ? "" : String(value), false);
+      else syncValidationState(this);
+      return;
+    }
+    if (lower === "type" && this._tag !== "textarea") {
+      this._inputType = canonicalInputType(value);
+    }
+    super.setAttribute(name, value);
+    if (VALIDATION_ATTRS.has(lower)) syncValidationState(this);
   }
 
   get selectionStart() {
@@ -1611,8 +1934,16 @@ export class Input extends Node {
 
   // From the tree: the value and selection in UTF-8 bytes.
   _changed(value, anchor, focus) {
+    const maxLen = this.maxLength;
+    if (maxLen >= 0 && value.length > maxLen && value.length > this.#value.length) {
+      value = value.slice(0, maxLen);
+      native.setText(this.nodeId, value);
+    }
     this.#value = value;
+    this.#dirtyValue = true;
+    this._userInteracted = true;
     this.#take(byteIndex(value, anchor), byteIndex(value, focus));
+    syncValidationState(this);
   }
 
   _selected(start, end) {
@@ -3033,10 +3364,759 @@ export function createNode(kind) {
   return new Node(kind);
 }
 
+// WHATWG HTML §4.10.5 input types; any unknown keyword falls back to "text".
+const CANONICAL_INPUT_TYPES = new Set([
+  "hidden", "text", "search", "tel", "url", "email", "password",
+  "date", "month", "week", "time", "datetime-local", "number", "range",
+  "color", "checkbox", "radio", "file", "submit", "image", "reset", "button",
+]);
+function canonicalInputType(raw) {
+  const lower = String(raw ?? "text").toLowerCase();
+  return CANONICAL_INPUT_TYPES.has(lower) ? lower : "text";
+}
+
 // `<input>` types that are not a text field.
 const BOX_INPUTS = new Set(["checkbox", "radio", "range", "color", "file", "hidden", "submit", "button", "reset", "image"]);
 // Tags that take focus without a tabindex, as on the web.
 const FOCUSABLE_TAGS = new Set(["button", "select", "summary", "iframe"]);
+// Input types supporting `valueAsNumber` and `stepUp`/`stepDown`.
+const NUMERIC_OR_TEMPORAL_TYPES = new Set(["number", "range", "date", "time", "datetime-local", "month", "week"]);
+// Input types supporting `valueAsDate` (WHATWG §4.10.5.4 excludes datetime-local).
+const DATE_VALUE_TYPES = new Set(["date", "time", "month", "week"]);
+// Attributes whose change can affect constraint validation or `:valid`/`:invalid`.
+const VALIDATION_ATTRS = new Set(["required", "disabled", "readonly", "minlength", "maxlength", "min", "max", "step", "pattern", "type", "multiple", "form"]);
+// Submittable / listed / resettable / labelable element tag sets (WHATWG §4.10.2).
+const LISTED_TAGS = new Set(["button", "fieldset", "input", "object", "output", "select", "textarea"]);
+const SUBMITTABLE_TAGS = new Set(["button", "input", "object", "select", "textarea"]);
+const LABELABLE_TAGS = new Set(["button", "input", "meter", "output", "progress", "select", "textarea"]);
+// Single-line text input types that strip CR/LF per WHATWG §4.10.5.1.
+const SINGLE_LINE_TYPES = new Set(["text", "search", "tel", "url", "email", "password"]);
+// RFC 5322 / WHATWG §4.10.5.1.5 email regex.
+const EMAIL_RE = /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+function sanitizeInputValue(type, value) {
+  let s = String(value);
+  if (SINGLE_LINE_TYPES.has(type)) {
+    s = s.replace(/[\r\n]/g, "");
+    if (type === "email") {
+      if (s.includes(",")) s = s.split(",").map((part) => part.trim()).join(",");
+      else s = s.trim();
+    } else if (type === "url") {
+      s = s.trim();
+    }
+    return s;
+  }
+  if (type === "number") {
+    const trimmed = s.trim();
+    if (trimmed === "") return "";
+    return Number.isFinite(Number(trimmed)) ? trimmed : "";
+  }
+  if (type === "color") return normalizeHexColor(s);
+  return s;
+}
+
+function normalizeHexColor(raw) {
+  const s = String(raw ?? "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(s) ? s : "#000000";
+}
+
+function isoWeek1MondayUtc(year) {
+  const jan4 = Date.UTC(year, 0, 4);
+  const dow = (new Date(jan4).getUTCDay() + 6) % 7; // Mon=0..Sun=6
+  return jan4 - dow * 86400000;
+}
+
+function parseInputValueAsNumber(type, raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return NaN;
+  if (type === "number" || type === "range") {
+    const n = Number(s);
+    return Number.isFinite(n) ? n : NaN;
+  }
+  if (type === "date") {
+    const m = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(s);
+    if (!m) return NaN;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) return NaN;
+    const ms = Date.UTC(y, mo - 1, d);
+    const dt = new Date(ms);
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return NaN;
+    return ms;
+  }
+  if (type === "time") {
+    const m = /^(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(s);
+    if (!m) return NaN;
+    const h = Number(m[1]), mi = Number(m[2]), sec = m[3] ? Number(m[3]) : 0;
+    const frac = m[4] ? Number(m[4].padEnd(3, "0")) : 0;
+    if (h > 23 || mi > 59 || sec > 59) return NaN;
+    return ((h * 60 + mi) * 60 + sec) * 1000 + frac;
+  }
+  if (type === "datetime-local") {
+    const m = /^(\d{4,})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(s);
+    if (!m) return NaN;
+    const y = Number(m[1]), mo = Number(m[2]), d = Number(m[3]);
+    const h = Number(m[4]), mi = Number(m[5]), sec = m[6] ? Number(m[6]) : 0;
+    const frac = m[7] ? Number(m[7].padEnd(3, "0")) : 0;
+    if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 59) return NaN;
+    const ms = Date.UTC(y, mo - 1, d, h, mi, sec, frac);
+    const dt = new Date(ms);
+    if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return NaN;
+    return ms;
+  }
+  if (type === "month") {
+    const m = /^(\d{4,})-(\d{2})$/.exec(s);
+    if (!m) return NaN;
+    const y = Number(m[1]), mo = Number(m[2]);
+    if (y < 1 || mo < 1 || mo > 12) return NaN;
+    return (y - 1970) * 12 + (mo - 1);
+  }
+  if (type === "week") {
+    const m = /^(\d{4,})-W(\d{2})$/.exec(s);
+    if (!m) return NaN;
+    const y = Number(m[1]), w = Number(m[2]);
+    if (y < 1 || w < 1 || w > 53) return NaN;
+    const mon = isoWeek1MondayUtc(y) + (w - 1) * 7 * 86400000;
+    if (w === 53 && mon >= isoWeek1MondayUtc(y + 1)) return NaN;
+    return mon;
+  }
+  return NaN;
+}
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+function pad4(n) { return String(n).padStart(4, "0"); }
+
+function formatNumberForInputType(type, n) {
+  if (!Number.isFinite(n)) return "";
+  if (type === "number" || type === "range") return String(Number(n.toPrecision(12)));
+  if (type === "date") {
+    const dt = new Date(n);
+    return `${pad4(dt.getUTCFullYear())}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+  }
+  if (type === "time") {
+    const total = ((Math.trunc(n) % 86400000) + 86400000) % 86400000;
+    const ms = total % 1000;
+    const s = Math.floor(total / 1000) % 60;
+    const mi = Math.floor(total / 60000) % 60;
+    const h = Math.floor(total / 3600000);
+    if (ms) return `${pad2(h)}:${pad2(mi)}:${pad2(s)}.${String(ms).padStart(3, "0").replace(/0+$/, "")}`;
+    if (s) return `${pad2(h)}:${pad2(mi)}:${pad2(s)}`;
+    return `${pad2(h)}:${pad2(mi)}`;
+  }
+  if (type === "datetime-local") {
+    const dt = new Date(n);
+    const datePart = `${pad4(dt.getUTCFullYear())}-${pad2(dt.getUTCMonth() + 1)}-${pad2(dt.getUTCDate())}`;
+    const timePart = formatNumberForInputType("time", ((dt.getUTCHours() * 60 + dt.getUTCMinutes()) * 60 + dt.getUTCSeconds()) * 1000 + dt.getUTCMilliseconds());
+    return `${datePart}T${timePart}`;
+  }
+  if (type === "month") {
+    const total = Math.trunc(n);
+    const y = 1970 + Math.floor(total / 12);
+    const mo = ((total % 12) + 12) % 12 + 1;
+    return `${pad4(y)}-${pad2(mo)}`;
+  }
+  if (type === "week") {
+    const dt = new Date(n);
+    const thu = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth(), dt.getUTCDate()));
+    thu.setUTCDate(thu.getUTCDate() + 3 - ((thu.getUTCDay() + 6) % 7));
+    const weekYear = thu.getUTCFullYear();
+    const w = 1 + Math.round((thu.getTime() - isoWeek1MondayUtc(weekYear)) / (7 * 86400000));
+    return `${pad4(weekYear)}-W${pad2(w)}`;
+  }
+  return String(n);
+}
+
+// Step scale & default step per WHATWG §4.10.5.3.9.
+function stepScaleOf(type) {
+  if (type === "date") return 86400000;
+  if (type === "week") return 604800000;
+  if (type === "time" || type === "datetime-local") return 1000;
+  return 1;
+}
+function defaultStepOf(type) {
+  if (type === "time" || type === "datetime-local") return 60;
+  return 1;
+}
+function allowedValueStep(control) {
+  const type = control.type;
+  const raw = control.getAttribute("step");
+  const scale = stepScaleOf(type);
+  if (raw === null || raw.trim() === "") return defaultStepOf(type) * scale;
+  if (raw.trim().toLowerCase() === "any") return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultStepOf(type) * scale;
+  return parsed * scale;
+}
+function stepBaseOf(control) {
+  const type = control.type;
+  const minVal = parseInputValueAsNumber(type, control.getAttribute("min"));
+  if (Number.isFinite(minVal)) return minVal;
+  const defVal = parseInputValueAsNumber(type, control.getAttribute("value"));
+  if (Number.isFinite(defVal)) return defVal;
+  if (type === "week") return -259200000; // 1970-W01 Monday
+  return 0;
+}
+
+function stepInputValue(control, delta) {
+  const type = control.type;
+  if (!NUMERIC_OR_TEMPORAL_TYPES.has(type)) {
+    throw domError("InvalidStateError", "This input element does not support stepUp/stepDown.");
+  }
+  const step = allowedValueStep(control);
+  if (step === null) throw domError("InvalidStateError", "This input element has step=\"any\".");
+  const min = parseInputValueAsNumber(type, control.getAttribute("min"));
+  const max = parseInputValueAsNumber(type, control.getAttribute("max"));
+  const base = stepBaseOf(control);
+  let current = control.valueAsNumber;
+  if (!Number.isFinite(current)) current = Number.isFinite(min) ? min : 0;
+  let next;
+  const rem = ((current - base) % step + step) % step;
+  if (rem > 1e-9 && step - rem > 1e-9 && delta !== 0) {
+    const snapped = delta > 0 ? current - rem + step : current - rem;
+    next = snapped + (delta > 0 ? delta - 1 : delta + 1) * step;
+  } else {
+    next = current + delta * step;
+  }
+  if (Number.isFinite(min) && next < min) {
+    next = min + Math.ceil((min - base) / step) * step - (min - base);
+    if (next < min) next = min;
+  }
+  if (Number.isFinite(max) && next > max) {
+    next = base + Math.floor((max - base) / step) * step;
+    if (next > max) next = max;
+  }
+  control.value = formatNumberForInputType(type, next);
+}
+
+// WHATWG §4.10.18.5: disabled directly or inside a disabled `<fieldset>` (exempting its first `<legend>` child).
+export function isControlDisabled(node) {
+  if (!node || node.nodeType !== 1) return false;
+  if (node.hasAttribute("disabled")) return true;
+  if (node instanceof OptionElement) {
+    if (node.parentNode instanceof OptGroupElement && node.parentNode.hasAttribute("disabled")) return true;
+  }
+  let child = node;
+  for (let parent = node.parentNode; parent; child = parent, parent = parent.parentNode) {
+    if (parent.localName === "fieldset" && parent.hasAttribute("disabled")) {
+      let firstLegend = null;
+      for (const c of parent.childNodes) {
+        if (c.localName === "legend") { firstLegend = c; break; }
+      }
+      if (!firstLegend || child !== firstLegend) return true;
+    }
+  }
+  return false;
+}
+
+function isInDataList(node) {
+  for (let p = node.parentNode; p; p = p.parentNode) {
+    if (p.localName === "datalist") return true;
+  }
+  return false;
+}
+
+// WHATWG §4.10.18.3: form owner via `form` attribute (if connected) or nearest `<form>` ancestor.
+function formOwnerOf(node) {
+  if (!node || node.nodeType !== 1) return null;
+  const tag = node.localName;
+  if (!LISTED_TAGS.has(tag) && tag !== "img") return null;
+  const formId = node.getAttribute("form");
+  if (formId !== null) {
+    if (!inDocument(node) || formId === "") return null;
+    const target = findById(formId);
+    return target instanceof FormElement ? target : null;
+  }
+  for (let p = node.parentNode; p; p = p.parentNode) {
+    if (p instanceof FormElement) return p;
+  }
+  return null;
+}
+
+function isLabelable(node) {
+  if (!node || node.nodeType !== 1) return false;
+  if (!LABELABLE_TAGS.has(node.localName)) return false;
+  if (node.localName === "input" && node.type === "hidden") return false;
+  return true;
+}
+
+function labelsOf(control) {
+  if (!isLabelable(control)) return [];
+  const out = [];
+  const top = rootOf(control);
+  eachDescendant(top, (node) => {
+    if (node instanceof LabelElement && node.control === control) out.push(node);
+  });
+  return out;
+}
+
+function createFileList(files) {
+  const list = Array.from(files);
+  list.item = (index) => list[index] ?? null;
+  return list;
+}
+
+/**
+ * Constraint validation state (WHATWG HTML §4.10.20.3).
+ */
+export class ValidityState {
+  constructor(flags = {}) {
+    this.valueMissing = !!flags.valueMissing;
+    this.typeMismatch = !!flags.typeMismatch;
+    this.patternMismatch = !!flags.patternMismatch;
+    this.tooLong = !!flags.tooLong;
+    this.tooShort = !!flags.tooShort;
+    this.rangeUnderflow = !!flags.rangeUnderflow;
+    this.rangeOverflow = !!flags.rangeOverflow;
+    this.stepMismatch = !!flags.stepMismatch;
+    this.badInput = !!flags.badInput;
+    this.customError = !!flags.customError;
+    this.valid = !(
+      this.valueMissing || this.typeMismatch || this.patternMismatch || this.tooLong
+      || this.tooShort || this.rangeUnderflow || this.rangeOverflow || this.stepMismatch
+      || this.badInput || this.customError
+    );
+  }
+}
+
+function isCandidateForConstraintValidation(node) {
+  if (!node || node.nodeType !== 1) return false;
+  if (isControlDisabled(node) || isInDataList(node)) return false;
+  if (node instanceof FieldSetElement || node instanceof OutputElement) return false;
+  if (node instanceof ButtonElement) return false;
+  if (node instanceof ButtonInput || node instanceof HiddenInput) return false;
+  if (node instanceof Input) {
+    if (node.hasAttribute("readonly")) return false;
+    const t = node.type;
+    if (t === "hidden" || t === "reset" || t === "button") return false;
+    return true;
+  }
+  if (node instanceof CheckInput || node instanceof RangeInput || node instanceof ColorInput || node instanceof FileInput || node instanceof SelectElement) {
+    return true;
+  }
+  return false;
+}
+
+function isValidEmailValue(value, multiple) {
+  if (!value) return true;
+  const parts = multiple ? value.split(",").map((p) => p.trim()) : [value];
+  return parts.every((part) => EMAIL_RE.test(part));
+}
+
+function isValidUrlValue(value) {
+  if (!value) return true;
+  try {
+    new URL(value);
+    return true;
+  } catch {
+    return /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/\S+$/.test(value);
+  }
+}
+
+function radioGroupPeers(radio) {
+  const name = radio.name;
+  if (!name) return [radio];
+  const form = formOwnerOf(radio);
+  const scope = form ?? rootOf(radio);
+  const peers = [];
+  const visit = (node) => {
+    if (node instanceof CheckInput && node.type === "radio" && node.name === name && formOwnerOf(node) === form) {
+      peers.push(node);
+    }
+  };
+  if (form) {
+    for (const el of collectFormControls(form)) visit(el);
+  } else {
+    eachDescendant(scope, visit);
+  }
+  return peers.length ? peers : [radio];
+}
+
+function computeValidity(control) {
+  const customError = Boolean(control._customValidity);
+  if (!isCandidateForConstraintValidation(control)) {
+    return new ValidityState({ customError });
+  }
+  let valueMissing = false;
+  let typeMismatch = false;
+  let patternMismatch = false;
+  let tooLong = false;
+  let tooShort = false;
+  let rangeUnderflow = false;
+  let rangeOverflow = false;
+  let stepMismatch = false;
+  const badInput = false;
+
+  if (control instanceof CheckInput) {
+    if (control.type === "checkbox") {
+      valueMissing = control.required && !control.checked;
+    } else if (control.type === "radio") {
+      const peers = radioGroupPeers(control);
+      const anyRequired = peers.some((p) => p.required && !isControlDisabled(p));
+      const anyChecked = peers.some((p) => p.checked);
+      valueMissing = anyRequired && !anyChecked;
+    }
+  } else if (control instanceof FileInput) {
+    valueMissing = control.required && control.files.length === 0;
+  } else if (control instanceof SelectElement) {
+    if (control.required) {
+      const selected = control.selectedOptions;
+      if (selected.length === 0) {
+        valueMissing = true;
+      } else if (!control.multiple && control.size <= 1) {
+        // Placeholder label option check (WHATWG §4.10.7).
+        const firstOpt = control.childNodes.find((c) => c instanceof OptionElement) ?? null;
+        if (firstOpt && firstOpt.value === "" && selected.length === 1 && selected[0] === firstOpt) {
+          valueMissing = true;
+        }
+      }
+    }
+  } else if (control instanceof Input) {
+    const val = control.value;
+    const t = control.type;
+    if (control.required && val === "") valueMissing = true;
+    if (val !== "") {
+      if (t === "email" && !isValidEmailValue(val, control.multiple)) typeMismatch = true;
+      else if (t === "url" && !isValidUrlValue(val)) typeMismatch = true;
+
+      if (control._tag !== "textarea" && (t === "text" || t === "search" || t === "tel" || t === "url" || t === "email" || t === "password")) {
+        const pattern = control.getAttribute("pattern");
+        if (pattern !== null && pattern !== "") {
+          try {
+            const re = new RegExp(`^(?:${pattern})$`, "v");
+            if (!re.test(val)) patternMismatch = true;
+          } catch {
+            try {
+              const re = new RegExp(`^(?:${pattern})$`, "u");
+              if (!re.test(val)) patternMismatch = true;
+            } catch {}
+          }
+        }
+      }
+
+      if (control._userInteracted) {
+        const minLen = control.minLength;
+        const maxLen = control.maxLength;
+        if (minLen >= 0 && val.length < minLen) tooShort = true;
+        if (maxLen >= 0 && val.length > maxLen) tooLong = true;
+      }
+
+      if (NUMERIC_OR_TEMPORAL_TYPES.has(t)) {
+        const num = parseInputValueAsNumber(t, val);
+        if (Number.isFinite(num)) {
+          const min = parseInputValueAsNumber(t, control.getAttribute("min"));
+          const max = parseInputValueAsNumber(t, control.getAttribute("max"));
+          if (Number.isFinite(min) && num < min) rangeUnderflow = true;
+          if (Number.isFinite(max) && num > max) rangeOverflow = true;
+          const step = allowedValueStep(control);
+          if (step !== null && step > 0) {
+            const base = stepBaseOf(control);
+            const rem = Math.abs((num - base) % step);
+            const eps = Math.max(1e-9, Math.abs(step) * 1e-9);
+            if (rem > eps && Math.abs(step - rem) > eps) stepMismatch = true;
+          }
+        }
+      }
+    }
+  }
+  return new ValidityState({
+    valueMissing, typeMismatch, patternMismatch, tooLong, tooShort,
+    rangeUnderflow, rangeOverflow, stepMismatch, badInput, customError,
+  });
+}
+
+function validationMessageFor(control) {
+  const v = computeValidity(control);
+  if (v.valid) return "";
+  if (v.customError) return control._customValidity;
+  if (v.valueMissing) return "Please fill out this field.";
+  if (v.typeMismatch) return control.type === "email" ? "Please enter an email address." : "Please enter a URL.";
+  if (v.patternMismatch) return "Please match the requested format.";
+  if (v.tooShort) return `Please lengthen this text to ${control.minLength} characters or more.`;
+  if (v.tooLong) return `Please shorten this text to ${control.maxLength} characters or fewer.`;
+  if (v.rangeUnderflow) return `Value must be greater than or equal to ${control.getAttribute("min")}.`;
+  if (v.rangeOverflow) return `Value must be less than or equal to ${control.getAttribute("max")}.`;
+  if (v.stepMismatch) return "Please enter a valid value.";
+  if (v.badInput) return "Please enter a valid value.";
+  return "";
+}
+
+function syncValidationState(control) {
+  if (!control || control.nodeId === undefined) return;
+  if (!isCandidateForConstraintValidation(control)) {
+    native.attribute(control.nodeId, "-silk-valid", null);
+    native.attribute(control.nodeId, "-silk-user-valid", null);
+    return;
+  }
+  const v = computeValidity(control);
+  native.attribute(control.nodeId, "-silk-valid", v.valid ? "1" : "0");
+  native.attribute(control.nodeId, "-silk-user-valid", control._userInteracted ? (v.valid ? "1" : "0") : null);
+  const form = formOwnerOf(control);
+  if (form) form._syncValidity();
+}
+
+function runCheckValidity(control) {
+  if (!isCandidateForConstraintValidation(control)) return true;
+  const v = computeValidity(control);
+  if (v.valid) return true;
+  const ev = new Event("invalid", control);
+  ev.bubbles = false;
+  ev.cancelable = true;
+  dispatchEvent(ev);
+  return false;
+}
+
+function runReportValidity(control) {
+  if (!isCandidateForConstraintValidation(control)) return true;
+  const v = computeValidity(control);
+  if (v.valid) return true;
+  control._userInteracted = true;
+  syncValidationState(control);
+  const ev = new Event("invalid", control);
+  ev.bubbles = false;
+  ev.cancelable = true;
+  const notCancelled = dispatchEvent(ev);
+  if (notCancelled && typeof control.focus === "function") control.focus();
+  return false;
+}
+
+function isSubmitButton(node) {
+  if (node instanceof ButtonElement) return node.type === "submit";
+  if (node instanceof ButtonInput) return node.type === "submit" || node.type === "image";
+  return false;
+}
+
+function collectFormControls(form) {
+  const top = rootOf(form);
+  const out = [];
+  eachDescendant(top, (node) => {
+    if (node.nodeType !== 1 || !LISTED_TAGS.has(node.localName)) return;
+    if (node instanceof ButtonInput && node.type === "image") return;
+    if (formOwnerOf(node) === form) out.push(node);
+  });
+  return out;
+}
+
+function defaultSubmitButtonOf(form) {
+  const top = rootOf(form);
+  let found = null;
+  eachDescendant(top, (node) => {
+    if (!found && isSubmitButton(node) && formOwnerOf(node) === form) found = node;
+  });
+  return found;
+}
+
+function implicitFormSubmit(control) {
+  const form = formOwnerOf(control);
+  if (!form) return;
+  const submitBtn = defaultSubmitButtonOf(form);
+  if (submitBtn) {
+    if (!isControlDisabled(submitBtn)) form.requestSubmit(submitBtn);
+    return;
+  }
+  // WHATWG §4.10.18.6: implicit submission without a submit button applies when the form
+  // has at most one text field blocking implicit submission.
+  const textControls = collectFormControls(form).filter((el) =>
+    el instanceof Input && el._tag === "input" && (SINGLE_LINE_TYPES.has(el.type) || NUMERIC_OR_TEMPORAL_TYPES.has(el.type))
+  );
+  if (textControls.length <= 1) form.requestSubmit();
+}
+
+function makeRadioNodeList(items) {
+  const list = items.slice();
+  list.item = (index) => list[index] ?? null;
+  Object.defineProperty(list, "value", {
+    get() {
+      const checked = list.find((el) => el instanceof CheckInput && el.type === "radio" && el.checked);
+      return checked ? checked.value : "";
+    },
+    set(val) {
+      const target = String(val);
+      for (const el of list) {
+        if (el instanceof CheckInput && el.type === "radio") {
+          el.checked = el.value === target;
+        }
+      }
+    },
+    configurable: true,
+  });
+  return list;
+}
+
+function makeFormControlsCollection(items) {
+  const namedItem = (name) => {
+    const key = String(name);
+    if (!key) return null;
+    const matches = items.filter((el) => el.getAttribute("id") === key || el.getAttribute("name") === key);
+    if (matches.length === 0) return null;
+    return matches.length === 1 ? matches[0] : makeRadioNodeList(matches);
+  };
+  items.item = (index) => items[index] ?? null;
+  items.namedItem = namedItem;
+  return new Proxy(items, {
+    get(target, prop, receiver) {
+      if (prop in target || typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+      return namedItem(prop);
+    },
+  });
+}
+
+let formCount = 0;
+
+function syncAncestorForm(node) {
+  for (let p = node; p; p = p.parentNode) {
+    if (p instanceof FormElement) {
+      p._onChildrenChange();
+      return;
+    }
+  }
+}
+
+/**
+ * `<form>`: groups form-associated controls, manages submission, reset, validation, and `:valid`/`:invalid`.
+ */
+export class FormElement extends Node {
+  #defaultButton = null;
+
+  constructor() {
+    super("box");
+    this._tag = "form";
+    formCount++;
+    native.attribute(this.nodeId, "element", "form");
+  }
+
+  _shallowClone() {
+    return new FormElement();
+  }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get action() { return this.getAttribute("action") ?? ""; }
+  set action(v) { this.setAttribute("action", String(v)); }
+
+  get method() {
+    const raw = (this.getAttribute("method") ?? "").toLowerCase();
+    return raw === "post" || raw === "dialog" ? raw : "get";
+  }
+  set method(v) { this.setAttribute("method", String(v)); }
+
+  get enctype() {
+    const raw = (this.getAttribute("enctype") ?? "").toLowerCase();
+    return raw === "multipart/form-data" || raw === "text/plain" ? raw : "application/x-www-form-urlencoded";
+  }
+  set enctype(v) { this.setAttribute("enctype", String(v)); }
+  get encoding() { return this.enctype; }
+  set encoding(v) { this.enctype = v; }
+
+  get target() { return this.getAttribute("target") ?? ""; }
+  set target(v) { this.setAttribute("target", String(v)); }
+
+  get acceptCharset() { return this.getAttribute("accept-charset") ?? ""; }
+  set acceptCharset(v) { this.setAttribute("accept-charset", String(v)); }
+
+  get autocomplete() { return this.getAttribute("autocomplete") === "off" ? "off" : "on"; }
+  set autocomplete(v) { this.setAttribute("autocomplete", String(v)); }
+
+  get noValidate() { return this.hasAttribute("novalidate"); }
+  set noValidate(v) { if (v) this.setAttribute("novalidate", ""); else this.removeAttribute("novalidate"); }
+
+  get rel() { return this.getAttribute("rel") ?? ""; }
+  set rel(v) { this.setAttribute("rel", String(v)); }
+
+  get elements() {
+    return makeFormControlsCollection(collectFormControls(this));
+  }
+
+  get length() {
+    return collectFormControls(this).length;
+  }
+
+  _syncDefaultButton() {
+    const next = defaultSubmitButtonOf(this);
+    if (this.#defaultButton && this.#defaultButton !== next && nodes[this.#defaultButton.nodeId] !== undefined) {
+      native.attribute(this.#defaultButton.nodeId, "-silk-default", null);
+    }
+    this.#defaultButton = next;
+    if (next) native.attribute(next.nodeId, "-silk-default", "1");
+  }
+
+  _syncValidity() {
+    const controls = collectFormControls(this);
+    const valid = controls.every((c) => !isCandidateForConstraintValidation(c) || computeValidity(c).valid);
+    native.attribute(this.nodeId, "-silk-valid", valid ? "1" : "0");
+  }
+
+  _onChildrenChange() {
+    this._syncDefaultButton();
+    this._syncValidity();
+  }
+
+  checkValidity() {
+    const controls = collectFormControls(this);
+    let allValid = true;
+    for (const control of controls) {
+      if (typeof control.checkValidity === "function" && !control.checkValidity()) allValid = false;
+    }
+    return allValid;
+  }
+
+  reportValidity() {
+    const controls = collectFormControls(this);
+    let firstInvalid = null;
+    for (const control of controls) {
+      if (!isCandidateForConstraintValidation(control)) continue;
+      if (computeValidity(control).valid) continue;
+      control._userInteracted = true;
+      syncValidationState(control);
+      const ev = new Event("invalid", control);
+      ev.bubbles = false;
+      ev.cancelable = true;
+      const notCancelled = dispatchEvent(ev);
+      if (notCancelled && !firstInvalid) firstInvalid = control;
+    }
+    if (firstInvalid) {
+      firstInvalid.focus?.();
+      return false;
+    }
+    // Check if any invalid control had its `invalid` event cancelled — form is still invalid.
+    return controls.every((c) => !isCandidateForConstraintValidation(c) || computeValidity(c).valid);
+  }
+
+  requestSubmit(submitter = null) {
+    if (submitter !== null && submitter !== undefined) {
+      if (!isSubmitButton(submitter)) throw new TypeError("The specified element is not a submit button.");
+      if (formOwnerOf(submitter) !== this) throw domError("NotFoundError", "The specified element is not owned by this form element.");
+    }
+    const skipValidation = this.noValidate || Boolean(submitter?.formNoValidate);
+    if (!skipValidation && !this.reportValidity()) return;
+    const SubmitEventClass = globalThis.SubmitEvent;
+    let ev;
+    if (typeof SubmitEventClass === "function") {
+      ev = new SubmitEventClass("submit", { bubbles: true, cancelable: true, submitter: submitter ?? null });
+      adopt(ev, this);
+    } else {
+      ev = new Event("submit", this);
+      ev.bubbles = true;
+      ev.cancelable = true;
+      ev.submitter = submitter ?? null;
+    }
+    dispatchEvent(ev);
+  }
+
+  submit() {
+    // Programmatic submit bypasses `submit` event and constraint validation per WHATWG §4.10.18.6.
+  }
+
+  reset() {
+    const ev = new Event("reset", this);
+    ev.bubbles = true;
+    ev.cancelable = true;
+    if (!dispatchEvent(ev)) return;
+    for (const control of collectFormControls(this)) {
+      control._reset?.();
+    }
+    this._syncValidity();
+  }
+}
 
 /**
  * `<input type="checkbox">` and `type="radio"`: a box a click checks, as on the web. It fires
@@ -3044,52 +4124,145 @@ const FOCUSABLE_TAGS = new Set(["button", "select", "summary", "iframe"]);
  */
 export class CheckInput extends Node {
   #checked = false;
+  #dirtyChecked = false;
+  #indeterminate = false;
+  #value = null;
+  _customValidity = "";
+  _userInteracted = false;
 
   constructor(type = "checkbox") {
     super("box");
     this._tag = "input";
-    this.type = type;
-    this.value = "on";
-    this.defaultChecked = false;
+    this._inputType = type === "radio" ? "radio" : "checkbox";
     native.attribute(this.nodeId, "element", "input");
-    native.attribute(this.nodeId, "type", type);
-    native.attribute(this.nodeId, "role", type === "radio" ? "radio" : "checkbox");
+    native.attribute(this.nodeId, "type", this._inputType);
+    native.attribute(this.nodeId, "role", this._inputType === "radio" ? "radio" : "checkbox");
     native.attribute(this.nodeId, "tabIndex", 0);
-    this._keep("focus", "blur");
+    this._keep("focus", "blur", "keydown");
     this._relisten();
+    syncValidationState(this);
   }
 
   _shallowClone() {
     const copy = new CheckInput(this.type);
     copy.checked = this.#checked;
+    copy.indeterminate = this.#indeterminate;
     return copy;
   }
 
-  get name() {
-    return this.getAttribute("name") ?? "";
+  get type() { return this._inputType; }
+  set type(v) {
+    const next = canonicalInputType(v);
+    if (next === "checkbox" || next === "radio") {
+      this._inputType = next;
+      native.attribute(this.nodeId, "type", next);
+      native.attribute(this.nodeId, "role", next === "radio" ? "radio" : "checkbox");
+      syncValidationState(this);
+    }
   }
 
-  get checked() {
-    return this.#checked;
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get required() { return this.hasAttribute("required"); }
+  set required(v) { if (v) this.setAttribute("required", ""); else this.removeAttribute("required"); }
+
+  get value() {
+    if (this.#value !== null) return this.#value;
+    return this.getAttribute("value") ?? "on";
+  }
+  set value(v) {
+    this.#value = String(v);
+    super.setAttribute("value", this.#value);
   }
 
+  get defaultValue() { return this.getAttribute("value") ?? ""; }
+  set defaultValue(v) { this.setAttribute("value", String(v)); }
+
+  get defaultChecked() { return this.hasAttribute("checked"); }
+  set defaultChecked(v) {
+    if (v) this.setAttribute("checked", "");
+    else this.removeAttribute("checked");
+  }
+
+  get checked() { return this.#checked; }
   set checked(value) {
-    value = !!value;
+    this.#dirtyChecked = true;
+    this.#setChecked(!!value);
+  }
+
+  #setChecked(value) {
     if (value === this.#checked) return;
     this.#checked = value;
     native.attribute(this.nodeId, "checked", value);
     if (value && this.type === "radio" && this.name) {
-      let top = this;
-      while (top.parentNode) top = top.parentNode;
-      eachDescendant(top, (node) => {
-        if (node !== this && node instanceof CheckInput && node.type === "radio" && node.name === this.name) node.checked = false;
-      });
+      for (const peer of radioGroupPeers(this)) {
+        if (peer !== this && peer.checked) peer._uncheckFromGroup();
+      }
+    }
+    syncValidationState(this);
+    if (this.type === "radio" && this.name) {
+      for (const peer of radioGroupPeers(this)) {
+        if (peer !== this) syncValidationState(peer);
+      }
     }
   }
 
+  _uncheckFromGroup() {
+    if (!this.#checked) return;
+    this.#checked = false;
+    native.attribute(this.nodeId, "checked", false);
+  }
+
+  get indeterminate() { return this.#indeterminate; }
+  set indeterminate(value) {
+    const next = !!value;
+    if (next === this.#indeterminate) return;
+    this.#indeterminate = next;
+    native.attribute(this.nodeId, "indeterminate", next);
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) {
+    this._customValidity = String(message);
+    syncValidationState(this);
+  }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    if (lower === "checked") {
+      super.setAttribute(name, value);
+      if (!this.#dirtyChecked) this.#setChecked(value !== null && value !== undefined && value !== false);
+      return;
+    }
+    if (lower === "value") {
+      this.#value = value == null ? null : String(value);
+      super.setAttribute(name, value);
+      return;
+    }
+    super.setAttribute(name, value);
+    if (VALIDATION_ATTRS.has(lower)) syncValidationState(this);
+  }
+
+  _reset() {
+    this.#dirtyChecked = false;
+    this._userInteracted = false;
+    this.indeterminate = false;
+    this.#setChecked(this.defaultChecked);
+  }
+
   _activate() {
-    if (this.hasAttribute("disabled")) return true;
+    if (isControlDisabled(this)) return true;
     if (this.type === "radio" && this.#checked) return true;
+    this._userInteracted = true;
+    if (this.type === "checkbox" && this.#indeterminate) this.indeterminate = false;
     this.checked = this.type === "radio" ? true : !this.#checked;
     const input = new Event("input", this);
     input.bubbles = true;
@@ -3098,6 +4271,32 @@ export class CheckInput extends Node {
     change.bubbles = true;
     dispatchEvent(change);
     return true;
+  }
+
+  _handleKey(event) {
+    if (isControlDisabled(this)) return false;
+    if (event.key === " ") {
+      event.preventDefault();
+      return this._activate();
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      implicitFormSubmit(this);
+      return true;
+    }
+    if (this.type === "radio" && (event.key === "ArrowRight" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowUp")) {
+      const peers = radioGroupPeers(this).filter((p) => !isControlDisabled(p));
+      if (peers.length <= 1) return false;
+      const idx = peers.indexOf(this);
+      if (idx < 0) return false;
+      event.preventDefault();
+      const delta = (event.key === "ArrowRight" || event.key === "ArrowDown") ? 1 : -1;
+      const next = peers[(idx + delta + peers.length) % peers.length];
+      next.focus();
+      next._activate();
+      return true;
+    }
+    return false;
   }
 }
 
@@ -3115,12 +4314,13 @@ export class RangeInput extends Node {
   #dragging = false;
   #dragPointerId = -1;
   #dragStartValue = 50;
+  _customValidity = "";
+  _userInteracted = false;
 
   constructor() {
     super("box");
     this._tag = "input";
     this.type = "range";
-    this.defaultValue = "";
     native.attribute(this.nodeId, "element", "input");
     native.attribute(this.nodeId, "type", "range");
     native.attribute(this.nodeId, "role", "slider");
@@ -3128,6 +4328,7 @@ export class RangeInput extends Node {
     this._keep("focus", "blur", "pointerdown", "pointermove", "pointerup", "pointercancel", "keydown");
     this._relisten();
     this.#syncRange();
+    syncValidationState(this);
   }
 
   _shallowClone() {
@@ -3139,22 +4340,17 @@ export class RangeInput extends Node {
     return copy;
   }
 
-  #effectiveMin() {
-    return Number.isFinite(this.#min) ? this.#min : 0;
-  }
-
+  #effectiveMin() { return Number.isFinite(this.#min) ? this.#min : 0; }
   #effectiveMax() {
     const min = this.#effectiveMin();
     const max = Number.isFinite(this.#max) ? this.#max : 100;
     return max < min ? min : max;
   }
-
   #stepNumber() {
     if (typeof this.#step === "string" && this.#step.trim().toLowerCase() === "any") return 0;
     const n = Number(this.#step);
     return Number.isFinite(n) && n > 0 ? n : 1;
   }
-
   #snap(raw) {
     const min = this.#effectiveMin();
     const max = this.#effectiveMax();
@@ -3167,12 +4363,10 @@ export class RangeInput extends Node {
       v = min + steps * step;
       if (v > max) v = min + Math.floor((max - min) / step) * step;
       if (v < min) v = min;
-      // Avoid IEEE-754 trailing dust like 1.2000000000000002.
       v = Number(v.toPrecision(12));
     }
     return v;
   }
-
   #syncRange() {
     const min = this.#effectiveMin();
     const max = this.#effectiveMax();
@@ -3181,10 +4375,7 @@ export class RangeInput extends Node {
     native.attribute(this.nodeId, "valueRange", min, max, val);
   }
 
-  get min() {
-    return this.getAttribute("min") ?? "";
-  }
-
+  get min() { return this.getAttribute("min") ?? ""; }
   set min(value) {
     const text = value == null ? "" : String(value);
     const n = text.trim() === "" ? 0 : Number(text);
@@ -3193,10 +4384,7 @@ export class RangeInput extends Node {
     this.#syncRange();
   }
 
-  get max() {
-    return this.getAttribute("max") ?? "";
-  }
-
+  get max() { return this.getAttribute("max") ?? ""; }
   set max(value) {
     const text = value == null ? "" : String(value);
     const n = text.trim() === "" ? 100 : Number(text);
@@ -3205,10 +4393,7 @@ export class RangeInput extends Node {
     this.#syncRange();
   }
 
-  get step() {
-    return this.getAttribute("step") ?? "";
-  }
-
+  get step() { return this.getAttribute("step") ?? ""; }
   set step(value) {
     const text = value == null ? "" : String(value);
     this.#step = text.trim() === "" ? "1" : text;
@@ -3216,10 +4401,10 @@ export class RangeInput extends Node {
     this.#syncRange();
   }
 
-  get value() {
-    return String(this.#value);
-  }
+  get defaultValue() { return this.getAttribute("value") ?? ""; }
+  set defaultValue(v) { this.setAttribute("value", String(v)); }
 
+  get value() { return String(this.#value); }
   set value(val) {
     const n = Number(val);
     this.#hasValue = true;
@@ -3227,20 +4412,52 @@ export class RangeInput extends Node {
     this.#syncRange();
   }
 
-  get valueAsNumber() {
-    return this.#value;
+  get valueAsNumber() { return this.#value; }
+  set valueAsNumber(val) { this.value = val; }
+
+  stepUp(n = 1) {
+    const step = this.#stepNumber();
+    if (step <= 0) throw domError("InvalidStateError", "This input element has step=\"any\".");
+    this.value = this.#value + (Math.trunc(Number(n)) || 1) * step;
+  }
+  stepDown(n = 1) {
+    const step = this.#stepNumber();
+    if (step <= 0) throw domError("InvalidStateError", "This input element has step=\"any\".");
+    this.value = this.#value - (Math.trunc(Number(n)) || 1) * step;
   }
 
-  set valueAsNumber(val) {
-    this.value = val;
-  }
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
 
-  get name() {
-    return this.getAttribute("name") ?? "";
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) {
+    this._customValidity = String(message);
+    syncValidationState(this);
+  }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  _reset() {
+    this.#hasValue = false;
+    this._userInteracted = false;
+    const def = this.getAttribute("value");
+    if (def !== null && def !== "") {
+      const n = Number(def);
+      this.#value = this.#snap(Number.isFinite(n) ? n : this.#effectiveMin() + (this.#effectiveMax() - this.#effectiveMin()) * 0.5);
+      this.#hasValue = true;
+    }
+    this.#syncRange();
+    syncValidationState(this);
   }
 
   setAttribute(name, value) {
-    if (name === "min") {
+    const lower = String(name).toLowerCase();
+    if (lower === "min") {
       const text = value == null ? "" : String(value);
       const n = text.trim() === "" ? 0 : Number(text);
       this.#min = Number.isFinite(n) ? n : 0;
@@ -3248,7 +4465,7 @@ export class RangeInput extends Node {
       this.#syncRange();
       return;
     }
-    if (name === "max") {
+    if (lower === "max") {
       const text = value == null ? "" : String(value);
       const n = text.trim() === "" ? 100 : Number(text);
       this.#max = Number.isFinite(n) ? n : 100;
@@ -3256,21 +4473,24 @@ export class RangeInput extends Node {
       this.#syncRange();
       return;
     }
-    if (name === "step") {
+    if (lower === "step") {
       const text = value == null ? "" : String(value);
       this.#step = text.trim() === "" ? "1" : text;
       super.setAttribute(name, value);
       this.#syncRange();
       return;
     }
-    if (name === "value") {
+    if (lower === "value") {
       super.setAttribute(name, value);
       if (value != null && !this.#hasValue) {
-        this.value = value;
+        const n = Number(value);
+        this.#value = this.#snap(Number.isFinite(n) ? n : this.#effectiveMin() + (this.#effectiveMax() - this.#effectiveMin()) * 0.5);
+        this.#syncRange();
       }
       return;
     }
     super.setAttribute(name, value);
+    if (VALIDATION_ATTRS.has(lower)) syncValidationState(this);
   }
 
   #setFromClientX(clientX) {
@@ -3286,6 +4506,7 @@ export class RangeInput extends Node {
     if (next === this.#value) return false;
     this.#hasValue = true;
     this.#value = next;
+    this._userInteracted = true;
     native.attribute(this.nodeId, "valueRange", min, max, next);
     const input = new Event("input", this);
     input.bubbles = true;
@@ -3294,7 +4515,7 @@ export class RangeInput extends Node {
   }
 
   _handlePointer(kind, event) {
-    if (this.hasAttribute("disabled")) return false;
+    if (isControlDisabled(this)) return false;
     if (kind === 0) {
       if (event.button !== 0) return false;
       this.focus();
@@ -3325,7 +4546,7 @@ export class RangeInput extends Node {
   }
 
   _handleKey(event) {
-    if (this.hasAttribute("disabled")) return false;
+    if (isControlDisabled(this)) return false;
     const min = this.#effectiveMin();
     const max = this.#effectiveMax();
     const step = this.#stepNumber() || (max - min) / 100 || 1;
@@ -3343,6 +4564,7 @@ export class RangeInput extends Node {
     if (snapped === this.#value) return true;
     this.#hasValue = true;
     this.#value = snapped;
+    this._userInteracted = true;
     native.attribute(this.nodeId, "valueRange", min, max, snapped);
     const input = new Event("input", this);
     input.bubbles = true;
@@ -3352,6 +4574,1208 @@ export class RangeInput extends Node {
     dispatchEvent(change);
     return true;
   }
+}
+
+/**
+ * `<input type="color">`: holds a 7-character lowercase `#rrggbb` color and paints an inset swatch.
+ */
+export class ColorInput extends Node {
+  #value = "#000000";
+  #dirtyValue = false;
+  _customValidity = "";
+  _userInteracted = false;
+
+  constructor() {
+    super("box");
+    this._tag = "input";
+    this.type = "color";
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", "color");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    native.attribute(this.nodeId, "-silk-color", this.#value);
+    this._keep("focus", "blur");
+    this._relisten();
+    syncValidationState(this);
+  }
+
+  _shallowClone() {
+    const copy = new ColorInput();
+    copy.value = this.#value;
+    return copy;
+  }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get defaultValue() { return this.getAttribute("value") ?? ""; }
+  set defaultValue(v) { this.setAttribute("value", String(v)); }
+
+  get value() { return this.#value; }
+  set value(v) {
+    this.#dirtyValue = true;
+    this.#setColor(normalizeHexColor(v));
+  }
+
+  #setColor(hex) {
+    if (hex === this.#value) return;
+    this.#value = hex;
+    native.attribute(this.nodeId, "-silk-color", hex);
+    syncValidationState(this);
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) { this._customValidity = String(message); syncValidationState(this); }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  _reset() {
+    this.#dirtyValue = false;
+    this._userInteracted = false;
+    this.#setColor(normalizeHexColor(this.getAttribute("value")));
+  }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (lower === "value" && !this.#dirtyValue) {
+      this.#setColor(normalizeHexColor(value));
+    } else if (VALIDATION_ATTRS.has(lower)) {
+      syncValidationState(this);
+    }
+  }
+}
+
+/**
+ * `<input type="file">`: holds a `FileList`, reports `C:\fakepath\<name>` from `.value`, and validates `required`.
+ */
+export class FileInput extends Node {
+  #files = [];
+  _customValidity = "";
+  _userInteracted = false;
+
+  constructor() {
+    super("box");
+    this._tag = "input";
+    this.type = "file";
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", "file");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur");
+    this._relisten();
+    syncValidationState(this);
+  }
+
+  _shallowClone() { return new FileInput(); }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get accept() { return this.getAttribute("accept") ?? ""; }
+  set accept(v) { this.setAttribute("accept", String(v)); }
+
+  get multiple() { return this.hasAttribute("multiple"); }
+  set multiple(v) { if (v) this.setAttribute("multiple", ""); else this.removeAttribute("multiple"); }
+
+  get required() { return this.hasAttribute("required"); }
+  set required(v) { if (v) this.setAttribute("required", ""); else this.removeAttribute("required"); }
+
+  get files() { return createFileList(this.#files); }
+  set files(list) {
+    this.#files = list ? Array.from(list) : [];
+    syncValidationState(this);
+  }
+
+  get value() {
+    return this.#files.length ? "C:\\fakepath\\" + (this.#files[0].name ?? "") : "";
+  }
+  set value(v) {
+    if (String(v) === "") {
+      this.#files = [];
+      syncValidationState(this);
+    } else {
+      throw domError("InvalidStateError", "This input element accepts a filename, which may only be programmatically set to the empty string.");
+    }
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) { this._customValidity = String(message); syncValidationState(this); }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  _reset() {
+    this.#files = [];
+    this._userInteracted = false;
+    syncValidationState(this);
+  }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (VALIDATION_ATTRS.has(lower)) syncValidationState(this);
+  }
+}
+
+/**
+ * `<input type="button|submit|reset|image">`: button-like input controls.
+ */
+export class ButtonInput extends Node {
+  _customValidity = "";
+
+  constructor(type = "button") {
+    super("box");
+    this._tag = "input";
+    this._inputType = canonicalInputType(type);
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", this._inputType);
+    native.attribute(this.nodeId, "role", "button");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur", "keydown");
+    this._relisten();
+  }
+
+  _shallowClone() { return new ButtonInput(this._inputType); }
+
+  get type() { return this._inputType; }
+  set type(v) {
+    this._inputType = canonicalInputType(v);
+    native.attribute(this.nodeId, "type", this._inputType);
+    formOwnerOf(this)?._syncDefaultButton();
+  }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get value() { return this.getAttribute("value") ?? ""; }
+  set value(v) { this.setAttribute("value", String(v)); }
+  get defaultValue() { return this.value; }
+  set defaultValue(v) { this.value = v; }
+
+  get formAction() { return this.getAttribute("formaction") ?? ""; }
+  set formAction(v) { this.setAttribute("formaction", String(v)); }
+  get formEnctype() { return this.getAttribute("formenctype") ?? ""; }
+  set formEnctype(v) { this.setAttribute("formenctype", String(v)); }
+  get formMethod() { return this.getAttribute("formmethod") ?? ""; }
+  set formMethod(v) { this.setAttribute("formmethod", String(v)); }
+  get formNoValidate() { return this.hasAttribute("formnovalidate"); }
+  set formNoValidate(v) { if (v) this.setAttribute("formnovalidate", ""); else this.removeAttribute("formnovalidate"); }
+  get formTarget() { return this.getAttribute("formtarget") ?? ""; }
+  set formTarget(v) { this.setAttribute("formtarget", String(v)); }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return false; }
+  get validity() { return new ValidityState({ customError: Boolean(this._customValidity) }); }
+  get validationMessage() { return this._customValidity; }
+  setCustomValidity(message) { this._customValidity = String(message); }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+
+  _activate() {
+    if (isControlDisabled(this)) return true;
+    const form = formOwnerOf(this);
+    if (!form) return false;
+    if (this._inputType === "submit" || this._inputType === "image") {
+      form.requestSubmit(this);
+      return true;
+    }
+    if (this._inputType === "reset") {
+      form.reset();
+      return true;
+    }
+    return false;
+  }
+
+  _handleKey(event) {
+    if (isControlDisabled(this)) return false;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      this.click?.() ?? this._activate();
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * `<input type="hidden">`: non-rendered form value carrier.
+ */
+export class HiddenInput extends Node {
+  _customValidity = "";
+
+  constructor() {
+    super("box");
+    this._tag = "input";
+    this.type = "hidden";
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", "hidden");
+  }
+
+  _shallowClone() { return new HiddenInput(); }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get value() { return this.getAttribute("value") ?? ""; }
+  set value(v) { this.setAttribute("value", String(v)); }
+  get defaultValue() { return this.value; }
+  set defaultValue(v) { this.value = v; }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return []; }
+  get willValidate() { return false; }
+  get validity() { return new ValidityState({ customError: Boolean(this._customValidity) }); }
+  get validationMessage() { return this._customValidity; }
+  setCustomValidity(message) { this._customValidity = String(message); }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+}
+
+/**
+ * `<option>`: an item inside a `<select>` or `<optgroup>`.
+ */
+export class OptionElement extends Node {
+  #selected = false;
+  #dirtySelected = false;
+
+  constructor(text, value, defaultSelected = false, selected = false) {
+    super("box");
+    this._tag = "option";
+    native.attribute(this.nodeId, "element", "option");
+    native.attribute(this.nodeId, "role", "option");
+    if (text !== undefined && text !== null && String(text) !== "") {
+      this.appendChild(createText(String(text)));
+    }
+    if (value !== undefined) this.setAttribute("value", String(value));
+    if (defaultSelected) this.setAttribute("selected", "");
+    if (selected) this.selected = true;
+  }
+
+  _shallowClone() {
+    const copy = new OptionElement();
+    copy.selected = this.#selected;
+    return copy;
+  }
+
+  _ownerSelect() {
+    if (this.parentNode instanceof SelectElement) return this.parentNode;
+    if (this.parentNode instanceof OptGroupElement && this.parentNode.parentNode instanceof SelectElement) {
+      return this.parentNode.parentNode;
+    }
+    return null;
+  }
+
+  _notifySelect() {
+    this._ownerSelect()?._syncSelectDisplay();
+  }
+
+  _onChildrenChange() {
+    this._notifySelect();
+  }
+
+  get text() {
+    let out = "";
+    for (const child of this.childNodes) if (child.nodeType === 3) out += child.data;
+    return out.trim().replace(/[\t\n\f\r ]+/g, " ");
+  }
+  set text(v) {
+    for (const child of [...this.childNodes]) child.remove();
+    const s = String(v);
+    if (s) this.appendChild(createText(s));
+    this._notifySelect();
+  }
+
+  get label() {
+    const attr = this.getAttribute("label");
+    return attr !== null && attr !== "" ? attr : this.text;
+  }
+  set label(v) {
+    this.setAttribute("label", String(v));
+    this._notifySelect();
+  }
+
+  get value() {
+    const attr = this.getAttribute("value");
+    return attr !== null ? attr : this.text;
+  }
+  set value(v) {
+    this.setAttribute("value", String(v));
+    this._notifySelect();
+  }
+
+  get defaultSelected() { return this.hasAttribute("selected"); }
+  set defaultSelected(v) {
+    if (v) this.setAttribute("selected", "");
+    else this.removeAttribute("selected");
+  }
+
+  get selected() { return this.#selected; }
+  set selected(v) {
+    const next = !!v;
+    this.#dirtySelected = true;
+    this._setSelectedInternal(next);
+    const select = this._ownerSelect();
+    if (select) select._optionSelectionChanged(this, next);
+  }
+
+  _setSelectedInternal(next) {
+    if (next === this.#selected) return;
+    this.#selected = next;
+    native.attribute(this.nodeId, "checked", next);
+  }
+
+  _resetSelection() {
+    this.#dirtySelected = false;
+    this._setSelectedInternal(this.defaultSelected);
+  }
+
+  get index() {
+    const select = this._ownerSelect();
+    if (!select) return 0;
+    const idx = select.options.indexOf(this);
+    return idx >= 0 ? idx : 0;
+  }
+
+  get form() {
+    const select = this._ownerSelect();
+    return select ? select.form : null;
+  }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (lower === "selected" && !this.#dirtySelected) {
+      const on = value !== null && value !== undefined && value !== false;
+      this._setSelectedInternal(on);
+      this._ownerSelect()?._optionSelectionChanged(this, on);
+    } else if (lower === "label" || lower === "value" || lower === "disabled") {
+      this._notifySelect();
+    }
+  }
+}
+
+/**
+ * `<optgroup>`: groups `<option>` elements inside a `<select>`.
+ */
+export class OptGroupElement extends Node {
+  constructor() {
+    super("box");
+    this._tag = "optgroup";
+    native.attribute(this.nodeId, "element", "optgroup");
+  }
+
+  _shallowClone() { return new OptGroupElement(); }
+
+  get label() { return this.getAttribute("label") ?? ""; }
+  set label(v) { this.setAttribute("label", String(v)); }
+
+  _onChildrenChange() {
+    if (this.parentNode instanceof SelectElement) this.parentNode._onChildrenChange();
+  }
+}
+
+// Floating popup listbox for an open single-select `<select>`, mounted on the document root
+// (never inside `<select>.childNodes`, keeping React reconciliation untouched).
+let openSelectPopup = null;
+
+function isInsideSelectPopup(target) {
+  if (!openSelectPopup) return false;
+  return target === openSelectPopup.box || openSelectPopup.box.contains(target) || target === openSelectPopup.select || openSelectPopup.select.contains(target);
+}
+
+function closeSelectPopup() {
+  if (!openSelectPopup) return;
+  const popup = openSelectPopup;
+  openSelectPopup = null;
+  if (popup.select && nodes[popup.select.nodeId] !== undefined) {
+    native.attribute(popup.select.nodeId, "expanded", false);
+  }
+  if (nodes[popup.box.nodeId] !== undefined) popup.box.destroy();
+}
+
+function popupHostFor(select) {
+  let top = rootOf(select);
+  if (top.localName === "html") {
+    const body = top.childNodes.find((c) => c.localName === "body");
+    if (body) return body;
+  }
+  return top;
+}
+
+/**
+ * `<select>`: single- or multi-select list box with native dropdown popup and keyboard support.
+ */
+export class SelectElement extends Node {
+  #hasExplicitSelection = false;
+  #typeahead = "";
+  #typeaheadAt = 0;
+  _customValidity = "";
+  _userInteracted = false;
+
+  constructor() {
+    super("box");
+    this._tag = "select";
+    native.attribute(this.nodeId, "element", "select");
+    native.attribute(this.nodeId, "role", "combobox");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur", "keydown");
+    this._relisten();
+    syncValidationState(this);
+  }
+
+  _shallowClone() { return new SelectElement(); }
+
+  get multiple() { return this.hasAttribute("multiple"); }
+  set multiple(v) {
+    if (v) this.setAttribute("multiple", "");
+    else this.removeAttribute("multiple");
+  }
+
+  get size() {
+    const raw = this.getAttribute("size");
+    const n = raw === null ? NaN : parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+  set size(v) {
+    const n = Math.trunc(Number(v));
+    if (n < 0) throw domError("IndexSizeError", "size cannot be negative");
+    this.setAttribute("size", String(n));
+  }
+
+  get type() { return this.multiple ? "select-multiple" : "select-one"; }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get required() { return this.hasAttribute("required"); }
+  set required(v) { if (v) this.setAttribute("required", ""); else this.removeAttribute("required"); }
+
+  get autocomplete() { return this.getAttribute("autocomplete") ?? ""; }
+  set autocomplete(v) { this.setAttribute("autocomplete", String(v)); }
+
+  get options() {
+    const list = [];
+    for (const child of this.childNodes) {
+      if (child instanceof OptionElement) list.push(child);
+      else if (child instanceof OptGroupElement) {
+        for (const sub of child.childNodes) {
+          if (sub instanceof OptionElement) list.push(sub);
+        }
+      }
+    }
+    list.item = (index) => list[index] ?? null;
+    list.namedItem = (name) => {
+      const key = String(name);
+      return list.find((o) => o.getAttribute("id") === key || o.getAttribute("name") === key) ?? null;
+    };
+    list.add = (el, before) => this.add(el, before);
+    list.remove = (index) => this.remove(index);
+    return list;
+  }
+
+  get length() { return this.options.length; }
+  set length(n) {
+    const target = Math.max(0, Math.trunc(Number(n)) || 0);
+    const opts = this.options;
+    if (target < opts.length) {
+      for (let i = opts.length - 1; i >= target; i--) opts[i].remove();
+    } else {
+      for (let i = opts.length; i < target; i++) this.appendChild(new OptionElement());
+    }
+  }
+
+  item(index) { return this.options[index] ?? null; }
+  namedItem(name) { return this.options.namedItem(name); }
+
+  add(element, before = null) {
+    if (!(element instanceof OptionElement) && !(element instanceof OptGroupElement)) return;
+    if (before === null || before === undefined) {
+      this.appendChild(element);
+      return;
+    }
+    if (typeof before === "number") {
+      const target = this.options[before] ?? null;
+      if (target && target.parentNode) target.parentNode.insertBefore(element, target);
+      else this.appendChild(element);
+      return;
+    }
+    if (before.parentNode === this) this.insertBefore(element, before);
+    else this.appendChild(element);
+  }
+
+  remove(index) {
+    if (arguments.length === 0) {
+      super.remove();
+      return;
+    }
+    const target = this.options[Math.trunc(Number(index))];
+    if (target) target.remove();
+  }
+
+  get selectedOptions() {
+    return this.options.filter((o) => o.selected);
+  }
+
+  get selectedIndex() {
+    const opts = this.options;
+    for (let i = 0; i < opts.length; i++) if (opts[i].selected) return i;
+    return -1;
+  }
+
+  set selectedIndex(index) {
+    const idx = Math.trunc(Number(index));
+    const opts = this.options;
+    this.#hasExplicitSelection = true;
+    for (let i = 0; i < opts.length; i++) opts[i]._setSelectedInternal(i === idx);
+    this._syncSelectDisplay();
+  }
+
+  get value() {
+    const selected = this.selectedOptions[0];
+    return selected ? selected.value : "";
+  }
+
+  set value(val) {
+    const target = String(val);
+    const opts = this.options;
+    this.#hasExplicitSelection = true;
+    let matched = false;
+    for (const opt of opts) {
+      if (!matched && opt.value === target) {
+        opt._setSelectedInternal(true);
+        matched = true;
+      } else {
+        opt._setSelectedInternal(false);
+      }
+    }
+    this._syncSelectDisplay();
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return isCandidateForConstraintValidation(this); }
+  get validity() { return computeValidity(this); }
+  get validationMessage() { return validationMessageFor(this); }
+  setCustomValidity(message) { this._customValidity = String(message); syncValidationState(this); }
+  checkValidity() { return runCheckValidity(this); }
+  reportValidity() { return runReportValidity(this); }
+
+  _ensureSingleSelection() {
+    if (this.multiple || this.size > 1) return;
+    const opts = this.options;
+    if (opts.length === 0) return;
+    let lastSelected = null;
+    for (const opt of opts) if (opt.selected) lastSelected = opt;
+    if (lastSelected) {
+      for (const opt of opts) opt._setSelectedInternal(opt === lastSelected);
+    } else if (!this.#hasExplicitSelection) {
+      const first = opts.find((o) => !isControlDisabled(o)) ?? opts[0];
+      if (first) first._setSelectedInternal(true);
+    }
+  }
+
+  _optionSelectionChanged(option, on) {
+    this.#hasExplicitSelection = true;
+    if (on && !this.multiple) {
+      for (const opt of this.options) {
+        if (opt !== option) opt._setSelectedInternal(false);
+      }
+    }
+    this._syncSelectDisplay();
+  }
+
+  _syncSelectDisplay() {
+    this._ensureSingleSelection();
+    const selected = this.selectedOptions[0];
+    const label = selected ? selected.label : "";
+    native.attribute(this.nodeId, "-silk-select-label", this.multiple || this.size > 1 ? null : label);
+    syncValidationState(this);
+  }
+
+  _onChildrenChange() {
+    this._syncSelectDisplay();
+  }
+
+  _reset() {
+    this.#hasExplicitSelection = false;
+    this._userInteracted = false;
+    for (const opt of this.options) opt._resetSelection();
+    this._syncSelectDisplay();
+  }
+
+  #commitSelection(option) {
+    if (!option || isControlDisabled(option)) return;
+    const prevValue = this.value;
+    const prevIndex = this.selectedIndex;
+    this.#hasExplicitSelection = true;
+    this._userInteracted = true;
+    if (this.multiple) {
+      option._setSelectedInternal(!option.selected);
+    } else {
+      for (const opt of this.options) opt._setSelectedInternal(opt === option);
+    }
+    this._syncSelectDisplay();
+    if (this.multiple || this.value !== prevValue || this.selectedIndex !== prevIndex) {
+      const inputEv = new Event("input", this);
+      inputEv.bubbles = true;
+      dispatchEvent(inputEv);
+      const changeEv = new Event("change", this);
+      changeEv.bubbles = true;
+      dispatchEvent(changeEv);
+    }
+  }
+
+  #openPopup() {
+    if (isControlDisabled(this) || this.multiple || this.size > 1) return;
+    if (openSelectPopup?.select === this) {
+      closeSelectPopup();
+      return;
+    }
+    closeSelectPopup();
+    const host = popupHostFor(this);
+    if (!host || host === this) return;
+    const rect = this.getBoundingClientRect();
+    const box = new Node("box");
+    box.style.set({
+      position: "fixed",
+      left: rect ? rect.left : 0,
+      top: rect ? rect.bottom + 2 : 0,
+      minWidth: rect ? Math.max(rect.width, 120) : 160,
+      maxHeight: 240,
+      overflowY: "auto",
+      display: "flex",
+      flexDirection: "column",
+      backgroundColor: "#ffffff",
+      borderWidth: 1,
+      borderColor: "#cbd5e1",
+      borderRadius: 6,
+      paddingTop: 4,
+      paddingBottom: 4,
+      zIndex: 2147483640,
+      boxShadow: "0 8px 24px rgba(0, 0, 0, 0.16)",
+    });
+    native.attribute(box.nodeId, "role", "listbox");
+    const addOptionRow = (opt, indented) => {
+      const row = new Node("box");
+      const disabled = isControlDisabled(opt);
+      row.style.set({
+        paddingTop: 6,
+        paddingBottom: 6,
+        paddingLeft: indented ? 20 : 10,
+        paddingRight: 10,
+        fontSize: 13,
+        color: disabled ? "#94a3b8" : opt.selected ? "#ffffff" : "#0f172a",
+        backgroundColor: opt.selected ? "#2563eb" : "transparent",
+        cursor: disabled ? "default" : "pointer",
+      });
+      if (!disabled && !opt.selected) row.look("hover").set({ backgroundColor: "#f1f5f9" });
+      row.appendChild(createText(opt.label));
+      if (!disabled) {
+        row.addEventListener("pointerdown", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.#commitSelection(opt);
+          closeSelectPopup();
+          this.focus();
+        });
+      }
+      box.appendChild(row);
+    };
+    for (const child of this.childNodes) {
+      if (child instanceof OptionElement) addOptionRow(child, false);
+      else if (child instanceof OptGroupElement) {
+        if (child.label) {
+          const hdr = new Node("box");
+          hdr.style.set({ paddingTop: 6, paddingBottom: 2, paddingLeft: 10, paddingRight: 10, fontSize: 11, fontWeight: 600, color: "#64748b" });
+          hdr.appendChild(createText(child.label));
+          box.appendChild(hdr);
+        }
+        for (const sub of child.childNodes) if (sub instanceof OptionElement) addOptionRow(sub, true);
+      }
+    }
+    host.appendChild(box);
+    native.attribute(this.nodeId, "expanded", true);
+    openSelectPopup = { select: this, box };
+  }
+
+  _activate() {
+    if (isControlDisabled(this)) return true;
+    this.focus();
+    if (!this.multiple && this.size <= 1) this.#openPopup();
+    return true;
+  }
+
+  _handleBlur() {
+    if (openSelectPopup?.select === this) closeSelectPopup();
+  }
+
+  _handleKey(event) {
+    if (isControlDisabled(this)) return false;
+    const opts = this.options;
+    const enabled = opts.filter((o) => !isControlDisabled(o));
+    if (event.key === "Escape") {
+      if (openSelectPopup?.select === this) {
+        event.preventDefault();
+        closeSelectPopup();
+        return true;
+      }
+      return false;
+    }
+    if (event.key === " " || event.key === "Enter") {
+      if (!this.multiple && this.size <= 1) {
+        event.preventDefault();
+        this.#openPopup();
+        return true;
+      }
+      return false;
+    }
+    if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Home" || event.key === "End") {
+      if (enabled.length === 0) return false;
+      event.preventDefault();
+      const curIdx = enabled.findIndex((o) => o.selected);
+      let nextIdx;
+      if (event.key === "Home") nextIdx = 0;
+      else if (event.key === "End") nextIdx = enabled.length - 1;
+      else if (event.key === "ArrowDown") nextIdx = curIdx < 0 ? 0 : Math.min(enabled.length - 1, curIdx + 1);
+      else nextIdx = curIdx < 0 ? enabled.length - 1 : Math.max(0, curIdx - 1);
+      this.#commitSelection(enabled[nextIdx]);
+      return true;
+    }
+    if (event.key && event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const now = Date.now();
+      if (now - this.#typeaheadAt > 750) this.#typeahead = "";
+      this.#typeaheadAt = now;
+      this.#typeahead += event.key.toLowerCase();
+      const match = enabled.find((o) => o.label.toLowerCase().startsWith(this.#typeahead));
+      if (match) {
+        event.preventDefault();
+        this.#commitSelection(match);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  setAttribute(name, value) {
+    const lower = String(name).toLowerCase();
+    super.setAttribute(name, value);
+    if (lower === "multiple" || lower === "size") {
+      native.attribute(this.nodeId, "role", this.multiple || this.size > 1 ? "listbox" : "combobox");
+      this._syncSelectDisplay();
+    } else if (VALIDATION_ATTRS.has(lower)) {
+      syncValidationState(this);
+    }
+  }
+}
+
+/**
+ * `<button>`: submit (default), reset, or plain button.
+ */
+export class ButtonElement extends Node {
+  _customValidity = "";
+
+  constructor() {
+    super("box");
+    this._tag = "button";
+    native.attribute(this.nodeId, "element", "button");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur", "keydown");
+    this._relisten();
+  }
+
+  _shallowClone() { return new ButtonElement(); }
+
+  get type() {
+    const raw = (this.getAttribute("type") ?? "").toLowerCase();
+    return raw === "button" || raw === "reset" ? raw : "submit";
+  }
+  set type(v) {
+    this.setAttribute("type", String(v));
+    formOwnerOf(this)?._syncDefaultButton();
+  }
+
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get value() { return this.getAttribute("value") ?? ""; }
+  set value(v) { this.setAttribute("value", String(v)); }
+
+  get formAction() { return this.getAttribute("formaction") ?? ""; }
+  set formAction(v) { this.setAttribute("formaction", String(v)); }
+  get formEnctype() { return this.getAttribute("formenctype") ?? ""; }
+  set formEnctype(v) { this.setAttribute("formenctype", String(v)); }
+  get formMethod() { return this.getAttribute("formmethod") ?? ""; }
+  set formMethod(v) { this.setAttribute("formmethod", String(v)); }
+  get formNoValidate() { return this.hasAttribute("formnovalidate"); }
+  set formNoValidate(v) { if (v) this.setAttribute("formnovalidate", ""); else this.removeAttribute("formnovalidate"); }
+  get formTarget() { return this.getAttribute("formtarget") ?? ""; }
+  set formTarget(v) { this.setAttribute("formtarget", String(v)); }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return false; }
+  get validity() { return new ValidityState({ customError: Boolean(this._customValidity) }); }
+  get validationMessage() { return this._customValidity; }
+  setCustomValidity(message) { this._customValidity = String(message); }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+
+  _activate() {
+    if (isControlDisabled(this)) return true;
+    const type = this.type;
+    if (type !== "submit" && type !== "reset") return false;
+    const form = formOwnerOf(this);
+    if (!form) return false;
+    if (type === "submit") form.requestSubmit(this);
+    else form.reset();
+    return true;
+  }
+
+  _handleKey(event) {
+    if (isControlDisabled(this)) return false;
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (typeof this.click === "function") this.click();
+      else this._activate();
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
+ * `<fieldset>`: groups controls and propagates `disabled` (exempting its first `<legend>` child).
+ */
+export class FieldSetElement extends Node {
+  _customValidity = "";
+
+  constructor() {
+    super("box");
+    this._tag = "fieldset";
+    native.attribute(this.nodeId, "element", "fieldset");
+  }
+
+  _shallowClone() { return new FieldSetElement(); }
+
+  get type() { return "fieldset"; }
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+  get form() { return formOwnerOf(this); }
+
+  get elements() {
+    const out = [];
+    eachDescendant(this, (node) => {
+      if (node.nodeType === 1 && LISTED_TAGS.has(node.localName) && !(node instanceof ButtonInput && node.type === "image")) {
+        out.push(node);
+      }
+    });
+    return makeFormControlsCollection(out);
+  }
+
+  get willValidate() { return false; }
+  get validity() { return new ValidityState({ customError: Boolean(this._customValidity) }); }
+  get validationMessage() { return this._customValidity; }
+  setCustomValidity(message) { this._customValidity = String(message); }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
+
+  setAttribute(name, value) {
+    super.setAttribute(name, value);
+    if (String(name).toLowerCase() === "disabled") {
+      eachDescendant(this, (node) => {
+        if (node.nodeType === 1 && LISTED_TAGS.has(node.localName)) syncValidationState(node);
+      });
+    }
+  }
+}
+
+/**
+ * `<label>`: associates a caption with a labelable form control via `for` or containment.
+ */
+export class LabelElement extends Node {
+  constructor() {
+    super("box");
+    this._tag = "label";
+    native.attribute(this.nodeId, "element", "label");
+    this._relisten();
+  }
+
+  _shallowClone() { return new LabelElement(); }
+
+  get htmlFor() { return this.getAttribute("for") ?? ""; }
+  set htmlFor(v) { this.setAttribute("for", String(v)); }
+
+  get control() {
+    const id = this.getAttribute("for");
+    if (id !== null) {
+      if (id === "") return null;
+      const target = findById(id);
+      return isLabelable(target) ? target : null;
+    }
+    let found = null;
+    eachDescendant(this, (node) => {
+      if (!found && isLabelable(node)) found = node;
+    });
+    return found;
+  }
+
+  get form() {
+    const c = this.control;
+    return c ? (c.form ?? null) : null;
+  }
+
+  _activate() {
+    const control = this.control;
+    if (!control || isControlDisabled(control)) return false;
+    if (control instanceof CheckInput || control instanceof ButtonElement || control instanceof ButtonInput || control instanceof SelectElement) {
+      control.focus();
+      control._activate();
+    } else {
+      control.focus();
+    }
+    return true;
+  }
+}
+
+/**
+ * `<progress>`: completion progress bar (determinate when `value` attribute is present, else indeterminate).
+ */
+export class ProgressElement extends Node {
+  constructor() {
+    super("box");
+    this._tag = "progress";
+    native.attribute(this.nodeId, "element", "progress");
+    native.attribute(this.nodeId, "role", "progressbar");
+    this.#syncProgress();
+  }
+
+  _shallowClone() { return new ProgressElement(); }
+
+  get max() {
+    const raw = this.getAttribute("max");
+    const n = raw === null ? NaN : Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+  set max(v) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) this.setAttribute("max", String(n));
+  }
+
+  get value() {
+    const raw = this.getAttribute("value");
+    if (raw === null) return 0;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(n, this.max);
+  }
+  set value(v) {
+    const n = Number(v);
+    if (Number.isFinite(n)) this.setAttribute("value", String(Math.max(0, n)));
+  }
+
+  get position() {
+    if (!this.hasAttribute("value")) return -1;
+    return this.value / this.max;
+  }
+
+  get labels() { return labelsOf(this); }
+
+  #syncProgress() {
+    if (!this.hasAttribute("value")) {
+      native.attribute(this.nodeId, "valueRange", 0, 1, -1);
+    } else {
+      native.attribute(this.nodeId, "valueRange", 0, this.max, this.value);
+    }
+  }
+
+  setAttribute(name, value) {
+    super.setAttribute(name, value);
+    const lower = String(name).toLowerCase();
+    if (lower === "value" || lower === "max") this.#syncProgress();
+  }
+}
+
+/**
+ * `<meter>`: scalar measurement within a known range with optimum/suboptimal/even-less-good regions (WHATWG §4.10.14).
+ */
+export class MeterElement extends Node {
+  constructor() {
+    super("box");
+    this._tag = "meter";
+    native.attribute(this.nodeId, "element", "meter");
+    native.attribute(this.nodeId, "role", "meter");
+    this.#syncMeter();
+  }
+
+  _shallowClone() { return new MeterElement(); }
+
+  get min() {
+    const raw = this.getAttribute("min");
+    const n = raw === null ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  }
+  set min(v) { this.setAttribute("min", String(Number(v))); }
+
+  get max() {
+    const raw = this.getAttribute("max");
+    const n = raw === null ? NaN : Number(raw);
+    const min = this.min;
+    const parsed = Number.isFinite(n) ? n : 1;
+    return Math.max(min, parsed);
+  }
+  set max(v) { this.setAttribute("max", String(Number(v))); }
+
+  get value() {
+    const raw = this.getAttribute("value");
+    const n = raw === null ? 0 : Number(raw);
+    const v = Number.isFinite(n) ? n : 0;
+    return Math.min(this.max, Math.max(this.min, v));
+  }
+  set value(v) { this.setAttribute("value", String(Number(v))); }
+
+  get low() {
+    const raw = this.getAttribute("low");
+    const n = raw === null ? NaN : Number(raw);
+    const min = this.min, max = this.max;
+    if (!Number.isFinite(n)) return min;
+    return Math.min(max, Math.max(min, n));
+  }
+  set low(v) { this.setAttribute("low", String(Number(v))); }
+
+  get high() {
+    const raw = this.getAttribute("high");
+    const n = raw === null ? NaN : Number(raw);
+    const low = this.low, max = this.max;
+    if (!Number.isFinite(n)) return max;
+    return Math.min(max, Math.max(low, n));
+  }
+  set high(v) { this.setAttribute("high", String(Number(v))); }
+
+  get optimum() {
+    const raw = this.getAttribute("optimum");
+    const n = raw === null ? NaN : Number(raw);
+    const min = this.min, max = this.max;
+    if (!Number.isFinite(n)) return (min + max) * 0.5;
+    return Math.min(max, Math.max(min, n));
+  }
+  set optimum(v) { this.setAttribute("optimum", String(Number(v))); }
+
+  get labels() { return labelsOf(this); }
+
+  #meterRegion() {
+    const v = this.value, low = this.low, high = this.high, opt = this.optimum;
+    if (opt < low) {
+      if (v <= low) return "optimum";
+      if (v <= high) return "suboptimal";
+      return "even-less-good";
+    }
+    if (opt > high) {
+      if (v >= high) return "optimum";
+      if (v >= low) return "suboptimal";
+      return "even-less-good";
+    }
+    if (v >= low && v <= high) return "optimum";
+    return "suboptimal";
+  }
+
+  #syncMeter() {
+    native.attribute(this.nodeId, "valueRange", this.min, this.max, this.value);
+    native.attribute(this.nodeId, "-silk-meter-state", this.#meterRegion());
+  }
+
+  setAttribute(name, value) {
+    super.setAttribute(name, value);
+    const lower = String(name).toLowerCase();
+    if (lower === "value" || lower === "min" || lower === "max" || lower === "low" || lower === "high" || lower === "optimum") {
+      this.#syncMeter();
+    }
+  }
+}
+
+/**
+ * `<output>`: displays the result of a calculation and resets to `defaultValue` on `form.reset()`.
+ */
+export class OutputElement extends Node {
+  #defaultValue = null;
+  _customValidity = "";
+
+  constructor() {
+    super("box");
+    this._tag = "output";
+    native.attribute(this.nodeId, "element", "output");
+    native.attribute(this.nodeId, "role", "status");
+  }
+
+  _shallowClone() { return new OutputElement(); }
+
+  get type() { return "output"; }
+  get name() { return this.getAttribute("name") ?? ""; }
+  set name(v) { this.setAttribute("name", String(v)); }
+
+  get htmlFor() {
+    const self = this;
+    return {
+      get value() { return self.getAttribute("for") ?? ""; },
+      set value(v) { self.setAttribute("for", String(v)); },
+      toString() { return this.value; },
+    };
+  }
+
+  #descendantText() {
+    let out = "";
+    for (const child of this.childNodes) {
+      if (child.nodeType === 3) out += child.data;
+      else if (child.textContent) out += child.textContent;
+    }
+    return out;
+  }
+
+  get defaultValue() {
+    return this.#defaultValue !== null ? this.#defaultValue : this.#descendantText();
+  }
+  set defaultValue(v) {
+    const s = String(v);
+    if (this.#defaultValue === null) {
+      for (const child of [...this.childNodes]) child.remove();
+      if (s) this.appendChild(createText(s));
+    } else {
+      this.#defaultValue = s;
+    }
+  }
+
+  get value() { return this.#descendantText(); }
+  set value(v) {
+    if (this.#defaultValue === null) this.#defaultValue = this.#descendantText();
+    for (const child of [...this.childNodes]) child.remove();
+    const s = String(v);
+    if (s) this.appendChild(createText(s));
+  }
+
+  _textChanged() {}
+  _onChildrenChange() {}
+
+  _reset() {
+    const def = this.defaultValue;
+    this.#defaultValue = null;
+    for (const child of [...this.childNodes]) child.remove();
+    if (def) this.appendChild(createText(def));
+  }
+
+  get form() { return formOwnerOf(this); }
+  get labels() { return labelsOf(this); }
+  get willValidate() { return false; }
+  get validity() { return new ValidityState({ customError: Boolean(this._customValidity) }); }
+  get validationMessage() { return this._customValidity; }
+  setCustomValidity(message) { this._customValidity = String(message); }
+  checkValidity() { return true; }
+  reportValidity() { return true; }
 }
 
 function eachDescendant(node, visit) {
@@ -3366,19 +5790,6 @@ function findById(id) {
   return null;
 }
 
-// What a click on a label, summary or submit button does (see `activate`).
-function labelActivate() {
-  const id = this.getAttribute("for");
-  let control = id ? findById(id) : null;
-  if (!control) eachDescendant(this, (node) => {
-    if (!control && (node instanceof Input || node instanceof CheckInput || node instanceof RangeInput)) control = node;
-  });
-  if (!control) return false;
-  if (control instanceof CheckInput) control._activate();
-  else control.focus();
-  return true;
-}
-
 function summaryActivate() {
   const details = this.parentNode;
   if (details?.localName !== "details") return false;
@@ -3388,26 +5799,11 @@ function summaryActivate() {
   return true;
 }
 
-function buttonActivate() {
-  if (this.hasAttribute("disabled")) return true;
-  const type = this.getAttribute("type") ?? "submit";
-  if (type !== "submit" && type !== "reset") return false;
-  let form = this.parentNode;
-  while (form && form.localName !== "form") form = form.parentNode;
-  if (!form) return false;
-  const event = new Event(type, form);
-  event.bubbles = true;
-  event.cancelable = true;
-  event.submitter = this;
-  dispatchEvent(event);
-  return true;
-}
-
 /**
  * The node for HTML element `tag`, as `document.createElement` makes it: `<input>` and
- * `<textarea>` are text fields (an `<input>` whose `type` is not a text field's is a box),
- * `<img>` an image, `<canvas>` a canvas, `<svg>` inline SVG, and every other tag a box the
- * tree knows by its tag, for selectors, its implicit role and the default stylesheet of
+ * `<textarea>` are text fields (an `<input>` whose `type` is not a text field's is a specialized
+ * control), `<img>` an image, `<canvas>` a canvas, `<svg>` inline SVG, and every other tag a box
+ * the tree knows by its tag, for selectors, its implicit role and the default stylesheet of
  * `@silkui/react`. `localName` and `tagName` give the tag.
  */
 // A style element in the document applies its text as a stylesheet, after the compiled
@@ -3479,36 +5875,62 @@ export class StyleElement extends Node {
 // is not an HTML element.
 function elementLike(node) {
   if (node._tag === undefined) return null;
-  const type = node instanceof CheckInput || node instanceof RangeInput ? node.type : node instanceof Input ? undefined : node.getAttribute("type") ?? undefined;
+  const type = node instanceof CheckInput || node instanceof RangeInput || node instanceof ColorInput
+    || node instanceof FileInput || node instanceof ButtonInput || node instanceof HiddenInput
+    ? node.type
+    : node instanceof Input ? (node._tag === "textarea" ? undefined : node.type) : node.getAttribute("type") ?? undefined;
   return createElement(node._tag, { type });
 }
 
 export function createElement(tag, options) {
   tag = String(tag).toLowerCase();
-  const type = String(options?.type ?? "text").toLowerCase();
+  const type = canonicalInputType(options?.type ?? "text");
   let node;
   if (tag === "svg") return new Svg();
-  if (tag === "input" && (type === "checkbox" || type === "radio")) return new CheckInput(type);
-  if (tag === "input" && type === "range") return new RangeInput();
-  if (tag === "input" && !BOX_INPUTS.has(type)) node = new Input();
-  else if (tag === "textarea") node = new Input();
-  else if (tag === "img") node = new Image();
-  else if (tag === "canvas") node = new Canvas();
-  else if (tag === "br") return new LineBreak();
-  else if (tag === "style") node = new StyleElement();
-  else node = new Node("box");
+  if (tag === "br") return new LineBreak();
+  if (tag === "form") return new FormElement();
+  if (tag === "select") return new SelectElement();
+  if (tag === "option") return new OptionElement();
+  if (tag === "optgroup") return new OptGroupElement();
+  if (tag === "button") return new ButtonElement();
+  if (tag === "fieldset") return new FieldSetElement();
+  if (tag === "label") return new LabelElement();
+  if (tag === "progress") return new ProgressElement();
+  if (tag === "meter") return new MeterElement();
+  if (tag === "output") return new OutputElement();
+  if (tag === "input") {
+    if (type === "checkbox" || type === "radio") return new CheckInput(type);
+    if (type === "range") return new RangeInput();
+    if (type === "color") return new ColorInput();
+    if (type === "file") return new FileInput();
+    if (type === "hidden") return new HiddenInput();
+    if (type === "button" || type === "submit" || type === "reset" || type === "image") return new ButtonInput(type);
+    node = new Input(type);
+  } else if (tag === "textarea") {
+    node = new Input("text");
+  } else if (tag === "img") {
+    node = new Image();
+  } else if (tag === "canvas") {
+    node = new Canvas();
+  } else if (tag === "style") {
+    node = new StyleElement();
+  } else {
+    node = new Node("box");
+  }
   node._tag = tag;
   native.attribute(node.nodeId, "element", tag);
   if (tag === "textarea") native.attribute(node.nodeId, "multiline", true);
   if (tag === "input" && type !== "text") native.attribute(node.nodeId, "type", type);
-  if (node instanceof Input || FOCUSABLE_TAGS.has(tag)) {
-    if (!(node instanceof Input)) native.attribute(node.nodeId, "tabIndex", 0);
+  if (node instanceof Input) {
+    syncValidationState(node);
+  } else if (FOCUSABLE_TAGS.has(tag)) {
+    native.attribute(node.nodeId, "tabIndex", 0);
     node._keep("focus", "blur");
   }
-  if (tag === "label") node._activate = labelActivate;
-  else if (tag === "summary") node._activate = summaryActivate;
-  else if (tag === "button") node._activate = buttonActivate;
-  if (node._activate) node._relisten();
+  if (tag === "summary") {
+    node._activate = summaryActivate;
+    node._relisten();
+  }
   return node;
 }
 
@@ -3735,7 +6157,7 @@ export function parseHTML(html, parent) {
       const node = createElement(tag);
       for (const [name, value] of attributes) node.setAttribute(name, value);
       const value = tag === "textarea" || tag === "title" ? decodeEntities(content) : content;
-      if (tag === "textarea") node.value = value;
+      if (tag === "textarea") node.defaultValue = value;
       else if (value) node.appendChild(createText(value));
       top().appendChild(node);
       continue;
@@ -3780,8 +6202,7 @@ export function parseHTML(html, parent) {
     const type = attributes.find(([name]) => name.toLowerCase() === "type")?.[1];
     const node = svg ? createSvgElement(tag) : createElement(tag, { type });
     for (const [name, value] of attributes) {
-      if (!svg && name.toLowerCase() === "value" && node instanceof Input) node.value = value;
-      else node.setAttribute(svg ? name : name.toLowerCase(), value);
+      node.setAttribute(svg ? name : name.toLowerCase(), value);
     }
     if (svg) top().appendChild(node);
     else insert(node);
@@ -5196,12 +7617,17 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (kind === FOCUS) {
     focusEvent("focusin", target, blurredNode);
     blurredNode = null;
+    target._handleFocus?.();
   }
-  else if (kind === BLUR) blurring(target);
+  else if (kind === BLUR) {
+    blurring(target);
+    target._handleBlur?.();
+  }
+  if (kind === 0 && openSelectPopup && !isInsideSelectPopup(target)) closeSelectPopup();
   if (kind === CLICK && !prevented && !activate(target)) follow(target);
-  if (!prevented && target instanceof RangeInput) {
-    if (kind === 0 || kind === 1 || kind === 3 || kind === 14) target._handlePointer(kind, event);
-    else if (kind === 7) target._handleKey(event);
+  if (!prevented) {
+    if ((kind === 0 || kind === 1 || kind === 3 || kind === 14) && target._handlePointer) target._handlePointer(kind, event);
+    else if (kind === 7 && target._handleKey) target._handleKey(event);
   }
   if (kind !== CLICK && isPointerKind(kind)) {
     // A prevented mousedown keeps focus and the selection where they are, as on the web.

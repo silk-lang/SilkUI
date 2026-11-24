@@ -1200,89 +1200,103 @@ fn hashBytes(data: &[u8]) -> u64 {
 // Entry point called from `UiTree.paintFrame` / `UiTree.paintSubtree`
 // ============================================================================
 
-/// Resolves page CSS rules onto every live SVG and markup SVG icon node in the current root.
-/// Skips unchanged SVGs using `UiTree.svgStyleRevision` and `LiveSvg.styleDirty`.
+/// Resolves page CSS rules onto every visible live SVG and markup SVG icon node in the current root.
+/// Skips unchanged and unrendered (`display: none`) SVGs using `UiTree.svgStylesPending`,
+/// `UiTree.svgStyleRevision`, `StyledIconMarkup.revision`, and `LiveSvg.styleDirty`.
 pub effect fn sync(tree: &mut UiTree<'_>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !tree.svgStylesPending { return () }
   let at = style_sheets.index(tree.styleSheets.asSlice(), tree.current)
-  if at == usize.MAX { return () }
-  if tree.styleSheets.asSlice()[at].sheets.length() == 0 && !tree.styleSheets.asSlice()[at].inlineVariables {
+  if at == usize.MAX {
+    tree.svgStylesPending = false
     return ()
   }
+  if tree.styleSheets.asSlice()[at].sheets.length() == 0 && !tree.styleSheets.asSlice()[at].inlineVariables {
+    tree.svgStylesPending = false
+    return ()
+  }
+  tree.svgStylesPending = false
   let rev = tree.svgStyleRevision
   let count = tree.nodes.length()
-  // Quick check: does any live Icon node need work?
-  let mut anyLiveWork = false
-  let mut anyMarkupIcon = false
+  // Quick check: does any rendered live Icon node actually need work?
+  let mut anyWork = false
   let mut slot: usize = 0
   while slot < count {
     let n = &tree.nodes.asSlice()[slot]
-    if n.live && n.kind == NodeKind.Icon {
+    if n.live && n.rendered && n.kind == NodeKind.Icon {
       if let Option<&LiveSvg>.Some { value: svg } = n.svg.get() {
-        if svg.styleDirty || svg.styleRevision != rev { anyLiveWork = true }
-      } else if n.resource != 0 {
-        anyMarkupIcon = true
+        if svg.styleDirty || svg.styleRevision != rev {
+          anyWork = true
+          break
+        }
+      } else if n.resource != 0 && tree.resources.styledIconRevision(usize.toU32(slot), n.resource) != rev {
+        anyWork = true
+        break
       }
     }
     slot = slot + 1
   }
-  let oldStyled = Intrinsic.replace(tree.resources.styledIcons, List<StyledIconMarkup>.make())
-  if !anyLiveWork && !anyMarkupIcon && oldStyled.length() == 0 {
+  if !anyWork {
     return ()
   }
+  let oldStyled = Intrinsic.replace(tree.resources.styledIcons, List<StyledIconMarkup>.make())
   let mut roots = Intrinsic.replace(tree.styleSheets, List<RootSheets>.make())
   let mut nextStyled = List<StyledIconMarkup>.make()
+  let mut oldCursor: usize = 0
   slot = 0
   while slot < count {
-    let live = tree.nodes.asSlice()[slot].live && tree.nodes.asSlice()[slot].kind == NodeKind.Icon
-    if !live {
+    let isIcon = tree.nodes.asSlice()[slot].live && tree.nodes.asSlice()[slot].kind == NodeKind.Icon
+    if !isIcon {
       slot = slot + 1
       continue
     }
+    let rendered = tree.nodes.asSlice()[slot].rendered
     let hasLiveSvg = tree.nodes.asSlice()[slot].svg.isSome()
     if hasLiveSvg {
-      let needs = match tree.nodes.asSlice()[slot].svg.get() {
-        Option<&LiveSvg>.Some { value: svg } => svg.styleDirty || svg.styleRevision != rev
-        _ => false
-      }
-      if needs {
-        let entries = roots.asMutSlice()
-        let resolved = match tree.nodes.asSlice()[slot].svg.get() {
-          Option<&LiveSvg>.Some { value: svg } => run Effect.result(
-            resolveLiveSvg(&mut entries[at].sheets, entries[at].systemColors, &tree.*, usize.toU32(slot), svg),
-          )
-          _ => Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: List<LiveResult>.make() }
+      if rendered {
+        let needs = match tree.nodes.asSlice()[slot].svg.get() {
+          Option<&LiveSvg>.Some { value: svg } => svg.styleDirty || svg.styleRevision != rev
+          _ => false
         }
-        match move resolved {
-          Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: items } => {
-            let mut list = move items
-            let mut changed = false
-            let svgMut = tree.nodeMut(usize.toU32(slot)).svg.expectMut()
-            let mut ri: usize = 0
-            while ri < list.length() {
-              let item = Intrinsic.replace(
-                list.asMutSlice()[ri],
-                LiveResult { element: NO_SVG_ELEMENT, props: Props.make(), transform: Option<Affine>.None },
-              )
-              if svgMut.setSheetResult(item.element, move item.props, item.transform) {
-                changed = true
-              }
-              ri = ri + 1
-            }
-            svgMut.styleDirty = false
-            svgMut.styleRevision = rev
-            if changed {
-              let target = tree.nodeMut(usize.toU32(slot))
-              target.paintHash = Hash.combine(target.paintHash, 0x53564753)
-              run tree.repair.nodes.append(usize.toU32(slot))
-              tree.repair.pending = true
-            }
+        if needs {
+          let entries = roots.asMutSlice()
+          let resolved = match tree.nodes.asSlice()[slot].svg.get() {
+            Option<&LiveSvg>.Some { value: svg } => run Effect.result(
+              resolveLiveSvg(&mut entries[at].sheets, entries[at].systemColors, &tree.*, usize.toU32(slot), svg),
+            )
+            _ => Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: List<LiveResult>.make() }
           }
-          Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error } => {
-            tree.styleSheets = move roots
-            tree.resources.styledIcons = move nextStyled
-            match move error {
-              OutOfMemoryError oom => { fail move oom }
-              _ => { return () }
+          match move resolved {
+            Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: items } => {
+              let mut list = move items
+              let mut changed = false
+              let svgMut = tree.nodeMut(usize.toU32(slot)).svg.expectMut()
+              let mut ri: usize = 0
+              while ri < list.length() {
+                let item = Intrinsic.replace(
+                  list.asMutSlice()[ri],
+                  LiveResult { element: NO_SVG_ELEMENT, props: Props.make(), transform: Option<Affine>.None },
+                )
+                if svgMut.setSheetResult(item.element, move item.props, item.transform) {
+                  changed = true
+                }
+                ri = ri + 1
+              }
+              svgMut.styleDirty = false
+              svgMut.styleRevision = rev
+              if changed {
+                let target = tree.nodeMut(usize.toU32(slot))
+                target.paintHash = Hash.combine(target.paintHash, 0x53564753)
+                run tree.repair.nodes.append(usize.toU32(slot))
+                tree.repair.pending = true
+              }
+            }
+            Result<List<LiveResult>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Failure { error } => {
+              tree.styleSheets = move roots
+              tree.resources.styledIcons = move nextStyled
+              match move error {
+                OutOfMemoryError oom => { fail move oom }
+                _ => { return () }
+              }
             }
           }
         }
@@ -1290,19 +1304,39 @@ pub effect fn sync(tree: &mut UiTree<'_>) -> () ! OutOfMemoryError ? &mut Alloca
     } else {
       let resource = tree.nodes.asSlice()[slot].resource
       if resource != 0 {
-        // Reuse cached entry when resource and style revision match.
+        let slotU32 = usize.toU32(slot)
+        // Advance monotonic cursor in `oldStyled` (entries are in ascending slot order).
+        while oldCursor < oldStyled.length() && oldStyled.asSlice()[oldCursor].slot < slotU32 {
+          oldCursor = oldCursor + 1
+        }
         let mut cachedIndex = usize.MAX
-        let mut oi: usize = 0
-        while oi < oldStyled.length() {
-          let entry = &oldStyled.asSlice()[oi]
-          if entry.slot == usize.toU32(slot) && entry.resource == resource {
-            cachedIndex = oi
-            break
+        if oldCursor < oldStyled.length() {
+          let entry = &oldStyled.asSlice()[oldCursor]
+          if entry.slot == slotU32 && entry.resource == resource {
+            cachedIndex = oldCursor
           }
-          oi = oi + 1
         }
         let currentHash = tree.nodes.asSlice()[slot].paintHash
         let mut base = currentHash
+        // Unrendered icons keep their cached entry (if any) without resolving until visible.
+        if !rendered {
+          if cachedIndex != usize.MAX {
+            let prev = &oldStyled.asSlice()[cachedIndex]
+            let mut keptMarkup = List<u8>.make()
+            run keptMarkup.appendSlice(prev.markup.asSlice())
+            run nextStyled.append(StyledIconMarkup {
+              slot: slotU32,
+              resource: resource,
+              revision: prev.revision,
+              key: prev.key,
+              markup: move keptMarkup,
+              base: prev.base,
+              mixed: prev.mixed,
+            })
+          }
+          slot = slot + 1
+          continue
+        }
         if cachedIndex != usize.MAX {
           let prev = &oldStyled.asSlice()[cachedIndex]
           if prev.mixed == currentHash { base = prev.base }
@@ -1311,13 +1345,13 @@ pub effect fn sync(tree: &mut UiTree<'_>) -> () ! OutOfMemoryError ? &mut Alloca
             run keptMarkup.appendSlice(prev.markup.asSlice())
             let mixed = if keptMarkup.length() == 0 { base } else { Hash.combine(base, prev.key) }
             if mixed != currentHash {
-              let target = tree.nodeMut(usize.toU32(slot))
+              let target = tree.nodeMut(slotU32)
               target.paintHash = mixed
-              run tree.repair.nodes.append(usize.toU32(slot))
+              run tree.repair.nodes.append(slotU32)
               tree.repair.pending = true
             }
             run nextStyled.append(StyledIconMarkup {
-              slot: usize.toU32(slot),
+              slot: slotU32,
               resource: resource,
               revision: rev,
               key: prev.key,
@@ -1333,20 +1367,20 @@ pub effect fn sync(tree: &mut UiTree<'_>) -> () ! OutOfMemoryError ? &mut Alloca
         if raw.length != 0 {
           let entries = roots.asMutSlice()
           let resolved = run Effect.result(
-            resolveMarkupSvg(&mut entries[at].sheets, entries[at].systemColors, &tree.*, usize.toU32(slot), raw),
+            resolveMarkupSvg(&mut entries[at].sheets, entries[at].systemColors, &tree.*, slotU32, raw),
           )
           match move resolved {
             Result<List<u8>, ResolverError | RegistrationError | CssError | OutOfMemoryError>.Success { value: styled } => {
               let key = if styled.length() == 0 { 0 } else { hashBytes(styled.asSlice()) }
               let mixed = if styled.length() == 0 { base } else { Hash.combine(base, key) }
               if mixed != currentHash {
-                let target = tree.nodeMut(usize.toU32(slot))
+                let target = tree.nodeMut(slotU32)
                 target.paintHash = mixed
-                run tree.repair.nodes.append(usize.toU32(slot))
+                run tree.repair.nodes.append(slotU32)
                 tree.repair.pending = true
               }
               run nextStyled.append(StyledIconMarkup {
-                slot: usize.toU32(slot),
+                slot: slotU32,
                 resource: resource,
                 revision: rev,
                 key: key,

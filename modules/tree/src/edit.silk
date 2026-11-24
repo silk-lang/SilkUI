@@ -141,6 +141,11 @@ pub struct EditState {
   pub preeditEnd: usize,
   pub multiline: bool,
   pub readOnly: bool,
+  pub masked: bool,
+  /// When `masked` is true (`<input type="password">`), the UTF-8 byte offset of each
+  /// code point in `node.text` (plus the total byte length at the end), so display byte
+  /// offsets (3 bytes per `•` bullet) map accurately to value byte offsets.
+  pub maskBytes: List<usize>,
   pub placeholder: String,
   /// What css-layout lays out, and whether it is the placeholder or ends with a filler.
   pub display: String,
@@ -193,6 +198,8 @@ impl EditState {
       preeditEnd: 0,
       multiline: false,
       readOnly: false,
+      masked: false,
+      maskBytes: List<usize>.make(),
       placeholder: String.make(),
       display: String.make(),
       showsPlaceholder: false,
@@ -276,6 +283,14 @@ impl EditState {
     if self.showsPlaceholder {
       return 0
     }
+    if self.masked && !self.composing {
+      let map = self.maskBytes.asSlice()
+      let mut i: usize = 0
+      while i < map.length && map[i] < v {
+        i = i + 1
+      }
+      return i * 3
+    }
     if self.composing && v > self.preeditAt {
       return v + String.byteLength(String.view(&self.preedit))
     }
@@ -287,6 +302,15 @@ impl EditState {
   pub fn toValue(self: &Self, d: usize, length: usize) -> usize {
     if self.showsPlaceholder {
       return 0
+    }
+    if self.masked && !self.composing {
+      let map = self.maskBytes.asSlice()
+      if map.length == 0 {
+        return 0
+      }
+      let idx = (d + 1) / 3
+      let clamped = minimum(idx, map.length - 1)
+      return minimum(map[clamped], length)
     }
     let mut v = d
     if self.composing {
@@ -387,9 +411,38 @@ effect fn ignoreTree(error: TreeError) -> () {
 
 // Display text.
 
+fn isPasswordInput(tree: &UiTree<'_>, slot: u32) -> bool {
+  let node = tree.node(slot)
+  if let Option.Some { value: id } = node.identity() {
+    let attrs = id.attributes()
+    let mut i: usize = 0
+    while i < attrs.length {
+      if String.view(&attrs[i].name) == "type" {
+        let v = String.utf8Bytes(String.view(&attrs[i].value))
+        if v.length == 8 {
+          // ASCII case-insensitive match for "password"
+          let mut ok = true
+          let want = b"password"
+          let mut k: usize = 0
+          while k < 8 {
+            let mut c = v[k]
+            if c >= 65 && c <= 90 { c = c + 32 }
+            if c != want[k] { ok = false break }
+            k = k + 1
+          }
+          if ok { return true }
+        }
+        return false
+      }
+      i = i + 1
+    }
+  }
+  return false
+}
+
 /// Writes the value of `slot` with its composition, or its placeholder, to `out`. Returns
 /// whether it wrote the placeholder.
-effect fn displayText(tree: &UiTree<'_>, slot: u32, out: &mut String) -> bool
+effect fn displayText(tree: &UiTree<'_>, slot: u32, masked: bool, out: &mut String, maskBytes: &mut List<usize>) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   let node = tree.node(slot)
@@ -407,6 +460,20 @@ effect fn displayText(tree: &UiTree<'_>, slot: u32, out: &mut String) -> bool
     run out.append(String.view(&e.placeholder))
     return true
   }
+  if masked {
+    let bytes = String.utf8Bytes(value)
+    let mut i: usize = 0
+    while i < bytes.length {
+      // UTF-8 leading byte (not 10xxxxxx continuation byte) starts a code point.
+      if (bytes[i] & 0xC0) != 0x80 {
+        run maskBytes.append(i)
+        run out.append("\u{2022}")
+      }
+      i = i + 1
+    }
+    run maskBytes.append(bytes.length)
+    return false
+  }
   run out.append(value)
   return false
 }
@@ -416,8 +483,10 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
   let mut display = String.make()
+  let mut maskBytes = List<usize>.make()
+  let masked = isPasswordInput(&tree.*, slot)
   let wasPlaceholder = tree.node(slot).edit().showsPlaceholder
-  let showing = run displayText(&tree.*, slot, &mut display)
+  let showing = run displayText(&tree.*, slot, masked, &mut display, &mut maskBytes)
   let multiline = state(&tree.*, slot).multiline
   let text = String.view(&display)
   let filler = !showing
@@ -425,7 +494,7 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   if filler {
     run display.append(FILLER)
   }
-  let rich = state(&tree.*, slot).rich && !showing
+  let rich = state(&tree.*, slot).rich && !showing && !masked
   let copy = if rich {
     String.make()
   } else {
@@ -434,6 +503,8 @@ pub effect fn syncDisplay(tree: &mut UiTree<'_>, slot: u32) -> ()
   let inner = tree.node(slot).inner
   let e = stateMut(&mut tree, slot)
   e.display = move display
+  e.masked = masked
+  e.maskBytes = move maskBytes
   e.showsPlaceholder = showing
   e.filler = filler
   run Effect.catch<InvalidNode>(
@@ -1598,6 +1669,9 @@ effect fn plainText(tree: &UiTree<'_>, slot: u32, lo: usize, hi: usize) -> Strin
 pub effect fn copySelection(tree: &mut UiTree<'_>, slot: u32) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
+  if state(&tree.*, slot).masked {
+    return false
+  }
   let lo = state(&tree.*, slot).low()
   let hi = state(&tree.*, slot).high()
   if lo == hi {
