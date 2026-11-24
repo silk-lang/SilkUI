@@ -54,6 +54,7 @@ import ui_protocol.options { RootOptions }
 import ui_protocol.root { RootEvent, RootEventKind, RootSupport, ExtraRoot }
 import mutation {
   Mutation,
+  CanvasCommand,
   NO_SURFACE,
   FIRST_ROOT,
   FACE_ITALIC,
@@ -228,7 +229,7 @@ import silk.num.usize
 import silk.text.string { String }
 import silk.trace { Trace as Prof }
 import canvas2d { Canvas2d, Measured as TextMeasured }
-import canvas_raster { CanvasRasters, Frame as RasterFrame, Live as RasterLive }
+import canvas_raster { CanvasRasters, Frame as RasterFrame, Job as RasterJob, Live as RasterLive }
 import canvas_raster
 
 /// An open root other than the current one: its share of the tree's state, kept while the
@@ -10455,6 +10456,57 @@ impl<'a> UiTree<'a> {
     run self.canvas2d.draw(&mut self.provider.text, commands)
   }
 
+  /// Whether canvas node `node` is still at `content`, still large enough to rasterize, and has
+  /// neither shown nor refused `key`.
+  pub fn acceptsRaster(self: &Self, node: u32, content: u64, key: u64) -> bool {
+    let slot = self.slotOf(node)
+    if slot == NONE { return false }
+    let item = self.node(slot)
+    if item.kind != NodeKind.Canvas { return false }
+    if item.content != content { return false }
+    if item.canvas().length < canvas_raster.MIN_COMMANDS { return false }
+    let raster = item.raster()
+    return raster.key != key && raster.refused != key
+  }
+
+  /// Validates `want`, computes its bitmap bounds, and copies its commands onto the process heap
+  /// into an owned [`canvas_raster.Job`] for background rasterization. Refuses empty or oversized
+  /// bitmaps (`canvas_raster.MAX_SIDE`) and returns `None` when `want` is stale or refused.
+  pub effect fn prepareRasterJob(self: &mut Self, want: canvas_raster.Want) -> Option<RasterJob>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if !self.acceptsRaster(want.node, want.content, want.key) {
+      return Option<RasterJob>.None
+    }
+    let slot = self.slotOf(want.node)
+    let ink = canvas_raster.ink(self.node(slot).canvas(), want.scale, want.fx, want.fy)
+    let width = ink.xMax - ink.xMin
+    let height = ink.yMax - ink.yMin
+    if width <= 0.0 || height <= 0.0 || width > canvas_raster.MAX_SIDE || height > canvas_raster.MAX_SIDE {
+      let extras = run self.nodeMut(slot).extrasMut()
+      extras.raster.refused = want.key
+      return Option<RasterJob>.None
+    }
+    let mut heap = Allocator.systemAllocatorProvider()
+    let mut commands = List<CanvasCommand>.make()
+    run commands.appendSlice(self.node(slot).canvas()) |> Effect.provideMut<Allocator>(&mut heap)
+    return Option<RasterJob>.some(
+      RasterJob {
+        node: want.node,
+        key: want.key,
+        content: want.content,
+        scale: want.scale,
+        dx: want.fx - ink.xMin,
+        dy: want.fy - ink.yMin,
+        x: f32.toI32(ink.xMin),
+        y: f32.toI32(ink.yMin),
+        width: f32.toU32(width),
+        height: f32.toU32(height),
+        commands: move commands,
+      },
+    )
+  }
+
   /// Draws the bitmaps paint asked for since the last call whose canvas did not change since
   /// (see [`canvas_raster`]), into `canvasRasters.frames` for the window to present. A canvas
   /// whose bitmap would be too large is refused: paint keeps drawing its commands.
@@ -10477,11 +10529,9 @@ impl<'a> UiTree<'a> {
         seen = all[k].node == want.node && all[k].key == want.key
         k = k + 1
       }
+      if seen || !self.acceptsRaster(want.node, want.content, want.key) { continue }
       let slot = self.slotOf(want.node)
-      if seen || slot == NONE { continue }
-      let node = self.node(slot)
-      if node.kind != NodeKind.Canvas || node.content != want.content || node.raster().key == want.key { continue }
-      let ink = canvas_raster.ink(node.canvas(), want.scale, want.fx, want.fy)
+      let ink = canvas_raster.ink(self.node(slot).canvas(), want.scale, want.fx, want.fy)
       let width = ink.xMax - ink.xMin
       let height = ink.yMax - ink.yMin
       if width <= 0.0 || height <= 0.0 || width > canvas_raster.MAX_SIDE || height > canvas_raster.MAX_SIDE {
@@ -10498,7 +10548,14 @@ impl<'a> UiTree<'a> {
         f32.toU32(height),
       )
       run self.canvasRasters.frames.append(
-        RasterFrame { node: want.node, key: want.key, x: f32.toI32(ink.xMin), y: f32.toI32(ink.yMin), pixels: move pixels },
+        RasterFrame {
+          node: want.node,
+          key: want.key,
+          content: want.content,
+          x: f32.toI32(ink.xMin),
+          y: f32.toI32(ink.yMin),
+          pixels: move pixels,
+        },
       )
     }
     drop wants
