@@ -1105,7 +1105,7 @@ export class Node {
     const text = this._tag !== undefined ? this.getAttribute("tabindex") : this._tabIndex;
     const number = text == null ? NaN : parseInt(String(text), 10);
     if (!Number.isNaN(number)) return number;
-    const focusable = this instanceof Input || this instanceof CheckInput || FOCUSABLE_TAGS.has(this._tag)
+    const focusable = this instanceof Input || this instanceof CheckInput || this instanceof RangeInput || FOCUSABLE_TAGS.has(this._tag)
       || (this._tag === "a" && this.hasAttribute("href"));
     return focusable ? 0 : -1;
   }
@@ -1697,9 +1697,15 @@ function dropAddress(url) {
  */
 export class Image extends Node {
   #src = "";
+  #settled = 0;
+  #naturalWidth = 0;
+  #naturalHeight = 0;
+  #decodeWaiters = [];
 
   constructor(src = "") {
     super("image");
+    this._keep("load", "error");
+    this._relisten();
     this.src = src;
   }
 
@@ -1712,12 +1718,146 @@ export class Image extends Node {
     if (url === this.#src) return;
     if (this.#src) dropAddress(this.#src);
     this.#src = url;
+    this.#settled = 0;
+    this.#naturalWidth = 0;
+    this.#naturalHeight = 0;
+    if (!url && this.#decodeWaiters.length) this._settleDecode(false);
     native.source(this.nodeId, url ? holdAddress(url) : 0);
+  }
+
+  get currentSrc() {
+    return this.#src;
+  }
+
+  #syncInfo() {
+    if (!this.#src) return { state: 0, width: 0, height: 0 };
+    if (this.#settled !== 0) {
+      return { state: this.#settled, width: this.#naturalWidth, height: this.#naturalHeight };
+    }
+    if (native.imageInfo?.(this.nodeId) === 3) {
+      const state = native.geometry(0) | 0;
+      const width = Math.round(native.geometry(1));
+      const height = Math.round(native.geometry(2));
+      if (state !== 0) {
+        this.#settled = state;
+        this.#naturalWidth = width;
+        this.#naturalHeight = height;
+        this._settleDecode(state === 1);
+      }
+      return { state, width, height };
+    }
+    return { state: 0, width: 0, height: 0 };
+  }
+
+  get naturalWidth() {
+    return this.#syncInfo().width;
+  }
+
+  get naturalHeight() {
+    return this.#syncInfo().height;
+  }
+
+  get complete() {
+    if (!this.#src) return true;
+    return this.#syncInfo().state !== 0;
+  }
+
+  get width() {
+    const attr = this.getAttribute("width");
+    if (attr != null) {
+      const n = parseInt(attr, 10);
+      if (!Number.isNaN(n) && n >= 0) return n;
+    }
+    return this.naturalWidth;
+  }
+
+  set width(value) {
+    const n = Math.max(0, Number(value) | 0);
+    this.setAttribute("width", String(n));
+  }
+
+  get height() {
+    const attr = this.getAttribute("height");
+    if (attr != null) {
+      const n = parseInt(attr, 10);
+      if (!Number.isNaN(n) && n >= 0) return n;
+    }
+    return this.naturalHeight;
+  }
+
+  set height(value) {
+    const n = Math.max(0, Number(value) | 0);
+    this.setAttribute("height", String(n));
+  }
+
+  decode() {
+    if (!this.#src) {
+      const ErrorClass = globalThis.DOMException ?? Error;
+      return Promise.reject(new ErrorClass("The image has no source.", "EncodingError"));
+    }
+    const info = this.#syncInfo();
+    if (info.state === 1) return Promise.resolve();
+    if (info.state === 2) {
+      const ErrorClass = globalThis.DOMException ?? Error;
+      return Promise.reject(new ErrorClass("The source image cannot be decoded.", "EncodingError"));
+    }
+    return new Promise((resolve, reject) => {
+      this.#decodeWaiters.push({ resolve, reject });
+    });
+  }
+
+  _onSourceEvent(ok) {
+    if (!this.#src) return;
+    if (ok && native.imageInfo?.(this.nodeId) === 3) {
+      this.#settled = 1;
+      this.#naturalWidth = Math.round(native.geometry(1));
+      this.#naturalHeight = Math.round(native.geometry(2));
+    } else {
+      this.#settled = ok ? 1 : 2;
+      if (!ok) {
+        this.#naturalWidth = 0;
+        this.#naturalHeight = 0;
+      }
+    }
+    this._settleDecode(ok);
+  }
+
+  _settleDecode(ok) {
+    if (!this.#decodeWaiters.length) return;
+    const waiters = this.#decodeWaiters.splice(0, this.#decodeWaiters.length);
+    if (ok) {
+      for (const waiter of waiters) waiter.resolve();
+    } else {
+      const ErrorClass = globalThis.DOMException ?? Error;
+      const err = new ErrorClass("The source image cannot be decoded.", "EncodingError");
+      for (const waiter of waiters) waiter.reject(err);
+    }
+  }
+
+  _readPixels() {
+    if (!this.#src || native.imagePixels?.(this.nodeId) !== 2) return null;
+    const width = native.geometry(0) | 0;
+    const height = native.geometry(1) | 0;
+    if (width <= 0 || height <= 0) return null;
+    const data = new Uint8ClampedArray(width * height * 4);
+    native.imageTake(data);
+    return { width, height, data };
+  }
+
+  setAttribute(name, value) {
+    if (name === "src") {
+      this.src = value == null ? "" : String(value);
+    }
+    super.setAttribute(name, value);
   }
 
   _forget() {
     if (this.#src) dropAddress(this.#src);
     this.#src = "";
+    this.#settled = 0;
+    this.#naturalWidth = 0;
+    this.#naturalHeight = 0;
+    if (this.#decodeWaiters.length) this._settleDecode(false);
   }
 
   _shallowClone() {
@@ -1777,6 +1917,36 @@ export class Canvas extends Node {
     if (!api) return null;
     this.#kind = kind;
     return (this.#context = api.context(this, options));
+  }
+
+  #encodePng() {
+    const w = this.#width | 0;
+    const h = this.#height | 0;
+    if (w <= 0 || h <= 0 || !native.pngEncode || !native.pngTake) return null;
+    const data = this.#kind === "2d" && this.#context?.getImageData
+      ? this.#context.getImageData(0, 0, w, h).data
+      : new Uint8ClampedArray(w * h * 4);
+    const len = native.pngEncode(w, h, data);
+    if (!len || len <= 0) return null;
+    const bytes = new Uint8Array(len);
+    native.pngTake(bytes);
+    return bytes;
+  }
+
+  toBlob(callback, _type = "image/png", _quality) {
+    if (typeof callback !== "function") throw new TypeError("Canvas.toBlob requires a callback");
+    const bytes = this.#encodePng();
+    const BlobClass = globalThis.Blob;
+    const blob = bytes && BlobClass ? new BlobClass([bytes], { type: "image/png" }) : null;
+    queueMicrotask(() => callback(blob));
+  }
+
+  toDataURL(_type = "image/png", _quality) {
+    const bytes = this.#encodePng();
+    if (!bytes) return "data:,";
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return "data:image/png;base64," + globalThis.btoa(binary);
   }
 
   setAttribute(name, value) {
@@ -2931,6 +3101,259 @@ export class CheckInput extends Node {
   }
 }
 
+/**
+ * `<input type="range">`: a slider control whose track, progress fill and thumb are painted
+ * natively using `accent-color` unless `appearance: none` is set. Supports pointer dragging
+ * and keyboard stepping, firing `input` while moving and `change` on commit.
+ */
+export class RangeInput extends Node {
+  #min = 0;
+  #max = 100;
+  #step = "1";
+  #value = 50;
+  #hasValue = false;
+  #dragging = false;
+  #dragPointerId = -1;
+  #dragStartValue = 50;
+
+  constructor() {
+    super("box");
+    this._tag = "input";
+    this.type = "range";
+    this.defaultValue = "";
+    native.attribute(this.nodeId, "element", "input");
+    native.attribute(this.nodeId, "type", "range");
+    native.attribute(this.nodeId, "role", "slider");
+    native.attribute(this.nodeId, "tabIndex", 0);
+    this._keep("focus", "blur", "pointerdown", "pointermove", "pointerup", "pointercancel", "keydown");
+    this._relisten();
+    this.#syncRange();
+  }
+
+  _shallowClone() {
+    const copy = new RangeInput();
+    copy.min = this.min;
+    copy.max = this.max;
+    copy.step = this.step;
+    if (this.#hasValue) copy.value = this.value;
+    return copy;
+  }
+
+  #effectiveMin() {
+    return Number.isFinite(this.#min) ? this.#min : 0;
+  }
+
+  #effectiveMax() {
+    const min = this.#effectiveMin();
+    const max = Number.isFinite(this.#max) ? this.#max : 100;
+    return max < min ? min : max;
+  }
+
+  #stepNumber() {
+    if (typeof this.#step === "string" && this.#step.trim().toLowerCase() === "any") return 0;
+    const n = Number(this.#step);
+    return Number.isFinite(n) && n > 0 ? n : 1;
+  }
+
+  #snap(raw) {
+    const min = this.#effectiveMin();
+    const max = this.#effectiveMax();
+    let v = Number.isFinite(raw) ? raw : min + (max - min) * 0.5;
+    if (v < min) v = min;
+    if (v > max) v = max;
+    const step = this.#stepNumber();
+    if (step > 0 && max > min) {
+      const steps = Math.round((v - min) / step);
+      v = min + steps * step;
+      if (v > max) v = min + Math.floor((max - min) / step) * step;
+      if (v < min) v = min;
+      // Avoid IEEE-754 trailing dust like 1.2000000000000002.
+      v = Number(v.toPrecision(12));
+    }
+    return v;
+  }
+
+  #syncRange() {
+    const min = this.#effectiveMin();
+    const max = this.#effectiveMax();
+    const val = this.#snap(this.#hasValue ? this.#value : min + (max - min) * 0.5);
+    this.#value = val;
+    native.attribute(this.nodeId, "valueRange", min, max, val);
+  }
+
+  get min() {
+    return this.getAttribute("min") ?? "";
+  }
+
+  set min(value) {
+    const text = value == null ? "" : String(value);
+    const n = text.trim() === "" ? 0 : Number(text);
+    this.#min = Number.isFinite(n) ? n : 0;
+    super.setAttribute("min", text === "" ? null : text);
+    this.#syncRange();
+  }
+
+  get max() {
+    return this.getAttribute("max") ?? "";
+  }
+
+  set max(value) {
+    const text = value == null ? "" : String(value);
+    const n = text.trim() === "" ? 100 : Number(text);
+    this.#max = Number.isFinite(n) ? n : 100;
+    super.setAttribute("max", text === "" ? null : text);
+    this.#syncRange();
+  }
+
+  get step() {
+    return this.getAttribute("step") ?? "";
+  }
+
+  set step(value) {
+    const text = value == null ? "" : String(value);
+    this.#step = text.trim() === "" ? "1" : text;
+    super.setAttribute("step", text === "" ? null : text);
+    this.#syncRange();
+  }
+
+  get value() {
+    return String(this.#value);
+  }
+
+  set value(val) {
+    const n = Number(val);
+    this.#hasValue = true;
+    this.#value = this.#snap(Number.isFinite(n) ? n : this.#effectiveMin() + (this.#effectiveMax() - this.#effectiveMin()) * 0.5);
+    this.#syncRange();
+  }
+
+  get valueAsNumber() {
+    return this.#value;
+  }
+
+  set valueAsNumber(val) {
+    this.value = val;
+  }
+
+  get name() {
+    return this.getAttribute("name") ?? "";
+  }
+
+  setAttribute(name, value) {
+    if (name === "min") {
+      const text = value == null ? "" : String(value);
+      const n = text.trim() === "" ? 0 : Number(text);
+      this.#min = Number.isFinite(n) ? n : 0;
+      super.setAttribute(name, value);
+      this.#syncRange();
+      return;
+    }
+    if (name === "max") {
+      const text = value == null ? "" : String(value);
+      const n = text.trim() === "" ? 100 : Number(text);
+      this.#max = Number.isFinite(n) ? n : 100;
+      super.setAttribute(name, value);
+      this.#syncRange();
+      return;
+    }
+    if (name === "step") {
+      const text = value == null ? "" : String(value);
+      this.#step = text.trim() === "" ? "1" : text;
+      super.setAttribute(name, value);
+      this.#syncRange();
+      return;
+    }
+    if (name === "value") {
+      super.setAttribute(name, value);
+      if (value != null && !this.#hasValue) {
+        this.value = value;
+      }
+      return;
+    }
+    super.setAttribute(name, value);
+  }
+
+  #setFromClientX(clientX) {
+    const rect = this.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return false;
+    const thumbDiameter = Math.min(16, Math.max(10, rect.height || 16));
+    const thumbR = thumbDiameter * 0.5;
+    const travel = Math.max(1, rect.width - thumbDiameter);
+    const ratio = Math.min(1, Math.max(0, (clientX - (rect.left + thumbR)) / travel));
+    const min = this.#effectiveMin();
+    const max = this.#effectiveMax();
+    const next = this.#snap(min + (max - min) * ratio);
+    if (next === this.#value) return false;
+    this.#hasValue = true;
+    this.#value = next;
+    native.attribute(this.nodeId, "valueRange", min, max, next);
+    const input = new Event("input", this);
+    input.bubbles = true;
+    dispatchEvent(input);
+    return true;
+  }
+
+  _handlePointer(kind, event) {
+    if (this.hasAttribute("disabled")) return false;
+    if (kind === 0) {
+      if (event.button !== 0) return false;
+      this.focus();
+      this.#dragging = true;
+      this.#dragPointerId = event.pointerId;
+      this.#dragStartValue = this.#value;
+      this.setPointerCapture(event.pointerId);
+      this.#setFromClientX(event.clientX);
+      return true;
+    }
+    if (kind === 3 && this.#dragging) {
+      this.#setFromClientX(event.clientX);
+      return true;
+    }
+    if ((kind === 1 || kind === 14) && this.#dragging) {
+      this.#dragging = false;
+      if (kind === 1) this.#setFromClientX(event.clientX);
+      try { this.releasePointerCapture(this.#dragPointerId); } catch {}
+      this.#dragPointerId = -1;
+      if (kind === 1 && this.#value !== this.#dragStartValue) {
+        const change = new Event("change", this);
+        change.bubbles = true;
+        dispatchEvent(change);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  _handleKey(event) {
+    if (this.hasAttribute("disabled")) return false;
+    const min = this.#effectiveMin();
+    const max = this.#effectiveMax();
+    const step = this.#stepNumber() || (max - min) / 100 || 1;
+    const big = Math.max(step, (max - min) * 0.1);
+    let next = this.#value;
+    if (event.key === "ArrowRight" || event.key === "ArrowUp") next = this.#value + step;
+    else if (event.key === "ArrowLeft" || event.key === "ArrowDown") next = this.#value - step;
+    else if (event.key === "PageUp") next = this.#value + big;
+    else if (event.key === "PageDown") next = this.#value - big;
+    else if (event.key === "Home") next = min;
+    else if (event.key === "End") next = max;
+    else return false;
+    event.preventDefault();
+    const snapped = this.#snap(next);
+    if (snapped === this.#value) return true;
+    this.#hasValue = true;
+    this.#value = snapped;
+    native.attribute(this.nodeId, "valueRange", min, max, snapped);
+    const input = new Event("input", this);
+    input.bubbles = true;
+    dispatchEvent(input);
+    const change = new Event("change", this);
+    change.bubbles = true;
+    dispatchEvent(change);
+    return true;
+  }
+}
+
 function eachDescendant(node, visit) {
   for (const child of node.childNodes) {
     visit(child);
@@ -2948,7 +3371,7 @@ function labelActivate() {
   const id = this.getAttribute("for");
   let control = id ? findById(id) : null;
   if (!control) eachDescendant(this, (node) => {
-    if (!control && (node instanceof Input || node instanceof CheckInput)) control = node;
+    if (!control && (node instanceof Input || node instanceof CheckInput || node instanceof RangeInput)) control = node;
   });
   if (!control) return false;
   if (control instanceof CheckInput) control._activate();
@@ -3056,7 +3479,7 @@ export class StyleElement extends Node {
 // is not an HTML element.
 function elementLike(node) {
   if (node._tag === undefined) return null;
-  const type = node instanceof CheckInput ? node.type : node instanceof Input ? undefined : node.getAttribute("type") ?? undefined;
+  const type = node instanceof CheckInput || node instanceof RangeInput ? node.type : node instanceof Input ? undefined : node.getAttribute("type") ?? undefined;
   return createElement(node._tag, { type });
 }
 
@@ -3066,6 +3489,7 @@ export function createElement(tag, options) {
   let node;
   if (tag === "svg") return new Svg();
   if (tag === "input" && (type === "checkbox" || type === "radio")) return new CheckInput(type);
+  if (tag === "input" && type === "range") return new RangeInput();
   if (tag === "input" && !BOX_INPUTS.has(type)) node = new Input();
   else if (tag === "textarea") node = new Input();
   else if (tag === "img") node = new Image();
@@ -4755,6 +5179,7 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (kind >= CLOSE_REQUEST) return dispatchRequest(kind, target, a);
   if (kind >= COPY) return dispatchEditing(kind, target, first, second, third);
   if (kind === SELECTION_CHANGE && !(target instanceof Input)) return selectionRecord(target, a);
+  if (target instanceof Image && (kind === LOAD || kind === ERROR)) target._onSourceEvent(kind === LOAD);
   if (kind === FOCUS) focusing(target);
   const event = new Event(TYPES[kind], target);
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
@@ -4774,6 +5199,10 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   }
   else if (kind === BLUR) blurring(target);
   if (kind === CLICK && !prevented && !activate(target)) follow(target);
+  if (!prevented && target instanceof RangeInput) {
+    if (kind === 0 || kind === 1 || kind === 3 || kind === 14) target._handlePointer(kind, event);
+    else if (kind === 7) target._handleKey(event);
+  }
   if (kind !== CLICK && isPointerKind(kind)) {
     // A prevented mousedown keeps focus and the selection where they are, as on the web.
     if (event.pointerType !== "touch") {

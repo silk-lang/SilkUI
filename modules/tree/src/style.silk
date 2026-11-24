@@ -122,6 +122,11 @@ pub struct Computed {
   /// `empty-cells: hide`: an empty cell of a table with separate borders paints no
   /// background or border. It inherits.
   pub emptyCellsHide: bool,
+  /// `accent-color`: native form-control highlight color (inherits).
+  pub accentColor: Rgba<f32>,
+  pub hasAccentColor: bool,
+  /// `appearance: none`: suppresses native form-control painting.
+  pub appearanceNone: bool,
   pub list: ListStyle,
   pub outline: Outline,
   pub columnRule: ColumnRule,
@@ -1440,6 +1445,9 @@ impl Computed {
       zAuto: true,
       nearest: false,
       emptyCellsHide: false,
+      accentColor: Rgba<f32> { r: 0.0, g: 0.459, b: 1.0, a: 1.0 },
+      hasAccentColor: false,
+      appearanceNone: false,
       outline: Outline.initial(),
       columnRule: ColumnRule.initial(),
       scroll: ScrollStyle.initial(),
@@ -2767,29 +2775,47 @@ impl Computed {
         self.layout.textOverflowEllipsis = convert.isKeyword(last, Keyword.Ellipsis)
       }
       CssProperty.AspectRatio => {
-        // `auto`, `<ratio>`, or `auto <ratio>`.
-        match &value.* {
-          Value.Sequence { separator: _, values } => {
-            let items = values.asSlice()
-            if items.length == 2 && convert.isKeyword(&items[0], Keyword.Auto) {
-              match convert.number(&items[1]) {
-                Option.Some { value: found } => {
-                  self.layout.aspectRatio = f32.max(0.0, found)
+        // `auto`, `<ratio>`, `auto <ratio>`, or `<ratio> auto`, where `<ratio>` is `a` or `a / b`.
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.layout.aspectRatio = 0.0
+          self.layout.aspectRatioAuto = true
+        } else if let Option<f32>.Some { value: found } = ratioOf(value) {
+          self.layout.aspectRatio = found
+          self.layout.aspectRatioAuto = false
+        } else if let Value.Sequence { separator, values } = &value.* {
+          let items = values.asSlice()
+          if items.length == 2 {
+            if separator == Separator.Space {
+              if convert.isKeyword(&items[0], Keyword.Auto) {
+                if let Option<f32>.Some { value: found } = ratioOf(&items[1]) {
+                  self.layout.aspectRatio = found
                   self.layout.aspectRatioAuto = true
                 }
-                Option.None => {}
-              }
-            }
-          }
-          _ => {
-            if convert.isKeyword(value, Keyword.Auto) {
-              self.layout.aspectRatioAuto = true
-            } else {
-              match convert.number(value) {
-                Option.Some { value: found } => {
-                  self.layout.aspectRatio = f32.max(0.0, found)
+              } else if convert.isKeyword(&items[1], Keyword.Auto) {
+                if let Option<f32>.Some { value: found } = ratioOf(&items[0]) {
+                  self.layout.aspectRatio = found
+                  self.layout.aspectRatioAuto = true
                 }
-                Option.None => {}
+              }
+            } else if separator == Separator.Slash {
+              // Slashes bind looser than spaces in `lib-css`: `auto 4 / 3` -> `Slash([Space([auto, 4]), 3])`,
+              // `4 / 3 auto` -> `Slash([4, Space([3, auto])])`.
+              if let Value.Sequence { separator: leftSep, values: leftVals } = &items[0] {
+                let left = leftVals.asSlice()
+                if leftSep == Separator.Space && left.length == 2 && convert.isKeyword(&left[0], Keyword.Auto) {
+                  if let Option<f32>.Some { value: found } = slashRatio(&left[1], &items[1]) {
+                    self.layout.aspectRatio = found
+                    self.layout.aspectRatioAuto = true
+                  }
+                }
+              } else if let Value.Sequence { separator: rightSep, values: rightVals } = &items[1] {
+                let right = rightVals.asSlice()
+                if rightSep == Separator.Space && right.length == 2 && convert.isKeyword(&right[1], Keyword.Auto) {
+                  if let Option<f32>.Some { value: found } = slashRatio(&items[0], &right[0]) {
+                    self.layout.aspectRatio = found
+                    self.layout.aspectRatioAuto = true
+                  }
+                }
               }
             }
           }
@@ -3061,6 +3087,22 @@ impl Computed {
           self.text.hasCaretColor = true
         }
       }
+      CssProperty.AccentColor => {
+        if convert.isKeyword(value, Keyword.Auto) {
+          self.hasAccentColor = false
+        } else if setColor(&mut self.accentColor, value) {
+          self.hasAccentColor = true
+        }
+      }
+      CssProperty.Appearance => {
+        match convert.keywordOf(value) {
+          Option.Some { value: word } => {
+            if word == Keyword.None { self.appearanceNone = true }
+            else if word == Keyword.Auto { self.appearanceNone = false }
+          }
+          Option.None => {}
+        }
+      }
       CssProperty.SilkSelectionColor => {
         drop setColor(&mut self.text.selectionColor, value)
       }
@@ -3163,7 +3205,10 @@ impl Computed {
     h = colorHash(h, self.paint.borderColor)
     h = Hash.combine(h, borderStyleIndex(self.paint.borderStyle))
     let emptyBit: u64 = if self.emptyCellsHide { 16 } else { 0 }
-    h = Hash.combine(h, u8.toU64(self.layout.borderHidden) + emptyBit)
+    let appearBit: u64 = if self.appearanceNone { 32 } else { 0 }
+    let accentBit: u64 = if self.hasAccentColor { 64 } else { 0 }
+    h = Hash.combine(h, u8.toU64(self.layout.borderHidden) + emptyBit + appearBit + accentBit)
+    if self.hasAccentColor { h = colorHash(h, self.accentColor) }
     h = floatHash(h, self.paint.radii.topLeft)
     h = floatHash(h, self.paint.radii.topRight)
     h = floatHash(h, self.paint.radii.bottomRight)
@@ -3329,4 +3374,33 @@ fn decorationIndex(value: DecorationLine) -> u64 {
     bits = bits + 4
   }
   return bits
+}
+
+/// Parses a CSS `<ratio>`: a non-negative number (`1.5`), or `a / b` where both are
+/// non-negative numbers. Negative values are invalid and return None.
+fn ratioOf(value: &Value) -> Option<f32> {
+  if let Option<f32>.Some { value: found } = convert.number(value) {
+    if found >= 0.0 {
+      return Option<f32>.some(found)
+    }
+    return Option<f32>.None
+  }
+  if let Value.Sequence { separator, values } = &value.* {
+    let items = values.asSlice()
+    if separator == Separator.Slash && items.length == 2 {
+      return slashRatio(&items[0], &items[1])
+    }
+  }
+  return Option<f32>.None
+}
+
+fn slashRatio(numerator: &Value, denominator: &Value) -> Option<f32> {
+  if let Option<f32>.Some { value: num } = convert.number(numerator) {
+    if let Option<f32>.Some { value: den } = convert.number(denominator) {
+      if num >= 0.0 && den >= 0.0 {
+        return Option<f32>.some(if num == 0.0 || den == 0.0 { 0.0 } else { num / den })
+      }
+    }
+  }
+  return Option<f32>.None
 }

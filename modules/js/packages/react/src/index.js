@@ -24,7 +24,7 @@ import {
   DiscreteEventPriority,
 } from "react-reconciler/constants.js";
 import { createContext, createElement, useLayoutEffect, useRef, useState } from "react";
-import { CheckInput, Input, RichInput, SvgElement, SvgText, createElement as createHtmlElement, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
+import { CheckInput, Input, RangeInput, RichInput, SvgElement, SvgText, createElement as createHtmlElement, createNode, createSvgElement, createText, flushSvg, mount, root as mountedRoot } from "@silkui/core";
 
 const LOOKS = { style: "base", hoverStyle: "hover", activeStyle: "active", focusStyle: "focus", focusVisibleStyle: "focusVisible", startingStyle: "starting" };
 const CONTINUOUS = new Set(["pointermove", "pointerenter", "pointerleave", "wheel", "scroll", "layout", "dragover"]);
@@ -137,6 +137,10 @@ function restoreControlled(node) {
   if (!props) return;
   if (node instanceof CheckInput) {
     if (props.checked !== undefined && !!props.checked !== node.checked) node.checked = props.checked;
+    return;
+  }
+  if (node instanceof RangeInput) {
+    if (props.value !== undefined && String(props.value) !== node.value) node.value = props.value;
     return;
   }
   if (node instanceof RichInput) {
@@ -285,6 +289,17 @@ function applyHtmlProps(node, previous, next) {
       listen(node, "onChange", "change", false, next);
     } else if (previous === EMPTY && next.defaultChecked !== undefined) node.checked = next.defaultChecked;
     if (next.value !== undefined) node.value = String(next.value);
+  } else if (node instanceof RangeInput) {
+    if (next.min !== undefined) node.min = next.min;
+    if (next.max !== undefined) node.max = next.max;
+    if (next.step !== undefined) node.step = next.step;
+    const value = next.value;
+    if (value !== undefined && value !== null) {
+      if (String(value) !== node.value) node.value = value;
+      listen(node, "onChange", "input", false, next);
+    } else if (previous === EMPTY && next.defaultValue !== undefined) {
+      node.value = next.defaultValue;
+    }
   } else if (node instanceof Input) {
     const value = next.value;
     if (value !== undefined && value !== null) {

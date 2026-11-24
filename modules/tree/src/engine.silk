@@ -173,6 +173,7 @@ import node {
 import paint { TextInk, Painter, paintRoots, cacheFragments, foldLiftedRoots, repairFragments, borderBox }
 import stacking { Stacking }
 import resources { Families, Resources, Resource, ResourceError, CSS_IMAGE_BASE, CssImageState, CursorPixels, IconVariables }
+import codec.image { Image as DecodedImage }
 import svg_css.effect_values { Image }
 import repair { Repair, FragileEntry, FRAGILE_SELF, FRAGILE_SUBTREE, MAX_TRACKED_FRAGILE, CarryPlan, VERIFY_ALWAYS, buildIndex, repairIndex, carryList, sortUnique }
 import provider { Provider }
@@ -1943,6 +1944,62 @@ impl<'a> UiTree<'a> {
     return self.sourceStates.asSlice()[at]
   }
 
+  /// `[state, naturalWidth, naturalHeight]` of image/icon node `id`: state 0 = pending,
+  /// 1 = loaded, 2 = failed. Dimensions are unzoomed CSS/natural pixels (0 while pending/failed).
+  pub fn imageInfo(self: &Self, id: u32) -> [f64; 3] {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return [0.0, 0.0, 0.0]
+    }
+    let node = self.node(slot)
+    if !node.live {
+      return [0.0, 0.0, 0.0]
+    }
+    if let Option<&LiveSvg>.Some { value } = node.svg.get() {
+      if value.width > 0.0 && value.height > 0.0 {
+        return [1.0, value.width, value.height]
+      }
+    }
+    let resource = node.resource
+    if resource == 0 {
+      return [0.0, 0.0, 0.0]
+    }
+    let state = self.sourceState(resource)
+    if state != SOURCE_LOADED {
+      return [u8.toF64(state), 0.0, 0.0]
+    }
+    if let Option<Resource>.Some { value } = self.resources.get(resource) {
+      return match value {
+        Resource.Image { width, height, .. } => [1.0, u32.toF64(width), u32.toF64(height)]
+        Resource.Icon { icon } => {
+          let w = self.resources.iconWidth(icon)
+          let h = self.resources.iconHeight(icon)
+          let ratio = self.resources.iconRatio(icon)
+          let nw = if w > 0.0 { w } else if h > 0.0 && ratio > 0.0 { h * ratio } else { 300.0 }
+          let nh = if h > 0.0 { h } else if ratio > 0.0 { nw / ratio } else { 150.0 }
+          [1.0, nw, nh]
+        }
+      }
+    }
+    return [u8.toF64(state), 0.0, 0.0]
+  }
+
+  /// Premultiplied sRGB RGBA8 pixels of image/icon node `id` at its natural size, for Canvas 2D
+  /// `drawImage(HTMLImageElement)` and `createImageBitmap(HTMLImageElement)`.
+  pub effect fn imagePixels(self: &mut Self, id: u32) -> Option<DecodedImage>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let slot = self.slotOf(id)
+    if slot == NONE {
+      return Option<DecodedImage>.None
+    }
+    let resource = if self.node(slot).live { self.node(slot).resource } else { 0 }
+    if resource == 0 {
+      return Option<DecodedImage>.None
+    }
+    return run self.resources.resourcePixels(resource)
+  }
+
   /// Queues the `Load` or `Error` record of node `slot`, if it listens.
   effect fn tellSource(self: &mut Self, slot: u32, ok: bool) -> ()
     ! OutOfMemoryError
@@ -3141,13 +3198,21 @@ impl<'a> UiTree<'a> {
             rare.valueMin = min
             rare.valueMax = max
             rare.valueNow = value
+            node.content = node.content + 1
+            self.paintDirty = true
           }
           Attribute.ClearValueRange => {
             if let Option.Some { value: rare } = node.rare.getMut() { rare.hasValueRange = false }
+            node.content = node.content + 1
+            self.paintDirty = true
           }
 
           Attribute.Role { value } => {
-            node.accessRole = value
+            if node.accessRole != value {
+              node.accessRole = value
+              node.content = node.content + 1
+              self.paintDirty = true
+            }
           }
           Attribute.Label { value } => {
             if value.ownedByteLength() != 0 || node.rare.isSome() {
@@ -3169,7 +3234,11 @@ impl<'a> UiTree<'a> {
             node.cursor = value
           }
           Attribute.Disabled { value } => {
-            node.disabled = value
+            if node.disabled != value {
+              node.disabled = value
+              node.content = node.content + 1
+              self.paintDirty = true
+            }
           }
           Attribute.Prevent { actions } => {
             node.prevents = actions
@@ -7970,6 +8039,8 @@ impl<'a> UiTree<'a> {
     if lender == NONE && parent != NONE {
       inheritTable(&mut computed.layout, &self.node(parent).computed().layout)
       computed.emptyCellsHide = self.node(parent).computed().emptyCellsHide
+      computed.accentColor = self.node(parent).computed().accentColor
+      computed.hasAccentColor = self.node(parent).computed().hasAccentColor
       computed.list = ListStyle.inherited(self.node(parent).computed().list)
     }
     if lender == NONE && !simpleStyles && containers.usesUnits(&self, slot) {

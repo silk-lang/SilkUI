@@ -8,7 +8,7 @@ import thin { Thin }
 import layout_table { LayoutTable }
 import layout.lib { WritingMode, DisplayInside, BorderCollapse }
 import mutation { ObjectFit, Overflow, Dimension, DimensionKind }
-import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position, NO_SURFACE }
+import mutation { NodeKind, BorderStyle as StyleBorder, CanvasCommand, Position, Role, NO_SURFACE }
 import style { Computed, Fill, PAINT_NONE, PAINT_CURRENT, PAINT_COLOR }
 import first_letter
 import properties.computed as computed_values
@@ -606,6 +606,20 @@ effect fn decorate(
   if edges != 15 {
     radii = Radii.new(cutCorners(radii.x, edges), cutCorners(radii.y, edges))
   }
+  let background = backgroundOf(c.paint.background)
+  let images = hasBackgrounds(&p.*, slot)
+  let colorClip = if c.effects.declared {
+    colorClipOf(&p.*, slot)
+  } else {
+    Clip.Border
+  }
+  // The color shares the border's quad only when it fills the border box under no image.
+  let joined = !images && colorClip == Clip.Border
+  let opaqueFill = joined && match c.paint.background {
+    Fill.Solid { color } => color.a >= 1.0
+    Fill.Gradient { from, to, .. } => from.a >= 1.0 && to.a >= 1.0
+    Fill.None => false
+  }
   if c.paint.hasShadow && !c.paint.shadow.inset && c.paint.shadow.color.a > 0.0 {
     drop run p.scene.shadow(
       Shadow {
@@ -617,6 +631,7 @@ effect fn decorate(
         offset: Vector2<f32> { x: c.paint.shadow.offsetX * s, y: c.paint.shadow.offsetY * s },
         spread: c.paint.shadow.spread * s,
         inset: false,
+        cutout: !opaqueFill,
       },
     )
   }
@@ -636,20 +651,10 @@ effect fn decorate(
       widths.left = borderWidth(c.paint.border.left * s)
     }
   }
-  let background = backgroundOf(c.paint.background)
   let imageBorder = hasBorderImage(&p.*, slot)
   let bordered = !imageBorder && (widths.top > 0.0 || widths.right > 0.0 || widths.bottom > 0.0
     || widths.left > 0.0)
     && c.paint.borderColor.a > 0.0
-  let images = hasBackgrounds(&p.*, slot)
-  let colorClip = if c.effects.declared {
-    colorClipOf(&p.*, slot)
-  } else {
-    Clip.Border
-  }
-
-  // The color shares the border's quad only when it fills the border box under no image.
-  let joined = !images && colorClip == Clip.Border
   let blended = images && blendsBackgrounds(&p.*, slot)
   if blended {
     drop run p.scene.pushEffectLayer(mask.bounds, mask, Isolation { opacity: 1.0, blend: 0 }, LayerEffects.none())
@@ -729,9 +734,105 @@ effect fn decorate(
         offset: Vector2<f32> { x: c.paint.shadow.offsetX * s, y: c.paint.shadow.offsetY * s },
         spread: c.paint.shadow.spread * s,
         inset: true,
+        cutout: false,
       },
     )
   }
+}
+
+/// Paints a native `<input type="range">` slider: background track, accent-colored progress
+/// fill, and circular thumb.
+effect fn paintRange(
+  p: &mut Painter<'_, '_>,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  mask: ContentMask,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let s = p.scale
+  let box = contentBox(f)
+  let w = box.xMax - box.xMin
+  let h = box.yMax - box.yMin
+  if w <= 0.0 || h <= 0.0 {
+    return ()
+  }
+  let minVal = node.valueMin()
+  let maxVal = node.valueMax()
+  let nowVal = node.valueNow()
+  let ratio: f32 = if maxVal > minVal {
+    f32.min(1.0, f32.max(0.0, (nowVal - minVal) / (maxVal - minVal)))
+  } else {
+    0.0
+  }
+  let mut accent = if c.hasAccentColor {
+    c.accentColor
+  } else {
+    Rgba<f32> { r: 0.0, g: 0.459, b: 1.0, a: 1.0 }
+  }
+  let mut trackColor = Rgba<f32> { r: 0.55, g: 0.55, b: 0.55, a: 0.35 }
+  if node.disabled {
+    accent.a = accent.a * 0.45
+    trackColor.a = trackColor.a * 0.45
+  }
+  let thumbDiameter = f32.min(16.0, f32.max(10.0, h))
+  let thumbR = thumbDiameter * 0.5
+  let trackH = f32.min(4.0, f32.max(2.0, thumbDiameter * 0.28))
+  let centerY = (box.yMin + box.yMax) * 0.5
+  let trackLeft = box.xMin
+  let trackRight = box.xMax
+  let travelLeft = f32.min(box.xMax, box.xMin + thumbR)
+  let travelRight = f32.max(travelLeft, box.xMax - thumbR)
+  let thumbX = travelLeft + (travelRight - travelLeft) * ratio
+
+  let trackRect = snapped(device(
+    Rect<f32>.new(trackLeft, centerY - trackH * 0.5, trackRight, centerY + trackH * 0.5),
+    s,
+  ))
+  let trackRadius = (trackH * 0.5) * s
+  let mut trackQuad = Quad.fill(trackRect, mask, Background.solid(trackColor))
+  trackQuad.cornerRadii = Radii.uniform(trackRadius)
+  drop run p.scene.quad(trackQuad)
+
+  if thumbX > trackLeft {
+    let fillRect = snapped(device(
+      Rect<f32>.new(trackLeft, centerY - trackH * 0.5, thumbX, centerY + trackH * 0.5),
+      s,
+    ))
+    let mut fillQuad = Quad.fill(fillRect, mask, Background.solid(accent))
+    fillQuad.cornerRadii = Radii.uniform(trackRadius)
+    drop run p.scene.quad(fillQuad)
+  }
+
+  let thumbRect = snapped(device(
+    Rect<f32>.new(thumbX - thumbR, centerY - thumbR, thumbX + thumbR, centerY + thumbR),
+    s,
+  ))
+  let thumbRadii = Radii.uniform(thumbR * s)
+  if !node.disabled {
+    drop run p.scene.shadow(
+      Shadow {
+        bounds: thumbRect,
+        mask: mask,
+        cornerRadii: thumbRadii,
+        color: Rgba<f32> { r: 0.0, g: 0.0, b: 0.0, a: 0.25 },
+        blurRadius: 2.0 * s,
+        offset: Vector2<f32> { x: 0.0, y: 1.0 * s },
+        spread: 0.0,
+        inset: false,
+        cutout: false,
+      },
+    )
+  }
+  let mut thumbQuad = Quad.fill(thumbRect, mask, Background.solid(accent))
+  thumbQuad.cornerRadii = thumbRadii
+  let bw = f32.max(1.0, 1.0 * s)
+  thumbQuad.borderWidths = Insets<f32> { top: bw, right: bw, bottom: bw, left: bw }
+  thumbQuad.borderColor = Rgba<f32> { r: 1.0, g: 1.0, b: 1.0, a: if node.disabled { 0.35 } else { 0.85 } }
+  thumbQuad.borderStyle = BorderStyle.Solid
+  drop run p.scene.quad(thumbQuad)
 }
 
 /// The color of an `outline: auto` focus ring whose color is `auto`.
@@ -3362,6 +3463,10 @@ effect fn paintBox(p: &mut Painter<'_, '_>, index: usize, f: &Fragment, mask: Co
           tint.a = tint.a * 0.5
           drop run p.scene.quad(Quad.fill(device(borderBox(f), p.scale), mask, Background.solid(tint)))
         }
+      } else if p.nodes.asSlice()[u32.toUsize(slot)].accessRole == Role.Slider
+        && p.nodes.asSlice()[u32.toUsize(slot)].hasValueRange()
+        && !c.appearanceNone {
+        run paintRange(&mut p, slot, c, f, mask)
       }
     }
     let mut inner = mask
@@ -3788,6 +3893,10 @@ fn ownHash(
   h = floatHash(h, f.contentRect.y)
   h = floatHash(h, f.contentRect.width)
   h = floatHash(h, f.contentRect.height)
+  h = floatHash(h, f.scrollableOverflow.x)
+  h = floatHash(h, f.scrollableOverflow.y)
+  h = floatHash(h, f.scrollableOverflow.width)
+  h = floatHash(h, f.scrollableOverflow.height)
   h = floatHash(h, f.firstBaselines.alphabetic)
   h = Hash.combine(h, u8.toU64(f.decorationEdges))
   let mut flags: u64 = 0
@@ -3813,6 +3922,9 @@ fn ownHash(
       if node.computed().transform.preserve3d { h = Hash.combine(h, 3) }
       h = Hash.combine(h, node.content)
       h = Hash.combine(h, u32.toU64(node.resource))
+      if node.hasValueRange() {
+        h = floatHash(floatHash(floatHash(Hash.combine(h, if node.disabled { 2 } else { 1 }), node.valueMin()), node.valueMax()), node.valueNow())
+      }
       if node.kind == NodeKind.Canvas { h = Hash.combine(h, u32.toU64(node.raster().stamp)) }
     }
   }

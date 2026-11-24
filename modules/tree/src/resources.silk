@@ -1108,6 +1108,61 @@ impl<'a> Resources<'a> {
     }
   }
 
+  /// Resource `id` as premultiplied sRGB RGBA8 pixels at its natural size: a loaded bitmap
+  /// image, or an SVG icon rasterized at its own width and height (clamped to 4096px per side).
+  pub effect fn resourcePixels(self: &mut Self, id: u32) -> Option<Image>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    match self.get(id) {
+      Option<Resource>.Some { value: Resource.Image { image, .. } } => {
+        return match self.images.image(image) {
+          Option<&Image>.Some { value } => Option<Image>.some(run value.copy())
+          _ => Option<Image>.None
+        }
+      }
+      Option<Resource>.Some { value: Resource.Icon { icon } } => {
+        let ownWidth = self.icons.width(icon)
+        let ownHeight = self.icons.height(icon)
+        let ratio = self.icons.ratio(icon)
+        let mut w = if ownWidth > 0.0 { ownWidth } else if ownHeight > 0.0 && ratio > 0.0 { ownHeight * ratio } else { 300.0 }
+        let mut h = if ownHeight > 0.0 { ownHeight } else if ratio > 0.0 { w / ratio } else { 150.0 }
+        if w > 4096.0 {
+          h = h * (4096.0 / w)
+          w = 4096.0
+        }
+        if h > 4096.0 {
+          w = w * (4096.0 / h)
+          h = 4096.0
+        }
+        let width = f64.toU32(f64.max(1.0, f64.ceil(w)))
+        let height = f64.toU32(f64.max(1.0, f64.ceil(h)))
+        let host = hostOf(&self.host, black())
+        let rendered = run Effect.catch<RenderError>(self.icons.rendered(&host, icon, width, height), noPixmap)
+          |> Effect.provideMut<Resolver>(&mut self.resolver)
+        drop host
+        if let Option<Pixmap>.Some { value: pixmap } = &rendered {
+          let made = run Effect.result(Image.make(width, height))
+          if let Result.Success { value } = move made {
+            let mut out = move value
+            let src = pixmap.data()
+            let dst = out.dataMut()
+            let len = if src.length < dst.length { src.length } else { dst.length }
+            let mut i: usize = 0
+            while i < len {
+              dst[i] = src[i]
+              i = i + 1
+            }
+            return Option<Image>.some(move out)
+          }
+        }
+        return Option<Image>.None
+      }
+      _ => {
+        return Option<Image>.None
+      }
+    }
+  }
+
   /// The tile of `image`, or None when it cannot be placed.
   /// Image resource `source` with `groups` applied in order (in its own pixels, clipped to its
   /// size), made the first time and kept: a `filter()` image filters once, not every frame.

@@ -68,6 +68,7 @@ import silkjs.js_eval_compile as flags
 import silkjs.js_string_types { StringLengthError }
 import ui_js_calls.stylesheets as stylesheets
 import codec.decode
+import codec.png
 import codec.image { Image }
 import ui_js_calls.stylesheets { Compiler }
 import ui_js_calls.markdown as markdown
@@ -253,6 +254,17 @@ pub const IMAGE_DECODE: u32 = 137512 // nativeId(b"imageDecode")
 /// `__ui.imageTake(into)`: the last decoded image's pixels into typed array `into`, as straight
 /// (not premultiplied) RGBA as `ImageData` holds them, and forgets them.
 pub const IMAGE_TAKE: u32 = 361895 // nativeId(b"imageTake")
+/// `__ui.imageInfo(id)`: leaves [state (0=pending, 1=loaded, 2=failed), naturalWidth, naturalHeight]
+/// of image node `id` for `__ui.geometry`, returning 3 (or 0 without a tree).
+pub const IMAGE_INFO: u32 = 1095115 // nativeId(b"imageInfo")
+/// `__ui.imagePixels(id)`: loads image node `id`'s decoded bitmap or rasterized SVG into `decoded`
+/// and leaves [width, height] for `__ui.geometry`, returning 2 (or 0 if unavailable).
+pub const IMAGE_PIXELS: u32 = 920008 // nativeId(b"imagePixels")
+/// `__ui.pngEncode(width, height, straightRgbaBytes)`: encodes straight RGBA8 pixels to PNG,
+/// returning the PNG byte length for `__ui.pngTake`.
+pub const PNG_ENCODE: u32 = 145861 // nativeId(b"pngEncode")
+/// `__ui.pngTake(into)`: copies the last encoded PNG bytes into typed array `into` and frees them.
+pub const PNG_TAKE: u32 = 498044 // nativeId(b"pngTake")
 /// `__ui.gpu(bytes)`: WebGPU commands (`webgpu.js` wrote them into the typed array `bytes`) for
 /// the host's GPU service, which takes them once the JavaScript turn ended.
 pub const GPU: u32 = 168108 // nativeId(b"gpu")
@@ -428,6 +440,8 @@ pub struct Bridge {
   pub geometry: List<f64>,
   /// The image `__ui.imageDecode` decoded last, until `__ui.imageTake` takes it.
   pub decoded: Option<Image>,
+  /// The PNG bytes `__ui.pngEncode` encoded last, until `__ui.pngTake` takes them.
+  pub encodedPng: Bytes,
   /// What IntersectionObserver and ResizeObserver watch (see `__ui.observe`).
   pub observers: Observers,
   /// Whether the host runs WebGPU commands.
@@ -634,6 +648,7 @@ impl Bridge {
       battery: BatteryState.full(),
       geometry: List<f64>.make(),
       decoded: Option<Image>.None,
+      encodedPng: Bytes.make(),
       observers: Observers.make(),
       gpuEnabled: false,
       canvas2dEnabled: false,
@@ -817,6 +832,10 @@ pub fn native(at: usize) -> Option<Native> {
     Native { name: b"geometry", arity: 1 },
     Native { name: b"imageDecode", arity: 1 },
     Native { name: b"imageTake", arity: 1 },
+    Native { name: b"imageInfo", arity: 1 },
+    Native { name: b"imagePixels", arity: 1 },
+    Native { name: b"pngEncode", arity: 3 },
+    Native { name: b"pngTake", arity: 1 },
     Native { name: b"gpu", arity: 1 },
     Native { name: b"gpuApi", arity: 0 },
     Native { name: b"gpuEnabled", arity: 0 },
@@ -1100,7 +1119,7 @@ pub effect fn call<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
     let query = run text(argv.get(0))
     let media = bridge.media
     return Outcome.Returned { value: ValueBits.Bool { value: run media.matches(String.utf8Bytes(String.view(&query))) } }
-  } else if function == IMAGE_DECODE || function == IMAGE_TAKE {
+  } else if function == IMAGE_DECODE || function == IMAGE_TAKE || function == IMAGE_INFO || function == IMAGE_PIXELS || function == PNG_ENCODE || function == PNG_TAKE {
     return run imageCall(&mut bridge.*, function, argv)
   } else if function == GEOMETRY {
     let at = f64.toUsize(number(argv.get(0).view()))
@@ -1437,6 +1456,105 @@ effect fn canvas2d<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) 
 }
 
 effect fn imageCall<'w>(bridge: &mut Bridge, function: u32, argv: Arguments<'w>) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  if function == IMAGE_INFO {
+    if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.number(0.0) } }
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+      &mut anchor,
+      unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+    )
+    if bridge.batch.length() != 0 {
+      drop run Effect.result(tree.apply(run bridge.batch.take()))
+    }
+    let info = tree.imageInfo(id(argv.get(0).view()))
+    bridge.geometry.clear()
+    run bridge.geometry.append(info[0])
+    run bridge.geometry.append(info[1])
+    run bridge.geometry.append(info[2])
+    return Outcome.Returned { value: ValueBits.number(3.0) }
+  }
+  if function == IMAGE_PIXELS {
+    bridge.decoded = Option<Image>.None
+    if Pointer.isNull(bridge.tree) { return Outcome.Returned { value: ValueBits.number(0.0) } }
+    let mut anchor: u8 = 0
+    let tree = unsafe Pointer.borrowMut<u8, UiTree<'static>>(
+      &mut anchor,
+      unsafe Intrinsic.pointerReinterpret<*mut u8, *mut UiTree<'static>>(unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(bridge.tree)),
+    )
+    if bridge.batch.length() != 0 {
+      drop run Effect.result(tree.apply(run bridge.batch.take()))
+    }
+    let found = run tree.imagePixels(id(argv.get(0).view()))
+    return match move found {
+      Option<Image>.Some { value: picture } => {
+        bridge.geometry.clear()
+        run bridge.geometry.append(u32.toF64(picture.width()))
+        run bridge.geometry.append(u32.toF64(picture.height()))
+        bridge.decoded = Option<Image>.some(move picture)
+        Outcome.Returned { value: ValueBits.number(2.0) }
+      }
+      Option<Image>.None => Outcome.Returned { value: ValueBits.number(0.0) }
+    }
+  }
+  if function == PNG_ENCODE {
+    bridge.encodedPng = Bytes.make()
+    let width = id(argv.get(0).view())
+    let height = id(argv.get(1).view())
+    let bytes = match move viewBytes(argv.get(2)) {
+      Option<ViewBytes>.Some { value } => move value
+      Option<ViewBytes>.None => { return Outcome.Returned { value: ValueBits.number(0.0) } }
+    }
+    let anchor: u8 = 0
+    let src = unsafe Pointer.borrowMany<u8, u8>(&anchor, unsafe Intrinsic.pointerRequalify<[*]mut u8, [*]const u8>(bytes.data), bytes.length)
+    let mut premul = run Bytes.zeroed(src.length)
+    let dst = Bytes.asMutSlice(&mut premul)
+    let mut i: usize = 0
+    while i + 3 < src.length {
+      let a = u8.toU32(src[i + 3])
+      if a == 255 {
+        dst[i] = src[i]
+        dst[i + 1] = src[i + 1]
+        dst[i + 2] = src[i + 2]
+      } else if a == 0 {
+        dst[i] = 0
+        dst[i + 1] = 0
+        dst[i + 2] = 0
+      } else {
+        dst[i] = u32.toU8((u8.toU32(src[i]) * a + 127) / 255)
+        dst[i + 1] = u32.toU8((u8.toU32(src[i + 1]) * a + 127) / 255)
+        dst[i + 2] = u32.toU8((u8.toU32(src[i + 2]) * a + 127) / 255)
+      }
+      dst[i + 3] = src[i + 3]
+      i = i + 4
+    }
+    let encoded = run Effect.result(png.encodePixels(width, height, Bytes.asSlice(&premul)))
+    return match move encoded {
+      Result.Success { value } => {
+        let len = value.length()
+        bridge.encodedPng = move value
+        Outcome.Returned { value: ValueBits.number(usize.toF64(len)) }
+      }
+      Result.Failure { error } => match move error {
+        OutOfMemoryError failure => { fail move failure }
+        _ => Outcome.Returned { value: ValueBits.number(0.0) }
+      }
+    }
+  }
+  if function == PNG_TAKE {
+    let from = Bytes.asSlice(&bridge.encodedPng)
+    if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {
+      let mut into: u8 = 0
+      let out = unsafe Pointer.borrowManyMut<u8, u8>(&mut into, bytes.data, bytes.length)
+      let len = if from.length < out.length { from.length } else { out.length }
+      let mut i: usize = 0
+      while i < len {
+        out[i] = from[i]
+        i = i + 1
+      }
+    }
+    bridge.encodedPng = Bytes.make()
+    return Outcome.Returned { value: ValueBits.Undefined }
+  }
   if function == IMAGE_TAKE {
     if let Option<Image>.Some { value: picture } = &bridge.decoded {
       if let Option<ViewBytes>.Some { value: bytes } = viewBytes(argv.get(0)) {

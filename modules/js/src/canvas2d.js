@@ -1090,6 +1090,10 @@
       if (!image._pixels) throw new (globalThis.DOMException ?? Error)("The image bitmap is closed.", "InvalidStateError");
       return image._pixels.width && image._pixels.height ? image._pixels : null;
     }
+    if (typeof image?._readPixels === "function") {
+      const read = image._readPixels();
+      return read && read.width && read.height ? read : null;
+    }
     const context = image?.getContext?.("2d");
     if (context instanceof CanvasRenderingContext2D) return { context, width: image.width, height: image.height };
     if (image?.data && image.width && image.height) return image;

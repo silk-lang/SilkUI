@@ -72,6 +72,10 @@ async function sourcePixels(image) {
     return read?.data?.length === width * height * 4 ? read : pixels(width, height);
   }
   if (image && image.data && typeof image.width === "number" && typeof image.height === "number") return image;
+  if (typeof image?._readPixels === "function") {
+    const read = image._readPixels();
+    if (read && read.width && read.height) return read;
+  }
   if (image && typeof image.src === "string") return decode(await addressBytes(image.src));
   throw new TypeError("createImageBitmap takes a Blob, ImageData, ImageBitmap, canvas or image.");
 }
