@@ -4,7 +4,9 @@
 //! become the canvas's bitmap.
 import ui_tree.legacy { UiTree, TreeError, Batch, FrameInput, NodeInfo, NodeKind, Mutation, info }
 import ui_tree.mutation { NO_SURFACE, CanvasCommand }
-import ui_tree.canvas_raster { Frame as RasterFrame }
+import ui_tree.canvas_raster { CancelCheck, Frame as RasterFrame, Job as RasterJob, NeverCancel }
+import ui_tree.canvas2d { CommandRasterizer }
+import vector.pixmap { Pixmap }
 import ui_tree.css { px }
 import ui_tree.css
 import ui_fixtures.fixtures as fixtures
@@ -266,4 +268,100 @@ test effect fn canvasShowsItsPixels() -> ()
   ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run pixelsBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+struct AlwaysCancel {}
+
+impl CancelCheck for AlwaysCancel {
+  fn cancelled(self: &Self) -> bool {
+    return true
+  }
+}
+
+effect fn jobAndCancelBody() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.root(1)
+  run batch.create(2, NodeKind.Canvas)
+  run batch.push(Mutation.InsertBefore { parent: 1, child: 2, before: Option<u32>.None })
+  run batch.style(2, &[css.width(px(200.0)), css.height(px(150.0))])
+  let mut commands = List<CanvasCommand>.make()
+  let mut i: u32 = 0
+  while i < 300 {
+    run commands.append(CanvasCommand.FillRect {
+      x: u32.toF32(i % 20) * 4.0,
+      y: u32.toF32(i / 20) * 4.0,
+      width: 4.0,
+      height: 4.0,
+      radius: 0.0,
+      color: Rgba<f32>.new(0.0, 1.0, 0.0, 1.0),
+    })
+    i = i + 1
+  }
+  run batch.canvas(2, commands.asSlice())
+  run tree.apply(run batch.take())
+  run tree.frame(input())
+  run Testing.expect(tree.canvasRasters.wants.length() == 1, "large canvas requests a raster")
+  let want = tree.canvasRasters.wants.asSlice()[0]
+  run Testing.expect(tree.acceptsRaster(want.node, want.content, want.key), "fresh want is accepted")
+
+  let prepared = run tree.prepareRasterJob(want)
+  let job = match move prepared {
+    Option<RasterJob>.Some { value } => move value
+    Option<RasterJob>.None => {
+      run Testing.expect(false, "prepareRasterJob produces an owned job")
+      return ()
+    }
+  }
+  run Testing.expect(job.commands.length() == 300, "job owns a copy of the commands")
+
+  let mut rasterizer = CommandRasterizer.make()
+  let cancelled = AlwaysCancel {}
+  let aborted = run rasterizer.draw(
+    job.commands.asSlice(),
+    job.scale,
+    job.dx,
+    job.dy,
+    job.width,
+    job.height,
+    &cancelled,
+  )
+  run Testing.expect(aborted.isNone(), "a cancelled raster stops early and returns None")
+
+  let never = NeverCancel {}
+  let drawn = run rasterizer.draw(
+    job.commands.asSlice(),
+    job.scale,
+    job.dx,
+    job.dy,
+    job.width,
+    job.height,
+    &never,
+  )
+  match move drawn {
+    Option<Pixmap>.Some { value } => {
+      let data = value.data()
+      let at = (u32.toUsize(2) * u32.toUsize(value.width()) + u32.toUsize(2)) * 4
+      run Testing.expect(data[at] == 0 && data[at + 1] == 255 && data[at + 2] == 0, "standalone rasterizer draws expected pixels")
+    }
+    Option<Pixmap>.None => {
+      run Testing.expect(false, "uncancelled raster returns a bitmap")
+    }
+  }
+
+  // Mutating the canvas makes the earlier want stale.
+  run batch.canvas(2, commands.asSlice())
+  run tree.apply(run batch.take())
+  run Testing.expect(!tree.acceptsRaster(want.node, want.content, want.key), "stale content is rejected")
+  run Testing.expect((run tree.prepareRasterJob(want)).isNone(), "prepareRasterJob refuses stale want")
+}
+
+test effect fn commandRasterizerRespectsCancellationAndStaleness() -> ()
+  ! AssertionError<'static> | TreeError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run jobAndCancelBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }

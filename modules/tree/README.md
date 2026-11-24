@@ -242,10 +242,11 @@ open/closed state, dismissal, and menu keyboard behavior remain client concerns.
 
 ## Large canvases and canvas pixels
 
-A canvas node with at least 256 commands is drawn once into a bitmap when its commands hold
-still for a frame, and paint then emits one sprite for it (`canvas_raster`). A window host
-does that drawing and presents the bitmap before each frame's layout
-(`ui_tree_window.canvas_bitmaps`); a host that never calls it keeps painting the commands.
+A canvas node with at least 256 commands is drawn once into a bitmap after its commands hold
+still through a settle cooldown, and paint then emits one sprite for it (`canvas_raster`). A
+window host rasterizes those snapshots on a background worker thread and presents finished
+bitmaps before layout (`ui_tree_window.canvas_bitmaps`), discarding stale results if the canvas
+changed; a host that never does keeps painting the commands.
 `SetCanvasPixels` gives a canvas straight RGBA8 pixels, as `putImageData` does; they are shown
 the same way, with the bitmap's size as the node's natural size.
 

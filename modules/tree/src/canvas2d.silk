@@ -25,6 +25,7 @@ import ui_scene.cpu { AtlasPixels, CpuRenderer }
 import ui_scene.path_cache { PathCache }
 import ui_scene.primitives { Background, ContentMask, GlyphSprite, ImageSprite, Quad }
 import ui_protocol.mutation { CanvasCommand }
+import canvas_raster { CancelCheck, NeverCancel }
 import ui_scene.radii { Radii }
 import ui_scene.scene { Scene }
 import ui_text.fonts { TextStyle }
@@ -394,62 +395,28 @@ impl<'a> Canvas2d<'a> {
     ! OutOfMemoryError
     ? &mut Allocator {
     run self.flush()
-    let mut pixels = run Pixmap.make(width, height)
-    let whole = Rect<f32>.new(0.0, 0.0, u32.toF32(width), u32.toF32(height))
-    let mask = ContentMask.new(whole)
-    let transform = Affine.new(f32.toF64(scale), 0.0, 0.0, f32.toF64(scale), f32.toF64(dx), f32.toF64(dy))
-    self.path.clear()
-    let mut queued = false
-    let mut i: usize = 0
-    while i < commands.length {
-      match commands[i] {
-        CanvasCommand.FillRect { x, y, width: w, height: h, radius, color } => {
-          let bounds = Rect<f32>.new(x * scale + dx, y * scale + dy, (x + w) * scale + dx, (y + h) * scale + dy)
-          if radius > 0.0 {
-            let mut quad = Quad.fill(bounds, mask, Background.solid(color))
-            quad.cornerRadii = Radii.uniform(radius * scale)
-            drop run self.scene.quad(quad)
-            queued = true
-          } else {
-            if queued {
-              run self.drawScene(&mut pixels)
-              queued = false
-            }
-            let area = intersect(bounds, whole)
-            if nonEmpty(area) { fillArea(&mut pixels, area, color) }
-          }
-        }
-        CanvasCommand.MoveTo { x, y } => { run self.path.moveTo(f32.toF64(x), f32.toF64(y)) }
-        CanvasCommand.LineTo { x, y } => { run self.path.lineTo(f32.toF64(x), f32.toF64(y)) }
-        CanvasCommand.QuadTo { x1, y1, x, y } => {
-          run self.path.quadTo(f32.toF64(x1), f32.toF64(y1), f32.toF64(x), f32.toF64(y))
-        }
-        CanvasCommand.CubicTo { x1, y1, x2, y2, x, y } => {
-          run self.path.cubicTo(f32.toF64(x1), f32.toF64(y1), f32.toF64(x2), f32.toF64(y2), f32.toF64(x), f32.toF64(y))
-        }
-        CanvasCommand.Close => { run self.path.close() }
-        CanvasCommand.Fill { color } => {
-          drop run Effect.catchAll(self.paths.fill(&mut self.scene, 0, &self.path, &transform, NONZERO, Background.solid(color), mask), noPath)
-          self.path.clear()
-          queued = true
-        }
-        CanvasCommand.Stroke { color, width: lineWidth } => {
-          let stroke = Stroke.make(f32.toF64(lineWidth))
-          drop run Effect.catchAll(self.paths.stroke(&mut self.scene, 0, &self.path, &stroke, &transform, Background.solid(color), mask), noPath)
-          self.path.clear()
-          queued = true
-        }
-      }
-      i = i + 1
+    let never = NeverCancel {}
+    return match move run drawCommandsInto(
+      &mut self.renderer,
+      &mut self.scene,
+      &mut self.paths,
+      &self.atlasPixels,
+      &mut self.path,
+      commands,
+      scale,
+      dx,
+      dy,
+      width,
+      height,
+      &never,
+    ) {
+      Option<Pixmap>.Some { value } => move value
+      Option<Pixmap>.None => run Pixmap.make(0, 0)
     }
-    if queued { run self.drawScene(&mut pixels) }
-    return move pixels
   }
 
   effect fn drawScene(self: &mut Self, pixels: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
-    run self.scene.finish()
-    run Effect.catchAll(self.renderer.draw(&self.scene, &self.atlasPixels, &mut pixels), noDraw)
-    self.scene.clear()
+    run drawSceneWith(&mut self.renderer, &mut self.scene, &self.atlasPixels, &mut pixels)
   }
 
   /// Runs `commands`, drawing with the fonts of `text`.
@@ -1851,3 +1818,154 @@ fn setSat(c: [f32; 3], s: f32) -> [f32; 3] {
 }
 
 fn minI(a: i32, b: i32) -> i32 { return if a < b { a } else { b } }
+
+/// Standalone rasterizer for canvas command lists (`canvas_raster`), with no font or tree state,
+/// so a window host can run it on a background thread.
+pub struct CommandRasterizer {
+  renderer: CpuRenderer,
+  scene: Scene,
+  paths: PathCache,
+  atlasPixels: AtlasPixels,
+  path: Path,
+}
+
+impl CommandRasterizer {
+  pub fn make() -> CommandRasterizer {
+    return CommandRasterizer {
+      renderer: CpuRenderer.make(),
+      scene: Scene.make(),
+      paths: PathCache.make(),
+      atlasPixels: AtlasPixels.make(),
+      path: Path.make(),
+    }
+  }
+
+  /// Draws `commands` into a new `width` by `height` bitmap, stopping early and returning `None`
+  /// if `cancel.cancelled()` becomes true.
+  pub effect fn draw<C: CancelCheck>(
+    self: &mut Self,
+    commands: &[CanvasCommand],
+    scale: f32,
+    dx: f32,
+    dy: f32,
+    width: u32,
+    height: u32,
+    cancel: &C,
+  ) -> Option<Pixmap>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    return run drawCommandsInto(
+      &mut self.renderer,
+      &mut self.scene,
+      &mut self.paths,
+      &self.atlasPixels,
+      &mut self.path,
+      commands,
+      scale,
+      dx,
+      dy,
+      width,
+      height,
+      cancel,
+    )
+  }
+}
+
+effect fn drawSceneWith(
+  renderer: &mut CpuRenderer,
+  scene: &mut Scene,
+  atlasPixels: &AtlasPixels,
+  pixels: &mut Pixmap,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run scene.finish()
+  run Effect.catchAll(renderer.draw(&scene.*, atlasPixels, &mut pixels), noDraw)
+  scene.clear()
+}
+
+effect fn drawCommandsInto<C: CancelCheck>(
+  renderer: &mut CpuRenderer,
+  scene: &mut Scene,
+  paths: &mut PathCache,
+  atlasPixels: &AtlasPixels,
+  path: &mut Path,
+  commands: &[CanvasCommand],
+  scale: f32,
+  dx: f32,
+  dy: f32,
+  width: u32,
+  height: u32,
+  cancel: &C,
+) -> Option<Pixmap>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if cancel.cancelled() { return Option<Pixmap>.None }
+  let mut pixels = run Pixmap.make(width, height)
+  let whole = Rect<f32>.new(0.0, 0.0, u32.toF32(width), u32.toF32(height))
+  let mask = ContentMask.new(whole)
+  let transform = Affine.new(f32.toF64(scale), 0.0, 0.0, f32.toF64(scale), f32.toF64(dx), f32.toF64(dy))
+  path.clear()
+  let mut queued = false
+  let mut i: usize = 0
+  while i < commands.length {
+    if i % 64 == 0 && cancel.cancelled() {
+      scene.clear()
+      path.clear()
+      return Option<Pixmap>.None
+    }
+    match commands[i] {
+      CanvasCommand.FillRect { x, y, width: w, height: h, radius, color } => {
+        let bounds = Rect<f32>.new(x * scale + dx, y * scale + dy, (x + w) * scale + dx, (y + h) * scale + dy)
+        if radius > 0.0 {
+          let mut quad = Quad.fill(bounds, mask, Background.solid(color))
+          quad.cornerRadii = Radii.uniform(radius * scale)
+          drop run scene.quad(quad)
+          queued = true
+        } else {
+          if queued {
+            if cancel.cancelled() {
+              scene.clear()
+              path.clear()
+              return Option<Pixmap>.None
+            }
+            run drawSceneWith(&mut renderer, &mut scene, atlasPixels, &mut pixels)
+            queued = false
+          }
+          let area = intersect(bounds, whole)
+          if nonEmpty(area) { fillArea(&mut pixels, area, color) }
+        }
+      }
+      CanvasCommand.MoveTo { x, y } => { run path.moveTo(f32.toF64(x), f32.toF64(y)) }
+      CanvasCommand.LineTo { x, y } => { run path.lineTo(f32.toF64(x), f32.toF64(y)) }
+      CanvasCommand.QuadTo { x1, y1, x, y } => {
+        run path.quadTo(f32.toF64(x1), f32.toF64(y1), f32.toF64(x), f32.toF64(y))
+      }
+      CanvasCommand.CubicTo { x1, y1, x2, y2, x, y } => {
+        run path.cubicTo(f32.toF64(x1), f32.toF64(y1), f32.toF64(x2), f32.toF64(y2), f32.toF64(x), f32.toF64(y))
+      }
+      CanvasCommand.Close => { run path.close() }
+      CanvasCommand.Fill { color } => {
+        drop run Effect.catchAll(paths.fill(&mut scene, 0, &path.*, &transform, NONZERO, Background.solid(color), mask), noPath)
+        path.clear()
+        queued = true
+      }
+      CanvasCommand.Stroke { color, width: lineWidth } => {
+        let stroke = Stroke.make(f32.toF64(lineWidth))
+        drop run Effect.catchAll(paths.stroke(&mut scene, 0, &path.*, &stroke, &transform, Background.solid(color), mask), noPath)
+        path.clear()
+        queued = true
+      }
+    }
+    i = i + 1
+  }
+  if queued {
+    if cancel.cancelled() {
+      scene.clear()
+      path.clear()
+      return Option<Pixmap>.None
+    }
+    run drawSceneWith(&mut renderer, &mut scene, atlasPixels, &mut pixels)
+  }
+  return Option<Pixmap>.some(move pixels)
+}

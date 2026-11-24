@@ -27,7 +27,7 @@ import ui_tree.mutation { FIRST_ROOT }
 import ui_tree.process_memory
 import render_thread { FastScroll, FastScrolled, Grab, RenderSettings }
 import canvas_frames { CanvasPresenter }
-import canvas_bitmaps { presentCanvasBitmaps }
+import canvas_bitmaps { CanvasRasterizer, presentCanvasBitmaps }
 import ui_scene.primitives { SURFACE_TEXTURE_BASE, surfaceOfTexture }
 import companion { Companion, Dock, NoCompanion, Paired, dockTarget, pointed }
 import screen_reader { ScreenReader, VARIABLE as SCREEN_READER_VARIABLE }
@@ -1442,6 +1442,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     tree.rootSupport = RootSupport { count: u32.MAX, extra: ExtraRoot.Window }
   }
   let canvasFrames = early.canvasPresenter()
+  let mut canvasRasterizer = CanvasRasterizer.make()
   if (run environmentVariable("SILK_UI_TRACE_CANVAS")).isSome() {
     canvasFrames.announce()
   }
@@ -1488,6 +1489,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       StderrWriter.print("cold-layout-ms={} nodes={} boxes={} output-boxes={} fragments={} probes={}\n", &((endLayout - startLayout) * 1000.0, tree.nodes.length(), tree.stats.layout.fullLayouts, tree.output.boxes.length(), tree.output.fragments.values.length(), tree.stats.layout.sizeProbes))
     }
     run content.frame(&mut state, &mut tree, early, &inspector)
+    run canvasRasterizer.observe(&mut tree, early.time)
     if tracing {
       StderrWriter.print("silk-ui: first frame laid out\n", &())
     }
@@ -1524,6 +1526,9 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
 
   // A request line for the inspector ends the wait for the next event, as a post does.
   if serves { run inspector.wakeWith(platform.nudge()) }
+  static if Intrinsic.targetArchitecture() != "wasm32" {
+    canvasRasterizer.wakeWith(platform.nudge())
+  }
   let mut host = HostState.of(&platform)
   let raw = platform.rawSurface(window)
 
@@ -1632,7 +1637,8 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       if content.quietAgain(&state.*) { quiet.again(now) }
     }
     let backgroundChanged = run content.poll(&mut state, &mut tree, now)
-    if backgroundChanged {
+    let rasterChanged = run canvasRasterizer.poll(&canvasFrames, &mut tree, now)
+    if backgroundChanged || rasterChanged {
       platform.requestFrame(owner)
     }
     if !check && content.quitting(&state.*) {
@@ -1667,6 +1673,12 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
         }
       }
       if let Option<f64>.Some { value } = companion.nextDeadline() {
+        let due = f64.max(0.0, value - now)
+        if deadline < 0.0 || due < deadline {
+          deadline = due
+        }
+      }
+      if let Option<f64>.Some { value } = canvasRasterizer.nextDeadline() {
         let due = f64.max(0.0, value - now)
         if deadline < 0.0 || due < deadline {
           deadline = due
@@ -1779,7 +1791,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       }
       next = Option<Event>.some(Event.RequestFrame { window: owner, targetTime: time })
     }
-    let mut redraw = backgroundChanged
+    let mut redraw = backgroundChanged || rasterChanged
     if !check {
       run content.tick(&mut state, &mut tree, time, false)
       redraw = content.needsFrame(&state.*, &tree) || tree.fontWakeDue(time)
@@ -1937,6 +1949,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               let frameStart = run seconds(&mut clock)
               let _prepareSpan = Prof.span("ui_window.prepare")
               run content.prepare(&mut state, &mut tree)
+              drop run canvasRasterizer.poll(&canvasFrames, &mut tree, time)
               drop run presentCanvasBitmaps(&canvasFrames, &mut tree)
               drop _prepareSpan
 
@@ -1946,6 +1959,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
               drop _layoutSpan
               let layoutEnd = run seconds(&mut clock)
               run content.frame(&mut state, &mut tree, viewport, &inspector)
+              run canvasRasterizer.observe(&mut tree, time)
               let canvasEnd = run seconds(&mut clock)
               if serves {
                 inspector.timed(
@@ -2388,6 +2402,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
     if serves && inspector.enabled() && (content.needsFrame(&state.*, &tree) || inspector.wantsFrame()) {
       let area = clientSize(width, height, &dock)
       run content.prepare(&mut state, &mut tree)
+      drop run canvasRasterizer.poll(&canvasFrames, &mut tree, time)
       drop run presentCanvasBitmaps(&canvasFrames, &mut tree)
       run content.layout(
         &mut state,
@@ -2403,6 +2418,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       run serve(&mut platform, owner, &mut tree, &mut host)
       let composedInput = tree.input
       run content.frame(&mut state, &mut tree, composedInput, &inspector)
+      run canvasRasterizer.observe(&mut tree, time)
       run inspector.afterFrameScene(&tree, content.scene(&state.*, &tree))
       redraw = true
     }
@@ -2453,6 +2469,7 @@ effect fn hostWindow<H: WindowClient<S, E, R>, K: Companion, S, E, ? R>(
       platform.requestFrame(owner)
     }
   }
+  canvasRasterizer.stop()
   if serves { run inspector.close() }
   platform.clearCompositor()
   renderer.stop()
