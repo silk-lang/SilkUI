@@ -11,6 +11,7 @@ test("the globals give browser libraries a document that builds live svg", () =>
   assert.equal(document.readyState, "complete");
   assert.equal(typeof navigator.userAgent, "string");
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 10 10");
   const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
   path.setAttributeNS(null, "d", "M0 0h10v10z");
   svg.appendChild(path);

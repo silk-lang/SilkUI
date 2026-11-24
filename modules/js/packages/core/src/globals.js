@@ -1128,7 +1128,7 @@ if (native && "rejected" in native && typeof global.PromiseRejectionEvent === "f
 
 // Storage: `localStorage` lasts (a file, on the full runtime), `sessionStorage` lasts as long
 // as the window. Both are made on first use.
-lazy("localStorage", () => localStorageArea());
+lazy("localStorage", () => { define("Storage", Storage); return localStorageArea(); });
 lazy("sessionStorage", () => sessionStorageArea());
 lazy("indexedDB", () => idb().indexedDB);
 for (const name of ["IDBFactory", "IDBDatabase", "IDBTransaction", "IDBObjectStore", "IDBIndex", "IDBRequest", "IDBOpenDBRequest", "IDBKeyRange", "IDBCursor", "IDBCursorWithValue", "IDBVersionChangeEvent"]) {
@@ -1139,7 +1139,9 @@ function idb() {
   return (idbModule ??= indexedDBModule());
 }
 function lazy(name, make) {
-  if (name in global) return;
+  if (name in global) {
+    try { if (global[name] !== undefined) return; } catch {}
+  }
   Object.defineProperty(global, name, {
     get: () => {
       const value = make();

@@ -485,6 +485,7 @@ test("identical svg markup shares one resource, released when no svg shows it", 
   mock.take();
   const svgOf = (d) => {
     const svg = createNode("svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
     const path = createSvgElement("path");
     path.setAttribute("d", d);
     svg.appendChild(path);

@@ -5878,7 +5878,7 @@ function elementLike(node) {
   const type = node instanceof CheckInput || node instanceof RangeInput || node instanceof ColorInput
     || node instanceof FileInput || node instanceof ButtonInput || node instanceof HiddenInput
     ? node.type
-    : node instanceof Input ? (node._tag === "textarea" ? undefined : node.type) : node.getAttribute("type") ?? undefined;
+    : node instanceof Input ? undefined : node.getAttribute("type") ?? undefined;
   return createElement(node._tag, { type });
 }
 
