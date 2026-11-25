@@ -155,6 +155,8 @@ pub struct Painter<'p, 'a> {
   /// Whether no scroll offset changed since the previous frame: then subtrees holding scroll
   /// containers can be replayed too.
   pub scrollsStill: bool,
+  /// Scroll offsets each scroll container in `previous` was actually painted (culled) at.
+  pub paintedScrolls: &'p [ScrollPosition],
   pub hashes: &'p List<u64>,
   /// Per fragment: the bounds of its subtree's ink, from [`inkFragments`].
   pub ink: &'p List<Rect<f32>>,
@@ -2686,7 +2688,7 @@ effect fn paintThrough(
   let saved = p.cull
   let scrolled = layers.scroller(c)
   if scrolled {
-    inner = run openScrollerAt(&mut p, slot, at, inner)
+    inner = run openScrollerAt(&mut p, slot, at, mask, inner)
   }
   run paintThrough(&mut p, path, count - 1, entry, inner)
   if scrolled {
@@ -2695,18 +2697,46 @@ effect fn paintThrough(
   }
 }
 
-/// `mask` cut by the clips between stacking context `root` and its entry `entry`.
-fn hoistedMask(p: &Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask) -> ContentMask {
-  let mut inner = mask
-  let mut at = p.output.fragments.values.asSlice()[entry].parent
+/// `mask` cut by the clips between stacking context `root` and its entry `entry`, matching
+/// `paintThrough` (top-down, expanding to a scroller's scrollable extent when passing through
+/// a scroll container).
+effect fn hoistedMask(p: &Painter<'_, '_>, root: usize, entry: usize, mask: ContentMask) -> ContentMask
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let values = p.output.fragments.values.asSlice()
+  let mut clips: [usize; 16] = [0; 16]
+  let mut count: usize = 0
+  let mut overflow = List<usize>.make()
+  let mut at = values[entry].parent
   while at != root && at != NO_INDEX {
     if clipsBelow(p, at) {
-      let f = &p.output.fragments.values.asSlice()[at]
-      let slot = slotIn(p.slotOfCss, f.source)
-      let c = &p.nodes.asSlice()[u32.toUsize(slot)].computed().*
-      inner = inner.intersect(clipMask(p, slot, c, f))
+      if count < 16 {
+        clips[count] = at
+        count = count + 1
+      } else {
+        if overflow.length() == 0 {
+          run overflow.appendSlice(Slice.view(&clips, 0, 16))
+        }
+        run overflow.append(at)
+      }
     }
-    at = p.output.fragments.values.asSlice()[at].parent
+    at = values[at].parent
+  }
+  let mut inner = mask
+  let mut idx = if overflow.length() != 0 { overflow.length() } else { count }
+  while idx > 0 {
+    idx = idx - 1
+    let cur = if overflow.length() != 0 { overflow.get(idx) } else { clips[idx] }
+    let f = &values[cur]
+    let slot = slotIn(p.slotOfCss, f.source)
+    let c = &p.nodes.asSlice()[u32.toUsize(slot)].computed().*
+    inner = inner.intersect(clipMask(p, slot, c, f))
+    if empty(inner) {
+      return inner
+    }
+    if layers.scroller(c) {
+      inner = scrollerExtent(f, p.scale)
+    }
   }
   return inner
 }
@@ -3426,7 +3456,7 @@ effect fn paintFragmentIn(p: &mut Painter<'_, '_>, index: usize, mask: ContentMa
       if scrolled {
         let inner = mask.intersect(clipMask(&p.*, slot, p.nodes.asSlice()[u32.toUsize(slot)].computed(), f))
         let saved = p.cull
-        let content = run openScrollerAt(&mut p, slot, index, inner)
+        let content = run openScrollerAt(&mut p, slot, index, mask, inner)
         run paintChildren(&mut p, index, content)
         p.cull = saved
         run p.scene.popScrollGroup()
@@ -3500,10 +3530,14 @@ effect fn shiftCaches(
     if c.clips() {
       inner = mask.intersect(clipMask(&p.*, parentSlot, c, parent))
     }
-  }
-
-  // Replay must expose the same paint order as the original clipped traversal.
-  if empty(inner) {
+    // Replay must expose the same paint order as the original clipped traversal.
+    if empty(inner) {
+      return ()
+    }
+    if layers.scroller(c) {
+      inner = scrollerExtent(parent, p.scale)
+    }
+  } else if empty(inner) {
     return ()
   }
   if !p.stacking.stacks(index) {
@@ -3517,7 +3551,7 @@ effect fn shiftCaches(
     if step == IN_FLOW {
       run shiftChildren(&mut p, index, from, to, inner)
     } else {
-      let entryMask = hoistedMask(&p.*, index, step, inner)
+      let entryMask = run hoistedMask(&p.*, index, step, inner)
       run shiftOne(&mut p, step, from, to, entryMask)
     }
     k = k + 1
@@ -3576,7 +3610,12 @@ effect fn shiftOne(
       }
     }
   }
-  run shiftCaches(&mut p, child, from, to, mask)
+  let childMask = if layers.flatOf(p.output, p.slotOfCss, &p.nodes.*, child).isSome() {
+    ContentMask.new(everywhere())
+  } else {
+    mask
+  }
+  run shiftCaches(&mut p, child, from, to, childMask)
 }
 
 /// The background and border of a rich input's run (a marked span or an atom), which has no
@@ -3875,12 +3914,56 @@ effect fn paintTrack(
   drop run p.scene.quad(quad)
 }
 
-/// Opens the scroll group of scroll container `slot` at fragment `at`, without copying `Computed`
-/// or `Fragment`.
+fn findScrollPosition(list: &[ScrollPosition], id: u32) -> Option<ScrollPosition> {
+  let mut i: usize = 0
+  while i < list.length {
+    if list[i].node == id {
+      return Option<ScrollPosition>.some(list[i])
+    }
+    i = i + 1
+  }
+  return Option<ScrollPosition>.None
+}
+
+/// Whether `paintBox` will replay fragment `index` from `previous` under `mask` and `p.cull`.
+fn canReplayBox(p: &Painter<'_, '_>, index: usize, slot: u32, f: &Fragment, mask: ContentMask) -> bool {
+  let holdsScroller = index < p.scrollers.length() && p.scrollers.get(index)
+  let cacheable = p.only == NONE && f.first && f.last && !f.repeated
+    && (!holdsScroller || p.scrollsStill)
+  if !cacheable || !p.replayable {
+    return false
+  }
+  let hash = if index < p.hashes.length() { p.hashes.get(index) } else { 0 }
+  let cache = p.caches.get(p.nodes.asSlice()[u32.toUsize(slot)].paintCache)
+  let culledAlike = sameRect(cache.cull, p.cull)
+    || (inkInside(p, index, cache.cull) && inkInside(p, index, p.cull))
+  return cache.frame == p.previousFrame && cache.hash == hash && sameRect(cache.mask, mask.bounds)
+    && cache.scale == p.scale && culledAlike
+}
+
+/// The content extent mask of scroll container fragment `f` in device pixels, matching
+/// [`openScroller`].
+fn scrollerExtent(f: &Fragment, scale: f32) -> ContentMask {
+  let box = borderBox(f)
+  let o = f.scrollableOverflow
+  let extent = Rect<f32>.new(
+    f32.min(box.xMin, box.xMin + o.x) - 1.0,
+    f32.min(box.yMin, box.yMin + o.y) - 1.0,
+    f32.max(box.xMax, box.xMin + o.x + o.width) + 1.0,
+    f32.max(box.yMax, box.yMin + o.y + o.height) + 1.0,
+  )
+  return ContentMask.new(device(extent, scale))
+}
+
+/// Opens the scroll group of scroll container `slot` at fragment `at` (for hoisted descendants
+/// or subtree snapshots), without copying `Computed` or `Fragment`. When `slot` itself is being
+/// replayed from an earlier paint's cull offset, matches that offset so `scene.scrolls()` and
+/// `p.cull` stay consistent with the replayed in-flow content.
 effect fn openScrollerAt(
   p: &mut Painter<'_, '_>,
   slot: u32,
   at: usize,
+  outerMask: ContentMask,
   inner: ContentMask,
 ) -> ContentMask
   ! OutOfMemoryError
@@ -3888,7 +3971,23 @@ effect fn openScrollerAt(
   let output = p.output
   let f = &output.fragments.values.asSlice()[at]
   let pin = StylePin.of(&p.nodes.asSlice()[u32.toUsize(slot)])
-  return run openScroller(&mut p, slot, pin.get(), f, inner)
+  let node = &p.nodes.asSlice()[u32.toUsize(slot)]
+  let s = p.scale
+  let mut sx: f32 = node.scrollX() * s
+  let mut sy: f32 = node.scrollY() * s
+  if !node.isGenerated() && p.only == NONE && p.scrollsStill && p.replayable {
+    let id = node.id
+    if let Option<ScrollPosition>.Some { value } = findScrollPosition(p.scene.scrolls(), id) {
+      sx = value.x
+      sy = value.y
+    } else if canReplayBox(&p.*, at, slot, f, outerMask) {
+      if let Option<ScrollPosition>.Some { value } = findScrollPosition(p.paintedScrolls, id) {
+        sx = value.x
+        sy = value.y
+      }
+    }
+  }
+  return run openScrollerAtOffset(&mut p, slot, pin.get(), f, inner, sx, sy)
 }
 
 /// Opens the scroll group of the content of scroll container `slot` (fragment `f`), cut to
@@ -3904,10 +4003,25 @@ effect fn openScroller(
   ! OutOfMemoryError
   ? &mut Allocator {
   let s = p.scale
+  let sx: f32 = p.nodes.asSlice()[u32.toUsize(slot)].scrollX() * s
+  let sy: f32 = p.nodes.asSlice()[u32.toUsize(slot)].scrollY() * s
+  return run openScrollerAtOffset(&mut p, slot, c, f, inner, sx, sy)
+}
+
+effect fn openScrollerAtOffset(
+  p: &mut Painter<'_, '_>,
+  slot: u32,
+  c: &Computed,
+  f: &Fragment,
+  inner: ContentMask,
+  sx: f32,
+  sy: f32,
+) -> ContentMask
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let s = p.scale
   let node = &p.nodes.asSlice()[u32.toUsize(slot)]
   let id = node.id
-  let sx: f32 = node.scrollX() * s
-  let sy: f32 = node.scrollY() * s
   let range = rangeOf(c, f)
   if node.isGenerated() {
     // Private boxes have no compositor-facing client id. Their offsets are baked into
@@ -3953,15 +4067,7 @@ effect fn openScroller(
     seen.xMax + sx + leadX,
     seen.yMax + sy + leadY,
   )
-  let box = borderBox(f)
-  let o = f.scrollableOverflow
-  let extent = Rect<f32>.new(
-    f32.min(box.xMin, box.xMin + o.x) - 1.0,
-    f32.min(box.yMin, box.yMin + o.y) - 1.0,
-    f32.max(box.xMax, box.xMin + o.x + o.width) + 1.0,
-    f32.max(box.yMax, box.yMin + o.y + o.height) + 1.0,
-  )
-  return ContentMask.new(device(extent, s))
+  return scrollerExtent(f, s)
 }
 
 /// Paints `thumb` (laid out at scroll `start`, the start of its range) in a group that follows

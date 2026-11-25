@@ -13,6 +13,7 @@ import ui_tree.legacy {
   NodeKind,
   FlexDirection,
   Overflow,
+  Position,
   Attribute,
   Event,
   EventKind,
@@ -1255,4 +1256,223 @@ test effect fn growingViewportDoesNotOutrunReplayedScrollLead() -> ()
   ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   run viewportGrowLeadBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+/// Same long scroll list as `longScrollList`, except row 1 is `position: relative` (so it is
+/// hoisted out of the scroll container into the root stacking context and painted via
+/// `paintHoisted` / `paintThrough`).
+effect fn longScrollListWithHoisted<'a>(
+  collection: &'a FontCollection,
+  status: string,
+  input: FrameInput,
+  y: f32,
+) -> UiTree<'a>
+  ! TreeError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut tree = run UiTree.make(collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[
+      css.display(Keyword.Flex),
+      css.flexDirection(FlexDirection.Column),
+      css.width(css.px(240.0)),
+      css.height(css.px(160.0)),
+      css.backgroundColor(Rgba<f32>.new(0.06, 0.06, 0.08, 1.0)),
+    ],
+  )
+  run batch.root(1)
+  run batch.box(1, 2, &[css.height(css.px(24.0)), css.flexShrink(0.0)])
+  run batch.text(2, 3, status)
+  run batch.box(
+    1,
+    4,
+    &[
+      css.height(css.px(120.0)),
+      css.flexShrink(0.0),
+      css.overflowY(Overflow.Scroll),
+      css.backgroundColor(Rgba<f32>.new(0.08, 0.08, 0.11, 1.0)),
+    ],
+  )
+  let mut i: u32 = 0
+  while i < 40 {
+    let rowId: u32 = 100 + i
+    let step: f32 = if i % 2 == 0 { 0.25 } else { 0.55 }
+    let r: f32 = 0.15 + 0.02 * u32.toF32(i)
+    if i == 1 {
+      run batch.box(
+        4,
+        rowId,
+        &[
+          css.position(Position.Relative),
+          css.height(css.px(24.0)),
+          css.flexShrink(0.0),
+          css.backgroundColor(Rgba<f32>.new(r, step, 0.7, 1.0)),
+        ],
+      )
+    } else {
+      run batch.box(
+        4,
+        rowId,
+        &[
+          css.height(css.px(24.0)),
+          css.flexShrink(0.0),
+          css.backgroundColor(Rgba<f32>.new(r, step, 0.7, 1.0)),
+        ],
+      )
+    }
+    i = i + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(input)
+  if y != 0.0 {
+    let mut scroll = Batch.make()
+    run scroll.scrollTo(4, 0.0, y)
+    run tree.apply(run scroll.take())
+  }
+  return move tree
+}
+
+effect fn hoistedDriftBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let input = FrameInput { width: 240.0, height: 160.0, scale: 1.0, time: 0.0 }
+  let mut tree = run longScrollListWithHoisted(&collection, "Ready", input, 0.0)
+  let mut snapshot = CpuSnapshot.make()
+  run snapshot.sync(&mut tree)
+
+  // Frame 2: kept scroll to y = 120 (within 160px lead of y = 0).
+  let mut step1 = Batch.make()
+  run step1.scrollTo(4, 0.0, 120.0)
+  run tree.apply(run step1.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(tree.scrollsKept == 1, "first scroll keeps the scene")
+
+  // Frame 3: unrelated sibling changes; scroller 4 replays at y = 0 while row 101 paints via
+  // `paintThrough` / `openScrollerAt(4)`. `openScrollerAt` must not advance `paintedScrolls[4]`
+  // to y = 120 while scroller 4's in-flow content is still culled at y = 0.
+  let mut sibling = Batch.make()
+  run sibling.setText(3, "Tick")
+  run tree.apply(run sibling.take())
+  drop run drawnFrameAt(&mut tree, &mut snapshot, input)
+
+  // Frame 4: scroll to y = 240 (within 160px of y = 120, past 160px of y = 0).
+  let mut step2 = Batch.make()
+  run step2.scrollTo(4, 0.0, 240.0)
+  run tree.apply(run step2.take())
+  let down = run drawnFrameAt(&mut tree, &mut snapshot, input)
+  run Testing.expect(
+    tree.scrollsKept == 1,
+    "hoisted child in replayed scroller does not drift paintedScrolls past the original lead",
+  )
+  let mut freshDown = run longScrollListWithHoisted(&collection, "Tick", input, 240.0)
+  freshDown.invalidatePaint()
+  let mut freshDownSnap = CpuSnapshot.make()
+  let expectedDown = run drawnFrameAt(&mut freshDown, &mut freshDownSnap, input)
+  run Testing.expect(
+    samePixels(&down, &expectedDown),
+    "in-flow rows past the original lead paint instead of turning blank",
+  )
+}
+
+test effect fn hoistedChildInScrollerDoesNotDriftPaintedLead() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run hoistedDriftBody() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn replayedScrollerPaintOrderBody() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError
+  ? &mut Allocator {
+  let collection = run fixtures.fonts()
+  let input = FrameInput { width: 240.0, height: 160.0, scale: 1.0, time: 0.0 }
+  let mut tree = run UiTree.make(&collection)
+  let mut batch = Batch.make()
+  run batch.create(1, NodeKind.Box)
+  run batch.style(
+    1,
+    &[
+      css.display(Keyword.Flex),
+      css.flexDirection(FlexDirection.Column),
+      css.width(css.px(240.0)),
+      css.height(css.px(160.0)),
+    ],
+  )
+  run batch.root(1)
+  run batch.box(1, 2, &[css.height(css.px(24.0)), css.flexShrink(0.0)])
+  run batch.text(2, 3, "Status")
+  run batch.box(
+    1,
+    4,
+    &[css.height(css.px(120.0)), css.flexShrink(0.0), css.overflowY(Overflow.Scroll)],
+  )
+  let mut i: u32 = 0
+  while i < 20 {
+    let rowId: u32 = 100 + i
+    if i == 15 {
+      // Nested clipped/scrollable row at layout y = 360..384 (below unscrolled 0..120 port).
+      run batch.box(
+        4,
+        rowId,
+        &[css.height(css.px(24.0)), css.flexShrink(0.0), css.overflowY(Overflow.Scroll)],
+      )
+      run batch.box(rowId, 215, &[css.height(css.px(48.0)), css.flexShrink(0.0)])
+    } else if i == 16 {
+      // Hoisted clipped row at layout y = 384..408.
+      run batch.box(
+        4,
+        rowId,
+        &[
+          css.position(Position.Relative),
+          css.height(css.px(24.0)),
+          css.flexShrink(0.0),
+          css.overflowY(Overflow.Hidden),
+        ],
+      )
+      run batch.box(rowId, 216, &[css.height(css.px(24.0)), css.flexShrink(0.0)])
+    } else {
+      run batch.box(4, rowId, &[css.height(css.px(24.0)), css.flexShrink(0.0)])
+    }
+    i = i + 1
+  }
+  run tree.apply(run batch.take())
+  run tree.frame(input)
+
+  // Scroll to y = 320 so rows 15 and 16 are visible inside the 120px scrollport, then prime
+  // scroller 4's paint cache at y = 320.
+  let mut scroll = Batch.make()
+  run scroll.scrollTo(4, 0.0, 320.0)
+  run tree.apply(run scroll.take())
+  run tree.frame(input)
+
+  let mut prime = Batch.make()
+  run prime.setText(3, "Primed")
+  run tree.apply(run prime.take())
+  run tree.frame(input)
+  let slot215 = u32.toUsize(tree.slotOf(215))
+  let slot216 = u32.toUsize(tree.slotOf(216))
+  run Testing.expect(tree.paintIndexOf.get(slot215) != NONE, "scrolled nested child has paintOrder after paint")
+  run Testing.expect(tree.paintIndexOf.get(slot216) != NONE, "scrolled hoisted child has paintOrder after paint")
+
+  // Unrelated sibling changes: scroller 4 replays via `shiftCaches`.
+  let mut tick = Batch.make()
+  run tick.setText(3, "Tick")
+  run tree.apply(run tick.take())
+  run tree.frame(input)
+  run Testing.expect(
+    tree.paintIndexOf.get(slot215) != NONE,
+    "replaying scroller 4 preserves paintOrder of scrolled nested clipped child",
+  )
+  run Testing.expect(
+    tree.paintIndexOf.get(slot216) != NONE,
+    "replaying scroller 4 preserves paintOrder of scrolled hoisted clipped child",
+  )
+}
+
+test effect fn replayedScrollerKeepsPaintOrderOfScrolledNestedClippedChildren() -> ()
+  ! AssertionError<'static> | TreeError | GeometryError | FileError | HostInputError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run replayedScrollerPaintOrderBody() |> Effect.provideMut<Allocator>(&mut allocator)
 }
