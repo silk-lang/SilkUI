@@ -173,6 +173,10 @@ function styleProxy(look) {
         const value = Reflect.get(target, key, target);
         return typeof value === "function" ? value.bind(target) : value;
       }
+      if (/^(?:0|[1-9]\d*)$/.test(key)) {
+        const index = Number(key);
+        return index < target.length ? target.item(index) : undefined;
+      }
       return target.get(key) ?? "";
     },
     set(target, key, value) {
@@ -1237,6 +1241,9 @@ export class Node {
 
   /** Whether this node matches CSS `selector`, by the same matcher as stylesheets. */
   matches(selector) {
+    const trimmed = String(selector).trim();
+    if (trimmed === ":popover-open") return Boolean(this._popoverOpen);
+    if (trimmed === ":modal") return Boolean(this._modal);
     return queried(0, this, selector) === 1;
   }
 
@@ -2565,12 +2572,16 @@ function svgDeclarations(element) {
       return old;
     },
     getPropertyValue: (name) => read().get(String(name)) ?? "",
+    getPropertyPriority: () => "",
+    item: (index) => [...read().keys()][index] ?? "",
   };
   return new Proxy(methods, {
     get(target, key) {
       if (typeof key !== "string") return undefined;
       if (key in target) return target[key];
       if (key === "cssText") return element.getAttribute("style") ?? "";
+      if (key === "length") return read().size;
+      if (/^(?:0|[1-9]\d*)$/.test(key)) return [...read().keys()][Number(key)];
       return read().get(cssName(key)) ?? "";
     },
     set(target, key, value) {
@@ -7283,6 +7294,7 @@ export class Event {
     this.bubbles = !NO_BUBBLE.has(type);
     this.cancelable = CANCELABLE.has(type);
     this.defaultPrevented = false;
+    this.isTrusted = false;
     this.timeStamp = typeof native.now === "function" ? native.now() : 0;
     this._stopped = false;
     this._immediate = false;
@@ -7603,6 +7615,7 @@ native.dispatch = function (kind, id, a, b, modifiers, d, e, first, second, thir
   if (target instanceof Image && (kind === LOAD || kind === ERROR)) target._onSourceEvent(kind === LOAD);
   if (kind === FOCUS) focusing(target);
   const event = new Event(TYPES[kind], target);
+  event.isTrusted = true;
   fill(event, kind, a, b, modifiers, d, e, first, second, third, fourth);
   if (kind === FOCUS || kind === BLUR) event.relatedTarget = kind === FOCUS ? blurredNode : null;
   const live = target instanceof Svg && target._live && isPointerKind(kind);

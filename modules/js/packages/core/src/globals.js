@@ -595,9 +595,41 @@ const elementMethods = {
     this.prepend(shadow);
     return shadow;
   },
-  showPopover() { this.hidden = false; this.dispatchEvent(new global.Event("toggle")); },
-  hidePopover() { this.hidden = true; this.dispatchEvent(new global.Event("toggle")); },
-  togglePopover(force) { const show = force === undefined ? this.hidden : Boolean(force); if (show) this.showPopover(); else this.hidePopover(); return show; },
+  showPopover() {
+    if (this._popoverOpen) return;
+    this._popoverOpen = true;
+    this.hidden = false;
+    const Toggle = global.ToggleEvent ?? global.Event;
+    this.dispatchEvent(new Toggle("toggle", { bubbles: false, oldState: "closed", newState: "open" }));
+  },
+  hidePopover() {
+    if (!this._popoverOpen) return;
+    this._popoverOpen = false;
+    this.hidden = true;
+    const Toggle = global.ToggleEvent ?? global.Event;
+    this.dispatchEvent(new Toggle("toggle", { bubbles: false, oldState: "open", newState: "closed" }));
+  },
+  togglePopover(force) {
+    const show = force === undefined ? !this._popoverOpen : Boolean(force);
+    if (show) this.showPopover();
+    else this.hidePopover();
+    return Boolean(this._popoverOpen);
+  },
+  show() {
+    this._modal = false;
+    this.open = true;
+  },
+  showModal() {
+    this._modal = true;
+    this.open = true;
+  },
+  close(returnValue) {
+    if (!this.open) return;
+    if (returnValue !== undefined) this.returnValue = String(returnValue);
+    this._modal = false;
+    this.open = false;
+    queueMicrotask(() => this.dispatchEvent(new global.Event("close", { bubbles: false })));
+  },
   checkVisibility() { return this.isConnected && this.getClientRects?.().length !== 0; },
   requestFullscreen() { return Promise.reject(domError("NotSupportedError", "a Silk UI element cannot go full screen")); },
   requestPointerLock() { return Promise.resolve(); },
@@ -631,6 +663,11 @@ const elementProperties2 = {
   hidden: flag("hidden"),
   inert: flag("inert"),
   autofocus: flag("autofocus"),
+  open: flag("open"),
+  returnValue: {
+    get() { return this._returnValue ?? ""; },
+    set(value) { this._returnValue = String(value); },
+  },
   title: reflect("title"),
   dir: reflect("dir"),
   lang: reflect("lang"),
@@ -934,6 +971,8 @@ const eventClasses = {
   PageTransitionEvent: global.PageTransitionEvent ?? eventClass("PageTransitionEvent", BaseEvent, { persisted: false }),
   SubmitEvent: global.SubmitEvent ?? eventClass("SubmitEvent", BaseEvent, { submitter: null }),
   FormDataEvent: global.FormDataEvent ?? eventClass("FormDataEvent", BaseEvent, { formData: null }),
+  ToggleEvent: global.ToggleEvent ?? eventClass("ToggleEvent", BaseEvent, { oldState: "", newState: "" }),
+  CustomEvent: global.CustomEvent ?? eventClass("CustomEvent", BaseEvent, { detail: null }),
 };
 // The host's events are the runtime's own `Event`s; each answers `instanceof` for the classes
 // a browser gives its type.
@@ -1090,6 +1129,16 @@ global.scrollBy ??= () => {};
 global.scroll ??= () => {};
 global.focus ??= () => {};
 global.blur ??= () => {};
+global.matchMedia ??= (query) => ({
+  media: String(query),
+  matches: false,
+  onchange: null,
+  addEventListener() {},
+  removeEventListener() {},
+  addListener() {},
+  removeListener() {},
+  dispatchEvent: () => false,
+});
 global.print ??= () => {};
 global.alert ??= (message) => console.warn("alert:", message);
 global.confirm ??= () => false;

@@ -255,6 +255,18 @@ export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
 program, the React example's twin: the count, the streak and the theme are the Model, and
 the same `motion.js` draws every frame, started by a Mount on the page element.
 
+## Effect UI (`@silkui/core/globals`)
+
+Standard DOM frameworks such as [Effect UI](https://ui.effect.website/) (`@effect/ui` and
+`@effect/ui-kit`) run directly on `@silkui/core/globals` without a framework-specific
+adapter. Import `@silkui/core/globals` before mounting and pass `html: true` to
+`@silkui/vite` to load `@silkui/core/html.css` (the HTML user-agent default stylesheet)
+before your app CSS.
+[examples/effect-ui-showcase](examples/effect-ui-showcase) demonstrates Effect UI
+components, Commands, Subscriptions, Providers, Queries, `@effect/ui-kit` primitives,
+Tailwind CSS v4, a live `MessageLog` viewer, live `memoryUsage()` telemetry, and a native
+`<canvas>` 2D synthesizer.
+
 ## @silkui/vite
 
 [packages/vite](packages/vite) is the Vite plugin. A host evaluates one ES module, so the

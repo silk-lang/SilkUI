@@ -27,6 +27,26 @@ import { reportDropped, standardize } from "./report.js";
 import { fontAssetResolver } from "./font-assets.js";
 import { NATIVES_DIR, jsModule, moduleOf, projectRoot, readDescription } from "./natives.js";
 
+// The HTML elements' default user-agent stylesheet (`@silkui/core/html.css`), loaded before
+// app CSS when `options.html` is true.
+const HTML_SHEET = "virtual:silk-core-html-sheet";
+const HTML_SHEET_ID = "\0" + HTML_SHEET;
+const htmlSheetPlugin = {
+  name: "silk:html-sheet",
+  enforce: "pre",
+  api: { silkPreload: [HTML_SHEET] },
+  resolveId(id) {
+    if (id === HTML_SHEET) return HTML_SHEET_ID;
+  },
+  load(id) {
+    if (id === HTML_SHEET_ID) return 'import "@silkui/core/html.css";';
+  },
+  transform(code, id) {
+    if (this.environment?.mode === "dev" || !this.getModuleInfo(id)?.isEntry) return;
+    return { code: 'import "@silkui/core/html.css";\n' + code, map: null };
+  },
+};
+
 /**
  * @param {object} [options]
  * @param {string} [options.entry] Entry module, relative to the Vite root. Default `src/main.jsx`.
@@ -42,6 +62,9 @@ import { NATIVES_DIR, jsModule, moduleOf, projectRoot, readDescription } from ".
  * @param {boolean} [options.node] The host runs the full SilkJS runtime (ui-js-node): Node
  *   builtins stay `node:` imports instead of empty stubs, and the API report leaves out
  *   what that runtime has.
+ * @param {boolean} [options.html] Inject `@silkui/core/html.css` (the HTML user-agent default
+ *   stylesheet) before the application's own CSS, for DOM frameworks used directly with
+ *   `@silkui/core/globals`. Default false.
  */
 export default function silk(options = {}) {
   // silkui's tasks start Vite with the host they built in SILKUI_HOST.
@@ -224,6 +247,7 @@ export default function silk(options = {}) {
     },
   };
   const plugins = [buildPlugin, workerPlugin, silkImports, apiPlugin, cssPlugin, stylesheetDevPlugin({ strict: options.strictStylesheets === true })];
+  if (options.html === true) plugins.unshift(htmlSheetPlugin);
   if (node) plugins.push(builtinsPlugin);
   return [...plugins, ...devPlugins({ entry, port: options.port ?? 0, host: options.host })];
 }

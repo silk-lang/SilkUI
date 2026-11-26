@@ -20,6 +20,11 @@ export interface SilkOptions {
   node?: boolean;
   /** Fail the stylesheet build when the CSS compiler drops an unsupported feature. */
   strictStylesheets?: boolean;
+  /**
+   * Inject `@silkui/core/html.css` (the HTML user-agent default stylesheet) before the app's
+   * own CSS, for DOM frameworks used directly with `@silkui/core/globals`. Default false.
+   */
+  html?: boolean;
 }
 
 export default function silk(options?: SilkOptions): Plugin[];

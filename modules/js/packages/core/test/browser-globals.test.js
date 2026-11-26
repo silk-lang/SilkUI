@@ -586,3 +586,46 @@ test("WheelEvent defines DOM_DELTA constants and host wheel events carry deltaMo
   assert.notEqual(received.deltaMode, WheelEvent.DOM_DELTA_PAGE);
   box.remove();
 });
+
+test("style indexed access, dialog methods, and popover :popover-open / ToggleEvent work", async () => {
+  const box = document.createElement("div");
+  box.style.setProperty("color", "red");
+  box.style.setProperty("margin-top", "4px");
+  assert.equal(box.style.length, 2);
+  assert.equal(box.style[0], "color");
+  assert.equal(box.style[1], "margin-top");
+  assert.equal(box.style[2], undefined);
+
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.style.setProperty("fill", "blue");
+  assert.equal(path.style.length, 1);
+  assert.equal(path.style[0], "fill");
+  assert.equal(path.style.getPropertyPriority("fill"), "");
+
+  const dialog = document.createElement("dialog");
+  document.body.appendChild(dialog);
+  let closedCount = 0;
+  dialog.addEventListener("close", () => closedCount++);
+  assert.equal(dialog.open, false);
+  assert.equal(dialog.matches(":modal"), false);
+  dialog.showModal();
+  assert.equal(dialog.open, true);
+  assert.equal(dialog.matches(":modal"), true);
+  dialog.close("confirmed");
+  assert.equal(dialog.open, false);
+  assert.equal(dialog.matches(":modal"), false);
+  assert.equal(dialog.returnValue, "confirmed");
+  await Promise.resolve();
+  assert.equal(closedCount, 1);
+
+  const toggles = [];
+  dialog.setAttribute("popover", "manual");
+  dialog.addEventListener("toggle", (event) => toggles.push([event.oldState, event.newState]));
+  assert.equal(dialog.matches(":popover-open"), false);
+  dialog.showPopover();
+  assert.equal(dialog.matches(":popover-open"), true);
+  dialog.hidePopover();
+  assert.equal(dialog.matches(":popover-open"), false);
+  assert.deepEqual(toggles, [["closed", "open"], ["open", "closed"]]);
+  dialog.remove();
+});
