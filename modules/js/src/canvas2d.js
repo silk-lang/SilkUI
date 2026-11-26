@@ -126,11 +126,16 @@
       leaving = true;
       queueMicrotask(send);
     }
-    close();
+    if (started >= 0) {
+      main.view.setUint32(started, main.at - started - 4, true);
+    }
+    main.need(12);
     started = main.at;
-    main.u32(0);
-    main.u32(op);
-    main.u32(node);
+    const v = main.view;
+    v.setUint32(started, 0, true);
+    v.setUint32(started + 4, op, true);
+    v.setUint32(started + 8, node, true);
+    main.at = started + 12;
     return main;
   }
 
@@ -265,42 +270,66 @@
   }
   const DEFAULT_FONT = "10px sans-serif";
 
-  // A path as numbers: a verb and its points.
-  function arcPoints(out, transform, cx, cy, rx, ry, rotation, start, end, counterclockwise, connect) {
+  // A path as numbers: a verb and its points. Returns the number of segments appended.
+  function arcPoints(out, m, isId, cx, cy, rx, ry, rotation, start, end, counterclockwise, connect) {
     let sweep = end - start;
     const full = Math.PI * 2;
     if (!counterclockwise && sweep < 0) sweep = (sweep % full) + full;
     if (counterclockwise && sweep > 0) sweep = (sweep % full) - full;
     if (Math.abs(end - start) >= full) sweep = counterclockwise ? -full : full;
-    const cos = Math.cos(rotation), sin = Math.sin(rotation);
-    const at = (angle) => {
-      const x = rx * Math.cos(angle), y = ry * Math.sin(angle);
-      return [cx + x * cos - y * sin, cy + x * sin + y * cos];
-    };
-    const first = at(start);
-    pushPoint(out, transform, connect ? LINE : MOVE, first);
+    const verb0 = connect ? LINE : MOVE;
+    const hasRot = rotation !== 0;
+    const cos = hasRot ? Math.cos(rotation) : 1;
+    const sin = hasRot ? Math.sin(rotation) : 0;
+    let a = Math.cos(start), b = Math.sin(start);
+    let fx = rx * a, fy = ry * b;
+    let x0 = hasRot ? cx + fx * cos - fy * sin : cx + fx;
+    let y0 = hasRot ? cy + fx * sin + fy * cos : cy + fy;
+    if (isId) {
+      out.push(verb0, x0, y0);
+    } else {
+      out.push(verb0, m[0] * x0 + m[2] * y0 + m[4], m[1] * x0 + m[3] * y0 + m[5]);
+    }
     const segments = Math.max(1, Math.ceil(Math.abs(sweep) / (Math.PI / 2) - 1e-9));
     const step = sweep / segments;
     const k = (4 / 3) * Math.tan(step / 4);
     let angle = start;
+    const m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3], m4 = m[4], m5 = m[5];
     for (let i = 0; i < segments; i++) {
       const next = angle + step;
-      const a = Math.cos(angle), b = Math.sin(angle), c = Math.cos(next), d = Math.sin(next);
-      const p1 = [rx * (a - k * b), ry * (b + k * a)];
-      const p2 = [rx * (c + k * d), ry * (d - k * c)];
-      const rot = (p) => [cx + p[0] * cos - p[1] * sin, cy + p[0] * sin + p[1] * cos];
-      const e = at(next);
-      const q1 = apply(transform, rot(p1)), q2 = apply(transform, rot(p2)), q3 = apply(transform, e);
-      out.push(CUBIC, q1[0], q1[1], q2[0], q2[1], q3[0], q3[1]);
+      const c = Math.cos(next), d = Math.sin(next);
+      const p1x = rx * (a - k * b), p1y = ry * (b + k * a);
+      const p2x = rx * (c + k * d), p2y = ry * (d - k * c);
+      const ex = rx * c, ey = ry * d;
+      let r1x, r1y, r2x, r2y, r3x, r3y;
+      if (hasRot) {
+        r1x = cx + p1x * cos - p1y * sin; r1y = cy + p1x * sin + p1y * cos;
+        r2x = cx + p2x * cos - p2y * sin; r2y = cy + p2x * sin + p2y * cos;
+        r3x = cx + ex * cos - ey * sin;   r3y = cy + ex * sin + ey * cos;
+      } else {
+        r1x = cx + p1x; r1y = cy + p1y;
+        r2x = cx + p2x; r2y = cy + p2y;
+        r3x = cx + ex;  r3y = cy + ey;
+      }
+      if (isId) {
+        out.push(CUBIC, r1x, r1y, r2x, r2y, r3x, r3y);
+      } else {
+        out.push(
+          CUBIC,
+          m0 * r1x + m2 * r1y + m4, m1 * r1x + m3 * r1y + m5,
+          m0 * r2x + m2 * r2y + m4, m1 * r2x + m3 * r2y + m5,
+          m0 * r3x + m2 * r3y + m4, m1 * r3x + m3 * r3y + m5,
+        );
+      }
       angle = next;
+      a = c;
+      b = d;
     }
+    return segments + 1;
   }
   const apply = (m, p) => [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]];
-  function pushPoint(out, transform, verb, p) {
-    const q = apply(transform, p);
-    out.push(verb, q[0], q[1]);
-  }
   const IDENTITY = [1, 0, 0, 1, 0, 0];
+  const isIdentityMatrix = (m) => m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0;
   const finite = (...values) => values.every((value) => Number.isFinite(value));
 
   // The path methods of a context and of `Path2D`, which keep points in device pixels under
@@ -308,68 +337,128 @@
   const pathMethods = {
     _begin() {
       this._points = [];
+      this._segments = 0;
       this._box = null;
       this._open = false;
-      this._last = [0, 0];
-      this._first = [0, 0];
+      this._lastX = 0;
+      this._lastY = 0;
+      this._firstX = 0;
+      this._firstY = 0;
     },
     moveTo(x, y) {
-      if (!finite(x, y)) return;
-      pushPoint(this._points, this._transform(), MOVE, [x, y]);
+      if (!(Number.isFinite(x) && Number.isFinite(y))) return;
+      const pts = this._points;
+      if (this._isIdentity()) {
+        pts.push(MOVE, x, y);
+      } else {
+        const m = this._transform();
+        pts.push(MOVE, m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+      }
+      this._segments++;
       this._open = true;
-      this._last = [x, y];
-      this._first = [x, y];
+      this._lastX = this._firstX = x;
+      this._lastY = this._firstY = y;
     },
     lineTo(x, y) {
-      if (!finite(x, y)) return;
-      pushPoint(this._points, this._transform(), this._open ? LINE : MOVE, [x, y]);
-      if (!this._open) this._first = [x, y];
-      this._open = true;
-      this._last = [x, y];
+      if (!(Number.isFinite(x) && Number.isFinite(y))) return;
+      const verb = this._open ? LINE : MOVE;
+      const pts = this._points;
+      if (this._isIdentity()) {
+        pts.push(verb, x, y);
+      } else {
+        const m = this._transform();
+        pts.push(verb, m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+      }
+      this._segments++;
+      if (!this._open) {
+        this._firstX = x;
+        this._firstY = y;
+        this._open = true;
+      }
+      this._lastX = x;
+      this._lastY = y;
     },
     quadraticCurveTo(x1, y1, x, y) {
-      if (!finite(x1, y1, x, y)) return;
+      if (!(Number.isFinite(x1) && Number.isFinite(y1) && Number.isFinite(x) && Number.isFinite(y))) return;
       if (!this._open) this.moveTo(x1, y1);
-      const m = this._transform();
-      const a = apply(m, [x1, y1]), b = apply(m, [x, y]);
-      this._points.push(QUAD, a[0], a[1], b[0], b[1]);
-      this._last = [x, y];
+      const pts = this._points;
+      if (this._isIdentity()) {
+        pts.push(QUAD, x1, y1, x, y);
+      } else {
+        const m = this._transform();
+        pts.push(QUAD, m[0] * x1 + m[2] * y1 + m[4], m[1] * x1 + m[3] * y1 + m[5], m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+      }
+      this._segments++;
+      this._lastX = x;
+      this._lastY = y;
     },
     bezierCurveTo(x1, y1, x2, y2, x, y) {
-      if (!finite(x1, y1, x2, y2, x, y)) return;
+      if (!(Number.isFinite(x1) && Number.isFinite(y1) && Number.isFinite(x2) && Number.isFinite(y2) && Number.isFinite(x) && Number.isFinite(y))) return;
       if (!this._open) this.moveTo(x1, y1);
-      const m = this._transform();
-      const a = apply(m, [x1, y1]), b = apply(m, [x2, y2]), c = apply(m, [x, y]);
-      this._points.push(CUBIC, a[0], a[1], b[0], b[1], c[0], c[1]);
-      this._last = [x, y];
+      const pts = this._points;
+      if (this._isIdentity()) {
+        pts.push(CUBIC, x1, y1, x2, y2, x, y);
+      } else {
+        const m = this._transform();
+        pts.push(
+          CUBIC,
+          m[0] * x1 + m[2] * y1 + m[4], m[1] * x1 + m[3] * y1 + m[5],
+          m[0] * x2 + m[2] * y2 + m[4], m[1] * x2 + m[3] * y2 + m[5],
+          m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5],
+        );
+      }
+      this._segments++;
+      this._lastX = x;
+      this._lastY = y;
     },
     closePath() {
       if (!this._open) return;
-      this._points.push(CLOSE);
-      this._last = this._first;
-      pushPoint(this._points, this._transform(), MOVE, this._first);
+      const fx = this._firstX, fy = this._firstY;
+      this._lastX = fx;
+      this._lastY = fy;
+      const pts = this._points;
+      if (this._isIdentity()) {
+        pts.push(CLOSE, MOVE, fx, fy);
+      } else {
+        const m = this._transform();
+        pts.push(CLOSE, MOVE, m[0] * fx + m[2] * fy + m[4], m[1] * fx + m[3] * fy + m[5]);
+      }
+      this._segments += 2;
     },
     // As moveTo, three lineTo and closePath. A path that is only this rectangle under an
     // axis-aligned transform keeps it in `_box`, so clip() need not find it in the points.
     rect(x, y, w, h) {
       if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h))) return;
-      const m = this._transform();
       const points = this._points;
       const empty = points.length === 0;
-      const x0 = m[0] * x + m[2] * y + m[4], y0 = m[1] * x + m[3] * y + m[5];
-      const x1 = m[0] * (x + w) + m[2] * y + m[4], y1 = m[1] * (x + w) + m[3] * y + m[5];
-      const x2 = m[0] * (x + w) + m[2] * (y + h) + m[4], y2 = m[1] * (x + w) + m[3] * (y + h) + m[5];
-      const x3 = m[0] * x + m[2] * (y + h) + m[4], y3 = m[1] * x + m[3] * (y + h) + m[5];
+      let x0, y0, x1, y1, x2, y2, x3, y3;
+      const isId = this._isIdentity();
+      let m = IDENTITY;
+      if (isId) {
+        x0 = x; y0 = y;
+        x1 = x + w; y1 = y;
+        x2 = x + w; y2 = y + h;
+        x3 = x; y3 = y + h;
+      } else {
+        m = this._transform();
+        const xw = x + w, yh = y + h;
+        x0 = m[0] * x + m[2] * y + m[4];  y0 = m[1] * x + m[3] * y + m[5];
+        x1 = m[0] * xw + m[2] * y + m[4]; y1 = m[1] * xw + m[3] * y + m[5];
+        x2 = m[0] * xw + m[2] * yh + m[4]; y2 = m[1] * xw + m[3] * yh + m[5];
+        x3 = m[0] * x + m[2] * yh + m[4]; y3 = m[1] * x + m[3] * yh + m[5];
+      }
       points.push(MOVE, x0, y0, LINE, x1, y1, LINE, x2, y2, LINE, x3, y3, CLOSE, MOVE, x0, y0);
+      this._segments += 6;
       this._open = true;
-      this._last = this._first = [x, y];
-      if (empty && m[1] === 0 && m[2] === 0 && w !== 0 && h !== 0) {
+      this._lastX = this._firstX = x;
+      this._lastY = this._firstY = y;
+      if (empty && (isId || (m[1] === 0 && m[2] === 0)) && w !== 0 && h !== 0) {
         this._box = [Math.min(x0, x2), Math.min(y0, y2), Math.max(x0, x2), Math.max(y0, y2)];
         this._boxLength = points.length;
       }
     },
     roundRect(x, y, w, h, radii = 0) {
-      if (!finite(x, y, w, h)) return;
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h))) return;
       const list = Array.isArray(radii) ? radii : [radii];
       const r = list.map((value) => (typeof value === "object" && value !== null ? +value.x || 0 : +value || 0));
       const [tl, tr, br, bl] = r.length === 1 ? [r[0], r[0], r[0], r[0]] : r.length === 2 ? [r[0], r[1], r[0], r[1]] : r.length === 3 ? [r[0], r[1], r[2], r[1]] : r;
@@ -383,22 +472,37 @@
       this.closePath();
     },
     arc(x, y, radius, start, end, counterclockwise = false) {
-      this.ellipse(x, y, radius, radius, 0, start, end, counterclockwise);
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(radius) && Number.isFinite(start) && Number.isFinite(end))) return;
+      if (radius < 0) throw new RangeError("The radius is negative.");
+      this._segments += arcPoints(this._points, this._transform(), this._isIdentity(), x, y, radius, radius, 0, start, end, counterclockwise, this._open);
+      if (!this._open) {
+        this._firstX = x + radius * Math.cos(start);
+        this._firstY = y + radius * Math.sin(start);
+        this._open = true;
+      }
+      this._lastX = x + radius * Math.cos(end);
+      this._lastY = y + radius * Math.sin(end);
     },
     ellipse(x, y, rx, ry, rotation, start, end, counterclockwise = false) {
-      if (!finite(x, y, rx, ry, rotation, start, end)) return;
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(rx) && Number.isFinite(ry) && Number.isFinite(rotation) && Number.isFinite(start) && Number.isFinite(end))) return;
       if (rx < 0 || ry < 0) throw new RangeError("The radius is negative.");
-      arcPoints(this._points, this._transform(), x, y, rx, ry, rotation, start, end, counterclockwise, this._open);
-      if (!this._open) this._first = [x + rx * Math.cos(start), y + ry * Math.sin(start)];
-      this._open = true;
+      this._segments += arcPoints(this._points, this._transform(), this._isIdentity(), x, y, rx, ry, rotation, start, end, counterclockwise, this._open);
+      if (!this._open) {
+        const cos0 = Math.cos(rotation), sin0 = Math.sin(rotation);
+        const sx = rx * Math.cos(start), sy = ry * Math.sin(start);
+        this._firstX = x + sx * cos0 - sy * sin0;
+        this._firstY = y + sx * sin0 + sy * cos0;
+        this._open = true;
+      }
       const cos = Math.cos(rotation), sin = Math.sin(rotation);
       const px = rx * Math.cos(end), py = ry * Math.sin(end);
-      this._last = [x + px * cos - py * sin, y + px * sin + py * cos];
+      this._lastX = x + px * cos - py * sin;
+      this._lastY = y + px * sin + py * cos;
     },
     arcTo(x1, y1, x2, y2, radius) {
-      if (!finite(x1, y1, x2, y2, radius)) return;
+      if (!(Number.isFinite(x1) && Number.isFinite(y1) && Number.isFinite(x2) && Number.isFinite(y2) && Number.isFinite(radius))) return;
       if (!this._open) this.moveTo(x1, y1);
-      const [x0, y0] = this._last;
+      const x0 = this._lastX, y0 = this._lastY;
       const ax = x0 - x1, ay = y0 - y1, bx = x2 - x1, by = y2 - y1;
       const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
       const cross = ax * by - ay * bx;
@@ -408,17 +512,18 @@
       }
       const angle = Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (la * lb))));
       const distance = radius / Math.tan(angle / 2);
-      const t0 = [x1 + (ax / la) * distance, y1 + (ay / la) * distance];
-      const t1 = [x1 + (bx / lb) * distance, y1 + (by / lb) * distance];
+      const t0x = x1 + (ax / la) * distance, t0y = y1 + (ay / la) * distance;
+      const t1x = x1 + (bx / lb) * distance, t1y = y1 + (by / lb) * distance;
       const ux = ax / la + bx / lb, uy = ay / la + by / lb;
       const lu = Math.hypot(ux, uy);
       const center = radius / Math.sin(angle / 2);
       const cx = x1 + (ux / lu) * center, cy = y1 + (uy / lu) * center;
-      const start = Math.atan2(t0[1] - cy, t0[0] - cx);
-      const end = Math.atan2(t1[1] - cy, t1[0] - cx);
-      this.lineTo(t0[0], t0[1]);
-      arcPoints(this._points, this._transform(), cx, cy, radius, radius, 0, start, end, cross > 0, true);
-      this._last = t1;
+      const start = Math.atan2(t0y - cy, t0x - cx);
+      const end = Math.atan2(t1y - cy, t1x - cx);
+      this.lineTo(t0x, t0y);
+      this._segments += arcPoints(this._points, this._transform(), this._isIdentity(), cx, cy, radius, radius, 0, start, end, cross > 0, true);
+      this._lastX = t1x;
+      this._lastY = t1y;
     },
   };
 
@@ -427,18 +532,25 @@
       this._begin();
       if (path instanceof Path2D) {
         this._points = path._points.slice();
+        this._segments = path._segments;
         this._open = path._open;
-        this._last = path._last;
-        this._first = path._first;
+        this._lastX = path._lastX;
+        this._lastY = path._lastY;
+        this._firstX = path._firstX;
+        this._firstY = path._firstY;
       }
     }
     _transform() {
       return IDENTITY;
     }
+    _isIdentity() {
+      return true;
+    }
     addPath(path, transform) {
       if (!(path instanceof Path2D)) return;
       const m = transform ? [transform.a ?? 1, transform.b ?? 0, transform.c ?? 0, transform.d ?? 1, transform.e ?? 0, transform.f ?? 0] : IDENTITY;
       this._points.push(...mapPoints(path._points, m));
+      this._segments += path._segments;
     }
   }
   Object.assign(Path2D.prototype, pathMethods);
@@ -538,6 +650,8 @@
   function initialState(width, height) {
     return {
       transform: IDENTITY,
+      identity: true,
+      inverse: IDENTITY,
       clip: [0, 0, width, height],
       // Clips that are not rectangles, in device pixels: [{ points, rule }], and their number.
       clipPaths: [],
@@ -611,6 +725,9 @@
     _transform() {
       return this._state.transform;
     }
+    _isIdentity() {
+      return this._state.identity;
+    }
     getContextAttributes() {
       return { alpha: this._alpha, desynchronized: false, colorSpace: "srgb", willReadFrequently: false };
     }
@@ -640,37 +757,59 @@
       return this._state.fillStyle;
     }
     set fillStyle(value) {
-      if (value instanceof CanvasGradient || value instanceof CanvasPattern) {
+      if (typeof value === "string") {
+        if (value === this._state.fillStyle) return;
+        const parsed = parseColor(value);
+        if (!parsed) return;
         this._state.fillStyle = value;
-        this._state.fill = paintOf(value);
+        this._state.fill = parsed;
         return;
       }
-      const parsed = parseColor(String(value));
+      if (value instanceof CanvasGradient || value instanceof CanvasPattern) {
+        this._state.fillStyle = value;
+        this._state.fill = null;
+        return;
+      }
+      const str = String(value);
+      if (str === this._state.fillStyle) return;
+      const parsed = parseColor(str);
       if (!parsed) return;
-      this._state.fillStyle = String(value);
+      this._state.fillStyle = str;
       this._state.fill = parsed;
     }
     get strokeStyle() {
       return this._state.strokeStyle;
     }
     set strokeStyle(value) {
-      if (value instanceof CanvasGradient || value instanceof CanvasPattern) {
+      if (typeof value === "string") {
+        if (value === this._state.strokeStyle) return;
+        const parsed = parseColor(value);
+        if (!parsed) return;
         this._state.strokeStyle = value;
-        this._state.stroke = paintOf(value);
+        this._state.stroke = parsed;
         return;
       }
-      const parsed = parseColor(String(value));
+      if (value instanceof CanvasGradient || value instanceof CanvasPattern) {
+        this._state.strokeStyle = value;
+        this._state.stroke = null;
+        return;
+      }
+      const str = String(value);
+      if (str === this._state.strokeStyle) return;
+      const parsed = parseColor(str);
       if (!parsed) return;
-      this._state.strokeStyle = String(value);
+      this._state.strokeStyle = str;
       this._state.stroke = parsed;
     }
     get font() {
       return this._state.font;
     }
     set font(value) {
-      const parsed = parseFont(value);
+      const str = typeof value === "string" ? value : String(value);
+      if (str === this._state.font) return;
+      const parsed = parseFont(str);
       if (!parsed) return;
-      this._state.font = String(value);
+      this._state.font = str;
       this._state.fontKey = parsed;
     }
 
@@ -686,19 +825,34 @@
     // Transforms.
     setTransform(a, b, c, d, e, f) {
       if (typeof a === "object" && a !== null) ({ a = 1, b = 0, c = 0, d = 1, e = 0, f = 0 } = a);
-      else if (a === undefined) [a, b, c, d, e, f] = IDENTITY;
-      if (!finite(a, b, c, d, e, f)) return;
-      this._state.transform = [+a, +b, +c, +d, +e, +f];
+      else if (a === undefined) {
+        this._state.transform = IDENTITY;
+        this._state.identity = true;
+        this._state.inverse = IDENTITY;
+        return;
+      }
+      if (!(Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(c) && Number.isFinite(d) && Number.isFinite(e) && Number.isFinite(f))) return;
+      const m = [+a, +b, +c, +d, +e, +f];
+      const id = isIdentityMatrix(m);
+      this._state.transform = id ? IDENTITY : m;
+      this._state.identity = id;
+      this._state.inverse = id ? IDENTITY : undefined;
     }
     getTransform() {
       return matrix(this._state.transform);
     }
     resetTransform() {
       this._state.transform = IDENTITY;
+      this._state.identity = true;
+      this._state.inverse = IDENTITY;
     }
     transform(a, b, c, d, e, f) {
-      if (!finite(a, b, c, d, e, f)) return;
-      this._state.transform = multiply(this._state.transform, [a, b, c, d, e, f]);
+      if (!(Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(c) && Number.isFinite(d) && Number.isFinite(e) && Number.isFinite(f))) return;
+      const m = multiply(this._state.transform, [a, b, c, d, e, f]);
+      const id = isIdentityMatrix(m);
+      this._state.transform = id ? IDENTITY : m;
+      this._state.identity = id;
+      this._state.inverse = id ? IDENTITY : undefined;
     }
     translate(x, y) {
       this.transform(1, 0, 0, 1, x, y);
@@ -732,9 +886,13 @@
       const s = this._state;
       const clip = s.clip;
       if (!(clip[0] < clip[2] && clip[1] < clip[3])) return -1;
+      const masked = s.clipPaths.length > 0;
+      const painted = typeof style === "object" && style !== null && (style instanceof CanvasGradient || style instanceof CanvasPattern);
+      if (op === undefined && !masked && !painted && s.shadow[3] === 0 && s.globalCompositeOperation === "source-over") {
+        return s.globalAlpha;
+      }
       const plain = op !== undefined;
       op ??= COMPOSITE[s.globalCompositeOperation];
-      const masked = s.clipPaths.length > 0;
       if (masked && this._sentClip !== s.clipId) {
         const w = this._clipped(command(CLIP_MASK, this._node));
         w.u32(s.clipPaths.length);
@@ -745,7 +903,6 @@
         this._sentClip = s.clipId;
       }
       const shadow = !plain && s.shadow[3] > 0 && (s.shadowBlur > 0 || s.shadowOffsetX !== 0 || s.shadowOffsetY !== 0);
-      const painted = style instanceof CanvasGradient || style instanceof CanvasPattern;
       if (!masked && !shadow && op === 0 && !painted) return s.globalAlpha;
       let inverse = null;
       if (painted) {
@@ -786,41 +943,105 @@
     }
     _strokeStyle(w) {
       const s = this._state;
-      w.f64(s.lineWidth);
-      w.u32(CAPS[s.lineCap]);
-      w.u32(JOINS[s.lineJoin]);
-      w.f64(s.miterLimit);
-      w.u32(s.lineDash.length);
-      for (const value of s.lineDash) w.f64(value);
-      w.f64(s.lineDashOffset);
+      const dashLen = s.lineDash.length;
+      w.need(36 + dashLen * 8);
+      const v = w.view;
+      let at = w.at;
+      v.setFloat64(at, +s.lineWidth, true);
+      v.setUint32(at + 8, CAPS[s.lineCap], true);
+      v.setUint32(at + 12, JOINS[s.lineJoin], true);
+      v.setFloat64(at + 16, +s.miterLimit, true);
+      v.setUint32(at + 24, dashLen, true);
+      at += 28;
+      if (dashLen > 0) {
+        const dash = s.lineDash;
+        for (let i = 0; i < dashLen; i++) {
+          v.setFloat64(at, +dash[i], true);
+          at += 8;
+        }
+      }
+      v.setFloat64(at, +s.lineDashOffset, true);
+      w.at = at + 8;
     }
     fill(path, rule) {
       if (typeof path === "string") [path, rule] = [undefined, path];
-      const points = this._pointsOf(path);
+      const isPath2d = path instanceof Path2D;
+      const points = isPath2d ? path._points : this._points;
       if (!points.length) return;
-      const alpha = this._effects(this._state.fillStyle);
+      const s = this._state;
+      const alpha = this._effects(s.fillStyle);
       if (alpha < 0) return;
-      const w = this._clipped(command(FILL_PATH, this._node));
-      w.color(this._state.fill ?? WHITE, alpha);
-      w.u32(rule === "evenodd" ? 1 : 0);
-      writePath(w, points);
+      const w = command(FILL_PATH, this._node);
+      w.need(68);
+      const v = w.view;
+      let at = w.at;
+      const clip = s.clip;
+      const rgba = s.fill ?? WHITE;
+      v.setFloat64(at, clip[0], true);
+      v.setFloat64(at + 8, clip[1], true);
+      v.setFloat64(at + 16, clip[2], true);
+      v.setFloat64(at + 24, clip[3], true);
+      v.setFloat64(at + 32, rgba[0], true);
+      v.setFloat64(at + 40, rgba[1], true);
+      v.setFloat64(at + 48, rgba[2], true);
+      v.setFloat64(at + 56, rgba[3] * alpha, true);
+      v.setUint32(at + 64, rule === "evenodd" ? 1 : 0, true);
+      w.at = at + 68;
+      if (isPath2d && !s.identity) {
+        writeMappedPath(w, points, path._segments, s.transform);
+      } else {
+        writePath(w, points, isPath2d ? path._segments : this._segments);
+      }
     }
     // The path goes in user space with the transform, so the line width, dashes and joins follow
     // the transform as a browser strokes them.
     stroke(path) {
-      const points = this._pointsOf(path);
+      const isPath2d = path instanceof Path2D;
+      const points = isPath2d ? path._points : this._points;
       if (!points.length) return;
       const s = this._state;
-      const inverse = invert(s.transform);
+      let inverse = s.inverse;
+      if (inverse === undefined) {
+        inverse = invert(s.transform);
+        s.inverse = inverse;
+      }
       if (!inverse) return;
       const alpha = this._effects(s.strokeStyle);
       if (alpha < 0) return;
-      const w = this._clipped(command(STROKE_PATH, this._node));
-      w.color(s.stroke ?? WHITE, alpha);
-      w.u32(0);
+      const w = command(STROKE_PATH, this._node);
+      w.need(116);
+      const v = w.view;
+      let at = w.at;
+      const clip = s.clip;
+      const rgba = s.stroke ?? WHITE;
+      v.setFloat64(at, clip[0], true);
+      v.setFloat64(at + 8, clip[1], true);
+      v.setFloat64(at + 16, clip[2], true);
+      v.setFloat64(at + 24, clip[3], true);
+      v.setFloat64(at + 32, rgba[0], true);
+      v.setFloat64(at + 40, rgba[1], true);
+      v.setFloat64(at + 48, rgba[2], true);
+      v.setFloat64(at + 56, rgba[3] * alpha, true);
+      v.setUint32(at + 64, 0, true);
+      w.at = at + 68;
       this._strokeStyle(w);
-      for (const value of s.transform) w.f64(value);
-      writePath(w, mapPoints(points, inverse));
+      w.need(48);
+      const v2 = w.view;
+      let at2 = w.at;
+      const m = s.transform;
+      v2.setFloat64(at2, m[0], true);
+      v2.setFloat64(at2 + 8, m[1], true);
+      v2.setFloat64(at2 + 16, m[2], true);
+      v2.setFloat64(at2 + 24, m[3], true);
+      v2.setFloat64(at2 + 32, m[4], true);
+      v2.setFloat64(at2 + 40, m[5], true);
+      w.at = at2 + 48;
+      if (isPath2d || s.identity) {
+        // Path2D points are already in user space; current path under identity is also in user space.
+        writePath(w, points, isPath2d ? path._segments : this._segments);
+      } else {
+        writeMappedPath(w, points, this._segments, inverse);
+      }
     }
     clip(path, rule) {
       if (typeof path === "string") [path, rule] = [undefined, path];
@@ -878,32 +1099,74 @@
     }
     fillRect(x, y, w, h) {
       if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h)) || w === 0 || h === 0) return;
-      if (!this._axisAligned()) {
+      const s = this._state;
+      const m = s.transform;
+      if (!s.identity && (m[1] !== 0 || m[2] !== 0)) {
         const path = new Path2D();
         path.rect(x, y, w, h);
         return this.fill(path);
       }
-      const s = this._state;
       const alpha = this._effects(s.fillStyle);
       if (alpha < 0) return;
-      const m = s.transform;
-      const ax = m[0] * x + m[4], ay = m[3] * y + m[5], bx = m[0] * (x + w) + m[4], by = m[3] * (y + h) + m[5];
-      const writer = this._clipped(command(FILL_RECT, this._node));
-      writer.color(s.fill ?? WHITE, alpha);
-      writer.rect(Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by));
+      let ax, ay, bx, by;
+      if (s.identity) {
+        ax = x; ay = y; bx = x + w; by = y + h;
+      } else {
+        ax = m[0] * x + m[4]; ay = m[3] * y + m[5];
+        bx = m[0] * (x + w) + m[4]; by = m[3] * (y + h) + m[5];
+      }
+      const writer = command(FILL_RECT, this._node);
+      writer.need(96);
+      const v = writer.view;
+      let at = writer.at;
+      const clip = s.clip;
+      const rgba = s.fill ?? WHITE;
+      v.setFloat64(at, clip[0], true);
+      v.setFloat64(at + 8, clip[1], true);
+      v.setFloat64(at + 16, clip[2], true);
+      v.setFloat64(at + 24, clip[3], true);
+      v.setFloat64(at + 32, rgba[0], true);
+      v.setFloat64(at + 40, rgba[1], true);
+      v.setFloat64(at + 48, rgba[2], true);
+      v.setFloat64(at + 56, rgba[3] * alpha, true);
+      v.setFloat64(at + 64, ax < bx ? ax : bx, true);
+      v.setFloat64(at + 72, ay < by ? ay : by, true);
+      v.setFloat64(at + 80, ax > bx ? ax : bx, true);
+      v.setFloat64(at + 88, ay > by ? ay : by, true);
+      writer.at = at + 96;
     }
     strokeRect(x, y, w, h) {
-      if (!finite(x, y, w, h)) return;
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h))) return;
       const path = new Path2D();
       path.rect(x, y, w, h);
       this.stroke(path);
     }
     clearRect(x, y, w, h) {
-      if (!finite(x, y, w, h) || w === 0 || h === 0) return;
-      if (this._axisAligned() && !this._state.clipPaths.length) {
-        const r = this._deviceRect(x, y, w, h);
-        const writer = this._clipped(command(CLEAR_RECT, this._node));
-        writer.rect(r[0], r[1], r[2], r[3]);
+      if (!(Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(w) && Number.isFinite(h)) || w === 0 || h === 0) return;
+      const s = this._state;
+      const m = s.transform;
+      if ((s.identity || (m[1] === 0 && m[2] === 0)) && !s.clipPaths.length) {
+        let ax, ay, bx, by;
+        if (s.identity) {
+          ax = x; ay = y; bx = x + w; by = y + h;
+        } else {
+          ax = m[0] * x + m[4]; ay = m[3] * y + m[5];
+          bx = m[0] * (x + w) + m[4]; by = m[3] * (y + h) + m[5];
+        }
+        const writer = command(CLEAR_RECT, this._node);
+        writer.need(64);
+        const v = writer.view;
+        let at = writer.at;
+        const clip = s.clip;
+        v.setFloat64(at, clip[0], true);
+        v.setFloat64(at + 8, clip[1], true);
+        v.setFloat64(at + 16, clip[2], true);
+        v.setFloat64(at + 24, clip[3], true);
+        v.setFloat64(at + 32, ax < bx ? ax : bx, true);
+        v.setFloat64(at + 40, ay < by ? ay : by, true);
+        v.setFloat64(at + 48, ax > bx ? ax : bx, true);
+        v.setFloat64(at + 56, ay > by ? ay : by, true);
+        writer.at = at + 64;
         return;
       }
       // Erased as a fill that takes away what it covers.
@@ -911,7 +1174,7 @@
       const writer = this._clipped(command(FILL_PATH, this._node));
       writer.color([0, 0, 0, 1], 1);
       writer.u32(0);
-      writePath(writer, mapPoints([MOVE, x, y, LINE, x + w, y, LINE, x + w, y + h, LINE, x, y + h, CLOSE], this._state.transform));
+      writeMappedPath(writer, [MOVE, x, y, LINE, x + w, y, LINE, x + w, y + h, LINE, x, y + h, CLOSE], 5, m);
     }
 
     // Text.
@@ -1164,15 +1427,99 @@
     return out;
   }
 
-  function writePath(w, points) {
-    w.u32(segmentCount(points));
+  function writePath(w, points, segCount) {
+    const count = segCount !== undefined ? segCount : segmentCount(points);
+    const len = points.length;
+    w.need(4 + len * 8);
+    const v = w.view;
+    let at = w.at;
+    v.setUint32(at, count, true);
+    at += 4;
     let i = 0;
-    while (i < points.length) {
+    while (i < len) {
       const verb = points[i++];
-      w.u32(verb);
-      const count = verb === MOVE || verb === LINE ? 2 : verb === QUAD ? 4 : verb === CUBIC ? 6 : 0;
-      for (let k = 0; k < count; k++) w.f64(points[i++]);
+      v.setUint32(at, verb, true);
+      at += 4;
+      if (verb === MOVE || verb === LINE) {
+        v.setFloat64(at, points[i], true);
+        v.setFloat64(at + 8, points[i + 1], true);
+        at += 16;
+        i += 2;
+      } else if (verb === QUAD) {
+        v.setFloat64(at, points[i], true);
+        v.setFloat64(at + 8, points[i + 1], true);
+        v.setFloat64(at + 16, points[i + 2], true);
+        v.setFloat64(at + 24, points[i + 3], true);
+        at += 32;
+        i += 4;
+      } else if (verb === CUBIC) {
+        v.setFloat64(at, points[i], true);
+        v.setFloat64(at + 8, points[i + 1], true);
+        v.setFloat64(at + 16, points[i + 2], true);
+        v.setFloat64(at + 24, points[i + 3], true);
+        v.setFloat64(at + 32, points[i + 4], true);
+        v.setFloat64(at + 40, points[i + 5], true);
+        at += 48;
+        i += 6;
+      }
     }
+    w.at = at;
+  }
+
+  function writeMappedPath(w, points, segCount, m) {
+    const count = segCount !== undefined ? segCount : segmentCount(points);
+    const len = points.length;
+    w.need(4 + len * 8);
+    const v = w.view;
+    let at = w.at;
+    v.setUint32(at, count, true);
+    at += 4;
+    const m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3], m4 = m[4], m5 = m[5];
+    let i = 0;
+    if (m1 === 0 && m2 === 0) {
+      while (i < len) {
+        const verb = points[i++];
+        v.setUint32(at, verb, true);
+        at += 4;
+        if (verb === MOVE || verb === LINE) {
+          v.setFloat64(at, m0 * points[i] + m4, true);
+          v.setFloat64(at + 8, m3 * points[i + 1] + m5, true);
+          at += 16;
+          i += 2;
+        } else if (verb === QUAD) {
+          v.setFloat64(at, m0 * points[i] + m4, true);
+          v.setFloat64(at + 8, m3 * points[i + 1] + m5, true);
+          v.setFloat64(at + 16, m0 * points[i + 2] + m4, true);
+          v.setFloat64(at + 24, m3 * points[i + 3] + m5, true);
+          at += 32;
+          i += 4;
+        } else if (verb === CUBIC) {
+          v.setFloat64(at, m0 * points[i] + m4, true);
+          v.setFloat64(at + 8, m3 * points[i + 1] + m5, true);
+          v.setFloat64(at + 16, m0 * points[i + 2] + m4, true);
+          v.setFloat64(at + 24, m3 * points[i + 3] + m5, true);
+          v.setFloat64(at + 32, m0 * points[i + 4] + m4, true);
+          v.setFloat64(at + 40, m3 * points[i + 5] + m5, true);
+          at += 48;
+          i += 6;
+        }
+      }
+    } else {
+      while (i < len) {
+        const verb = points[i++];
+        v.setUint32(at, verb, true);
+        at += 4;
+        const pairs = verb === MOVE || verb === LINE ? 1 : verb === QUAD ? 2 : verb === CUBIC ? 3 : 0;
+        for (let k = 0; k < pairs; k++) {
+          const px = points[i], py = points[i + 1];
+          v.setFloat64(at, m0 * px + m2 * py + m4, true);
+          v.setFloat64(at + 8, m1 * px + m3 * py + m5, true);
+          at += 16;
+          i += 2;
+        }
+      }
+    }
+    w.at = at;
   }
 
   const contexts = new WeakMap();
