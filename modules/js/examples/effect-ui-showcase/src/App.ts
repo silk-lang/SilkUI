@@ -49,20 +49,25 @@ const StudioShell = Html.component({
           h.div.class("studio-shell", isLight ? "theme-light" : ""),
         ).children(
           // 56px translucent macOS titlebar header
-          h.header.class("studio-header").children(
+          h.header.class("studio-header").attr("aria-label", "Application header").children(
             // Real Effect stacked-layers logo mark
-            h.div.class("flex items-center gap-2.5").children(
+            h.div.class("flex items-center gap-2.5 shrink-0").children(
               h.el("svg")
                 .attr("width", "24")
                 .attr("height", "24")
                 .attr("viewBox", "0 0 180 180")
                 .attr("fill", "none")
+                .attr("aria-hidden", "true")
                 .children(
                   h.el("rect")
-                    .attr("width", "180")
-                    .attr("height", "180")
-                    .attr("rx", "42")
-                    .attr("fill", isLight ? "#18181b" : "#5c5cf6"),
+                    .attr("x", "3")
+                    .attr("y", "3")
+                    .attr("width", "174")
+                    .attr("height", "174")
+                    .attr("rx", "40")
+                    .attr("fill", isLight ? "#18181b" : "#1f1f26")
+                    .attr("stroke", isLight ? "#18181b" : "rgba(255, 255, 255, 0.18)")
+                    .attr("stroke-width", "6"),
                   h.el("path")
                     .attr("fill-rule", "evenodd")
                     .attr("clip-rule", "evenodd")
@@ -78,28 +83,32 @@ const StudioShell = Html.component({
                     )
                     .attr("fill", "#ffffff"),
                 ),
-              h.span.class("text-sm font-semibold tracking-tight").children("Effect UI"),
+              h.span.class("text-sm font-semibold tracking-tight whitespace-nowrap").children("Effect UI"),
               h.span
-                .class("studio-mono text-[11px]")
+                .class("studio-mono text-[11px] whitespace-nowrap")
                 .attr("style", "color: var(--fg-subtle)")
                 .children("× Silk UI"),
             ),
 
             // Center segmented pill tabs
-            tabs.list(h.div.class("studio-pill-group")).children(
+            tabs.list(h.div.class("studio-pill-group").attr("aria-label", "Showcase sections")).children(
               tabs.tab({ element: h.button.class("studio-tab"), value: "studio" }).children("Studio"),
               tabs.tab({ element: h.button.class("studio-tab"), value: "uikit" }).children("UI Kit"),
               tabs.tab({ element: h.button.class("studio-tab"), value: "log" }).children("Log"),
             ),
 
             // Right: Live macOS memory + fps pill & Theme switch
-            h.div.class("flex items-center gap-3").children(
+            h.div.class("flex items-center gap-3 shrink-0").children(
               MemoryBadge(h, {}),
               Switch(h, {
                 props: { checked: isLight },
                 onToggle: () => ShellMessage.ToggledTheme(),
                 view: (sw) =>
-                  sw.root(h.button.class("studio-switch")).children(
+                  sw.root(
+                    h.button
+                      .class("studio-switch shrink-0")
+                      .attr("aria-label", "Light theme"),
+                  ).children(
                     sw.thumb(h.span.class("studio-switch-thumb")),
                   ),
               }),
@@ -107,7 +116,7 @@ const StudioShell = Html.component({
           ),
 
           // Main canvas
-          h.main.class("flex-1 overflow-auto px-6 py-5").children(
+          h.main.class("flex-1 overflow-auto px-6 py-5").attr("aria-label", "Showcase content").children(
             tabs.panel({ element: h.div.class("flex flex-col gap-4"), value: "studio" })?.children(
               // Minimal editorial hero strip
               h.div.class("flex items-center justify-between px-1").children(
@@ -127,6 +136,8 @@ const StudioShell = Html.component({
                     .children("WebGPU · SilkJS · Tailwind v4"),
                   h.span
                     .class("studio-chip")
+                    .attr("role", "status")
+                    .attr("aria-label", `${h.reads.studio.interactions} total interactions`)
                     .attr("style", "background-color: var(--accent-soft); border: 1px solid var(--accent-border); color: var(--accent-bright)")
                     .children(`${h.reads.studio.interactions} events`),
                 ),
